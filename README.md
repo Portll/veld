@@ -162,6 +162,14 @@ let results = memory.recall("user-1", "user preferences", 5)?;
 | Windows x86_64 | Supported |
 | Linux ARM64 | Coming soon |
 
+## Community Implementations
+
+| Project | Description | Author |
+|---------|-------------|--------|
+| [SHODH on Cloudflare](https://github.com/doobidoo/shodh-on-cloudflare) | Edge-native implementation on Cloudflare Workers with D1, Vectorize, and Workers AI | [@doobidoo](https://github.com/doobidoo) |
+
+Have an implementation? [Open a discussion](https://github.com/varun29ankuS/shodh-memory/discussions) to get it listed.
+
 ## References
 
 [1] Cowan, N. (2010). The Magical Mystery Four: How is Working Memory Capacity Limited, and Why? *Current Directions in Psychological Science*.
