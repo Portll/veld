@@ -82,8 +82,21 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
+      - name: Verify files exist
+        run: |
+          echo "=== Checking downloaded files ==="
+          ls -la shodh_memory/lib/ || echo "lib dir missing"
+          ls -la shodh_memory/models/minilm-l6/ || echo "minilm dir missing"
+          ls -la shodh_memory/models/bert-tiny-ner/ || echo "ner dir missing"
+          du -sh shodh_memory/
+
       - name: Build ABI3 wheels (Python 3.8+)
-        run: maturin build --release --target aarch64-apple-darwin --out dist --features python
+        run: maturin build --release --target aarch64-apple-darwin --out dist --features python -v
+
+      - name: Inspect wheel
+        run: |
+          echo "=== Wheel contents ==="
+          unzip -l dist/*.whl
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
