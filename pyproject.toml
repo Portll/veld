@@ -43,3 +43,12 @@ features = ["python"]
 python-source = "python"
 module-name = "shodh_memory.shodh_memory"
 strip = true
+include = [
+    "python/shodh_memory/lib/*.dll",
+    "python/shodh_memory/lib/*.so",
+    "python/shodh_memory/lib/*.dylib",
+    "python/shodh_memory/models/minilm-l6/*.onnx",
+    "python/shodh_memory/models/minilm-l6/*.json",
+    "python/shodh_memory/models/bert-tiny-ner/*.onnx",
+    "python/shodh_memory/models/bert-tiny-ner/*.json",
+]
