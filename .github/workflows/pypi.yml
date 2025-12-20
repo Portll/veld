@@ -30,22 +30,32 @@ jobs:
 
       - name: Download models and ONNX Runtime
         run: |
-          mkdir -p shodh_memory/models/minilm-l6 shodh_memory/models/bert-tiny-ner shodh_memory/lib
-          curl -L -o shodh_memory/models/minilm-l6/model_quantized.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx"
-          curl -L -o shodh_memory/models/minilm-l6/tokenizer.json "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
-          curl -L -o shodh_memory/models/bert-tiny-ner/model.onnx "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx"
-          curl -L -o shodh_memory/models/bert-tiny-ner/tokenizer.json "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json"
+          mkdir -p python/shodh_memory/models/minilm-l6 python/shodh_memory/models/bert-tiny-ner python/shodh_memory/lib
+          curl -L -o python/shodh_memory/models/minilm-l6/model_quantized.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx"
+          curl -L -o python/shodh_memory/models/minilm-l6/tokenizer.json "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+          curl -L -o python/shodh_memory/models/bert-tiny-ner/model.onnx "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx"
+          curl -L -o python/shodh_memory/models/bert-tiny-ner/tokenizer.json "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json"
           curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz"
           tar -xzf onnxruntime.tgz
-          cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0 shodh_memory/lib/libonnxruntime.so
-          ls -la shodh_memory/models/minilm-l6/ shodh_memory/models/bert-tiny-ner/ shodh_memory/lib/
+          cp onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0 python/shodh_memory/lib/libonnxruntime.so
+          echo "=== Downloaded files ==="
+          ls -la python/shodh_memory/models/minilm-l6/ python/shodh_memory/models/bert-tiny-ner/ python/shodh_memory/lib/
+          du -sh python/shodh_memory/
         shell: bash
 
       - name: Build wheels with maturin
         run: |
           source $HOME/.cargo/env
           /opt/python/cp311-cp311/bin/pip install maturin
-          /opt/python/cp311-cp311/bin/maturin build --release --out dist --features python --manylinux 2_28
+          /opt/python/cp311-cp311/bin/maturin build --release --out dist --features python --manylinux 2_28 -v
+        shell: bash
+
+      - name: Inspect wheel
+        run: |
+          echo "=== Wheel file size ==="
+          ls -lh dist/*.whl
+          echo "=== Wheel contents ==="
+          unzip -l dist/*.whl
         shell: bash
 
       - name: Upload wheels
@@ -70,14 +80,14 @@ jobs:
 
       - name: Download models and ONNX Runtime
         run: |
-          mkdir -p shodh_memory/models/minilm-l6 shodh_memory/models/bert-tiny-ner shodh_memory/lib
-          curl -L -o shodh_memory/models/minilm-l6/model_quantized.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx"
-          curl -L -o shodh_memory/models/minilm-l6/tokenizer.json "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
-          curl -L -o shodh_memory/models/bert-tiny-ner/model.onnx "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx"
-          curl -L -o shodh_memory/models/bert-tiny-ner/tokenizer.json "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json"
+          mkdir -p python/shodh_memory/models/minilm-l6 python/shodh_memory/models/bert-tiny-ner python/shodh_memory/lib
+          curl -L -o python/shodh_memory/models/minilm-l6/model_quantized.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx"
+          curl -L -o python/shodh_memory/models/minilm-l6/tokenizer.json "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+          curl -L -o python/shodh_memory/models/bert-tiny-ner/model.onnx "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx"
+          curl -L -o python/shodh_memory/models/bert-tiny-ner/tokenizer.json "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json"
           curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-arm64-1.22.0.tgz"
           tar -xzf onnxruntime.tgz
-          cp onnxruntime-osx-arm64-1.22.0/lib/libonnxruntime.1.22.0.dylib shodh_memory/lib/libonnxruntime.dylib
+          cp onnxruntime-osx-arm64-1.22.0/lib/libonnxruntime.1.22.0.dylib python/shodh_memory/lib/libonnxruntime.dylib
 
       - name: Install maturin
         run: pip install maturin
@@ -85,10 +95,10 @@ jobs:
       - name: Verify files exist
         run: |
           echo "=== Checking downloaded files ==="
-          ls -la shodh_memory/lib/ || echo "lib dir missing"
-          ls -la shodh_memory/models/minilm-l6/ || echo "minilm dir missing"
-          ls -la shodh_memory/models/bert-tiny-ner/ || echo "ner dir missing"
-          du -sh shodh_memory/
+          ls -la python/shodh_memory/lib/ || echo "lib dir missing"
+          ls -la python/shodh_memory/models/minilm-l6/ || echo "minilm dir missing"
+          ls -la python/shodh_memory/models/bert-tiny-ner/ || echo "ner dir missing"
+          du -sh python/shodh_memory/
 
       - name: Build ABI3 wheels (Python 3.8+)
         run: maturin build --release --target aarch64-apple-darwin --out dist --features python -v
@@ -120,14 +130,17 @@ jobs:
 
       - name: Download models and ONNX Runtime
         run: |
-          mkdir -p shodh_memory/models/minilm-l6 shodh_memory/models/bert-tiny-ner shodh_memory/lib
-          curl -L -o shodh_memory/models/minilm-l6/model_quantized.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx"
-          curl -L -o shodh_memory/models/minilm-l6/tokenizer.json "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
-          curl -L -o shodh_memory/models/bert-tiny-ner/model.onnx "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx"
-          curl -L -o shodh_memory/models/bert-tiny-ner/tokenizer.json "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json"
+          mkdir -p python/shodh_memory/models/minilm-l6 python/shodh_memory/models/bert-tiny-ner python/shodh_memory/lib
+          curl -L -o python/shodh_memory/models/minilm-l6/model_quantized.onnx "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx"
+          curl -L -o python/shodh_memory/models/minilm-l6/tokenizer.json "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+          curl -L -o python/shodh_memory/models/bert-tiny-ner/model.onnx "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx"
+          curl -L -o python/shodh_memory/models/bert-tiny-ner/tokenizer.json "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json"
           curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-x86_64-1.22.0.tgz"
           tar -xzf onnxruntime.tgz
-          cp onnxruntime-osx-x86_64-1.22.0/lib/libonnxruntime.1.22.0.dylib shodh_memory/lib/libonnxruntime.dylib
+          cp onnxruntime-osx-x86_64-1.22.0/lib/libonnxruntime.1.22.0.dylib python/shodh_memory/lib/libonnxruntime.dylib
+          echo "=== Downloaded files ==="
+          ls -la python/shodh_memory/models/minilm-l6/ python/shodh_memory/models/bert-tiny-ner/ python/shodh_memory/lib/
+          du -sh python/shodh_memory/
 
       - name: Install maturin
         run: pip install maturin
@@ -135,7 +148,14 @@ jobs:
       - name: Build ABI3 wheels (Python 3.8+)
         env:
           MACOSX_DEPLOYMENT_TARGET: "10.13"
-        run: maturin build --release --target x86_64-apple-darwin --out dist --features python
+        run: maturin build --release --target x86_64-apple-darwin --out dist --features python -v
+
+      - name: Inspect wheel
+        run: |
+          echo "=== Wheel file size ==="
+          ls -lh dist/*.whl
+          echo "=== Wheel contents ==="
+          unzip -l dist/*.whl
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -160,23 +180,35 @@ jobs:
       - name: Download models and ONNX Runtime
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path shodh_memory/models/minilm-l6
-          New-Item -ItemType Directory -Force -Path shodh_memory/models/bert-tiny-ner
-          New-Item -ItemType Directory -Force -Path shodh_memory/lib
-          Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx" -OutFile "shodh_memory/models/minilm-l6/model_quantized.onnx"
-          Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json" -OutFile "shodh_memory/models/minilm-l6/tokenizer.json"
-          Invoke-WebRequest -Uri "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx" -OutFile "shodh_memory/models/bert-tiny-ner/model.onnx"
-          Invoke-WebRequest -Uri "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json" -OutFile "shodh_memory/models/bert-tiny-ner/tokenizer.json"
+          New-Item -ItemType Directory -Force -Path python/shodh_memory/models/minilm-l6
+          New-Item -ItemType Directory -Force -Path python/shodh_memory/models/bert-tiny-ner
+          New-Item -ItemType Directory -Force -Path python/shodh_memory/lib
+          Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx" -OutFile "python/shodh_memory/models/minilm-l6/model_quantized.onnx"
+          Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json" -OutFile "python/shodh_memory/models/minilm-l6/tokenizer.json"
+          Invoke-WebRequest -Uri "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx" -OutFile "python/shodh_memory/models/bert-tiny-ner/model.onnx"
+          Invoke-WebRequest -Uri "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json" -OutFile "python/shodh_memory/models/bert-tiny-ner/tokenizer.json"
           Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip" -OutFile "onnxruntime.zip"
           Expand-Archive -Path "onnxruntime.zip" -DestinationPath "."
-          Copy-Item "onnxruntime-win-x64-1.22.0/lib/onnxruntime.dll" -Destination "shodh_memory/lib/onnxruntime.dll"
-          Copy-Item "onnxruntime-win-x64-1.22.0/lib/onnxruntime_providers_shared.dll" -Destination "shodh_memory/lib/onnxruntime_providers_shared.dll"
+          Copy-Item "onnxruntime-win-x64-1.22.0/lib/onnxruntime.dll" -Destination "python/shodh_memory/lib/onnxruntime.dll"
+          Copy-Item "onnxruntime-win-x64-1.22.0/lib/onnxruntime_providers_shared.dll" -Destination "python/shodh_memory/lib/onnxruntime_providers_shared.dll"
+          Write-Host "=== Downloaded files ==="
+          Get-ChildItem -Path python/shodh_memory -Recurse | Measure-Object -Property Length -Sum
 
       - name: Install maturin
         run: pip install maturin
 
       - name: Build ABI3 wheels (Python 3.8+)
-        run: maturin build --release --target x86_64-pc-windows-msvc --out dist --features python
+        run: maturin build --release --target x86_64-pc-windows-msvc --out dist --features python -v
+
+      - name: Inspect wheel
+        shell: pwsh
+        run: |
+          Write-Host "=== Wheel file size ==="
+          Get-ChildItem dist/*.whl | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
+          Write-Host "=== Wheel contents ==="
+          $wheel = Get-ChildItem dist/*.whl | Select-Object -First 1
+          Expand-Archive -Path $wheel.FullName -DestinationPath wheel_contents -Force
+          Get-ChildItem wheel_contents -Recurse | Select-Object FullName
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
