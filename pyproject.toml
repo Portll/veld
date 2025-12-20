@@ -43,3 +43,9 @@ features = ["python"]
 python-source = "python"
 module-name = "shodh_memory.shodh_memory"
 strip = true
+include = [
+    # ONNX Runtime - platform-specific (only one will exist per build)
+    { path = "python/shodh_memory/lib/*", format = "wheel" },
+    # Models
+    { path = "python/shodh_memory/models/**/*", format = "wheel" },
+]
