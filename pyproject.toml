@@ -44,8 +44,15 @@ python-source = "python"
 module-name = "shodh_memory.shodh_memory"
 strip = true
 include = [
-    # ONNX Runtime - platform-specific (only one will exist per build)
-    { path = "python/shodh_memory/lib/*", format = "wheel" },
-    # Models
-    { path = "python/shodh_memory/models/**/*", format = "wheel" },
+    # ONNX Runtime - platform-specific
+    { path = "shodh_memory/lib/onnxruntime.dll", format = "wheel" },
+    { path = "shodh_memory/lib/onnxruntime_providers_shared.dll", format = "wheel" },
+    { path = "shodh_memory/lib/libonnxruntime.so", format = "wheel" },
+    { path = "shodh_memory/lib/libonnxruntime.dylib", format = "wheel" },
+    # MiniLM model
+    { path = "shodh_memory/models/minilm-l6/model_quantized.onnx", format = "wheel" },
+    { path = "shodh_memory/models/minilm-l6/tokenizer.json", format = "wheel" },
+    # TinyBERT NER model
+    { path = "shodh_memory/models/bert-tiny-ner/model.onnx", format = "wheel" },
+    { path = "shodh_memory/models/bert-tiny-ner/tokenizer.json", format = "wheel" },
 ]
