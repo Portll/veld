@@ -46,6 +46,10 @@ pub enum ExperienceType {
     Search,
     Command,
     Observation,
+    /// Prospective memory - future intention/reminder (SHO-116)
+    /// Filtered from normal recall, surfaces via dedicated reminder queries
+    /// or when context triggers via spreading activation
+    Intention,
 }
 
 /// Default experience type for minimal API calls
@@ -1720,11 +1724,19 @@ impl Query {
         }
 
         // Experience type filter
+        // By default, exclude Intention type from normal queries (prospective memory)
+        // This makes reminders invisible to regular recall, surfacing only via dedicated APIs
         if let Some(types) = &self.experience_types {
+            // Explicit filter: only include specified types
             if !types.iter().any(|t| {
                 std::mem::discriminant(&memory.experience.experience_type)
                     == std::mem::discriminant(t)
             }) {
+                return false;
+            }
+        } else {
+            // Default filter: exclude Intention (prospective memory)
+            if matches!(memory.experience.experience_type, ExperienceType::Intention) {
                 return false;
             }
         }
@@ -2428,6 +2440,208 @@ pub struct RetrievalStats {
 
     /// Time spent on graph traversal (microseconds)
     pub graph_time_us: u64,
+}
+
+// =============================================================================
+// PROSPECTIVE MEMORY - Future intentions and reminders (SHO-116)
+// =============================================================================
+
+/// Unique identifier for prospective tasks (reminders)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProspectiveTaskId(pub Uuid);
+
+impl ProspectiveTaskId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ProspectiveTaskId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for ProspectiveTaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Trigger condition for prospective tasks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProspectiveTrigger {
+    /// Trigger at a specific time
+    AtTime {
+        at: DateTime<Utc>,
+    },
+    /// Trigger after a duration from creation
+    AfterDuration {
+        seconds: u64,
+        #[serde(default = "Utc::now")]
+        from: DateTime<Utc>,
+    },
+    /// Trigger when context matches keywords or semantic similarity
+    OnContext {
+        keywords: Vec<String>,
+        #[serde(default = "default_context_threshold")]
+        threshold: f32,
+    },
+}
+
+fn default_context_threshold() -> f32 {
+    0.7
+}
+
+impl ProspectiveTrigger {
+    /// Check if a time-based trigger is due
+    pub fn is_due(&self) -> bool {
+        let now = Utc::now();
+        match self {
+            ProspectiveTrigger::AtTime { at } => now >= *at,
+            ProspectiveTrigger::AfterDuration { seconds, from } => {
+                let due_at = *from + chrono::Duration::seconds(*seconds as i64);
+                now >= due_at
+            }
+            ProspectiveTrigger::OnContext { .. } => false, // Context triggers are checked separately
+        }
+    }
+
+    /// Get the due time for time-based triggers
+    pub fn due_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            ProspectiveTrigger::AtTime { at } => Some(*at),
+            ProspectiveTrigger::AfterDuration { seconds, from } => {
+                Some(*from + chrono::Duration::seconds(*seconds as i64))
+            }
+            ProspectiveTrigger::OnContext { .. } => None,
+        }
+    }
+
+    /// Check if this is a context-based trigger
+    pub fn is_context_trigger(&self) -> bool {
+        matches!(self, ProspectiveTrigger::OnContext { .. })
+    }
+
+    /// Check if context matches this trigger's keywords
+    pub fn matches_context(&self, context: &str) -> bool {
+        match self {
+            ProspectiveTrigger::OnContext { keywords, .. } => {
+                let context_lower = context.to_lowercase();
+                keywords.iter().any(|kw| context_lower.contains(&kw.to_lowercase()))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Status of a prospective task
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProspectiveTaskStatus {
+    /// Waiting for trigger condition
+    Pending,
+    /// Trigger condition met, shown to user
+    Triggered,
+    /// User acknowledged/dismissed
+    Dismissed,
+    /// Task expired without being triggered (optional cleanup)
+    Expired,
+}
+
+impl Default for ProspectiveTaskStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// A prospective memory task (reminder/intention)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProspectiveTask {
+    /// Unique identifier
+    pub id: ProspectiveTaskId,
+
+    /// User who created this task
+    pub user_id: String,
+
+    /// What to remember/remind about
+    pub content: String,
+
+    /// When/how to trigger this reminder
+    pub trigger: ProspectiveTrigger,
+
+    /// Current status
+    #[serde(default)]
+    pub status: ProspectiveTaskStatus,
+
+    /// When the task was created
+    pub created_at: DateTime<Utc>,
+
+    /// When the trigger condition was met (if triggered)
+    pub triggered_at: Option<DateTime<Utc>>,
+
+    /// When the user dismissed the reminder
+    pub dismissed_at: Option<DateTime<Utc>>,
+
+    /// Optional tags for categorization
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Optional priority (1-5, higher = more important)
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+}
+
+fn default_priority() -> u8 {
+    3
+}
+
+impl ProspectiveTask {
+    /// Create a new prospective task
+    pub fn new(user_id: String, content: String, trigger: ProspectiveTrigger) -> Self {
+        Self {
+            id: ProspectiveTaskId::new(),
+            user_id,
+            content,
+            trigger,
+            status: ProspectiveTaskStatus::Pending,
+            created_at: Utc::now(),
+            triggered_at: None,
+            dismissed_at: None,
+            tags: Vec::new(),
+            priority: default_priority(),
+        }
+    }
+
+    /// Check if this task is due (for time-based triggers)
+    pub fn is_due(&self) -> bool {
+        self.status == ProspectiveTaskStatus::Pending && self.trigger.is_due()
+    }
+
+    /// Mark as triggered
+    pub fn mark_triggered(&mut self) {
+        self.status = ProspectiveTaskStatus::Triggered;
+        self.triggered_at = Some(Utc::now());
+    }
+
+    /// Mark as dismissed
+    pub fn mark_dismissed(&mut self) {
+        self.status = ProspectiveTaskStatus::Dismissed;
+        self.dismissed_at = Some(Utc::now());
+    }
+
+    /// Get overdue duration in seconds (if time-based and overdue)
+    pub fn overdue_seconds(&self) -> Option<i64> {
+        if let Some(due_at) = self.trigger.due_at() {
+            let now = Utc::now();
+            if now > due_at {
+                return Some((now - due_at).num_seconds());
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

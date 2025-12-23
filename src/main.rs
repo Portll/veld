@@ -55,8 +55,10 @@ use graph_memory::{
     RelationType, RelationshipEdge,
 };
 use memory::{
-    ActivatedMemory, Experience, ExperienceType, GraphStats as VisualizationStats, Memory,
-    MemoryConfig, MemoryId, MemoryStats, MemorySystem, Query as MemoryQuery, SharedMemory,
+    prospective::ProspectiveStore, ActivatedMemory, Experience, ExperienceType,
+    GraphStats as VisualizationStats, Memory, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
+    ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger,
+    Query as MemoryQuery, SharedMemory,
 };
 
 /// Audit event for history tracking
@@ -216,6 +218,10 @@ pub struct MultiUserMemoryManager {
     /// Streaming memory extractor for implicit learning
     /// Handles WebSocket connections for continuous memory formation
     streaming_extractor: Arc<streaming::StreamingMemoryExtractor>,
+
+    /// Prospective memory store for reminders/intentions (SHO-116)
+    /// Handles time-based and context-based triggers
+    prospective_store: Arc<ProspectiveStore>,
 }
 
 impl MultiUserMemoryManager {
@@ -335,6 +341,10 @@ impl MultiUserMemoryManager {
             })
             .build();
 
+        // Initialize prospective memory store (SHO-116)
+        let prospective_store = Arc::new(ProspectiveStore::new(&base_path)?);
+        info!("📅 Prospective memory store initialized");
+
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -348,6 +358,7 @@ impl MultiUserMemoryManager {
             server_config,
             event_broadcaster,
             streaming_extractor,
+            prospective_store,
         };
 
         // Perform initial audit log rotation on startup
@@ -6791,6 +6802,461 @@ async fn build_visualization(
     Ok(Json(stats))
 }
 
+// =============================================================================
+// Prospective Memory / Reminders (SHO-116)
+// =============================================================================
+
+/// Request to create a new reminder
+#[derive(Debug, Deserialize)]
+struct CreateReminderRequest {
+    user_id: String,
+    content: String,
+    /// Trigger configuration
+    trigger: ReminderTriggerRequest,
+    /// Optional tags for categorization
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Priority 1-5 (higher = more important)
+    #[serde(default = "default_reminder_priority")]
+    priority: u8,
+}
+
+fn default_reminder_priority() -> u8 {
+    3
+}
+
+/// Trigger configuration for reminder creation
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ReminderTriggerRequest {
+    /// Trigger at a specific time
+    Time { at: chrono::DateTime<chrono::Utc> },
+    /// Trigger after a duration (seconds from now)
+    Duration { after_seconds: u64 },
+    /// Trigger when context matches keywords
+    Context {
+        keywords: Vec<String>,
+        #[serde(default = "default_context_threshold")]
+        threshold: f32,
+    },
+}
+
+fn default_context_threshold() -> f32 {
+    0.7
+}
+
+/// Response for reminder creation
+#[derive(Debug, Serialize)]
+struct CreateReminderResponse {
+    id: String,
+    content: String,
+    trigger_type: String,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Create a new reminder (prospective memory)
+async fn create_reminder(
+    State(state): State<AppState>,
+    Json(req): Json<CreateReminderRequest>,
+) -> Result<Json<CreateReminderResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.content.trim().is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "content".to_string(),
+            reason: "Reminder content cannot be empty".to_string(),
+        });
+    }
+
+    // Convert request trigger to ProspectiveTrigger
+    let trigger = match req.trigger {
+        ReminderTriggerRequest::Time { at } => ProspectiveTrigger::AtTime { at },
+        ReminderTriggerRequest::Duration { after_seconds } => ProspectiveTrigger::AfterDuration {
+            seconds: after_seconds,
+            from: chrono::Utc::now(),
+        },
+        ReminderTriggerRequest::Context { keywords, threshold } => {
+            if keywords.is_empty() {
+                return Err(AppError::InvalidInput {
+                    field: "keywords".to_string(),
+                    reason: "Context trigger requires at least one keyword".to_string(),
+                });
+            }
+            ProspectiveTrigger::OnContext { keywords, threshold }
+        }
+    };
+
+    let mut task = ProspectiveTask::new(req.user_id.clone(), req.content.clone(), trigger);
+    task.tags = req.tags;
+    task.priority = req.priority.clamp(1, 5);
+
+    let trigger_type = match &task.trigger {
+        ProspectiveTrigger::AtTime { .. } => "time",
+        ProspectiveTrigger::AfterDuration { .. } => "duration",
+        ProspectiveTrigger::OnContext { .. } => "context",
+    };
+
+    let due_at = task.trigger.due_at();
+
+    state
+        .prospective_store
+        .store(&task)
+        .map_err(AppError::Internal)?;
+
+    tracing::info!(
+        user_id = %req.user_id,
+        reminder_id = %task.id,
+        trigger_type = trigger_type,
+        "Created prospective memory (reminder)"
+    );
+
+    Ok(Json(CreateReminderResponse {
+        id: task.id.to_string(),
+        content: task.content,
+        trigger_type: trigger_type.to_string(),
+        due_at,
+        created_at: task.created_at,
+    }))
+}
+
+/// Request to list reminders
+#[derive(Debug, Deserialize)]
+struct ListRemindersRequest {
+    user_id: String,
+    /// Filter by status (pending, triggered, dismissed, expired)
+    status: Option<String>,
+}
+
+/// Individual reminder in list response
+#[derive(Debug, Serialize)]
+struct ReminderItem {
+    id: String,
+    content: String,
+    trigger_type: String,
+    status: String,
+    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+    dismissed_at: Option<chrono::DateTime<chrono::Utc>>,
+    priority: u8,
+    tags: Vec<String>,
+    overdue_seconds: Option<i64>,
+}
+
+/// Response for listing reminders
+#[derive(Debug, Serialize)]
+struct ListRemindersResponse {
+    reminders: Vec<ReminderItem>,
+    count: usize,
+}
+
+/// List reminders for a user
+async fn list_reminders(
+    State(state): State<AppState>,
+    Json(req): Json<ListRemindersRequest>,
+) -> Result<Json<ListRemindersResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let status_filter = req.status.as_ref().and_then(|s| match s.as_str() {
+        "pending" => Some(ProspectiveTaskStatus::Pending),
+        "triggered" => Some(ProspectiveTaskStatus::Triggered),
+        "dismissed" => Some(ProspectiveTaskStatus::Dismissed),
+        "expired" => Some(ProspectiveTaskStatus::Expired),
+        _ => None,
+    });
+
+    let tasks = state
+        .prospective_store
+        .list_for_user(&req.user_id, status_filter)
+        .map_err(AppError::Internal)?;
+
+    let reminders: Vec<ReminderItem> = tasks
+        .into_iter()
+        .map(|t| {
+            let overdue_seconds = t.overdue_seconds();
+            ReminderItem {
+                id: t.id.to_string(),
+                content: t.content,
+                trigger_type: match &t.trigger {
+                    ProspectiveTrigger::AtTime { .. } => "time".to_string(),
+                    ProspectiveTrigger::AfterDuration { .. } => "duration".to_string(),
+                    ProspectiveTrigger::OnContext { .. } => "context".to_string(),
+                },
+                status: format!("{:?}", t.status).to_lowercase(),
+                due_at: t.trigger.due_at(),
+                created_at: t.created_at,
+                triggered_at: t.triggered_at,
+                dismissed_at: t.dismissed_at,
+                priority: t.priority,
+                tags: t.tags,
+                overdue_seconds,
+            }
+        })
+        .collect();
+
+    let count = reminders.len();
+
+    Ok(Json(ListRemindersResponse { reminders, count }))
+}
+
+/// Request to get due reminders
+#[derive(Debug, Deserialize)]
+struct GetDueRemindersRequest {
+    user_id: String,
+    /// Whether to mark reminders as triggered when returned
+    #[serde(default = "default_true")]
+    mark_triggered: bool,
+}
+
+// Note: default_true() is already defined elsewhere in this file
+
+/// Response for due reminders
+#[derive(Debug, Serialize)]
+struct DueRemindersResponse {
+    reminders: Vec<ReminderItem>,
+    count: usize,
+}
+
+/// Get due time-based reminders (for polling/hooks)
+async fn get_due_reminders(
+    State(state): State<AppState>,
+    Json(req): Json<GetDueRemindersRequest>,
+) -> Result<Json<DueRemindersResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let mut due_tasks = state
+        .prospective_store
+        .get_due_tasks(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    // Mark as triggered if requested
+    if req.mark_triggered {
+        for task in &mut due_tasks {
+            let _ = state
+                .prospective_store
+                .mark_triggered(&req.user_id, &task.id);
+        }
+    }
+
+    let reminders: Vec<ReminderItem> = due_tasks
+        .into_iter()
+        .map(|t| {
+            let overdue_seconds = t.overdue_seconds();
+            ReminderItem {
+                id: t.id.to_string(),
+                content: t.content,
+                trigger_type: match &t.trigger {
+                    ProspectiveTrigger::AtTime { .. } => "time".to_string(),
+                    ProspectiveTrigger::AfterDuration { .. } => "duration".to_string(),
+                    ProspectiveTrigger::OnContext { .. } => "context".to_string(),
+                },
+                status: if req.mark_triggered {
+                    "triggered".to_string()
+                } else {
+                    format!("{:?}", t.status).to_lowercase()
+                },
+                due_at: t.trigger.due_at(),
+                created_at: t.created_at,
+                triggered_at: if req.mark_triggered {
+                    Some(chrono::Utc::now())
+                } else {
+                    t.triggered_at
+                },
+                dismissed_at: t.dismissed_at,
+                priority: t.priority,
+                tags: t.tags,
+                overdue_seconds,
+            }
+        })
+        .collect();
+
+    let count = reminders.len();
+
+    if count > 0 {
+        tracing::debug!(
+            user_id = %req.user_id,
+            count = count,
+            "Returning due reminders"
+        );
+    }
+
+    Ok(Json(DueRemindersResponse { reminders, count }))
+}
+
+/// Request to check context-triggered reminders
+#[derive(Debug, Deserialize)]
+struct CheckContextRemindersRequest {
+    user_id: String,
+    /// Current context text to match against
+    context: String,
+    /// Whether to mark matched reminders as triggered
+    #[serde(default = "default_true")]
+    mark_triggered: bool,
+}
+
+/// Check for context-triggered reminders
+async fn check_context_reminders(
+    State(state): State<AppState>,
+    Json(req): Json<CheckContextRemindersRequest>,
+) -> Result<Json<DueRemindersResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.context.trim().is_empty() {
+        return Ok(Json(DueRemindersResponse {
+            reminders: vec![],
+            count: 0,
+        }));
+    }
+
+    let mut matched_tasks = state
+        .prospective_store
+        .check_context_triggers(&req.user_id, &req.context)
+        .map_err(AppError::Internal)?;
+
+    // Mark as triggered if requested
+    if req.mark_triggered {
+        for task in &mut matched_tasks {
+            let _ = state
+                .prospective_store
+                .mark_triggered(&req.user_id, &task.id);
+        }
+    }
+
+    let reminders: Vec<ReminderItem> = matched_tasks
+        .into_iter()
+        .map(|t| ReminderItem {
+            id: t.id.to_string(),
+            content: t.content,
+            trigger_type: "context".to_string(),
+            status: if req.mark_triggered {
+                "triggered".to_string()
+            } else {
+                format!("{:?}", t.status).to_lowercase()
+            },
+            due_at: None,
+            created_at: t.created_at,
+            triggered_at: if req.mark_triggered {
+                Some(chrono::Utc::now())
+            } else {
+                t.triggered_at
+            },
+            dismissed_at: t.dismissed_at,
+            priority: t.priority,
+            tags: t.tags,
+            overdue_seconds: None,
+        })
+        .collect();
+
+    let count = reminders.len();
+
+    if count > 0 {
+        tracing::debug!(
+            user_id = %req.user_id,
+            count = count,
+            context_preview = %req.context.chars().take(50).collect::<String>(),
+            "Context-triggered reminders matched"
+        );
+    }
+
+    Ok(Json(DueRemindersResponse { reminders, count }))
+}
+
+/// Request to dismiss a reminder
+#[derive(Debug, Deserialize)]
+struct DismissReminderRequest {
+    user_id: String,
+}
+
+/// Response for dismiss/delete operations
+#[derive(Debug, Serialize)]
+struct ReminderActionResponse {
+    success: bool,
+    message: String,
+}
+
+/// Dismiss (acknowledge) a triggered reminder
+async fn dismiss_reminder(
+    State(state): State<AppState>,
+    Path(reminder_id): Path<String>,
+    Json(req): Json<DismissReminderRequest>,
+) -> Result<Json<ReminderActionResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let task_id = uuid::Uuid::parse_str(&reminder_id).map_err(|_| AppError::InvalidInput {
+        field: "reminder_id".to_string(),
+        reason: "Invalid reminder ID format".to_string(),
+    })?;
+
+    let task_id = ProspectiveTaskId(task_id);
+
+    let success = state
+        .prospective_store
+        .mark_dismissed(&req.user_id, &task_id)
+        .map_err(AppError::Internal)?;
+
+    if success {
+        tracing::info!(
+            user_id = %req.user_id,
+            reminder_id = %reminder_id,
+            "Dismissed reminder"
+        );
+    }
+
+    Ok(Json(ReminderActionResponse {
+        success,
+        message: if success {
+            "Reminder dismissed".to_string()
+        } else {
+            "Reminder not found".to_string()
+        },
+    }))
+}
+
+/// Request to delete a reminder
+#[derive(Debug, Deserialize)]
+struct DeleteReminderQuery {
+    user_id: String,
+}
+
+/// Delete (cancel) a reminder
+async fn delete_reminder(
+    State(state): State<AppState>,
+    Path(reminder_id): Path<String>,
+    Query(query): Query<DeleteReminderQuery>,
+) -> Result<Json<ReminderActionResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    let task_id = uuid::Uuid::parse_str(&reminder_id).map_err(|_| AppError::InvalidInput {
+        field: "reminder_id".to_string(),
+        reason: "Invalid reminder ID format".to_string(),
+    })?;
+
+    let task_id = ProspectiveTaskId(task_id);
+
+    let success = state
+        .prospective_store
+        .delete(&query.user_id, &task_id)
+        .map_err(AppError::Internal)?;
+
+    if success {
+        tracing::info!(
+            user_id = %query.user_id,
+            reminder_id = %reminder_id,
+            "Deleted reminder"
+        );
+    }
+
+    Ok(Json(ReminderActionResponse {
+        success,
+        message: if success {
+            "Reminder deleted".to_string()
+        } else {
+            "Reminder not found".to_string()
+        },
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file if present (silently ignore if not found)
@@ -7036,6 +7502,13 @@ async fn main() -> Result<()> {
         // Streaming endpoints (moved from public to require auth - SHO-56)
         .route("/api/events", get(memory_events_sse)) // SSE: Real-time memory events for dashboard
         .route("/api/stream", get(streaming_memory_ws)) // WS: Streaming memory ingestion (SHO-25)
+        // Prospective Memory / Reminders (SHO-116)
+        .route("/api/remind", post(create_reminder))
+        .route("/api/reminders", post(list_reminders))
+        .route("/api/reminders/due", post(get_due_reminders))
+        .route("/api/reminders/context", post(check_context_reminders))
+        .route("/api/reminders/{reminder_id}/dismiss", post(dismiss_reminder))
+        .route("/api/reminders/{reminder_id}", delete(delete_reminder))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         // Apply rate limiting to API routes only (not health/metrics/static)

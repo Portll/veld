@@ -760,6 +760,78 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
+      // Prospective Memory / Reminders (SHO-116)
+      {
+        name: "set_reminder",
+        description: "Set a reminder for the future. Triggers on time (at specific time or after duration) or context match (when keywords appear in conversation). Reminders will surface automatically when conditions are met.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description: "What to remember/remind about",
+            },
+            trigger_type: {
+              type: "string",
+              enum: ["time", "duration", "context"],
+              description: "When to trigger: 'time' (at specific ISO timestamp), 'duration' (after N seconds), 'context' (when keywords match)",
+            },
+            trigger_at: {
+              type: "string",
+              description: "ISO 8601 timestamp for 'time' trigger (e.g., '2025-12-23T18:00:00Z')",
+            },
+            after_seconds: {
+              type: "number",
+              description: "Seconds from now for 'duration' trigger",
+            },
+            keywords: {
+              type: "array",
+              items: { type: "string" },
+              description: "Keywords for 'context' trigger - reminder surfaces when any keyword appears",
+            },
+            priority: {
+              type: "number",
+              description: "Priority 1-5 (5 = highest, default: 3)",
+              default: 3,
+            },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional tags for categorization",
+            },
+          },
+          required: ["content", "trigger_type"],
+        },
+      },
+      {
+        name: "list_reminders",
+        description: "List all pending reminders. Use to check what reminders are scheduled.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: {
+              type: "string",
+              enum: ["pending", "triggered", "dismissed", "all"],
+              description: "Filter by status (default: pending)",
+              default: "pending",
+            },
+          },
+        },
+      },
+      {
+        name: "dismiss_reminder",
+        description: "Dismiss/acknowledge a triggered reminder. Call this after you've handled a reminder.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            reminder_id: {
+              type: "string",
+              description: "ID of the reminder to dismiss",
+            },
+          },
+          required: ["reminder_id"],
+        },
+      },
     ],
   };
 });
@@ -864,13 +936,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ...(preceding_memory_id && { preceding_memory_id }),
         });
 
+        // Format response with branded display
+        let response = `🐘 Memory Stored\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `📝 ${content.slice(0, 60)}${content.length > 60 ? '...' : ''}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Type: ${type}`;
+        if (tags.length > 0) {
+          response += ` │ Tags: ${tags.join(', ')}`;
+        }
+        response += `\nID: ${result.id.slice(0, 8)}...`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Remembered: "${content.slice(0, 50)}${content.length > 50 ? '...' : ''}"\nMemory ID: ${result.id}`,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -910,35 +988,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
               {
                 type: "text",
-                text: `No memories found for: "${query}" (mode: ${mode})`,
+                text: `🐘 No memories found for: "${query}"\n   Mode: ${mode}`,
               },
             ],
           };
         }
 
-        const formatted = memories
-          .map((m, i) => {
-            const content = getContent(m);
-            const score = ((m.score || 0) * 100).toFixed(0);
-            return `${i + 1}. [${score}% match] ${content}\n   Type: ${getType(m)} | ID: ${m.id.slice(0, 8)}...`;
-          })
-          .join("\n\n");
+        // Build formatted response
+        let response = `🐘 Recalled ${memories.length} Memories\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Query: "${query.slice(0, 40)}${query.length > 40 ? '...' : ''}" │ Mode: ${mode}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        for (let i = 0; i < memories.length; i++) {
+          const m = memories[i];
+          const content = getContent(m);
+          const score = ((m.score || 0) * 100).toFixed(0);
+          const matchBar = '█'.repeat(Math.round((m.score || 0) * 10)) + '░'.repeat(10 - Math.round((m.score || 0) * 10));
+
+          response += `${i + 1}. ${matchBar} ${score}%\n`;
+          response += `   ${content.slice(0, 70)}${content.length > 70 ? '...' : ''}\n`;
+          response += `   ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
+          if (i < memories.length - 1) response += `\n`;
+        }
 
         // Build stats summary for associative/hybrid modes
-        let statsText = "";
         if (stats && (mode === "associative" || mode === "hybrid")) {
+          response += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `📊 Retrieval Stats\n`;
           const graphPct = (stats.graph_weight * 100).toFixed(0);
           const semPct = (stats.semantic_weight * 100).toFixed(0);
-          statsText = `\n\n[Stats: ${stats.mode} mode | graph=${graphPct}% semantic=${semPct}% | density=${stats.graph_density.toFixed(2)} | ${stats.graph_candidates} graph + ${stats.semantic_candidates} semantic candidates | ${stats.entities_activated} entities | ${(stats.retrieval_time_us / 1000).toFixed(1)}ms]`;
+          response += `   Graph: ${graphPct}% │ Semantic: ${semPct}% │ Density: ${stats.graph_density.toFixed(2)}\n`;
+          response += `   Candidates: ${stats.graph_candidates} graph + ${stats.semantic_candidates} semantic\n`;
+          response += `   Entities: ${stats.entities_activated} │ Time: ${(stats.retrieval_time_us / 1000).toFixed(1)}ms`;
         }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Found ${memories.length} relevant memories (${mode} mode):\n\n${formatted}${statsText}`,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -963,13 +1049,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const memories = result.memories || [];
 
         if (memories.length === 0) {
+          let response = `🐘 Context Summary\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `No memories stored yet.\n`;
+          response += `Start remembering to build context!`;
           return {
-            content: [
-              {
-                type: "text",
-                text: "No memories stored yet. Start remembering things to build context!",
-              },
-            ],
+            content: [{ type: "text", text: response }],
           };
         }
 
@@ -1001,45 +1086,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Build summary
-        const sections: string[] = [];
+        // Build branded response
+        let response = `🐘 Context Summary\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Total: ${memories.length} memories │ `;
+        response += `📋 ${decisions.length} │ 💡 ${learnings.length} │ 📁 ${context.length} │ 🔄 ${patterns.length} │ ⚠️ ${errors.length}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
         if (include_context && context.length > 0) {
-          const items = context.slice(0, max_items).map(m => `  - ${getContent(m).slice(0, 100)}`);
-          sections.push(`PROJECT CONTEXT:\n${items.join('\n')}`);
+          response += `📁 PROJECT CONTEXT\n`;
+          for (const m of context.slice(0, max_items)) {
+            response += `   • ${getContent(m).slice(0, 70)}${getContent(m).length > 70 ? '...' : ''}\n`;
+          }
+          response += `\n`;
         }
 
         if (include_decisions && decisions.length > 0) {
-          const items = decisions.slice(0, max_items).map(m => `  - ${getContent(m).slice(0, 100)}`);
-          sections.push(`DECISIONS MADE:\n${items.join('\n')}`);
+          response += `📋 DECISIONS\n`;
+          for (const m of decisions.slice(0, max_items)) {
+            response += `   • ${getContent(m).slice(0, 70)}${getContent(m).length > 70 ? '...' : ''}\n`;
+          }
+          response += `\n`;
         }
 
         if (include_learnings && learnings.length > 0) {
-          const items = learnings.slice(0, max_items).map(m => `  - ${getContent(m).slice(0, 100)}`);
-          sections.push(`LEARNINGS:\n${items.join('\n')}`);
+          response += `💡 LEARNINGS\n`;
+          for (const m of learnings.slice(0, max_items)) {
+            response += `   • ${getContent(m).slice(0, 70)}${getContent(m).length > 70 ? '...' : ''}\n`;
+          }
+          response += `\n`;
         }
 
         if (patterns.length > 0) {
-          const items = patterns.slice(0, max_items).map(m => `  - ${getContent(m).slice(0, 100)}`);
-          sections.push(`PATTERNS NOTICED:\n${items.join('\n')}`);
+          response += `🔄 PATTERNS\n`;
+          for (const m of patterns.slice(0, max_items)) {
+            response += `   • ${getContent(m).slice(0, 70)}${getContent(m).length > 70 ? '...' : ''}\n`;
+          }
+          response += `\n`;
         }
 
         if (errors.length > 0) {
-          const items = errors.slice(0, Math.min(3, max_items)).map(m => `  - ${getContent(m).slice(0, 100)}`);
-          sections.push(`ERRORS TO AVOID:\n${items.join('\n')}`);
+          response += `⚠️ ERRORS TO AVOID\n`;
+          for (const m of errors.slice(0, Math.min(3, max_items))) {
+            response += `   • ${getContent(m).slice(0, 70)}${getContent(m).length > 70 ? '...' : ''}\n`;
+          }
         }
 
-        const summary = sections.length > 0
-          ? sections.join('\n\n')
-          : `${memories.length} memories stored, but none categorized as decisions, learnings, or context. Consider using those types when remembering.`;
+        if (decisions.length === 0 && learnings.length === 0 && context.length === 0) {
+          response += `ℹ️  Tip: Use types like Decision, Learning, Context when remembering\n`;
+          response += `   to build richer context summaries.`;
+        }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `CONTEXT SUMMARY (${memories.length} total memories)\n${'='.repeat(40)}\n\n${summary}`,
-            },
-          ],
+          content: [{ type: "text", text: response.trimEnd() }],
         };
       }
 
@@ -1053,30 +1152,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const memories = (result.memories || []).slice(0, limit);
 
         if (memories.length === 0) {
+          let response = `🐘 Memory List\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `No memories stored yet.`;
           return {
-            content: [
-              {
-                type: "text",
-                text: "No memories stored yet.",
-              },
-            ],
+            content: [{ type: "text", text: response }],
           };
         }
 
-        const formatted = memories
-          .map((m, i) => {
-            const content = getContent(m);
-            return `${i + 1}. ${content.slice(0, 80)}${content.length > 80 ? '...' : ''}\n   Type: ${getType(m)} | ID: ${m.id.slice(0, 8)}...`;
-          })
-          .join("\n\n");
+        // Group by type for summary
+        const typeCounts: Record<string, number> = {};
+        for (const m of memories) {
+          const type = getType(m);
+          typeCounts[type] = (typeCounts[type] || 0) + 1;
+        }
+
+        let response = `🐘 Memory List\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Showing ${memories.length} memories\n`;
+        response += `Types: ${Object.entries(typeCounts).map(([t, c]) => `${t}(${c})`).join(' │ ')}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        for (let i = 0; i < memories.length; i++) {
+          const m = memories[i];
+          const content = getContent(m);
+          const typeIcon = {
+            'Decision': '📋',
+            'Learning': '💡',
+            'Context': '📁',
+            'Pattern': '🔄',
+            'Error': '⚠️',
+            'Observation': '👁️',
+            'Discovery': '🔍',
+            'Task': '✅',
+            'CodeEdit': '📝',
+            'FileAccess': '📄',
+            'Search': '🔎',
+            'Command': '⚡',
+            'Conversation': '💬',
+          }[getType(m)] || '📦';
+
+          response += `${String(i + 1).padStart(2)}. ${typeIcon} ${content.slice(0, 60)}${content.length > 60 ? '...' : ''}\n`;
+          response += `    ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
+        }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `${memories.length} memories:\n\n${formatted}`,
-            },
-          ],
+          content: [{ type: "text", text: response.trimEnd() }],
         };
       }
 
@@ -1085,26 +1206,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         await apiCall(`/api/memory/${id}?user_id=${USER_ID}`, "DELETE");
 
+        let response = `🐘 Memory Deleted\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `✓ Removed: ${id.slice(0, 8)}...`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Deleted memory: ${id}`,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
       case "memory_stats": {
-        const result = await apiCall<Record<string, unknown>>(`/api/users/${USER_ID}/stats`, "GET");
+        interface MemoryStats {
+          total_memories: number;
+          memory_types: Record<string, number>;
+          total_importance: number;
+          avg_importance: number;
+          graph_nodes: number;
+          graph_edges: number;
+          indexed_vectors: number;
+        }
+
+        const result = await apiCall<MemoryStats>(`/api/users/${USER_ID}/stats`, "GET");
+
+        let response = `🐘 Memory Statistics\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Total Memories: ${result.total_memories || 0}\n`;
+        response += `Graph: ${result.graph_nodes || 0} nodes │ ${result.graph_edges || 0} edges\n`;
+        response += `Indexed Vectors: ${result.indexed_vectors || 0}\n`;
+        response += `Avg Importance: ${(result.avg_importance || 0).toFixed(2)}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        if (result.memory_types && Object.keys(result.memory_types).length > 0) {
+          response += `\nBy Type:\n`;
+          const typeIcons: Record<string, string> = {
+            'Decision': '📋',
+            'Learning': '💡',
+            'Context': '📁',
+            'Pattern': '🔄',
+            'Error': '⚠️',
+            'Observation': '👁️',
+            'Discovery': '🔍',
+            'Task': '✅',
+            'CodeEdit': '📝',
+            'FileAccess': '📄',
+            'Search': '🔎',
+            'Command': '⚡',
+            'Conversation': '💬',
+          };
+          for (const [type, count] of Object.entries(result.memory_types)) {
+            const icon = typeIcons[type] || '📦';
+            const bar = '█'.repeat(Math.min(20, Math.round((count as number) / (result.total_memories || 1) * 20)));
+            response += `   ${icon} ${type.padEnd(12)} ${bar} ${count}\n`;
+          }
+        }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Memory Statistics:\n${JSON.stringify(result, null, 2)}`,
-            },
-          ],
+          content: [{ type: "text", text: response.trimEnd() }],
         };
       }
 
@@ -1121,27 +1278,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           user_id: USER_ID,
         });
 
-        const statusIcon = result.is_healthy ? "✓" : "⚠";
-        const healthText = result.is_healthy ? "Healthy" : "Unhealthy - orphaned memories detected";
+        const statusIcon = result.is_healthy ? "✓" : "⚠️";
+        const healthText = result.is_healthy ? "HEALTHY" : "UNHEALTHY";
 
-        let response = `Index Integrity Report\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Status: ${statusIcon} ${healthText}\n`;
-        response += `Total in storage: ${result.total_storage}\n`;
-        response += `Total indexed: ${result.total_indexed}\n`;
-        response += `Orphaned count: ${result.orphaned_count}\n`;
+        let response = `🐘 Index Verification\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `${statusIcon} ${healthText}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Storage: ${result.total_storage} memories\n`;
+        response += `Indexed: ${result.total_indexed} vectors\n`;
+        response += `Orphaned: ${result.orphaned_count}\n`;
 
         if (result.orphaned_count > 0) {
-          response += `\nRecommendation: Run repair_index to fix orphaned memories.`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `⚠️ Run repair_index to fix orphaned memories`;
         }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: response,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -1159,28 +1313,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           user_id: USER_ID,
         });
 
-        const statusIcon = result.is_healthy ? "✓" : "⚠";
+        const statusIcon = result.is_healthy ? "✓" : "⚠️";
+        const statusText = result.success ? "SUCCESS" : "PARTIAL";
 
-        let response = `Index Repair Results\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Status: ${statusIcon} ${result.success ? "Success" : "Partial success"}\n`;
-        response += `Total in storage: ${result.total_storage}\n`;
-        response += `Total indexed: ${result.total_indexed}\n`;
+        let response = `🐘 Index Repair\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `${statusIcon} ${statusText}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Storage: ${result.total_storage} memories\n`;
+        response += `Indexed: ${result.total_indexed} vectors\n`;
         response += `Repaired: ${result.repaired}\n`;
         response += `Failed: ${result.failed}\n`;
-        response += `Index healthy: ${result.is_healthy ? "Yes" : "No"}\n`;
 
         if (result.failed > 0) {
-          response += `\nNote: ${result.failed} memories could not be repaired (embedding generation failed).`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `⚠️ ${result.failed} could not be repaired`;
         }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: response,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -1196,30 +1347,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const memories = result.memories || [];
 
         if (memories.length === 0) {
+          let response = `🐘 Recall by Tags\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `Tags: ${tags.map(t => `#${t}`).join(' ')}\n`;
+          response += `No memories found.`;
           return {
-            content: [
-              {
-                type: "text",
-                text: `No memories found with tags: ${tags.join(", ")}`,
-              },
-            ],
+            content: [{ type: "text", text: response }],
           };
         }
 
-        const formatted = memories
-          .map((m, i) => {
-            const content = getContent(m);
-            return `${i + 1}. ${content.slice(0, 80)}${content.length > 80 ? '...' : ''}\n   Type: ${getType(m)} | ID: ${m.id.slice(0, 8)}...`;
-          })
-          .join("\n\n");
+        let response = `🐘 Recall by Tags\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Tags: ${tags.map(t => `#${t}`).join(' ')} │ Found: ${memories.length}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        for (let i = 0; i < memories.length; i++) {
+          const m = memories[i];
+          const content = getContent(m);
+          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 60)}${content.length > 60 ? '...' : ''}\n`;
+          response += `    ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
+        }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Found ${memories.length} memories with tags [${tags.join(", ")}]:\n\n${formatted}`,
-            },
-          ],
+          content: [{ type: "text", text: response.trimEnd() }],
         };
       }
 
@@ -1235,31 +1385,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const memories = result.memories || [];
 
+        // Format date range for display
+        const startDate = new Date(start).toLocaleDateString();
+        const endDate = new Date(end).toLocaleDateString();
+
         if (memories.length === 0) {
+          let response = `🐘 Recall by Date\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `Range: ${startDate} → ${endDate}\n`;
+          response += `No memories found.`;
           return {
-            content: [
-              {
-                type: "text",
-                text: `No memories found between ${start} and ${end}`,
-              },
-            ],
+            content: [{ type: "text", text: response }],
           };
         }
 
-        const formatted = memories
-          .map((m, i) => {
-            const content = getContent(m);
-            return `${i + 1}. ${content.slice(0, 80)}${content.length > 80 ? '...' : ''}\n   Type: ${getType(m)} | Created: ${m.created_at || 'unknown'}`;
-          })
-          .join("\n\n");
+        let response = `🐘 Recall by Date\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Range: ${startDate} → ${endDate} │ Found: ${memories.length}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+        for (let i = 0; i < memories.length; i++) {
+          const m = memories[i];
+          const content = getContent(m);
+          const created = m.created_at ? new Date(m.created_at).toLocaleString() : 'unknown';
+          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 55)}${content.length > 55 ? '...' : ''}\n`;
+          response += `    ┗━ ${getType(m)} │ ${created}\n`;
+        }
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Found ${memories.length} memories between ${start} and ${end}:\n\n${formatted}`,
-            },
-          ],
+          content: [{ type: "text", text: response.trimEnd() }],
         };
       }
 
@@ -1271,13 +1425,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tags,
         });
 
+        let response = `🐘 Forget by Tags\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Tags: ${tags.map(t => `#${t}`).join(' ')}\n`;
+        response += `✓ Deleted: ${result.deleted_count} memories`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Deleted ${result.deleted_count} memories with tags: ${tags.join(", ")}`,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -1290,13 +1444,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           end,
         });
 
+        const startDate = new Date(start).toLocaleDateString();
+        const endDate = new Date(end).toLocaleDateString();
+
+        let response = `🐘 Forget by Date\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Range: ${startDate} → ${endDate}\n`;
+        response += `✓ Deleted: ${result.deleted_count} memories`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Deleted ${result.deleted_count} memories between ${start} and ${end}`,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -1419,11 +1576,77 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? `\n\nDetected entities: ${entities.map(e => `"${e.text}" (${e.entity_type})`).join(', ')}`
           : '';
 
+        // Check for due reminders and context-triggered reminders (SHO-116)
+        let reminderBlock = "";
+        try {
+          // Check time-based due reminders
+          interface ReminderItem {
+            id: string;
+            content: string;
+            trigger_type: string;
+            priority: number;
+            overdue_seconds: number | null;
+            due_at: string | null;
+          }
+          interface DueRemindersResponse {
+            reminders: ReminderItem[];
+            count: number;
+          }
+
+          const dueResult = await apiCall<DueRemindersResponse>("/api/reminders/due", "POST", {
+            user_id: USER_ID,
+            mark_triggered: true,
+          });
+
+          // Check context-triggered reminders
+          const contextResult = await apiCall<DueRemindersResponse>("/api/reminders/context", "POST", {
+            user_id: USER_ID,
+            context,
+            mark_triggered: true,
+          });
+
+          // Combine all triggered reminders
+          const allReminders = [...dueResult.reminders, ...contextResult.reminders];
+          const uniqueReminders = allReminders.filter((r, i, arr) =>
+            arr.findIndex(x => x.id === r.id) === i
+          );
+
+          if (uniqueReminders.length > 0) {
+            // 54 chars wide box
+            reminderBlock = `\n\n`;
+            reminderBlock += `🐘━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━🧠\n`;
+            reminderBlock += `┃  SHODH MEMORY                    REMINDERS (${String(uniqueReminders.length).padStart(2)})  ┃\n`;
+            reminderBlock += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
+
+            for (const r of uniqueReminders) {
+              const icon = r.overdue_seconds && r.overdue_seconds > 0 ? "⏰" : "📌";
+              const contentText = r.content.slice(0, 42);
+              reminderBlock += `┃  ${icon} ${contentText.padEnd(48)} ┃\n`;
+
+              if (r.overdue_seconds && r.overdue_seconds > 0) {
+                const mins = Math.round(r.overdue_seconds / 60);
+                const overdueText = mins > 60
+                  ? `⚠️  OVERDUE by ${Math.round(mins/60)}h ${mins % 60}m`
+                  : `⚠️  OVERDUE by ${mins}m`;
+                reminderBlock += `┃     ${overdueText.padEnd(47)} ┃\n`;
+              } else if (r.due_at) {
+                const dueText = `Due: ${new Date(r.due_at).toLocaleString()}`;
+                reminderBlock += `┃     ${dueText.padEnd(47)} ┃\n`;
+              }
+            }
+
+            reminderBlock += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n`;
+            reminderBlock += `\n💡 Use dismiss_reminder to acknowledge`;
+          }
+        } catch (e) {
+          // Silently ignore reminder check failures
+        }
+
         return {
           content: [
             {
               type: "text",
-              text: `Surfaced ${memories.length} relevant memories:\n\n${formatted}${entitySummary}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms | Threshold: ${(semantic_threshold * 100).toFixed(0)}%]`,
+              text: `Surfaced ${memories.length} relevant memories:\n\n${formatted}${entitySummary}${reminderBlock}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms | Threshold: ${(semantic_threshold * 100).toFixed(0)}%]`,
             },
           ],
         };
@@ -1450,44 +1673,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           connectStream().catch(() => {});
         }
 
+        const statusIcon = status.handshake_complete ? '✓' : '✗';
+        const statusText = status.handshake_complete ? 'ACTIVE' : 'INACTIVE';
+
+        let response = `🐘 Streaming Status\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `${statusIcon} ${statusText}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Enabled: ${status.enabled ? 'Yes' : 'No'}\n`;
+        response += `Socket: ${status.socket_state}\n`;
+        response += `Handshake: ${status.handshake_complete ? 'Complete' : 'Pending'}\n`;
+        response += `Buffer: ${status.buffer_size} messages\n`;
+        if (status.connecting) response += `Connecting...\n`;
+        if (status.reconnect_pending) response += `Reconnect pending\n`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Streaming Status:\n\n` +
-                `Enabled: ${status.enabled}\n` +
-                `WebSocket URL: ${status.ws_url}\n` +
-                `Socket State: ${status.socket_state}\n` +
-                `Handshake Complete: ${status.handshake_complete}\n` +
-                `Buffer Size: ${status.buffer_size}\n` +
-                `Currently Connecting: ${status.connecting}\n` +
-                `Reconnect Pending: ${status.reconnect_pending}\n\n` +
-                (status.handshake_complete ? "✓ Streaming is ACTIVE" : "✗ Streaming is NOT ACTIVE - attempting reconnect..."),
-            },
-          ],
+          content: [{ type: "text", text: response.trimEnd() }],
         };
       }
 
       case "token_status": {
         const status = getTokenStatus();
-        const sessionDuration = Math.round((Date.now() - sessionStartTime) / 1000 / 60); // minutes
+        const sessionDuration = Math.round((Date.now() - sessionStartTime) / 1000 / 60);
         const remaining = status.budget - status.tokens;
         const percentUsed = Math.round(status.percent * 100);
 
+        // Visual progress bar
+        const barLength = 20;
+        const filledLength = Math.round(percentUsed / 100 * barLength);
+        const bar = '█'.repeat(filledLength) + '░'.repeat(barLength - filledLength);
+
+        let response = `🐘 Token Status\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `${bar} ${percentUsed}%\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Used: ${status.tokens.toLocaleString()} tokens\n`;
+        response += `Budget: ${status.budget.toLocaleString()} tokens\n`;
+        response += `Remaining: ${remaining.toLocaleString()} tokens\n`;
+        response += `Session: ${sessionDuration} min\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += status.alert
+          ? `⚠️ ALERT: ${percentUsed}% used - Consider new session`
+          : `✓ Context window healthy`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Token Status:\n\n` +
-                `Tokens Used: ${status.tokens.toLocaleString()}\n` +
-                `Token Budget: ${status.budget.toLocaleString()}\n` +
-                `Remaining: ${remaining.toLocaleString()}\n` +
-                `Usage: ${percentUsed}%\n` +
-                `Session Duration: ${sessionDuration} minutes\n` +
-                `Alert Threshold: ${Math.round(ALERT_THRESHOLD * 100)}%\n\n` +
-                (status.alert ? `⚠️ ${status.alert.toUpperCase().replace('_', ' ')} - Consider consolidation or new session` : "✓ Context window healthy"),
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -1495,13 +1725,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const previousTokens = sessionTokens;
         resetTokenSession();
 
+        let response = `🐘 Token Session Reset\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Previous: ${previousTokens.toLocaleString()} tokens\n`;
+        response += `Current: 0 tokens\n`;
+        response += `Budget: ${TOKEN_BUDGET.toLocaleString()} tokens\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `✓ Counter cleared`;
+
         return {
-          content: [
-            {
-              type: "text",
-              text: `Token session reset.\n\nPrevious tokens: ${previousTokens.toLocaleString()}\nNew tokens: 0\nBudget: ${TOKEN_BUDGET.toLocaleString()}\n\n✓ Session counter cleared`,
-            },
-          ],
+          content: [{ type: "text", text: response }],
         };
       }
 
@@ -1566,7 +1799,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
 
         const stats = result.statistics;
-        const sections: string[] = [];
 
         // Calculate event count
         const eventCount =
@@ -1579,54 +1811,223 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           result.extracted_facts.length +
           result.reinforced_facts.length;
 
-        // Summary header
-        sections.push(`CONSOLIDATION REPORT (${eventCount} events)`);
-        sections.push(`Period: ${result.period.start} to ${result.period.end}`);
-        sections.push('='.repeat(50));
+        // Format dates
+        const startDate = new Date(result.period.start).toLocaleString();
+        const endDate = new Date(result.period.end).toLocaleString();
+
+        let response = `🐘 Consolidation Report\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Period: ${startDate} → ${endDate}\n`;
+        response += `Events: ${eventCount} │ Memories: ${stats.total_memories}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
         // Memory changes
         if (stats.memories_strengthened > 0 || stats.memories_decayed > 0 || stats.memories_at_risk > 0) {
-          const memoryLines: string[] = [];
-          if (stats.memories_strengthened > 0) memoryLines.push(`  + ${stats.memories_strengthened} memories strengthened`);
-          if (stats.memories_decayed > 0) memoryLines.push(`  - ${stats.memories_decayed} memories decayed`);
-          if (stats.memories_at_risk > 0) memoryLines.push(`  ! ${stats.memories_at_risk} memories at risk of forgetting`);
-          sections.push(`MEMORY CHANGES:\n${memoryLines.join('\n')}`);
+          response += `🧠 MEMORY DYNAMICS\n`;
+          if (stats.memories_strengthened > 0) response += `   ↑ ${stats.memories_strengthened} strengthened\n`;
+          if (stats.memories_decayed > 0) response += `   ↓ ${stats.memories_decayed} decayed\n`;
+          if (stats.memories_at_risk > 0) response += `   ⚠️ ${stats.memories_at_risk} at risk\n`;
+          response += `\n`;
         }
 
         // Edge changes (associations)
         if (stats.edges_formed > 0 || stats.edges_strengthened > 0 || stats.edges_potentiated > 0 || stats.edges_pruned > 0) {
-          const edgeLines: string[] = [];
-          if (stats.edges_formed > 0) edgeLines.push(`  + ${stats.edges_formed} new associations formed`);
-          if (stats.edges_strengthened > 0) edgeLines.push(`  + ${stats.edges_strengthened} associations strengthened`);
-          if (stats.edges_potentiated > 0) edgeLines.push(`  * ${stats.edges_potentiated} associations became permanent (LTP)`);
-          if (stats.edges_pruned > 0) edgeLines.push(`  - ${stats.edges_pruned} weak associations pruned`);
-          sections.push(`ASSOCIATIONS (Hebbian Learning):\n${edgeLines.join('\n')}`);
+          response += `🔗 ASSOCIATIONS (Hebbian)\n`;
+          if (stats.edges_formed > 0) response += `   + ${stats.edges_formed} formed\n`;
+          if (stats.edges_strengthened > 0) response += `   ↑ ${stats.edges_strengthened} strengthened\n`;
+          if (stats.edges_potentiated > 0) response += `   ★ ${stats.edges_potentiated} permanent (LTP)\n`;
+          if (stats.edges_pruned > 0) response += `   ✂ ${stats.edges_pruned} pruned\n`;
+          response += `\n`;
         }
 
         // Fact changes
         if (stats.facts_extracted > 0 || stats.facts_reinforced > 0) {
-          const factLines: string[] = [];
-          if (stats.facts_extracted > 0) factLines.push(`  + ${stats.facts_extracted} facts extracted`);
-          if (stats.facts_reinforced > 0) factLines.push(`  + ${stats.facts_reinforced} facts reinforced`);
-          sections.push(`FACTS:\n${factLines.join('\n')}`);
+          response += `📚 FACTS\n`;
+          if (stats.facts_extracted > 0) response += `   + ${stats.facts_extracted} extracted\n`;
+          if (stats.facts_reinforced > 0) response += `   ↑ ${stats.facts_reinforced} reinforced\n`;
+          response += `\n`;
         }
 
         // Maintenance cycles
         if (stats.maintenance_cycles > 0) {
           const durationSec = (stats.total_maintenance_duration_ms / 1000).toFixed(2);
-          sections.push(`MAINTENANCE: ${stats.maintenance_cycles} cycle(s) completed (${durationSec}s total)`);
+          response += `⚙️ MAINTENANCE: ${stats.maintenance_cycles} cycles (${durationSec}s)\n`;
         }
 
         // No activity message
         if (eventCount === 0) {
-          sections.push('No consolidation activity in this period. Store and access memories to trigger learning.');
+          response += `ℹ️ No consolidation activity in this period.\n`;
+          response += `   Store and access memories to trigger learning.`;
         }
+
+        return {
+          content: [{ type: "text", text: response.trimEnd() }],
+        };
+      }
+
+      // =================================================================
+      // Prospective Memory / Reminders (SHO-116)
+      // =================================================================
+
+      case "set_reminder": {
+        const { content, trigger_type, trigger_at, after_seconds, keywords, priority = 3, tags = [] } = args as {
+          content: string;
+          trigger_type: "time" | "duration" | "context";
+          trigger_at?: string;
+          after_seconds?: number;
+          keywords?: string[];
+          priority?: number;
+          tags?: string[];
+        };
+
+        // Build trigger object based on type
+        let trigger: Record<string, unknown>;
+        switch (trigger_type) {
+          case "time":
+            if (!trigger_at) {
+              return {
+                content: [{ type: "text", text: "Error: 'trigger_at' is required for time-based reminders" }],
+                isError: true,
+              };
+            }
+            trigger = { type: "time", at: trigger_at };
+            break;
+          case "duration":
+            if (!after_seconds || after_seconds <= 0) {
+              return {
+                content: [{ type: "text", text: "Error: 'after_seconds' must be positive for duration-based reminders" }],
+                isError: true,
+              };
+            }
+            trigger = { type: "duration", after_seconds };
+            break;
+          case "context":
+            if (!keywords || keywords.length === 0) {
+              return {
+                content: [{ type: "text", text: "Error: 'keywords' is required for context-based reminders" }],
+                isError: true,
+              };
+            }
+            trigger = { type: "context", keywords, threshold: 0.7 };
+            break;
+          default:
+            return {
+              content: [{ type: "text", text: `Error: Invalid trigger_type: ${trigger_type}` }],
+              isError: true,
+            };
+        }
+
+        interface ReminderResponse {
+          id: string;
+          content: string;
+          trigger_type: string;
+          due_at: string | null;
+          created_at: string;
+        }
+
+        const result = await apiCall<ReminderResponse>("/api/remind", "POST", {
+          user_id: USER_ID,
+          content,
+          trigger,
+          priority,
+          tags,
+        });
+
+        let response = `🐘 Reminder Set\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `ID: ${result.id.slice(0, 8)}...\n`;
+        response += `Content: ${content}\n`;
+        response += `Trigger: ${trigger_type}`;
+        if (trigger_type === "time" && result.due_at) {
+          response += ` (${new Date(result.due_at).toLocaleString()})`;
+        } else if (trigger_type === "duration" && after_seconds) {
+          const mins = Math.round(after_seconds / 60);
+          response += ` (in ${mins > 60 ? Math.round(mins/60) + 'h' : mins + 'm'})`;
+        } else if (trigger_type === "context" && keywords) {
+          response += ` (keywords: ${keywords.join(", ")})`;
+        }
+        response += `\n`;
+        if (priority !== 3) {
+          response += `Priority: ${'★'.repeat(priority)}${'☆'.repeat(5-priority)}\n`;
+        }
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "list_reminders": {
+        const { status = "pending" } = args as { status?: string };
+
+        interface ReminderItem {
+          id: string;
+          content: string;
+          trigger_type: string;
+          status: string;
+          due_at: string | null;
+          created_at: string;
+          priority: number;
+          overdue_seconds: number | null;
+        }
+
+        interface ListRemindersResponse {
+          reminders: ReminderItem[];
+          count: number;
+        }
+
+        const result = await apiCall<ListRemindersResponse>("/api/reminders", "POST", {
+          user_id: USER_ID,
+          status: status === "all" ? null : status,
+        });
+
+        if (result.count === 0) {
+          return {
+            content: [{ type: "text", text: `No ${status === "all" ? "" : status + " "}reminders found.` }],
+          };
+        }
+
+        let response = `🐘 SHODH REMINDERS (${result.count})\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        for (const r of result.reminders) {
+          const icon = r.overdue_seconds && r.overdue_seconds > 0 ? "⏰" : "📌";
+          const statusBadge = r.status === "triggered" ? " [TRIGGERED]" : "";
+          response += `${icon} ${r.content.slice(0, 50)}${r.content.length > 50 ? "..." : ""}${statusBadge}\n`;
+          response += `   Type: ${r.trigger_type} | Priority: ${'★'.repeat(r.priority)} | ID: ${r.id.slice(0, 8)}...\n`;
+          if (r.due_at) {
+            response += `   Due: ${new Date(r.due_at).toLocaleString()}\n`;
+          }
+          if (r.overdue_seconds && r.overdue_seconds > 0) {
+            const mins = Math.round(r.overdue_seconds / 60);
+            response += `   ⚠️ Overdue by ${mins > 60 ? Math.round(mins/60) + 'h' : mins + 'm'}\n`;
+          }
+          response += `\n`;
+        }
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "dismiss_reminder": {
+        const { reminder_id } = args as { reminder_id: string };
+
+        interface ActionResponse {
+          success: boolean;
+          message: string;
+        }
+
+        const result = await apiCall<ActionResponse>(`/api/reminders/${reminder_id}/dismiss`, "POST", {
+          user_id: USER_ID,
+        });
 
         return {
           content: [
             {
               type: "text",
-              text: sections.join('\n\n'),
+              text: result.success
+                ? `✓ Reminder dismissed: ${reminder_id.slice(0, 8)}...`
+                : `⚠️ ${result.message}`,
             },
           ],
         };

@@ -9,14 +9,15 @@
 pub mod compression;
 pub mod context;
 pub mod introspection;
+pub mod prospective;
+pub mod query_parser;
 pub mod replay;
 pub mod retrieval;
 pub mod storage;
 pub mod types;
+pub mod visualization;
 // pub mod vector_storage;  // Disabled - requires crate::rag::vamana from parent project
 pub mod graph_retrieval;
-pub mod query_parser;
-pub mod visualization;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -64,6 +65,7 @@ pub use crate::memory::retrieval::{
     PrefetchResult, ReinforcementStats, RetrievalFeedback, RetrievalOutcome, TrackedRetrieval,
 };
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
+pub use crate::memory::prospective::ProspectiveStore;
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
