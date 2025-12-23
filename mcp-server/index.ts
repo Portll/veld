@@ -1595,14 +1595,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           const dueResult = await apiCall<DueRemindersResponse>("/api/reminders/due", "POST", {
             user_id: USER_ID,
-            mark_triggered: true,
+            mark_triggered: false,  // Don't auto-trigger, let user dismiss manually
           });
 
           // Check context-triggered reminders
           const contextResult = await apiCall<DueRemindersResponse>("/api/reminders/context", "POST", {
             user_id: USER_ID,
             context,
-            mark_triggered: true,
+            mark_triggered: false,  // Don't auto-trigger, let user dismiss manually
           });
 
           // Combine all triggered reminders
@@ -1620,8 +1620,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             for (const r of uniqueReminders) {
               const icon = r.overdue_seconds && r.overdue_seconds > 0 ? "⏰" : "📌";
-              const contentText = r.content.slice(0, 42);
-              reminderBlock += `┃  ${icon} ${contentText.padEnd(48)} ┃\n`;
+              const contentText = r.content.slice(0, 38);
+              reminderBlock += `┃  ${icon} ${contentText.padEnd(44)} [${r.id.slice(0,8)}] ┃\n`;
 
               if (r.overdue_seconds && r.overdue_seconds > 0) {
                 const mins = Math.round(r.overdue_seconds / 60);
@@ -1636,10 +1636,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             reminderBlock += `┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n`;
-            reminderBlock += `\n💡 Use dismiss_reminder to acknowledge`;
+            reminderBlock += `\n💡 Use dismiss_reminder with the [id] shown above`;
           }
         } catch (e) {
-          // Silently ignore reminder check failures
+          // Log reminder check failures for debugging
+          console.error("[proactive_context] Reminder check failed:", e);
         }
 
         return {

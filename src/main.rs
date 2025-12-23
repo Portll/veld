@@ -7495,12 +7495,21 @@ async fn dismiss_reminder(
 ) -> Result<Json<ReminderActionResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let task_id = uuid::Uuid::parse_str(&reminder_id).map_err(|_| AppError::InvalidInput {
-        field: "reminder_id".to_string(),
-        reason: "Invalid reminder ID format".to_string(),
-    })?;
-
-    let task_id = ProspectiveTaskId(task_id);
+    // Try parsing as full UUID first, then fall back to prefix lookup
+    let task_id = if let Ok(uuid) = uuid::Uuid::parse_str(&reminder_id) {
+        ProspectiveTaskId(uuid)
+    } else {
+        // Try prefix lookup for short IDs like "d8cdc580"
+        let task = state
+            .prospective_store
+            .find_by_prefix(&req.user_id, &reminder_id)
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "reminder_id".to_string(),
+                reason: format!("No reminder found with ID prefix '{}'", reminder_id),
+            })?;
+        task.id
+    };
 
     let success = state
         .prospective_store
@@ -7510,7 +7519,7 @@ async fn dismiss_reminder(
     if success {
         tracing::info!(
             user_id = %req.user_id,
-            reminder_id = %reminder_id,
+            reminder_id = %task_id.0,
             "Dismissed reminder"
         );
     }
@@ -7539,12 +7548,21 @@ async fn delete_reminder(
 ) -> Result<Json<ReminderActionResponse>, AppError> {
     validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
 
-    let task_id = uuid::Uuid::parse_str(&reminder_id).map_err(|_| AppError::InvalidInput {
-        field: "reminder_id".to_string(),
-        reason: "Invalid reminder ID format".to_string(),
-    })?;
-
-    let task_id = ProspectiveTaskId(task_id);
+    // Try parsing as full UUID first, then fall back to prefix lookup
+    let task_id = if let Ok(uuid) = uuid::Uuid::parse_str(&reminder_id) {
+        ProspectiveTaskId(uuid)
+    } else {
+        // Try prefix lookup for short IDs like "d8cdc580"
+        let task = state
+            .prospective_store
+            .find_by_prefix(&query.user_id, &reminder_id)
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::InvalidInput {
+                field: "reminder_id".to_string(),
+                reason: format!("No reminder found with ID prefix '{}'", reminder_id),
+            })?;
+        task.id
+    };
 
     let success = state
         .prospective_store
@@ -7554,7 +7572,7 @@ async fn delete_reminder(
     if success {
         tracing::info!(
             user_id = %query.user_id,
-            reminder_id = %reminder_id,
+            reminder_id = %task_id.0,
             "Deleted reminder"
         );
     }

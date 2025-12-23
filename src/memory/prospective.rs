@@ -462,6 +462,39 @@ impl ProspectiveStore {
         Ok(tasks.len())
     }
 
+    /// Find a task by ID prefix (for short ID lookups)
+    ///
+    /// Allows users to dismiss reminders using short IDs like "d8cdc580"
+    /// instead of full UUIDs like "d8cdc580-bf96-403a-85c5-57098c7b1786"
+    pub fn find_by_prefix(
+        &self,
+        user_id: &str,
+        id_prefix: &str,
+    ) -> Result<Option<ProspectiveTask>> {
+        let prefix_lower = id_prefix.to_lowercase();
+        let tasks = self.list_for_user(user_id, None)?;
+
+        let matches: Vec<_> = tasks
+            .into_iter()
+            .filter(|t| t.id.0.to_string().to_lowercase().starts_with(&prefix_lower))
+            .collect();
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches.into_iter().next().unwrap())),
+            _ => {
+                // Multiple matches - return the first one but log warning
+                tracing::warn!(
+                    user_id = %user_id,
+                    prefix = %id_prefix,
+                    matches = matches.len(),
+                    "Multiple reminders match prefix, using first"
+                );
+                Ok(Some(matches.into_iter().next().unwrap()))
+            }
+        }
+    }
+
     /// Cleanup expired/dismissed tasks older than given days
     pub fn cleanup_old_tasks(&self, user_id: &str, older_than_days: i64) -> Result<usize> {
         let cutoff = Utc::now() - chrono::Duration::days(older_than_days);
