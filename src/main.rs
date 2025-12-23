@@ -6876,14 +6876,20 @@ async fn create_reminder(
             seconds: after_seconds,
             from: chrono::Utc::now(),
         },
-        ReminderTriggerRequest::Context { keywords, threshold } => {
+        ReminderTriggerRequest::Context {
+            keywords,
+            threshold,
+        } => {
             if keywords.is_empty() {
                 return Err(AppError::InvalidInput {
                     field: "keywords".to_string(),
                     reason: "Context trigger requires at least one keyword".to_string(),
                 });
             }
-            ProspectiveTrigger::OnContext { keywords, threshold }
+            ProspectiveTrigger::OnContext {
+                keywords,
+                threshold,
+            }
         }
     };
 
@@ -7507,7 +7513,10 @@ async fn main() -> Result<()> {
         .route("/api/reminders", post(list_reminders))
         .route("/api/reminders/due", post(get_due_reminders))
         .route("/api/reminders/context", post(check_context_reminders))
-        .route("/api/reminders/{reminder_id}/dismiss", post(dismiss_reminder))
+        .route(
+            "/api/reminders/{reminder_id}/dismiss",
+            post(dismiss_reminder),
+        )
         .route("/api/reminders/{reminder_id}", delete(delete_reminder))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))

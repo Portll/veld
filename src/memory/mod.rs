@@ -55,6 +55,7 @@ pub use crate::memory::introspection::{
     ConsolidationStats, EdgeFormationReason, FactChange, InterferenceEvent, InterferenceType,
     MemoryChange, PruningReason, ReplayEvent, ReportPeriod, StrengtheningReason,
 };
+pub use crate::memory::prospective::ProspectiveStore;
 pub use crate::memory::replay::{
     InterferenceCheckResult, InterferenceDetector, InterferenceRecord, ReplayCandidate,
     ReplayCycleResult, ReplayManager,
@@ -65,7 +66,6 @@ pub use crate::memory::retrieval::{
     PrefetchResult, ReinforcementStats, RetrievalFeedback, RetrievalOutcome, TrackedRetrieval,
 };
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
-pub use crate::memory::prospective::ProspectiveStore;
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]

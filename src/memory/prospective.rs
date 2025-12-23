@@ -97,7 +97,12 @@ impl ProspectiveStore {
         // Index context triggers by keywords
         if let ProspectiveTrigger::OnContext { ref keywords, .. } = task.trigger {
             for keyword in keywords {
-                let kw_key = format!("context:{}:{}:{}", keyword.to_lowercase(), task.user_id, task.id);
+                let kw_key = format!(
+                    "context:{}:{}:{}",
+                    keyword.to_lowercase(),
+                    task.user_id,
+                    task.id
+                );
                 batch.put(kw_key.as_bytes(), b"1");
             }
         }
@@ -110,13 +115,17 @@ impl ProspectiveStore {
     }
 
     /// Get a task by ID
-    pub fn get(&self, user_id: &str, task_id: &ProspectiveTaskId) -> Result<Option<ProspectiveTask>> {
+    pub fn get(
+        &self,
+        user_id: &str,
+        task_id: &ProspectiveTaskId,
+    ) -> Result<Option<ProspectiveTask>> {
         let key = format!("{}:{}", user_id, task_id);
 
         match self.db.get(key.as_bytes())? {
             Some(value) => {
-                let task: ProspectiveTask =
-                    bincode::deserialize(&value).context("Failed to deserialize prospective task")?;
+                let task: ProspectiveTask = bincode::deserialize(&value)
+                    .context("Failed to deserialize prospective task")?;
                 Ok(Some(task))
             }
             None => Ok(None),
@@ -151,7 +160,8 @@ impl ProspectiveStore {
 
             if let ProspectiveTrigger::OnContext { ref keywords, .. } = task.trigger {
                 for keyword in keywords {
-                    let kw_key = format!("context:{}:{}:{}", keyword.to_lowercase(), user_id, task_id);
+                    let kw_key =
+                        format!("context:{}:{}:{}", keyword.to_lowercase(), user_id, task_id);
                     batch.delete(kw_key.as_bytes());
                 }
             }
@@ -290,7 +300,11 @@ impl ProspectiveStore {
     /// - Trigger is OnContext
     /// - Any keyword matches the context text
     /// - Status is Pending
-    pub fn check_context_triggers(&self, user_id: &str, context: &str) -> Result<Vec<ProspectiveTask>> {
+    pub fn check_context_triggers(
+        &self,
+        user_id: &str,
+        context: &str,
+    ) -> Result<Vec<ProspectiveTask>> {
         let context_lower = context.to_lowercase();
         let mut matches = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
@@ -305,7 +319,9 @@ impl ProspectiveStore {
 
             if let ProspectiveTrigger::OnContext { ref keywords, .. } = task.trigger {
                 // Check if any keyword matches
-                let matched = keywords.iter().any(|kw| context_lower.contains(&kw.to_lowercase()));
+                let matched = keywords
+                    .iter()
+                    .any(|kw| context_lower.contains(&kw.to_lowercase()));
                 if matched {
                     seen_ids.insert(task.id.0);
                     matches.push(task);
@@ -493,7 +509,11 @@ mod tests {
             "test-user".to_string(),
             "Check auth token".to_string(),
             ProspectiveTrigger::OnContext {
-                keywords: vec!["authentication".to_string(), "token".to_string(), "jwt".to_string()],
+                keywords: vec![
+                    "authentication".to_string(),
+                    "token".to_string(),
+                    "jwt".to_string(),
+                ],
                 threshold: 0.7,
             },
         );

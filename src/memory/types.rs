@@ -2474,9 +2474,7 @@ impl std::fmt::Display for ProspectiveTaskId {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProspectiveTrigger {
     /// Trigger at a specific time
-    AtTime {
-        at: DateTime<Utc>,
-    },
+    AtTime { at: DateTime<Utc> },
     /// Trigger after a duration from creation
     AfterDuration {
         seconds: u64,
@@ -2530,7 +2528,9 @@ impl ProspectiveTrigger {
         match self {
             ProspectiveTrigger::OnContext { keywords, .. } => {
                 let context_lower = context.to_lowercase();
-                keywords.iter().any(|kw| context_lower.contains(&kw.to_lowercase()))
+                keywords
+                    .iter()
+                    .any(|kw| context_lower.contains(&kw.to_lowercase()))
             }
             _ => false,
         }
