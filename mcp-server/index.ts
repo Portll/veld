@@ -52,6 +52,40 @@ const RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1000;
 const REQUEST_TIMEOUT_MS = 10000;
 
+// =============================================================================
+// TOKEN TRACKING - Context window awareness (SHO-115)
+// =============================================================================
+
+// Token budget configuration (default 100k tokens, ~400k chars)
+const TOKEN_BUDGET = parseInt(process.env.SHODH_TOKEN_BUDGET || "100000", 10);
+const ALERT_THRESHOLD = parseFloat(process.env.SHODH_ALERT_THRESHOLD || "0.9");
+
+// Session token tracking
+let sessionTokens = 0;
+let sessionStartTime = Date.now();
+
+// Simple token estimation: ~4 chars per token (rough approximation)
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+// Get current token status
+function getTokenStatus(): { tokens: number; budget: number; percent: number; alert: string | null } {
+  const percent = sessionTokens / TOKEN_BUDGET;
+  return {
+    tokens: sessionTokens,
+    budget: TOKEN_BUDGET,
+    percent: Math.round(percent * 100) / 100,
+    alert: percent >= ALERT_THRESHOLD ? `context_${Math.round(ALERT_THRESHOLD * 100)}_percent` : null,
+  };
+}
+
+// Reset session (call on new conversation or explicit clear)
+function resetTokenSession(): void {
+  sessionTokens = 0;
+  sessionStartTime = Date.now();
+}
+
 // Streaming ingestion settings
 const STREAM_ENABLED = process.env.SHODH_STREAM !== "false"; // enabled by default
 const STREAM_MIN_CONTENT_LENGTH = 50; // minimum content length to stream
@@ -710,14 +744,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
+      {
+        name: "token_status",
+        description: "Get current token usage status for this session. Returns tokens used, budget remaining, and percentage consumed. Use this to check context window health.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "reset_token_session",
+        description: "Reset the token counter for a new session. Call this when starting a new conversation or after context has been compressed/summarized.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
     ],
   };
 });
 
 // Auto-stream context from tool arguments (captures conversation intent)
 function autoStreamContext(toolName: string, args: Record<string, unknown>): void {
-  // Skip tools that already handle their own streaming
-  if (["proactive_context", "streaming_status"].includes(toolName)) return;
+  // Skip tools that already handle their own streaming or are meta/diagnostic
+  if (["proactive_context", "streaming_status", "token_status", "reset_token_session"].includes(toolName)) return;
 
   // Extract meaningful context from tool arguments
   let context = "";
@@ -1418,6 +1468,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "token_status": {
+        const status = getTokenStatus();
+        const sessionDuration = Math.round((Date.now() - sessionStartTime) / 1000 / 60); // minutes
+        const remaining = status.budget - status.tokens;
+        const percentUsed = Math.round(status.percent * 100);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Token Status:\n\n` +
+                `Tokens Used: ${status.tokens.toLocaleString()}\n` +
+                `Token Budget: ${status.budget.toLocaleString()}\n` +
+                `Remaining: ${remaining.toLocaleString()}\n` +
+                `Usage: ${percentUsed}%\n` +
+                `Session Duration: ${sessionDuration} minutes\n` +
+                `Alert Threshold: ${Math.round(ALERT_THRESHOLD * 100)}%\n\n` +
+                (status.alert ? `⚠️ ${status.alert.toUpperCase().replace('_', ' ')} - Consider consolidation or new session` : "✓ Context window healthy"),
+            },
+          ],
+        };
+      }
+
+      case "reset_token_session": {
+        const previousTokens = sessionTokens;
+        resetTokenSession();
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Token session reset.\n\nPrevious tokens: ${previousTokens.toLocaleString()}\nNew tokens: 0\nBudget: ${TOKEN_BUDGET.toLocaleString()}\n\n✓ Session counter cleared`,
+            },
+          ],
+        };
+      }
+
       case "consolidation_report": {
         const { since, until } = args as { since?: string; until?: string };
 
@@ -1558,6 +1645,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const resultText = result.content.map(c => c.text).join('\n');
     streamToolCall(name, args as Record<string, unknown>, resultText);
 
+    // Token tracking: count tokens in response (SHO-115)
+    const responseTokens = estimateTokens(resultText);
+    sessionTokens += responseTokens;
+    const tokenStatus = getTokenStatus();
+
     // Proactive surfacing: append relevant memories to non-memory tool responses
     if (PROACTIVE_SURFACING && !["remember", "recall", "forget", "list_memories", "proactive_context", "context_summary", "memory_stats"].includes(name)) {
       // Extract context from tool args
@@ -1581,7 +1673,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
 
-    return result;
+    // Inject context window warning if >= threshold (SHO-115)
+    if (tokenStatus.alert) {
+      const percentUsed = Math.round(tokenStatus.percent * 100);
+      const warning = `⚠️ CONTEXT ALERT: ${percentUsed}% of token budget used (${tokenStatus.tokens.toLocaleString()}/${tokenStatus.budget.toLocaleString()}). Consider starting a new session or running consolidation.\n\n`;
+      result.content[0].text = warning + result.content[0].text;
+    }
+
+    // Add _meta with token status to response
+    return {
+      ...result,
+      _meta: {
+        token_status: tokenStatus,
+      },
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
 
