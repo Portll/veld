@@ -55,10 +55,11 @@ use graph_memory::{
     RelationType, RelationshipEdge,
 };
 use memory::{
-    prospective::ProspectiveStore, ActivatedMemory, Experience, ExperienceType,
+    prospective::ProspectiveStore, todo_formatter, ActivatedMemory, Experience, ExperienceType,
     GraphStats as VisualizationStats, Memory, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
-    ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger,
-    Query as MemoryQuery, SharedMemory,
+    Project, ProjectId, ProjectStats, ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus,
+    ProspectiveTrigger, Query as MemoryQuery, SharedMemory, Todo, TodoId, TodoPriority,
+    TodoStatus, TodoStore, UserTodoStats,
 };
 
 /// Audit event for history tracking
@@ -222,6 +223,10 @@ pub struct MultiUserMemoryManager {
     /// Prospective memory store for reminders/intentions (SHO-116)
     /// Handles time-based and context-based triggers
     prospective_store: Arc<ProspectiveStore>,
+
+    /// GTD-style todo store (Linear-inspired)
+    /// Handles todos, projects, and task management
+    todo_store: Arc<TodoStore>,
 }
 
 impl MultiUserMemoryManager {
@@ -345,6 +350,10 @@ impl MultiUserMemoryManager {
         let prospective_store = Arc::new(ProspectiveStore::new(&base_path)?);
         info!("📅 Prospective memory store initialized");
 
+        // Initialize GTD todo store (Linear-style)
+        let todo_store = Arc::new(TodoStore::new(&base_path)?);
+        info!("📋 Todo store initialized");
+
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -359,6 +368,7 @@ impl MultiUserMemoryManager {
             event_broadcaster,
             streaming_extractor,
             prospective_store,
+            todo_store,
         };
 
         // Perform initial audit log rotation on startup
@@ -7587,6 +7597,693 @@ async fn delete_reminder(
     }))
 }
 
+// =============================================================================
+// GTD-STYLE TODO MANAGEMENT (Linear-inspired)
+// =============================================================================
+
+/// Request to create a new todo
+#[derive(Debug, Deserialize)]
+struct CreateTodoRequest {
+    user_id: String,
+    content: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    contexts: Option<Vec<String>>,
+    #[serde(default)]
+    due_date: Option<String>,
+    #[serde(default)]
+    blocked_on: Option<String>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// Response for todo operations
+#[derive(Debug, Serialize)]
+struct TodoResponse {
+    success: bool,
+    todo: Option<Todo>,
+    project: Option<Project>,
+    formatted: String,
+}
+
+/// Response for todo list operations
+#[derive(Debug, Serialize)]
+struct TodoListResponse {
+    success: bool,
+    count: usize,
+    todos: Vec<Todo>,
+    projects: Vec<Project>,
+    formatted: String,
+}
+
+/// Response for todo complete with potential next recurrence
+#[derive(Debug, Serialize)]
+struct TodoCompleteResponse {
+    success: bool,
+    todo: Option<Todo>,
+    next_recurrence: Option<Todo>,
+    formatted: String,
+}
+
+/// Request to list todos with filters
+#[derive(Debug, Deserialize)]
+struct ListTodosRequest {
+    user_id: String,
+    #[serde(default)]
+    status: Option<Vec<String>>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    include_completed: Option<bool>,
+}
+
+/// Request to update a todo
+#[derive(Debug, Deserialize)]
+struct UpdateTodoRequest {
+    user_id: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    contexts: Option<Vec<String>>,
+    #[serde(default)]
+    due_date: Option<String>,
+    #[serde(default)]
+    blocked_on: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+/// Request to get due todos
+#[derive(Debug, Deserialize)]
+struct DueTodosRequest {
+    user_id: String,
+    #[serde(default = "default_include_overdue")]
+    include_overdue: bool,
+}
+
+fn default_include_overdue() -> bool {
+    true
+}
+
+/// Request to create a project
+#[derive(Debug, Deserialize)]
+struct CreateProjectRequest {
+    user_id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+/// Response for project operations
+#[derive(Debug, Serialize)]
+struct ProjectResponse {
+    success: bool,
+    project: Option<Project>,
+    stats: Option<ProjectStats>,
+    formatted: String,
+}
+
+/// Response for project list
+#[derive(Debug, Serialize)]
+struct ProjectListResponse {
+    success: bool,
+    count: usize,
+    projects: Vec<(Project, ProjectStats)>,
+    formatted: String,
+}
+
+/// Request to list projects
+#[derive(Debug, Deserialize)]
+struct ListProjectsRequest {
+    user_id: String,
+}
+
+/// Request for todo stats
+#[derive(Debug, Deserialize)]
+struct TodoStatsRequest {
+    user_id: String,
+}
+
+/// Response for todo stats
+#[derive(Debug, Serialize)]
+struct TodoStatsResponse {
+    success: bool,
+    stats: UserTodoStats,
+    formatted: String,
+}
+
+/// Query params for single todo operations
+#[derive(Debug, Deserialize)]
+struct TodoQuery {
+    user_id: String,
+}
+
+/// POST /api/todos - Create a new todo
+async fn create_todo(
+    State(state): State<AppState>,
+    Json(req): Json<CreateTodoRequest>,
+) -> Result<Json<TodoResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.content.trim().is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "content".to_string(),
+            reason: "Content cannot be empty".to_string(),
+        });
+    }
+
+    let mut todo = Todo::new(req.user_id.clone(), req.content.clone());
+
+    // Set status
+    if let Some(ref status_str) = req.status {
+        todo.status = TodoStatus::from_str_loose(status_str).unwrap_or_default();
+    }
+
+    // Set priority
+    if let Some(ref priority_str) = req.priority {
+        todo.priority = TodoPriority::from_str_loose(priority_str).unwrap_or_default();
+    }
+
+    // Handle project (find or create)
+    let mut project_name = None;
+    if let Some(ref proj_name) = req.project {
+        let project = state
+            .todo_store
+            .find_or_create_project(&req.user_id, proj_name)
+            .map_err(AppError::Internal)?;
+        todo.project_id = Some(project.id.clone());
+        project_name = Some(project.name.clone());
+    }
+
+    // Set contexts (extract from content if not provided)
+    if let Some(contexts) = req.contexts {
+        todo.contexts = contexts;
+    } else {
+        todo.contexts = todo_formatter::extract_contexts(&req.content);
+    }
+
+    // Parse and set due date
+    if let Some(ref due_str) = req.due_date {
+        todo.due_date = todo_formatter::parse_due_date(due_str);
+    }
+
+    // Set blocked_on
+    todo.blocked_on = req.blocked_on;
+
+    // Set parent_id for subtasks
+    if let Some(ref parent_str) = req.parent_id {
+        if let Some(parent) = state
+            .todo_store
+            .find_todo_by_prefix(&req.user_id, parent_str)
+            .map_err(AppError::Internal)?
+        {
+            todo.parent_id = Some(parent.id);
+        }
+    }
+
+    // Set tags and notes
+    todo.tags = req.tags.unwrap_or_default();
+    todo.notes = req.notes;
+
+    // Store the todo
+    state
+        .todo_store
+        .store_todo(&todo)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_todo_created(&todo, project_name.as_deref());
+
+    tracing::info!(
+        user_id = %req.user_id,
+        todo_id = %todo.id,
+        content = %req.content,
+        "Created todo"
+    );
+
+    Ok(Json(TodoResponse {
+        success: true,
+        todo: Some(todo),
+        project: None,
+        formatted,
+    }))
+}
+
+/// POST /api/todos/list - List todos with filters
+async fn list_todos(
+    State(state): State<AppState>,
+    Json(req): Json<ListTodosRequest>,
+) -> Result<Json<TodoListResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Parse status filters
+    let status_filter: Option<Vec<TodoStatus>> = req.status.as_ref().map(|statuses| {
+        statuses
+            .iter()
+            .filter_map(|s| TodoStatus::from_str_loose(s))
+            .collect()
+    });
+
+    let mut todos = if let Some(ref statuses) = status_filter {
+        state
+            .todo_store
+            .list_todos_for_user(&req.user_id, Some(statuses))
+            .map_err(AppError::Internal)?
+    } else {
+        // Default: exclude Done and Cancelled unless requested
+        let include_completed = req.include_completed.unwrap_or(false);
+        let all_todos = state
+            .todo_store
+            .list_todos_for_user(&req.user_id, None)
+            .map_err(AppError::Internal)?;
+
+        if include_completed {
+            all_todos
+        } else {
+            all_todos
+                .into_iter()
+                .filter(|t| t.status != TodoStatus::Done && t.status != TodoStatus::Cancelled)
+                .collect()
+        }
+    };
+
+    // Filter by project
+    if let Some(ref proj_name) = req.project {
+        if let Some(project) = state
+            .todo_store
+            .find_project_by_name(&req.user_id, proj_name)
+            .map_err(AppError::Internal)?
+        {
+            todos.retain(|t| t.project_id.as_ref() == Some(&project.id));
+        }
+    }
+
+    // Filter by context
+    if let Some(ref ctx) = req.context {
+        let ctx_lower = ctx.to_lowercase();
+        todos.retain(|t| t.contexts.iter().any(|c| c.to_lowercase() == ctx_lower));
+    }
+
+    // Get projects for formatting
+    let projects = state
+        .todo_store
+        .list_projects(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_todo_list(&todos, &projects);
+
+    Ok(Json(TodoListResponse {
+        success: true,
+        count: todos.len(),
+        todos,
+        projects,
+        formatted,
+    }))
+}
+
+/// POST /api/todos/due - List due/overdue todos
+async fn list_due_todos(
+    State(state): State<AppState>,
+    Json(req): Json<DueTodosRequest>,
+) -> Result<Json<TodoListResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let todos = state
+        .todo_store
+        .list_due_todos(&req.user_id, req.include_overdue)
+        .map_err(AppError::Internal)?;
+
+    let projects = state
+        .todo_store
+        .list_projects(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_due_todos(&todos);
+
+    Ok(Json(TodoListResponse {
+        success: true,
+        count: todos.len(),
+        todos,
+        projects,
+        formatted,
+    }))
+}
+
+/// GET /api/todos/{todo_id} - Get a single todo
+async fn get_todo(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Query(query): Query<TodoQuery>,
+) -> Result<Json<TodoResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    let todo = state
+        .todo_store
+        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    // Get project name if assigned
+    let project_name = if let Some(ref pid) = todo.project_id {
+        state
+            .todo_store
+            .get_project(&query.user_id, pid)
+            .map_err(AppError::Internal)?
+            .map(|p| p.name)
+    } else {
+        None
+    };
+
+    let formatted = todo_formatter::format_todo_line(&todo, project_name.as_deref(), true);
+
+    Ok(Json(TodoResponse {
+        success: true,
+        todo: Some(todo),
+        project: None,
+        formatted,
+    }))
+}
+
+/// POST /api/todos/{todo_id}/update - Update a todo
+async fn update_todo(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Json(req): Json<UpdateTodoRequest>,
+) -> Result<Json<TodoResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let mut todo = state
+        .todo_store
+        .find_todo_by_prefix(&req.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    // Update fields
+    if let Some(ref content) = req.content {
+        todo.content = content.clone();
+    }
+    if let Some(ref status_str) = req.status {
+        if let Some(status) = TodoStatus::from_str_loose(status_str) {
+            todo.status = status;
+        }
+    }
+    if let Some(ref priority_str) = req.priority {
+        if let Some(priority) = TodoPriority::from_str_loose(priority_str) {
+            todo.priority = priority;
+        }
+    }
+    if let Some(ref contexts) = req.contexts {
+        todo.contexts = contexts.clone();
+    }
+    if let Some(ref due_str) = req.due_date {
+        todo.due_date = todo_formatter::parse_due_date(due_str);
+    }
+    if let Some(ref blocked) = req.blocked_on {
+        todo.blocked_on = Some(blocked.clone());
+    }
+    if let Some(ref notes) = req.notes {
+        todo.notes = Some(notes.clone());
+    }
+    if let Some(ref tags) = req.tags {
+        todo.tags = tags.clone();
+    }
+
+    // Handle project change
+    let mut project_name = None;
+    if let Some(ref proj_name) = req.project {
+        let project = state
+            .todo_store
+            .find_or_create_project(&req.user_id, proj_name)
+            .map_err(AppError::Internal)?;
+        todo.project_id = Some(project.id.clone());
+        project_name = Some(project.name.clone());
+    }
+
+    todo.updated_at = chrono::Utc::now();
+
+    state
+        .todo_store
+        .update_todo(&todo)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_todo_updated(&todo, project_name.as_deref());
+
+    tracing::info!(
+        user_id = %req.user_id,
+        todo_id = %todo.id,
+        "Updated todo"
+    );
+
+    Ok(Json(TodoResponse {
+        success: true,
+        todo: Some(todo),
+        project: None,
+        formatted,
+    }))
+}
+
+/// POST /api/todos/{todo_id}/complete - Mark todo as complete
+async fn complete_todo(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Json(req): Json<TodoQuery>,
+) -> Result<Json<TodoCompleteResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Find the todo first
+    let todo = state
+        .todo_store
+        .find_todo_by_prefix(&req.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    // Complete it (handles recurrence)
+    let result = state
+        .todo_store
+        .complete_todo(&req.user_id, &todo.id)
+        .map_err(AppError::Internal)?;
+
+    match result {
+        Some((completed, next)) => {
+            let formatted = todo_formatter::format_todo_completed(&completed, next.as_ref());
+
+            tracing::info!(
+                user_id = %req.user_id,
+                todo_id = %completed.id,
+                has_next = next.is_some(),
+                "Completed todo"
+            );
+
+            Ok(Json(TodoCompleteResponse {
+                success: true,
+                todo: Some(completed),
+                next_recurrence: next,
+                formatted,
+            }))
+        }
+        None => Err(AppError::TodoNotFound(todo_id)),
+    }
+}
+
+/// DELETE /api/todos/{todo_id} - Delete a todo
+async fn delete_todo(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Query(query): Query<TodoQuery>,
+) -> Result<Json<TodoResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    // Find the todo first
+    let todo = state
+        .todo_store
+        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    let success = state
+        .todo_store
+        .delete_todo(&query.user_id, &todo.id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = if success {
+        todo_formatter::format_todo_deleted(&todo.short_id())
+    } else {
+        "Todo not found".to_string()
+    };
+
+    if success {
+        tracing::info!(
+            user_id = %query.user_id,
+            todo_id = %todo.id,
+            "Deleted todo"
+        );
+    }
+
+    Ok(Json(TodoResponse {
+        success,
+        todo: None,
+        project: None,
+        formatted,
+    }))
+}
+
+/// POST /api/projects - Create a new project
+async fn create_project(
+    State(state): State<AppState>,
+    Json(req): Json<CreateProjectRequest>,
+) -> Result<Json<ProjectResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.name.trim().is_empty() {
+        return Err(AppError::InvalidInput {
+            field: "name".to_string(),
+            reason: "Project name cannot be empty".to_string(),
+        });
+    }
+
+    let mut project = Project::new(req.user_id.clone(), req.name.clone());
+    project.description = req.description;
+    project.color = req.color;
+
+    state
+        .todo_store
+        .store_project(&project)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_project_created(&project);
+
+    tracing::info!(
+        user_id = %req.user_id,
+        project_id = %project.id.0,
+        name = %req.name,
+        "Created project"
+    );
+
+    Ok(Json(ProjectResponse {
+        success: true,
+        project: Some(project),
+        stats: None,
+        formatted,
+    }))
+}
+
+/// POST /api/projects/list - List projects
+async fn list_projects(
+    State(state): State<AppState>,
+    Json(req): Json<ListProjectsRequest>,
+) -> Result<Json<ProjectListResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let projects = state
+        .todo_store
+        .list_projects(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    // Get stats for each project
+    let mut project_stats = Vec::new();
+    for project in projects {
+        let stats = state
+            .todo_store
+            .get_project_stats(&req.user_id, &project.id)
+            .map_err(AppError::Internal)?;
+        project_stats.push((project, stats));
+    }
+
+    let formatted = todo_formatter::format_project_list(&project_stats);
+
+    Ok(Json(ProjectListResponse {
+        success: true,
+        count: project_stats.len(),
+        projects: project_stats,
+        formatted,
+    }))
+}
+
+/// GET /api/projects/{project_id} - Get a project with stats
+async fn get_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Query(query): Query<TodoQuery>,
+) -> Result<Json<ProjectResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    // Try to find by name first, then by ID
+    let project = state
+        .todo_store
+        .find_project_by_name(&query.user_id, &project_id)
+        .map_err(AppError::Internal)?
+        .or_else(|| {
+            uuid::Uuid::parse_str(&project_id).ok().and_then(|uuid| {
+                state
+                    .todo_store
+                    .get_project(&query.user_id, &ProjectId(uuid))
+                    .ok()
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
+
+    let stats = state
+        .todo_store
+        .get_project_stats(&query.user_id, &project.id)
+        .map_err(AppError::Internal)?;
+
+    let todos = state
+        .todo_store
+        .list_todos_by_project(&query.user_id, &project.id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_project_todos(&project, &todos, &stats);
+
+    Ok(Json(ProjectResponse {
+        success: true,
+        project: Some(project),
+        stats: Some(stats),
+        formatted,
+    }))
+}
+
+/// POST /api/todos/stats - Get todo statistics
+async fn get_todo_stats(
+    State(state): State<AppState>,
+    Json(req): Json<TodoStatsRequest>,
+) -> Result<Json<TodoStatsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let stats = state
+        .todo_store
+        .get_user_stats(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = todo_formatter::format_user_stats(&stats);
+
+    Ok(Json(TodoStatsResponse {
+        success: true,
+        stats,
+        formatted,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file if present (silently ignore if not found)
@@ -7844,6 +8541,18 @@ async fn main() -> Result<()> {
             post(dismiss_reminder),
         )
         .route("/api/reminders/{reminder_id}", delete(delete_reminder))
+        // GTD-style Todo Management (Linear-inspired)
+        .route("/api/todos", post(create_todo))
+        .route("/api/todos/list", post(list_todos))
+        .route("/api/todos/due", post(list_due_todos))
+        .route("/api/todos/{todo_id}", get(get_todo))
+        .route("/api/todos/{todo_id}/update", post(update_todo))
+        .route("/api/todos/{todo_id}/complete", post(complete_todo))
+        .route("/api/todos/{todo_id}", delete(delete_todo))
+        .route("/api/projects", post(create_project))
+        .route("/api/projects/list", post(list_projects))
+        .route("/api/projects/{project_id}", get(get_project))
+        .route("/api/todos/stats", post(get_todo_stats))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         // Apply rate limiting to API routes only (not health/metrics/static)

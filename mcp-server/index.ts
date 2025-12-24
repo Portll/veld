@@ -832,6 +832,219 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["reminder_id"],
         },
       },
+      // =================================================================
+      // GTD Todo List Tools
+      // =================================================================
+      {
+        name: "add_todo",
+        description: "Add a task to your todo list. Supports GTD workflow with projects, contexts (@computer, @phone), priorities, and due dates.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description: "What needs to be done",
+            },
+            status: {
+              type: "string",
+              enum: ["backlog", "todo", "in_progress", "blocked"],
+              description: "Initial status (default: todo)",
+              default: "todo",
+            },
+            priority: {
+              type: "string",
+              enum: ["urgent", "high", "medium", "low", "none"],
+              description: "Priority level (default: medium)",
+              default: "medium",
+            },
+            project: {
+              type: "string",
+              description: "Project name (created if doesn't exist)",
+            },
+            contexts: {
+              type: "array",
+              items: { type: "string" },
+              description: "Contexts like @computer, @phone, @errands",
+            },
+            due_date: {
+              type: "string",
+              description: "Due date - ISO format or 'today', 'tomorrow', 'monday', etc.",
+            },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "Optional tags for categorization",
+            },
+            blocked_on: {
+              type: "string",
+              description: "Who/what you're waiting on (sets status to blocked)",
+            },
+            notes: {
+              type: "string",
+              description: "Additional notes",
+            },
+            recurrence: {
+              type: "string",
+              enum: ["daily", "weekly", "monthly"],
+              description: "Recurrence pattern for repeating tasks",
+            },
+          },
+          required: ["content"],
+        },
+      },
+      {
+        name: "list_todos",
+        description: "List todos with GTD filters. Returns Linear-style formatted output grouped by status.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            status: {
+              type: "array",
+              items: { type: "string", enum: ["backlog", "todo", "in_progress", "blocked", "done", "cancelled"] },
+              description: "Filter by status(es)",
+            },
+            project: {
+              type: "string",
+              description: "Filter by project name",
+            },
+            context: {
+              type: "string",
+              description: "Filter by context (e.g., @computer)",
+            },
+            priority: {
+              type: "string",
+              enum: ["urgent", "high", "medium", "low"],
+              description: "Filter by priority",
+            },
+            due: {
+              type: "string",
+              enum: ["today", "overdue", "this_week", "all"],
+              description: "Filter by due date",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum results (default: 50)",
+              default: 50,
+            },
+          },
+        },
+      },
+      {
+        name: "update_todo",
+        description: "Update a todo's properties. Use short ID prefix (e.g., SHO-1a2b) or full ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix",
+            },
+            content: {
+              type: "string",
+              description: "New content",
+            },
+            status: {
+              type: "string",
+              enum: ["backlog", "todo", "in_progress", "blocked", "done", "cancelled"],
+              description: "New status",
+            },
+            priority: {
+              type: "string",
+              enum: ["urgent", "high", "medium", "low", "none"],
+              description: "New priority",
+            },
+            project: {
+              type: "string",
+              description: "New project name",
+            },
+            contexts: {
+              type: "array",
+              items: { type: "string" },
+              description: "New contexts",
+            },
+            due_date: {
+              type: "string",
+              description: "New due date",
+            },
+            blocked_on: {
+              type: "string",
+              description: "Who/what you're waiting on",
+            },
+            notes: {
+              type: "string",
+              description: "Additional notes",
+            },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "New tags",
+            },
+          },
+          required: ["todo_id"],
+        },
+      },
+      {
+        name: "complete_todo",
+        description: "Mark a todo as complete. For recurring tasks, automatically creates the next occurrence.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix",
+            },
+          },
+          required: ["todo_id"],
+        },
+      },
+      {
+        name: "delete_todo",
+        description: "Delete a todo permanently.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix",
+            },
+          },
+          required: ["todo_id"],
+        },
+      },
+      {
+        name: "add_project",
+        description: "Create a new project to group todos.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Project name",
+            },
+            description: {
+              type: "string",
+              description: "Project description",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "list_projects",
+        description: "List all projects with todo counts and status breakdown.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "todo_stats",
+        description: "Get statistics about your todos - counts by status, overdue items, etc.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
     ],
   };
 });
@@ -1643,11 +1856,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           console.error("[proactive_context] Reminder check failed:", e);
         }
 
+        // Check for due todos (GTD integration)
+        let todoBlock = "";
+        try {
+          interface DueTodoItem {
+            id: string;
+            content: string;
+            status: string;
+            priority: string;
+            due_date: string | null;
+            project_name: string | null;
+          }
+          interface DueTodosResponse {
+            todos: DueTodoItem[];
+            formatted: string;
+            count: number;
+          }
+
+          const dueTodosResult = await apiCall<DueTodosResponse>("/api/todos/due", "POST", {
+            user_id: USER_ID,
+          });
+
+          if (dueTodosResult.count > 0) {
+            todoBlock = "\n\n" + dueTodosResult.formatted;
+          }
+        } catch (e) {
+          // Log todo check failures for debugging
+          console.error("[proactive_context] Todo check failed:", e);
+        }
+
         return {
           content: [
             {
               type: "text",
-              text: `Surfaced ${memories.length} relevant memories:\n\n${formatted}${entitySummary}${reminderBlock}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms | Threshold: ${(semantic_threshold * 100).toFixed(0)}%]`,
+              text: `Surfaced ${memories.length} relevant memories:\n\n${formatted}${entitySummary}${reminderBlock}${todoBlock}\n\n[Latency: ${result.latency_ms.toFixed(1)}ms | Threshold: ${(semantic_threshold * 100).toFixed(0)}%]`,
             },
           ],
         };
@@ -2033,6 +2275,242 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
       }
+
+      // =================================================================
+      // GTD Todo List Handlers
+      // =================================================================
+
+      case "add_todo": {
+        const {
+          content: todoContent,
+          status = "todo",
+          priority = "medium",
+          project,
+          contexts = [],
+          due_date,
+          tags = [],
+          blocked_on,
+          notes,
+          recurrence,
+        } = args as {
+          content: string;
+          status?: string;
+          priority?: string;
+          project?: string;
+          contexts?: string[];
+          due_date?: string;
+          tags?: string[];
+          blocked_on?: string;
+          notes?: string;
+          recurrence?: string;
+        };
+
+        interface TodoResponse {
+          success: boolean;
+          todo: {
+            id: string;
+            content: string;
+            status: string;
+            priority: string;
+            project_id?: string;
+            due_date?: string;
+          };
+          formatted: string;
+        }
+
+        const result = await apiCall<TodoResponse>("/api/todos", "POST", {
+          user_id: USER_ID,
+          content: todoContent,
+          status,
+          priority,
+          project,
+          contexts,
+          due_date,
+          tags,
+          blocked_on,
+          notes,
+          recurrence,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "list_todos": {
+        const {
+          status: statusFilter,
+          project,
+          context,
+          priority,
+          due,
+          limit = 50,
+        } = args as {
+          status?: string[];
+          project?: string;
+          context?: string;
+          priority?: string;
+          due?: string;
+          limit?: number;
+        };
+
+        interface ListTodosResponse {
+          success: boolean;
+          todos: unknown[];
+          projects: unknown[];
+          formatted: string;
+          count: number;
+        }
+
+        const result = await apiCall<ListTodosResponse>("/api/todos/list", "POST", {
+          user_id: USER_ID,
+          status: statusFilter,
+          project,
+          context,
+          priority,
+          due,
+          limit,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "update_todo": {
+        const {
+          todo_id,
+          content: newContent,
+          status,
+          priority,
+          project,
+          contexts,
+          due_date,
+          blocked_on,
+          notes,
+          tags,
+        } = args as {
+          todo_id: string;
+          content?: string;
+          status?: string;
+          priority?: string;
+          project?: string;
+          contexts?: string[];
+          due_date?: string;
+          blocked_on?: string;
+          notes?: string;
+          tags?: string[];
+        };
+
+        interface UpdateTodoResponse {
+          success: boolean;
+          todo: unknown;
+          formatted: string;
+        }
+
+        const result = await apiCall<UpdateTodoResponse>(`/api/todos/${todo_id}/update`, "POST", {
+          user_id: USER_ID,
+          content: newContent,
+          status,
+          priority,
+          project,
+          contexts,
+          due_date,
+          blocked_on,
+          notes,
+          tags,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "complete_todo": {
+        const { todo_id } = args as { todo_id: string };
+
+        interface CompleteTodoResponse {
+          success: boolean;
+          todo: unknown;
+          next_recurrence?: unknown;
+          formatted: string;
+        }
+
+        const result = await apiCall<CompleteTodoResponse>(`/api/todos/${todo_id}/complete`, "POST", {
+          user_id: USER_ID,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "delete_todo": {
+        const { todo_id } = args as { todo_id: string };
+
+        interface DeleteTodoResponse {
+          success: boolean;
+          formatted: string;
+        }
+
+        const result = await apiCall<DeleteTodoResponse>(`/api/todos/${todo_id}?user_id=${USER_ID}`, "DELETE");
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "add_project": {
+        const { name, description } = args as { name: string; description?: string };
+
+        interface ProjectResponse {
+          success: boolean;
+          project: { id: string; name: string };
+          formatted: string;
+        }
+
+        const result = await apiCall<ProjectResponse>("/api/projects", "POST", {
+          user_id: USER_ID,
+          name,
+          description,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "list_projects": {
+        interface ListProjectsResponse {
+          success: boolean;
+          projects: unknown[];
+          formatted: string;
+        }
+
+        const result = await apiCall<ListProjectsResponse>("/api/projects/list", "POST", {
+          user_id: USER_ID,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "todo_stats": {
+        interface TodoStatsResponse {
+          stats: unknown;
+          formatted: string;
+        }
+
+        const result = await apiCall<TodoStatsResponse>("/api/todos/stats", "POST", {
+          user_id: USER_ID,
+        });
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
 
       default:
         throw new Error(`Unknown tool: ${name}`);

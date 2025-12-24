@@ -53,6 +53,8 @@ pub enum AppError {
     // Not Found Errors (404)
     MemoryNotFound(String),
     UserNotFound(String),
+    TodoNotFound(String),
+    ProjectNotFound(String),
 
     // Conflict Errors (409)
     MemoryAlreadyExists(String),
@@ -108,6 +110,8 @@ impl AppError {
             Self::ResourceLimit { .. } => "RESOURCE_LIMIT",
             Self::MemoryNotFound(_) => "MEMORY_NOT_FOUND",
             Self::UserNotFound(_) => "USER_NOT_FOUND",
+            Self::TodoNotFound(_) => "TODO_NOT_FOUND",
+            Self::ProjectNotFound(_) => "PROJECT_NOT_FOUND",
             Self::MemoryAlreadyExists(_) => "MEMORY_ALREADY_EXISTS",
             Self::StorageError(_) => "STORAGE_ERROR",
             Self::DatabaseError(_) => "DATABASE_ERROR",
@@ -131,7 +135,10 @@ impl AppError {
 
             Self::ResourceLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
 
-            Self::MemoryNotFound(_) | Self::UserNotFound(_) => StatusCode::NOT_FOUND,
+            Self::MemoryNotFound(_)
+            | Self::UserNotFound(_)
+            | Self::TodoNotFound(_)
+            | Self::ProjectNotFound(_) => StatusCode::NOT_FOUND,
 
             Self::MemoryAlreadyExists(_) => StatusCode::CONFLICT,
 
@@ -168,6 +175,8 @@ impl AppError {
             }
             Self::MemoryNotFound(id) => format!("Memory not found: {id}"),
             Self::UserNotFound(id) => format!("User not found: {id}"),
+            Self::TodoNotFound(id) => format!("Todo not found: {id}"),
+            Self::ProjectNotFound(id) => format!("Project not found: {id}"),
             Self::MemoryAlreadyExists(id) => format!("Memory already exists: {id}"),
             Self::StorageError(msg) => format!("Storage error: {msg}"),
             Self::DatabaseError(msg) => format!("Database error: {msg}"),

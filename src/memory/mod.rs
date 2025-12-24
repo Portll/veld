@@ -14,6 +14,8 @@ pub mod query_parser;
 pub mod replay;
 pub mod retrieval;
 pub mod storage;
+pub mod todo_formatter;
+pub mod todos;
 pub mod types;
 pub mod visualization;
 // pub mod vector_storage;  // Disabled - requires crate::rag::vamana from parent project
@@ -56,6 +58,7 @@ pub use crate::memory::introspection::{
     MemoryChange, PruningReason, ReplayEvent, ReportPeriod, StrengtheningReason,
 };
 pub use crate::memory::prospective::ProspectiveStore;
+pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::replay::{
     InterferenceCheckResult, InterferenceDetector, InterferenceRecord, ReplayCandidate,
     ReplayCycleResult, ReplayManager,

@@ -2644,6 +2644,405 @@ impl ProspectiveTask {
     }
 }
 
+// =============================================================================
+// TODO/GTD SYSTEM TYPES (Linear-style)
+// =============================================================================
+
+/// Unique identifier for todos
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TodoId(pub Uuid);
+
+impl TodoId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Get short ID format (SHO-xxxx)
+    pub fn short(&self) -> String {
+        format!("SHO-{}", &self.0.to_string()[..4])
+    }
+}
+
+impl Default for TodoId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TodoId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.short())
+    }
+}
+
+/// Unique identifier for projects
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(pub Uuid);
+
+impl ProjectId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ProjectId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Todo status (Linear-style workflow)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    /// ◌ Not started, someday/maybe
+    Backlog,
+    /// ○ Ready to do
+    #[default]
+    Todo,
+    /// ◐ Actively working on
+    InProgress,
+    /// ⊘ Waiting for someone/something
+    Blocked,
+    /// ● Completed
+    Done,
+    /// ⊗ Won't do
+    Cancelled,
+}
+
+impl TodoStatus {
+    /// Get the status icon (Linear-style)
+    pub fn icon(&self) -> &'static str {
+        match self {
+            TodoStatus::Backlog => "◌",
+            TodoStatus::Todo => "○",
+            TodoStatus::InProgress => "◐",
+            TodoStatus::Blocked => "⊘",
+            TodoStatus::Done => "●",
+            TodoStatus::Cancelled => "⊗",
+        }
+    }
+
+    /// Parse from string (case-insensitive)
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "backlog" | "someday" | "maybe" => Some(TodoStatus::Backlog),
+            "todo" | "next" | "ready" => Some(TodoStatus::Todo),
+            "in_progress" | "inprogress" | "active" | "doing" => Some(TodoStatus::InProgress),
+            "blocked" | "waiting" | "waiting_for" => Some(TodoStatus::Blocked),
+            "done" | "completed" | "complete" => Some(TodoStatus::Done),
+            "cancelled" | "canceled" | "wont_do" => Some(TodoStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// Todo priority (Linear-style)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoPriority {
+    /// !!! Urgent (P1)
+    Urgent,
+    /// !! High (P2)
+    High,
+    /// ! Medium (P3) - default
+    #[default]
+    Medium,
+    /// (none) Low (P4)
+    Low,
+    /// No priority set
+    None,
+}
+
+impl TodoPriority {
+    /// Get priority indicator (Linear-style)
+    pub fn indicator(&self) -> &'static str {
+        match self {
+            TodoPriority::Urgent => "!!!",
+            TodoPriority::High => "!!",
+            TodoPriority::Medium => "!",
+            TodoPriority::Low => "",
+            TodoPriority::None => "",
+        }
+    }
+
+    /// Get numeric value (1=urgent, 4=low, 5=none)
+    pub fn value(&self) -> u8 {
+        match self {
+            TodoPriority::Urgent => 1,
+            TodoPriority::High => 2,
+            TodoPriority::Medium => 3,
+            TodoPriority::Low => 4,
+            TodoPriority::None => 5,
+        }
+    }
+
+    /// Parse from string (case-insensitive)
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "urgent" | "p1" | "1" | "!!!" => Some(TodoPriority::Urgent),
+            "high" | "p2" | "2" | "!!" => Some(TodoPriority::High),
+            "medium" | "p3" | "3" | "!" => Some(TodoPriority::Medium),
+            "low" | "p4" | "4" => Some(TodoPriority::Low),
+            "none" | "no_priority" | "" => Some(TodoPriority::None),
+            _ => None,
+        }
+    }
+}
+
+/// Recurrence pattern for repeating todos
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Recurrence {
+    /// Every day
+    Daily,
+    /// Specific days of week (0=Sun, 6=Sat)
+    Weekly { days: Vec<u8> },
+    /// Specific day of month (1-31)
+    Monthly { day: u8 },
+    /// Every N days
+    EveryNDays { n: u32 },
+}
+
+impl Recurrence {
+    /// Calculate the next due date from a given date
+    pub fn next_occurrence(&self, from: DateTime<Utc>) -> DateTime<Utc> {
+        use chrono::{Datelike, Duration};
+
+        match self {
+            Recurrence::Daily => from + Duration::days(1),
+            Recurrence::Weekly { days } => {
+                if days.is_empty() {
+                    return from + Duration::weeks(1);
+                }
+                let current_dow = from.weekday().num_days_from_sunday() as u8;
+                // Find next day in the list
+                let next_day = days
+                    .iter()
+                    .find(|&&d| d > current_dow)
+                    .copied()
+                    .unwrap_or(days[0]);
+
+                let days_until = if next_day > current_dow {
+                    (next_day - current_dow) as i64
+                } else {
+                    (7 - current_dow + next_day) as i64
+                };
+                from + Duration::days(days_until)
+            }
+            Recurrence::Monthly { day } => {
+                let target_day = (*day).min(28) as u32; // Cap at 28 to avoid month overflow
+                let mut next = from;
+                // Move to next month if we're past the target day
+                if from.day() >= target_day {
+                    next = from + Duration::days(32); // Jump to next month
+                }
+                // Set to target day
+                next.with_day(target_day).unwrap_or(next)
+            }
+            Recurrence::EveryNDays { n } => from + Duration::days(*n as i64),
+        }
+    }
+}
+
+/// A GTD-style todo item
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    /// Unique identifier
+    pub id: TodoId,
+
+    /// User who owns this todo
+    pub user_id: String,
+
+    /// What needs to be done
+    pub content: String,
+
+    /// Current status (Linear-style workflow)
+    #[serde(default)]
+    pub status: TodoStatus,
+
+    /// Priority level
+    #[serde(default)]
+    pub priority: TodoPriority,
+
+    /// Associated project (optional)
+    pub project_id: Option<ProjectId>,
+
+    /// Parent todo for subtasks
+    pub parent_id: Option<TodoId>,
+
+    /// GTD contexts (@computer, @phone, @errands, etc.)
+    #[serde(default)]
+    pub contexts: Vec<String>,
+
+    /// Tags for categorization
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Due date/time (optional)
+    pub due_date: Option<DateTime<Utc>>,
+
+    /// Recurrence pattern (optional)
+    pub recurrence: Option<Recurrence>,
+
+    /// Who/what this is blocked on (when status=Blocked)
+    pub blocked_on: Option<String>,
+
+    /// Additional notes
+    pub notes: Option<String>,
+
+    /// When created
+    pub created_at: DateTime<Utc>,
+
+    /// When last modified
+    pub updated_at: DateTime<Utc>,
+
+    /// When completed (if Done)
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl Todo {
+    /// Create a new todo
+    pub fn new(user_id: String, content: String) -> Self {
+        let now = Utc::now();
+        Self {
+            id: TodoId::new(),
+            user_id,
+            content,
+            status: TodoStatus::Todo,
+            priority: TodoPriority::Medium,
+            project_id: None,
+            parent_id: None,
+            contexts: Vec::new(),
+            tags: Vec::new(),
+            due_date: None,
+            recurrence: None,
+            blocked_on: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        }
+    }
+
+    /// Check if todo is overdue
+    pub fn is_overdue(&self) -> bool {
+        if let Some(due) = &self.due_date {
+            Utc::now() > *due && self.status != TodoStatus::Done && self.status != TodoStatus::Cancelled
+        } else {
+            false
+        }
+    }
+
+    /// Get overdue duration in seconds
+    pub fn overdue_seconds(&self) -> Option<i64> {
+        if let Some(due) = &self.due_date {
+            let now = Utc::now();
+            if now > *due && self.status != TodoStatus::Done && self.status != TodoStatus::Cancelled {
+                return Some((now - *due).num_seconds());
+            }
+        }
+        None
+    }
+
+    /// Check if due today
+    pub fn is_due_today(&self) -> bool {
+        if let Some(due) = &self.due_date {
+            let now = Utc::now();
+            due.date_naive() == now.date_naive()
+        } else {
+            false
+        }
+    }
+
+    /// Mark as completed
+    pub fn complete(&mut self) {
+        self.status = TodoStatus::Done;
+        self.completed_at = Some(Utc::now());
+        self.updated_at = Utc::now();
+    }
+
+    /// Create next recurrence if applicable
+    pub fn create_next_recurrence(&self) -> Option<Todo> {
+        self.recurrence.as_ref().map(|r| {
+            let base_date = self.due_date.unwrap_or_else(Utc::now);
+            let next_due = r.next_occurrence(base_date);
+
+            let mut next = self.clone();
+            next.id = TodoId::new();
+            next.status = TodoStatus::Todo;
+            next.due_date = Some(next_due);
+            next.completed_at = None;
+            next.created_at = Utc::now();
+            next.updated_at = Utc::now();
+            next
+        })
+    }
+
+    /// Get short ID
+    pub fn short_id(&self) -> String {
+        self.id.short()
+    }
+}
+
+/// Project status
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectStatus {
+    #[default]
+    Active,
+    OnHold,
+    Completed,
+    Archived,
+}
+
+/// A project that groups related todos
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    /// Unique identifier
+    pub id: ProjectId,
+
+    /// User who owns this project
+    pub user_id: String,
+
+    /// Project name
+    pub name: String,
+
+    /// Optional description
+    pub description: Option<String>,
+
+    /// Project status
+    #[serde(default)]
+    pub status: ProjectStatus,
+
+    /// Optional color (hex)
+    pub color: Option<String>,
+
+    /// When created
+    pub created_at: DateTime<Utc>,
+
+    /// When completed
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl Project {
+    /// Create a new project
+    pub fn new(user_id: String, name: String) -> Self {
+        Self {
+            id: ProjectId::new(),
+            user_id,
+            name,
+            description: None,
+            status: ProjectStatus::Active,
+            color: None,
+            created_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
