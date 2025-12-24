@@ -1589,23 +1589,31 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
 
 
 fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
-    // Show both vec len and stats total for debugging
-    let active_count = state.todos.len();
-    let project_count = state.projects.len();
-    let with_project = state.todos.iter().filter(|t| t.project_name.is_some()).count();
+    let width = area.width as usize;
+    let is_focused = state.focus_panel == FocusPanel::Left;
+
+    // Active todos count (non-done, non-cancelled)
+    let active_count = state.todos.iter()
+        .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
+        .count();
+
+    // Focus indicator in title
+    let focus_indicator = if is_focused { "▸ " } else { "  " };
+    let title_color = if is_focused { SAFFRON } else { Color::Rgb(255, 215, 0) };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Black))
+        .border_style(Style::default().fg(if is_focused { SAFFRON } else { Color::Black }))
         .title(Span::styled(
-            format!(" TODO ({}) [P:{}/{}] ", active_count, with_project, project_count),
-            Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD),
+            format!("{} TODO ({}) ", focus_indicator, active_count),
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if state.todos.is_empty() {
         let empty_msg = Paragraph::new("No active todos")
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(TEXT_DISABLED))
             .alignment(Alignment::Center);
         f.render_widget(empty_msg, inner);
         return;
@@ -1617,6 +1625,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
     // Calculate available height for todos (leave room for stats summary)
     let available_lines = inner.height.saturating_sub(3) as usize;
     let mut used_lines = 0;
+    let mut flat_idx: usize = 0;
 
     // In Progress section (priority - show more)
     let in_progress: Vec<_> = state.todos.iter()
@@ -1624,19 +1633,21 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
     if !in_progress.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            format!("◐ In Progress ({})", in_progress.len()),
-            Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD),
+            format!(" ◐ In Progress ({})", in_progress.len()),
+            Style::default().fg(SAFFRON).add_modifier(Modifier::BOLD),
         )));
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(in_progress.len()).min(4);
         for todo in in_progress.iter().take(show_count) {
-            lines.push(render_todo_line(todo));
+            let is_selected = state.selected_todo == flat_idx;
+            lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
             used_lines += 1;
+            flat_idx += 1;
         }
         if in_progress.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("  +{} more", in_progress.len() - show_count),
-                Style::default().fg(Color::DarkGray),
+                format!("    +{} more", in_progress.len() - show_count),
+                Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
         }
@@ -1648,19 +1659,21 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
     if !todos.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            format!("○ Todo ({})", todos.len()),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            format!(" ○ Todo ({})", todos.len()),
+            Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD),
         )));
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(todos.len()).min(4);
         for todo in todos.iter().take(show_count) {
-            lines.push(render_todo_line(todo));
+            let is_selected = state.selected_todo == flat_idx;
+            lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
             used_lines += 1;
+            flat_idx += 1;
         }
         if todos.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("  +{} more", todos.len() - show_count),
-                Style::default().fg(Color::DarkGray),
+                format!("    +{} more", todos.len() - show_count),
+                Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
         }
@@ -1672,19 +1685,21 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
     if !blocked.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            format!("⊘ Blocked ({})", blocked.len()),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            format!(" ⊘ Blocked ({})", blocked.len()),
+            Style::default().fg(MAROON).add_modifier(Modifier::BOLD),
         )));
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(blocked.len()).min(3);
         for todo in blocked.iter().take(show_count) {
-            lines.push(render_todo_line(todo));
+            let is_selected = state.selected_todo == flat_idx;
+            lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
             used_lines += 1;
+            flat_idx += 1;
         }
         if blocked.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("  +{} more", blocked.len() - show_count),
-                Style::default().fg(Color::DarkGray),
+                format!("    +{} more", blocked.len() - show_count),
+                Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
         }
@@ -1696,33 +1711,35 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
     if !backlog.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            format!("◌ Backlog ({})", backlog.len()),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            format!(" ◌ Backlog ({})", backlog.len()),
+            Style::default().fg(TEXT_DISABLED).add_modifier(Modifier::BOLD),
         )));
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(backlog.len()).min(2);
         for todo in backlog.iter().take(show_count) {
-            lines.push(render_todo_line(todo));
+            let is_selected = state.selected_todo == flat_idx;
+            lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
+            flat_idx += 1;
         }
         if backlog.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("  +{} more", backlog.len() - show_count),
-                Style::default().fg(Color::DarkGray),
+                format!("    +{} more", backlog.len() - show_count),
+                Style::default().fg(TEXT_DISABLED),
             )));
         }
     }
 
     // Stats summary at bottom
     lines.push(Line::from(vec![
-        Span::styled("─".repeat(inner.width as usize - 2), Style::default().fg(Color::DarkGray)),
+        Span::styled("─".repeat(inner.width as usize - 2), Style::default().fg(BORDER_DIVIDER)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(format!("◐{} ", state.todo_stats.in_progress), Style::default().fg(Color::Rgb(255, 215, 0))),
-        Span::styled(format!("○{} ", state.todo_stats.todo), Style::default().fg(Color::White)),
-        Span::styled(format!("⊘{} ", state.todo_stats.blocked), Style::default().fg(Color::Red)),
-        Span::styled(format!("●{}", state.todo_stats.done), Style::default().fg(Color::Green)),
+        Span::styled(format!("◐{} ", state.todo_stats.in_progress), Style::default().fg(SAFFRON)),
+        Span::styled(format!("○{} ", state.todo_stats.todo), Style::default().fg(TEXT_PRIMARY)),
+        Span::styled(format!("⊘{} ", state.todo_stats.blocked), Style::default().fg(MAROON)),
+        Span::styled(format!("●{}", state.todo_stats.done), Style::default().fg(GOLD)),
         if state.todo_stats.overdue > 0 {
-            Span::styled(format!(" ⚠{}", state.todo_stats.overdue), Style::default().fg(Color::LightRed))
+            Span::styled(format!(" ⚠{}", state.todo_stats.overdue), Style::default().fg(MAROON))
         } else {
             Span::raw("")
         },
@@ -1730,6 +1747,61 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, inner);
+}
+
+/// Render a todo line for Dashboard with selection support
+fn render_dashboard_todo_line(todo: &TuiTodo, width: usize, is_selected: bool, is_panel_focused: bool) -> Line<'static> {
+    let (icon, color) = match todo.status {
+        TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
+        TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
+        TuiTodoStatus::InProgress => ("◐", SAFFRON),
+        TuiTodoStatus::Blocked => ("⊘", MAROON),
+        TuiTodoStatus::Done => ("●", GOLD),
+        TuiTodoStatus::Cancelled => ("⊗", TEXT_DISABLED),
+    };
+
+    let priority = match todo.priority {
+        TuiPriority::Urgent => ("!!!", MAROON),
+        TuiPriority::High => ("!! ", SAFFRON),
+        TuiPriority::Medium => ("!  ", TEXT_DISABLED),
+        TuiPriority::Low => ("   ", TEXT_DISABLED),
+    };
+
+    // Selection indicator and background - always visible, brighter when focused
+    let sel_marker = if is_selected { "▸ " } else { "   " };
+    let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
+    let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+    let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
+
+    let content_width = width.saturating_sub(18);
+    let content = truncate(&todo.content, content_width);
+
+    let mut spans = vec![
+        Span::styled(sel_marker, Style::default().fg(sel_color).bg(bg)),
+        Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
+        Span::styled(priority.0, Style::default().fg(priority.1).bg(bg)),
+        Span::styled(content, Style::default().fg(text_color).bg(bg)),
+    ];
+
+    // Project name if any
+    if let Some(project) = &todo.project_name {
+        let short_project = truncate(project, 10);
+        spans.push(Span::styled(format!(" {}", short_project), Style::default().fg(TEXT_DISABLED).bg(bg)));
+    }
+
+    if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            spans.push(Span::styled(format!(" {}", label), Style::default().fg(MAROON).bg(bg)));
+        }
+    }
+
+    // Pad to full width for consistent background
+    let used_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used_width < width && is_selected {
+        spans.push(Span::styled(" ".repeat(width.saturating_sub(used_width)), Style::default().bg(bg)));
+    }
+
+    Line::from(spans)
 }
 
 fn render_todo_line(todo: &TuiTodo) -> Line<'static> {

@@ -913,7 +913,13 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         }
                         KeyCode::Tab => g.cycle_view(),
                         KeyCode::Up | KeyCode::Char('k') => match g.view_mode {
-                            ViewMode::Dashboard | ViewMode::ActivityLogs => g.select_event_prev(),
+                            ViewMode::Dashboard => {
+                                match g.focus_panel {
+                                    FocusPanel::Left => g.dashboard_todo_up(),
+                                    FocusPanel::Right => g.select_event_prev(),
+                                }
+                            }
+                            ViewMode::ActivityLogs => g.select_event_prev(),
                             ViewMode::Projects => {
                                 match g.focus_panel {
                                     FocusPanel::Left => {
@@ -927,7 +933,13 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             _ => g.scroll_up(),
                         },
                         KeyCode::Down | KeyCode::Char('j') => match g.view_mode {
-                            ViewMode::Dashboard | ViewMode::ActivityLogs => g.select_event_next(),
+                            ViewMode::Dashboard => {
+                                match g.focus_panel {
+                                    FocusPanel::Left => g.dashboard_todo_down(),
+                                    FocusPanel::Right => g.select_event_next(),
+                                }
+                            }
+                            ViewMode::ActivityLogs => g.select_event_next(),
                             ViewMode::Projects => {
                                 match g.focus_panel {
                                     FocusPanel::Left => {
@@ -942,14 +954,19 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             _ => g.scroll_down(),
                         },
                         KeyCode::Left => {
-                            if matches!(g.view_mode, ViewMode::Projects) && g.focus_panel == FocusPanel::Right {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) && g.focus_panel == FocusPanel::Right {
                                 g.focus_panel = FocusPanel::Left;
                             } else if matches!(g.view_mode, ViewMode::GraphMap) {
                                 g.rotate_graph_left();
                             }
                         }
                         KeyCode::Right => {
-                            if matches!(g.view_mode, ViewMode::Projects) && g.focus_panel == FocusPanel::Left {
+                            if matches!(g.view_mode, ViewMode::Dashboard) && g.focus_panel == FocusPanel::Left {
+                                g.focus_panel = FocusPanel::Right;
+                                if g.selected_event.is_none() && !g.events.is_empty() {
+                                    g.selected_event = Some(0);
+                                }
+                            } else if matches!(g.view_mode, ViewMode::Projects) && g.focus_panel == FocusPanel::Left {
                                 g.focus_panel = FocusPanel::Right;
                                 g.todos_selected = 0;
                             } else if matches!(g.view_mode, ViewMode::GraphMap) {

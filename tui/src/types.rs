@@ -1949,6 +1949,28 @@ impl AppState {
         }
     }
 
+    /// Get count of todos for Dashboard navigation (all non-done todos)
+    pub fn dashboard_todo_count(&self) -> usize {
+        self.todos.iter()
+            .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
+            .count()
+    }
+
+    /// Navigate up in Dashboard todos
+    pub fn dashboard_todo_up(&mut self) {
+        if self.selected_todo > 0 {
+            self.selected_todo -= 1;
+        }
+    }
+
+    /// Navigate down in Dashboard todos
+    pub fn dashboard_todo_down(&mut self) {
+        let max = self.dashboard_todo_count().saturating_sub(1);
+        if self.selected_todo < max {
+            self.selected_todo += 1;
+        }
+    }
+
     /// Get flat item count for left panel (projects + expanded todos + inbox todos)
     pub fn left_panel_flat_count(&self) -> usize {
         let mut count = 0;
