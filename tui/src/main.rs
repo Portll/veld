@@ -931,7 +931,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             ViewMode::Projects => {
                                 match g.focus_panel {
                                     FocusPanel::Left => {
-                                        let total_items = g.projects.len() + g.standalone_todos().len();
+                                        let total_items = g.left_panel_flat_count();
                                         if g.projects_selected < total_items.saturating_sub(1) {
                                             g.projects_selected += 1;
                                         }
@@ -960,12 +960,11 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             ViewMode::Projects => {
                                 match g.focus_panel {
                                     FocusPanel::Left => {
-                                        // Toggle expansion of selected project
-                                        if g.projects_selected < g.projects.len() {
-                                            let project_id =
-                                                g.projects[g.projects_selected].id.clone();
+                                        // Toggle expansion only if a project is selected
+                                        if let Some(project_id) = g.selected_project_id() {
                                             g.toggle_project_expansion(&project_id);
                                         }
+                                        // If a todo is selected, could open detail in future
                                     }
                                     FocusPanel::Right => {
                                         // Future: toggle todo status or view detail
@@ -1008,8 +1007,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     ViewMode::Projects => {
                                         match g.focus_panel {
                                             FocusPanel::Left => {
-                                                let total_items =
-                                                    g.projects.len() + g.standalone_todos().len();
+                                                let total_items = g.left_panel_flat_count();
                                                 if g.projects_selected < total_items.saturating_sub(1) {
                                                     g.projects_selected += 1;
                                                 }

@@ -837,7 +837,7 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
     render_todos_panel_right(f, columns[1], state);
 }
 
-/// Left sidebar - projects list
+/// Left sidebar - projects list with flat navigation (projects + todos)
 fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -853,6 +853,7 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = chunks[1];
     let width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let is_left_focused = state.focus_panel == FocusPanel::Left;
 
     // Header with breathing room
     let proj_count = state.projects.len();
@@ -863,13 +864,16 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
     ]));
     lines.push(Line::from("")); // breathing room
 
+    // Flat index for navigation - includes projects and their expanded todos
+    let mut flat_idx = 0;
+
     // Render projects with folder icons
-    for (idx, project) in state.projects.iter().enumerate() {
+    for project in state.projects.iter() {
         if lines.len() >= inner.height as usize - 1 {
             break;
         }
 
-        let is_selected = state.projects_selected == idx;
+        let is_selected = state.projects_selected == flat_idx;
         let is_expanded = state.is_project_expanded(&project.id);
         let todos = state.todos_for_project(&project.id);
         let done = todos.iter().filter(|t| t.status == TuiTodoStatus::Done).count();
@@ -879,7 +883,9 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
 
         // Folder icon: 📂 open, 📁 closed
         let folder = if is_expanded { "📂" } else { "📁" };
+        // Cursor always visible - brighter when focused
         let sel = if is_selected { "▸ " } else { "  " };
+        let sel_color = if is_selected && is_left_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
         let name_width = width.saturating_sub(28);
         let name = truncate(&project.name, name_width);
 
@@ -898,19 +904,22 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(sel, Style::default().fg(SAFFRON).bg(bg)),
+            Span::styled(sel, Style::default().fg(sel_color).bg(bg)),
             Span::styled(format!("{} ", folder), Style::default().bg(bg)),
             Span::styled(format!("{:<w$}", name, w = name_width), Style::default().fg(TEXT_PRIMARY).bg(bg)),
             Span::styled(format!(" {:<12}", status_str), Style::default().fg(progress_color).bg(bg)),
         ]));
+        flat_idx += 1;
 
-        // Expanded todos with indentation
+        // Expanded todos with indentation - each one is navigable
         if is_expanded {
             for todo in todos.iter().take(5) {
                 if lines.len() >= inner.height as usize - 1 {
                     break;
                 }
-                lines.push(render_project_todo(todo, width));
+                let todo_selected = state.projects_selected == flat_idx;
+                lines.push(render_sidebar_todo(todo, width, todo_selected, is_left_focused));
+                flat_idx += 1;
             }
             if todos.len() > 5 {
                 lines.push(Line::from(Span::styled(
@@ -936,15 +945,16 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
             if lines.len() >= inner.height as usize {
                 break;
             }
-            lines.push(render_project_todo(todo, width));
+            let todo_selected = state.projects_selected == flat_idx;
+            lines.push(render_sidebar_todo(todo, width, todo_selected, is_left_focused));
+            flat_idx += 1;
         }
     }
 
     f.render_widget(Paragraph::new(lines), inner);
 
     // Footer shows panel focus state
-    let is_focused = state.focus_panel == FocusPanel::Left;
-    let footer = if is_focused {
+    let footer = if is_left_focused {
         Line::from(vec![
             Span::styled(" ▸ ", Style::default().fg(SAFFRON)),
             Span::styled("↑↓", Style::default().fg(TEXT_SECONDARY)),
@@ -1075,8 +1085,8 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             lines.push(Line::from("")); // space after header
             for todo in in_progress.iter().take(4) {
                 if lines.len() >= content_height - 1 { break; }
-                let is_selected = is_focused && state.todos_selected == todo_idx;
-                lines.push(render_todo_row_with_selection(todo, width, is_selected));
+                let is_selected = state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
                 todo_idx += 1;
             }
             lines.push(Line::from("")); // section separator
@@ -1092,8 +1102,8 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             let max_todos = (content_height.saturating_sub(lines.len() + 4)).min(8);
             for todo in todo_items.iter().take(max_todos) {
                 if lines.len() >= content_height - 1 { break; }
-                let is_selected = is_focused && state.todos_selected == todo_idx;
-                lines.push(render_todo_row_with_selection(todo, width, is_selected));
+                let is_selected = state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
                 todo_idx += 1;
             }
             if todo_items.len() > max_todos {
@@ -1114,8 +1124,8 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             lines.push(Line::from("")); // space after header
             for todo in blocked.iter().take(3) {
                 if lines.len() >= content_height - 1 { break; }
-                let is_selected = is_focused && state.todos_selected == todo_idx;
-                lines.push(render_todo_row_with_selection(todo, width, is_selected));
+                let is_selected = state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
                 todo_idx += 1;
             }
             lines.push(Line::from("")); // section separator
@@ -1189,7 +1199,7 @@ fn render_todo_row(todo: &TuiTodo, width: usize) -> Line<'static> {
 }
 
 /// Render a todo row with selection highlighting
-fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: bool) -> Line<'static> {
+fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: bool, is_panel_focused: bool) -> Line<'static> {
     let (icon, color) = match todo.status {
         TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
         TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
@@ -1209,13 +1219,14 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
     let content_width = width.saturating_sub(18);
     let content = truncate(&todo.content, content_width);
 
-    // Selection indicator and background
+    // Selection indicator and background - always visible, brighter when focused
     let sel_marker = if is_selected { "▸ " } else { "   " };
+    let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
     let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
     let mut spans = vec![
-        Span::styled(sel_marker, Style::default().fg(SAFFRON).bg(bg)),
+        Span::styled(sel_marker, Style::default().fg(sel_color).bg(bg)),
         Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
         Span::styled(priority.0, Style::default().fg(priority.1).bg(bg)),
         Span::styled(content, Style::default().fg(text_color).bg(bg)),
@@ -1236,19 +1247,26 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
     Line::from(spans)
 }
 
-/// Render todo under expanded project in sidebar
-fn render_project_todo(todo: &TuiTodo, _width: usize) -> Line<'static> {
+/// Render todo under expanded project in sidebar (with selection support)
+fn render_sidebar_todo(todo: &TuiTodo, width: usize, is_selected: bool, is_panel_focused: bool) -> Line<'static> {
     let (icon, color) = match todo.status {
         TuiTodoStatus::InProgress => ("◐", SAFFRON),
-        TuiTodoStatus::Todo => ("○", TEXT_DISABLED),
+        TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
         TuiTodoStatus::Done => ("●", GOLD),
+        TuiTodoStatus::Blocked => ("⊘", MAROON),
         _ => ("○", TEXT_DISABLED),
     };
 
+    // Selection indicator - always visible, brighter when focused
+    let sel = if is_selected { "  ▸ " } else { "    " };
+    let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
+    let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+    let content_width = width.saturating_sub(12);
+
     Line::from(vec![
-        Span::styled("      ", Style::default()),
-        Span::styled(format!("{} ", icon), Style::default().fg(color)),
-        Span::styled(truncate(&todo.content, 25), Style::default().fg(TEXT_SECONDARY)),
+        Span::styled(sel, Style::default().fg(sel_color).bg(bg)),
+        Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
+        Span::styled(truncate(&todo.content, content_width), Style::default().fg(TEXT_SECONDARY).bg(bg)),
     ])
 }
 

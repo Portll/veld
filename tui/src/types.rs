@@ -1948,4 +1948,52 @@ impl AppState {
             self.todos_selected += 1;
         }
     }
+
+    /// Get flat item count for left panel (projects + expanded todos + inbox todos)
+    pub fn left_panel_flat_count(&self) -> usize {
+        let mut count = 0;
+        for project in &self.projects {
+            count += 1; // The project itself
+            if self.is_project_expanded(&project.id) {
+                // Add up to 5 expanded todos
+                let todos = self.todos_for_project(&project.id);
+                count += todos.len().min(5);
+            }
+        }
+        // Add inbox todos (up to 5)
+        count += self.standalone_todos().len().min(5);
+        count
+    }
+
+    /// Check if the current left panel selection is on a project (not a todo)
+    pub fn is_project_selected(&self) -> bool {
+        let mut flat_idx = 0;
+        for project in &self.projects {
+            if self.projects_selected == flat_idx {
+                return true;
+            }
+            flat_idx += 1;
+            if self.is_project_expanded(&project.id) {
+                let todos = self.todos_for_project(&project.id);
+                flat_idx += todos.len().min(5);
+            }
+        }
+        false // Must be an inbox todo
+    }
+
+    /// Get the project ID if the current selection is on a project
+    pub fn selected_project_id(&self) -> Option<String> {
+        let mut flat_idx = 0;
+        for project in &self.projects {
+            if self.projects_selected == flat_idx {
+                return Some(project.id.clone());
+            }
+            flat_idx += 1;
+            if self.is_project_expanded(&project.id) {
+                let todos = self.todos_for_project(&project.id);
+                flat_idx += todos.len().min(5);
+            }
+        }
+        None
+    }
 }
