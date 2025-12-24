@@ -795,27 +795,16 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
-    // Vertical split: ribbon at top, spacer, content below
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),   // Status ribbon
-            Constraint::Length(2),   // Spacer for breathing room
-            Constraint::Min(5),      // Main content
-        ])
-        .split(area);
+    let content_area = with_ribbon_layout(f, area, state);
 
-    render_status_ribbon(f, rows[0], state);
-    // rows[1] is empty spacer
-
-    // 40/60 split: Todos+Stats on left, Activity on right
+    // 50/50 split: Todos+Stats on left, Activity on right
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),  // Todos + Stats
-            Constraint::Percentage(60),  // Activity
+            Constraint::Percentage(50),  // Todos + Stats
+            Constraint::Percentage(50),  // Activity
         ])
-        .split(rows[2]);
+        .split(content_area);
 
     // Left panel: split vertically for todos (top) and stats (bottom)
     let left_chunks = Layout::default()
@@ -837,18 +826,7 @@ pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
 
 /// Main Projects view - full-width ribbon + two-column layout
 fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
-    // Vertical split: ribbon at top, spacer, columns below
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),   // Status ribbon
-            Constraint::Length(2),   // Spacer for breathing room
-            Constraint::Min(5),      // Main content
-        ])
-        .split(area);
-
-    render_status_ribbon(f, rows[0], state);
-    // rows[1] is empty spacer
+    let content_area = with_ribbon_layout(f, area, state);
 
     // 50/50 columns for main content
     let columns = Layout::default()
@@ -857,7 +835,7 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Percentage(50),
             Constraint::Percentage(50),
         ])
-        .split(rows[2]);
+        .split(content_area);
 
     render_projects_sidebar(f, columns[0], state);
     render_todos_panel_right(f, columns[1], state);
@@ -955,6 +933,22 @@ fn render_status_ribbon(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Standard view layout with ribbon at top
+/// Returns the content area below ribbon and spacer
+fn with_ribbon_layout(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),   // Status ribbon
+            Constraint::Length(2),   // Spacer for breathing room
+            Constraint::Min(5),      // Main content
+        ])
+        .split(area);
+
+    render_status_ribbon(f, rows[0], state);
+    rows[2]
 }
 
 /// Left sidebar - projects list with flat navigation (projects + todos)
@@ -1751,6 +1745,12 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
 
 /// Render a todo line for Dashboard with selection support
 fn render_dashboard_todo_line(todo: &TuiTodo, width: usize, is_selected: bool, is_panel_focused: bool) -> Line<'static> {
+    // Fixed column widths for uniform layout
+    // | sel(3) | status(2) | pri(3) | content(flex) | project(14) | due(10) |
+    const PROJECT_COL_WIDTH: usize = 14;
+    const DUE_COL_WIDTH: usize = 10;
+    const FIXED_LEFT: usize = 8; // sel(3) + status(2) + pri(3)
+
     let (icon, color) = match todo.status {
         TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
         TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
@@ -1767,43 +1767,59 @@ fn render_dashboard_todo_line(todo: &TuiTodo, width: usize, is_selected: bool, i
         TuiPriority::Low => ("   ", TEXT_DISABLED),
     };
 
-    // Selection indicator and background - always visible, brighter when focused
+    // Selection styling
     let sel_marker = if is_selected { "▸ " } else { "   " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
     let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
-    let content_width = width.saturating_sub(18);
-    let content = truncate(&todo.content, content_width);
+    // Calculate content width (flexible column)
+    let content_width = width.saturating_sub(FIXED_LEFT + PROJECT_COL_WIDTH + DUE_COL_WIDTH + 1);
+    let content = if todo.content.chars().count() <= content_width {
+        // Pad content to fill the column
+        format!("{:<width$}", todo.content, width = content_width)
+    } else {
+        // Truncate with ellipsis
+        format!("{:.<width$}",
+            todo.content.chars().take(content_width.saturating_sub(2)).collect::<String>(),
+            width = content_width)
+    };
 
-    let mut spans = vec![
+    // Project column - fixed width with folder icon
+    let project_col = if let Some(project) = &todo.project_name {
+        let max_name = PROJECT_COL_WIDTH - 2; // folder icon + space
+        let name = if project.chars().count() <= max_name {
+            project.clone()
+        } else {
+            format!("{}..", project.chars().take(max_name - 2).collect::<String>())
+        };
+        format!("📁 {:<width$}", name, width = max_name)
+    } else {
+        " ".repeat(PROJECT_COL_WIDTH)
+    };
+
+    // Due column - fixed width
+    let due_col = if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            format!("{:>width$}", label, width = DUE_COL_WIDTH)
+        } else {
+            " ".repeat(DUE_COL_WIDTH)
+        }
+    } else {
+        " ".repeat(DUE_COL_WIDTH)
+    };
+
+    let spans = vec![
         Span::styled(sel_marker, Style::default().fg(sel_color).bg(bg)),
         Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
         Span::styled(priority.0, Style::default().fg(priority.1).bg(bg)),
         Span::styled(content, Style::default().fg(text_color).bg(bg)),
+        Span::styled(project_col, Style::default().fg(GOLD).bg(bg)),
+        Span::styled(due_col, Style::default().fg(MAROON).bg(bg)),
     ];
-
-    // Project name if any
-    if let Some(project) = &todo.project_name {
-        let short_project = truncate(project, 10);
-        spans.push(Span::styled(format!(" {}", short_project), Style::default().fg(TEXT_DISABLED).bg(bg)));
-    }
-
-    if todo.is_overdue() {
-        if let Some(label) = todo.due_label() {
-            spans.push(Span::styled(format!(" {}", label), Style::default().fg(MAROON).bg(bg)));
-        }
-    }
-
-    // Pad to full width for consistent background
-    let used_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    if used_width < width && is_selected {
-        spans.push(Span::styled(" ".repeat(width.saturating_sub(used_width)), Style::default().bg(bg)));
-    }
 
     Line::from(spans)
 }
-
 fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
     let mut spans = vec![
         Span::styled("  ", Style::default()),
@@ -2317,6 +2333,8 @@ fn render_event_detail(f: &mut Frame, area: Rect, event: &DisplayEvent, state: &
 }
 
 fn render_activity_logs(f: &mut Frame, area: Rect, state: &AppState) {
+    let content_area = with_ribbon_layout(f, area, state);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Black))
@@ -2333,8 +2351,8 @@ fn render_activity_logs(f: &mut Frame, area: Rect, state: &AppState) {
             ))
             .alignment(Alignment::Right),
         );
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(content_area);
+    f.render_widget(block, content_area);
 
     if state.events.is_empty() {
         let msg = Paragraph::new(vec![
@@ -2688,10 +2706,12 @@ fn render_river_event(f: &mut Frame, area: Rect, event: &DisplayEvent) {
 }
 
 fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
+    let content_area = with_ribbon_layout(f, area, state);
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(area);
+        .split(content_area);
 
     // LEFT: Node list
     let node_count = state.graph_data.nodes.len();
@@ -2911,6 +2931,8 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_graph_map(f: &mut Frame, area: Rect, state: &AppState) {
+    let content_area = with_ribbon_layout(f, area, state);
+
     // Three-column layout: Top Entities | Selected Focus | Type Summary
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -2919,7 +2941,7 @@ fn render_graph_map(f: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Min(40),    // Center: Focus view
             Constraint::Length(24), // Right: Type summary
         ])
-        .split(area);
+        .split(content_area);
 
     render_graph_top_entities(f, main_chunks[0], state);
     render_graph_focus_view(f, main_chunks[1], state);
