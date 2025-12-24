@@ -165,6 +165,8 @@ impl MemoryStream {
 
     pub async fn run(&self) {
         self.fetch_initial_data().await;
+
+        // SSE connection loop - todo updates are handled via TODO_* events
         loop {
             match self.connect().await {
                 Ok(()) => {}
@@ -179,6 +181,107 @@ impl MemoryStream {
             }
             sleep(Duration::from_secs(3)).await;
         }
+    }
+
+    /// Static poll function for background task
+    async fn poll_todos(
+        client: &Client,
+        base_url: &str,
+        api_key: &str,
+        user_id: &str,
+    ) -> Result<(Vec<TuiTodo>, Vec<TuiProject>, TodoStats), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let resp = client
+            .post(format!("{}/api/todos/list", base_url))
+            .header("X-API-Key", api_key)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "user_id": user_id,
+                "include_completed": false
+            }))
+            .send()
+            .await?;
+
+        let body = resp.text().await?;
+        let todos_resp: TodoListResponse = serde_json::from_str(&body)?;
+
+        let projects_clone = todos_resp.projects.clone();
+        let todos: Vec<TuiTodo> = todos_resp
+            .todos
+            .into_iter()
+            .map(|t| {
+                let status = match t.status.as_str() {
+                    "backlog" => TuiTodoStatus::Backlog,
+                    "todo" => TuiTodoStatus::Todo,
+                    "in_progress" => TuiTodoStatus::InProgress,
+                    "blocked" => TuiTodoStatus::Blocked,
+                    "done" => TuiTodoStatus::Done,
+                    "cancelled" => TuiTodoStatus::Cancelled,
+                    _ => TuiTodoStatus::Todo,
+                };
+                let priority = match t.priority.as_str() {
+                    "urgent" => TuiPriority::Urgent,
+                    "high" => TuiPriority::High,
+                    "medium" => TuiPriority::Medium,
+                    "low" => TuiPriority::Low,
+                    _ => TuiPriority::Medium,
+                };
+                let project_name = t.project_id.as_ref().and_then(|pid| {
+                    projects_clone
+                        .iter()
+                        .find(|p| &p.id == pid)
+                        .map(|p| p.name.clone())
+                });
+                TuiTodo {
+                    id: t.id,
+                    content: t.content,
+                    status,
+                    priority,
+                    project_id: t.project_id,
+                    project_name,
+                    contexts: t.contexts,
+                    due_date: t.due_date.and_then(|d| d.parse().ok()),
+                    blocked_on: t.blocked_on,
+                    created_at: t.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                }
+            })
+            .collect();
+
+        let projects: Vec<TuiProject> = todos_resp
+            .projects
+            .into_iter()
+            .map(|p| TuiProject {
+                id: p.id,
+                name: p.name,
+                description: p.description,
+                status: p.status,
+                todo_count: 0,
+                completed_count: 0,
+            })
+            .collect();
+
+        let stats_resp = client
+            .post(format!("{}/api/todos/stats", base_url))
+            .header("X-API-Key", api_key)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "user_id": user_id }))
+            .send()
+            .await?;
+
+        let stats_body = stats_resp.text().await?;
+        let stats_resp: TodoStatsResponse = serde_json::from_str(&stats_body)?;
+
+        let todo_stats = TodoStats {
+            total: stats_resp.stats.total,
+            backlog: stats_resp.stats.backlog,
+            todo: stats_resp.stats.todo,
+            in_progress: stats_resp.stats.in_progress,
+            blocked: stats_resp.stats.blocked,
+            done: stats_resp.stats.done,
+            overdue: stats_resp.stats.overdue,
+        };
+
+        Ok((todos, projects, todo_stats))
     }
 
     async fn fetch_initial_data(&self) {
@@ -356,31 +459,40 @@ impl MemoryStream {
             state.graph_data.apply_force_layout(50);
         }
         // Fetch todos and projects
-        if let Ok((todos, projects, stats)) = self.fetch_todos(user_id).await {
-            let mut state = self.state.lock().await;
-            state.todos = todos;
-            state.projects = projects;
-            state.todo_stats = stats;
+        match self.fetch_todos(user_id).await {
+            Ok((todos, projects, stats)) => {
+                let mut state = self.state.lock().await;
+                state.todos = todos;
+                state.projects = projects;
+                state.todo_stats = stats;
+            }
+            Err(e) => {
+                let mut state = self.state.lock().await;
+                state.set_error(format!("Failed to load todos: {}", e));
+            }
         }
     }
 
     async fn fetch_todos(
         &self,
         user_id: &str,
-    ) -> Result<(Vec<TuiTodo>, Vec<TuiProject>, TodoStats), reqwest::Error> {
-        let todos_resp: TodoListResponse = self
+    ) -> Result<(Vec<TuiTodo>, Vec<TuiProject>, TodoStats), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self
             .client
             .post(format!("{}/api/todos/list", self.base_url))
             .header("X-API-Key", &self.api_key)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "user_id": user_id,
-                "include_done": false
+                "include_completed": false
             }))
             .send()
-            .await?
-            .json()
             .await?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+        let todos_resp: TodoListResponse = serde_json::from_str(&body)
+            .map_err(|e| format!("Parse todos: {} (status: {})", e, status))?;
 
         let projects_clone = todos_resp.projects.clone();
         let todos: Vec<TuiTodo> = todos_resp
@@ -437,16 +549,18 @@ impl MemoryStream {
             })
             .collect();
 
-        let stats_resp: TodoStatsResponse = self
+        let stats_resp_raw = self
             .client
             .post(format!("{}/api/todos/stats", self.base_url))
             .header("X-API-Key", &self.api_key)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({ "user_id": user_id }))
             .send()
-            .await?
-            .json()
             .await?;
+        let stats_status = stats_resp_raw.status();
+        let stats_body = stats_resp_raw.text().await?;
+        let stats_resp: TodoStatsResponse = serde_json::from_str(&stats_body)
+            .map_err(|e| format!("Parse stats: {} (status: {})", e, stats_status))?;
 
         let todo_stats = TodoStats {
             total: stats_resp.stats.total,
@@ -514,7 +628,22 @@ impl MemoryStream {
                 }
                 Ok(Event::Message(msg)) => {
                     if let Ok(e) = serde_json::from_str::<MemoryEvent>(&msg.data) {
+                        let is_todo_event = e.event_type.starts_with("TODO_");
+
+                        // Add event to activity feed
                         self.state.lock().await.add_event(e);
+
+                        // Refetch todos on todo events for live updates
+                        if is_todo_event {
+                            if let Ok((todos, projects, stats)) =
+                                Self::poll_todos(&self.client, &self.base_url, &self.api_key, &self.user_id).await
+                            {
+                                let mut state = self.state.lock().await;
+                                state.todos = todos;
+                                state.projects = projects;
+                                state.todo_stats = stats;
+                            }
+                        }
                     }
                 }
                 Err(reqwest_eventsource::Error::StreamEnded) | Err(_) => break,

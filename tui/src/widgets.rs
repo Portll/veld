@@ -1,9 +1,38 @@
 use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, SHODH_GRADIENT, SHODH_TEXT};
 use crate::types::{
-    AppState, DisplayEvent, SearchMode, SearchResult, TodoStats, TuiPriority, TuiTodo,
+    AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiPriority, TuiTodo,
     TuiTodoStatus, ViewMode, VERSION,
 };
 use ratatui::{prelude::*, widgets::*};
+
+// ============================================================================
+// SHANTI THEME - Hindu-inspired minimal aesthetic with pastel accents
+// ============================================================================
+
+/// Pastel Saffron - Active/In-Progress (soft, warm)
+const SAFFRON: Color = Color::Rgb(255, 183, 130);
+/// Pastel Gold - Success/Completed (soft golden)
+const GOLD: Color = Color::Rgb(255, 214, 130);
+/// Pastel Turmeric - Highlights/Due today
+const TURMERIC: Color = Color::Rgb(255, 200, 120);
+/// Pastel Rose - Blocked/Overdue (soft attention)
+const MAROON: Color = Color::Rgb(255, 140, 140);
+/// Deep Blue - Links/Connections
+const DEEP_BLUE: Color = Color::Rgb(130, 160, 220);
+/// Primary text - almost white
+const TEXT_PRIMARY: Color = Color::Rgb(240, 240, 240);
+/// Secondary text - muted grey
+const TEXT_SECONDARY: Color = Color::Rgb(160, 160, 160);
+/// Disabled/inactive text
+const TEXT_DISABLED: Color = Color::Rgb(100, 100, 100);
+/// Subtle borders
+const BORDER_SUBTLE: Color = Color::Rgb(50, 50, 50);
+/// Section dividers
+const BORDER_DIVIDER: Color = Color::Rgb(60, 60, 60);
+/// Surface/card background
+const SURFACE: Color = Color::Rgb(35, 35, 35);
+/// Live/connected indicator
+const LIVE_GREEN: Color = Color::Rgb(150, 230, 170);
 
 /// Apply opacity to a color (blend with black)
 fn apply_opacity(color: Color, opacity: f32) -> Color {
@@ -111,7 +140,7 @@ fn progress_bar(value: u32, max: u32, width: usize) -> String {
 pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Black));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -358,6 +387,7 @@ pub fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
     // Render the view first, then overlay transition effect on top
     match state.view_mode {
         ViewMode::Dashboard => render_dashboard(f, area, state),
+        ViewMode::Projects => render_projects_view(f, area, state),
         ViewMode::ActivityLogs => render_activity_logs(f, area, state),
         ViewMode::GraphList => render_graph_list(f, area, state),
         ViewMode::GraphMap => render_graph_map(f, area, state),
@@ -676,7 +706,7 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " MEMORY DETAIL ",
             Style::default()
@@ -765,23 +795,514 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
+    // 40/60 split: Todos+Stats on left, Activity on right
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(34),  // Stats
-            Constraint::Length(42),  // Todos
-            Constraint::Min(30),     // Activity
+            Constraint::Percentage(40),  // Todos + Stats
+            Constraint::Percentage(60),  // Activity
         ])
         .split(area);
-    render_stats_panel(f, chunks[0], state);
-    render_todos_panel(f, chunks[1], state);
-    render_activity_feed(f, chunks[2], state);
+
+    // Left panel: split vertically for todos (top) and stats (bottom)
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(10),      // Todos (expandable)
+            Constraint::Length(8),    // Stats summary (compact)
+        ])
+        .split(chunks[0]);
+
+    render_todos_panel(f, left_chunks[0], state);
+    render_compact_stats(f, left_chunks[1], state);
+    render_activity_feed(f, chunks[1], state);
+}
+
+// ============================================================================
+// PROJECTS VIEW - Full-width layout with proper spacing
+// ============================================================================
+
+/// Main Projects view - two-column layout
+fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
+    // 50/50 split
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+
+    render_projects_sidebar(f, columns[0], state);
+    render_todos_panel_right(f, columns[1], state);
+}
+
+/// Left sidebar - projects list
+fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),   // NOW indicator
+            Constraint::Min(5),      // Projects list
+            Constraint::Length(1),   // Footer
+        ])
+        .split(area);
+
+    render_now_indicator(f, chunks[0], state);
+
+    let inner = chunks[1];
+    let width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header with breathing room
+    let proj_count = state.projects.len();
+    let header_line = "─".repeat(width.saturating_sub(14));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" PROJECTS {} ", proj_count), Style::default().fg(TEXT_SECONDARY)),
+        Span::styled(header_line, Style::default().fg(Color::Rgb(40, 40, 40))),
+    ]));
+    lines.push(Line::from("")); // breathing room
+
+    // Render projects with folder icons
+    for (idx, project) in state.projects.iter().enumerate() {
+        if lines.len() >= inner.height as usize - 1 {
+            break;
+        }
+
+        let is_selected = state.projects_selected == idx;
+        let is_expanded = state.is_project_expanded(&project.id);
+        let todos = state.todos_for_project(&project.id);
+        let done = todos.iter().filter(|t| t.status == TuiTodoStatus::Done).count();
+        let active = todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress).count();
+        let remaining = todos.iter().filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled).count();
+        let total = todos.len();
+
+        // Folder icon: 📂 open, 📁 closed
+        let folder = if is_expanded { "📂" } else { "📁" };
+        let sel = if is_selected { "▸ " } else { "  " };
+        let name_width = width.saturating_sub(28);
+        let name = truncate(&project.name, name_width);
+
+        // Progress percentage
+        let pct = if total > 0 { (done * 100) / total } else { 0 };
+        let progress_color = if pct == 100 { GOLD } else if active > 0 { SAFFRON } else { TEXT_DISABLED };
+        let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+
+        // Format: "3 left · 75%"  or "✓ done" if complete
+        let status_str = if total == 0 {
+            "empty".to_string()
+        } else if pct == 100 {
+            "✓ done".to_string()
+        } else {
+            format!("{} left · {}%", remaining, pct)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(sel, Style::default().fg(SAFFRON).bg(bg)),
+            Span::styled(format!("{} ", folder), Style::default().bg(bg)),
+            Span::styled(format!("{:<w$}", name, w = name_width), Style::default().fg(TEXT_PRIMARY).bg(bg)),
+            Span::styled(format!(" {:<12}", status_str), Style::default().fg(progress_color).bg(bg)),
+        ]));
+
+        // Expanded todos with indentation
+        if is_expanded {
+            for todo in todos.iter().take(5) {
+                if lines.len() >= inner.height as usize - 1 {
+                    break;
+                }
+                lines.push(render_project_todo(todo, width));
+            }
+            if todos.len() > 5 {
+                lines.push(Line::from(Span::styled(
+                    format!("       +{} more", todos.len() - 5),
+                    Style::default().fg(TEXT_DISABLED),
+                )));
+            }
+            lines.push(Line::from("")); // space after expanded project
+        }
+    }
+
+    // INBOX section with spacing
+    let standalone = state.standalone_todos();
+    if !standalone.is_empty() && lines.len() < inner.height as usize - 2 {
+        lines.push(Line::from("")); // breathing room
+        let inbox_line = "─".repeat(width.saturating_sub(12));
+        lines.push(Line::from(vec![
+            Span::styled(format!(" INBOX {} ", standalone.len()), Style::default().fg(TEXT_SECONDARY)),
+            Span::styled(inbox_line, Style::default().fg(Color::Rgb(40, 40, 40))),
+        ]));
+        lines.push(Line::from("")); // breathing room
+        for todo in standalone.iter().take(5) {
+            if lines.len() >= inner.height as usize {
+                break;
+            }
+            lines.push(render_project_todo(todo, width));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Footer shows panel focus state
+    let is_focused = state.focus_panel == FocusPanel::Left;
+    let footer = if is_focused {
+        Line::from(vec![
+            Span::styled(" ▸ ", Style::default().fg(SAFFRON)),
+            Span::styled("↑↓", Style::default().fg(TEXT_SECONDARY)),
+            Span::styled(" navigate  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("→", Style::default().fg(TEXT_SECONDARY)),
+            Span::styled(" todos  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("Enter", Style::default().fg(TEXT_SECONDARY)),
+            Span::styled(" expand", Style::default().fg(Color::Rgb(60, 60, 60))),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled("←", Style::default().fg(TEXT_DISABLED)),
+            Span::styled(" return", Style::default().fg(Color::Rgb(50, 50, 50))),
+        ])
+    };
+    f.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+/// NOW indicator - status with spacing
+fn render_now_indicator(f: &mut Frame, area: Rect, state: &AppState) {
+    let in_progress = state.in_progress_todos();
+    let (overdue, due_today, _blocked) = state.attention_counts();
+    let width = area.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Line 1: NOW badge + current task
+    if let Some(current) = in_progress.first() {
+        let duration = format_duration_since(&current.created_at);
+        let task_width = width.saturating_sub(18);
+        lines.push(Line::from(vec![
+            Span::styled(" NOW ", Style::default().fg(Color::Rgb(40, 30, 20)).bg(SAFFRON)),
+            Span::styled("  ", Style::default()),
+            Span::styled(truncate(&current.content, task_width), Style::default().fg(TEXT_PRIMARY)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("       ⏱ ", Style::default().fg(TEXT_DISABLED)),
+            Span::styled(duration, Style::default().fg(SAFFRON)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" NOW ", Style::default().fg(Color::Rgb(100, 100, 100)).bg(Color::Rgb(50, 50, 50))),
+            Span::styled("  ─ idle ─", Style::default().fg(TEXT_DISABLED)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // Line 3: alerts if any
+    if overdue > 0 || due_today > 0 {
+        let mut alerts: Vec<Span> = vec![Span::styled(" ", Style::default())];
+        if overdue > 0 {
+            alerts.push(Span::styled(format!("⚠ {} overdue", overdue), Style::default().fg(MAROON)));
+            alerts.push(Span::styled("   ", Style::default()));
+        }
+        if due_today > 0 {
+            alerts.push(Span::styled(format!("{} due today", due_today), Style::default().fg(TURMERIC)));
+        }
+        lines.push(Line::from(alerts));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Right panel - todos for selected project
+fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
+    let width = area.width as usize;
+    let is_focused = state.focus_panel == FocusPanel::Right;
+
+    // Split area for header, content, and footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),      // Content
+            Constraint::Length(1),   // Footer
+        ])
+        .split(area);
+
+    let content_area = chunks[0];
+    let content_height = content_area.height as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Get todos for selected project or inbox
+    let (title, todos): (String, Vec<&TuiTodo>) = if state.projects_selected < state.projects.len() {
+        let project = &state.projects[state.projects_selected];
+        (project.name.clone(), state.todos_for_project(&project.id))
+    } else {
+        ("Inbox".to_string(), state.standalone_todos())
+    };
+
+    // Header with focus indicator
+    let header_line = "─".repeat(width.saturating_sub(title.len() + 6));
+    let focus_indicator = if is_focused { "▸ " } else { "  " };
+    lines.push(Line::from(vec![
+        Span::styled(focus_indicator, Style::default().fg(SAFFRON)),
+        Span::styled(format!("{} ", title), Style::default().fg(TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(header_line, Style::default().fg(Color::Rgb(40, 40, 40))),
+    ]));
+    lines.push(Line::from("")); // breathing room
+
+    if todos.is_empty() {
+        lines.push(Line::from(Span::styled("   No tasks yet", Style::default().fg(TEXT_DISABLED))));
+    } else {
+        // Build flat list of todos for selection tracking
+        let mut flat_todos: Vec<&TuiTodo> = Vec::new();
+
+        // Collect in order: in_progress, todo, blocked, done
+        let in_progress: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress).cloned().collect();
+        let todo_items: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Todo).cloned().collect();
+        let blocked: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked).cloned().collect();
+        let done: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Done).cloned().collect();
+
+        flat_todos.extend(in_progress.iter());
+        flat_todos.extend(todo_items.iter());
+        flat_todos.extend(blocked.iter());
+        flat_todos.extend(done.iter());
+
+        let mut todo_idx = 0;
+
+        // In Progress section
+        if !in_progress.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(" ◐ In Progress ({})", in_progress.len()),
+                Style::default().fg(SAFFRON),
+            )));
+            lines.push(Line::from("")); // space after header
+            for todo in in_progress.iter().take(4) {
+                if lines.len() >= content_height - 1 { break; }
+                let is_selected = is_focused && state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected));
+                todo_idx += 1;
+            }
+            lines.push(Line::from("")); // section separator
+        }
+
+        // Todo section
+        if !todo_items.is_empty() && lines.len() < content_height - 2 {
+            lines.push(Line::from(Span::styled(
+                format!(" ○ Todo ({})", todo_items.len()),
+                Style::default().fg(TEXT_SECONDARY),
+            )));
+            lines.push(Line::from("")); // space after header
+            let max_todos = (content_height.saturating_sub(lines.len() + 4)).min(8);
+            for todo in todo_items.iter().take(max_todos) {
+                if lines.len() >= content_height - 1 { break; }
+                let is_selected = is_focused && state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected));
+                todo_idx += 1;
+            }
+            if todo_items.len() > max_todos {
+                lines.push(Line::from(Span::styled(
+                    format!("      +{} more", todo_items.len() - max_todos),
+                    Style::default().fg(TEXT_DISABLED),
+                )));
+            }
+            lines.push(Line::from("")); // section separator
+        }
+
+        // Blocked section
+        if !blocked.is_empty() && lines.len() < content_height - 2 {
+            lines.push(Line::from(Span::styled(
+                format!(" ⊘ Blocked ({})", blocked.len()),
+                Style::default().fg(MAROON),
+            )));
+            lines.push(Line::from("")); // space after header
+            for todo in blocked.iter().take(3) {
+                if lines.len() >= content_height - 1 { break; }
+                let is_selected = is_focused && state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected));
+                todo_idx += 1;
+            }
+            lines.push(Line::from("")); // section separator
+        }
+
+        // Done section (collapsed, not navigable)
+        if !done.is_empty() && lines.len() < content_height {
+            lines.push(Line::from(Span::styled(
+                format!(" ● Completed ({})", done.len()),
+                Style::default().fg(TEXT_DISABLED),
+            )));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), content_area);
+
+    // Footer shows panel state
+    let footer = if is_focused {
+        Line::from(vec![
+            Span::styled(" ▸ ", Style::default().fg(SAFFRON)),
+            Span::styled("↑↓", Style::default().fg(TEXT_SECONDARY)),
+            Span::styled(" navigate  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("←", Style::default().fg(TEXT_SECONDARY)),
+            Span::styled(" projects", Style::default().fg(Color::Rgb(60, 60, 60))),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled("→", Style::default().fg(TEXT_DISABLED)),
+            Span::styled(" navigate tasks", Style::default().fg(Color::Rgb(50, 50, 50))),
+        ])
+    };
+    f.render_widget(Paragraph::new(footer), chunks[1]);
+}
+
+/// Render a todo row with full width
+fn render_todo_row(todo: &TuiTodo, width: usize) -> Line<'static> {
+    let (icon, color) = match todo.status {
+        TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
+        TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
+        TuiTodoStatus::InProgress => ("◐", SAFFRON),
+        TuiTodoStatus::Blocked => ("⊘", MAROON),
+        TuiTodoStatus::Done => ("●", GOLD),
+        TuiTodoStatus::Cancelled => ("⊗", TEXT_DISABLED),
+    };
+
+    let priority = match todo.priority {
+        TuiPriority::Urgent => ("!!!", MAROON),
+        TuiPriority::High => ("!! ", SAFFRON),
+        TuiPriority::Medium => ("!  ", TEXT_DISABLED),
+        TuiPriority::Low => ("   ", TEXT_DISABLED),
+    };
+
+    let content_width = width.saturating_sub(15);
+    let content = truncate(&todo.content, content_width);
+
+    let mut spans = vec![
+        Span::styled("   ", Style::default()),
+        Span::styled(format!("{} ", icon), Style::default().fg(color)),
+        Span::styled(priority.0, Style::default().fg(priority.1)),
+        Span::styled(content, Style::default().fg(if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY })),
+    ];
+
+    if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            spans.push(Span::styled(format!(" {}", label), Style::default().fg(MAROON)));
+        }
+    }
+
+    Line::from(spans)
+}
+
+/// Render a todo row with selection highlighting
+fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: bool) -> Line<'static> {
+    let (icon, color) = match todo.status {
+        TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
+        TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
+        TuiTodoStatus::InProgress => ("◐", SAFFRON),
+        TuiTodoStatus::Blocked => ("⊘", MAROON),
+        TuiTodoStatus::Done => ("●", GOLD),
+        TuiTodoStatus::Cancelled => ("⊗", TEXT_DISABLED),
+    };
+
+    let priority = match todo.priority {
+        TuiPriority::Urgent => ("!!!", MAROON),
+        TuiPriority::High => ("!! ", SAFFRON),
+        TuiPriority::Medium => ("!  ", TEXT_DISABLED),
+        TuiPriority::Low => ("   ", TEXT_DISABLED),
+    };
+
+    let content_width = width.saturating_sub(18);
+    let content = truncate(&todo.content, content_width);
+
+    // Selection indicator and background
+    let sel_marker = if is_selected { "▸ " } else { "   " };
+    let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+    let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
+
+    let mut spans = vec![
+        Span::styled(sel_marker, Style::default().fg(SAFFRON).bg(bg)),
+        Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
+        Span::styled(priority.0, Style::default().fg(priority.1).bg(bg)),
+        Span::styled(content, Style::default().fg(text_color).bg(bg)),
+    ];
+
+    if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            spans.push(Span::styled(format!(" {}", label), Style::default().fg(MAROON).bg(bg)));
+        }
+    }
+
+    // Pad to full width for consistent background
+    let used_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used_width < width && is_selected {
+        spans.push(Span::styled(" ".repeat(width.saturating_sub(used_width)), Style::default().bg(bg)));
+    }
+
+    Line::from(spans)
+}
+
+/// Render todo under expanded project in sidebar
+fn render_project_todo(todo: &TuiTodo, _width: usize) -> Line<'static> {
+    let (icon, color) = match todo.status {
+        TuiTodoStatus::InProgress => ("◐", SAFFRON),
+        TuiTodoStatus::Todo => ("○", TEXT_DISABLED),
+        TuiTodoStatus::Done => ("●", GOLD),
+        _ => ("○", TEXT_DISABLED),
+    };
+
+    Line::from(vec![
+        Span::styled("      ", Style::default()),
+        Span::styled(format!("{} ", icon), Style::default().fg(color)),
+        Span::styled(truncate(&todo.content, 25), Style::default().fg(TEXT_SECONDARY)),
+    ])
+}
+
+/// Format duration since a timestamp
+fn format_duration_since(created_at: &chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(*created_at);
+
+    let hours = duration.num_hours();
+    let mins = duration.num_minutes() % 60;
+
+    if hours > 0 {
+        format!("{}h {:02}m", hours, mins)
+    } else {
+        format!("{}m", mins)
+    }
+}
+
+/// Compact stats panel for dashboard
+fn render_compact_stats(f: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Black))
+        .title(Span::styled(" Stats ", Style::default().fg(Color::Rgb(255, 215, 0))));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let stats_line1 = Line::from(vec![
+        Span::styled("Memories: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", state.total_memories), Style::default().fg(Color::White)),
+        Span::styled("  Recalls: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", state.total_recalls), Style::default().fg(Color::White)),
+    ]);
+
+    let stats_line2 = Line::from(vec![
+        Span::styled("W:", Style::default().fg(Color::Yellow)),
+        Span::styled(format!("{} ", state.tier_stats.working), Style::default().fg(Color::White)),
+        Span::styled("S:", Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{} ", state.tier_stats.session), Style::default().fg(Color::White)),
+        Span::styled("L:", Style::default().fg(Color::Green)),
+        Span::styled(format!("{}", state.tier_stats.long_term), Style::default().fg(Color::White)),
+        Span::styled("  Nodes:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", state.graph_stats.nodes), Style::default().fg(Color::Magenta)),
+    ]);
+
+    let text = vec![stats_line1, stats_line2];
+    let paragraph = Paragraph::new(text);
+    f.render_widget(paragraph, inner);
 }
 
 fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Black));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -980,12 +1501,16 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
 
 
 fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
+    // Show both vec len and stats total for debugging
+    let active_count = state.todos.len();
+    let project_count = state.projects.len();
+    let with_project = state.todos.iter().filter(|t| t.project_name.is_some()).count();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
-            format!(" TODO ({}) ", state.todo_stats.total - state.todo_stats.done),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            format!(" TODO ({}) [P:{}/{}] ", active_count, with_project, project_count),
+            Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1001,49 +1526,102 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
     // Group todos by status for Linear-style display
     let mut lines: Vec<Line> = Vec::new();
 
-    // In Progress section
+    // Calculate available height for todos (leave room for stats summary)
+    let available_lines = inner.height.saturating_sub(3) as usize;
+    let mut used_lines = 0;
+
+    // In Progress section (priority - show more)
     let in_progress: Vec<_> = state.todos.iter()
         .filter(|t| t.status == TuiTodoStatus::InProgress)
         .collect();
-    if !in_progress.is_empty() {
+    if !in_progress.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            "◐ In Progress",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            format!("◐ In Progress ({})", in_progress.len()),
+            Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD),
         )));
-        for todo in in_progress.iter().take(3) {
+        used_lines += 1;
+        let show_count = (available_lines - used_lines).min(in_progress.len()).min(4);
+        for todo in in_progress.iter().take(show_count) {
             lines.push(render_todo_line(todo));
+            used_lines += 1;
         }
-        lines.push(Line::from(""));
+        if in_progress.len() > show_count {
+            lines.push(Line::from(Span::styled(
+                format!("  +{} more", in_progress.len() - show_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+            used_lines += 1;
+        }
     }
 
     // Todo section
     let todos: Vec<_> = state.todos.iter()
         .filter(|t| t.status == TuiTodoStatus::Todo)
         .collect();
-    if !todos.is_empty() {
+    if !todos.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            "○ Todo",
+            format!("○ Todo ({})", todos.len()),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         )));
-        for todo in todos.iter().take(3) {
+        used_lines += 1;
+        let show_count = (available_lines - used_lines).min(todos.len()).min(4);
+        for todo in todos.iter().take(show_count) {
             lines.push(render_todo_line(todo));
+            used_lines += 1;
         }
-        lines.push(Line::from(""));
+        if todos.len() > show_count {
+            lines.push(Line::from(Span::styled(
+                format!("  +{} more", todos.len() - show_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+            used_lines += 1;
+        }
     }
 
     // Blocked section
     let blocked: Vec<_> = state.todos.iter()
         .filter(|t| t.status == TuiTodoStatus::Blocked)
         .collect();
-    if !blocked.is_empty() {
+    if !blocked.is_empty() && used_lines < available_lines {
         lines.push(Line::from(Span::styled(
-            "⊘ Blocked",
+            format!("⊘ Blocked ({})", blocked.len()),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
-        for todo in blocked.iter().take(2) {
+        used_lines += 1;
+        let show_count = (available_lines - used_lines).min(blocked.len()).min(3);
+        for todo in blocked.iter().take(show_count) {
+            lines.push(render_todo_line(todo));
+            used_lines += 1;
+        }
+        if blocked.len() > show_count {
+            lines.push(Line::from(Span::styled(
+                format!("  +{} more", blocked.len() - show_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+            used_lines += 1;
+        }
+    }
+
+    // Backlog section
+    let backlog: Vec<_> = state.todos.iter()
+        .filter(|t| t.status == TuiTodoStatus::Backlog)
+        .collect();
+    if !backlog.is_empty() && used_lines < available_lines {
+        lines.push(Line::from(Span::styled(
+            format!("◌ Backlog ({})", backlog.len()),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        used_lines += 1;
+        let show_count = (available_lines - used_lines).min(backlog.len()).min(2);
+        for todo in backlog.iter().take(show_count) {
             lines.push(render_todo_line(todo));
         }
-        lines.push(Line::from(""));
+        if backlog.len() > show_count {
+            lines.push(Line::from(Span::styled(
+                format!("  +{} more", backlog.len() - show_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     // Stats summary at bottom
@@ -1051,7 +1629,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("─".repeat(inner.width as usize - 2), Style::default().fg(Color::DarkGray)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(format!("◐{} ", state.todo_stats.in_progress), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("◐{} ", state.todo_stats.in_progress), Style::default().fg(Color::Rgb(255, 215, 0))),
         Span::styled(format!("○{} ", state.todo_stats.todo), Style::default().fg(Color::White)),
         Span::styled(format!("⊘{} ", state.todo_stats.blocked), Style::default().fg(Color::Red)),
         Span::styled(format!("●{}", state.todo_stats.done), Style::default().fg(Color::Green)),
@@ -1080,14 +1658,28 @@ fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
         ),
     ];
 
-    // Content (truncated)
-    let max_content_len = 28;
+    // Content (truncated based on whether we have project name)
+    let has_project = todo.project_name.is_some();
+    let max_content_len = if has_project { 18 } else { 28 };
     let content = if todo.content.len() > max_content_len {
         format!("{}…", &todo.content[..max_content_len])
     } else {
         todo.content.clone()
     };
     spans.push(Span::styled(content, Style::default().fg(Color::White)));
+
+    // Project name (if any)
+    if let Some(project) = &todo.project_name {
+        let short_project = if project.len() > 12 {
+            format!("{}…", &project[..12])
+        } else {
+            project.clone()
+        };
+        spans.push(Span::styled(
+            format!("  {}", short_project),
+            Style::default().fg(Color::Rgb(180, 180, 180)),
+        ));
+    }
 
     // Due date or blocked indicator
     if todo.is_overdue() {
@@ -1115,11 +1707,11 @@ fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
 fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " Activity ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 215, 0))
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
@@ -1567,7 +2159,7 @@ fn render_event_detail(f: &mut Frame, area: Rect, event: &DisplayEvent, state: &
 fn render_activity_logs(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " ACTIVITY LOGS ",
             Style::default()
@@ -1946,7 +2538,7 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
     let selected_idx = state.graph_data.selected_node;
     let left_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " NODES ",
             Style::default()
@@ -2064,7 +2656,7 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
     // RIGHT: Edges from selected node
     let right_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " EDGES ",
             Style::default()
@@ -2181,7 +2773,7 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " TOP ENTITIES ",
             Style::default()
@@ -2316,7 +2908,7 @@ fn render_graph_focus_view(f: &mut Frame, area: Rect, state: &AppState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             format!(" {} ", selected_name),
             Style::default()
@@ -2513,7 +3105,7 @@ fn render_graph_focus_view(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(Color::Black))
         .title(Span::styled(
             " TYPES ",
             Style::default()
@@ -2644,9 +3236,10 @@ fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
 pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     let view_name = match state.view_mode {
         ViewMode::Dashboard => "Dashboard",
-        ViewMode::ActivityLogs => "Logs",
-        ViewMode::GraphList => "Graph List",
-        ViewMode::GraphMap => "Graph Map",
+        ViewMode::Projects => "Projects",
+        ViewMode::ActivityLogs => "Activity",
+        ViewMode::GraphList => "Graph",
+        ViewMode::GraphMap => "Map",
     };
 
     // Check for error message

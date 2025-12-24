@@ -7834,6 +7834,18 @@ async fn create_todo(
 
     let formatted = todo_formatter::format_todo_created(&todo, project_name.as_deref());
 
+    // Emit SSE event for live TUI updates
+    state.emit_event(MemoryEvent {
+        event_type: "TODO_CREATE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(todo.id.0.to_string()),
+        content_preview: Some(todo.content.clone()),
+        memory_type: Some(format!("{:?}", todo.status)),
+        importance: None,
+        count: None,
+    });
+
     tracing::info!(
         user_id = %req.user_id,
         todo_id = %todo.id,
@@ -8048,6 +8060,18 @@ async fn update_todo(
 
     let formatted = todo_formatter::format_todo_updated(&todo, project_name.as_deref());
 
+    // Emit SSE event for live TUI updates
+    state.emit_event(MemoryEvent {
+        event_type: "TODO_UPDATE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(todo.id.0.to_string()),
+        content_preview: Some(todo.content.clone()),
+        memory_type: Some(format!("{:?}", todo.status)),
+        importance: None,
+        count: None,
+    });
+
     tracing::info!(
         user_id = %req.user_id,
         todo_id = %todo.id,
@@ -8086,6 +8110,18 @@ async fn complete_todo(
     match result {
         Some((completed, next)) => {
             let formatted = todo_formatter::format_todo_completed(&completed, next.as_ref());
+
+            // Emit SSE event for live TUI updates
+            state.emit_event(MemoryEvent {
+                event_type: "TODO_COMPLETE".to_string(),
+                timestamp: chrono::Utc::now(),
+                user_id: req.user_id.clone(),
+                memory_id: Some(completed.id.0.to_string()),
+                content_preview: Some(completed.content.clone()),
+                memory_type: Some("Done".to_string()),
+                importance: None,
+                count: None,
+            });
 
             tracing::info!(
                 user_id = %req.user_id,
@@ -8132,6 +8168,18 @@ async fn delete_todo(
     };
 
     if success {
+        // Emit SSE event for live TUI updates
+        state.emit_event(MemoryEvent {
+            event_type: "TODO_DELETE".to_string(),
+            timestamp: chrono::Utc::now(),
+            user_id: query.user_id.clone(),
+            memory_id: Some(todo.id.0.to_string()),
+            content_preview: Some(todo.content.clone()),
+            memory_type: None,
+            importance: None,
+            count: None,
+        });
+
         tracing::info!(
             user_id = %query.user_id,
             todo_id = %todo.id,

@@ -429,9 +429,18 @@ impl SmoothScroll {
 pub enum ViewMode {
     #[default]
     Dashboard,
+    Projects,
     ActivityLogs,
     GraphList,
     GraphMap,
+}
+
+/// Which panel is focused in Projects view
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FocusPanel {
+    #[default]
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -1034,7 +1043,7 @@ impl TuiTodoStatus {
         match self {
             TuiTodoStatus::Backlog => Color::DarkGray,
             TuiTodoStatus::Todo => Color::White,
-            TuiTodoStatus::InProgress => Color::Cyan,
+            TuiTodoStatus::InProgress => Color::Rgb(255, 215, 0),
             TuiTodoStatus::Blocked => Color::Red,
             TuiTodoStatus::Done => Color::Green,
             TuiTodoStatus::Cancelled => Color::DarkGray,
@@ -1236,6 +1245,16 @@ pub struct AppState {
     pub activity_current_count: u8,
     /// Last event timestamp for "last activity" display
     pub last_event_time: Option<Instant>,
+    /// Expanded projects in Projects view (project IDs)
+    pub expanded_projects: std::collections::HashSet<String>,
+    /// Selected item index in Projects view (flat list index)
+    pub projects_selected: usize,
+    /// Scroll offset for Projects view
+    pub projects_scroll: usize,
+    /// Which panel is focused in Projects view (Left = projects, Right = todos)
+    pub focus_panel: FocusPanel,
+    /// Selected todo index in right panel for Projects view
+    pub todos_selected: usize,
 }
 
 impl AppState {
@@ -1294,6 +1313,11 @@ impl AppState {
             activity_last_second: 0,
             activity_current_count: 0,
             last_event_time: None,
+            expanded_projects: std::collections::HashSet::new(),
+            projects_selected: 0,
+            projects_scroll: 0,
+            focus_panel: FocusPanel::default(),
+            todos_selected: 0,
         }
     }
 
@@ -1488,7 +1512,8 @@ impl AppState {
 
     pub fn cycle_view(&mut self) {
         let new_mode = match self.view_mode {
-            ViewMode::Dashboard => ViewMode::ActivityLogs,
+            ViewMode::Dashboard => ViewMode::Projects,
+            ViewMode::Projects => ViewMode::ActivityLogs,
             ViewMode::ActivityLogs => ViewMode::GraphList,
             ViewMode::GraphList => ViewMode::GraphMap,
             ViewMode::GraphMap => ViewMode::Dashboard,
@@ -1827,5 +1852,100 @@ impl AppState {
     /// Get fractional scroll offset for sub-pixel rendering hints
     pub fn scroll_fraction(&self) -> f32 {
         self.smooth_scroll.fractional_offset()
+    }
+
+    /// Toggle project expansion in Projects view
+    pub fn toggle_project_expansion(&mut self, project_id: &str) {
+        if self.expanded_projects.contains(project_id) {
+            self.expanded_projects.remove(project_id);
+        } else {
+            self.expanded_projects.insert(project_id.to_string());
+        }
+    }
+
+    /// Check if a project is expanded
+    pub fn is_project_expanded(&self, project_id: &str) -> bool {
+        self.expanded_projects.contains(project_id)
+    }
+
+    /// Get in-progress todos for NOW bar
+    pub fn in_progress_todos(&self) -> Vec<&TuiTodo> {
+        self.todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::InProgress)
+            .collect()
+    }
+
+    /// Get overdue/due today/blocked counts for attention bar
+    pub fn attention_counts(&self) -> (usize, usize, usize) {
+        let overdue = self.todos.iter().filter(|t| t.is_overdue()).count();
+        let due_today = self.todos.iter().filter(|t| {
+            if let Some(due) = &t.due_date {
+                let now = chrono::Utc::now();
+                due.date_naive() == now.date_naive() && !t.is_overdue()
+            } else {
+                false
+            }
+        }).count();
+        let blocked = self.todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked).count();
+        (overdue, due_today, blocked)
+    }
+
+    /// Get todos for a specific project
+    pub fn todos_for_project(&self, project_id: &str) -> Vec<&TuiTodo> {
+        self.todos
+            .iter()
+            .filter(|t| t.project_id.as_deref() == Some(project_id))
+            .collect()
+    }
+
+    /// Get standalone todos (no project)
+    pub fn standalone_todos(&self) -> Vec<&TuiTodo> {
+        self.todos
+            .iter()
+            .filter(|t| t.project_id.is_none())
+            .collect()
+    }
+
+    /// Toggle focus between left and right panel in Projects view
+    pub fn toggle_focus_panel(&mut self) {
+        self.focus_panel = match self.focus_panel {
+            FocusPanel::Left => FocusPanel::Right,
+            FocusPanel::Right => FocusPanel::Left,
+        };
+        // Reset right panel selection when switching to it
+        if self.focus_panel == FocusPanel::Right {
+            self.todos_selected = 0;
+        }
+    }
+
+    /// Get todos visible in the right panel (for current project selection)
+    pub fn visible_todos_right_panel(&self) -> Vec<&TuiTodo> {
+        if self.projects_selected < self.projects.len() {
+            let project_id = &self.projects[self.projects_selected].id;
+            self.todos_for_project(project_id)
+        } else {
+            self.standalone_todos()
+        }
+    }
+
+    /// Get count of todos visible in the right panel
+    pub fn visible_todos_count(&self) -> usize {
+        self.visible_todos_right_panel().len()
+    }
+
+    /// Navigate up in right panel
+    pub fn right_panel_up(&mut self) {
+        if self.todos_selected > 0 {
+            self.todos_selected -= 1;
+        }
+    }
+
+    /// Navigate down in right panel
+    pub fn right_panel_down(&mut self) {
+        let max = self.visible_todos_count().saturating_sub(1);
+        if self.todos_selected < max {
+            self.todos_selected += 1;
+        }
     }
 }

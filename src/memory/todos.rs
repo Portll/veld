@@ -468,14 +468,14 @@ impl TodoStore {
         let user_key = format!("user:{}:{}", project.user_id, project.id.0);
         self.index_db.put(user_key.as_bytes(), b"p")?; // 'p' for project
 
-        // Index by name (for lookup)
+        // Index by name (for lookup) - store as string for easy parsing
         let name_key = format!(
             "project_name:{}:{}",
             project.name.to_lowercase(),
             project.user_id
         );
         self.index_db
-            .put(name_key.as_bytes(), project.id.0.as_bytes())?;
+            .put(name_key.as_bytes(), project.id.0.to_string().as_bytes())?;
 
         tracing::debug!(project_id = %project.id.0, name = %project.name, "Stored project");
 

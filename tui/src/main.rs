@@ -25,7 +25,7 @@ mod widgets;
 
 use logo::{ELEPHANT, ELEPHANT_FRAMES, SHODH_GRADIENT, SHODH_TEXT};
 use stream::MemoryStream;
-use types::{AppState, SearchMode, ViewMode};
+use types::{AppState, FocusPanel, SearchMode, ViewMode};
 use widgets::{render_footer, render_header, render_main};
 
 /// Set the terminal window title
@@ -37,6 +37,7 @@ fn set_terminal_title(title: &str) {
 fn generate_title(state: &AppState) -> String {
     let view_name = match state.view_mode {
         ViewMode::Dashboard => "Dashboard",
+        ViewMode::Projects => "Projects",
         ViewMode::ActivityLogs => "Activity",
         ViewMode::GraphList => "Graph",
         ViewMode::GraphMap => "Map",
@@ -795,7 +796,13 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             g.start_search();
                         }
                         KeyCode::Char('c') => g.events.clear(),
+                        KeyCode::Char('1') => g.set_view(ViewMode::Dashboard),
+                        KeyCode::Char('2') => g.set_view(ViewMode::Projects),
+                        KeyCode::Char('3') => g.set_view(ViewMode::ActivityLogs),
+                        KeyCode::Char('4') => g.set_view(ViewMode::GraphList),
+                        KeyCode::Char('5') => g.set_view(ViewMode::GraphMap),
                         KeyCode::Char('d') => g.set_view(ViewMode::Dashboard),
+                        KeyCode::Char('p') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),
                         KeyCode::Char('g') => g.set_view(ViewMode::GraphList),
                         KeyCode::Char('m') => g.set_view(ViewMode::GraphMap),
@@ -907,15 +914,68 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         KeyCode::Tab => g.cycle_view(),
                         KeyCode::Up | KeyCode::Char('k') => match g.view_mode {
                             ViewMode::Dashboard | ViewMode::ActivityLogs => g.select_event_prev(),
+                            ViewMode::Projects => {
+                                match g.focus_panel {
+                                    FocusPanel::Left => {
+                                        if g.projects_selected > 0 {
+                                            g.projects_selected -= 1;
+                                        }
+                                    }
+                                    FocusPanel::Right => g.right_panel_up(),
+                                }
+                            }
                             _ => g.scroll_up(),
                         },
                         KeyCode::Down | KeyCode::Char('j') => match g.view_mode {
                             ViewMode::Dashboard | ViewMode::ActivityLogs => g.select_event_next(),
+                            ViewMode::Projects => {
+                                match g.focus_panel {
+                                    FocusPanel::Left => {
+                                        let total_items = g.projects.len() + g.standalone_todos().len();
+                                        if g.projects_selected < total_items.saturating_sub(1) {
+                                            g.projects_selected += 1;
+                                        }
+                                    }
+                                    FocusPanel::Right => g.right_panel_down(),
+                                }
+                            }
                             _ => g.scroll_down(),
                         },
-                        KeyCode::Enter => {
-                            if g.selected_event.is_none() && !g.events.is_empty() {
-                                g.selected_event = Some(0);
+                        KeyCode::Left => {
+                            if matches!(g.view_mode, ViewMode::Projects) && g.focus_panel == FocusPanel::Right {
+                                g.focus_panel = FocusPanel::Left;
+                            } else if matches!(g.view_mode, ViewMode::GraphMap) {
+                                g.rotate_graph_left();
+                            }
+                        }
+                        KeyCode::Right => {
+                            if matches!(g.view_mode, ViewMode::Projects) && g.focus_panel == FocusPanel::Left {
+                                g.focus_panel = FocusPanel::Right;
+                                g.todos_selected = 0;
+                            } else if matches!(g.view_mode, ViewMode::GraphMap) {
+                                g.rotate_graph_right();
+                            }
+                        }
+                        KeyCode::Enter => match g.view_mode {
+                            ViewMode::Projects => {
+                                match g.focus_panel {
+                                    FocusPanel::Left => {
+                                        // Toggle expansion of selected project
+                                        if g.projects_selected < g.projects.len() {
+                                            let project_id =
+                                                g.projects[g.projects_selected].id.clone();
+                                            g.toggle_project_expansion(&project_id);
+                                        }
+                                    }
+                                    FocusPanel::Right => {
+                                        // Future: toggle todo status or view detail
+                                    }
+                                }
+                            }
+                            _ => {
+                                if g.selected_event.is_none() && !g.events.is_empty() {
+                                    g.selected_event = Some(0);
+                                }
                             }
                         }
                         KeyCode::Backspace => g.clear_event_selection(),
@@ -924,6 +984,16 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 match g.view_mode {
                                     ViewMode::Dashboard | ViewMode::ActivityLogs => {
                                         g.select_event_prev()
+                                    }
+                                    ViewMode::Projects => {
+                                        match g.focus_panel {
+                                            FocusPanel::Left => {
+                                                if g.projects_selected > 0 {
+                                                    g.projects_selected -= 1;
+                                                }
+                                            }
+                                            FocusPanel::Right => g.right_panel_up(),
+                                        }
                                     }
                                     _ => g.scroll_up(),
                                 }
@@ -935,16 +1005,42 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     ViewMode::Dashboard | ViewMode::ActivityLogs => {
                                         g.select_event_next()
                                     }
+                                    ViewMode::Projects => {
+                                        match g.focus_panel {
+                                            FocusPanel::Left => {
+                                                let total_items =
+                                                    g.projects.len() + g.standalone_todos().len();
+                                                if g.projects_selected < total_items.saturating_sub(1) {
+                                                    g.projects_selected += 1;
+                                                }
+                                            }
+                                            FocusPanel::Right => g.right_panel_down(),
+                                        }
+                                    }
                                     _ => g.scroll_down(),
                                 }
                             }
                         }
                         KeyCode::Home => {
                             g.scroll_offset = 0;
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::ActivityLogs)
-                                && !g.events.is_empty()
-                            {
-                                g.selected_event = Some(0);
+                            match g.view_mode {
+                                ViewMode::Dashboard | ViewMode::ActivityLogs => {
+                                    if !g.events.is_empty() {
+                                        g.selected_event = Some(0);
+                                    }
+                                }
+                                ViewMode::Projects => {
+                                    match g.focus_panel {
+                                        FocusPanel::Left => {
+                                            g.projects_selected = 0;
+                                            g.projects_scroll = 0;
+                                        }
+                                        FocusPanel::Right => {
+                                            g.todos_selected = 0;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         _ => {}
@@ -1434,12 +1530,14 @@ fn ui(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
-            Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(9),  // Header with logo
+            Constraint::Length(1),  // Spacer
+            Constraint::Min(10),    // Main content
+            Constraint::Length(3),  // Footer
         ])
         .split(f.area());
     render_header(f, chunks[0], state);
-    render_main(f, chunks[1], state);
-    render_footer(f, chunks[2], state);
+    // chunks[1] is spacer - empty
+    render_main(f, chunks[2], state);
+    render_footer(f, chunks[3], state);
 }
