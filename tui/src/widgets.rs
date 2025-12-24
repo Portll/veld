@@ -1,5 +1,8 @@
 use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, SHODH_GRADIENT, SHODH_TEXT};
-use crate::types::{AppState, DisplayEvent, SearchMode, SearchResult, ViewMode, VERSION};
+use crate::types::{
+    AppState, DisplayEvent, SearchMode, SearchResult, TodoStats, TuiPriority, TuiTodo,
+    TuiTodoStatus, ViewMode, VERSION,
+};
 use ratatui::{prelude::*, widgets::*};
 
 /// Apply opacity to a color (blend with black)
@@ -764,10 +767,15 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
 pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(34), Constraint::Min(40)])
+        .constraints([
+            Constraint::Length(34),  // Stats
+            Constraint::Length(42),  // Todos
+            Constraint::Min(30),     // Activity
+        ])
         .split(area);
     render_stats_panel(f, chunks[0], state);
-    render_activity_feed(f, chunks[1], state);
+    render_todos_panel(f, chunks[1], state);
+    render_activity_feed(f, chunks[2], state);
 }
 
 fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
@@ -967,6 +975,141 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
         )));
     }
     f.render_widget(Paragraph::new(entity_lines), chunks[4]);
+}
+
+
+
+fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            format!(" TODO ({}) ", state.todo_stats.total - state.todo_stats.done),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if state.todos.is_empty() {
+        let empty_msg = Paragraph::new("No active todos")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        f.render_widget(empty_msg, inner);
+        return;
+    }
+
+    // Group todos by status for Linear-style display
+    let mut lines: Vec<Line> = Vec::new();
+
+    // In Progress section
+    let in_progress: Vec<_> = state.todos.iter()
+        .filter(|t| t.status == TuiTodoStatus::InProgress)
+        .collect();
+    if !in_progress.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "◐ In Progress",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        for todo in in_progress.iter().take(3) {
+            lines.push(render_todo_line(todo));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Todo section
+    let todos: Vec<_> = state.todos.iter()
+        .filter(|t| t.status == TuiTodoStatus::Todo)
+        .collect();
+    if !todos.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "○ Todo",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        for todo in todos.iter().take(3) {
+            lines.push(render_todo_line(todo));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Blocked section
+    let blocked: Vec<_> = state.todos.iter()
+        .filter(|t| t.status == TuiTodoStatus::Blocked)
+        .collect();
+    if !blocked.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "⊘ Blocked",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for todo in blocked.iter().take(2) {
+            lines.push(render_todo_line(todo));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Stats summary at bottom
+    lines.push(Line::from(vec![
+        Span::styled("─".repeat(inner.width as usize - 2), Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("◐{} ", state.todo_stats.in_progress), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("○{} ", state.todo_stats.todo), Style::default().fg(Color::White)),
+        Span::styled(format!("⊘{} ", state.todo_stats.blocked), Style::default().fg(Color::Red)),
+        Span::styled(format!("●{}", state.todo_stats.done), Style::default().fg(Color::Green)),
+        if state.todo_stats.overdue > 0 {
+            Span::styled(format!(" ⚠{}", state.todo_stats.overdue), Style::default().fg(Color::LightRed))
+        } else {
+            Span::raw("")
+        },
+    ]));
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, inner);
+}
+
+fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            todo.status.icon(),
+            Style::default().fg(todo.status.color()),
+        ),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            todo.priority.indicator(),
+            Style::default().fg(todo.priority.color()),
+        ),
+    ];
+
+    // Content (truncated)
+    let max_content_len = 28;
+    let content = if todo.content.len() > max_content_len {
+        format!("{}…", &todo.content[..max_content_len])
+    } else {
+        todo.content.clone()
+    };
+    spans.push(Span::styled(content, Style::default().fg(Color::White)));
+
+    // Due date or blocked indicator
+    if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            spans.push(Span::styled(
+                format!(" {}", label),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    } else if let Some(blocked) = &todo.blocked_on {
+        let short_blocked = if blocked.len() > 12 {
+            format!("{}…", &blocked[..12])
+        } else {
+            blocked.clone()
+        };
+        spans.push(Span::styled(
+            format!(" @{}", short_blocked),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    Line::from(spans)
 }
 
 fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {

@@ -1,4 +1,8 @@
-use crate::types::{AppState, GraphEdge, GraphNode, MemoryEvent};
+use crate::types::{
+    AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiPriority, TuiProject, TuiTodo,
+    TuiTodoStatus,
+};
+use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
@@ -41,6 +45,7 @@ struct GraphStatsResponse {
     #[serde(default)]
     relationship_count: usize,
 }
+
 #[derive(Debug, Deserialize)]
 struct UniverseStar {
     id: String,
@@ -77,6 +82,60 @@ struct MemoryUniverse {
     stars: Vec<UniverseStar>,
     #[serde(default)]
     connections: Vec<UniverseConnection>,
+}
+
+// Todo API response types
+#[derive(Debug, Deserialize)]
+struct TodoListResponse {
+    #[serde(default)]
+    todos: Vec<TodoApiItem>,
+    #[serde(default)]
+    projects: Vec<ProjectApiItem>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TodoApiItem {
+    id: String,
+    content: String,
+    status: String,
+    priority: String,
+    project_id: Option<String>,
+    #[serde(default)]
+    contexts: Vec<String>,
+    due_date: Option<String>,
+    blocked_on: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ProjectApiItem {
+    id: String,
+    name: String,
+    description: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TodoStatsResponse {
+    stats: TodoStatsApi,
+}
+
+#[derive(Debug, Deserialize)]
+struct TodoStatsApi {
+    #[serde(default)]
+    total: u32,
+    #[serde(default)]
+    backlog: u32,
+    #[serde(default)]
+    todo: u32,
+    #[serde(default)]
+    in_progress: u32,
+    #[serde(default)]
+    blocked: u32,
+    #[serde(default)]
+    done: u32,
+    #[serde(default)]
+    overdue: u32,
 }
 
 pub struct MemoryStream {
@@ -141,7 +200,6 @@ impl MemoryStream {
         }
         if let Ok(list) = self.fetch_memory_list(user_id).await {
             let mut state = self.state.lock().await;
-            // Sort by created_at ascending (oldest first), so newest ends up at front after push_front
             let mut memories = list.memories;
             memories.sort_by(|a, b| a.created_at.cmp(&b.created_at));
             for mem in memories {
@@ -159,10 +217,7 @@ impl MemoryStream {
                         state.entity_stats.top_entities.push((tag.clone(), 1));
                     }
                 }
-                state
-                    .entity_stats
-                    .top_entities
-                    .sort_by(|a, b| b.1.cmp(&a.1));
+                state.entity_stats.top_entities.sort_by(|a, b| b.1.cmp(&a.1));
                 state.entity_stats.top_entities.truncate(10);
                 let short_id = if mem.id.len() > 8 {
                     mem.id[..8].to_string()
@@ -175,14 +230,12 @@ impl MemoryStream {
                     (n * 0.618).cos() * 0.35 + 0.5,
                     ((n * 0.3).sin() * 0.2 + 0.5).clamp(0.1, 0.9),
                 );
-                // Store full content - truncation happens at display time
                 let content_preview = mem.content.clone();
                 let content = if mem.content.len() > 40 {
                     format!("{}...", &mem.content[..37.min(mem.content.len())])
                 } else {
                     mem.content.clone()
                 };
-                // Add as event for Activity feed
                 state.add_event(MemoryEvent {
                     event_type: "HISTORY".to_string(),
                     timestamp: mem.created_at,
@@ -222,18 +275,13 @@ impl MemoryStream {
             state.graph_stats.edges += gs.relationship_count as u32;
             state.total_entities += gs.entity_count as u64;
         }
-        // Fetch universe - entities as nodes, relationships as edges
         if let Ok(universe) = self.fetch_universe(user_id).await {
             let mut state = self.state.lock().await;
-
-            // Filter out short/meaningless entity names
             let valid_stars: Vec<_> = universe
                 .stars
                 .iter()
                 .filter(|s| s.name.len() >= 3 && !s.name.chars().all(|c| c.is_lowercase()))
                 .collect();
-
-            // Only use universe data if it has valid entities
             if !valid_stars.is_empty() {
                 state.graph_data.nodes.clear();
                 state.graph_data.edges.clear();
@@ -244,11 +292,9 @@ impl MemoryStream {
                 } else {
                     star.id.clone()
                 };
-                // Normalize 3D position to 0.1-0.9 range for force layout
                 let x = (star.position.x / 200.0 + 0.5).clamp(0.1, 0.9);
                 let y = (star.position.y / 200.0 + 0.5).clamp(0.1, 0.9);
                 let z = (star.position.z / 200.0 + 0.5).clamp(0.1, 0.9);
-                // Use golden angle for better distribution if position is near center
                 let (px, py, pz) = if (x - 0.5).abs() < 0.05 && (y - 0.5).abs() < 0.05 {
                     let n = i as f32;
                     (
@@ -271,8 +317,6 @@ impl MemoryStream {
                 });
             }
             state.graph_stats.nodes = state.graph_data.nodes.len() as u32;
-
-            // Add edges from connections
             for conn in universe.connections {
                 let from_idx = state
                     .graph_data
@@ -309,10 +353,112 @@ impl MemoryStream {
                 state.graph_stats.density =
                     (state.graph_data.edges.len() as f64 / max_edges) as f32;
             }
-
-            // Apply force-directed layout to position nodes based on connections
             state.graph_data.apply_force_layout(50);
         }
+        // Fetch todos and projects
+        if let Ok((todos, projects, stats)) = self.fetch_todos(user_id).await {
+            let mut state = self.state.lock().await;
+            state.todos = todos;
+            state.projects = projects;
+            state.todo_stats = stats;
+        }
+    }
+
+    async fn fetch_todos(
+        &self,
+        user_id: &str,
+    ) -> Result<(Vec<TuiTodo>, Vec<TuiProject>, TodoStats), reqwest::Error> {
+        let todos_resp: TodoListResponse = self
+            .client
+            .post(format!("{}/api/todos/list", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "user_id": user_id,
+                "include_done": false
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let projects_clone = todos_resp.projects.clone();
+        let todos: Vec<TuiTodo> = todos_resp
+            .todos
+            .into_iter()
+            .map(|t| {
+                let status = match t.status.as_str() {
+                    "backlog" => TuiTodoStatus::Backlog,
+                    "todo" => TuiTodoStatus::Todo,
+                    "in_progress" => TuiTodoStatus::InProgress,
+                    "blocked" => TuiTodoStatus::Blocked,
+                    "done" => TuiTodoStatus::Done,
+                    "cancelled" => TuiTodoStatus::Cancelled,
+                    _ => TuiTodoStatus::Todo,
+                };
+                let priority = match t.priority.as_str() {
+                    "urgent" => TuiPriority::Urgent,
+                    "high" => TuiPriority::High,
+                    "medium" => TuiPriority::Medium,
+                    "low" => TuiPriority::Low,
+                    _ => TuiPriority::Medium,
+                };
+                let project_name = t.project_id.as_ref().and_then(|pid| {
+                    projects_clone
+                        .iter()
+                        .find(|p| &p.id == pid)
+                        .map(|p| p.name.clone())
+                });
+                TuiTodo {
+                    id: t.id,
+                    content: t.content,
+                    status,
+                    priority,
+                    project_id: t.project_id,
+                    project_name,
+                    contexts: t.contexts,
+                    due_date: t.due_date.and_then(|d| d.parse().ok()),
+                    blocked_on: t.blocked_on,
+                    created_at: t.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                }
+            })
+            .collect();
+
+        let projects: Vec<TuiProject> = todos_resp
+            .projects
+            .into_iter()
+            .map(|p| TuiProject {
+                id: p.id,
+                name: p.name,
+                description: p.description,
+                status: p.status,
+                todo_count: 0,
+                completed_count: 0,
+            })
+            .collect();
+
+        let stats_resp: TodoStatsResponse = self
+            .client
+            .post(format!("{}/api/todos/stats", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "user_id": user_id }))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let todo_stats = TodoStats {
+            total: stats_resp.stats.total,
+            backlog: stats_resp.stats.backlog,
+            todo: stats_resp.stats.todo,
+            in_progress: stats_resp.stats.in_progress,
+            blocked: stats_resp.stats.blocked,
+            done: stats_resp.stats.done,
+            overdue: stats_resp.stats.overdue,
+        };
+
+        Ok((todos, projects, todo_stats))
     }
 
     async fn fetch_user_stats(&self, user_id: &str) -> Result<MemoryStats, reqwest::Error> {
@@ -344,6 +490,7 @@ impl MemoryStream {
             .json()
             .await
     }
+
     async fn fetch_universe(&self, user_id: &str) -> Result<MemoryUniverse, reqwest::Error> {
         self.client
             .get(format!("{}/api/graph/{}/universe", self.base_url, user_id))

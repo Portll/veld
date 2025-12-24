@@ -852,6 +852,10 @@ impl MemoryEvent {
             "DECAY" => Color::Gray,
             "PROMOTE" => Color::LightYellow,
             "HISTORY" => Color::DarkGray,
+            "TODO_CREATE" => Color::Green,
+            "TODO_UPDATE" => Color::Yellow,
+            "TODO_COMPLETE" => Color::LightGreen,
+            "TODO_DELETE" => Color::Red,
             _ => Color::White,
         }
     }
@@ -868,6 +872,10 @@ impl MemoryEvent {
             "DECAY" => "↓",
             "PROMOTE" => "⇧",
             "HISTORY" => "◌",
+            "TODO_CREATE" => "□",
+            "TODO_UPDATE" => "◧",
+            "TODO_COMPLETE" => "☑",
+            "TODO_DELETE" => "☒",
             _ => "•",
         }
     }
@@ -994,9 +1002,166 @@ impl TypeStats {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TODO/PROJECT TYPES (GTD System)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTodoStatus {
+    Backlog,
+    Todo,
+    InProgress,
+    Blocked,
+    Done,
+    Cancelled,
+}
+
+impl TuiTodoStatus {
+    pub fn icon(&self) -> &'static str {
+        match self {
+            TuiTodoStatus::Backlog => "◌",
+            TuiTodoStatus::Todo => "○",
+            TuiTodoStatus::InProgress => "◐",
+            TuiTodoStatus::Blocked => "⊘",
+            TuiTodoStatus::Done => "●",
+            TuiTodoStatus::Cancelled => "⊗",
+        }
+    }
+
+    pub fn color(&self) -> Color {
+        match self {
+            TuiTodoStatus::Backlog => Color::DarkGray,
+            TuiTodoStatus::Todo => Color::White,
+            TuiTodoStatus::InProgress => Color::Cyan,
+            TuiTodoStatus::Blocked => Color::Red,
+            TuiTodoStatus::Done => Color::Green,
+            TuiTodoStatus::Cancelled => Color::DarkGray,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiPriority {
+    Urgent,
+    High,
+    Medium,
+    Low,
+}
+
+impl TuiPriority {
+    pub fn indicator(&self) -> &'static str {
+        match self {
+            TuiPriority::Urgent => "!!!",
+            TuiPriority::High => "!! ",
+            TuiPriority::Medium => "!  ",
+            TuiPriority::Low => "   ",
+        }
+    }
+
+    pub fn color(&self) -> Color {
+        match self {
+            TuiPriority::Urgent => Color::Red,
+            TuiPriority::High => Color::LightRed,
+            TuiPriority::Medium => Color::Yellow,
+            TuiPriority::Low => Color::DarkGray,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiTodo {
+    pub id: String,
+    pub content: String,
+    pub status: TuiTodoStatus,
+    pub priority: TuiPriority,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub contexts: Vec<String>,
+    pub due_date: Option<DateTime<Utc>>,
+    pub blocked_on: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TuiTodo {
+    pub fn short_id(&self) -> String {
+        format!("SHO-{}", &self.id[..4.min(self.id.len())])
+    }
+
+    pub fn is_overdue(&self) -> bool {
+        if let Some(due) = self.due_date {
+            due < Utc::now() && self.status != TuiTodoStatus::Done
+        } else {
+            false
+        }
+    }
+
+    pub fn due_label(&self) -> Option<String> {
+        self.due_date.map(|due| {
+            let now = Utc::now();
+            let diff = due.signed_duration_since(now);
+            if diff.num_hours() < 0 {
+                let hours = (-diff.num_hours()) as i32;
+                if hours < 24 {
+                    format!("⚠ {}h ago", hours)
+                } else {
+                    format!("⚠ {}d ago", hours / 24)
+                }
+            } else if diff.num_hours() < 24 {
+                format!("Due {}", due.format("%I:%M %p"))
+            } else if diff.num_days() < 7 {
+                format!("Due {}", due.format("%a"))
+            } else {
+                format!("Due {}", due.format("%b %d"))
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiProject {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub todo_count: usize,
+    pub completed_count: usize,
+}
+
+impl TuiProject {
+    pub fn progress_percent(&self) -> u8 {
+        if self.todo_count == 0 {
+            0
+        } else {
+            ((self.completed_count as f32 / self.todo_count as f32) * 100.0) as u8
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TodoStats {
+    pub total: u32,
+    pub backlog: u32,
+    pub todo: u32,
+    pub in_progress: u32,
+    pub blocked: u32,
+    pub done: u32,
+    pub overdue: u32,
+}
+
 pub struct AppState {
     pub events: VecDeque<DisplayEvent>,
     pub view_mode: ViewMode,
+    /// GTD Todos
+    pub todos: Vec<TuiTodo>,
+    /// Projects
+    pub projects: Vec<TuiProject>,
+    /// Todo statistics
+    pub todo_stats: TodoStats,
+    /// Selected todo index for navigation
+    pub selected_todo: usize,
     pub theme: Theme,
     pub type_stats: TypeStats,
     pub tier_stats: TierStats,
@@ -1078,6 +1243,10 @@ impl AppState {
         Self {
             events: VecDeque::new(),
             view_mode: ViewMode::Dashboard,
+            todos: Vec::new(),
+            projects: Vec::new(),
+            todo_stats: TodoStats::default(),
+            selected_todo: 0,
             theme: Theme::default(),
             type_stats: TypeStats::default(),
             tier_stats: TierStats::default(),
