@@ -957,11 +957,9 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 }
                             }
                         }
-                        // Priority shortcuts: 1=Urgent, 2=High, 3=Medium, 4=Low
+                        // Priority shortcuts: !=Urgent, @=High, #=Medium, $=Low
                         KeyCode::Char('!') => {
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
-                                && g.focus_panel == FocusPanel::Left
-                            {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
                                 if let Some(todo) = g.get_selected_dashboard_todo() {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
@@ -971,9 +969,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                         }
                         KeyCode::Char('@') => {
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
-                                && g.focus_panel == FocusPanel::Left
-                            {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
                                 if let Some(todo) = g.get_selected_dashboard_todo() {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
@@ -983,9 +979,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                         }
                         KeyCode::Char('#') => {
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
-                                && g.focus_panel == FocusPanel::Left
-                            {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
                                 if let Some(todo) = g.get_selected_dashboard_todo() {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
@@ -995,9 +989,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                         }
                         KeyCode::Char('$') => {
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
-                                && g.focus_panel == FocusPanel::Left
-                            {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
                                 if let Some(todo) = g.get_selected_dashboard_todo() {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
@@ -1008,9 +1000,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         }
                         // Reorder shortcuts: [ = move up, ] = move down
                         KeyCode::Char('[') => {
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
-                                && g.focus_panel == FocusPanel::Left
-                            {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
                                 if let Some(todo) = g.get_selected_dashboard_todo() {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
@@ -1020,9 +1010,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                         }
                         KeyCode::Char(']') => {
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
-                                && g.focus_panel == FocusPanel::Left
-                            {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
                                 if let Some(todo) = g.get_selected_dashboard_todo() {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();

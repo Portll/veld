@@ -1310,42 +1310,90 @@ fn render_todo_row(todo: &TuiTodo, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Render contextual action bar below selected todo
+/// Render contextual action bar below selected todo - changes based on status
 fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
-    let priority_label = match todo.priority {
-        TuiPriority::Urgent => "Urgent",
-        TuiPriority::High => "High",
-        TuiPriority::Medium => "Medium",
-        TuiPriority::Low => "Low",
-    };
-    let status_label = match todo.status {
-        TuiTodoStatus::Backlog => "Backlog",
-        TuiTodoStatus::Todo => "Todo",
-        TuiTodoStatus::InProgress => "In Progress",
-        TuiTodoStatus::Blocked => "Blocked",
-        TuiTodoStatus::Done => "Done",
-        TuiTodoStatus::Cancelled => "Cancelled",
-    };
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::styled("      ", Style::default()));
 
-    Line::from(vec![
-        Span::styled("      ", Style::default()),
-        Span::styled(format!("[{}] ", status_label), Style::default().fg(TEXT_DISABLED)),
-        Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("=status  ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled("[]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("=move  ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled("!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled("=urg ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled("@", Style::default().fg(Color::Rgb(255, 165, 0)).add_modifier(Modifier::BOLD)),
-        Span::styled("=hi ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled("#", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("=med ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled("$", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
-        Span::styled("=low  ", Style::default().fg(TEXT_DISABLED)),
-        Span::styled(format!("Pri:{}", priority_label), Style::default().fg(GOLD)),
-    ])
+    // Status-specific actions
+    match todo.status {
+        TuiTodoStatus::Done => {
+            spans.push(Span::styled("● Done ", Style::default().fg(GOLD)));
+            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=reopen  ", Style::default().fg(TEXT_DISABLED)));
+        }
+        TuiTodoStatus::Cancelled => {
+            spans.push(Span::styled("⊗ Cancelled ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=restore  ", Style::default().fg(TEXT_DISABLED)));
+        }
+        TuiTodoStatus::Blocked => {
+            spans.push(Span::styled("⊘ Blocked ", Style::default().fg(MAROON)));
+            spans.push(Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=unblock  ", Style::default().fg(TEXT_DISABLED)));
+        }
+        TuiTodoStatus::InProgress => {
+            spans.push(Span::styled("◐ Working ", Style::default().fg(SAFFRON)));
+            spans.push(Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=pause  ", Style::default().fg(TEXT_DISABLED)));
+        }
+        TuiTodoStatus::Todo => {
+            spans.push(Span::styled("○ Ready ", Style::default().fg(TEXT_SECONDARY)));
+            spans.push(Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=start  ", Style::default().fg(TEXT_DISABLED)));
+        }
+        TuiTodoStatus::Backlog => {
+            spans.push(Span::styled("◌ Backlog ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=activate  ", Style::default().fg(TEXT_DISABLED)));
+        }
+    }
+
+    // Common actions for active items only
+    if todo.status != TuiTodoStatus::Done && todo.status != TuiTodoStatus::Cancelled {
+        spans.push(Span::styled("[]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled("=move  ", Style::default().fg(TEXT_DISABLED)));
+
+        // Priority shortcuts - highlight current
+        let (urg_style, hi_style, med_style, low_style) = match todo.priority {
+            TuiPriority::Urgent => (
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+            ),
+            TuiPriority::High => (
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(255, 165, 0)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+            ),
+            TuiPriority::Medium => (
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+            ),
+            TuiPriority::Low => (
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Rgb(100, 80, 60)),
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
+        };
+        spans.push(Span::styled("!", urg_style));
+        spans.push(Span::styled("@", hi_style));
+        spans.push(Span::styled("#", med_style));
+        spans.push(Span::styled("$", low_style));
+    }
+
+    Line::from(spans)
 }
 
 /// Render a todo row with selection highlighting
