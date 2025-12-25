@@ -1029,7 +1029,11 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
                     break;
                 }
                 let todo_selected = state.projects_selected == flat_idx;
+                let is_selected_and_focused = todo_selected && is_left_focused;
                 lines.push(render_sidebar_todo(todo, width, todo_selected, is_left_focused));
+                if is_selected_and_focused && lines.len() < inner.height as usize - 1 {
+                    lines.push(render_action_bar(todo));
+                }
                 flat_idx += 1;
             }
             if todos.len() > 5 {
@@ -1057,7 +1061,11 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
                 break;
             }
             let todo_selected = state.projects_selected == flat_idx;
+            let is_selected_and_focused = todo_selected && is_left_focused;
             lines.push(render_sidebar_todo(todo, width, todo_selected, is_left_focused));
+            if is_selected_and_focused && lines.len() < inner.height as usize {
+                lines.push(render_action_bar(todo));
+            }
             flat_idx += 1;
         }
     }
