@@ -197,7 +197,7 @@ impl MemoryStream {
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "user_id": user_id,
-                "include_completed": false
+                "include_completed": true
             }))
             .send()
             .await?;
@@ -484,7 +484,7 @@ impl MemoryStream {
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "user_id": user_id,
-                "include_completed": false
+                "include_completed": true
             }))
             .send()
             .await?;

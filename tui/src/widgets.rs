@@ -1210,12 +1210,25 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             lines.push(Line::from("")); // section separator
         }
 
-        // Done section (collapsed, not navigable)
-        if !done.is_empty() && lines.len() < content_height {
+        // Done section (shows completed items)
+        if !done.is_empty() && lines.len() < content_height - 2 {
             lines.push(Line::from(Span::styled(
                 format!(" ● Completed ({})", done.len()),
-                Style::default().fg(TEXT_DISABLED),
+                Style::default().fg(GOLD),
             )));
+            lines.push(Line::from("")); // space after header
+            for todo in done.iter().take(5) {
+                if lines.len() >= content_height - 1 { break; }
+                let is_selected = state.todos_selected == todo_idx;
+                lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
+                todo_idx += 1;
+            }
+            if done.len() > 5 {
+                lines.push(Line::from(Span::styled(
+                    format!("      +{} more", done.len() - 5),
+                    Style::default().fg(TEXT_DISABLED),
+                )));
+            }
         }
     }
 

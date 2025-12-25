@@ -1984,10 +1984,55 @@ impl AppState {
 
     /// Get the currently selected todo in Dashboard view
     pub fn get_selected_dashboard_todo(&self) -> Option<&TuiTodo> {
-        let active_todos: Vec<_> = self.todos.iter()
-            .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
-            .collect();
-        active_todos.get(self.selected_todo).copied()
+        match self.view_mode {
+            ViewMode::Dashboard => {
+                let active_todos: Vec<_> = self.todos.iter()
+                    .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
+                    .collect();
+                active_todos.get(self.selected_todo).copied()
+            }
+            ViewMode::Projects => {
+                // In Projects view, get todo from right panel or selected project's expanded todo
+                if self.focus_panel == FocusPanel::Right {
+                    // Right panel shows project todos
+                    let todos = self.visible_todos_right_panel();
+                    todos.get(self.todos_selected).copied()
+                } else {
+                    // Left panel - check if a todo is selected within expanded project
+                    self.get_left_panel_selected_todo()
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get selected todo from the left panel in Projects view
+    fn get_left_panel_selected_todo(&self) -> Option<&TuiTodo> {
+        let mut flat_idx = 0;
+        for project in &self.projects {
+            if self.projects_selected == flat_idx {
+                return None; // Project header selected, not a todo
+            }
+            flat_idx += 1;
+
+            if self.is_project_expanded(&project.id) {
+                let todos = self.todos_for_project(&project.id);
+                for todo in todos.iter().take(5) {
+                    if self.projects_selected == flat_idx {
+                        return Some(todo);
+                    }
+                    flat_idx += 1;
+                }
+            }
+        }
+        // Check inbox todos
+        for todo in self.standalone_todos().iter().take(5) {
+            if self.projects_selected == flat_idx {
+                return Some(todo);
+            }
+            flat_idx += 1;
+        }
+        None
     }
 
     /// Get flat item count for left panel (projects + expanded todos + inbox todos)
