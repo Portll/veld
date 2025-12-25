@@ -24,7 +24,7 @@ mod types;
 mod widgets;
 
 use logo::{ELEPHANT, ELEPHANT_FRAMES, SHODH_GRADIENT, SHODH_TEXT};
-use stream::MemoryStream;
+use stream::{MemoryStream, complete_todo, update_todo_status, next_status};
 use types::{AppState, FocusPanel, SearchMode, ViewMode};
 use widgets::{render_footer, render_header, render_main};
 
@@ -907,6 +907,52 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     }
                                     Err(e) => {
                                         g.set_error(format!("Refresh failed: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        // Complete selected todo (mark as done)
+                        KeyCode::Char('x') => {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
+                                if let Some(todo) = g.get_selected_dashboard_todo() {
+                                    let todo_id = todo.id.clone();
+                                    let user_id = g.current_user.clone();
+                                    drop(g);
+
+                                    // Call API to complete todo
+                                    match complete_todo(&base_url, &api_key, &user_id, &todo_id).await {
+                                        Ok(()) => {
+                                            // SSE will auto-refresh todos
+                                        }
+                                        Err(e) => {
+                                            let mut g = search_state.lock().await;
+                                            g.set_error(format!("Complete failed: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Cycle todo status (backlog -> todo -> in_progress -> done)
+                        KeyCode::Char(' ') => {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
+                                && g.focus_panel == FocusPanel::Left
+                            {
+                                if let Some(todo) = g.get_selected_dashboard_todo() {
+                                    let todo_id = todo.id.clone();
+                                    let current_status = todo.status.as_str();
+                                    let new_status = next_status(current_status);
+                                    let user_id = g.current_user.clone();
+                                    drop(g);
+
+                                    // Call API to update status
+                                    match update_todo_status(&base_url, &api_key, &user_id, &todo_id, new_status).await {
+                                        Ok(()) => {
+                                            // SSE will auto-refresh todos
+                                        }
+                                        Err(e) => {
+                                            let mut g = search_state.lock().await;
+                                            g.set_error(format!("Status update failed: {}", e));
+                                        }
                                     }
                                 }
                             }

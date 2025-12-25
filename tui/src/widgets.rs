@@ -3566,6 +3566,13 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         ),
         Span::styled("dash ", Style::default().fg(Color::DarkGray)),
         Span::styled(
+            "p ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("proj ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
             "a ",
             Style::default()
                 .fg(Color::Cyan)

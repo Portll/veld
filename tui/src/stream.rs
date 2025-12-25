@@ -652,3 +652,94 @@ impl MemoryStream {
         Ok(())
     }
 }
+
+// ============================================================================
+// PUBLIC API FUNCTIONS - Called from keyboard handlers in main.rs
+// ============================================================================
+
+/// Complete a todo by ID
+pub async fn complete_todo(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    todo_id: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .post(format!("{}/api/todos/{}/complete", base_url, todo_id))
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to complete todo: {}", resp.status()))
+    }
+}
+
+/// Update todo status
+pub async fn update_todo_status(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    todo_id: &str,
+    new_status: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .post(format!("{}/api/todos/{}/update", base_url, todo_id))
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "status": new_status
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to update todo: {}", resp.status()))
+    }
+}
+
+/// Delete a todo by ID
+pub async fn delete_todo(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    todo_id: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .delete(format!("{}/api/todos/{}", base_url, todo_id))
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to delete todo: {}", resp.status()))
+    }
+}
+
+/// Cycle todo status: Todo -> InProgress -> Done
+pub fn next_status(current: &str) -> &'static str {
+    match current {
+        "backlog" => "todo",
+        "todo" => "in_progress",
+        "in_progress" => "done",
+        "blocked" => "in_progress",
+        _ => "todo",
+    }
+}

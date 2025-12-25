@@ -1049,6 +1049,17 @@ impl TuiTodoStatus {
             TuiTodoStatus::Cancelled => Color::DarkGray,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TuiTodoStatus::Backlog => "backlog",
+            TuiTodoStatus::Todo => "todo",
+            TuiTodoStatus::InProgress => "in_progress",
+            TuiTodoStatus::Blocked => "blocked",
+            TuiTodoStatus::Done => "done",
+            TuiTodoStatus::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1969,6 +1980,14 @@ impl AppState {
         if self.selected_todo < max {
             self.selected_todo += 1;
         }
+    }
+
+    /// Get the currently selected todo in Dashboard view
+    pub fn get_selected_dashboard_todo(&self) -> Option<&TuiTodo> {
+        let active_todos: Vec<_> = self.todos.iter()
+            .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
+            .collect();
+        active_todos.get(self.selected_todo).copied()
     }
 
     /// Get flat item count for left panel (projects + expanded todos + inbox todos)
