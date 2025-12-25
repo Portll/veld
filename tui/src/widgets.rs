@@ -1448,6 +1448,12 @@ fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
 
 /// Render a todo row with selection highlighting
 fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: bool, is_panel_focused: bool) -> Line<'static> {
+    // Fixed column widths for uniform layout (same as dashboard)
+    // | sel(3) | status(2) | pri(3) | content(flex) | project(14) | due(10) |
+    const PROJECT_COL_WIDTH: usize = 14;
+    const DUE_COL_WIDTH: usize = 10;
+    const FIXED_LEFT: usize = 8; // sel(3) + status(2) + pri(3)
+
     let (icon, color) = match todo.status {
         TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
         TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
@@ -1464,33 +1470,54 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
         TuiPriority::Low => ("   ", TEXT_DISABLED),
     };
 
-    let content_width = width.saturating_sub(18);
-    let content = truncate(&todo.content, content_width);
-
     // Selection indicator and background - always visible, brighter when focused
     let sel_marker = if is_selected { "▸ " } else { "   " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
     let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
-    let mut spans = vec![
+    // Calculate content width (flexible column)
+    let content_width = width.saturating_sub(FIXED_LEFT + PROJECT_COL_WIDTH + DUE_COL_WIDTH + 1);
+    let content = if todo.content.chars().count() <= content_width {
+        format!("{:<width$}", todo.content, width = content_width)
+    } else {
+        format!("{:.<width$}",
+            todo.content.chars().take(content_width.saturating_sub(2)).collect::<String>(),
+            width = content_width)
+    };
+
+    // Project column - fixed width with folder icon
+    let project_col = if let Some(project) = &todo.project_name {
+        let max_name = PROJECT_COL_WIDTH - 2; // folder icon + space
+        let name = if project.chars().count() <= max_name {
+            project.clone()
+        } else {
+            format!("{}..", project.chars().take(max_name - 2).collect::<String>())
+        };
+        format!("📁 {:<width$}", name, width = max_name)
+    } else {
+        " ".repeat(PROJECT_COL_WIDTH)
+    };
+
+    // Due column - fixed width
+    let due_col = if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            format!("{:>width$}", label, width = DUE_COL_WIDTH)
+        } else {
+            " ".repeat(DUE_COL_WIDTH)
+        }
+    } else {
+        " ".repeat(DUE_COL_WIDTH)
+    };
+
+    let spans = vec![
         Span::styled(sel_marker, Style::default().fg(sel_color).bg(bg)),
         Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
         Span::styled(priority.0, Style::default().fg(priority.1).bg(bg)),
         Span::styled(content, Style::default().fg(text_color).bg(bg)),
+        Span::styled(project_col, Style::default().fg(GOLD).bg(bg)),
+        Span::styled(due_col, Style::default().fg(MAROON).bg(bg)),
     ];
-
-    if todo.is_overdue() {
-        if let Some(label) = todo.due_label() {
-            spans.push(Span::styled(format!(" {}", label), Style::default().fg(MAROON).bg(bg)));
-        }
-    }
-
-    // Pad to full width for consistent background
-    let used_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    if used_width < width && is_selected {
-        spans.push(Span::styled(" ".repeat(width.saturating_sub(used_width)), Style::default().bg(bg)));
-    }
 
     Line::from(spans)
 }
