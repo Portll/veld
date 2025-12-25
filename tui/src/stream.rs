@@ -743,3 +743,31 @@ pub fn next_status(current: &str) -> &'static str {
         _ => "todo",
     }
 }
+
+/// Update todo priority
+pub async fn update_todo_priority(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    todo_id: &str,
+    priority: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .post(format!("{}/api/todos/{}/update", base_url, todo_id))
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "priority": priority
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to update priority: {}", resp.status()))
+    }
+}
