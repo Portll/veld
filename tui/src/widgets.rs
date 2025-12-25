@@ -797,26 +797,16 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
 pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
     let content_area = with_ribbon_layout(f, area, state);
 
-    // 50/50 split: Todos+Stats on left, Activity on right
+    // 50/50 split: Todos on left, Activity on right
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50),  // Todos + Stats
+            Constraint::Percentage(50),  // Todos (full height)
             Constraint::Percentage(50),  // Activity
         ])
         .split(content_area);
 
-    // Left panel: split vertically for todos (top) and stats (bottom)
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(10),      // Todos (expandable)
-            Constraint::Length(8),    // Stats summary (compact)
-        ])
-        .split(columns[0]);
-
-    render_todos_panel(f, left_chunks[0], state);
-    render_compact_stats(f, left_chunks[1], state);
+    render_todos_panel(f, columns[0], state);
     render_activity_feed(f, columns[1], state);
 }
 
@@ -844,12 +834,16 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
 /// Full-width status ribbon showing current work context
 fn render_status_ribbon(f: &mut Frame, area: Rect, state: &AppState) {
     let width = area.width as usize;
-    let ribbon_bg = Color::Rgb(50, 45, 40);
+    let ribbon_bg = Color::Rgb(40, 38, 35);
 
     let in_progress = state.in_progress_todos();
     let mut spans: Vec<Span> = Vec::new();
 
-    // Current task info
+    // Count todos by status
+    let pending_count = state.todos.iter().filter(|t| t.status == TuiTodoStatus::Todo).count();
+    let blocked_count = state.todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked).count();
+    let done_count = state.todos.iter().filter(|t| t.status == TuiTodoStatus::Done).count();
+
     if let Some(current) = in_progress.first() {
         let duration = format_duration_since(&current.created_at);
 
@@ -863,62 +857,118 @@ fn render_status_ribbon(f: &mut Frame, area: Rect, state: &AppState) {
             "Inbox"
         };
 
-        // Priority indicator
-        let (pri_icon, pri_color) = match current.priority {
-            TuiPriority::Urgent => ("▲▲▲", MAROON),
-            TuiPriority::High => ("▲▲", SAFFRON),
-            TuiPriority::Medium => ("▲", TEXT_DISABLED),
-            TuiPriority::Low => ("", TEXT_DISABLED),
+        // Priority color
+        let pri_color = match current.priority {
+            TuiPriority::Urgent => MAROON,
+            TuiPriority::High => SAFFRON,
+            TuiPriority::Medium => TEXT_SECONDARY,
+            TuiPriority::Low => TEXT_DISABLED,
         };
 
-        spans.push(Span::styled(" ◐ ", Style::default().fg(SAFFRON).bg(ribbon_bg)));
+        // WORKING: [project] task content  ⏱ 2h 15m
+        spans.push(Span::styled(" WORKING ", Style::default().fg(Color::Black).bg(SAFFRON).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" ", Style::default().bg(ribbon_bg)));
         spans.push(Span::styled(
-            truncate(project_name, 15),
-            Style::default().fg(TEXT_SECONDARY).bg(ribbon_bg)
+            format!("[{}] ", truncate(project_name, 12)),
+            Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
         ));
-        spans.push(Span::styled(" › ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
         spans.push(Span::styled(
-            truncate(&current.content, 30),
-            Style::default().fg(TEXT_PRIMARY).bg(ribbon_bg)
+            truncate(&current.content, 35),
+            Style::default().fg(pri_color).bg(ribbon_bg).add_modifier(Modifier::BOLD)
         ));
-        if !pri_icon.is_empty() {
-            spans.push(Span::styled(
-                format!("  {} ", pri_icon),
-                Style::default().fg(pri_color).bg(ribbon_bg)
-            ));
-        }
         spans.push(Span::styled(
             format!("  ⏱ {}", duration),
             Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
         ));
 
-        // Next up (if there's another todo)
-        let todos: Vec<_> = state.todos.iter()
-            .filter(|t| t.status == TuiTodoStatus::Todo)
-            .collect();
-        if let Some(next) = todos.first() {
-            spans.push(Span::styled("   │   ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
-            spans.push(Span::styled("next: ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
+        // Right side: stats summary
+        spans.push(Span::styled("  │  ", Style::default().fg(Color::Rgb(60, 55, 50)).bg(ribbon_bg)));
+
+        if done_count > 0 {
             spans.push(Span::styled(
-                truncate(&next.content, 20),
+                format!("✓{}", done_count),
+                Style::default().fg(GOLD).bg(ribbon_bg)
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(ribbon_bg)));
+        }
+
+        if pending_count > 0 {
+            spans.push(Span::styled(
+                format!("○{}", pending_count),
                 Style::default().fg(TEXT_SECONDARY).bg(ribbon_bg)
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(ribbon_bg)));
+        }
+
+        if blocked_count > 0 {
+            spans.push(Span::styled(
+                format!("⊘{}", blocked_count),
+                Style::default().fg(MAROON).bg(ribbon_bg)
             ));
         }
     } else {
-        // Idle state
-        spans.push(Span::styled(" ○ ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
-        spans.push(Span::styled("idle", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
-
-        // Show next todo if any
-        let todos: Vec<_> = state.todos.iter()
+        // Idle state - suggest next action
+        let next_todo: Option<&TuiTodo> = state.todos.iter()
             .filter(|t| t.status == TuiTodoStatus::Todo)
-            .collect();
-        if let Some(next) = todos.first() {
-            spans.push(Span::styled("   │   ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
-            spans.push(Span::styled("next: ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
+            .next();
+
+        spans.push(Span::styled(" READY ", Style::default().fg(Color::Black).bg(TEXT_DISABLED).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" ", Style::default().bg(ribbon_bg)));
+
+        if let Some(next) = next_todo {
+            let project_name = if let Some(ref pid) = next.project_id {
+                state.projects.iter()
+                    .find(|p| &p.id == pid)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("—")
+            } else {
+                "Inbox"
+            };
+
+            spans.push(Span::styled("Start → ", Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)));
             spans.push(Span::styled(
-                truncate(&next.content, 25),
+                format!("[{}] ", truncate(project_name, 12)),
+                Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+            ));
+            spans.push(Span::styled(
+                truncate(&next.content, 35),
+                Style::default().fg(TEXT_PRIMARY).bg(ribbon_bg)
+            ));
+        } else if state.todos.is_empty() {
+            spans.push(Span::styled(
+                "No tasks — press 'n' to add one",
+                Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+            ));
+        } else {
+            spans.push(Span::styled(
+                "All caught up!",
+                Style::default().fg(GOLD).bg(ribbon_bg)
+            ));
+        }
+
+        // Right side: stats
+        spans.push(Span::styled("  │  ", Style::default().fg(Color::Rgb(60, 55, 50)).bg(ribbon_bg)));
+
+        if done_count > 0 {
+            spans.push(Span::styled(
+                format!("✓{} done", done_count),
+                Style::default().fg(GOLD).bg(ribbon_bg)
+            ));
+            spans.push(Span::styled("  ", Style::default().bg(ribbon_bg)));
+        }
+
+        if pending_count > 0 {
+            spans.push(Span::styled(
+                format!("{} pending", pending_count),
                 Style::default().fg(TEXT_SECONDARY).bg(ribbon_bg)
+            ));
+            spans.push(Span::styled("  ", Style::default().bg(ribbon_bg)));
+        }
+
+        if blocked_count > 0 {
+            spans.push(Span::styled(
+                format!("{} blocked", blocked_count),
+                Style::default().fg(MAROON).bg(ribbon_bg)
             ));
         }
     }
