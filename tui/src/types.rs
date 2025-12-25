@@ -851,19 +851,19 @@ pub struct MemoryEvent {
 impl MemoryEvent {
     pub fn event_color(&self) -> Color {
         match self.event_type.as_str() {
-            "CREATE" => Color::Green,
-            "RETRIEVE" => Color::Cyan,
+            "CREATE" => Color::Rgb(180, 230, 180),      // Pastel green
+            "RETRIEVE" => Color::Rgb(255, 200, 150),   // Pastel orange
             "DELETE" => Color::Red,
             "UPDATE" => Color::Yellow,
             "GRAPH_UPDATE" => Color::Magenta,
-            "CONSOLIDATE" => Color::LightBlue,
-            "STRENGTHEN" => Color::LightGreen,
+            "CONSOLIDATE" => Color::Rgb(180, 200, 255), // Pastel blue
+            "STRENGTHEN" => Color::Rgb(200, 255, 200), // Light pastel green
             "DECAY" => Color::Gray,
             "PROMOTE" => Color::LightYellow,
             "HISTORY" => Color::DarkGray,
-            "TODO_CREATE" => Color::Green,
+            "TODO_CREATE" => Color::Rgb(180, 230, 180), // Pastel green
             "TODO_UPDATE" => Color::Yellow,
-            "TODO_COMPLETE" => Color::LightGreen,
+            "TODO_COMPLETE" => Color::Rgb(200, 255, 200), // Light pastel green
             "TODO_DELETE" => Color::Red,
             _ => Color::White,
         }
@@ -959,6 +959,149 @@ impl DisplayEvent {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MEMORY OPERATION TRACKING (for ribbon display)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MemoryOperationType {
+    Storing,
+    Recalling,
+    Consolidating,
+    Strengthening,
+    Decaying,
+    GraphUpdate,
+}
+
+impl MemoryOperationType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MemoryOperationType::Storing => "STORING",
+            MemoryOperationType::Recalling => "RECALLING",
+            MemoryOperationType::Consolidating => "CONSOLIDATING",
+            MemoryOperationType::Strengthening => "STRENGTHENING",
+            MemoryOperationType::Decaying => "DECAYING",
+            MemoryOperationType::GraphUpdate => "UPDATING",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            MemoryOperationType::Storing => "●",
+            MemoryOperationType::Recalling => "◎",
+            MemoryOperationType::Consolidating => "⟳",
+            MemoryOperationType::Strengthening => "↑",
+            MemoryOperationType::Decaying => "↓",
+            MemoryOperationType::GraphUpdate => "◆",
+        }
+    }
+
+    pub fn color(&self) -> Color {
+        match self {
+            MemoryOperationType::Storing => Color::Rgb(180, 230, 180),      // Pastel green
+            MemoryOperationType::Recalling => Color::Rgb(255, 200, 150),    // Pastel orange
+            MemoryOperationType::Consolidating => Color::Rgb(180, 200, 255), // Pastel blue
+            MemoryOperationType::Strengthening => Color::Rgb(200, 255, 200), // Light green
+            MemoryOperationType::Decaying => Color::Gray,
+            MemoryOperationType::GraphUpdate => Color::Magenta,
+        }
+    }
+}
+
+/// Tracks the current/last memory operation for ribbon display
+#[derive(Debug, Clone)]
+pub struct CurrentOperation {
+    pub op_type: MemoryOperationType,
+    pub content_preview: String,
+    pub memory_type: Option<String>,
+    pub timestamp: Instant,
+    pub latency_ms: Option<f32>,
+    pub count: Option<usize>,
+}
+
+impl CurrentOperation {
+    pub fn new(op_type: MemoryOperationType, content: &str, memory_type: Option<String>) -> Self {
+        Self {
+            op_type,
+            content_preview: content.to_string(),
+            memory_type,
+            timestamp: Instant::now(),
+            latency_ms: None,
+            count: None,
+        }
+    }
+
+    pub fn with_latency(mut self, ms: f32) -> Self {
+        self.latency_ms = Some(ms);
+        self
+    }
+
+    pub fn with_count(mut self, count: usize) -> Self {
+        self.count = Some(count);
+        self
+    }
+
+    pub fn age_secs(&self) -> u64 {
+        self.timestamp.elapsed().as_secs()
+    }
+
+    /// Returns true if this operation is "fresh" (within last 10 seconds)
+    pub fn is_fresh(&self) -> bool {
+        self.timestamp.elapsed().as_secs() < 10
+    }
+}
+
+/// Tracks the last memory being used/referenced
+#[derive(Debug, Clone)]
+pub struct LastUsedMemory {
+    pub content_preview: String,
+    pub memory_type: String,
+    pub memory_id: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub accessed_at: Instant,
+}
+
+impl LastUsedMemory {
+    pub fn new(content: &str, memory_type: &str) -> Self {
+        Self {
+            content_preview: content.to_string(),
+            memory_type: memory_type.to_string(),
+            memory_id: None,
+            created_at: None,
+            accessed_at: Instant::now(),
+        }
+    }
+
+    pub fn with_id(mut self, id: &str) -> Self {
+        self.memory_id = Some(id.to_string());
+        self
+    }
+
+    pub fn with_created_at(mut self, created: DateTime<Utc>) -> Self {
+        self.created_at = Some(created);
+        self
+    }
+
+    pub fn age_display(&self) -> String {
+        if let Some(created) = self.created_at {
+            let now = chrono::Utc::now();
+            let elapsed = (now - created).num_seconds();
+            if elapsed < 60 {
+                format!("{}s ago", elapsed)
+            } else if elapsed < 3600 {
+                format!("{}m ago", elapsed / 60)
+            } else if elapsed < 86400 {
+                format!("{}h ago", elapsed / 3600)
+            } else {
+                let local_time = created.with_timezone(&chrono::Local);
+                local_time.format("%b %d").to_string()
+            }
+        } else {
+            "just now".to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TypeStats {
     pub context: u32,
@@ -999,12 +1142,12 @@ impl TypeStats {
 
     pub fn as_vec(&self) -> Vec<(&'static str, u32, Color)> {
         vec![
-            ("Context", self.context, Color::Cyan),
-            ("Learning", self.learning, Color::Green),
+            ("Context", self.context, Color::Rgb(255, 200, 150)),    // Pastel orange
+            ("Learning", self.learning, Color::Rgb(180, 230, 180)),  // Pastel green
             ("Decision", self.decision, Color::Yellow),
             ("Discovery", self.discovery, Color::Magenta),
-            ("Task", self.task, Color::Blue),
-            ("Pattern", self.pattern, Color::LightCyan),
+            ("Task", self.task, Color::Rgb(180, 200, 255)),          // Pastel blue
+            ("Pattern", self.pattern, Color::Rgb(255, 220, 180)),    // Light pastel orange
             ("Error", self.error, Color::Red),
             ("Conversation", self.conversation, Color::White),
         ]
@@ -1045,7 +1188,7 @@ impl TuiTodoStatus {
             TuiTodoStatus::Todo => Color::White,
             TuiTodoStatus::InProgress => Color::Rgb(255, 215, 0),
             TuiTodoStatus::Blocked => Color::Red,
-            TuiTodoStatus::Done => Color::Green,
+            TuiTodoStatus::Done => Color::Rgb(180, 230, 180),  // Pastel green
             TuiTodoStatus::Cancelled => Color::DarkGray,
         }
     }
@@ -1266,6 +1409,10 @@ pub struct AppState {
     pub focus_panel: FocusPanel,
     /// Selected todo index in right panel for Projects view
     pub todos_selected: usize,
+    /// Current/last memory operation (for ribbon display)
+    pub current_operation: Option<CurrentOperation>,
+    /// Last memory being used/referenced (for ribbon display)
+    pub last_used_memory: Option<LastUsedMemory>,
 }
 
 impl AppState {
@@ -1329,6 +1476,8 @@ impl AppState {
             projects_scroll: 0,
             focus_panel: FocusPanel::default(),
             todos_selected: 0,
+            current_operation: None,
+            last_used_memory: None,
         }
     }
 
@@ -1338,7 +1487,7 @@ impl AppState {
             // Trigger connection animation
             self.connection_animation = Some(Animation::new(
                 AnimationType::Flash {
-                    color: Color::Green,
+                    color: Color::Rgb(180, 230, 180),  // Pastel green
                     duration_ms: 1000, // Longer flash for visibility
                 },
                 Easing::EaseOut,
@@ -1557,6 +1706,10 @@ impl AppState {
     }
 
     pub fn add_event(&mut self, event: MemoryEvent) {
+        // Track current operation for ribbon display
+        let content_preview = event.content_preview.clone().unwrap_or_default();
+        let mem_type = event.memory_type.clone();
+
         match event.event_type.as_str() {
             "CREATE" => {
                 self.total_memories += 1;
@@ -1579,6 +1732,17 @@ impl AppState {
                         .unwrap_or_else(|| "Unknown".to_string());
                     self.add_graph_node(id.clone(), content, mem_type);
                 }
+
+                // Update ribbon: STORING operation
+                let mut op = CurrentOperation::new(
+                    MemoryOperationType::Storing,
+                    &content_preview,
+                    mem_type.clone(),
+                );
+                if let Some(latency) = event.latency_ms {
+                    op = op.with_latency(latency);
+                }
+                self.current_operation = Some(op);
             }
             "RETRIEVE" => {
                 self.total_recalls += 1;
@@ -1598,6 +1762,32 @@ impl AppState {
                                 / total as f32;
                     }
                 }
+
+                // Update ribbon: RECALLING operation
+                let mut op = CurrentOperation::new(
+                    MemoryOperationType::Recalling,
+                    &content_preview,
+                    mem_type.clone(),
+                );
+                if let Some(latency) = event.latency_ms {
+                    op = op.with_latency(latency);
+                }
+                if let Some(count) = event.count {
+                    op = op.with_count(count);
+                }
+                self.current_operation = Some(op);
+
+                // Update last used memory context
+                if !content_preview.is_empty() {
+                    let mut last_mem = LastUsedMemory::new(
+                        &content_preview,
+                        mem_type.as_deref().unwrap_or("Unknown"),
+                    );
+                    if let Some(ref id) = event.memory_id {
+                        last_mem = last_mem.with_id(id);
+                    }
+                    self.last_used_memory = Some(last_mem);
+                }
             }
             "DELETE" => {
                 let count = event.count.unwrap_or(1);
@@ -1612,15 +1802,56 @@ impl AppState {
                     self.add_graph_edge(from.clone(), to.clone(), weight);
                     self.update_graph_stats();
                 }
+
+                // Update ribbon: GRAPH UPDATE operation
+                let op = CurrentOperation::new(
+                    MemoryOperationType::GraphUpdate,
+                    &format!("{} → {}",
+                        event.from_id.as_deref().unwrap_or("?")[..8.min(event.from_id.as_ref().map(|s| s.len()).unwrap_or(1))].to_string(),
+                        event.to_id.as_deref().unwrap_or("?")[..8.min(event.to_id.as_ref().map(|s| s.len()).unwrap_or(1))].to_string()
+                    ),
+                    None,
+                );
+                self.current_operation = Some(op);
             }
-            "STRENGTHEN" => self.consolidation_stats.strengthened += 1,
-            "DECAY" => self.consolidation_stats.decayed += 1,
+            "STRENGTHEN" => {
+                self.consolidation_stats.strengthened += 1;
+
+                // Update ribbon: STRENGTHENING operation
+                let op = CurrentOperation::new(
+                    MemoryOperationType::Strengthening,
+                    &content_preview,
+                    mem_type.clone(),
+                );
+                self.current_operation = Some(op);
+            }
+            "DECAY" => {
+                self.consolidation_stats.decayed += 1;
+
+                // Update ribbon: DECAYING operation
+                let op = CurrentOperation::new(
+                    MemoryOperationType::Decaying,
+                    &content_preview,
+                    mem_type.clone(),
+                );
+                self.current_operation = Some(op);
+            }
             "PROMOTE" => {
                 self.consolidation_stats.promoted += 1;
                 self.tier_stats.working = self.tier_stats.working.saturating_sub(1);
                 self.tier_stats.session += 1;
             }
-            "CONSOLIDATE" => self.consolidation_stats.cycles += 1,
+            "CONSOLIDATE" => {
+                self.consolidation_stats.cycles += 1;
+
+                // Update ribbon: CONSOLIDATING operation
+                let op = CurrentOperation::new(
+                    MemoryOperationType::Consolidating,
+                    "Memory consolidation cycle",
+                    None,
+                );
+                self.current_operation = Some(op);
+            }
             _ => {}
         }
         // Update indices for existing events (they're all shifting down)

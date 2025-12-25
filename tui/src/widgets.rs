@@ -149,7 +149,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         .constraints([
             Constraint::Length(22),
             Constraint::Min(20),
-            Constraint::Length(20),
+            Constraint::Length(22),  // Symmetric with left
         ])
         .split(inner);
 
@@ -215,7 +215,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(
             format!("{} ", state.total_memories),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("memories ", Style::default().fg(Color::DarkGray)),
@@ -231,7 +231,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(
             format!("{} ", state.total_recalls),
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::Rgb(180, 230, 180))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("recalls", Style::default().fg(Color::DarkGray)),
@@ -312,7 +312,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     // Activity counter - events per minute
     let events_per_min = state.events_per_minute();
     let counter_color = if events_per_min > 10 {
-        Color::Green // High activity
+        Color::Rgb(180, 230, 180) // High activity
     } else if events_per_min > 0 {
         Color::Rgb(100, 180, 220) // Some activity
     } else {
@@ -473,7 +473,7 @@ fn render_search_loading(f: &mut Frame, area: Rect, state: &AppState) {
 fn render_search_results(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(Color::Rgb(180, 230, 180)))
         .title(Span::styled(
             format!(
                 " SEARCH RESULTS: \"{}\" ({}) ",
@@ -481,13 +481,13 @@ fn render_search_results(f: &mut Frame, area: Rect, state: &AppState) {
                 state.search_results.len()
             ),
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::Rgb(180, 230, 180))
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
             block::Title::from(Span::styled(
                 format!(" [{}] ", state.search_mode.label()),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Rgb(255, 200, 150)),
             ))
             .alignment(Alignment::Right),
         );
@@ -612,7 +612,7 @@ fn render_search_result_item(
             prefix,
             Style::default()
                 .fg(if is_selected {
-                    Color::Cyan
+                    Color::Rgb(255, 200, 150)
                 } else {
                     Color::DarkGray
                 })
@@ -622,7 +622,7 @@ fn render_search_result_item(
         Span::styled(
             format!("[{}]", result.memory_type),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD)
                 .bg(bg),
         ),
@@ -690,7 +690,7 @@ fn render_search_result_item(
             Span::styled("tags: ", Style::default().fg(Color::DarkGray).bg(bg)),
             Span::styled(
                 truncate(&tags_str, content_width.saturating_sub(8)),
-                Style::default().fg(Color::Green).bg(bg),
+                Style::default().fg(Color::Rgb(180, 230, 180)).bg(bg),
             ),
         ]));
     }
@@ -710,7 +710,7 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             " MEMORY DETAIL ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
@@ -735,7 +735,7 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 format!(" [{}] ", result.memory_type),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(&result.id, Style::default().fg(Color::DarkGray)),
@@ -758,7 +758,7 @@ fn render_search_detail(f: &mut Frame, area: Rect, state: &AppState) {
             if result.tags.is_empty() {
                 Span::styled("(none)", Style::default().fg(Color::DarkGray))
             } else {
-                Span::styled(result.tags.join(", "), Style::default().fg(Color::Green))
+                Span::styled(result.tags.join(", "), Style::default().fg(Color::Rgb(180, 230, 180)))
             },
         ]),
         Line::from(""),
@@ -985,20 +985,130 @@ fn render_status_ribbon(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Standard view layout with ribbon at top
-/// Returns the content area below ribbon and spacer
+/// Standard view layout with dual ribbons at top
+/// Returns the content area below ribbons and spacer
 fn with_ribbon_layout(f: &mut Frame, area: Rect, state: &AppState) -> Rect {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // Status ribbon
-            Constraint::Length(2),   // Spacer for breathing room
+            Constraint::Length(1),   // Status ribbon (work in progress)
+            Constraint::Length(1),   // Memory ribbon (current operation + context)
+            Constraint::Length(1),   // Spacer for breathing room
             Constraint::Min(5),      // Main content
         ])
         .split(area);
 
     render_status_ribbon(f, rows[0], state);
-    rows[2]
+    render_memory_ribbon(f, rows[1], state);
+    rows[3]
+}
+
+/// Memory operation ribbon - shows current operation and context being used
+fn render_memory_ribbon(f: &mut Frame, area: Rect, state: &AppState) {
+    let width = area.width as usize;
+    let ribbon_bg = Color::Rgb(40, 38, 35);  // Same as status ribbon
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Left side: Current operation
+    if let Some(ref op) = state.current_operation {
+        if op.is_fresh() {
+            let op_color = op.op_type.color();
+
+            // Operation badge (same format as " WORKING ")
+            spans.push(Span::styled(
+                format!(" {} ", op.op_type.label()),
+                Style::default().fg(Color::Black).bg(op_color).add_modifier(Modifier::BOLD)
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(ribbon_bg)));
+
+            // Content preview
+            spans.push(Span::styled(
+                truncate(&op.content_preview, 40),
+                Style::default().fg(TEXT_PRIMARY).bg(ribbon_bg)
+            ));
+
+            // Memory type if available
+            if let Some(ref mem_type) = op.memory_type {
+                spans.push(Span::styled(
+                    format!("  [{}]", mem_type),
+                    Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+                ));
+            }
+
+            // Latency if available
+            if let Some(latency) = op.latency_ms {
+                spans.push(Span::styled(
+                    format!("  {}ms", latency as u32),
+                    Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+                ));
+            }
+
+            // Count if available (for recalls)
+            if let Some(count) = op.count {
+                spans.push(Span::styled(
+                    format!(" ({} found)", count),
+                    Style::default().fg(GOLD).bg(ribbon_bg)
+                ));
+            }
+        } else {
+            // Stale operation - show dimmed
+            spans.push(Span::styled(
+                format!(" {} ", op.op_type.icon()),
+                Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(ribbon_bg)));
+            spans.push(Span::styled(
+                truncate(&op.content_preview, 40),
+                Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+            ));
+        }
+    } else {
+        // No badge when idle - just subtle text
+        spans.push(Span::styled(
+            " ○ Awaiting memory activity",
+            Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+        ));
+    }
+
+    // Separator (same as status ribbon)
+    spans.push(Span::styled("  │  ", Style::default().fg(Color::Rgb(60, 55, 50)).bg(ribbon_bg)));
+
+    // Right side: Last used memory (context)
+    if let Some(ref mem) = state.last_used_memory {
+        spans.push(Span::styled(
+            "CONTEXT ",
+            Style::default().fg(SAFFRON).bg(ribbon_bg).add_modifier(Modifier::BOLD)
+        ));
+        spans.push(Span::styled(
+            truncate(&mem.content_preview, 30),
+            Style::default().fg(TEXT_PRIMARY).bg(ribbon_bg)
+        ));
+        spans.push(Span::styled(
+            format!("  [{}]", mem.memory_type),
+            Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+        ));
+        spans.push(Span::styled(
+            format!("  {}", mem.age_display()),
+            Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+        ));
+    } else {
+        spans.push(Span::styled(
+            "No context",
+            Style::default().fg(TEXT_DISABLED).bg(ribbon_bg)
+        ));
+    }
+
+    // Pad to full width (same method as status ribbon)
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width.saturating_sub(used)),
+            Style::default().bg(ribbon_bg)
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Left sidebar - projects list with flat navigation (projects + todos)
@@ -1576,9 +1686,9 @@ fn render_compact_stats(f: &mut Frame, area: Rect, state: &AppState) {
     let stats_line2 = Line::from(vec![
         Span::styled("W:", Style::default().fg(Color::Yellow)),
         Span::styled(format!("{} ", state.tier_stats.working), Style::default().fg(Color::White)),
-        Span::styled("S:", Style::default().fg(Color::Cyan)),
+        Span::styled("S:", Style::default().fg(Color::Rgb(255, 200, 150))),
         Span::styled(format!("{} ", state.tier_stats.session), Style::default().fg(Color::White)),
-        Span::styled("L:", Style::default().fg(Color::Green)),
+        Span::styled("L:", Style::default().fg(Color::Rgb(180, 230, 180))),
         Span::styled(format!("{}", state.tier_stats.long_term), Style::default().fg(Color::White)),
         Span::styled("  Nodes:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", state.graph_stats.nodes), Style::default().fg(Color::Magenta)),
@@ -1613,18 +1723,18 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
         Line::from(Span::styled(
             " TIERS",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
             Span::styled("  Working   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 progress_bar(state.tier_stats.working, tier_total, 8),
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::Rgb(180, 230, 180)),
             ),
             Span::styled(
                 format!(" {}", state.tier_stats.working),
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::Rgb(180, 230, 180)),
             ),
         ]),
         Line::from(vec![
@@ -1657,7 +1767,7 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
     let mut type_lines = vec![Line::from(Span::styled(
         " TYPES",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(Color::Rgb(255, 200, 150))
             .add_modifier(Modifier::BOLD),
     ))];
     for (name, count, color) in state.type_stats.as_vec() {
@@ -1682,7 +1792,7 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
         Line::from(Span::styled(
             " GRAPH",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
@@ -1701,11 +1811,11 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("  Density: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 progress_bar((state.graph_stats.density * 100.0) as u32, 100, 8),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Rgb(255, 200, 150)),
             ),
             Span::styled(
                 format!(" {:.2}", state.graph_stats.density),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Rgb(255, 200, 150)),
             ),
         ]),
         Line::from(vec![
@@ -1724,18 +1834,18 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
         Line::from(Span::styled(
             " RETRIEVAL",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
             Span::styled("  semantic ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 progress_bar(state.retrieval_stats.semantic, ret_total, 5),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Rgb(255, 200, 150)),
             ),
             Span::styled(
                 format!(" {}", state.retrieval_stats.semantic),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Rgb(255, 200, 150)),
             ),
         ]),
         Line::from(vec![
@@ -1753,11 +1863,11 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled("  hybrid   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 progress_bar(state.retrieval_stats.hybrid, ret_total, 5),
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::Rgb(180, 230, 180)),
             ),
             Span::styled(
                 format!(" {}", state.retrieval_stats.hybrid),
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::Rgb(180, 230, 180)),
             ),
         ]),
     ];
@@ -1767,7 +1877,7 @@ fn render_stats_panel(f: &mut Frame, area: Rect, state: &AppState) {
     let mut entity_lines = vec![Line::from(Span::styled(
         " ENTITIES",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(Color::Rgb(255, 200, 150))
             .add_modifier(Modifier::BOLD),
     ))];
     for (name, count) in state.entity_stats.top_entities.iter().take(5) {
@@ -2253,9 +2363,9 @@ fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {
                 (50.0 * intensity).min(255.0) as u8,
             )
         } else if is_newest {
-            Color::Green
+            Color::Rgb(180, 230, 180) // Pastel green
         } else if is_selected {
-            Color::Cyan
+            Color::Rgb(255, 200, 150) // Pastel orange
         } else {
             Color::DarkGray
         };
@@ -2325,7 +2435,7 @@ fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {
         if let Some(t) = &event.event.memory_type {
             meta_spans.push(Span::styled(
                 format!("[{}]", t),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Rgb(255, 200, 150)), // Pastel orange
             ));
             meta_spans.push(Span::raw(" "));
         }
@@ -2337,7 +2447,7 @@ fn render_activity_feed(f: &mut Frame, area: Rect, state: &AppState) {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", ");
-                meta_spans.push(Span::styled(tags, Style::default().fg(Color::Green)));
+                meta_spans.push(Span::styled(tags, Style::default().fg(Color::Rgb(180, 230, 180)))); // Pastel green
             }
         }
         let line3 = Line::from(meta_spans);
@@ -2472,7 +2582,7 @@ fn render_event_card(f: &mut Frame, area: Rect, event: &DisplayEvent, _index: us
     }
     let mut info_spans = Vec::new();
     if let Some(mem_type) = &event.event.memory_type {
-        info_spans.push(Span::styled(mem_type, Style::default().fg(Color::Cyan)));
+        info_spans.push(Span::styled(mem_type, Style::default().fg(Color::Rgb(255, 200, 150))));
         info_spans.push(Span::raw(" "));
     }
     if let Some(mode) = &event.event.retrieval_mode {
@@ -2523,7 +2633,7 @@ fn render_event_detail(f: &mut Frame, area: Rect, event: &DisplayEvent, state: &
         header.push(Span::styled(
             format!("[{}] ", t),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -2565,7 +2675,7 @@ fn render_event_detail(f: &mut Frame, area: Rect, event: &DisplayEvent, state: &
     let mut id_line = Vec::new();
     if let Some(id) = &event.event.memory_id {
         id_line.push(Span::styled("ID: ", Style::default().fg(Color::DarkGray)));
-        id_line.push(Span::styled(id.clone(), Style::default().fg(Color::Cyan)));
+        id_line.push(Span::styled(id.clone(), Style::default().fg(Color::Rgb(255, 200, 150))));
         id_line.push(Span::raw("  "));
     }
     let local_time = event.event.timestamp.with_timezone(&chrono::Local);
@@ -2581,7 +2691,7 @@ fn render_event_detail(f: &mut Frame, area: Rect, event: &DisplayEvent, state: &
             let es = entities.join(", ");
             lines.push(Line::from(vec![
                 Span::styled("Tags: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(es, Style::default().fg(Color::Green)),
+                Span::styled(es, Style::default().fg(Color::Rgb(180, 230, 180))),
             ]));
         }
     }
@@ -2598,7 +2708,7 @@ fn render_activity_logs(f: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             " ACTIVITY LOGS ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
@@ -2752,7 +2862,7 @@ fn render_river_event_selectable(
     let (prefix, prefix_color) = if is_fresh {
         ("★ ", Color::Yellow) // Yellow star for fresh live events
     } else if is_selected {
-        ("▶ ", Color::Cyan)
+        ("▶ ", Color::Rgb(255, 200, 150))
     } else {
         ("  ", Color::DarkGray)
     };
@@ -2761,7 +2871,7 @@ fn render_river_event_selectable(
     let border_color = if is_fresh {
         Color::Yellow
     } else if glow > 0.0 {
-        lerp_color(Color::DarkGray, Color::Green, glow * 0.5)
+        lerp_color(Color::DarkGray, Color::Rgb(180, 230, 180), glow * 0.5)
     } else {
         Color::DarkGray
     };
@@ -2808,9 +2918,9 @@ fn render_river_event_selectable(
     }
 
     let meta_color = if is_animating {
-        apply_opacity(Color::Cyan, opacity)
+        apply_opacity(Color::Rgb(255, 200, 150), opacity)
     } else {
-        Color::Cyan
+        Color::Rgb(255, 200, 150)
     };
     let mut meta = vec![
         Span::styled("      ", Style::default().bg(bg)),
@@ -2863,11 +2973,11 @@ fn render_river_event_selectable(
                 .collect::<Vec<_>>()
                 .join(", ");
             let tag_color = if is_animating {
-                apply_opacity(Color::Green, opacity)
+                apply_opacity(Color::Rgb(180, 230, 180), opacity)
             } else if glow > 0.0 {
-                glow_color(Color::Green, glow * 0.3)
+                glow_color(Color::Rgb(180, 230, 180), glow * 0.3)
             } else {
-                Color::Green
+                Color::Rgb(180, 230, 180)
             };
             lines.push(Line::from(vec![
                 Span::styled("      ", Style::default().bg(bg)),
@@ -2920,7 +3030,7 @@ fn render_river_event(f: &mut Frame, area: Rect, event: &DisplayEvent) {
     if let Some(t) = &event.event.memory_type {
         meta.push(Span::styled(
             format!("type:{} ", t),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Rgb(255, 200, 150)),
         ));
     }
     if let Some(m) = &event.event.retrieval_mode {
@@ -2955,7 +3065,7 @@ fn render_river_event(f: &mut Frame, area: Rect, event: &DisplayEvent) {
                 Span::raw("      "),
                 Span::styled("| ", Style::default().fg(Color::DarkGray)),
                 Span::styled("entities: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(truncate(&es, 40), Style::default().fg(Color::Green)),
+                Span::styled(truncate(&es, 40), Style::default().fg(Color::Rgb(180, 230, 180))),
             ]));
         }
     }
@@ -2979,7 +3089,7 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             " NODES ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
@@ -3028,7 +3138,7 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
             let prefix = if is_selected { "> " } else { "  " };
             let style = if is_selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -3051,13 +3161,13 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::raw(" "),
                 Span::styled(
                     &node.memory_type[..3.min(node.memory_type.len())],
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::Rgb(255, 200, 150)),
                 ),
                 Span::raw(" "),
-                Span::styled(bar, Style::default().fg(Color::Green)),
+                Span::styled(bar, Style::default().fg(Color::Rgb(180, 230, 180))),
                 Span::styled(
                     format!(" {}", node.connections),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(Color::Rgb(180, 230, 180)),
                 ),
             ]));
             // Use theme-aware colors for node content readability on both dark and light backgrounds
@@ -3122,7 +3232,7 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
                 ),
                 Span::styled(
                     format!(" ({})", selected.memory_type),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::Rgb(255, 200, 150)),
                 ),
             ]),
             Line::from(Span::styled(
@@ -3145,7 +3255,7 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
         } else {
             for (edge, target) in edges.iter().take(10) {
                 let weight_color = if edge.weight >= 0.7 {
-                    Color::Green
+                    Color::Rgb(180, 230, 180)
                 } else if edge.weight >= 0.4 {
                     Color::Yellow
                 } else {
@@ -3166,10 +3276,10 @@ fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
 
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled(" strong ", Style::default().fg(Color::Green)),
+            Span::styled(" strong ", Style::default().fg(Color::Rgb(180, 230, 180))),
             Span::styled(
                 format!("{} ", state.graph_stats.strong_edges),
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::Rgb(180, 230, 180)),
             ),
             Span::styled(" medium ", Style::default().fg(Color::Yellow)),
             Span::styled(
@@ -3216,7 +3326,7 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
         .title(Span::styled(
             " TOP ENTITIES ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
@@ -3295,7 +3405,7 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let conn_color = if node.connections >= 10 {
-            Color::Green
+            Color::Rgb(180, 230, 180)
         } else if node.connections >= 5 {
             Color::Yellow
         } else {
@@ -3462,7 +3572,7 @@ fn render_graph_focus_view(f: &mut Frame, area: Rect, state: &AppState) {
 
         // Draw connection line
         let edge_color = if *weight >= 0.7 {
-            Color::Green
+            Color::Rgb(180, 230, 180)
         } else if *weight >= 0.4 {
             Color::Yellow
         } else {
@@ -3591,9 +3701,9 @@ fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
         let bar = "█".repeat(bar_width) + &"░".repeat(8 - bar_width);
 
         let type_color = match *type_name {
-            "Person" => Color::Cyan,
-            "Organization" => Color::Blue,
-            "Location" => Color::Green,
+            "Person" => Color::Rgb(255, 200, 150),
+            "Organization" => Color::Rgb(180, 200, 255),  // Pastel blue
+            "Location" => Color::Rgb(180, 230, 180),
             "Technology" => Color::Magenta,
             "Issue" => Color::Yellow,
             _ => state.theme.fg(),
@@ -3622,11 +3732,11 @@ fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
     let weak = state.graph_stats.weak_edges;
 
     lines.push(Line::from(vec![
-        Span::styled(" Strong ", Style::default().fg(Color::Green)),
+        Span::styled(" Strong ", Style::default().fg(Color::Rgb(180, 230, 180))),
         Span::styled(
             format!("{}", strong),
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::Rgb(180, 230, 180))
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -3656,7 +3766,7 @@ fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" Density: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{:.1}%", state.graph_stats.density * 100.0),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Rgb(255, 200, 150)),
         ),
     ]));
 
@@ -3665,7 +3775,7 @@ fn render_graph_type_summary(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(" Avg wt:  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{:.2}", state.graph_stats.avg_weight),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Rgb(255, 200, 150)),
         ),
     ]));
 
@@ -3730,7 +3840,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 format!(" [{}] ", state.search_mode.label()),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(&state.search_query, Style::default().fg(Color::White)),
@@ -3752,32 +3862,32 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     if state.search_results_visible {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green))
+            .border_style(Style::default().fg(Color::Rgb(180, 230, 180)))
             .title(Span::styled(
                 format!(" {} RESULTS ", state.search_results.len()),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::Rgb(180, 230, 180))
                     .add_modifier(Modifier::BOLD),
             ));
         let result_line = Line::from(vec![
             Span::styled(
                 " j/k ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("navigate ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 " / ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("new search ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 " Esc ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("close ", Style::default().fg(Color::DarkGray)),
@@ -3811,49 +3921,49 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(
             "q ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("quit ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "d ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("dash ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "p ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("proj ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "a ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("activity ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "g ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("graph ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "m ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("map ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "j/k ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("↑↓ ", Style::default().fg(Color::DarkGray)),
@@ -3865,14 +3975,14 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 "r ",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::Rgb(180, 230, 180))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("rebuild ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 "R ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("refresh ", Style::default().fg(Color::DarkGray)),
@@ -3883,16 +3993,16 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 "x ",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::Rgb(180, 230, 180))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("done ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Spc ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Spc ", Style::default().fg(Color::Rgb(255, 200, 150)).add_modifier(Modifier::BOLD)),
             Span::styled("status ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 "[] ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("move ", Style::default().fg(Color::DarkGray)),
@@ -3920,7 +4030,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 "$ ",
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Color::Rgb(180, 200, 255))  // Pastel blue
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("low ", Style::default().fg(Color::DarkGray)),
@@ -3930,7 +4040,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
             Span::styled(
                 "+/- ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Rgb(255, 200, 150))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("zoom ", Style::default().fg(Color::DarkGray)),
@@ -3946,7 +4056,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(
             "t ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(255, 200, 150))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(theme_label, Style::default().fg(state.theme.accent())),
