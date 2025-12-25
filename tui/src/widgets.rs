@@ -1163,9 +1163,12 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             )));
             lines.push(Line::from("")); // space after header
             for todo in in_progress.iter().take(4) {
-                if lines.len() >= content_height - 1 { break; }
-                let is_selected = state.todos_selected == todo_idx;
+                if lines.len() >= content_height - 2 { break; }
+                let is_selected = state.todos_selected == todo_idx && is_focused;
                 lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
+                if is_selected {
+                    lines.push(render_action_bar(todo));
+                }
                 todo_idx += 1;
             }
             lines.push(Line::from("")); // section separator
@@ -1180,9 +1183,12 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             lines.push(Line::from("")); // space after header
             let max_todos = (content_height.saturating_sub(lines.len() + 4)).min(8);
             for todo in todo_items.iter().take(max_todos) {
-                if lines.len() >= content_height - 1 { break; }
-                let is_selected = state.todos_selected == todo_idx;
+                if lines.len() >= content_height - 2 { break; }
+                let is_selected = state.todos_selected == todo_idx && is_focused;
                 lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
+                if is_selected {
+                    lines.push(render_action_bar(todo));
+                }
                 todo_idx += 1;
             }
             if todo_items.len() > max_todos {
@@ -1202,9 +1208,12 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             )));
             lines.push(Line::from("")); // space after header
             for todo in blocked.iter().take(3) {
-                if lines.len() >= content_height - 1 { break; }
-                let is_selected = state.todos_selected == todo_idx;
+                if lines.len() >= content_height - 2 { break; }
+                let is_selected = state.todos_selected == todo_idx && is_focused;
                 lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
+                if is_selected {
+                    lines.push(render_action_bar(todo));
+                }
                 todo_idx += 1;
             }
             lines.push(Line::from("")); // section separator
@@ -1218,9 +1227,12 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             )));
             lines.push(Line::from("")); // space after header
             for todo in done.iter().take(5) {
-                if lines.len() >= content_height - 1 { break; }
-                let is_selected = state.todos_selected == todo_idx;
+                if lines.len() >= content_height - 2 { break; }
+                let is_selected = state.todos_selected == todo_idx && is_focused;
                 lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
+                if is_selected {
+                    lines.push(render_action_bar(todo));
+                }
                 todo_idx += 1;
             }
             if done.len() > 5 {
@@ -1288,6 +1300,44 @@ fn render_todo_row(todo: &TuiTodo, width: usize) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+/// Render contextual action bar below selected todo
+fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
+    let priority_label = match todo.priority {
+        TuiPriority::Urgent => "Urgent",
+        TuiPriority::High => "High",
+        TuiPriority::Medium => "Medium",
+        TuiPriority::Low => "Low",
+    };
+    let status_label = match todo.status {
+        TuiTodoStatus::Backlog => "Backlog",
+        TuiTodoStatus::Todo => "Todo",
+        TuiTodoStatus::InProgress => "In Progress",
+        TuiTodoStatus::Blocked => "Blocked",
+        TuiTodoStatus::Done => "Done",
+        TuiTodoStatus::Cancelled => "Cancelled",
+    };
+
+    Line::from(vec![
+        Span::styled("      ", Style::default()),
+        Span::styled(format!("[{}] ", status_label), Style::default().fg(TEXT_DISABLED)),
+        Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("=status  ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled("[]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("=move  ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled("!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled("=urg ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled("@", Style::default().fg(Color::Rgb(255, 165, 0)).add_modifier(Modifier::BOLD)),
+        Span::styled("=hi ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled("#", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("=med ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled("$", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        Span::styled("=low  ", Style::default().fg(TEXT_DISABLED)),
+        Span::styled(format!("Pri:{}", priority_label), Style::default().fg(GOLD)),
+    ])
 }
 
 /// Render a todo row with selection highlighting
@@ -1646,9 +1696,13 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(in_progress.len()).min(4);
         for todo in in_progress.iter().take(show_count) {
-            let is_selected = state.selected_todo == flat_idx;
+            let is_selected = state.selected_todo == flat_idx && is_focused;
             lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
             used_lines += 1;
+            if is_selected && used_lines < available_lines {
+                lines.push(render_action_bar(todo));
+                used_lines += 1;
+            }
             flat_idx += 1;
         }
         if in_progress.len() > show_count {
@@ -1672,9 +1726,13 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(todos.len()).min(4);
         for todo in todos.iter().take(show_count) {
-            let is_selected = state.selected_todo == flat_idx;
+            let is_selected = state.selected_todo == flat_idx && is_focused;
             lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
             used_lines += 1;
+            if is_selected && used_lines < available_lines {
+                lines.push(render_action_bar(todo));
+                used_lines += 1;
+            }
             flat_idx += 1;
         }
         if todos.len() > show_count {
@@ -1698,9 +1756,13 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(blocked.len()).min(3);
         for todo in blocked.iter().take(show_count) {
-            let is_selected = state.selected_todo == flat_idx;
+            let is_selected = state.selected_todo == flat_idx && is_focused;
             lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
             used_lines += 1;
+            if is_selected && used_lines < available_lines {
+                lines.push(render_action_bar(todo));
+                used_lines += 1;
+            }
             flat_idx += 1;
         }
         if blocked.len() > show_count {
@@ -1724,8 +1786,13 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         used_lines += 1;
         let show_count = (available_lines - used_lines).min(backlog.len()).min(2);
         for todo in backlog.iter().take(show_count) {
-            let is_selected = state.selected_todo == flat_idx;
+            let is_selected = state.selected_todo == flat_idx && is_focused;
             lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
+            used_lines += 1;
+            if is_selected && used_lines < available_lines {
+                lines.push(render_action_bar(todo));
+                used_lines += 1;
+            }
             flat_idx += 1;
         }
         if backlog.len() > show_count {
