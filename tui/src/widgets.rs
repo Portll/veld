@@ -1053,7 +1053,7 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
         // Progress percentage
         let pct = if total > 0 { (done * 100) / total } else { 0 };
         let progress_color = if pct == 100 { GOLD } else if active > 0 { SAFFRON } else { TEXT_DISABLED };
-        let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+        let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
 
         // Format: "3 left · 75%"  or "✓ done" if complete
         let status_str = if total == 0 {
@@ -1219,7 +1219,6 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                 format!(" ◐ In Progress ({})", in_progress.len()),
                 Style::default().fg(SAFFRON),
             )));
-            lines.push(Line::from("")); // space after header
             for todo in in_progress.iter().take(4) {
                 if lines.len() >= content_height - 2 { break; }
                 let is_selected = state.todos_selected == todo_idx && is_focused;
@@ -1229,7 +1228,6 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                 }
                 todo_idx += 1;
             }
-            lines.push(Line::from("")); // section separator
         }
 
         // Todo section
@@ -1238,7 +1236,6 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                 format!(" ○ Todo ({})", todo_items.len()),
                 Style::default().fg(TEXT_SECONDARY),
             )));
-            lines.push(Line::from("")); // space after header
             let max_todos = (content_height.saturating_sub(lines.len() + 4)).min(8);
             for todo in todo_items.iter().take(max_todos) {
                 if lines.len() >= content_height - 2 { break; }
@@ -1255,7 +1252,6 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(TEXT_DISABLED),
                 )));
             }
-            lines.push(Line::from("")); // section separator
         }
 
         // Blocked section
@@ -1264,7 +1260,6 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                 format!(" ⊘ Blocked ({})", blocked.len()),
                 Style::default().fg(MAROON),
             )));
-            lines.push(Line::from("")); // space after header
             for todo in blocked.iter().take(3) {
                 if lines.len() >= content_height - 2 { break; }
                 let is_selected = state.todos_selected == todo_idx && is_focused;
@@ -1274,28 +1269,29 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                 }
                 todo_idx += 1;
             }
-            lines.push(Line::from("")); // section separator
         }
 
-        // Done section (shows completed items)
-        if !done.is_empty() && lines.len() < content_height - 2 {
+        // Done section (shows completed items) - always show if there are done items
+        if !done.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!(" ● Completed ({})", done.len()),
                 Style::default().fg(GOLD),
             )));
-            lines.push(Line::from("")); // space after header
-            for todo in done.iter().take(5) {
-                if lines.len() >= content_height - 2 { break; }
-                let is_selected = state.todos_selected == todo_idx && is_focused;
-                lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
-                if is_selected {
-                    lines.push(render_action_bar(todo));
+            let remaining_height = content_height.saturating_sub(lines.len() + 2);
+            let show_count = remaining_height.min(done.len()).min(5);
+            if show_count > 0 {
+                for todo in done.iter().take(show_count) {
+                    let is_selected = state.todos_selected == todo_idx && is_focused;
+                    lines.push(render_todo_row_with_selection(todo, width, is_selected, is_focused));
+                    if is_selected {
+                        lines.push(render_action_bar(todo));
+                    }
+                    todo_idx += 1;
                 }
-                todo_idx += 1;
             }
-            if done.len() > 5 {
+            if done.len() > show_count && show_count > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("      +{} more", done.len() - 5),
+                    format!("      +{} more", done.len() - show_count),
                     Style::default().fg(TEXT_DISABLED),
                 )));
             }
@@ -1362,79 +1358,88 @@ fn render_todo_row(todo: &TuiTodo, width: usize) -> Line<'static> {
 
 /// Render contextual action bar below selected todo - changes based on status
 fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled("      ", Style::default()));
+    // Very pale yellow/cream background - high readability
+    let bar_bg = Color::Rgb(250, 245, 200); // Cream/pale yellow
+    let bar_style = Style::default().bg(bar_bg);
 
-    // Status-specific actions
+    let mut spans: Vec<Span> = Vec::new();
+    // Left border indicator
+    spans.push(Span::styled("   ┃ ", bar_style.fg(Color::Rgb(180, 160, 80))));
+
+    // Very dark text for cream background - maximum contrast
+    let label_color = Color::Rgb(20, 15, 5); // Near black
+    let key_color = Color::Rgb(50, 20, 70); // Dark purple for keys
+    let desc_color = Color::Rgb(40, 35, 20); // Very dark brown
+
+    // Status-specific actions - all very dark for cream bg
+    let dark_green = Color::Rgb(15, 50, 15);
+    let dark_red = Color::Rgb(80, 20, 20);
+    let dark_orange = Color::Rgb(90, 50, 10);
+
     match todo.status {
         TuiTodoStatus::Done => {
-            spans.push(Span::styled("● Done ", Style::default().fg(GOLD)));
-            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=reopen  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("● Done ", bar_style.fg(dark_green)));
+            spans.push(Span::styled("Spc", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=reopen  ", bar_style.fg(desc_color)));
         }
         TuiTodoStatus::Cancelled => {
-            spans.push(Span::styled("⊗ Cancelled ", Style::default().fg(TEXT_DISABLED)));
-            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=restore  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("⊗ Cancelled ", bar_style.fg(label_color)));
+            spans.push(Span::styled("Spc", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=restore  ", bar_style.fg(desc_color)));
         }
         TuiTodoStatus::Blocked => {
-            spans.push(Span::styled("⊘ Blocked ", Style::default().fg(MAROON)));
-            spans.push(Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)));
-            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=unblock  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("⊘ Blocked ", bar_style.fg(dark_red)));
+            spans.push(Span::styled("x", bar_style.fg(dark_green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=done  ", bar_style.fg(desc_color)));
+            spans.push(Span::styled("Spc", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=unblock  ", bar_style.fg(desc_color)));
         }
         TuiTodoStatus::InProgress => {
-            spans.push(Span::styled("◐ Working ", Style::default().fg(SAFFRON)));
-            spans.push(Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)));
-            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=pause  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("◐ Working ", bar_style.fg(dark_orange)));
+            spans.push(Span::styled("x", bar_style.fg(dark_green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=done  ", bar_style.fg(desc_color)));
+            spans.push(Span::styled("Spc", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=pause  ", bar_style.fg(desc_color)));
         }
         TuiTodoStatus::Todo => {
-            spans.push(Span::styled("○ Ready ", Style::default().fg(TEXT_SECONDARY)));
-            spans.push(Span::styled("x", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=done  ", Style::default().fg(TEXT_DISABLED)));
-            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=start  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("○ Ready ", bar_style.fg(label_color)));
+            spans.push(Span::styled("x", bar_style.fg(dark_green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=done  ", bar_style.fg(desc_color)));
+            spans.push(Span::styled("Spc", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=start  ", bar_style.fg(desc_color)));
         }
         TuiTodoStatus::Backlog => {
-            spans.push(Span::styled("◌ Backlog ", Style::default().fg(TEXT_DISABLED)));
-            spans.push(Span::styled("Spc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled("=activate  ", Style::default().fg(TEXT_DISABLED)));
+            spans.push(Span::styled("◌ Backlog ", bar_style.fg(label_color)));
+            spans.push(Span::styled("Spc", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("=activate  ", bar_style.fg(desc_color)));
         }
     }
 
     // Common actions for active items only
     if todo.status != TuiTodoStatus::Done && todo.status != TuiTodoStatus::Cancelled {
-        spans.push(Span::styled("[]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled("=move  ", Style::default().fg(TEXT_DISABLED)));
+        spans.push(Span::styled("[]", bar_style.fg(key_color).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled("=move  ", bar_style.fg(desc_color)));
 
-        // Priority shortcuts - highlight current
+        // Priority shortcuts - very dark colors
+        let dim = bar_style.fg(Color::Rgb(70, 60, 40));
         let (urg_style, hi_style, med_style, low_style) = match todo.priority {
             TuiPriority::Urgent => (
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
+                bar_style.fg(Color::Rgb(120, 20, 20)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                dim, dim, dim,
             ),
             TuiPriority::High => (
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(255, 165, 0)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
+                dim,
+                bar_style.fg(Color::Rgb(120, 60, 10)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                dim, dim,
             ),
             TuiPriority::Medium => (
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
+                dim, dim,
+                bar_style.fg(Color::Rgb(80, 70, 10)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                dim,
             ),
             TuiPriority::Low => (
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Rgb(100, 80, 60)),
-                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                dim, dim, dim,
+                bar_style.fg(Color::Rgb(20, 40, 80)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ),
         };
         spans.push(Span::styled("!", urg_style));
@@ -1442,8 +1447,15 @@ fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
         spans.push(Span::styled("#", med_style));
         spans.push(Span::styled("$", low_style));
     }
+    // Fill rest of line with background color for full-width bar effect
+    spans.push(Span::styled(format!("{:>80}", " "), bar_style));
 
     Line::from(spans)
+}
+
+/// Empty spacer line for visual breathing room between todos
+fn spacer_line() -> Line<'static> {
+    Line::from(Span::raw(""))
 }
 
 /// Render a todo row with selection highlighting
@@ -1473,7 +1485,7 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
     // Selection indicator and background - always visible, brighter when focused
     let sel_marker = if is_selected { "▸ " } else { "   " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-    let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+    let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
     // Calculate content width (flexible column)
@@ -1535,7 +1547,7 @@ fn render_sidebar_todo(todo: &TuiTodo, width: usize, is_selected: bool, is_panel
     // Selection indicator - always visible, brighter when focused
     let sel = if is_selected { "  ▸ " } else { "    " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-    let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+    let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
     let content_width = width.saturating_sub(12);
 
     Line::from(vec![
@@ -1937,24 +1949,23 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
-    // Done section (show recent completions)
+    // Done section (show recent completions) - always show if there are done items
     let done: Vec<_> = state.todos.iter()
         .filter(|t| t.status == TuiTodoStatus::Done)
         .collect();
-    if !done.is_empty() && used_lines < available_lines {
+    if !done.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(" ● Done ({})", done.len()),
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         )));
-        used_lines += 1;
-        let show_count = (available_lines - used_lines).min(done.len()).min(3);
+        // Show up to 5 done items, using remaining space
+        let remaining = available_lines.saturating_sub(used_lines + 3);
+        let show_count = remaining.max(2).min(done.len()).min(5);
         for todo in done.iter().take(show_count) {
             let is_selected = state.selected_todo == flat_idx && is_focused;
             lines.push(render_dashboard_todo_line(todo, width, is_selected, is_focused));
-            used_lines += 1;
-            if is_selected && used_lines < available_lines {
+            if is_selected {
                 lines.push(render_action_bar(todo));
-                used_lines += 1;
             }
             flat_idx += 1;
         }
@@ -1971,12 +1982,15 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("─".repeat(inner.width as usize - 2), Style::default().fg(BORDER_DIVIDER)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(format!("◐{} ", state.todo_stats.in_progress), Style::default().fg(SAFFRON)),
-        Span::styled(format!("○{} ", state.todo_stats.todo), Style::default().fg(TEXT_PRIMARY)),
-        Span::styled(format!("⊘{} ", state.todo_stats.blocked), Style::default().fg(MAROON)),
-        Span::styled(format!("●{}", state.todo_stats.done), Style::default().fg(GOLD)),
+        Span::styled(format!(" ◐ {} ", state.todo_stats.in_progress), Style::default().fg(SAFFRON)),
+        Span::styled(" ", Style::default()),
+        Span::styled(format!("○ {} ", state.todo_stats.todo), Style::default().fg(TEXT_PRIMARY)),
+        Span::styled(" ", Style::default()),
+        Span::styled(format!("⊘ {} ", state.todo_stats.blocked), Style::default().fg(MAROON)),
+        Span::styled(" ", Style::default()),
+        Span::styled(format!("● {}", state.todo_stats.done), Style::default().fg(GOLD)),
         if state.todo_stats.overdue > 0 {
-            Span::styled(format!(" ⚠{}", state.todo_stats.overdue), Style::default().fg(MAROON))
+            Span::styled(format!(" ⚠ {}", state.todo_stats.overdue), Style::default().fg(MAROON))
         } else {
             Span::raw("")
         },
@@ -2013,7 +2027,7 @@ fn render_dashboard_todo_line(todo: &TuiTodo, width: usize, is_selected: bool, i
     // Selection styling
     let sel_marker = if is_selected { "▸ " } else { "   " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-    let bg = if is_selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
+    let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
     // Calculate content width (flexible column)
