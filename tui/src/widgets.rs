@@ -3602,7 +3602,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("↑↓ ", Style::default().fg(Color::DarkGray)),
     ];
 
-    // Add graph-specific controls
+    // Add view-specific controls
     if is_graph_view {
         keys.extend([
             Span::styled(
@@ -3619,6 +3619,31 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("refresh ", Style::default().fg(Color::DarkGray)),
+        ]);
+    } else if matches!(state.view_mode, ViewMode::Dashboard | ViewMode::Projects) {
+        // Todo controls for Dashboard/Projects
+        keys.extend([
+            Span::styled(
+                "x ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("done ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "!@#$ ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("pri ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[] ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("move ", Style::default().fg(Color::DarkGray)),
         ]);
     } else {
         keys.extend([

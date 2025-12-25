@@ -7690,6 +7690,15 @@ struct UpdateTodoRequest {
     notes: Option<String>,
     #[serde(default)]
     tags: Option<Vec<String>>,
+    #[serde(default)]
+    sort_order: Option<i32>,
+}
+
+/// Request to reorder a todo (move up/down)
+#[derive(Debug, Deserialize)]
+struct ReorderTodoRequest {
+    user_id: String,
+    direction: String, // "up" or "down"
 }
 
 /// Request to get due todos
@@ -8195,6 +8204,64 @@ async fn delete_todo(
     }))
 }
 
+/// POST /api/todos/{todo_id}/reorder - Move todo up/down within status group
+async fn reorder_todo(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Json(req): Json<ReorderTodoRequest>,
+) -> Result<Json<TodoResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Find the todo first
+    let todo = state
+        .todo_store
+        .find_todo_by_prefix(&req.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    let result = state
+        .todo_store
+        .reorder_todo(&req.user_id, &todo.id, &req.direction)
+        .map_err(AppError::Internal)?;
+
+    match result {
+        Some(updated) => {
+            let formatted = format!(
+                "Moved {} {}",
+                updated.short_id(),
+                if req.direction == "up" { "up" } else { "down" }
+            );
+
+            // Emit SSE event for live TUI updates
+            state.emit_event(MemoryEvent {
+                event_type: "TODO_REORDER".to_string(),
+                timestamp: chrono::Utc::now(),
+                user_id: req.user_id.clone(),
+                memory_id: Some(updated.id.0.to_string()),
+                content_preview: Some(updated.content.clone()),
+                memory_type: Some(format!("{:?}", updated.status)),
+                importance: None,
+                count: None,
+            });
+
+            tracing::debug!(
+                user_id = %req.user_id,
+                todo_id = %updated.id,
+                direction = %req.direction,
+                "Reordered todo"
+            );
+
+            Ok(Json(TodoResponse {
+                success: true,
+                todo: Some(updated),
+                project: None,
+                formatted,
+            }))
+        }
+        None => Err(AppError::TodoNotFound(todo_id)),
+    }
+}
+
 /// POST /api/projects - Create a new project
 async fn create_project(
     State(state): State<AppState>,
@@ -8596,6 +8663,7 @@ async fn main() -> Result<()> {
         .route("/api/todos/{todo_id}", get(get_todo))
         .route("/api/todos/{todo_id}/update", post(update_todo))
         .route("/api/todos/{todo_id}/complete", post(complete_todo))
+        .route("/api/todos/{todo_id}/reorder", post(reorder_todo))
         .route("/api/todos/{todo_id}", delete(delete_todo))
         .route("/api/projects", post(create_project))
         .route("/api/projects/list", post(list_projects))

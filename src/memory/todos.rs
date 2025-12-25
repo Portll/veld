@@ -280,6 +280,66 @@ impl TodoStore {
         }
     }
 
+    /// Reorder a todo within its status group
+    /// direction: "up" moves earlier in list (lower sort_order), "down" moves later
+    pub fn reorder_todo(
+        &self,
+        user_id: &str,
+        todo_id: &TodoId,
+        direction: &str,
+    ) -> Result<Option<Todo>> {
+        let todo = match self.get_todo(user_id, todo_id)? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Get all todos with the same status
+        let mut same_status_todos: Vec<Todo> = self
+            .list_todos_for_user(user_id, Some(&[todo.status.clone()]))?
+            .into_iter()
+            .collect();
+
+        // Sort by sort_order to get current ordering
+        same_status_todos.sort_by_key(|t| t.sort_order);
+
+        // Find current position
+        let pos = same_status_todos
+            .iter()
+            .position(|t| t.id == *todo_id)
+            .unwrap_or(0);
+
+        let swap_pos = match direction {
+            "up" => {
+                if pos == 0 {
+                    return Ok(Some(todo)); // Already at top
+                }
+                pos - 1
+            }
+            "down" => {
+                if pos >= same_status_todos.len() - 1 {
+                    return Ok(Some(todo)); // Already at bottom
+                }
+                pos + 1
+            }
+            _ => return Ok(Some(todo)), // Invalid direction
+        };
+
+        // Swap sort_order values with adjacent todo
+        let mut current = same_status_todos[pos].clone();
+        let mut adjacent = same_status_todos[swap_pos].clone();
+
+        std::mem::swap(&mut current.sort_order, &mut adjacent.sort_order);
+
+        // Update both todos
+        current.updated_at = Utc::now();
+        adjacent.updated_at = Utc::now();
+
+        self.update_todo(&current)?;
+        self.update_todo(&adjacent)?;
+
+        Ok(Some(current))
+    }
+
     // =========================================================================
     // TODO QUERIES
     // =========================================================================
@@ -320,12 +380,19 @@ impl TodoStore {
             }
         }
 
-        // Sort by priority, then due date
+        // Sort by: sort_order (manual), then priority, then due date
         todos.sort_by(|a, b| {
+            // First by sort_order (lower = higher in list)
+            let order_cmp = a.sort_order.cmp(&b.sort_order);
+            if order_cmp != std::cmp::Ordering::Equal {
+                return order_cmp;
+            }
+            // Then by priority
             let priority_cmp = a.priority.value().cmp(&b.priority.value());
             if priority_cmp != std::cmp::Ordering::Equal {
                 return priority_cmp;
             }
+            // Finally by due date
             match (&a.due_date, &b.due_date) {
                 (Some(a_due), Some(b_due)) => a_due.cmp(b_due),
                 (Some(_), None) => std::cmp::Ordering::Less,

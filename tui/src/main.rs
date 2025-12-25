@@ -24,7 +24,7 @@ mod types;
 mod widgets;
 
 use logo::{ELEPHANT, ELEPHANT_FRAMES, SHODH_GRADIENT, SHODH_TEXT};
-use stream::{MemoryStream, complete_todo, update_todo_status, update_todo_priority, next_status};
+use stream::{MemoryStream, complete_todo, update_todo_status, update_todo_priority, reorder_todo, next_status};
 use types::{AppState, FocusPanel, SearchMode, ViewMode};
 use widgets::{render_footer, render_header, render_main};
 
@@ -1003,6 +1003,31 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let user_id = g.current_user.clone();
                                     drop(g);
                                     let _ = update_todo_priority(&base_url, &api_key, &user_id, &todo_id, "low").await;
+                                }
+                            }
+                        }
+                        // Reorder shortcuts: [ = move up, ] = move down
+                        KeyCode::Char('[') => {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
+                                && g.focus_panel == FocusPanel::Left
+                            {
+                                if let Some(todo) = g.get_selected_dashboard_todo() {
+                                    let todo_id = todo.id.clone();
+                                    let user_id = g.current_user.clone();
+                                    drop(g);
+                                    let _ = reorder_todo(&base_url, &api_key, &user_id, &todo_id, "up").await;
+                                }
+                            }
+                        }
+                        KeyCode::Char(']') => {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
+                                && g.focus_panel == FocusPanel::Left
+                            {
+                                if let Some(todo) = g.get_selected_dashboard_todo() {
+                                    let todo_id = todo.id.clone();
+                                    let user_id = g.current_user.clone();
+                                    drop(g);
+                                    let _ = reorder_todo(&base_url, &api_key, &user_id, &todo_id, "down").await;
                                 }
                             }
                         }

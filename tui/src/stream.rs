@@ -771,3 +771,31 @@ pub async fn update_todo_priority(
         Err(format!("Failed to update priority: {}", resp.status()))
     }
 }
+
+/// Reorder todo (move up/down within status group)
+pub async fn reorder_todo(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    todo_id: &str,
+    direction: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .post(format!("{}/api/todos/{}/reorder", base_url, todo_id))
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "user_id": user_id,
+            "direction": direction
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Failed to reorder todo: {}", resp.status()))
+    }
+}

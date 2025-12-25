@@ -2901,6 +2901,10 @@ pub struct Todo {
 
     /// When completed (if Done)
     pub completed_at: Option<DateTime<Utc>>,
+
+    /// Manual sort order within status group (lower = higher in list)
+    #[serde(default)]
+    pub sort_order: i32,
 }
 
 impl Todo {
@@ -2924,6 +2928,7 @@ impl Todo {
             created_at: now,
             updated_at: now,
             completed_at: None,
+            sort_order: 0,
         }
     }
 
