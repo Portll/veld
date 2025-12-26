@@ -39,8 +39,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::Dashboard => "Dashboard",
         ViewMode::Projects => "Projects",
         ViewMode::ActivityLogs => "Activity",
-        ViewMode::GraphList => "Graph",
-        ViewMode::GraphMap => "Map",
+        ViewMode::GraphMap => "Graph",
     };
 
     format!("🦣 Shodh - {}", view_name)
@@ -799,13 +798,11 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         KeyCode::Char('1') => g.set_view(ViewMode::Dashboard),
                         KeyCode::Char('2') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('3') => g.set_view(ViewMode::ActivityLogs),
-                        KeyCode::Char('4') => g.set_view(ViewMode::GraphList),
-                        KeyCode::Char('5') => g.set_view(ViewMode::GraphMap),
+                        KeyCode::Char('4') => g.set_view(ViewMode::GraphMap),
                         KeyCode::Char('d') => g.set_view(ViewMode::Dashboard),
                         KeyCode::Char('p') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),
-                        KeyCode::Char('g') => g.set_view(ViewMode::GraphList),
-                        KeyCode::Char('m') => g.set_view(ViewMode::GraphMap),
+                        KeyCode::Char('g') => g.set_view(ViewMode::GraphMap),
                         KeyCode::Char('t') => g.toggle_theme(),
                         KeyCode::Char('o') => {
                             // Toggle auto-rotate in graph map view
@@ -841,8 +838,8 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                         }
                         KeyCode::Char('r') => {
-                            // Rebuild graph in graph views (lowercase r = rebuild)
-                            if matches!(g.view_mode, ViewMode::GraphList | ViewMode::GraphMap) {
+                            // Rebuild graph in graph view (lowercase r = rebuild)
+                            if matches!(g.view_mode, ViewMode::GraphMap) {
                                 let user_id = g.current_user.clone();
                                 g.set_error("Rebuilding graph...".to_string());
                                 drop(g);
@@ -882,7 +879,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         }
                         KeyCode::Char('R') => {
                             // Refresh graph data without rebuilding (uppercase R)
-                            if matches!(g.view_mode, ViewMode::GraphList | ViewMode::GraphMap) {
+                            if matches!(g.view_mode, ViewMode::GraphMap) {
                                 let user_id = g.current_user.clone();
                                 g.set_error("Refreshing graph...".to_string());
                                 drop(g);
@@ -1065,7 +1062,8 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) && g.focus_panel == FocusPanel::Right {
                                 g.focus_panel = FocusPanel::Left;
                             } else if matches!(g.view_mode, ViewMode::GraphMap) {
-                                g.rotate_graph_left();
+                                // Switch focus to entities panel
+                                g.graph_map_focus = FocusPanel::Left;
                             }
                         }
                         KeyCode::Right => {
@@ -1078,7 +1076,14 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 g.focus_panel = FocusPanel::Right;
                                 g.todos_selected = 0;
                             } else if matches!(g.view_mode, ViewMode::GraphMap) {
-                                g.rotate_graph_right();
+                                // Switch focus to connections panel
+                                g.graph_map_focus = FocusPanel::Right;
+                                g.selected_connection = 0;
+                            }
+                        }
+                        KeyCode::Tab => {
+                            if matches!(g.view_mode, ViewMode::GraphMap) {
+                                g.toggle_graph_map_focus();
                             }
                         }
                         KeyCode::Enter => match g.view_mode {

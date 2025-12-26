@@ -33,6 +33,18 @@ const BORDER_DIVIDER: Color = Color::Rgb(60, 60, 60);
 const SURFACE: Color = Color::Rgb(35, 35, 35);
 /// Live/connected indicator
 const LIVE_GREEN: Color = Color::Rgb(150, 230, 170);
+/// Selection background - pale yellow/cream
+const SELECTION_BG: Color = Color::Rgb(75, 70, 50);
+
+// ============================================================================
+// CONNECTION STRENGTH COLORS (unified across all panels)
+// ============================================================================
+/// Strong connection (weight >= 0.7) - bright green
+const CONN_STRONG: Color = Color::Rgb(120, 200, 120);
+/// Medium connection (weight >= 0.4) - golden yellow
+const CONN_MEDIUM: Color = Color::Rgb(230, 200, 100);
+/// Weak connection (weight < 0.4) - muted gray
+const CONN_WEAK: Color = Color::Rgb(120, 120, 120);
 
 /// Apply opacity to a color (blend with black)
 fn apply_opacity(color: Color, opacity: f32) -> Color {
@@ -389,7 +401,6 @@ pub fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
         ViewMode::Dashboard => render_dashboard(f, area, state),
         ViewMode::Projects => render_projects_view(f, area, state),
         ViewMode::ActivityLogs => render_activity_logs(f, area, state),
-        ViewMode::GraphList => render_graph_list(f, area, state),
         ViewMode::GraphMap => render_graph_map(f, area, state),
     }
 
@@ -1163,7 +1174,7 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
         // Progress percentage
         let pct = if total > 0 { (done * 100) / total } else { 0 };
         let progress_color = if pct == 100 { GOLD } else if active > 0 { SAFFRON } else { TEXT_DISABLED };
-        let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
+        let bg = if is_selected { SELECTION_BG } else { Color::Reset };
 
         // Format: "3 left · 75%"  or "✓ done" if complete
         let status_str = if total == 0 {
@@ -1595,7 +1606,7 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
     // Selection indicator and background - always visible, brighter when focused
     let sel_marker = if is_selected { "▸ " } else { "   " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-    let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
+    let bg = if is_selected { SELECTION_BG } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
     // Calculate content width (flexible column)
@@ -1657,7 +1668,7 @@ fn render_sidebar_todo(todo: &TuiTodo, width: usize, is_selected: bool, is_panel
     // Selection indicator - always visible, brighter when focused
     let sel = if is_selected { "  ▸ " } else { "    " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-    let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
+    let bg = if is_selected { SELECTION_BG } else { Color::Reset };
     let content_width = width.saturating_sub(12);
 
     Line::from(vec![
@@ -2137,7 +2148,7 @@ fn render_dashboard_todo_line(todo: &TuiTodo, width: usize, is_selected: bool, i
     // Selection styling
     let sel_marker = if is_selected { "▸ " } else { "   " };
     let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-    let bg = if is_selected { Color::Rgb(60, 50, 75) } else { Color::Reset };
+    let bg = if is_selected { SELECTION_BG } else { Color::Reset };
     let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
 
     // Calculate content width (flexible column)
@@ -3072,250 +3083,546 @@ fn render_river_event(f: &mut Frame, area: Rect, event: &DisplayEvent) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_graph_list(f: &mut Frame, area: Rect, state: &AppState) {
-    let content_area = with_ribbon_layout(f, area, state);
-
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(content_area);
-
-    // LEFT: Node list
-    let node_count = state.graph_data.nodes.len();
-    let selected_idx = state.graph_data.selected_node;
-    let left_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Black))
-        .title(Span::styled(
-            " NODES ",
-            Style::default()
-                .fg(Color::Rgb(255, 200, 150))
-                .add_modifier(Modifier::BOLD),
-        ))
-        .title(
-            block::Title::from(Span::styled(
-                format!(
-                    " [{}/{}] ",
-                    if node_count > 0 { selected_idx + 1 } else { 0 },
-                    node_count
-                ),
-                Style::default().fg(Color::Yellow),
-            ))
-            .alignment(Alignment::Right),
-        );
-    let left_inner = left_block.inner(chunks[0]);
-    f.render_widget(left_block, chunks[0]);
-
-    if state.graph_data.nodes.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                "  No nodes yet",
-                Style::default().fg(Color::DarkGray),
-            )),
-            left_inner,
-        );
-    } else {
-        let lines_per_node = 2_usize;
-        let max_visible_nodes = (left_inner.height as usize) / lines_per_node;
-
-        // Calculate scroll offset to keep selected node in view
-        let scroll_offset = if selected_idx >= max_visible_nodes {
-            selected_idx - max_visible_nodes + 1
-        } else {
-            0
-        };
-
-        let mut lines = Vec::new();
-        for (i, node) in state
-            .graph_data
-            .nodes
-            .iter()
-            .enumerate()
-            .skip(scroll_offset)
-            .take(max_visible_nodes)
-        {
-            let is_selected = i == selected_idx;
-            let prefix = if is_selected { "> " } else { "  " };
-            let style = if is_selected {
-                Style::default()
-                    .fg(Color::Rgb(255, 200, 150))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let bar = progress_bar(
-                node.connections,
-                state.graph_data.nodes.len().max(1) as u32,
-                4,
-            );
-            lines.push(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(
-                    &node.short_id,
-                    Style::default().fg(if is_selected {
-                        Color::Yellow
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    &node.memory_type[..3.min(node.memory_type.len())],
-                    Style::default().fg(Color::Rgb(255, 200, 150)),
-                ),
-                Span::raw(" "),
-                Span::styled(bar, Style::default().fg(Color::Rgb(180, 230, 180))),
-                Span::styled(
-                    format!(" {}", node.connections),
-                    Style::default().fg(Color::Rgb(180, 230, 180)),
-                ),
-            ]));
-            // Use theme-aware colors for node content readability on both dark and light backgrounds
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    truncate(&node.content, left_inner.width.saturating_sub(4) as usize),
-                    Style::default().fg(if is_selected {
-                        state.theme.fg()
-                    } else {
-                        state.theme.fg_dim()
-                    }),
-                ),
-            ]));
-        }
-        f.render_widget(Paragraph::new(lines), left_inner);
-
-        // Show scrollbar if there are more nodes than can display
-        if node_count > max_visible_nodes {
-            let scrollbar = Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight);
-            let mut scrollbar_state = ScrollbarState::new(node_count).position(selected_idx);
-            f.render_stateful_widget(
-                scrollbar,
-                chunks[0].inner(Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut scrollbar_state,
-            );
-        }
+/// Get emoji for entity type
+fn entity_type_emoji(entity_type: &str) -> &'static str {
+    match entity_type.to_lowercase().as_str() {
+        "person" | "per" => "👤",
+        "organization" | "org" => "🏢",
+        "location" | "loc" | "gpe" => "📍",
+        "technology" | "tech" | "product" => "💻",
+        "project" | "work_of_art" => "📦",
+        "language" | "norp" => "🗣️",
+        "event" => "📅",
+        "money" | "cardinal" | "quantity" | "percent" => "💰",
+        "date" | "time" => "⏰",
+        "law" | "fac" => "📜",
+        _ => "◆",
     }
+}
 
-    // RIGHT: Edges from selected node
-    let right_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Black))
-        .title(Span::styled(
-            " EDGES ",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .title(
-            block::Title::from(Span::styled(
-                format!(" {} ", state.graph_stats.edges),
-                Style::default().fg(Color::Yellow),
-            ))
-            .alignment(Alignment::Right),
-        );
-    let right_inner = right_block.inner(chunks[1]);
-    f.render_widget(right_block, chunks[1]);
+/// Format connection strength as visual indicator
+fn connection_strength_indicator(weight: f32) -> (&'static str, Color) {
+    if weight >= 0.7 {
+        ("━━━", CONN_STRONG) // Strong - green
+    } else if weight >= 0.4 {
+        ("━━╍", CONN_MEDIUM) // Medium - yellow
+    } else {
+        ("╍╍╍", CONN_WEAK) // Weak - gray
+    }
+}
 
-    if let Some(selected) = state.graph_data.selected() {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(" Selected: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    &selected.short_id,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" ({})", selected.memory_type),
-                    Style::default().fg(Color::Rgb(255, 200, 150)),
-                ),
-            ]),
-            Line::from(Span::styled(
-                format!(" {}", selected.content),
-                Style::default().fg(state.theme.fg()),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                " Connections:",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-
-        let edges = state.graph_data.edges_from_selected();
-        if edges.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "   (no outgoing edges)",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for (edge, target) in edges.iter().take(10) {
-                let weight_color = if edge.weight >= 0.7 {
-                    Color::Rgb(180, 230, 180)
-                } else if edge.weight >= 0.4 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                };
-                let target_info = target
-                    .map(|t| format!(" {} \"{}\"", t.short_id, truncate(&t.content, 25)))
-                    .unwrap_or_else(|| " ???".to_string());
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("   --{:.2}-->", edge.weight),
-                        Style::default().fg(weight_color),
-                    ),
-                    Span::styled(target_info, Style::default().fg(state.theme.fg())),
-                ]));
-            }
-        }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(" strong ", Style::default().fg(Color::Rgb(180, 230, 180))),
-            Span::styled(
-                format!("{} ", state.graph_stats.strong_edges),
-                Style::default().fg(Color::Rgb(180, 230, 180)),
-            ),
-            Span::styled(" medium ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("{} ", state.graph_stats.medium_edges),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(" weak ", Style::default().fg(Color::Red)),
-            Span::styled(
-                format!("{}", state.graph_stats.weak_edges),
-                Style::default().fg(Color::Red),
-            ),
-        ]));
-
-        f.render_widget(Paragraph::new(lines), right_inner);
+/// Get connection color based on weight (for graph visualization)
+fn connection_color(weight: f32) -> Color {
+    if weight >= 0.7 {
+        CONN_STRONG
+    } else if weight >= 0.4 {
+        CONN_MEDIUM
+    } else {
+        CONN_WEAK
     }
 }
 
 fn render_graph_map(f: &mut Frame, area: Rect, state: &AppState) {
     let content_area = with_ribbon_layout(f, area, state);
 
-    // Three-column layout: Top Entities | Selected Focus | Type Summary
+    // Three-column layout: Entities (20%) | Connections (20%) | Visualization (60%)
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(28), // Left: Top entities
-            Constraint::Min(40),    // Center: Focus view
-            Constraint::Length(24), // Right: Type summary
+            Constraint::Percentage(20), // Left: Entity list
+            Constraint::Percentage(20), // Middle: Connections
+            Constraint::Percentage(60), // Right: Visualization (hero)
         ])
         .split(content_area);
 
-    render_graph_top_entities(f, main_chunks[0], state);
-    render_graph_focus_view(f, main_chunks[1], state);
-    render_graph_type_summary(f, main_chunks[2], state);
+    render_graph_entity_selector(f, main_chunks[0], state);
+    render_graph_connections_panel(f, main_chunks[1], state);
+    render_graph_visualization(f, main_chunks[2], state);
 }
 
-/// Left panel: Top entities sorted by connections
+/// Compact entity selector for graph map view - sorted by name for stable ordering
+fn render_graph_entity_selector(f: &mut Frame, area: Rect, state: &AppState) {
+    use crate::types::FocusPanel;
+
+    let entity_count = state.graph_data.nodes.len();
+    let selected_idx = state.graph_data.selected_node;
+    let is_focused = state.graph_map_focus == FocusPanel::Left;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if is_focused { GOLD } else { BORDER_DIVIDER }))
+        .title(Span::styled(
+            " Entities ",
+            Style::default()
+                .fg(GOLD)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            block::Title::from(Span::styled(
+                format!(" {} ", entity_count),
+                Style::default().fg(TEXT_DISABLED),
+            ))
+            .alignment(Alignment::Right),
+        );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if state.graph_data.nodes.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled("  No entities yet", Style::default().fg(TEXT_DISABLED))),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    // Create sorted indices for stable display order (by name alphabetically)
+    let mut sorted_indices: Vec<usize> = (0..state.graph_data.nodes.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        state.graph_data.nodes[a]
+            .content
+            .to_lowercase()
+            .cmp(&state.graph_data.nodes[b].content.to_lowercase())
+    });
+
+    // Find where the selected node appears in the sorted list
+    let selected_sort_pos = sorted_indices
+        .iter()
+        .position(|&idx| idx == selected_idx)
+        .unwrap_or(0);
+
+    let max_visible = inner.height as usize;
+    let scroll_offset = if selected_sort_pos >= max_visible {
+        selected_sort_pos - max_visible + 1
+    } else {
+        0
+    };
+
+    let mut lines = Vec::new();
+    let max_name_width = inner.width.saturating_sub(10) as usize;
+
+    for &node_idx in sorted_indices
+        .iter()
+        .skip(scroll_offset)
+        .take(max_visible)
+    {
+        let node = &state.graph_data.nodes[node_idx];
+        let is_selected = node_idx == selected_idx;
+        let emoji = entity_type_emoji(&node.memory_type);
+        let bg = if is_selected { SELECTION_BG } else { Color::Reset };
+
+        let name = truncate(&node.content, max_name_width);
+        let count_str = format!("{:>3}", node.connections);
+
+        // Pad to fill width for background
+        let padding = inner.width.saturating_sub(name.len() as u16 + 8) as usize;
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_selected { " ▸ " } else { "   " },
+                Style::default().fg(if is_selected { GOLD } else { TEXT_DISABLED }).bg(bg),
+            ),
+            Span::styled(format!("{} ", emoji), Style::default().bg(bg)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(if is_selected { Color::White } else { TEXT_PRIMARY })
+                    .bg(bg)
+                    .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
+            ),
+            Span::styled(" ".repeat(padding), Style::default().bg(bg)),
+            Span::styled(count_str, Style::default().fg(TEXT_DISABLED).bg(bg)),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Scrollbar
+    if entity_count > max_visible {
+        let scrollbar = Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight);
+        let mut scrollbar_state = ScrollbarState::new(entity_count).position(selected_sort_pos);
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin { vertical: 1, horizontal: 0 }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
+/// Middle panel: Connections list for selected entity
+fn render_graph_connections_panel(f: &mut Frame, area: Rect, state: &AppState) {
+    use crate::types::FocusPanel;
+
+    let is_focused = state.graph_map_focus == FocusPanel::Right;
+    let selected_conn = state.selected_connection;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if is_focused { GOLD } else { BORDER_DIVIDER }))
+        .title(Span::styled(
+            " Connections ",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            block::Title::from(Span::styled(
+                " ←→ ",
+                Style::default().fg(TEXT_DISABLED),
+            ))
+            .alignment(Alignment::Right),
+        );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(selected) = state.graph_data.selected() else {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Select an entity",
+                    Style::default().fg(TEXT_DISABLED),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    // Subtitle showing selected entity
+    let emoji = entity_type_emoji(&selected.memory_type);
+    let subtitle = format!(" {} {}", emoji, truncate(&selected.content, (inner.width - 4) as usize));
+
+    // Get connected entities
+    let mut connections: Vec<(&str, &str, f32, bool)> = Vec::new();
+
+    for edge in &state.graph_data.edges {
+        if edge.from_id == selected.id {
+            if let Some(target) = state.graph_data.nodes.iter().find(|n| n.id == edge.to_id) {
+                connections.push((&target.content, &target.memory_type, edge.weight, true));
+            }
+        } else if edge.to_id == selected.id {
+            if let Some(source) = state.graph_data.nodes.iter().find(|n| n.id == edge.from_id) {
+                connections.push((&source.content, &source.memory_type, edge.weight, false));
+            }
+        }
+    }
+
+    connections.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Start with subtitle showing selected entity
+    let mut lines = vec![
+        Line::from(Span::styled(
+            subtitle,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""), // Spacer
+    ];
+
+    if connections.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No connections",
+            Style::default().fg(TEXT_DISABLED),
+        )));
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    // Account for subtitle + spacer (2 lines)
+    let max_visible = inner.height.saturating_sub(3) as usize;
+    let max_name_width = inner.width.saturating_sub(12) as usize;
+
+    // Calculate scroll offset for connections
+    let scroll_offset = if selected_conn >= max_visible {
+        selected_conn - max_visible + 1
+    } else {
+        0
+    };
+
+    for (idx, (name, entity_type, weight, is_outgoing)) in connections
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(max_visible)
+    {
+        let is_selected = is_focused && idx == selected_conn;
+        let conn_emoji = entity_type_emoji(entity_type);
+        let arrow = if *is_outgoing { "→" } else { "←" };
+        let (strength_bar, strength_color) = connection_strength_indicator(*weight);
+        let bg = if is_selected { SELECTION_BG } else { Color::Reset };
+
+        let prefix = if is_selected { "▸" } else { " " };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} {} ", prefix, arrow),
+                Style::default().fg(if is_selected { GOLD } else { TEXT_DISABLED }).bg(bg),
+            ),
+            Span::styled(format!("{} ", conn_emoji), Style::default().bg(bg)),
+            Span::styled(
+                truncate(name, max_name_width),
+                Style::default()
+                    .fg(if is_selected { Color::White } else { TEXT_PRIMARY })
+                    .bg(bg)
+                    .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
+            ),
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(strength_bar, Style::default().fg(strength_color).bg(bg)),
+        ]));
+    }
+
+    if connections.len() > max_visible + scroll_offset {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", connections.len() - max_visible - scroll_offset),
+            Style::default().fg(TEXT_DISABLED),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Right panel: Large radial visualization (50%)
+fn render_graph_visualization(f: &mut Frame, area: Rect, state: &AppState) {
+    use crate::types::FocusPanel;
+
+    let is_connections_focused = state.graph_map_focus == FocusPanel::Right;
+    let highlighted_conn = if is_connections_focused {
+        Some(state.selected_connection)
+    } else {
+        None
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER_DIVIDER))
+        .title(Span::styled(
+            " Knowledge Graph ",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            block::Title::from(Span::styled(
+                " ↑↓ navigate ",
+                Style::default().fg(TEXT_DISABLED),
+            ))
+            .alignment(Alignment::Right),
+        );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(selected) = state.graph_data.selected() else {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Select an entity to visualize",
+                    Style::default().fg(TEXT_DISABLED),
+                )),
+                Line::from(Span::styled(
+                    "  its connections",
+                    Style::default().fg(TEXT_DISABLED),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+
+    if height < 5 || width < 20 {
+        return;
+    }
+
+    // Get connections (same order as connections panel)
+    let mut connected: Vec<(&str, &str, f32)> = Vec::new(); // (name, type, weight)
+    for edge in &state.graph_data.edges {
+        if edge.from_id == selected.id {
+            if let Some(target) = state.graph_data.nodes.iter().find(|n| n.id == edge.to_id) {
+                connected.push((&target.content, &target.memory_type, edge.weight));
+            }
+        } else if edge.to_id == selected.id {
+            if let Some(source) = state.graph_data.nodes.iter().find(|n| n.id == edge.from_id) {
+                connected.push((&source.content, &source.memory_type, edge.weight));
+            }
+        }
+    }
+    connected.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build character grid
+    let mut grid: Vec<Vec<(char, Color)>> = vec![vec![(' ', Color::DarkGray); width]; height];
+
+    let center_x = width / 2;
+    let center_y = height / 2;
+
+    // Draw center node with box
+    let center_label = truncate(&selected.content, 16);
+    let box_half_width = (center_label.len() + 2) / 2;
+    let label_start = center_x.saturating_sub(box_half_width);
+    let box_left = label_start.saturating_sub(1);
+    let box_right = (label_start + center_label.len() + 1).min(width - 1);
+
+    // Draw box around center
+    if center_y > 0 && center_y + 1 < height {
+        // Top border
+        grid[center_y - 1][box_left] = ('╭', GOLD);
+        for x in (box_left + 1)..box_right {
+            if x < width {
+                grid[center_y - 1][x] = ('─', GOLD);
+            }
+        }
+        if box_right < width {
+            grid[center_y - 1][box_right] = ('╮', GOLD);
+        }
+        // Bottom border
+        grid[center_y + 1][box_left] = ('╰', GOLD);
+        for x in (box_left + 1)..box_right {
+            if x < width {
+                grid[center_y + 1][x] = ('─', GOLD);
+            }
+        }
+        if box_right < width {
+            grid[center_y + 1][box_right] = ('╯', GOLD);
+        }
+        // Side borders
+        grid[center_y][box_left] = ('│', GOLD);
+        if box_right < width {
+            grid[center_y][box_right] = ('│', GOLD);
+        }
+    }
+
+    // Draw center label
+    for (i, ch) in center_label.chars().enumerate() {
+        let x = label_start + i;
+        if x < width && x > box_left && x < box_right {
+            grid[center_y][x] = (ch, Color::White);
+        }
+    }
+
+    // Draw connections radially
+    let max_connections = 8.min(connected.len());
+    let radius_x = (width as f32 * 0.38) as usize;
+    let radius_y = (height as f32 * 0.40) as usize;
+
+    // Highlight color for selected connection
+    let highlight_color = Color::Rgb(255, 100, 100); // Red highlight
+
+    for (i, (name, entity_type, weight)) in connected.iter().take(max_connections).enumerate() {
+        let is_highlighted = highlighted_conn == Some(i);
+        let angle = (i as f32 / max_connections as f32) * std::f32::consts::PI * 2.0
+            - std::f32::consts::PI / 2.0;
+        let target_x = (center_x as f32 + angle.cos() * radius_x as f32) as usize;
+        let target_y = (center_y as f32 + angle.sin() * radius_y as f32) as usize;
+
+        // Edge color - highlight if selected, otherwise use unified weight-based colors
+        let edge_color = if is_highlighted {
+            highlight_color
+        } else {
+            connection_color(*weight)
+        };
+
+        // Draw line from center to target
+        let dx = target_x as i32 - center_x as i32;
+        let dy = target_y as i32 - center_y as i32;
+        let steps = dx.abs().max(dy.abs()) as usize;
+
+        if steps > 3 {
+            for step in 3..(steps - 1) {
+                let t = step as f32 / steps as f32;
+                let x = (center_x as f32 + dx as f32 * t) as usize;
+                let y = (center_y as f32 + dy as f32 * t) as usize;
+                if y < height && x < width && grid[y][x].0 == ' ' {
+                    let ch = if is_highlighted {
+                        '━' // Thicker line for highlighted
+                    } else if dx.abs() > dy.abs() * 2 {
+                        '─'
+                    } else if dy.abs() > dx.abs() * 2 {
+                        '│'
+                    } else {
+                        '·'
+                    };
+                    grid[y][x] = (ch, edge_color);
+                }
+            }
+        }
+
+        // Draw target node with emoji - highlight if selected
+        let node_emoji = entity_type_emoji(entity_type);
+        let label = format!("{} {}", node_emoji, truncate(name, 10));
+        let label_x = if target_x > center_x {
+            target_x.min(width.saturating_sub(label.len()))
+        } else {
+            target_x.saturating_sub(label.len())
+        };
+
+        // Use highlight color for selected connection's target node
+        let label_color = if is_highlighted {
+            highlight_color
+        } else {
+            TEXT_PRIMARY
+        };
+
+        if target_y < height {
+            for (j, ch) in label.chars().enumerate() {
+                if label_x + j < width {
+                    grid[target_y][label_x + j] = (ch, label_color);
+                }
+            }
+        }
+    }
+
+    // Draw legend at bottom (before overflow to avoid collision)
+    if !connected.is_empty() && height > 3 {
+        let legend_y = height - 2; // One line above the very bottom
+        let legend_parts = [
+            ("━━━", CONN_STRONG),
+            (" Strong  ", TEXT_DISABLED),
+            ("━━╍", CONN_MEDIUM),
+            (" Medium  ", TEXT_DISABLED),
+            ("╍╍╍", CONN_WEAK),
+            (" Weak", TEXT_DISABLED),
+        ];
+
+        let mut x = 1;
+        for (text, color) in legend_parts {
+            for ch in text.chars() {
+                if x < width {
+                    grid[legend_y][x] = (ch, color);
+                    x += 1;
+                }
+            }
+        }
+    }
+
+    // Show overflow indicator at bottom right
+    if connected.len() > max_connections {
+        let overflow_text = format!("+{} more", connected.len() - max_connections);
+        if height > 1 {
+            for (i, ch) in overflow_text.chars().enumerate() {
+                let x = width.saturating_sub(overflow_text.len()) + i;
+                if x < width {
+                    grid[height - 1][x] = (ch, TEXT_DISABLED);
+                }
+            }
+        }
+    }
+
+    // Convert grid to lines
+    let lines: Vec<Line> = grid
+        .iter()
+        .map(|row| {
+            Line::from(
+                row.iter()
+                    .map(|(ch, color)| Span::styled(ch.to_string(), Style::default().fg(*color)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Left panel: Top entities sorted by connections (legacy - used by old map view)
 fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
     let node_count = state.graph_data.nodes.len();
     let selected_idx = state.graph_data.selected_node;
@@ -3394,7 +3701,8 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
         };
 
         let prefix = if is_selected { "▶" } else { " " };
-        let name = truncate(&node.content, 15);
+        let emoji = entity_type_emoji(&node.memory_type);
+        let name = truncate(&node.content, 12);
 
         let style = if is_selected {
             Style::default()
@@ -3422,6 +3730,7 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
                 }),
             ),
             Span::raw(rank_str),
+            Span::raw(emoji),
             Span::styled(name, style),
             Span::styled(
                 format!(" {:>2}", node.connections),
@@ -3447,27 +3756,26 @@ fn render_graph_top_entities(f: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-/// Center panel: Selected entity with radial connections
+/// Center panel: Selected entity with radial connections visualization
 fn render_graph_focus_view(f: &mut Frame, area: Rect, state: &AppState) {
-    let selected_name = state
-        .graph_data
-        .selected()
-        .map(|n| truncate(&n.content, 20))
-        .unwrap_or_else(|| "None".to_string());
+    let selected_info = state.graph_data.selected().map(|n| {
+        let emoji = entity_type_emoji(&n.memory_type);
+        format!(" {} {} ", emoji, truncate(&n.content, 18))
+    });
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Black))
+        .border_style(Style::default().fg(BORDER_DIVIDER))
         .title(Span::styled(
-            format!(" {} ", selected_name),
+            selected_info.clone().unwrap_or_else(|| " Connections ".to_string()),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(GOLD)
                 .add_modifier(Modifier::BOLD),
         ))
         .title(
             block::Title::from(Span::styled(
-                " j/k=select Enter=expand ",
-                Style::default().fg(Color::DarkGray),
+                " ↑↓ navigate ",
+                Style::default().fg(TEXT_DISABLED),
             ))
             .alignment(Alignment::Right),
         );
@@ -3476,10 +3784,17 @@ fn render_graph_focus_view(f: &mut Frame, area: Rect, state: &AppState) {
 
     let Some(selected) = state.graph_data.selected() else {
         f.render_widget(
-            Paragraph::new(Span::styled(
-                "  Select an entity from the list",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Select an entity to visualize",
+                    Style::default().fg(TEXT_DISABLED),
+                )),
+                Line::from(Span::styled(
+                    "  its connections",
+                    Style::default().fg(TEXT_DISABLED),
+                )),
+            ]),
             inner,
         );
         return;
@@ -3787,8 +4102,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         ViewMode::Dashboard => "Dashboard",
         ViewMode::Projects => "Projects",
         ViewMode::ActivityLogs => "Activity",
-        ViewMode::GraphList => "Graph",
-        ViewMode::GraphMap => "Map",
+        ViewMode::GraphMap => "Graph",
     };
 
     // Check for error message
@@ -3908,7 +4222,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     // Normal footer - context-sensitive based on view
-    let is_graph_view = matches!(state.view_mode, ViewMode::GraphList | ViewMode::GraphMap);
+    let is_graph_view = matches!(state.view_mode, ViewMode::GraphMap);
 
     let mut keys = vec![
         Span::styled(
@@ -3953,13 +4267,6 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("graph ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "m ",
-            Style::default()
-                .fg(Color::Rgb(255, 200, 150))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("map ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "j/k ",
             Style::default()

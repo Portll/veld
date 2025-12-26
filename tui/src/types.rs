@@ -431,7 +431,6 @@ pub enum ViewMode {
     Dashboard,
     Projects,
     ActivityLogs,
-    GraphList,
     GraphMap,
 }
 
@@ -708,14 +707,19 @@ impl GraphData {
         }
     }
 
-    /// Get sorted indices by connection count (descending)
+    /// Get sorted indices by name (alphabetically, case-insensitive)
     pub fn sorted_indices(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..self.nodes.len()).collect();
-        indices.sort_by(|&a, &b| self.nodes[b].connections.cmp(&self.nodes[a].connections));
+        indices.sort_by(|&a, &b| {
+            self.nodes[a]
+                .content
+                .to_lowercase()
+                .cmp(&self.nodes[b].content.to_lowercase())
+        });
         indices
     }
 
-    /// Select next node in sorted order (by connections)
+    /// Select next node in sorted order (alphabetically by name)
     pub fn select_next_sorted(&mut self) {
         if self.nodes.is_empty() {
             return;
@@ -729,7 +733,7 @@ impl GraphData {
         self.selected_node = sorted[next_pos];
     }
 
-    /// Select previous node in sorted order (by connections)
+    /// Select previous node in sorted order (alphabetically by name)
     pub fn select_prev_sorted(&mut self) {
         if self.nodes.is_empty() {
             return;
@@ -1409,6 +1413,10 @@ pub struct AppState {
     pub focus_panel: FocusPanel,
     /// Selected todo index in right panel for Projects view
     pub todos_selected: usize,
+    /// Which panel is focused in Graph Map view (Left = entities, Right = connections)
+    pub graph_map_focus: FocusPanel,
+    /// Selected connection index in Graph Map view
+    pub selected_connection: usize,
     /// Current/last memory operation (for ribbon display)
     pub current_operation: Option<CurrentOperation>,
     /// Last memory being used/referenced (for ribbon display)
@@ -1476,6 +1484,8 @@ impl AppState {
             projects_scroll: 0,
             focus_panel: FocusPanel::default(),
             todos_selected: 0,
+            graph_map_focus: FocusPanel::default(),
+            selected_connection: 0,
             current_operation: None,
             last_used_memory: None,
         }
@@ -1674,8 +1684,7 @@ impl AppState {
         let new_mode = match self.view_mode {
             ViewMode::Dashboard => ViewMode::Projects,
             ViewMode::Projects => ViewMode::ActivityLogs,
-            ViewMode::ActivityLogs => ViewMode::GraphList,
-            ViewMode::GraphList => ViewMode::GraphMap,
+            ViewMode::ActivityLogs => ViewMode::GraphMap,
             ViewMode::GraphMap => ViewMode::Dashboard,
         };
         self.set_view(new_mode);
@@ -2010,8 +2019,15 @@ impl AppState {
 
     pub fn scroll_up(&mut self) {
         match self.view_mode {
-            ViewMode::GraphList => self.graph_data.select_prev(),
-            ViewMode::GraphMap => self.graph_data.select_prev_sorted(),
+            ViewMode::GraphMap => {
+                match self.graph_map_focus {
+                    FocusPanel::Left => self.graph_data.select_prev_sorted(),
+                    FocusPanel::Right => {
+                        // Navigate connections
+                        self.selected_connection = self.selected_connection.saturating_sub(1);
+                    }
+                }
+            }
             _ => {
                 let new_offset = self.scroll_offset.saturating_sub(1);
                 self.scroll_offset = new_offset;
@@ -2022,8 +2038,18 @@ impl AppState {
 
     pub fn scroll_down(&mut self) {
         match self.view_mode {
-            ViewMode::GraphList => self.graph_data.select_next(),
-            ViewMode::GraphMap => self.graph_data.select_next_sorted(),
+            ViewMode::GraphMap => {
+                match self.graph_map_focus {
+                    FocusPanel::Left => self.graph_data.select_next_sorted(),
+                    FocusPanel::Right => {
+                        // Navigate connections - need to check max
+                        let max_connections = self.graph_connection_count();
+                        if max_connections > 0 && self.selected_connection < max_connections - 1 {
+                            self.selected_connection += 1;
+                        }
+                    }
+                }
+            }
             _ => {
                 let max = self.events.len().saturating_sub(1);
                 if self.scroll_offset < max {
@@ -2031,6 +2057,30 @@ impl AppState {
                     self.smooth_scroll.set_target(self.scroll_offset);
                 }
             }
+        }
+    }
+
+    /// Get count of connections for currently selected entity
+    pub fn graph_connection_count(&self) -> usize {
+        let Some(selected) = self.graph_data.selected() else {
+            return 0;
+        };
+        self.graph_data
+            .edges
+            .iter()
+            .filter(|e| e.from_id == selected.id || e.to_id == selected.id)
+            .count()
+    }
+
+    /// Toggle focus between entities and connections in Graph Map view
+    pub fn toggle_graph_map_focus(&mut self) {
+        self.graph_map_focus = match self.graph_map_focus {
+            FocusPanel::Left => FocusPanel::Right,
+            FocusPanel::Right => FocusPanel::Left,
+        };
+        // Reset connection selection when switching to connections
+        if self.graph_map_focus == FocusPanel::Right {
+            self.selected_connection = 0;
         }
     }
 
