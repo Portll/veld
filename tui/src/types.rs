@@ -1295,6 +1295,8 @@ pub struct TuiProject {
     pub status: String,
     pub todo_count: usize,
     pub completed_count: usize,
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 impl TuiProject {
@@ -1304,6 +1306,11 @@ impl TuiProject {
         } else {
             ((self.completed_count as f32 / self.todo_count as f32) * 100.0) as u8
         }
+    }
+
+    /// Check if this is a sub-project
+    pub fn is_subproject(&self) -> bool {
+        self.parent_id.is_some()
     }
 }
 

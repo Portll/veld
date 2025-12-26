@@ -113,6 +113,8 @@ struct ProjectApiItem {
     name: String,
     description: Option<String>,
     status: String,
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +259,7 @@ impl MemoryStream {
                 status: p.status,
                 todo_count: 0,
                 completed_count: 0,
+                parent_id: p.parent_id,
             })
             .collect();
 
@@ -546,6 +549,7 @@ impl MemoryStream {
                 status: p.status,
                 todo_count: 0,
                 completed_count: 0,
+                parent_id: p.parent_id,
             })
             .collect();
 

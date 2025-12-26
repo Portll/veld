@@ -1,6 +1,6 @@
 use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, SHODH_GRADIENT, SHODH_TEXT};
 use crate::types::{
-    AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiPriority, TuiTodo,
+    AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiPriority, TuiProject, TuiTodo,
     TuiTodoStatus, ViewMode, VERSION,
 };
 use ratatui::{prelude::*, widgets::*};
@@ -1149,71 +1149,25 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
     // Flat index for navigation - includes projects and their expanded todos
     let mut flat_idx = 0;
 
-    // Render projects with folder icons
-    for project in state.projects.iter() {
+    // Separate root projects and sub-projects
+    let root_projects: Vec<_> = state.projects.iter().filter(|p| p.parent_id.is_none()).collect();
+    let sub_projects: Vec<_> = state.projects.iter().filter(|p| p.parent_id.is_some()).collect();
+
+    // Render projects with folder icons - root projects first, then sub-projects under them
+    for project in root_projects.iter() {
         if lines.len() >= inner.height as usize - 1 {
             break;
         }
 
-        let is_selected = state.projects_selected == flat_idx;
-        let is_expanded = state.is_project_expanded(&project.id);
-        let todos = state.todos_for_project(&project.id);
-        let done = todos.iter().filter(|t| t.status == TuiTodoStatus::Done).count();
-        let active = todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress).count();
-        let remaining = todos.iter().filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled).count();
-        let total = todos.len();
+        // Render the root project
+        flat_idx = render_project_line(&mut lines, project, state, flat_idx, width, is_left_focused, 0);
 
-        // Folder icon: 📂 open, 📁 closed
-        let folder = if is_expanded { "📂" } else { "📁" };
-        // Cursor always visible - brighter when focused
-        let sel = if is_selected { "▸ " } else { "  " };
-        let sel_color = if is_selected && is_left_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
-        let name_width = width.saturating_sub(28);
-        let name = truncate(&project.name, name_width);
-
-        // Progress percentage
-        let pct = if total > 0 { (done * 100) / total } else { 0 };
-        let progress_color = if pct == 100 { GOLD } else if active > 0 { SAFFRON } else { TEXT_DISABLED };
-        let bg = if is_selected { SELECTION_BG } else { Color::Reset };
-
-        // Format: "3 left · 75%"  or "✓ done" if complete
-        let status_str = if total == 0 {
-            "empty".to_string()
-        } else if pct == 100 {
-            "✓ done".to_string()
-        } else {
-            format!("{} left · {}%", remaining, pct)
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(sel, Style::default().fg(sel_color).bg(bg)),
-            Span::styled(format!("{} ", folder), Style::default().bg(bg)),
-            Span::styled(format!("{:<w$}", name, w = name_width), Style::default().fg(TEXT_PRIMARY).bg(bg)),
-            Span::styled(format!(" {:<12}", status_str), Style::default().fg(progress_color).bg(bg)),
-        ]));
-        flat_idx += 1;
-
-        // Expanded todos with indentation - each one is navigable
-        if is_expanded {
-            for todo in todos.iter().take(5) {
-                if lines.len() >= inner.height as usize - 1 {
-                    break;
-                }
-                let todo_selected = state.projects_selected == flat_idx;
-                let is_selected_and_focused = todo_selected && is_left_focused;
-                lines.push(render_sidebar_todo(todo, width, todo_selected, is_left_focused));
-                if is_selected_and_focused && lines.len() < inner.height as usize - 1 {
-                    lines.push(render_action_bar(todo));
-                }
-                flat_idx += 1;
+        // Find and render sub-projects of this project
+        for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+            if lines.len() >= inner.height as usize - 1 {
+                break;
             }
-            if todos.len() > 5 {
-                lines.push(Line::from(Span::styled(
-                    format!("       +{} more", todos.len() - 5),
-                    Style::default().fg(TEXT_DISABLED),
-                )));
-            }
-            lines.push(Line::from("")); // space after expanded project
+            flat_idx = render_project_line(&mut lines, subproject, state, flat_idx, width, is_left_focused, 1);
         }
     }
 
@@ -1653,6 +1607,86 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
     ];
 
     Line::from(spans)
+}
+
+/// Render a project line with indentation level (0 = root, 1 = sub-project)
+fn render_project_line(
+    lines: &mut Vec<Line<'static>>,
+    project: &TuiProject,
+    state: &AppState,
+    mut flat_idx: usize,
+    width: usize,
+    is_left_focused: bool,
+    indent_level: usize,
+) -> usize {
+    let is_selected = state.projects_selected == flat_idx;
+    let is_expanded = state.is_project_expanded(&project.id);
+    let todos = state.todos_for_project(&project.id);
+    let done = todos.iter().filter(|t| t.status == TuiTodoStatus::Done).count();
+    let active = todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress).count();
+    let remaining = todos.iter().filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled).count();
+    let total = todos.len();
+
+    // Folder icon: 📂 open, 📁 closed; sub-projects use different icons
+    let folder = if indent_level > 0 {
+        if is_expanded { "📂" } else { "📁" }
+    } else {
+        if is_expanded { "📂" } else { "📁" }
+    };
+
+    // Indentation for sub-projects
+    let indent_str = "   ".repeat(indent_level);
+
+    // Cursor always visible - brighter when focused
+    let sel = if is_selected { "▸ " } else { "  " };
+    let sel_color = if is_selected && is_left_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
+    let name_width = width.saturating_sub(28 + indent_level * 3);
+    let name = truncate(&project.name, name_width);
+
+    // Progress percentage
+    let pct = if total > 0 { (done * 100) / total } else { 0 };
+    let progress_color = if pct == 100 { GOLD } else if active > 0 { SAFFRON } else { TEXT_DISABLED };
+    let bg = if is_selected { SELECTION_BG } else { Color::Reset };
+
+    // Format: "3 left · 75%"  or "✓ done" if complete
+    let status_str = if total == 0 {
+        "empty".to_string()
+    } else if pct == 100 {
+        "✓ done".to_string()
+    } else {
+        format!("{} left · {}%", remaining, pct)
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(sel, Style::default().fg(sel_color).bg(bg)),
+        Span::styled(indent_str, Style::default().bg(bg)),
+        Span::styled(format!("{} ", folder), Style::default().bg(bg)),
+        Span::styled(format!("{:<w$}", name, w = name_width), Style::default().fg(TEXT_PRIMARY).bg(bg)),
+        Span::styled(format!(" {:<12}", status_str), Style::default().fg(progress_color).bg(bg)),
+    ]));
+    flat_idx += 1;
+
+    // Expanded todos with indentation - each one is navigable
+    if is_expanded {
+        for todo in todos.iter().take(5) {
+            let todo_selected = state.projects_selected == flat_idx;
+            let is_selected_and_focused = todo_selected && is_left_focused;
+            lines.push(render_sidebar_todo(todo, width, todo_selected, is_left_focused));
+            if is_selected_and_focused {
+                lines.push(render_action_bar(todo));
+            }
+            flat_idx += 1;
+        }
+        if todos.len() > 5 {
+            lines.push(Line::from(Span::styled(
+                format!("       +{} more", todos.len() - 5),
+                Style::default().fg(TEXT_DISABLED),
+            )));
+        }
+        lines.push(Line::from("")); // space after expanded project
+    }
+
+    flat_idx
 }
 
 /// Render todo under expanded project in sidebar (with selection support)
