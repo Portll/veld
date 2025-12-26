@@ -3028,6 +3028,10 @@ pub struct Project {
     /// Optional color (hex)
     pub color: Option<String>,
 
+    /// Parent project ID (for sub-projects)
+    #[serde(default)]
+    pub parent_id: Option<ProjectId>,
+
     /// When created
     pub created_at: DateTime<Utc>,
 
@@ -3045,6 +3049,22 @@ impl Project {
             description: None,
             status: ProjectStatus::Active,
             color: None,
+            parent_id: None,
+            created_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    /// Create a new sub-project under a parent
+    pub fn new_subproject(user_id: String, name: String, parent_id: ProjectId) -> Self {
+        Self {
+            id: ProjectId::new(),
+            user_id,
+            name,
+            description: None,
+            status: ProjectStatus::Active,
+            color: None,
+            parent_id: Some(parent_id),
             created_at: Utc::now(),
             completed_at: None,
         }

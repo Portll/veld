@@ -926,6 +926,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Maximum results (default: 50)",
               default: 50,
             },
+            offset: {
+              type: "number",
+              description: "Skip first N items for pagination (default: 0)",
+              default: 0,
+            },
           },
         },
       },
@@ -1032,7 +1037,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "add_project",
-        description: "Create a new project to group todos.",
+        description: "Create a new project to group todos. Use parent to create a sub-project under another project.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1043,6 +1048,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: {
               type: "string",
               description: "Project description",
+            },
+            parent: {
+              type: "string",
+              description: "Parent project name or ID to create a sub-project",
             },
           },
           required: ["name"],
@@ -2412,6 +2421,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           priority,
           due,
           limit = 50,
+          offset = 0,
         } = args as {
           status?: string[];
           project?: string;
@@ -2419,6 +2429,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           priority?: string;
           due?: string;
           limit?: number;
+          offset?: number;
         };
 
         interface ListTodosResponse {
@@ -2437,6 +2448,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           priority,
           due,
           limit,
+          offset,
         });
 
         return {
@@ -2547,7 +2559,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "add_project": {
-        const { name, description } = args as { name: string; description?: string };
+        const { name, description, parent } = args as { name: string; description?: string; parent?: string };
 
         interface ProjectResponse {
           success: boolean;
@@ -2559,6 +2571,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           user_id: USER_ID,
           name,
           description,
+          parent,
         });
 
         return {

@@ -120,15 +120,37 @@ pub fn format_subtask_line(todo: &Todo, project_name: Option<&str>) -> String {
 /// Format list of todos grouped by status (Linear-style main view)
 /// Subtasks are shown indented under their parent todos
 pub fn format_todo_list(todos: &[Todo], projects: &[Project]) -> String {
+    format_todo_list_with_total(todos, projects, todos.len())
+}
+
+/// Format list with total count (for pagination display)
+pub fn format_todo_list_with_total(
+    todos: &[Todo],
+    projects: &[Project],
+    total_count: usize,
+) -> String {
     if todos.is_empty() {
         return "No todos found.".to_string();
     }
 
-    let mut output = format!(
-        "SHO · My Todos{:>width$} items\n\n",
-        todos.len(),
-        width = LINE_WIDTH - 14
-    );
+    let shown = todos.len();
+    let header = if total_count > shown {
+        format!(
+            "SHO · My Todos{:>width$} items (showing {}, {} more)\n\n",
+            total_count,
+            shown,
+            total_count - shown,
+            width = LINE_WIDTH - 14 - 20 // account for "showing X, Y more"
+        )
+    } else {
+        format!(
+            "SHO · My Todos{:>width$} items\n\n",
+            shown,
+            width = LINE_WIDTH - 14
+        )
+    };
+
+    let mut output = header;
 
     // Separate parent todos and subtasks
     let parent_todos: Vec<_> = todos.iter().filter(|t| t.parent_id.is_none()).collect();
@@ -320,7 +342,7 @@ pub fn format_todo_deleted(todo_id: &str) -> String {
     format!("✓ Deleted {}", todo_id)
 }
 
-/// Format project list
+/// Format project list with sub-project hierarchy
 pub fn format_project_list(projects: &[(Project, ProjectStats)]) -> String {
     if projects.is_empty() {
         return "No projects found.".to_string();
@@ -332,43 +354,82 @@ pub fn format_project_list(projects: &[(Project, ProjectStats)]) -> String {
         width = LINE_WIDTH - 14
     );
 
-    for (project, stats) in projects {
-        let active = stats.in_progress + stats.todo;
-        output.push_str(&format!(
-            "  📁 {:<40} {} active / {} total\n",
-            project.name, active, stats.total
-        ));
+    // Separate root projects and sub-projects
+    let root_projects: Vec<_> = projects
+        .iter()
+        .filter(|(p, _)| p.parent_id.is_none())
+        .collect();
+    let sub_projects: Vec<_> = projects
+        .iter()
+        .filter(|(p, _)| p.parent_id.is_some())
+        .collect();
 
-        // Status breakdown
-        let mut parts = Vec::new();
-        if stats.in_progress > 0 {
-            parts.push(format!("◐ {}", stats.in_progress));
+    // Format each root project and its sub-projects
+    for (project, stats) in root_projects {
+        output.push_str(&format_project_line(project, stats, 0));
+
+        // Find and format sub-projects of this project
+        let children: Vec<_> = sub_projects
+            .iter()
+            .filter(|(p, _)| p.parent_id.as_ref() == Some(&project.id))
+            .collect();
+
+        for (subproject, substats) in children {
+            output.push_str(&format_project_line(subproject, substats, 1));
         }
-        if stats.todo > 0 {
-            parts.push(format!("○ {}", stats.todo));
-        }
-        if stats.blocked > 0 {
-            parts.push(format!("⊘ {}", stats.blocked));
-        }
-        if stats.done > 0 {
-            parts.push(format!("● {}", stats.done));
-        }
-        if !parts.is_empty() {
-            output.push_str(&format!("     {}\n", parts.join("  ")));
-        }
-        output.push('\n');
     }
+
+    output
+}
+
+/// Format a single project line with indentation level
+fn format_project_line(project: &Project, stats: &ProjectStats, indent_level: usize) -> String {
+    let indent = "    ".repeat(indent_level);
+    let icon = if indent_level > 0 { "📂" } else { "📁" };
+    let active = stats.in_progress + stats.todo;
+
+    let mut output = format!(
+        "  {}{} {:<40} {} active / {} total\n",
+        indent, icon, project.name, active, stats.total
+    );
+
+    // Status breakdown
+    let mut parts = Vec::new();
+    if stats.in_progress > 0 {
+        parts.push(format!("◐ {}", stats.in_progress));
+    }
+    if stats.todo > 0 {
+        parts.push(format!("○ {}", stats.todo));
+    }
+    if stats.blocked > 0 {
+        parts.push(format!("⊘ {}", stats.blocked));
+    }
+    if stats.done > 0 {
+        parts.push(format!("● {}", stats.done));
+    }
+    if !parts.is_empty() {
+        output.push_str(&format!("     {}{}\n", indent, parts.join("  ")));
+    }
+    output.push('\n');
 
     output
 }
 
 /// Format project created confirmation
 pub fn format_project_created(project: &Project) -> String {
-    format!(
-        "✓ Created project '{}' (ID: {})",
-        project.name,
-        &project.id.0.to_string()[..8]
-    )
+    if project.parent_id.is_some() {
+        format!(
+            "✓ Created sub-project '{}' (ID: {})",
+            project.name,
+            &project.id.0.to_string()[..8]
+        )
+    } else {
+        format!(
+            "✓ Created project '{}' (ID: {})",
+            project.name,
+            &project.id.0.to_string()[..8]
+        )
+    }
 }
 
 /// Format project update output

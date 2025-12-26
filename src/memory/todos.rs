@@ -544,7 +544,16 @@ impl TodoStore {
         self.index_db
             .put(name_key.as_bytes(), project.id.0.to_string().as_bytes())?;
 
-        tracing::debug!(project_id = %project.id.0, name = %project.name, "Stored project");
+        // Index by parent (for sub-projects)
+        if let Some(ref parent_id) = project.parent_id {
+            let parent_key = format!(
+                "project_parent:{}:{}:{}",
+                project.user_id, parent_id.0, project.id.0
+            );
+            self.index_db.put(parent_key.as_bytes(), b"1")?;
+        }
+
+        tracing::debug!(project_id = %project.id.0, name = %project.name, parent = ?project.parent_id, "Stored project");
 
         Ok(())
     }
@@ -611,6 +620,38 @@ impl TodoStore {
         projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         Ok(projects)
+    }
+
+    /// List sub-projects of a parent project
+    pub fn list_subprojects(&self, user_id: &str, parent_id: &ProjectId) -> Result<Vec<Project>> {
+        let mut subprojects = Vec::new();
+
+        let prefix = format!("project_parent:{}:{}:", user_id, parent_id.0);
+        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+
+        for item in iter {
+            let (key, _) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+
+            // Extract project ID from key
+            let parts: Vec<&str> = key_str.split(':').collect();
+            if parts.len() >= 4 {
+                if let Ok(uuid) = Uuid::parse_str(parts[3]) {
+                    if let Some(project) = self.get_project(user_id, &ProjectId(uuid))? {
+                        subprojects.push(project);
+                    }
+                }
+            }
+        }
+
+        // Sort by name
+        subprojects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        Ok(subprojects)
     }
 
     /// Get project with todo counts
@@ -712,6 +753,12 @@ impl TodoStore {
                 }
             }
 
+            // Delete sub-projects recursively
+            let subprojects = self.list_subprojects(user_id, project_id)?;
+            for subproject in subprojects {
+                self.delete_project(user_id, &subproject.id, delete_todos)?;
+            }
+
             // Delete project
             let key = format!("{}:{}", user_id, project_id.0);
             self.project_db.delete(key.as_bytes())?;
@@ -722,6 +769,15 @@ impl TodoStore {
 
             let name_key = format!("project_name:{}:{}", project.name.to_lowercase(), user_id);
             self.index_db.delete(name_key.as_bytes())?;
+
+            // Delete parent index (if this was a sub-project)
+            if let Some(ref parent_id) = project.parent_id {
+                let parent_key = format!(
+                    "project_parent:{}:{}:{}",
+                    user_id, parent_id.0, project_id.0
+                );
+                self.index_db.delete(parent_key.as_bytes())?;
+            }
 
             Ok(true)
         } else {

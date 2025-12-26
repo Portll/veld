@@ -7686,6 +7686,8 @@ struct ListTodosRequest {
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
     parent_id: Option<String>,
 }
 
@@ -7743,6 +7745,8 @@ struct CreateProjectRequest {
     description: Option<String>,
     #[serde(default)]
     color: Option<String>,
+    #[serde(default)]
+    parent: Option<String>, // Parent project name or ID
 }
 
 /// Response for project operations
@@ -8018,9 +8022,19 @@ async fn list_todos(
         }
     }
 
-    // Apply limit
-    let limit = req.limit.unwrap_or(100);
+    // Apply pagination (offset + limit)
     let total_count = todos.len();
+    let offset = req.offset.unwrap_or(0);
+    let limit = req.limit.unwrap_or(100);
+
+    // Skip offset items
+    if offset > 0 && offset < todos.len() {
+        todos = todos.into_iter().skip(offset).collect();
+    } else if offset >= total_count {
+        todos.clear();
+    }
+
+    // Apply limit
     if todos.len() > limit {
         todos.truncate(limit);
     }
@@ -8031,7 +8045,7 @@ async fn list_todos(
         .list_projects(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let formatted = todo_formatter::format_todo_list(&todos, &projects);
+    let formatted = todo_formatter::format_todo_list_with_total(&todos, &projects, total_count);
 
     Ok(Json(TodoListResponse {
         success: true,
@@ -8430,9 +8444,35 @@ async fn create_project(
         });
     }
 
+    // Resolve parent project if specified
+    let parent_id = if let Some(ref parent_ref) = req.parent {
+        // Try as UUID first
+        if let Ok(uuid) = uuid::Uuid::parse_str(parent_ref) {
+            let pid = ProjectId(uuid);
+            // Verify parent exists
+            state
+                .todo_store
+                .get_project(&req.user_id, &pid)
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::ProjectNotFound(parent_ref.clone()))?;
+            Some(pid)
+        } else {
+            // Try by name
+            let parent = state
+                .todo_store
+                .find_project_by_name(&req.user_id, parent_ref)
+                .map_err(AppError::Internal)?
+                .ok_or_else(|| AppError::ProjectNotFound(parent_ref.clone()))?;
+            Some(parent.id)
+        }
+    } else {
+        None
+    };
+
     let mut project = Project::new(req.user_id.clone(), req.name.clone());
     project.description = req.description;
     project.color = req.color;
+    project.parent_id = parent_id;
 
     state
         .todo_store
@@ -8445,6 +8485,7 @@ async fn create_project(
         user_id = %req.user_id,
         project_id = %project.id.0,
         name = %req.name,
+        parent = ?project.parent_id,
         "Created project"
     );
 
