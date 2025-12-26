@@ -105,6 +105,8 @@ struct TodoApiItem {
     due_date: Option<String>,
     blocked_on: Option<String>,
     created_at: String,
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -245,6 +247,7 @@ impl MemoryStream {
                     due_date: t.due_date.and_then(|d| d.parse().ok()),
                     blocked_on: t.blocked_on,
                     created_at: t.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                    parent_id: t.parent_id,
                 }
             })
             .collect();
@@ -535,6 +538,7 @@ impl MemoryStream {
                     due_date: t.due_date.and_then(|d| d.parse().ok()),
                     blocked_on: t.blocked_on,
                     created_at: t.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                    parent_id: t.parent_id,
                 }
             })
             .collect();

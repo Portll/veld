@@ -1275,11 +1275,13 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
         // Build flat list of todos for selection tracking
         let mut flat_todos: Vec<&TuiTodo> = Vec::new();
 
-        // Collect in order: in_progress, todo, blocked, done
-        let in_progress: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress).cloned().collect();
-        let todo_items: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Todo).cloned().collect();
-        let blocked: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked).cloned().collect();
-        let done: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Done).cloned().collect();
+        // Collect parent todos only (exclude subtasks) in order: in_progress, todo, blocked, done
+        let in_progress: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress && t.parent_id.is_none()).cloned().collect();
+        let todo_items: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Todo && t.parent_id.is_none()).cloned().collect();
+        let blocked: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked && t.parent_id.is_none()).cloned().collect();
+        let done: Vec<_> = todos.iter().filter(|t| t.status == TuiTodoStatus::Done && t.parent_id.is_none()).cloned().collect();
+        // Keep all todos for subtask lookup
+        let all_todos: Vec<_> = todos.iter().cloned().collect();
 
         flat_todos.extend(in_progress.iter());
         flat_todos.extend(todo_items.iter());
@@ -1302,6 +1304,14 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                     lines.push(render_action_bar(todo));
                 }
                 todo_idx += 1;
+                // Render subtasks of this todo
+                for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+                    if lines.len() >= content_height - 2 { break; }
+                    let sub_selected = state.todos_selected == todo_idx && is_focused;
+                    lines.push(render_todo_row_with_indent(subtask, width, sub_selected, is_focused, 1));
+                    if sub_selected { lines.push(render_action_bar(subtask)); }
+                    todo_idx += 1;
+                }
             }
         }
 
@@ -1320,6 +1330,14 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                     lines.push(render_action_bar(todo));
                 }
                 todo_idx += 1;
+                // Render subtasks of this todo
+                for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+                    if lines.len() >= content_height - 2 { break; }
+                    let sub_selected = state.todos_selected == todo_idx && is_focused;
+                    lines.push(render_todo_row_with_indent(subtask, width, sub_selected, is_focused, 1));
+                    if sub_selected { lines.push(render_action_bar(subtask)); }
+                    todo_idx += 1;
+                }
             }
             if todo_items.len() > max_todos {
                 lines.push(Line::from(Span::styled(
@@ -1343,6 +1361,14 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                     lines.push(render_action_bar(todo));
                 }
                 todo_idx += 1;
+                // Render subtasks of this todo
+                for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+                    if lines.len() >= content_height - 2 { break; }
+                    let sub_selected = state.todos_selected == todo_idx && is_focused;
+                    lines.push(render_todo_row_with_indent(subtask, width, sub_selected, is_focused, 1));
+                    if sub_selected { lines.push(render_action_bar(subtask)); }
+                    todo_idx += 1;
+                }
             }
         }
 
@@ -1362,6 +1388,14 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
                         lines.push(render_action_bar(todo));
                     }
                     todo_idx += 1;
+                    // Render subtasks of this todo
+                    for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+                        if lines.len() >= content_height - 2 { break; }
+                        let sub_selected = state.todos_selected == todo_idx && is_focused;
+                        lines.push(render_todo_row_with_indent(subtask, width, sub_selected, is_focused, 1));
+                        if sub_selected { lines.push(render_action_bar(subtask)); }
+                        todo_idx += 1;
+                    }
                 }
             }
             if done.len() > show_count && show_count > 0 {
@@ -1587,6 +1621,82 @@ fn render_todo_row_with_selection(todo: &TuiTodo, width: usize, is_selected: boo
     };
 
     // Due column - fixed width
+    let due_col = if todo.is_overdue() {
+        if let Some(label) = todo.due_label() {
+            format!("{:>width$}", label, width = DUE_COL_WIDTH)
+        } else {
+            " ".repeat(DUE_COL_WIDTH)
+        }
+    } else {
+        " ".repeat(DUE_COL_WIDTH)
+    };
+
+    let spans = vec![
+        Span::styled(sel_marker, Style::default().fg(sel_color).bg(bg)),
+        Span::styled(format!("{} ", icon), Style::default().fg(color).bg(bg)),
+        Span::styled(priority.0, Style::default().fg(priority.1).bg(bg)),
+        Span::styled(content, Style::default().fg(text_color).bg(bg)),
+        Span::styled(project_col, Style::default().fg(GOLD).bg(bg)),
+        Span::styled(due_col, Style::default().fg(MAROON).bg(bg)),
+    ];
+
+    Line::from(spans)
+}
+
+/// Render a todo row with indentation (for subtasks)
+fn render_todo_row_with_indent(todo: &TuiTodo, width: usize, is_selected: bool, is_panel_focused: bool, indent: usize) -> Line<'static> {
+    const PROJECT_COL_WIDTH: usize = 14;
+    const DUE_COL_WIDTH: usize = 10;
+    let indent_chars = indent * 2;
+    let fixed_left: usize = 8 + indent_chars;
+
+    let (icon, color) = match todo.status {
+        TuiTodoStatus::Backlog => ("◌", TEXT_DISABLED),
+        TuiTodoStatus::Todo => ("○", TEXT_SECONDARY),
+        TuiTodoStatus::InProgress => ("◐", SAFFRON),
+        TuiTodoStatus::Blocked => ("⊘", MAROON),
+        TuiTodoStatus::Done => ("●", GOLD),
+        TuiTodoStatus::Cancelled => ("⊗", TEXT_DISABLED),
+    };
+
+    let priority = match todo.priority {
+        TuiPriority::Urgent => ("!!!", MAROON),
+        TuiPriority::High => ("!! ", SAFFRON),
+        TuiPriority::Medium => ("!  ", TEXT_DISABLED),
+        TuiPriority::Low => ("   ", TEXT_DISABLED),
+    };
+
+    let indent_str = "  ".repeat(indent);
+    let sel_marker = if is_selected {
+        format!("{}▸ ", indent_str)
+    } else {
+        format!("{}  ", indent_str)
+    };
+    let sel_color = if is_selected && is_panel_focused { SAFFRON } else if is_selected { TEXT_DISABLED } else { Color::Reset };
+    let bg = if is_selected { SELECTION_BG } else { Color::Reset };
+    let text_color = if todo.status == TuiTodoStatus::Done { TEXT_DISABLED } else { TEXT_PRIMARY };
+
+    let content_width = width.saturating_sub(fixed_left + PROJECT_COL_WIDTH + DUE_COL_WIDTH + 1);
+    let content = if todo.content.chars().count() <= content_width {
+        format!("{:<width$}", todo.content, width = content_width)
+    } else {
+        format!("{:.<width$}",
+            todo.content.chars().take(content_width.saturating_sub(2)).collect::<String>(),
+            width = content_width)
+    };
+
+    let project_col = if let Some(project) = &todo.project_name {
+        let max_name = PROJECT_COL_WIDTH - 2;
+        let name = if project.chars().count() <= max_name {
+            project.clone()
+        } else {
+            format!("{}..", project.chars().take(max_name - 2).collect::<String>())
+        };
+        format!("📁 {:<width$}", name, width = max_name)
+    } else {
+        " ".repeat(PROJECT_COL_WIDTH)
+    };
+
     let due_col = if todo.is_overdue() {
         if let Some(label) = todo.due_label() {
             format!("{:>width$}", label, width = DUE_COL_WIDTH)

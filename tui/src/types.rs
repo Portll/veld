@@ -1250,9 +1250,17 @@ pub struct TuiTodo {
     pub due_date: Option<DateTime<Utc>>,
     pub blocked_on: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Parent todo ID (for subtasks)
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 impl TuiTodo {
+    /// Check if this is a subtask
+    pub fn is_subtask(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
     pub fn short_id(&self) -> String {
         format!("SHO-{}", &self.id[..4.min(self.id.len())])
     }
