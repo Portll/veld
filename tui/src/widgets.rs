@@ -1251,10 +1251,32 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
     let content_height = content_area.height as usize;
     let mut lines: Vec<Line> = Vec::new();
 
+    // Build visual order list (same order as sidebar: root projects, then sub-projects under each)
+    // This is needed because projects_selected is a flat index in visual order, not array index
+    let mut visual_order: Vec<&TuiProject> = Vec::new();
+    let root_projects: Vec<_> = state.projects.iter().filter(|p| p.parent_id.is_none()).collect();
+    let sub_projects: Vec<_> = state.projects.iter().filter(|p| p.parent_id.is_some()).collect();
+    for project in root_projects.iter() {
+        visual_order.push(project);
+        for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+            visual_order.push(subproject);
+        }
+    }
+
     // Get todos for selected project or inbox
-    let (title, todos): (String, Vec<&TuiTodo>) = if state.projects_selected < state.projects.len() {
-        let project = &state.projects[state.projects_selected];
-        (project.name.clone(), state.todos_for_project(&project.id))
+    // For parent projects, also include todos from sub-projects
+    let (title, todos): (String, Vec<&TuiTodo>) = if state.projects_selected < visual_order.len() {
+        let project = visual_order[state.projects_selected];
+        let mut all_todos = state.todos_for_project(&project.id);
+        
+        // If this is a parent project (not a sub-project), also include todos from its sub-projects
+        if project.parent_id.is_none() {
+            for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+                all_todos.extend(state.todos_for_project(&subproject.id));
+            }
+        }
+        
+        (project.name.clone(), all_todos)
     } else {
         ("Inbox".to_string(), state.standalone_todos())
     };
