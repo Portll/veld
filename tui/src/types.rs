@@ -1752,6 +1752,12 @@ impl AppState {
     }
 
     pub fn add_event(&mut self, event: MemoryEvent) {
+        // Skip CONTEXT_UPDATE - it's not a memory event, just status ping
+        // Context refresh is handled separately in stream.rs
+        if event.event_type == "CONTEXT_UPDATE" {
+            return;
+        }
+
         // Track current operation for ribbon display
         let content_preview = event.content_preview.clone().unwrap_or_default();
         let mem_type = event.memory_type.clone();
