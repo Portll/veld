@@ -12,7 +12,8 @@ use crossterm::{
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::{
-    io,
+    env,
+    io::{self, Read as IoRead, Write},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -583,8 +584,124 @@ async fn run_user_selector(
     Ok(result)
 }
 
+/// Status line mode: reads JSON from stdin, posts to backend, outputs formatted status
+/// This is called by Claude Code's statusLine configuration
+async fn run_statusline() -> Result<()> {
+    let base_url = env::var("SHODH_API_URL")
+        .or_else(|_| env::var("SHODH_SERVER_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string());
+
+    // Read JSON from stdin
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+
+    // Parse JSON
+    let json: serde_json::Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => {
+            // Fallback output if JSON parsing fails
+            println!("Shodh Memory");
+            return Ok(());
+        }
+    };
+
+    // Extract fields
+    let session_id = json
+        .pointer("/session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let model = json
+        .pointer("/model/display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Claude");
+    let cwd = json
+        .pointer("/workspace/current_dir")
+        .or_else(|| json.pointer("/cwd"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let context_size = json
+        .pointer("/context_window/context_window_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200000);
+
+    // Calculate token usage
+    let (current_tokens, percent) = if let Some(usage) = json.pointer("/context_window/current_usage") {
+        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_create = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let total = input_tokens + cache_create + cache_read;
+        let pct = if context_size > 0 { (total * 100 / context_size) as u8 } else { 0 };
+        (total, pct)
+    } else {
+        (0, 0)
+    };
+
+    // POST to shodh-memory backend (fire and forget)
+    let client = reqwest::Client::new();
+    let post_body = serde_json::json!({
+        "session_id": session_id,
+        "tokens_used": current_tokens,
+        "tokens_budget": context_size,
+        "current_dir": cwd,
+        "model": model
+    });
+
+    // Spawn background task to POST (don't block status line output)
+    let url = format!("{}/api/context_status", base_url);
+    tokio::spawn(async move {
+        let _ = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&post_body)
+            .send()
+            .await;
+    });
+
+    // Format token counts
+    let tokens_fmt = if current_tokens > 1000 {
+        format!("{}k", current_tokens / 1000)
+    } else {
+        current_tokens.to_string()
+    };
+    let size_fmt = if context_size > 1000 {
+        format!("{}k", context_size / 1000)
+    } else {
+        context_size.to_string()
+    };
+
+    // Extract directory name
+    let dir_name = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // ANSI color codes based on usage
+    let (color, reset) = if percent < 50 {
+        ("\x1b[32m", "\x1b[0m") // Green
+    } else if percent < 80 {
+        ("\x1b[33m", "\x1b[0m") // Yellow
+    } else {
+        ("\x1b[31m", "\x1b[0m") // Red
+    };
+
+    // Output status line
+    println!("{}{}%{} {}/{} | {} | {}", color, percent, reset, tokens_fmt, size_fmt, model, dir_name);
+    io::stdout().flush()?;
+
+    // Give the background POST a moment to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Check for statusline subcommand
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "statusline" {
+        return run_statusline().await;
+    }
+
     let base_url = std::env::var("SHODH_SERVER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string())
         .trim_end_matches("/api/events")
