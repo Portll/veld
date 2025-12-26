@@ -2126,6 +2126,11 @@ impl AppState {
         self.error_message = Some((message, Instant::now()));
     }
 
+    /// Clear error immediately
+    pub fn clear_error(&mut self) {
+        self.error_message = None;
+    }
+
     /// Clear error if older than 5 seconds
     pub fn clear_stale_error(&mut self) {
         if let Some((_, timestamp)) = &self.error_message {

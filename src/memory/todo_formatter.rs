@@ -162,6 +162,8 @@ pub fn format_todo_list_with_total(
         (TodoStatus::Todo, "Todo ○"),
         (TodoStatus::Blocked, "Blocked ⊘"),
         (TodoStatus::Backlog, "Backlog ◌"),
+        (TodoStatus::Done, "Done ●"),
+        (TodoStatus::Cancelled, "Cancelled ⊗"),
     ];
 
     for (status, label) in status_order {

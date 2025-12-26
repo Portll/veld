@@ -1591,10 +1591,22 @@ async fn update_context_status(
     };
 
     // Store by session_id (allows multiple Claude windows)
-    state.context_sessions.insert(req.session_id, status.clone());
+    state.context_sessions.insert(req.session_id.clone(), status.clone());
 
-    // Broadcast for TUI SSE subscribers
+    // Broadcast for TUI SSE subscribers (dedicated context channel)
     let _ = state.context_broadcaster.send(status);
+
+    // Also emit through main SSE channel for TUI to pick up
+    state.emit_event(MemoryEvent {
+        event_type: "CONTEXT_UPDATE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: "system".to_string(),
+        memory_id: Some(req.session_id),
+        content_preview: Some(format!("{}% ({}/{})", percent_used, req.tokens_used, req.tokens_budget)),
+        memory_type: Some("Context".to_string()),
+        importance: None,
+        count: None,
+    });
 
     Json(serde_json::json!({
         "success": true,
@@ -8602,6 +8614,18 @@ async fn create_project(
 
     let formatted = todo_formatter::format_project_created(&project);
 
+    // Emit SSE event for live TUI updates
+    state.emit_event(MemoryEvent {
+        event_type: "PROJECT_CREATE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(project.id.0.to_string()),
+        content_preview: Some(project.name.clone()),
+        memory_type: Some("Project".to_string()),
+        importance: None,
+        count: None,
+    });
+
     tracing::info!(
         user_id = %req.user_id,
         project_id = %project.id.0,
@@ -8733,6 +8757,18 @@ async fn update_project(
 
     let formatted = todo_formatter::format_project_updated(&updated);
 
+    // Emit SSE event for live TUI updates
+    state.emit_event(MemoryEvent {
+        event_type: "PROJECT_UPDATE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(updated.id.0.to_string()),
+        content_preview: Some(updated.name.clone()),
+        memory_type: Some("Project".to_string()),
+        importance: None,
+        count: None,
+    });
+
     tracing::info!(
         user_id = %req.user_id,
         project_id = %updated.id.0,
@@ -8793,6 +8829,18 @@ async fn delete_project(
     }
 
     let formatted = todo_formatter::format_project_deleted(&project, todos_count);
+
+    // Emit SSE event for live TUI updates
+    state.emit_event(MemoryEvent {
+        event_type: "PROJECT_DELETE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(project.id.0.to_string()),
+        content_preview: Some(project.name.clone()),
+        memory_type: Some("Project".to_string()),
+        importance: None,
+        count: Some(todos_count),
+    });
 
     tracing::info!(
         user_id = %req.user_id,

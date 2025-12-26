@@ -161,7 +161,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         .constraints([
             Constraint::Length(22),
             Constraint::Min(20),
-            Constraint::Length(22),  // Symmetric with left
+            Constraint::Length(45),  // Wider for context tracker
         ])
         .split(inner);
 
@@ -257,8 +257,8 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Length(1), // Version
             Constraint::Length(2), // Status with heartbeat
             Constraint::Length(2), // Sparkline/activity
-            Constraint::Length(1), // Context window status
-            Constraint::Min(0),    // Session
+            Constraint::Min(1),    // Context window status (multiple sessions)
+            Constraint::Length(1), // Session
         ])
         .split(chunks[2]);
 
@@ -347,36 +347,44 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         right_chunks[2],
     );
 
-    // Context window status from Claude Code
-    let context_line = if let Some(session) = state.context_sessions.first() {
-        let percent = session.percent_used;
-        let color = if percent < 50 {
-            Color::Rgb(100, 200, 100) // Green
-        } else if percent < 80 {
-            Color::Rgb(220, 180, 80) // Yellow
-        } else {
-            Color::Rgb(220, 100, 100) // Red
-        };
-        let tokens_k = session.tokens_used / 1000;
-        let budget_k = session.tokens_budget / 1000;
-        let model = session.model.as_deref().unwrap_or("Claude");
-        Line::from(vec![
-            Span::styled("⬡ ", Style::default().fg(color)),
-            Span::styled(
-                format!("{}%", percent),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {}k/{}k ", tokens_k, budget_k),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(model, Style::default().fg(Color::Rgb(150, 180, 220))),
-        ])
+    // Context window status from Claude Code (supports multiple sessions)
+    let context_lines: Vec<Line> = if state.context_sessions.is_empty() {
+        vec![Line::from(Span::styled("⬡ --", Style::default().fg(Color::DarkGray)))]
     } else {
-        Line::from(Span::styled("⬡ --", Style::default().fg(Color::DarkGray)))
+        state.context_sessions.iter().map(|session| {
+            let percent = session.percent_used;
+            let color = if percent < 50 {
+                Color::Rgb(100, 200, 100) // Green
+            } else if percent < 80 {
+                Color::Rgb(220, 180, 80) // Yellow
+            } else {
+                Color::Rgb(220, 100, 100) // Red
+            };
+            let tokens_k = session.tokens_used / 1000;
+            let budget_k = session.tokens_budget / 1000;
+            let model = session.model.as_deref().unwrap_or("Claude");
+            // Extract directory name from full path
+            let dir_name = session.current_task.as_ref()
+                .and_then(|p| p.split(['/', '\\']).last())
+                .unwrap_or("");
+            Line::from(vec![
+                Span::styled(
+                    format!("{}%", percent),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}k/{}k", tokens_k, budget_k),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(model, Style::default().fg(Color::Rgb(150, 180, 220))),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(dir_name, Style::default().fg(Color::Rgb(180, 180, 180))),
+            ])
+        }).collect()
     };
     f.render_widget(
-        Paragraph::new(context_line).alignment(Alignment::Right),
+        Paragraph::new(context_lines).alignment(Alignment::Right),
         right_chunks[3],
     );
 
@@ -4589,3 +4597,4 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(state.theme.border()));
     f.render_widget(Paragraph::new(Line::from(keys)).block(block), area);
 }
+

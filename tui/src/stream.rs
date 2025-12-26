@@ -688,12 +688,13 @@ impl MemoryStream {
                 Ok(Event::Message(msg)) => {
                     if let Ok(e) = serde_json::from_str::<MemoryEvent>(&msg.data) {
                         let is_todo_event = e.event_type.starts_with("TODO_");
+                        let is_project_event = e.event_type.starts_with("PROJECT_");
 
                         // Add event to activity feed
                         self.state.lock().await.add_event(e);
 
-                        // Refetch todos on todo events for live updates
-                        if is_todo_event {
+                        // Refetch todos on todo or project events for live updates
+                        if is_todo_event || is_project_event {
                             if let Ok((todos, projects, stats)) =
                                 Self::poll_todos(&self.client, &self.base_url, &self.api_key, &self.user_id).await
                             {
@@ -702,6 +703,12 @@ impl MemoryStream {
                                 state.projects = projects;
                                 state.todo_stats = stats;
                             }
+                        }
+
+                        // Also refresh context sessions on any event
+                        if let Ok(sessions) = self.fetch_context_sessions().await {
+                            let mut state = self.state.lock().await;
+                            state.context_sessions = sessions;
                         }
                     }
                 }
@@ -856,5 +863,26 @@ pub async fn reorder_todo(
         Ok(())
     } else {
         Err(format!("Failed to reorder todo: {}", resp.status()))
+    }
+}
+
+/// Manual refresh of todos and projects - called on F5
+pub async fn refresh_todos(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::types::AppState>>,
+) -> Result<(), String> {
+    // Reuse the existing poll_todos function
+    let client = Client::new();
+    match MemoryStream::poll_todos(&client, base_url, api_key, user_id).await {
+        Ok((todos, projects, stats)) => {
+            let mut s = state.lock().await;
+            s.todos = todos;
+            s.projects = projects;
+            s.todo_stats = stats;
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to refresh: {}", e)),
     }
 }

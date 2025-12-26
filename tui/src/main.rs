@@ -25,7 +25,7 @@ mod types;
 mod widgets;
 
 use logo::{ELEPHANT, ELEPHANT_FRAMES, SHODH_GRADIENT, SHODH_TEXT};
-use stream::{MemoryStream, complete_todo, update_todo_status, update_todo_priority, reorder_todo, next_status};
+use stream::{MemoryStream, complete_todo, update_todo_status, update_todo_priority, reorder_todo, next_status, refresh_todos};
 use types::{AppState, FocusPanel, SearchMode, ViewMode};
 use widgets::{render_footer, render_header, render_main};
 
@@ -921,6 +921,23 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),
                         KeyCode::Char('g') => g.set_view(ViewMode::GraphMap),
                         KeyCode::Char('t') => g.toggle_theme(),
+                        KeyCode::F(5) => {
+                            // Manual refresh of todos and projects
+                            let user_id = g.current_user.clone();
+                            g.set_error("Refreshing...".to_string());
+                            drop(g);
+
+                            match refresh_todos(&base_url, &api_key, &user_id, &search_state).await {
+                                Ok(()) => {
+                                    let mut g = search_state.lock().await;
+                                    g.clear_error();
+                                }
+                                Err(e) => {
+                                    let mut g = search_state.lock().await;
+                                    g.set_error(format!("Refresh failed: {}", e));
+                                }
+                            }
+                        }
                         KeyCode::Char('o') => {
                             // Toggle auto-rotate in graph map view
                             if matches!(g.view_mode, ViewMode::GraphMap) {
