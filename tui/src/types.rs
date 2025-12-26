@@ -2227,10 +2227,30 @@ impl AppState {
     }
 
     /// Get todos visible in the right panel (for current project selection)
+    /// Uses visual order (same as sidebar) and includes sub-project todos for parent projects
     pub fn visible_todos_right_panel(&self) -> Vec<&TuiTodo> {
-        if self.projects_selected < self.projects.len() {
-            let project_id = &self.projects[self.projects_selected].id;
-            self.todos_for_project(project_id)
+        // Build visual order list (same order as sidebar: root projects, then sub-projects under each)
+        let mut visual_order: Vec<&TuiProject> = Vec::new();
+        let root_projects: Vec<_> = self.projects.iter().filter(|p| p.parent_id.is_none()).collect();
+        let sub_projects: Vec<_> = self.projects.iter().filter(|p| p.parent_id.is_some()).collect();
+        for project in root_projects.iter() {
+            visual_order.push(project);
+            for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+                visual_order.push(subproject);
+            }
+        }
+
+        if self.projects_selected < visual_order.len() {
+            let project = visual_order[self.projects_selected];
+            let mut all_todos = self.todos_for_project(&project.id);
+            
+            // If this is a parent project, also include todos from sub-projects
+            if project.parent_id.is_none() {
+                for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+                    all_todos.extend(self.todos_for_project(&subproject.id));
+                }
+            }
+            all_todos
         } else {
             self.standalone_todos()
         }
