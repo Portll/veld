@@ -6,8 +6,11 @@
 //! type-dependent inertia to prevent noise from destabilizing useful memories.
 
 use chrono::{DateTime, Duration, Utc};
+use rocksdb::{Options, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::memory::types::{ExperienceType, MemoryId};
 
@@ -381,8 +384,10 @@ impl FeedbackMomentum {
 
     /// Calculate effective inertia combining all factors
     pub fn effective_inertia(&self) -> f32 {
-        let inertia =
-            self.base_inertia() * self.age_factor() * self.history_factor() * self.stability_factor();
+        let inertia = self.base_inertia()
+            * self.age_factor()
+            * self.history_factor()
+            * self.stability_factor();
 
         // Clamp to valid range - never fully frozen, never fully fluid
         inertia.clamp(0.5, 0.99)
@@ -430,8 +435,7 @@ impl FeedbackMomentum {
         self.ema = old_ema * (1.0 - alpha) + signal.value * alpha;
 
         // Update stability
-        let direction_matches =
-            (signal.value > 0.0) == (old_ema > 0.0) || old_ema.abs() < 0.1;
+        let direction_matches = (signal.value > 0.0) == (old_ema > 0.0) || old_ema.abs() < 0.1;
 
         if direction_matches {
             // Consistent feedback: increase stability
@@ -606,19 +610,105 @@ pub fn process_implicit_feedback(
 // FEEDBACK STORE
 // =============================================================================
 
-/// In-memory store for feedback momentum and pending feedback
-#[derive(Debug, Default)]
+/// Persistent store for feedback momentum with in-memory cache
 pub struct FeedbackStore {
-    /// Momentum per memory: memory_id -> FeedbackMomentum
-    momentum: HashMap<MemoryId, FeedbackMomentum>,
+    /// In-memory cache: memory_id -> FeedbackMomentum
+    pub momentum: HashMap<MemoryId, FeedbackMomentum>,
 
-    /// Pending feedback per user: user_id -> PendingFeedback
+    /// Pending feedback per user: user_id -> PendingFeedback (in-memory only)
     pending: HashMap<String, PendingFeedback>,
+
+    /// Persistent storage for momentum data
+    db: Option<Arc<DB>>,
+
+    /// Track dirty entries that need persistence
+    dirty: HashSet<MemoryId>,
+}
+
+impl std::fmt::Debug for FeedbackStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FeedbackStore")
+            .field("momentum_count", &self.momentum.len())
+            .field("pending_count", &self.pending.len())
+            .field("has_db", &self.db.is_some())
+            .field("dirty_count", &self.dirty.len())
+            .finish()
+    }
+}
+
+impl Default for FeedbackStore {
+    fn default() -> Self {
+        Self {
+            momentum: HashMap::new(),
+            pending: HashMap::new(),
+            db: None,
+            dirty: HashSet::new(),
+        }
+    }
 }
 
 impl FeedbackStore {
+    /// Create in-memory only store (no persistence)
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create persistent store with RocksDB backend
+    pub fn with_persistence<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+
+        let db = DB::open(&opts, path.as_ref())?;
+        let db = Arc::new(db);
+
+        // Load all momentum entries from disk
+        let mut momentum = HashMap::new();
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if key_str.starts_with("momentum:") {
+                        if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
+                            momentum.insert(m.memory_id.clone(), m);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also load pending feedback entries (filter expired ones)
+        let mut pending = HashMap::new();
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if key_str.starts_with("pending:") {
+                        if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
+                            if !p.is_expired() {
+                                pending.insert(p.user_id.clone(), p);
+                            } else {
+                                // Clean up expired pending feedback from disk
+                                let _ = db.delete(key_str.as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded {} feedback momentum entries and {} pending feedback from disk",
+            momentum.len(),
+            pending.len()
+        );
+
+        Ok(Self {
+            momentum,
+            pending,
+            db: Some(db),
+            dirty: HashSet::new(),
+        })
     }
 
     /// Get or create momentum for a memory
@@ -627,9 +717,22 @@ impl FeedbackStore {
         memory_id: MemoryId,
         memory_type: ExperienceType,
     ) -> &mut FeedbackMomentum {
-        self.momentum
-            .entry(memory_id.clone())
-            .or_insert_with(|| FeedbackMomentum::new(memory_id, memory_type))
+        // Check if we need to load from disk
+        if !self.momentum.contains_key(&memory_id) {
+            if let Some(ref db) = self.db {
+                let key = format!("momentum:{}", memory_id.0);
+                if let Ok(Some(data)) = db.get(key.as_bytes()) {
+                    if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&data) {
+                        self.momentum.insert(memory_id.clone(), m);
+                    }
+                }
+            }
+        }
+
+        self.momentum.entry(memory_id.clone()).or_insert_with(|| {
+            self.dirty.insert(memory_id.clone());
+            FeedbackMomentum::new(memory_id, memory_type)
+        })
     }
 
     /// Get momentum for a memory (if exists)
@@ -637,14 +740,38 @@ impl FeedbackStore {
         self.momentum.get(memory_id)
     }
 
-    /// Set pending feedback for a user
-    pub fn set_pending(&mut self, pending: PendingFeedback) {
-        self.pending.insert(pending.user_id.clone(), pending);
+    /// Mark a memory as dirty (needs persistence)
+    pub fn mark_dirty(&mut self, memory_id: &MemoryId) {
+        self.dirty.insert(memory_id.clone());
     }
 
-    /// Take pending feedback for a user (removes from store)
+    /// Set pending feedback for a user (also persists to disk)
+    pub fn set_pending(&mut self, pending: PendingFeedback) {
+        let user_id = pending.user_id.clone();
+        self.pending.insert(user_id.clone(), pending.clone());
+
+        // Persist to disk
+        if let Some(ref db) = self.db {
+            let key = format!("pending:{}", user_id);
+            if let Ok(value) = serde_json::to_vec(&pending) {
+                if let Err(e) = db.put(key.as_bytes(), &value) {
+                    tracing::warn!("Failed to persist pending feedback: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Take pending feedback for a user (removes from store and disk)
     pub fn take_pending(&mut self, user_id: &str) -> Option<PendingFeedback> {
-        self.pending.remove(user_id)
+        let result = self.pending.remove(user_id);
+
+        // Remove from disk
+        if let Some(ref db) = self.db {
+            let key = format!("pending:{}", user_id);
+            let _ = db.delete(key.as_bytes());
+        }
+
+        result
     }
 
     /// Get pending feedback for a user (without removing)
@@ -655,6 +782,29 @@ impl FeedbackStore {
     /// Clean up expired pending feedback
     pub fn cleanup_expired(&mut self) {
         self.pending.retain(|_, p| !p.is_expired());
+    }
+
+    /// Flush dirty entries to disk
+    pub fn flush(&mut self) -> anyhow::Result<usize> {
+        let Some(ref db) = self.db else {
+            return Ok(0);
+        };
+
+        let mut flushed = 0;
+        for memory_id in self.dirty.drain() {
+            if let Some(momentum) = self.momentum.get(&memory_id) {
+                let key = format!("momentum:{}", memory_id.0);
+                let value = serde_json::to_vec(momentum)?;
+                db.put(key.as_bytes(), &value)?;
+                flushed += 1;
+            }
+        }
+
+        if flushed > 0 {
+            tracing::debug!("Flushed {} feedback momentum entries to disk", flushed);
+        }
+
+        Ok(flushed)
     }
 
     /// Get statistics
@@ -710,14 +860,9 @@ mod tests {
 
     #[test]
     fn test_momentum_inertia_by_type() {
-        let learning = FeedbackMomentum::new(
-            MemoryId(Uuid::new_v4()),
-            ExperienceType::Learning,
-        );
-        let conversation = FeedbackMomentum::new(
-            MemoryId(Uuid::new_v4()),
-            ExperienceType::Conversation,
-        );
+        let learning = FeedbackMomentum::new(MemoryId(Uuid::new_v4()), ExperienceType::Learning);
+        let conversation =
+            FeedbackMomentum::new(MemoryId(Uuid::new_v4()), ExperienceType::Conversation);
 
         assert!(learning.base_inertia() > conversation.base_inertia());
         assert!(learning.base_inertia() >= 0.9);
@@ -833,7 +978,10 @@ mod tests {
 
         // Should have pending now
         assert!(store.get_pending(user_id).is_some());
-        assert_eq!(store.get_pending(user_id).unwrap().surfaced_memories.len(), 1);
+        assert_eq!(
+            store.get_pending(user_id).unwrap().surfaced_memories.len(),
+            1
+        );
 
         // Take should remove it
         let taken = store.take_pending(user_id);
@@ -847,10 +995,7 @@ mod tests {
         let memory_id = MemoryId(Uuid::new_v4());
 
         // Get or create momentum
-        let momentum = store.get_or_create_momentum(
-            memory_id.clone(),
-            ExperienceType::Context,
-        );
+        let momentum = store.get_or_create_momentum(memory_id.clone(), ExperienceType::Context);
         assert_eq!(momentum.signal_count, 0);
         assert_eq!(momentum.ema, 0.0);
 
@@ -881,7 +1026,10 @@ mod tests {
             vec![
                 SurfacedMemoryInfo {
                     id: memory_id1.clone(),
-                    entities: ["rust", "async", "tokio"].iter().map(|s| s.to_string()).collect(),
+                    entities: ["rust", "async", "tokio"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
                     content_preview: "Rust async with tokio".to_string(),
                     score: 0.9,
                 },
@@ -895,7 +1043,8 @@ mod tests {
         );
 
         // Response that uses Rust async terminology
-        let response = "To use async in Rust, you can use tokio runtime. Here is an example with async await.";
+        let response =
+            "To use async in Rust, you can use tokio runtime. Here is an example with async await.";
         let signals = process_implicit_feedback(&pending, response, None);
 
         assert_eq!(signals.len(), 2);
@@ -981,10 +1130,8 @@ mod tests {
 
         // Add some momentum entries
         for i in 0..5 {
-            let mut momentum = FeedbackMomentum::new(
-                MemoryId(Uuid::new_v4()),
-                ExperienceType::Context,
-            );
+            let mut momentum =
+                FeedbackMomentum::new(MemoryId(Uuid::new_v4()), ExperienceType::Context);
             momentum.ema = i as f32 * 0.2; // 0, 0.2, 0.4, 0.6, 0.8
             store.momentum.insert(momentum.memory_id.clone(), momentum);
         }

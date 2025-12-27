@@ -869,6 +869,8 @@ impl MemoryEvent {
             "TODO_UPDATE" => Color::Yellow,
             "TODO_COMPLETE" => Color::Rgb(200, 255, 200), // Light pastel green
             "TODO_DELETE" => Color::Red,
+            "FEEDBACK_PROCESSED" => Color::Rgb(200, 180, 255), // Pastel purple
+            "PROACTIVE_CONTEXT" => Color::Rgb(180, 220, 255),  // Light blue
             _ => Color::White,
         }
     }
@@ -889,6 +891,8 @@ impl MemoryEvent {
             "TODO_UPDATE" => "◧",
             "TODO_COMPLETE" => "☑",
             "TODO_DELETE" => "☒",
+            "FEEDBACK_PROCESSED" => "⟲",
+            "PROACTIVE_CONTEXT" => "◉",
             _ => "•",
         }
     }

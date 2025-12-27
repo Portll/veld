@@ -56,13 +56,13 @@ use graph_memory::{
     RelationType, RelationshipEdge,
 };
 use memory::{
-    prospective::ProspectiveStore, todo_formatter, ActivatedMemory, Experience, ExperienceType,
+    extract_entities_simple, process_implicit_feedback, prospective::ProspectiveStore,
+    todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore,
     GraphStats as VisualizationStats, Memory, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
-    Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId,
-    ProspectiveTaskStatus, ProspectiveTrigger, Query as MemoryQuery, Recurrence, SharedMemory,
-    Todo, TodoId, TodoPriority, TodoStatus, TodoStore, UserTodoStats,
-    FeedbackStore, PendingFeedback, SurfacedMemoryInfo, process_implicit_feedback,
-    extract_entities_simple,
+    PendingFeedback, Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask,
+    ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger, Query as MemoryQuery, Recurrence,
+    SharedMemory, SurfacedMemoryInfo, Todo, TodoId, TodoPriority, TodoStatus, TodoStore,
+    UserTodoStats,
 };
 
 /// Audit event for history tracking
@@ -390,6 +390,15 @@ impl MultiUserMemoryManager {
         let todo_store = Arc::new(TodoStore::new(&base_path)?);
         info!("📋 Todo store initialized");
 
+        // Initialize feedback store with persistence
+        let feedback_store = Arc::new(parking_lot::RwLock::new(
+            FeedbackStore::with_persistence(base_path.join("feedback")).unwrap_or_else(|e| {
+                tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
+                FeedbackStore::new()
+            }),
+        ));
+        info!("🔄 Feedback store initialized");
+
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -405,7 +414,7 @@ impl MultiUserMemoryManager {
             streaming_extractor,
             prospective_store,
             todo_store,
-            feedback_store: Arc::new(parking_lot::RwLock::new(FeedbackStore::new())),
+            feedback_store,
             context_sessions: Arc::new(DashMap::new()),
             context_broadcaster: {
                 let (tx, _) = tokio::sync::broadcast::channel(16);
@@ -3960,54 +3969,122 @@ async fn proactive_context(
     // 0. Process pending feedback if previous_response is provided
     let feedback_processed = if let Some(ref prev_response) = req.previous_response {
         let feedback_store = state.feedback_store.clone();
-        let user_id = req.user_id.clone();
+        let user_id_for_feedback = req.user_id.clone();
         let response_text = prev_response.clone();
         let followup = req.user_followup.clone();
-        
-        tokio::task::spawn_blocking(move || {
+
+        // Process feedback and collect memory IDs for reinforcement
+        let (result, helpful_ids, misleading_ids) = tokio::task::spawn_blocking(move || {
             let mut store = feedback_store.write();
-            
+
             // Take pending feedback for this user
-            if let Some(pending) = store.take_pending(&user_id) {
+            if let Some(pending) = store.take_pending(&user_id_for_feedback) {
                 // Process the feedback
                 let signals = crate::memory::feedback::process_implicit_feedback(
                     &pending,
                     &response_text,
                     followup.as_deref(),
                 );
-                
+
                 let mut reinforced = Vec::new();
                 let mut weakened = Vec::new();
-                
+                let mut helpful_ids: Vec<crate::memory::types::MemoryId> = Vec::new();
+                let mut misleading_ids: Vec<crate::memory::types::MemoryId> = Vec::new();
+
                 for (memory_id, signal) in signals {
                     // Get or create momentum for this memory
                     let momentum = store.get_or_create_momentum(
                         memory_id.clone(),
-                        crate::memory::types::ExperienceType::Context, // Default type
+                        crate::memory::types::ExperienceType::Context,
                     );
-                    
+
                     // Track reinforced/weakened
                     let old_ema = momentum.ema;
-                    momentum.update(signal);
-                    
-                    if momentum.ema > old_ema + 0.05 {
+                    let new_ema = {
+                        momentum.update(signal.clone());
+                        momentum.ema
+                    };
+
+                    // Determine outcome based on signal and EMA change
+                    if signal.value > 0.3 || new_ema > old_ema + 0.05 {
                         reinforced.push(memory_id.0.to_string());
-                    } else if momentum.ema < old_ema - 0.05 {
+                        helpful_ids.push(memory_id.clone());
+                    } else if signal.value < -0.3 || new_ema < old_ema - 0.05 {
                         weakened.push(memory_id.0.to_string());
+                        misleading_ids.push(memory_id.clone());
                     }
+
+                    // Mark dirty after releasing the mutable borrow
+                    store.mark_dirty(&memory_id);
                 }
-                
-                Some(FeedbackProcessed {
+
+                // Flush dirty entries to disk
+                if let Err(e) = store.flush() {
+                    tracing::warn!("Failed to flush feedback store: {}", e);
+                }
+
+                let result = FeedbackProcessed {
                     memories_evaluated: pending.surfaced_memories.len(),
                     reinforced,
                     weakened,
-                })
+                };
+                (Some(result), helpful_ids, misleading_ids)
             } else {
-                None
+                (None, Vec::new(), Vec::new())
             }
         })
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Feedback task panicked: {e}")))?
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Feedback task panicked: {e}")))?;
+
+        // Apply reinforcement to memory system based on feedback
+        if !helpful_ids.is_empty() || !misleading_ids.is_empty() {
+            let memory_sys_for_reinforce = memory_system.clone();
+            tokio::task::spawn_blocking(move || {
+                let memory_guard = memory_sys_for_reinforce.read();
+
+                // Reinforce helpful memories
+                if !helpful_ids.is_empty() {
+                    if let Err(e) = memory_guard
+                        .reinforce_recall(&helpful_ids, crate::memory::RetrievalOutcome::Helpful)
+                    {
+                        tracing::warn!("Failed to reinforce helpful memories: {}", e);
+                    }
+                }
+
+                // Weaken misleading memories
+                if !misleading_ids.is_empty() {
+                    if let Err(e) = memory_guard.reinforce_recall(
+                        &misleading_ids,
+                        crate::memory::RetrievalOutcome::Misleading,
+                    ) {
+                        tracing::warn!("Failed to weaken misleading memories: {}", e);
+                    }
+                }
+            })
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("Reinforce task panicked: {e}")))?;
+
+            // Emit SSE event for feedback processing
+            if let Some(ref feedback) = result {
+                state.emit_event(MemoryEvent {
+                    event_type: "FEEDBACK_PROCESSED".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    user_id: req.user_id.clone(),
+                    memory_id: None,
+                    content_preview: Some(format!(
+                        "Evaluated {} memories: {} reinforced, {} weakened",
+                        feedback.memories_evaluated,
+                        feedback.reinforced.len(),
+                        feedback.weakened.len()
+                    )),
+                    memory_type: Some("feedback".to_string()),
+                    importance: None,
+                    count: Some(feedback.memories_evaluated),
+                });
+            }
+        }
+
+        result
     } else {
         None
     };
@@ -4102,8 +4179,7 @@ async fn proactive_context(
         let surfaced_infos: Vec<crate::memory::feedback::SurfacedMemoryInfo> = memories
             .iter()
             .map(|m| {
-                let id = uuid::Uuid::parse_str(&m.id)
-                    .unwrap_or_else(|_| uuid::Uuid::new_v4());
+                let id = uuid::Uuid::parse_str(&m.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
                 crate::memory::feedback::SurfacedMemoryInfo {
                     id: crate::memory::types::MemoryId(id),
                     entities: crate::memory::feedback::extract_entities_simple(&m.content),
