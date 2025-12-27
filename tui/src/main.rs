@@ -1,9 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
@@ -710,8 +707,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "sk-shodh-dev-local-testing-key".to_string());
 
     // Initialize terminal for splash and user selector
+    // Note: Mouse capture disabled to allow native terminal text selection/copy
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     // Show splash screen
@@ -723,11 +721,7 @@ async fn main() -> Result<()> {
         None => {
             // Clean up terminal before exit
             disable_raw_mode()?;
-            execute!(
-                terminal.backend_mut(),
-                LeaveAlternateScreen,
-                DisableMouseCapture
-            )?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
             terminal.show_cursor()?;
             return Ok(());
         }
@@ -735,11 +729,7 @@ async fn main() -> Result<()> {
 
     // Clean up terminal - run_tui will create its own session
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     drop(terminal);
 
@@ -765,7 +755,7 @@ async fn main() -> Result<()> {
 
 async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
@@ -1308,26 +1298,6 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         _ => {}
                     }
                 }
-                Event::Mouse(m) => {
-                    let mut g = state.lock().await;
-                    match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            if m.modifiers.contains(KeyModifiers::CONTROL) {
-                                g.zoom_in();
-                            } else {
-                                g.scroll_up();
-                            }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            if m.modifiers.contains(KeyModifiers::CONTROL) {
-                                g.zoom_out();
-                            } else {
-                                g.scroll_down();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
                 _ => {}
             }
         }
@@ -1364,11 +1334,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
