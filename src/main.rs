@@ -6280,20 +6280,28 @@ async fn recall_by_tags(
     let memory_guard = memory_sys.read();
     let limit = req.limit.unwrap_or(50);
 
-    // Search using tag criteria
-    let criteria = memory::storage::SearchCriteria::ByTags(req.tags.clone());
+    // Use recall_by_tags which increments the retrieval counter
     let memories = memory_guard
-        .advanced_search(criteria)
+        .recall_by_tags(&req.tags, limit)
         .map_err(AppError::Internal)?;
-
-    // Apply limit
-    let memories: Vec<_> = memories.into_iter().take(limit).collect();
     let count = memories.len();
 
     info!(
         "📋 Recall by tags: user={}, tags={:?}, found={}",
         req.user_id, req.tags, count
     );
+
+    // Broadcast RETRIEVE event for real-time dashboard
+    state.emit_event(MemoryEvent {
+        event_type: "RETRIEVE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: None,
+        content_preview: Some(format!("tags: {}", req.tags.join(", "))),
+        memory_type: Some("by_tags".to_string()),
+        importance: None,
+        count: Some(count),
+    });
 
     Ok(Json(RetrieveResponse { memories, count }))
 }
@@ -6330,23 +6338,32 @@ async fn recall_by_date(
     let memory_guard = memory_sys.read();
     let limit = req.limit.unwrap_or(50);
 
-    // Search using date range criteria
-    let criteria = memory::storage::SearchCriteria::ByDate {
-        start: req.start,
-        end: req.end,
-    };
+    // Use recall_by_date which increments the retrieval counter
     let memories = memory_guard
-        .advanced_search(criteria)
+        .recall_by_date(req.start, req.end, limit)
         .map_err(AppError::Internal)?;
-
-    // Apply limit
-    let memories: Vec<_> = memories.into_iter().take(limit).collect();
     let count = memories.len();
 
     info!(
         "📅 Recall by date: user={}, start={}, end={}, found={}",
         req.user_id, req.start, req.end, count
     );
+
+    // Broadcast RETRIEVE event for real-time dashboard
+    state.emit_event(MemoryEvent {
+        event_type: "RETRIEVE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: None,
+        content_preview: Some(format!(
+            "{} to {}",
+            req.start.format("%Y-%m-%d"),
+            req.end.format("%Y-%m-%d")
+        )),
+        memory_type: Some("by_date".to_string()),
+        importance: None,
+        count: Some(count),
+    });
 
     Ok(Json(RetrieveResponse { memories, count }))
 }
