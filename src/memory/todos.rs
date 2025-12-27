@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::types::{Project, ProjectId, ProjectStatus, Todo, TodoId, TodoStatus};
+use super::types::{Project, ProjectId, ProjectStatus, Recurrence, Todo, TodoId, TodoStatus};
 
 /// Storage and query engine for todos and projects
 pub struct TodoStore {

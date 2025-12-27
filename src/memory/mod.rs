@@ -20,6 +20,7 @@ pub mod types;
 pub mod visualization;
 // pub mod vector_storage;  // Disabled - requires crate::rag::vamana from parent project
 pub mod graph_retrieval;
+pub mod feedback;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -69,6 +70,7 @@ pub use crate::memory::retrieval::{
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
+pub use crate::memory::feedback::{    calculate_entity_overlap, detect_negative_keywords, extract_entities_simple,    process_implicit_feedback, ContextFingerprint, FeedbackMomentum, FeedbackStore,    FeedbackStoreStats, PendingFeedback, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,};
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]

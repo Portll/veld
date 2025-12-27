@@ -61,6 +61,8 @@ use memory::{
     Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId,
     ProspectiveTaskStatus, ProspectiveTrigger, Query as MemoryQuery, Recurrence, SharedMemory,
     Todo, TodoId, TodoPriority, TodoStatus, TodoStore, UserTodoStats,
+    FeedbackStore, PendingFeedback, SurfacedMemoryInfo, process_implicit_feedback,
+    extract_entities_simple,
 };
 
 /// Audit event for history tracking
@@ -252,6 +254,9 @@ pub struct MultiUserMemoryManager {
     /// Handles todos, projects, and task management
     todo_store: Arc<TodoStore>,
 
+    /// Implicit feedback store for memory reinforcement
+    feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
+
     /// Context status from Claude Code sessions (keyed by session_id)
     /// Multiple Claude windows can run simultaneously, each with own context
     context_sessions: Arc<ContextSessions>,
@@ -400,6 +405,7 @@ impl MultiUserMemoryManager {
             streaming_extractor,
             prospective_store,
             todo_store,
+            feedback_store: Arc::new(parking_lot::RwLock::new(FeedbackStore::new())),
             context_sessions: Arc::new(DashMap::new()),
             context_broadcaster: {
                 let (tx, _) = tokio::sync::broadcast::channel(16);
@@ -3871,6 +3877,20 @@ struct ProactiveContextRequest {
     /// Whether to auto-ingest the context as a Conversation memory
     #[serde(default = "default_true")]
     auto_ingest: bool,
+    /// Agent's previous response (for implicit feedback extraction)
+    #[serde(default)]
+    previous_response: Option<String>,
+    /// User's followup message after agent response (for delayed signals)
+    #[serde(default)]
+    user_followup: Option<String>,
+}
+
+/// Feedback processing results
+#[derive(Debug, Serialize)]
+struct FeedbackProcessed {
+    memories_evaluated: usize,
+    reinforced: Vec<String>,
+    weakened: Vec<String>,
 }
 
 fn default_proactive_max_results() -> usize {
@@ -3912,6 +3932,9 @@ struct ProactiveContextResponse {
     /// ID of auto-ingested memory (if auto_ingest=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     ingested_memory_id: Option<String>,
+    /// Feedback processing results (if previous_response was provided)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feedback_processed: Option<FeedbackProcessed>,
 }
 
 /// POST /api/proactive_context - Combined recall + reminders for AI agents
@@ -3933,6 +3956,61 @@ async fn proactive_context(
     let graph_memory = state
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
+
+    // 0. Process pending feedback if previous_response is provided
+    let feedback_processed = if let Some(ref prev_response) = req.previous_response {
+        let feedback_store = state.feedback_store.clone();
+        let user_id = req.user_id.clone();
+        let response_text = prev_response.clone();
+        let followup = req.user_followup.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let mut store = feedback_store.write();
+            
+            // Take pending feedback for this user
+            if let Some(pending) = store.take_pending(&user_id) {
+                // Process the feedback
+                let signals = crate::memory::feedback::process_implicit_feedback(
+                    &pending,
+                    &response_text,
+                    followup.as_deref(),
+                );
+                
+                let mut reinforced = Vec::new();
+                let mut weakened = Vec::new();
+                
+                for (memory_id, signal) in signals {
+                    // Get or create momentum for this memory
+                    let momentum = store.get_or_create_momentum(
+                        memory_id.clone(),
+                        crate::memory::types::ExperienceType::Context, // Default type
+                    );
+                    
+                    // Track reinforced/weakened
+                    let old_ema = momentum.ema;
+                    momentum.update(signal);
+                    
+                    if momentum.ema > old_ema + 0.05 {
+                        reinforced.push(memory_id.0.to_string());
+                    } else if momentum.ema < old_ema - 0.05 {
+                        weakened.push(memory_id.0.to_string());
+                    }
+                }
+                
+                Some(FeedbackProcessed {
+                    memories_evaluated: pending.surfaced_memories.len(),
+                    reinforced,
+                    weakened,
+                })
+            } else {
+                None
+            }
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Feedback task panicked: {e}")))?
+    } else {
+        None
+    };
 
     // 1. Semantic recall
     let context_clone = req.context.clone();
@@ -4018,6 +4096,34 @@ async fn proactive_context(
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?;
+
+    // Store pending feedback for next call
+    {
+        let surfaced_infos: Vec<crate::memory::feedback::SurfacedMemoryInfo> = memories
+            .iter()
+            .map(|m| {
+                let id = uuid::Uuid::parse_str(&m.id)
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4());
+                crate::memory::feedback::SurfacedMemoryInfo {
+                    id: crate::memory::types::MemoryId(id),
+                    entities: crate::memory::feedback::extract_entities_simple(&m.content),
+                    content_preview: m.content.chars().take(100).collect(),
+                    score: m.score,
+                }
+            })
+            .collect();
+
+        if !surfaced_infos.is_empty() {
+            let pending = crate::memory::feedback::PendingFeedback::new(
+                req.user_id.clone(),
+                req.context.clone(),
+                context_embedding.clone(),
+                surfaced_infos,
+            );
+            let feedback_store = state.feedback_store.clone();
+            feedback_store.write().set_pending(pending);
+        }
+    }
 
     // Now check context triggers with semantic matching
     let user_id = req.user_id.clone();
@@ -4110,6 +4216,7 @@ async fn proactive_context(
         memory_count,
         reminder_count,
         ingested_memory_id,
+        feedback_processed,
     }))
 }
 
