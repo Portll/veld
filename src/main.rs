@@ -3,7 +3,6 @@
 //! Standalone memory server with REST API for Python clients
 
 use anyhow::{Context, Result};
-use chrono::Datelike;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -11,6 +10,7 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use chrono::Datelike;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -255,7 +255,7 @@ pub struct MultiUserMemoryManager {
     /// Context status from Claude Code sessions (keyed by session_id)
     /// Multiple Claude windows can run simultaneously, each with own context
     context_sessions: Arc<ContextSessions>,
-    
+
     /// SSE broadcaster for context status updates (separate from memory events)
     context_broadcaster: tokio::sync::broadcast::Sender<ContextStatus>,
 }
@@ -1591,7 +1591,9 @@ async fn update_context_status(
     };
 
     // Store by session_id (allows multiple Claude windows)
-    state.context_sessions.insert(req.session_id.clone(), status.clone());
+    state
+        .context_sessions
+        .insert(req.session_id.clone(), status.clone());
 
     // Broadcast for TUI SSE subscribers (dedicated context channel)
     let _ = state.context_broadcaster.send(status);
@@ -1602,7 +1604,10 @@ async fn update_context_status(
         timestamp: chrono::Utc::now(),
         user_id: "system".to_string(),
         memory_id: Some(req.session_id),
-        content_preview: Some(format!("{}% ({}/{})", percent_used, req.tokens_used, req.tokens_budget)),
+        content_preview: Some(format!(
+            "{}% ({}/{})",
+            percent_used, req.tokens_used, req.tokens_budget
+        )),
         memory_type: Some("Context".to_string()),
         importance: None,
         count: None,
@@ -1620,7 +1625,8 @@ async fn get_context_status(State(state): State<AppState>) -> Json<Vec<ContextSt
     let stale_threshold = chrono::Duration::minutes(5);
 
     // Collect stale session IDs for cleanup
-    let stale_ids: Vec<String> = state.context_sessions
+    let stale_ids: Vec<String> = state
+        .context_sessions
         .iter()
         .filter(|r| now - r.value().updated_at > stale_threshold)
         .map(|r| r.key().clone())
@@ -1632,7 +1638,8 @@ async fn get_context_status(State(state): State<AppState>) -> Json<Vec<ContextSt
     }
 
     // Return active sessions sorted by most recently updated
-    let mut sessions: Vec<ContextStatus> = state.context_sessions
+    let mut sessions: Vec<ContextStatus> = state
+        .context_sessions
         .iter()
         .map(|r| r.value().clone())
         .collect();
@@ -1643,9 +1650,11 @@ async fn get_context_status(State(state): State<AppState>) -> Json<Vec<ContextSt
 /// SSE endpoint for context status updates (no auth - local status line script)
 async fn context_status_sse(
     State(state): State<AppState>,
-) -> axum::response::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
-    use tokio_stream::wrappers::BroadcastStream;
+) -> axum::response::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     use futures::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
 
     let receiver = state.context_broadcaster.subscribe();
     let stream = BroadcastStream::new(receiver);
@@ -8146,7 +8155,8 @@ async fn list_todos(
             .and_hms_opt(23, 59, 59)
             .map(|t| t.and_utc())
             .unwrap_or(now);
-        let end_of_week = now + chrono::Duration::days(7 - now.weekday().num_days_from_monday() as i64);
+        let end_of_week =
+            now + chrono::Duration::days(7 - now.weekday().num_days_from_monday() as i64);
 
         match due_filter.to_lowercase().as_str() {
             "today" => {

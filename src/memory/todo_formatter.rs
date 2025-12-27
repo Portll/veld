@@ -101,7 +101,10 @@ pub fn format_subtask_line(todo: &Todo, project_name: Option<&str>) -> String {
     let short_id = todo.id.short();
 
     // Indented by 4 extra spaces for subtasks
-    let mut line = format!("      {} {} {}  {}", status, priority, short_id, todo.content);
+    let mut line = format!(
+        "      {} {} {}  {}",
+        status, priority, short_id, todo.content
+    );
 
     if let Some(proj) = project_name {
         let content_width = line.chars().count();
@@ -167,10 +170,7 @@ pub fn format_todo_list_with_total(
     ];
 
     for (status, label) in status_order {
-        let items: Vec<_> = parent_todos
-            .iter()
-            .filter(|t| t.status == status)
-            .collect();
+        let items: Vec<_> = parent_todos.iter().filter(|t| t.status == status).collect();
 
         if !items.is_empty() {
             output.push_str(&format_section_header(label));

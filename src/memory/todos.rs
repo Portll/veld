@@ -706,7 +706,8 @@ impl TodoStore {
                     changed = true;
 
                     // Set completed_at when archiving or completing
-                    if new_status == ProjectStatus::Completed || new_status == ProjectStatus::Archived
+                    if new_status == ProjectStatus::Completed
+                        || new_status == ProjectStatus::Archived
                     {
                         project.completed_at = Some(Utc::now());
                     } else {
