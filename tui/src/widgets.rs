@@ -1422,7 +1422,7 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             }
             if todo_items.len() > max_todos {
                 lines.push(Line::from(Span::styled(
-                    format!("      +{} more", todo_items.len() - max_todos),
+                    format!("      +{} more (press e to expand)", todo_items.len() - max_todos),
                     Style::default().fg(TEXT_DISABLED),
                 )));
             }
@@ -1486,7 +1486,7 @@ fn render_todos_panel_right(f: &mut Frame, area: Rect, state: &AppState) {
             }
             if done.len() > show_count && show_count > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("      +{} more", done.len() - show_count),
+                    format!("      +{} more (press e to expand)", done.len() - show_count),
                     Style::default().fg(TEXT_DISABLED),
                 )));
             }
@@ -1876,7 +1876,7 @@ fn render_project_line(
         }
         if todos.len() > max_todos {
             lines.push(Line::from(Span::styled(
-                format!("       +{} more", todos.len() - max_todos),
+                format!("       +{} more (press e to expand)", todos.len() - max_todos),
                 Style::default().fg(TEXT_DISABLED),
             )));
         }
@@ -2208,7 +2208,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if in_progress.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("    +{} more", in_progress.len() - show_count),
+                format!("    +{} more (press e to expand)", in_progress.len() - show_count),
                 Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
@@ -2242,7 +2242,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if todos.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("    +{} more", todos.len() - show_count),
+                format!("    +{} more (press e to expand)", todos.len() - show_count),
                 Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
@@ -2276,7 +2276,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if blocked.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("    +{} more", blocked.len() - show_count),
+                format!("    +{} more (press e to expand)", blocked.len() - show_count),
                 Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
@@ -2310,7 +2310,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if backlog.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("    +{} more", backlog.len() - show_count),
+                format!("    +{} more (press e to expand)", backlog.len() - show_count),
                 Style::default().fg(TEXT_DISABLED),
             )));
             used_lines += 1;
@@ -2343,7 +2343,7 @@ fn render_todos_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
         if done.len() > show_count {
             lines.push(Line::from(Span::styled(
-                format!("    +{} more", done.len() - show_count),
+                format!("    +{} more (press e to expand)", done.len() - show_count),
                 Style::default().fg(TEXT_DISABLED),
             )));
         }
