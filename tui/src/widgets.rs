@@ -251,13 +251,15 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(Paragraph::new(stats_line), title_chunks[1]);
 
     // Right side: version, status with heartbeat, sparkline, context, session
+    // Dynamic context height based on active sessions (min 1, max 4)
+    let context_height = state.context_sessions.len().max(1).min(4) as u16;
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Version
             Constraint::Length(2), // Status with heartbeat
             Constraint::Length(2), // Sparkline/activity
-            Constraint::Min(1),    // Context window status (multiple sessions)
+            Constraint::Min(context_height), // Context window status (multiple sessions)
             Constraint::Length(1), // Session
         ])
         .split(chunks[2]);
@@ -348,10 +350,17 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     );
 
     // Context window status from Claude Code (supports multiple sessions)
+    // Pastel colors for different sessions
+    const SESSION_COLORS: [Color; 4] = [
+        Color::Rgb(255, 220, 130), // Pastel yellow
+        Color::Rgb(255, 160, 140), // Pastel red/coral
+        Color::Rgb(160, 220, 255), // Pastel blue
+        Color::Rgb(180, 255, 180), // Pastel green
+    ];
     let context_lines: Vec<Line> = if state.context_sessions.is_empty() {
         vec![Line::from(Span::styled("⬡ --", Style::default().fg(Color::DarkGray)))]
     } else {
-        state.context_sessions.iter().map(|session| {
+        state.context_sessions.iter().enumerate().map(|(idx, session)| {
             let percent = session.percent_used;
             let color = if percent < 50 {
                 Color::Rgb(100, 200, 100) // Green
@@ -367,6 +376,8 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             let dir_name = session.current_task.as_ref()
                 .and_then(|p| p.split(['/', '\\']).last())
                 .unwrap_or("");
+            // Use different pastel color for each session's directory name
+            let session_color = SESSION_COLORS[idx % SESSION_COLORS.len()];
             Line::from(vec![
                 Span::styled(
                     format!("{}%", percent),
@@ -379,7 +390,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(model, Style::default().fg(Color::Rgb(150, 180, 220))),
                 Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(dir_name, Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled(dir_name, Style::default().fg(session_color)),
             ])
         }).collect()
     };

@@ -1614,12 +1614,29 @@ async fn update_context_status(
     }))
 }
 
-/// Get all active context sessions
+/// Get all active context sessions (auto-cleans stale sessions > 5 mins old)
 async fn get_context_status(State(state): State<AppState>) -> Json<Vec<ContextStatus>> {
-    let sessions: Vec<ContextStatus> = state.context_sessions
+    let now = chrono::Utc::now();
+    let stale_threshold = chrono::Duration::minutes(5);
+
+    // Collect stale session IDs for cleanup
+    let stale_ids: Vec<String> = state.context_sessions
+        .iter()
+        .filter(|r| now - r.value().updated_at > stale_threshold)
+        .map(|r| r.key().clone())
+        .collect();
+
+    // Remove stale sessions
+    for id in stale_ids {
+        state.context_sessions.remove(&id);
+    }
+
+    // Return active sessions sorted by most recently updated
+    let mut sessions: Vec<ContextStatus> = state.context_sessions
         .iter()
         .map(|r| r.value().clone())
         .collect();
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Json(sessions)
 }
 

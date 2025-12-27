@@ -1789,10 +1789,14 @@ fn ui(f: &mut Frame, state: &AppState) {
         f.area(),
     );
 
+    // Dynamic header height: base 9 + extra lines for additional context sessions
+    let extra_context_lines = state.context_sessions.len().saturating_sub(1).min(3) as u16;
+    let header_height = 9 + extra_context_lines;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),  // Header with logo
+            Constraint::Length(header_height), // Header with logo (dynamic for multi-session)
             Constraint::Length(1),  // Spacer
             Constraint::Min(10),    // Main content
             Constraint::Length(3),  // Footer
