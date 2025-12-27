@@ -911,6 +911,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),
                         KeyCode::Char('g') => g.set_view(ViewMode::GraphMap),
                         KeyCode::Char('t') => g.toggle_theme(),
+                        KeyCode::Char('e') => g.toggle_expand_sections(),
                         KeyCode::F(5) => {
                             // Manual refresh of todos and projects
                             let user_id = g.current_user.clone();

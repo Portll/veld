@@ -1420,6 +1420,8 @@ pub struct AppState {
     pub last_event_time: Option<Instant>,
     /// Expanded projects in Projects view (project IDs)
     pub expanded_projects: std::collections::HashSet<String>,
+    /// Expand all sections to show full todo lists (toggle with 'e')
+    pub expand_sections: bool,
     /// Selected item index in Projects view (flat list index)
     pub projects_selected: usize,
     /// Scroll offset for Projects view
@@ -1516,6 +1518,7 @@ impl AppState {
             activity_current_count: 0,
             last_event_time: None,
             expanded_projects: std::collections::HashSet::new(),
+            expand_sections: false,
             projects_selected: 0,
             projects_scroll: 0,
             focus_panel: FocusPanel::default(),
@@ -2206,6 +2209,11 @@ impl AppState {
     /// Check if a project is expanded
     pub fn is_project_expanded(&self, project_id: &str) -> bool {
         self.expanded_projects.contains(project_id)
+    }
+
+    /// Toggle expand_sections mode to show all todos in sections
+    pub fn toggle_expand_sections(&mut self) {
+        self.expand_sections = !self.expand_sections;
     }
 
     /// Get in-progress todos for NOW bar
