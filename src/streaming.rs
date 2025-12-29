@@ -40,7 +40,11 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::embeddings::{NerEntity, NeuralNer};
-use crate::memory::{Experience, ExperienceType, MemorySystem};
+use crate::graph_memory::GraphMemory;
+use crate::memory::{
+    injection::{compute_relevance, InjectionConfig, RelevanceInput},
+    Experience, ExperienceType, MemorySystem, Query as MemoryQuery,
+};
 
 /// Case-insensitive substring search without allocation.
 /// Returns true if `haystack` contains `needle` (ASCII case-insensitive).
@@ -163,6 +167,24 @@ pub struct ExtractionConfig {
     /// Event types that trigger immediate extraction
     #[serde(default = "default_trigger_events")]
     pub trigger_events: Vec<String>,
+
+    // === Context Injection Configuration ===
+    /// Enable proactive context injection (surface relevant memories on each message)
+    #[serde(default = "default_true")]
+    pub enable_context_injection: bool,
+
+    /// Minimum relevance score for context injection (0.0 - 1.0)
+    /// Higher = stricter, surfaces only highly relevant memories
+    #[serde(default = "default_injection_min_relevance")]
+    pub injection_min_relevance: f32,
+
+    /// Maximum memories to inject per message
+    #[serde(default = "default_injection_max_memories")]
+    pub injection_max_memories: usize,
+
+    /// Cooldown in seconds before re-injecting same memory
+    #[serde(default = "default_injection_cooldown")]
+    pub injection_cooldown_secs: u64,
 }
 
 fn default_min_importance() -> f32 {
@@ -187,6 +209,15 @@ fn default_trigger_events() -> Vec<String> {
         "discovery".to_string(),
         "learning".to_string(),
     ]
+}
+fn default_injection_min_relevance() -> f32 {
+    0.70 // Same default as InjectionConfig
+}
+fn default_injection_max_memories() -> usize {
+    3 // Same default as InjectionConfig
+}
+fn default_injection_cooldown() -> u64 {
+    180 // 3 minutes
 }
 
 // Validation bounds to prevent DoS via malformed configs
@@ -222,6 +253,11 @@ impl ExtractionConfig {
         if self.trigger_events.len() > MAX_TRIGGER_EVENTS {
             self.trigger_events.truncate(MAX_TRIGGER_EVENTS);
         }
+
+        // Clamp injection config
+        self.injection_min_relevance = self.injection_min_relevance.clamp(0.0, 1.0);
+        self.injection_max_memories = self.injection_max_memories.clamp(1, 10);
+        self.injection_cooldown_secs = self.injection_cooldown_secs.clamp(0, 3600);
     }
 }
 
@@ -237,6 +273,11 @@ impl Default for ExtractionConfig {
             create_relationships: true,
             merge_consecutive: true,
             trigger_events: default_trigger_events(),
+            // Context injection enabled by default for bidirectional streaming
+            enable_context_injection: true,
+            injection_min_relevance: default_injection_min_relevance(),
+            injection_max_memories: default_injection_max_memories(),
+            injection_cooldown_secs: default_injection_cooldown(),
         }
     }
 }
@@ -366,6 +407,22 @@ pub enum ExtractionResult {
         timestamp: DateTime<Utc>,
     },
 
+    /// Context injection - proactively surfaced memories based on streaming content
+    /// This enables bidirectional streaming: client sends context, server surfaces memories
+    ContextInjection {
+        /// Surfaced memories with relevance scores
+        memories: Vec<SurfacedStreamMemory>,
+
+        /// Context signature (hash of triggering content for dedup)
+        context_hash: u64,
+
+        /// Processing time in milliseconds
+        processing_time_ms: u64,
+
+        /// Timestamp
+        timestamp: DateTime<Utc>,
+    },
+
     /// Acknowledgement for non-extraction messages
     Ack {
         /// Original message type acknowledged
@@ -392,6 +449,44 @@ pub enum ExtractionResult {
         total_memories_created: usize,
         timestamp: DateTime<Utc>,
     },
+}
+
+/// Memory surfaced during streaming context injection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurfacedStreamMemory {
+    /// Memory ID
+    pub id: String,
+
+    /// Memory content
+    pub content: String,
+
+    /// Memory type (Observation, Decision, Learning, etc.)
+    pub memory_type: String,
+
+    /// Composite relevance score (0.0 - 1.0)
+    pub relevance: f32,
+
+    /// Breakdown of relevance components
+    pub relevance_breakdown: RelevanceBreakdown,
+
+    /// When the memory was created
+    pub created_at: DateTime<Utc>,
+
+    /// Tags/entities from the memory
+    pub tags: Vec<String>,
+}
+
+/// Breakdown of composite relevance score components
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelevanceBreakdown {
+    /// Semantic similarity component (cosine similarity with context)
+    pub semantic: f32,
+
+    /// Recency component (exponential decay based on age)
+    pub recency: f32,
+
+    /// Hebbian strength component (graph-based association strength)
+    pub strength: f32,
 }
 
 /// Entity detected during extraction
@@ -472,6 +567,13 @@ pub struct StreamSession {
     /// Reserved for future semantic deduplication
     #[allow(dead_code)]
     recent_embeddings: VecDeque<(String, Vec<f32>)>,
+
+    /// Injection cooldowns: memory_id -> last injection timestamp
+    /// Prevents re-surfacing the same memory too frequently
+    injection_cooldowns: HashMap<String, DateTime<Utc>>,
+
+    /// Recent context hashes to avoid redundant injections on similar content
+    recent_context_hashes: VecDeque<u64>,
 }
 
 impl StreamSession {
@@ -497,7 +599,34 @@ impl StreamSession {
             total_memories_created: 0,
             seen_hashes: HashSet::with_capacity(1024),
             recent_embeddings: VecDeque::with_capacity(100),
+            injection_cooldowns: HashMap::new(),
+            recent_context_hashes: VecDeque::with_capacity(20),
         }
+    }
+
+    /// Check if a memory is on injection cooldown
+    fn is_on_injection_cooldown(&self, memory_id: &str) -> bool {
+        if let Some(last_injected) = self.injection_cooldowns.get(memory_id) {
+            let elapsed = Utc::now()
+                .signed_duration_since(*last_injected)
+                .num_seconds() as u64;
+            elapsed < self.config.injection_cooldown_secs
+        } else {
+            false
+        }
+    }
+
+    /// Mark a memory as recently injected
+    fn mark_injected(&mut self, memory_id: &str) {
+        self.injection_cooldowns
+            .insert(memory_id.to_string(), Utc::now());
+    }
+
+    /// Cleanup old injection cooldowns to prevent memory leak
+    fn cleanup_injection_cooldowns(&mut self) {
+        let threshold = self.config.injection_cooldown_secs as i64 * 2;
+        let cutoff = Utc::now() - chrono::Duration::seconds(threshold);
+        self.injection_cooldowns.retain(|_, ts| *ts > cutoff);
     }
 
     /// Check if time-based extraction should trigger
@@ -1065,6 +1194,185 @@ impl StreamingMemoryExtractor {
     }
 
     /// Get session stats
+    /// Surface relevant memories for streaming content (context injection)
+    ///
+    /// This is the core of bidirectional streaming: as content flows in,
+    /// relevant memories are surfaced back to the client.
+    pub async fn inject_context(
+        &self,
+        session_id: &str,
+        content: &str,
+        memory_system: Arc<parking_lot::RwLock<MemorySystem>>,
+        graph_memory: Arc<parking_lot::RwLock<GraphMemory>>,
+    ) -> Option<ExtractionResult> {
+        let start = std::time::Instant::now();
+
+        // Get session config and check if injection is enabled
+        let (config, user_id) = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(session_id)?;
+            if !session.config.enable_context_injection {
+                return None;
+            }
+            (session.config.clone(), session.user_id.clone())
+        };
+
+        // Hash content for dedup tracking
+        let context_hash = content_hash(content);
+
+        // Check if we recently injected for similar context
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(session) = sessions.get(session_id) {
+                if session.recent_context_hashes.contains(&context_hash) {
+                    return None; // Skip - already injected for this context
+                }
+            }
+        }
+
+        // Compute context embedding
+        let content_for_embed = content.to_string();
+        let memory_for_embed = memory_system.clone();
+        let context_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
+            let guard = memory_for_embed.read();
+            guard
+                .compute_embedding(&content_for_embed)
+                .unwrap_or_else(|_| vec![0.0; 384])
+        })
+        .await
+        .ok()?;
+
+        // Create injection config from extraction config
+        let injection_config = InjectionConfig {
+            min_relevance: config.injection_min_relevance,
+            max_per_message: config.injection_max_memories,
+            cooldown_seconds: config.injection_cooldown_secs,
+            ..InjectionConfig::default()
+        };
+
+        // Query memories semantically
+        let content_for_query = content.to_string();
+        let max_results = config.injection_max_memories * 2; // Fetch more for filtering
+        let context_emb = context_embedding.clone();
+
+        let surfaced: Vec<SurfacedStreamMemory> = {
+            let memory = memory_system.clone();
+            let graph = graph_memory.clone();
+            let sessions = self.sessions.clone();
+            let session_id_owned = session_id.to_string();
+
+            tokio::task::spawn_blocking(move || {
+                let memory_guard = memory.read();
+                let graph_guard = graph.read();
+                let now = Utc::now();
+
+                // Semantic query
+                let query = MemoryQuery {
+                    query_text: Some(content_for_query),
+                    max_results,
+                    ..Default::default()
+                };
+                let results = memory_guard.recall(&query).unwrap_or_default();
+
+                // Score with composite relevance
+                let mut candidates: Vec<(_, f32, f32, f32, f32)> = results
+                    .into_iter()
+                    .filter_map(|m| {
+                        let memory_embedding = m.experience.embeddings.as_ref()?.clone();
+                        let hebbian_strength = graph_guard
+                            .get_memory_hebbian_strength(&m.id)
+                            .unwrap_or(0.5);
+
+                        let input = RelevanceInput {
+                            memory_embedding: memory_embedding.clone(),
+                            created_at: m.created_at,
+                            hebbian_strength,
+                        };
+
+                        // Compute individual components for breakdown
+                        let semantic = crate::memory::injection::cosine_similarity(
+                            &memory_embedding,
+                            &context_emb,
+                        );
+                        let hours_old = (now - m.created_at).num_hours().max(0) as f32;
+                        let recency = (-injection_config.recency_decay_rate * hours_old).exp();
+
+                        let score = compute_relevance(&input, &context_emb, now, &injection_config);
+
+                        Some((m, score, semantic, recency, hebbian_strength))
+                    })
+                    .collect();
+
+                // Sort by score descending
+                candidates
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Filter by threshold, cooldown, and limit - need runtime check for cooldown
+                let sessions_guard = futures::executor::block_on(async { sessions.read().await });
+
+                candidates
+                    .into_iter()
+                    .filter(|(m, score, _, _, _)| {
+                        if *score < injection_config.min_relevance {
+                            return false;
+                        }
+                        // Check cooldown
+                        if let Some(session) = sessions_guard.get(&session_id_owned) {
+                            if session.is_on_injection_cooldown(&m.id.0.to_string()) {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .take(injection_config.max_per_message)
+                    .map(
+                        |(m, score, semantic, recency, strength)| SurfacedStreamMemory {
+                            id: m.id.0.to_string(),
+                            content: m.experience.content.clone(),
+                            memory_type: format!("{:?}", m.experience.experience_type),
+                            relevance: score,
+                            relevance_breakdown: RelevanceBreakdown {
+                                semantic,
+                                recency,
+                                strength,
+                            },
+                            created_at: m.created_at,
+                            tags: m.experience.entities.clone(),
+                        },
+                    )
+                    .collect()
+            })
+            .await
+            .ok()?
+        };
+
+        if surfaced.is_empty() {
+            return None;
+        }
+
+        // Update session state: mark memories as injected and track context hash
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(session_id) {
+                for mem in &surfaced {
+                    session.mark_injected(&mem.id);
+                }
+                session.recent_context_hashes.push_back(context_hash);
+                if session.recent_context_hashes.len() > 20 {
+                    session.recent_context_hashes.pop_front();
+                }
+                session.cleanup_injection_cooldowns();
+            }
+        }
+
+        Some(ExtractionResult::ContextInjection {
+            memories: surfaced,
+            context_hash,
+            processing_time_ms: start.elapsed().as_millis() as u64,
+            timestamp: Utc::now(),
+        })
+    }
+
     pub async fn get_session_stats(&self, session_id: &str) -> Option<SessionStats> {
         let sessions = self.sessions.read().await;
         sessions.get(session_id).map(|s| SessionStats {
@@ -1101,6 +1409,12 @@ mod tests {
         assert!(config.auto_dedupe);
         assert_eq!(config.checkpoint_interval_ms, 5000);
         assert_eq!(config.max_buffer_size, 50);
+
+        // Context injection defaults
+        assert!(config.enable_context_injection);
+        assert_eq!(config.injection_min_relevance, 0.70);
+        assert_eq!(config.injection_max_memories, 3);
+        assert_eq!(config.injection_cooldown_secs, 180);
     }
 
     #[test]

@@ -131,8 +131,8 @@ pub fn compute_relevance(
     score.clamp(0.0, 1.0)
 }
 
-/// Cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+/// Cosine similarity between two vectors (public for use by streaming module)
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
