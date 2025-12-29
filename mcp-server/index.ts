@@ -1049,6 +1049,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Project name",
             },
+            prefix: {
+              type: "string",
+              description: "Custom prefix for todo IDs (e.g., 'BOLT', 'MEM'). Auto-derived from name if not provided.",
+            },
             description: {
               type: "string",
               description: "Project description",
@@ -1123,6 +1127,97 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["parent_id"],
+        },
+      },
+      {
+        name: "add_todo_comment",
+        description: "Add a comment to a todo. Use to track progress, notes, or resolution details.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix (e.g., 'BOLT-1', 'MEM-2')",
+            },
+            content: {
+              type: "string",
+              description: "Comment content (supports markdown)",
+            },
+            comment_type: {
+              type: "string",
+              enum: ["comment", "progress", "resolution", "activity"],
+              description: "Type of comment: comment (default), progress (updates), resolution (fix details), activity (system)",
+            },
+          },
+          required: ["todo_id", "content"],
+        },
+      },
+      {
+        name: "list_todo_comments",
+        description: "List all comments and activity history for a specific todo.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix (e.g., 'BOLT-1', 'MEM-2')",
+            },
+          },
+          required: ["todo_id"],
+        },
+      },
+      {
+        name: "update_todo_comment",
+        description: "Update an existing comment on a todo.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix",
+            },
+            comment_id: {
+              type: "string",
+              description: "Comment ID (UUID)",
+            },
+            content: {
+              type: "string",
+              description: "New comment content",
+            },
+          },
+          required: ["todo_id", "comment_id", "content"],
+        },
+      },
+      {
+        name: "delete_todo_comment",
+        description: "Delete a comment from a todo.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            todo_id: {
+              type: "string",
+              description: "Todo ID or short prefix",
+            },
+            comment_id: {
+              type: "string",
+              description: "Comment ID (UUID)",
+            },
+          },
+          required: ["todo_id", "comment_id"],
+        },
+      },
+      {
+        name: "read_memory",
+        description: "Read the FULL content of a specific memory by ID. Use this when you need to see the complete text of a memory that was truncated in search results.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "The memory ID (full UUID or short prefix like '5581cd02')",
+            },
+          },
+          required: ["memory_id"],
         },
       },
     ],
@@ -1300,7 +1395,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const matchBar = '█'.repeat(Math.round((m.score || 0) * 10)) + '░'.repeat(10 - Math.round((m.score || 0) * 10));
 
           response += `${i + 1}. ${matchBar} ${score}%\n`;
-          response += `   ${content.slice(0, 70)}${content.length > 70 ? '...' : ''}\n`;
+          response += `   ${content.slice(0, 200)}${content.length > 200 ? '...' : ''}\n`;
           response += `   ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
           if (i < memories.length - 1) response += `\n`;
         }
@@ -1485,7 +1580,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             'Conversation': '💬',
           }[getType(m)] || '📦';
 
-          response += `${String(i + 1).padStart(2)}. ${typeIcon} ${content.slice(0, 60)}${content.length > 60 ? '...' : ''}\n`;
+          response += `${String(i + 1).padStart(2)}. ${typeIcon} ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
           response += `    ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
         }
 
@@ -1657,7 +1752,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         for (let i = 0; i < memories.length; i++) {
           const m = memories[i];
           const content = getContent(m);
-          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 60)}${content.length > 60 ? '...' : ''}\n`;
+          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
           response += `    ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
         }
 
@@ -1701,7 +1796,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const m = memories[i];
           const content = getContent(m);
           const created = m.created_at ? new Date(m.created_at).toLocaleString() : 'unknown';
-          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 55)}${content.length > 55 ? '...' : ''}\n`;
+          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
           response += `    ┗━ ${getType(m)} │ ${created}\n`;
         }
 
@@ -2566,17 +2661,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "add_project": {
-        const { name, description, parent } = args as { name: string; description?: string; parent?: string };
+        const { name, prefix, description, parent } = args as { name: string; prefix?: string; description?: string; parent?: string };
 
         interface ProjectResponse {
           success: boolean;
-          project: { id: string; name: string };
+          project: { id: string; name: string; prefix?: string };
           formatted: string;
         }
 
         const result = await apiCall<ProjectResponse>("/api/projects", "POST", {
           user_id: USER_ID,
           name,
+          prefix,
           description,
           parent,
         });
@@ -2671,6 +2767,154 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         return {
           content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "add_todo_comment": {
+        const { todo_id, content, comment_type } = args as {
+          todo_id: string;
+          content: string;
+          comment_type?: string;
+        };
+
+        interface CommentResponse {
+          success: boolean;
+          comment: unknown;
+          formatted: string;
+        }
+
+        const result = await apiCall<CommentResponse>(
+          `/api/todos/${todo_id}/comments`,
+          "POST",
+          {
+            user_id: USER_ID,
+            content,
+            comment_type,
+          }
+        );
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "list_todo_comments": {
+        const { todo_id } = args as { todo_id: string };
+
+        interface CommentListResponse {
+          success: boolean;
+          count: number;
+          comments: unknown[];
+          formatted: string;
+        }
+
+        const result = await apiCall<CommentListResponse>(
+          `/api/todos/${todo_id}/comments?user_id=${USER_ID}`,
+          "GET"
+        );
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "update_todo_comment": {
+        const { todo_id, comment_id, content } = args as {
+          todo_id: string;
+          comment_id: string;
+          content: string;
+        };
+
+        interface CommentResponse {
+          success: boolean;
+          comment: unknown;
+          formatted: string;
+        }
+
+        const result = await apiCall<CommentResponse>(
+          `/api/todos/${todo_id}/comments/${comment_id}/update`,
+          "POST",
+          {
+            user_id: USER_ID,
+            content,
+          }
+        );
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "delete_todo_comment": {
+        const { todo_id, comment_id } = args as {
+          todo_id: string;
+          comment_id: string;
+        };
+
+        interface CommentResponse {
+          success: boolean;
+          formatted: string;
+        }
+
+        const result = await apiCall<CommentResponse>(
+          `/api/todos/${todo_id}/comments/${comment_id}?user_id=${USER_ID}`,
+          "DELETE"
+        );
+
+        return {
+          content: [{ type: "text", text: result.formatted }],
+        };
+      }
+
+      case "read_memory": {
+        const { memory_id } = args as { memory_id: string };
+
+        // Use recall with a query that matches the ID to find the memory
+        interface RecallResponse {
+          memories: Array<{
+            id: string;
+            experience: {
+              content: string;
+              memory_type: string;
+              tags?: string[];
+            };
+            importance: number;
+            created_at: string;
+          }>;
+          count: number;
+        }
+
+        // First try to get memory by searching for its ID
+        const result = await apiCall<RecallResponse>("/api/recall", "POST", {
+          user_id: USER_ID,
+          query: memory_id,
+          limit: 20,
+        });
+
+        // Find exact match by ID prefix
+        const memory = result.memories.find(m =>
+          m.id.toLowerCase().startsWith(memory_id.toLowerCase())
+        );
+
+        if (!memory) {
+          return {
+            content: [{ type: "text", text: `❌ Memory not found: ${memory_id}` }],
+          };
+        }
+
+        // Format full memory content
+        const tags = memory.experience.tags?.join(", ") || "none";
+        const created = new Date(memory.created_at).toLocaleString();
+
+        let response = `🐘 Memory: ${memory.id}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `Type: ${memory.experience.memory_type} │ Tags: ${tags}\n`;
+        response += `Created: ${created} │ Importance: ${(memory.importance * 100).toFixed(0)}%\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        response += memory.experience.content;
+
+        return {
+          content: [{ type: "text", text: response }],
         };
       }
 
