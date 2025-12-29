@@ -173,7 +173,12 @@ impl SemanticFactStore {
     }
 
     /// Find facts by related entity
-    pub fn find_by_entity(&self, user_id: &str, entity: &str, limit: usize) -> Result<Vec<SemanticFact>> {
+    pub fn find_by_entity(
+        &self,
+        user_id: &str,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<SemanticFact>> {
         let prefix = format!("facts_by_entity:{}:{}:", user_id, entity.to_lowercase());
         let mut facts = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
@@ -206,7 +211,12 @@ impl SemanticFactStore {
     }
 
     /// Find facts by type
-    pub fn find_by_type(&self, user_id: &str, fact_type: FactType, limit: usize) -> Result<Vec<SemanticFact>> {
+    pub fn find_by_type(
+        &self,
+        user_id: &str,
+        fact_type: FactType,
+        limit: usize,
+    ) -> Result<Vec<SemanticFact>> {
         let type_name = format!("{:?}", fact_type);
         let prefix = format!("facts_by_type:{}:{}:", user_id, type_name);
         let mut facts = Vec::new();
@@ -258,7 +268,8 @@ impl SemanticFactStore {
             return Ok(FactStats::default());
         }
 
-        let mut by_type: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut by_type: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut total_confidence: f32 = 0.0;
         let mut total_support: usize = 0;
 
@@ -279,7 +290,11 @@ impl SemanticFactStore {
     }
 
     /// Find facts that should decay (no reinforcement for too long)
-    pub fn find_decaying_facts(&self, user_id: &str, max_age_days: i64) -> Result<Vec<SemanticFact>> {
+    pub fn find_decaying_facts(
+        &self,
+        user_id: &str,
+        max_age_days: i64,
+    ) -> Result<Vec<SemanticFact>> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days);
         let all_facts = self.list(user_id, 10000)?;
 
@@ -292,7 +307,12 @@ impl SemanticFactStore {
     }
 
     /// Check if a similar fact already exists (for deduplication)
-    pub fn find_similar(&self, user_id: &str, fact_content: &str, threshold: f32) -> Result<Option<SemanticFact>> {
+    pub fn find_similar(
+        &self,
+        user_id: &str,
+        fact_content: &str,
+        threshold: f32,
+    ) -> Result<Option<SemanticFact>> {
         let facts = self.list(user_id, 1000)?;
         let query_lower = fact_content.to_lowercase();
 
@@ -301,8 +321,10 @@ impl SemanticFactStore {
             let fact_lower = fact.fact.to_lowercase();
 
             // Check for significant overlap
-            let query_words: std::collections::HashSet<&str> = query_lower.split_whitespace().collect();
-            let fact_words: std::collections::HashSet<&str> = fact_lower.split_whitespace().collect();
+            let query_words: std::collections::HashSet<&str> =
+                query_lower.split_whitespace().collect();
+            let fact_words: std::collections::HashSet<&str> =
+                fact_lower.split_whitespace().collect();
 
             let intersection = query_words.intersection(&fact_words).count();
             let union = query_words.union(&fact_words).count();
@@ -390,7 +412,10 @@ mod tests {
         let retrieved = store.get("user-1", "fact-1").unwrap();
 
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().fact, "Rust is a systems programming language");
+        assert_eq!(
+            retrieved.unwrap().fact,
+            "Rust is a systems programming language"
+        );
     }
 
     #[test]
@@ -436,8 +461,12 @@ mod tests {
     fn test_stats() {
         let (store, _dir) = create_test_store();
 
-        store.store("user-1", &create_test_fact("fact-1", "Fact one")).unwrap();
-        store.store("user-1", &create_test_fact("fact-2", "Fact two")).unwrap();
+        store
+            .store("user-1", &create_test_fact("fact-1", "Fact one"))
+            .unwrap();
+        store
+            .store("user-1", &create_test_fact("fact-2", "Fact two"))
+            .unwrap();
 
         let stats = store.stats("user-1").unwrap();
         assert_eq!(stats.total_facts, 2);

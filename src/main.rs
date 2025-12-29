@@ -3780,7 +3780,6 @@ async fn get_consolidation_events(
     Ok(Json(events))
 }
 
-
 // ============================================================================
 // SEMANTIC FACTS API (SHO-f0e7)
 // Facts are durable knowledge distilled from episodic memories

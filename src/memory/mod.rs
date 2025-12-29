@@ -54,6 +54,7 @@ use crate::memory::compression::CompressionPipeline;
 pub use crate::memory::compression::{
     ConsolidationResult, FactType, SemanticConsolidator, SemanticFact,
 };
+pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
     calculate_entity_overlap, detect_negative_keywords, extract_entities_simple,
     process_implicit_feedback, ContextFingerprint, FeedbackMomentum, FeedbackStore,
@@ -77,7 +78,6 @@ pub use crate::memory::retrieval::{
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
-pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2790,7 +2790,8 @@ impl MemorySystem {
             .collect();
 
         // Create consolidator with custom thresholds
-        let consolidator = compression::SemanticConsolidator::with_thresholds(min_support, min_age_days);
+        let consolidator =
+            compression::SemanticConsolidator::with_thresholds(min_support, min_age_days);
 
         // Run consolidation
         let result = consolidator.consolidate(&memories);
@@ -2866,7 +2867,12 @@ impl MemorySystem {
     /// * `user_id` - User whose facts to search
     /// * `query` - Search query
     /// * `limit` - Maximum number of facts to return
-    pub fn search_facts(&self, user_id: &str, query: &str, limit: usize) -> Result<Vec<SemanticFact>> {
+    pub fn search_facts(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SemanticFact>> {
         self.fact_store.search(user_id, query, limit)
     }
 
@@ -2879,7 +2885,12 @@ impl MemorySystem {
     ///
     /// Called when a new memory supports an existing fact.
     /// Increments support_count and boosts confidence.
-    pub fn reinforce_fact(&self, user_id: &str, fact_id: &str, memory_id: &MemoryId) -> Result<bool> {
+    pub fn reinforce_fact(
+        &self,
+        user_id: &str,
+        fact_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<bool> {
         if let Some(mut fact) = self.fact_store.get(user_id, fact_id)? {
             // Track confidence before change for event
             let confidence_before = fact.confidence;
@@ -2934,9 +2945,9 @@ impl MemorySystem {
     ///
     /// Returns (facts_decayed, facts_deleted)
     fn decay_facts_for_all_users(&self) -> Result<(usize, usize)> {
-        const DECAY_THRESHOLD_DAYS: i64 = 30;  // Start decay after 30 days without reinforcement
-        const DELETE_CONFIDENCE: f32 = 0.1;    // Delete facts below this confidence
-        const BASE_DECAY_RATE: f32 = 0.05;     // 5% decay per maintenance cycle
+        const DECAY_THRESHOLD_DAYS: i64 = 30; // Start decay after 30 days without reinforcement
+        const DELETE_CONFIDENCE: f32 = 0.1; // Delete facts below this confidence
+        const BASE_DECAY_RATE: f32 = 0.05; // 5% decay per maintenance cycle
 
         let now = chrono::Utc::now();
         let mut total_decayed = 0;
