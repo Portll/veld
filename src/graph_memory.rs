@@ -989,6 +989,73 @@ impl GraphMemory {
         Ok(strengthened)
     }
 
+    /// Get average Hebbian strength for a memory based on its entity relationships
+    ///
+    /// This looks up the entities referenced by the memory and averages their
+    /// relationship strengths in the graph. Used for composite relevance scoring.
+    ///
+    /// The algorithm:
+    /// 1. Look up memory's EpisodicNode (memory_id.0 == episode UUID)
+    /// 2. Get entity_refs from the episode
+    /// 3. For each entity, get relationships using get_entity_relationships
+    /// 4. Filter to edges where both endpoints are in the memory's entity set
+    /// 5. Return average effective_strength of these intra-memory edges
+    ///
+    /// Returns 0.5 (neutral) if no entities or relationships found.
+    pub fn get_memory_hebbian_strength(&self, memory_id: &crate::memory::MemoryId) -> Option<f32> {
+        // 1. Look up EpisodicNode for this memory (memory_id.0 == episode UUID)
+        let episode = match self.get_episode(&memory_id.0) {
+            Ok(Some(ep)) => ep,
+            Ok(None) => return Some(0.5), // No episode found - neutral
+            Err(_) => return Some(0.5),   // Error - neutral fallback
+        };
+
+        // 2. Get entity references from the episode
+        if episode.entity_refs.is_empty() {
+            return Some(0.5); // No entities - neutral
+        }
+
+        // Build a set of entity UUIDs for fast lookup
+        let entity_set: std::collections::HashSet<Uuid> =
+            episode.entity_refs.iter().cloned().collect();
+
+        // 3. Collect all intra-memory relationship strengths
+        let mut strengths: Vec<f32> = Vec::new();
+        let mut seen_edges: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+        for entity_uuid in &episode.entity_refs {
+            if let Ok(edges) = self.get_entity_relationships(entity_uuid) {
+                for edge in edges {
+                    // Skip if already processed (edges are bidirectional in lookup)
+                    if seen_edges.contains(&edge.uuid) {
+                        continue;
+                    }
+                    seen_edges.insert(edge.uuid);
+
+                    // 4. Only count edges where BOTH endpoints are in this memory's entities
+                    if entity_set.contains(&edge.from_entity)
+                        && entity_set.contains(&edge.to_entity)
+                    {
+                        // Skip invalidated edges
+                        if edge.invalidated_at.is_some() {
+                            continue;
+                        }
+                        // Use effective_strength which applies time-based decay
+                        strengths.push(edge.effective_strength());
+                    }
+                }
+            }
+        }
+
+        // 5. Return average strength, or neutral if no intra-memory edges
+        if strengths.is_empty() {
+            Some(0.5)
+        } else {
+            let avg = strengths.iter().sum::<f32>() / strengths.len() as f32;
+            Some(avg)
+        }
+    }
+
     /// Apply decay to a synapse
     ///
     /// Returns true if the synapse should be pruned (non-potentiated and below threshold)
@@ -2658,5 +2725,154 @@ mod tests {
         // Person (0.8) * 1.2 = 0.96, should not exceed 1.0
         let salience = EntityExtractor::calculate_base_salience(&EntityLabel::Person, true);
         assert!(salience <= 1.0);
+    }
+
+    #[test]
+    fn test_hebbian_strength_no_episode() {
+        // Create a temporary graph memory for testing
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path()).unwrap();
+
+        // Random memory ID with no associated episode should return 0.5 (neutral)
+        let fake_memory_id = crate::memory::MemoryId(Uuid::new_v4());
+        let strength = graph.get_memory_hebbian_strength(&fake_memory_id);
+        assert_eq!(strength, Some(0.5), "No episode should return neutral 0.5");
+    }
+
+    #[test]
+    fn test_hebbian_strength_with_episode_no_edges() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path()).unwrap();
+
+        // Create entities
+        let entity1 = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Entity1".to_string(),
+            labels: vec![EntityLabel::Person],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+        };
+        let entity2 = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Entity2".to_string(),
+            labels: vec![EntityLabel::Organization],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+        };
+
+        let entity1_uuid = graph.add_entity(entity1.clone()).unwrap();
+        let entity2_uuid = graph.add_entity(entity2.clone()).unwrap();
+
+        // Create episode with entities but no edges
+        let memory_id = crate::memory::MemoryId(Uuid::new_v4());
+        let episode = EpisodicNode {
+            uuid: memory_id.0,
+            name: "Test Episode".to_string(),
+            content: "Test content".to_string(),
+            valid_at: Utc::now(),
+            created_at: Utc::now(),
+            entity_refs: vec![entity1_uuid, entity2_uuid],
+            source: EpisodeSource::Message,
+            metadata: std::collections::HashMap::new(),
+        };
+        graph.add_episode(episode).unwrap();
+
+        // Episode with entities but no edges should return 0.5
+        let strength = graph.get_memory_hebbian_strength(&memory_id);
+        assert_eq!(
+            strength,
+            Some(0.5),
+            "Episode without edges should return neutral 0.5"
+        );
+    }
+
+    #[test]
+    fn test_hebbian_strength_with_edges() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path()).unwrap();
+
+        // Create entities
+        let entity1_uuid = Uuid::new_v4();
+        let entity2_uuid = Uuid::new_v4();
+
+        let entity1 = EntityNode {
+            uuid: entity1_uuid,
+            name: "Entity1".to_string(),
+            labels: vec![EntityLabel::Person],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+        };
+        let entity2 = EntityNode {
+            uuid: entity2_uuid,
+            name: "Entity2".to_string(),
+            labels: vec![EntityLabel::Organization],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+        };
+
+        graph.add_entity(entity1).unwrap();
+        graph.add_entity(entity2).unwrap();
+
+        // Create episode
+        let memory_id = crate::memory::MemoryId(Uuid::new_v4());
+        let episode = EpisodicNode {
+            uuid: memory_id.0,
+            name: "Test Episode".to_string(),
+            content: "Test content".to_string(),
+            valid_at: Utc::now(),
+            created_at: Utc::now(),
+            entity_refs: vec![entity1_uuid, entity2_uuid],
+            source: EpisodeSource::Message,
+            metadata: std::collections::HashMap::new(),
+        };
+        graph.add_episode(episode).unwrap();
+
+        // Create edge between entities with known strength
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: entity1_uuid,
+            to_entity: entity2_uuid,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: Some(memory_id.0),
+            context: "Test context".to_string(),
+            last_activated: Utc::now(), // Just activated - no decay
+            activation_count: 5,
+            potentiated: false,
+        };
+        graph.add_relationship(edge).unwrap();
+
+        // Should return the edge strength (0.8, with minimal decay since just activated)
+        let strength = graph.get_memory_hebbian_strength(&memory_id);
+        assert!(strength.is_some());
+        let s = strength.unwrap();
+        assert!(s > 0.75 && s <= 0.8, "Strength should be ~0.8, got {}", s);
     }
 }

@@ -21,6 +21,7 @@ pub mod visualization;
 // pub mod vector_storage;  // Disabled - requires crate::rag::vamana from parent project
 pub mod feedback;
 pub mod graph_retrieval;
+pub mod injection;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;

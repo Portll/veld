@@ -56,7 +56,12 @@ use graph_memory::{
     RelationType, RelationshipEdge,
 };
 use memory::{
-    extract_entities_simple, process_implicit_feedback, prospective::ProspectiveStore,
+    extract_entities_simple,
+    injection::{
+        compute_relevance, InjectionCandidate, InjectionConfig, InjectionEngine, RelevanceInput,
+    },
+    process_implicit_feedback,
+    prospective::ProspectiveStore,
     todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore,
     GraphStats as VisualizationStats, Memory, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
     PendingFeedback, Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask,
@@ -4110,35 +4115,77 @@ async fn proactive_context(
         None
     };
 
-    // 1. Semantic recall
+    // 1. Compute context embedding first (needed for composite relevance scoring)
+    let context_for_embedding = req.context.clone();
+    let memory_for_embedding = memory_system.clone();
+    let context_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory_for_embedding.read();
+        memory_guard
+            .compute_embedding(&context_for_embedding)
+            .unwrap_or_else(|_| vec![0.0; 384])
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?;
+
+    // 2. Semantic recall with composite relevance scoring
     let context_clone = req.context.clone();
     let max_results = req.max_results;
+    let context_emb_for_scoring = context_embedding.clone();
+    let injection_config = InjectionConfig::default();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
+        let graph = graph_memory.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
+            let graph_guard = graph.read();
+            let now = chrono::Utc::now();
+
             let query = MemoryQuery {
                 query_text: Some(context_clone),
-                max_results,
+                max_results: max_results * 2, // Fetch more, filter with injection engine
                 ..Default::default()
             };
             let results = memory_guard.recall(&query).unwrap_or_default();
-            results
+
+            // Compute composite relevance for each memory
+            let mut candidates: Vec<(SharedMemory, f32)> = results
                 .into_iter()
-                .enumerate()
-                .map(|(rank, m)| {
-                    let total = max_results.max(1);
-                    let rank_score = 1.0 - (rank as f32 / total as f32);
-                    let salience = m.salience_score_with_access();
-                    let score = rank_score * 0.7 + salience * 0.3;
-                    ProactiveSurfacedMemory {
-                        id: m.id.0.to_string(),
-                        content: m.experience.content.clone(),
-                        memory_type: format!("{:?}", m.experience.experience_type),
-                        score,
-                        created_at: m.created_at.to_rfc3339(),
-                        tags: m.experience.entities.clone(),
-                    }
+                .filter_map(|m| {
+                    // Get embedding (skip if none)
+                    let memory_embedding = m.experience.embeddings.as_ref()?.clone();
+
+                    // Get Hebbian strength from graph (default 0.5 if not found)
+                    let hebbian_strength = graph_guard
+                        .get_memory_hebbian_strength(&m.id)
+                        .unwrap_or(0.5);
+
+                    let input = RelevanceInput {
+                        memory_embedding,
+                        created_at: m.created_at,
+                        hebbian_strength,
+                    };
+
+                    let score =
+                        compute_relevance(&input, &context_emb_for_scoring, now, &injection_config);
+                    Some((m, score))
+                })
+                .collect();
+
+            // Sort by composite relevance (highest first)
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Apply injection threshold and limit
+            candidates
+                .into_iter()
+                .filter(|(_, score)| *score >= injection_config.min_relevance)
+                .take(max_results)
+                .map(|(m, score)| ProactiveSurfacedMemory {
+                    id: m.id.0.to_string(),
+                    content: m.experience.content.clone(),
+                    memory_type: format!("{:?}", m.experience.experience_type),
+                    score,
+                    created_at: m.created_at.to_rfc3339(),
+                    tags: m.experience.entities.clone(),
                 })
                 .collect()
         })
@@ -4146,7 +4193,7 @@ async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // 2. Check due reminders
+    // 3. Check due reminders
     let user_id = req.user_id.clone();
     let due_reminders: Vec<ReminderItem> = {
         let prospective = state.prospective_store.clone();
@@ -4182,20 +4229,7 @@ async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // 3. Check context-triggered reminders (keyword + semantic matching)
-    // First, compute context embedding for semantic matching
-    let context_for_triggers = req.context.clone();
-    let memory_for_embedding = memory_system.clone();
-    let context_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
-        let memory_guard = memory_for_embedding.read();
-        memory_guard
-            .compute_embedding(&context_for_triggers)
-            .unwrap_or_else(|_| vec![0.0; 384])
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?;
-
-    // Store pending feedback for next call
+    // 4. Store pending feedback for next call
     {
         let surfaced_infos: Vec<crate::memory::feedback::SurfacedMemoryInfo> = memories
             .iter()
