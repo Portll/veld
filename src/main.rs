@@ -8875,6 +8875,8 @@ struct UpdateTodoRequest {
     tags: Option<Vec<String>>,
     #[serde(default)]
     sort_order: Option<i32>,
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 /// Request to reorder a todo (move up/down)
@@ -9322,6 +9324,17 @@ async fn update_todo(
     }
     if let Some(ref tags) = req.tags {
         todo.tags = tags.clone();
+    }
+    if let Some(ref parent_id_str) = req.parent_id {
+        // Resolve parent todo by prefix
+        if parent_id_str.is_empty() {
+            todo.parent_id = None;
+        } else if let Ok(Some(parent)) = state
+            .todo_store
+            .find_todo_by_prefix(&req.user_id, parent_id_str)
+        {
+            todo.parent_id = Some(parent.id.clone());
+        }
     }
 
     // Handle project change

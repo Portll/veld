@@ -984,6 +984,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description: "New tags",
             },
+            parent_id: {
+              type: "string",
+              description: "Parent todo ID or short prefix to make this a subtask. Pass empty string to remove parent.",
+            },
           },
           required: ["todo_id"],
         },
@@ -2468,6 +2472,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           blocked_on,
           notes,
           tags,
+          parent_id,
         } = args as {
           todo_id: string;
           content?: string;
@@ -2479,6 +2484,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           blocked_on?: string;
           notes?: string;
           tags?: string[];
+          parent_id?: string;
         };
 
         interface UpdateTodoResponse {
@@ -2498,6 +2504,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           blocked_on,
           notes,
           tags,
+          parent_id,
         });
 
         return {
