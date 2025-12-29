@@ -1,7 +1,7 @@
 use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, SHODH_GRADIENT, SHODH_TEXT};
 use crate::types::{
-    AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiPriority, TuiProject, TuiTodo,
-    TuiTodoStatus, ViewMode, VERSION,
+    AppState, DisplayEvent, FocusPanel, LineageEdge, LineageNode, LineageTrace, SearchMode,
+    SearchResult, TuiPriority, TuiProject, TuiTodo, TuiTodoStatus, ViewMode, VERSION,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -878,9 +878,18 @@ pub fn render_dashboard(f: &mut Frame, area: Rect, state: &AppState) {
 // PROJECTS VIEW - Full-width layout with proper spacing
 // ============================================================================
 
-/// Main Projects view - full-width ribbon + two-column layout
+/// Main Projects view - full-width ribbon + two-column layout + bottom lineage
 fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
     let content_area = with_ribbon_layout(f, area, state);
+
+    // Split into main content (top) + lineage chain (bottom)
+    let main_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(10),      // Main content takes most space
+            Constraint::Length(5),    // Lineage chain (fixed 5 lines)
+        ])
+        .split(content_area);
 
     // 50/50 columns for main content
     let columns = Layout::default()
@@ -889,10 +898,13 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
             Constraint::Percentage(50),
             Constraint::Percentage(50),
         ])
-        .split(content_area);
+        .split(main_split[0]);
 
     render_projects_sidebar(f, columns[0], state);
     render_todos_panel_right(f, columns[1], state);
+
+    // Render lineage chain at bottom
+    render_lineage_chain(f, main_split[1], state);
 }
 
 /// Full-width status ribbon showing current work context
@@ -1651,6 +1663,164 @@ fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
 /// Empty spacer line for visual breathing room between todos
 fn spacer_line() -> Line<'static> {
     Line::from(Span::raw(""))
+}
+
+// ============================================================================
+// LINEAGE CHAIN VISUALIZATION
+// ============================================================================
+
+/// Render horizontal lineage chain at bottom of Projects view
+fn render_lineage_chain(f: &mut Frame, area: Rect, state: &AppState) {
+    let width = area.width as usize;
+
+    // Border line separating from main content
+    let border_line = "─".repeat(width);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header with border
+    lines.push(Line::from(Span::styled(
+        border_line,
+        Style::default().fg(Color::Rgb(40, 40, 40)),
+    )));
+
+    if let Some(ref trace) = state.lineage_trace {
+        if trace.edges.is_empty() {
+            // No lineage - show placeholder
+            lines.push(Line::from(Span::styled(
+                " ◇ No causal chain detected",
+                Style::default().fg(TEXT_DISABLED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "   Select a todo or memory to see its lineage",
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            )));
+        } else {
+            // Build horizontal chain visualization
+            // Format: [Node] ──relation──▸ [Node] ──relation──▸ [Node]
+
+            // Header showing direction
+            let direction_label = match trace.direction.as_str() {
+                "backward" => "◀── Tracing causes (why this happened)",
+                "forward" => "──▸ Tracing effects (what this led to)",
+                "both" => "◀── causes │ effects ──▸",
+                _ => "──▸ Lineage chain",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" ⑂ LINEAGE ", Style::default().fg(Color::Black).bg(Color::Rgb(100, 180, 255)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {} ", direction_label), Style::default().fg(Color::Rgb(200, 200, 200))),
+                Span::styled(
+                    format!("(depth: {}, {} edges)", trace.depth, trace.edges.len()),
+                    Style::default().fg(Color::Rgb(140, 140, 140)),
+                ),
+            ]));
+
+            // Build the chain line
+            let mut chain_spans: Vec<Span> = vec![Span::raw(" ")];
+
+            // Calculate visible nodes based on scroll
+            let visible_start = state.lineage_scroll;
+            let max_visible = (width / 25).max(2); // Each node+edge takes ~25 chars
+
+            // Get ordered path (or use edges if path is empty)
+            let path: Vec<&str> = if trace.path.is_empty() {
+                // Build path from edges
+                let mut p = vec![trace.root_id.as_str()];
+                for edge in &trace.edges {
+                    if !p.contains(&edge.to_id.as_str()) {
+                        p.push(&edge.to_id);
+                    }
+                }
+                p
+            } else {
+                trace.path.iter().map(|s| s.as_str()).collect()
+            };
+
+            // Show scroll indicator if needed
+            if visible_start > 0 {
+                chain_spans.push(Span::styled("◀ ", Style::default().fg(TEXT_DISABLED)));
+            }
+
+            // Render visible portion of chain
+            for (idx, node_id) in path.iter().enumerate().skip(visible_start).take(max_visible) {
+                // Get node info
+                let node_info = trace.nodes.get(*node_id);
+                let (type_icon, type_color, preview) = if let Some(node) = node_info {
+                    (node.type_icon(), node.type_color(), &node.content_preview)
+                } else {
+                    ("•", Color::Gray, &node_id.to_string())
+                };
+
+                // Render node box
+                let node_preview = truncate(preview, 12);
+                chain_spans.push(Span::styled(
+                    format!("{}", type_icon),
+                    Style::default().fg(type_color).add_modifier(Modifier::BOLD),
+                ));
+                chain_spans.push(Span::styled(
+                    format!(" {} ", node_preview),
+                    Style::default().fg(Color::Rgb(240, 240, 240)),
+                ));
+
+                // Render edge to next node (if not last)
+                if idx < path.len() - 1 {
+                    // Find edge between this node and next
+                    let next_id = path.get(idx + 1).unwrap_or(node_id);
+                    let edge = trace.edges.iter().find(|e| {
+                        (e.from_id == *node_id && e.to_id == *next_id)
+                            || (e.to_id == *node_id && e.from_id == *next_id)
+                    });
+
+                    if let Some(e) = edge {
+                        let conf_pct = (e.confidence * 100.0) as u8;
+                        let source_ind = e.source_indicator();
+                        chain_spans.push(Span::styled(
+                            format!("─{}{}{}─▸", e.relation_icon(), conf_pct, source_ind),
+                            Style::default().fg(e.relation_color()).add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        chain_spans.push(Span::styled("───▸", Style::default().fg(Color::Rgb(120, 120, 120))));
+                    }
+                }
+            }
+
+            // Show scroll indicator if more nodes
+            if visible_start + max_visible < path.len() {
+                chain_spans.push(Span::styled(" ▶", Style::default().fg(TEXT_DISABLED)));
+            }
+
+            lines.push(Line::from(chain_spans));
+
+            // Footer with navigation hints
+            lines.push(Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled("<>", Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled(" scroll  ", Style::default().fg(Color::Rgb(100, 100, 100))),
+                Span::styled("L", Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled(" trace  ", Style::default().fg(Color::Rgb(100, 100, 100))),
+                Span::styled("C", Style::default().fg(Color::Rgb(100, 255, 150))),
+                Span::styled(" confirm  ", Style::default().fg(Color::Rgb(100, 100, 100))),
+                Span::styled("X", Style::default().fg(Color::Rgb(255, 100, 100))),
+                Span::styled(" reject", Style::default().fg(Color::Rgb(100, 100, 100))),
+            ]));
+        }
+    } else {
+        // No trace loaded
+        lines.push(Line::from(Span::styled(
+            " ⑂ LINEAGE ",
+            Style::default().fg(Color::Black).bg(Color::Rgb(60, 60, 70)),
+        )));
+        lines.push(Line::from(Span::styled(
+            "   Select a todo and press Shift+L to trace its causal chain",
+            Style::default().fg(TEXT_DISABLED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "   Discover: why did this happen? what did it lead to?",
+            Style::default().fg(Color::Rgb(50, 50, 50)),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Render a todo row with selection highlighting

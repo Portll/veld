@@ -23,6 +23,7 @@ pub mod facts;
 pub mod feedback;
 pub mod graph_retrieval;
 pub mod injection;
+pub mod lineage;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -65,6 +66,10 @@ pub use crate::memory::introspection::{
     AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
     ConsolidationStats, EdgeFormationReason, FactChange, InterferenceEvent, InterferenceType,
     MemoryChange, PruningReason, ReplayEvent, ReportPeriod, StrengtheningReason,
+};
+pub use crate::memory::lineage::{
+    CausalRelation, InferenceConfig, LineageBranch, LineageEdge, LineageGraph, LineageSource,
+    LineageStats, LineageTrace, PostMortem, TraceDirection,
 };
 pub use crate::memory::prospective::ProspectiveStore;
 pub use crate::memory::replay::{
@@ -168,6 +173,11 @@ pub struct MemorySystem {
     /// Stores distilled knowledge extracted from episodic memories
     /// Separate from episodic storage: facts persist, episodes flow
     fact_store: Arc<facts::SemanticFactStore>,
+
+    /// Decision lineage graph (SHO-118)
+    /// Tracks causal relationships between memories for "why" reasoning
+    /// Enables: audit trails, project branching, automatic post-mortems
+    lineage_graph: Arc<lineage::LineageGraph>,
 }
 
 impl MemorySystem {
@@ -218,6 +228,10 @@ impl MemorySystem {
         // Facts use "facts:" prefix to avoid key collisions with episodic memories
         let fact_store = Arc::new(facts::SemanticFactStore::new(storage.db()));
 
+        // SHO-118: Create lineage graph for causal memory tracking
+        // Lineage uses "lineage:" prefix for edges and branches
+        let lineage_graph = Arc::new(lineage::LineageGraph::new(storage.db()));
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -239,6 +253,8 @@ impl MemorySystem {
             interference_detector: Arc::new(RwLock::new(replay::InterferenceDetector::new())),
             // SHO-f0e7: Semantic fact store
             fact_store,
+            // SHO-118: Decision lineage graph
+            lineage_graph,
         })
     }
 
@@ -2935,6 +2951,80 @@ impl MemorySystem {
     /// Get the fact store for direct access
     pub fn fact_store(&self) -> &Arc<facts::SemanticFactStore> {
         &self.fact_store
+    }
+
+    // =========================================================================
+    // SHO-118: DECISION LINEAGE GRAPH METHODS
+    // =========================================================================
+
+    /// Get the lineage graph for direct access
+    pub fn lineage_graph(&self) -> &Arc<lineage::LineageGraph> {
+        &self.lineage_graph
+    }
+
+    /// Infer and store lineage between a new memory and existing memories
+    ///
+    /// Called after storing a new memory to automatically detect causal relationships.
+    /// Uses entity overlap, temporal proximity, and memory type patterns.
+    pub fn infer_lineage_for_memory(
+        &self,
+        user_id: &str,
+        new_memory: &Memory,
+        candidate_memories: &[Memory],
+    ) -> Result<Vec<LineageEdge>> {
+        let mut inferred_edges = Vec::new();
+
+        for candidate in candidate_memories {
+            // Try inferring from candidate to new memory (candidate caused new)
+            if let Some((relation, confidence)) =
+                self.lineage_graph.infer_relation(candidate, new_memory)
+            {
+                // Check if edge already exists
+                if !self
+                    .lineage_graph
+                    .edge_exists(user_id, &candidate.id, &new_memory.id)?
+                {
+                    let edge = LineageEdge::inferred(
+                        candidate.id.clone(),
+                        new_memory.id.clone(),
+                        relation,
+                        confidence,
+                    );
+                    self.lineage_graph.store_edge(user_id, &edge)?;
+                    inferred_edges.push(edge);
+                }
+            }
+        }
+
+        // Check for branch signal in memory content
+        if lineage::LineageGraph::detect_branch_signal(&new_memory.experience.content) {
+            // Ensure main branch exists
+            self.lineage_graph.ensure_main_branch(user_id)?;
+        }
+
+        Ok(inferred_edges)
+    }
+
+    /// Trace lineage from a memory
+    pub fn trace_lineage(
+        &self,
+        user_id: &str,
+        memory_id: &MemoryId,
+        direction: TraceDirection,
+        max_depth: usize,
+    ) -> Result<LineageTrace> {
+        self.lineage_graph
+            .trace(user_id, memory_id, direction, max_depth)
+    }
+
+    /// Find the root cause of a memory
+    pub fn find_root_cause(&self, user_id: &str, memory_id: &MemoryId) -> Result<Option<MemoryId>> {
+        self.lineage_graph.find_root_cause(user_id, memory_id)
+    }
+
+    /// Get lineage statistics
+    pub fn lineage_stats(&self, user_id: &str) -> Result<LineageStats> {
+        self.lineage_graph.stats(user_id)
     }
 
     /// Decay facts for all users during maintenance

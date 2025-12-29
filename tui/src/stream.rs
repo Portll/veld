@@ -886,3 +886,426 @@ pub async fn refresh_todos(
         Err(e) => Err(format!("Failed to refresh: {}", e)),
     }
 }
+
+// =============================================================================
+// LINEAGE API FUNCTIONS
+// =============================================================================
+
+use crate::types::{LineageEdge, LineageNode, LineageTrace};
+use std::collections::HashMap;
+
+/// Fetch lineage trace for a memory/todo
+pub async fn fetch_lineage_trace(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    memory_id: &str,
+    direction: &str,
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::types::AppState>>,
+) -> Result<(), String> {
+    let client = Client::new();
+    let url = format!("{}/api/lineage/trace", base_url);
+
+    #[derive(serde::Serialize)]
+    struct TraceRequest {
+        user_id: String,
+        memory_id: String,
+        direction: String,
+        max_depth: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TraceResponse {
+        root: String,
+        direction: String,
+        edges: Vec<EdgeInfo>,
+        path: Vec<String>,
+        depth: usize,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct EdgeInfo {
+        id: String,
+        from: String,
+        to: String,
+        relation: String,
+        confidence: f32,
+        source: String,
+    }
+
+    let request = TraceRequest {
+        user_id: user_id.to_string(),
+        memory_id: memory_id.to_string(),
+        direction: direction.to_string(),
+        max_depth: 10,
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let trace_resp: TraceResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    // Convert to LineageTrace
+    let edges: Vec<LineageEdge> = trace_resp
+        .edges
+        .into_iter()
+        .map(|e| LineageEdge {
+            id: e.id,
+            from_id: e.from,
+            to_id: e.to,
+            relation: e.relation,
+            confidence: e.confidence,
+            source: e.source,
+        })
+        .collect();
+
+    // Build nodes map from path (we'll need to fetch memory details separately or use placeholders)
+    let mut nodes: HashMap<String, LineageNode> = HashMap::new();
+    for node_id in &trace_resp.path {
+        nodes.insert(
+            node_id.clone(),
+            LineageNode {
+                id: node_id.clone(),
+                short_id: node_id.chars().take(8).collect(),
+                content_preview: format!("Memory {}", &node_id[..8.min(node_id.len())]),
+                memory_type: "Unknown".to_string(),
+            },
+        );
+    }
+
+    // Also add root if not in path
+    if !nodes.contains_key(&trace_resp.root) {
+        nodes.insert(
+            trace_resp.root.clone(),
+            LineageNode {
+                id: trace_resp.root.clone(),
+                short_id: trace_resp.root.chars().take(8).collect(),
+                content_preview: format!("Root {}", &trace_resp.root[..8.min(trace_resp.root.len())]),
+                memory_type: "Unknown".to_string(),
+            },
+        );
+    }
+
+    let trace = LineageTrace {
+        root_id: trace_resp.root,
+        direction: trace_resp.direction,
+        edges,
+        nodes,
+        path: trace_resp.path,
+        depth: trace_resp.depth,
+    };
+
+    let mut s = state.lock().await;
+    s.set_lineage_trace(trace);
+    Ok(())
+}
+
+/// Fetch lineage trace with node details (fetches memory info for each node)
+pub async fn fetch_lineage_with_details(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    memory_id: &str,
+    direction: &str,
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::types::AppState>>,
+) -> Result<(), String> {
+    let client = Client::new();
+    let url = format!("{}/api/lineage/trace", base_url);
+
+    #[derive(serde::Serialize)]
+    struct TraceRequest {
+        user_id: String,
+        memory_id: String,
+        direction: String,
+        max_depth: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TraceResponse {
+        root: String,
+        direction: String,
+        edges: Vec<EdgeInfo>,
+        path: Vec<String>,
+        depth: usize,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct EdgeInfo {
+        id: String,
+        from: String,
+        to: String,
+        relation: String,
+        confidence: f32,
+        source: String,
+    }
+
+    let request = TraceRequest {
+        user_id: user_id.to_string(),
+        memory_id: memory_id.to_string(),
+        direction: direction.to_string(),
+        max_depth: 10,
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let trace_resp: TraceResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    // Collect all unique node IDs
+    let mut node_ids: Vec<String> = trace_resp.path.clone();
+    if !node_ids.contains(&trace_resp.root) {
+        node_ids.push(trace_resp.root.clone());
+    }
+    for edge in &trace_resp.edges {
+        if !node_ids.contains(&edge.from) {
+            node_ids.push(edge.from.clone());
+        }
+        if !node_ids.contains(&edge.to) {
+            node_ids.push(edge.to.clone());
+        }
+    }
+
+    // Fetch memory details for each node
+    let mut nodes: HashMap<String, LineageNode> = HashMap::new();
+    for node_id in &node_ids {
+        // Try to get memory info
+        if let Ok(Some(node_info)) = fetch_memory_info(&client, base_url, api_key, user_id, node_id).await {
+            nodes.insert(node_id.clone(), node_info);
+        } else {
+            // Fallback to placeholder
+            nodes.insert(
+                node_id.clone(),
+                LineageNode {
+                    id: node_id.clone(),
+                    short_id: node_id.chars().take(8).collect(),
+                    content_preview: format!("Memory {}", &node_id[..8.min(node_id.len())]),
+                    memory_type: "Unknown".to_string(),
+                },
+            );
+        }
+    }
+
+    let edges: Vec<LineageEdge> = trace_resp
+        .edges
+        .into_iter()
+        .map(|e| LineageEdge {
+            id: e.id,
+            from_id: e.from,
+            to_id: e.to,
+            relation: e.relation,
+            confidence: e.confidence,
+            source: e.source,
+        })
+        .collect();
+
+    let trace = LineageTrace {
+        root_id: trace_resp.root,
+        direction: trace_resp.direction,
+        edges,
+        nodes,
+        path: trace_resp.path,
+        depth: trace_resp.depth,
+    };
+
+    let mut s = state.lock().await;
+    s.set_lineage_trace(trace);
+    Ok(())
+}
+
+/// Fetch memory info for a single memory ID
+async fn fetch_memory_info(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    memory_id: &str,
+) -> Result<Option<LineageNode>, String> {
+    // Try the recall endpoint with the specific ID
+    let url = format!("{}/api/recall", base_url);
+
+    #[derive(serde::Serialize)]
+    struct RecallRequest {
+        user_id: String,
+        query: String,
+        limit: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RecallResponse {
+        memories: Vec<MemoryInfo>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct MemoryInfo {
+        id: String,
+        content: String,
+        memory_type: String,
+    }
+
+    // Search by ID prefix
+    let request = RecallRequest {
+        user_id: user_id.to_string(),
+        query: memory_id.chars().take(8).collect(),
+        limit: 5,
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let recall_resp: RecallResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    // Find matching memory
+    for mem in recall_resp.memories {
+        if mem.id == memory_id || mem.id.starts_with(&memory_id[..8.min(memory_id.len())]) {
+            return Ok(Some(LineageNode {
+                id: mem.id.clone(),
+                short_id: mem.id.chars().take(8).collect(),
+                content_preview: mem.content.chars().take(30).collect(),
+                memory_type: mem.memory_type,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Confirm a lineage edge
+pub async fn confirm_lineage_edge(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    edge_id: &str,
+) -> Result<String, String> {
+    let client = Client::new();
+    let url = format!("{}/api/lineage/confirm", base_url);
+
+    #[derive(serde::Serialize)]
+    struct ConfirmRequest {
+        user_id: String,
+        edge_id: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ConfirmResponse {
+        message: String,
+    }
+
+    let request = ConfirmRequest {
+        user_id: user_id.to_string(),
+        edge_id: edge_id.to_string(),
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let resp: ConfirmResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(resp.message)
+}
+
+/// Reject a lineage edge
+pub async fn reject_lineage_edge(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    edge_id: &str,
+) -> Result<String, String> {
+    let client = Client::new();
+    let url = format!("{}/api/lineage/reject", base_url);
+
+    #[derive(serde::Serialize)]
+    struct RejectRequest {
+        user_id: String,
+        edge_id: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RejectResponse {
+        message: String,
+    }
+
+    let request = RejectRequest {
+        user_id: user_id.to_string(),
+        edge_id: edge_id.to_string(),
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let resp: RejectResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(resp.message)
+}

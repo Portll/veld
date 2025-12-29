@@ -1444,6 +1444,10 @@ pub struct AppState {
     pub last_used_memory: Option<LastUsedMemory>,
     /// Claude Code context sessions (multiple windows supported)
     pub context_sessions: Vec<ContextSession>,
+    /// Current lineage trace (for selected todo/memory)
+    pub lineage_trace: Option<LineageTrace>,
+    /// Lineage horizontal scroll offset
+    pub lineage_scroll: usize,
 }
 
 /// Claude Code context session status
@@ -1532,6 +1536,8 @@ impl AppState {
             current_operation: None,
             last_used_memory: None,
             context_sessions: Vec::new(),
+            lineage_trace: None,
+            lineage_scroll: 0,
         }
     }
 
@@ -2443,4 +2449,140 @@ impl AppState {
         }
         None
     }
+
+    /// Set lineage trace data
+    pub fn set_lineage_trace(&mut self, trace: LineageTrace) {
+        self.lineage_trace = Some(trace);
+        self.lineage_scroll = 0;
+    }
+
+    /// Clear lineage trace
+    pub fn clear_lineage_trace(&mut self) {
+        self.lineage_trace = None;
+        self.lineage_scroll = 0;
+    }
+
+    /// Scroll lineage left
+    pub fn lineage_scroll_left(&mut self) {
+        if self.lineage_scroll > 0 {
+            self.lineage_scroll -= 1;
+        }
+    }
+
+    /// Scroll lineage right
+    pub fn lineage_scroll_right(&mut self) {
+        if let Some(ref trace) = self.lineage_trace {
+            let max_scroll = trace.edges.len().saturating_sub(3);
+            if self.lineage_scroll < max_scroll {
+                self.lineage_scroll += 1;
+            }
+        }
+    }
+}
+
+// =============================================================================
+// LINEAGE TYPES (Decision Lineage Graph)
+// =============================================================================
+
+/// Lineage edge representing a causal relationship
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageEdge {
+    pub id: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub relation: String,
+    pub confidence: f32,
+    pub source: String,
+}
+
+impl LineageEdge {
+    /// Get display icon for relation type
+    pub fn relation_icon(&self) -> &'static str {
+        match self.relation.as_str() {
+            "Caused" => "→",
+            "ResolvedBy" => "✓",
+            "InformedBy" => "◈",
+            "SupersededBy" => "⇢",
+            "TriggeredBy" => "⚡",
+            "BranchedFrom" => "⑂",
+            "RelatedTo" => "~",
+            _ => "→",
+        }
+    }
+
+    /// Get color for relation type
+    pub fn relation_color(&self) -> Color {
+        match self.relation.as_str() {
+            "Caused" => Color::Rgb(255, 100, 100),      // Bright red
+            "ResolvedBy" => Color::Rgb(100, 255, 150),  // Bright green
+            "InformedBy" => Color::Rgb(100, 180, 255),  // Bright blue
+            "SupersededBy" => Color::Rgb(180, 180, 180), // Light gray
+            "TriggeredBy" => Color::Rgb(255, 220, 80),  // Bright yellow
+            "BranchedFrom" => Color::Rgb(255, 130, 255), // Bright magenta
+            "RelatedTo" => Color::Rgb(150, 150, 150),   // Medium gray
+            _ => Color::White,
+        }
+    }
+
+    /// Get source indicator
+    pub fn source_indicator(&self) -> &'static str {
+        match self.source.as_str() {
+            "Confirmed" => "✓",
+            "Explicit" => "⚡",
+            "Inferred" => "?",
+            _ => "·",
+        }
+    }
+}
+
+/// Lineage node info (minimal info for chain display)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageNode {
+    pub id: String,
+    pub short_id: String,
+    pub content_preview: String,
+    pub memory_type: String,
+}
+
+impl LineageNode {
+    /// Get icon for memory type
+    pub fn type_icon(&self) -> &'static str {
+        match self.memory_type.to_lowercase().as_str() {
+            "error" => "⚠",
+            "task" => "□",
+            "learning" => "◆",
+            "decision" => "◇",
+            "discovery" => "★",
+            "pattern" => "◎",
+            "context" => "●",
+            "conversation" => "○",
+            _ => "•",
+        }
+    }
+
+    /// Get color for memory type
+    pub fn type_color(&self) -> Color {
+        match self.memory_type.to_lowercase().as_str() {
+            "error" => Color::Rgb(255, 80, 80),       // Bright red
+            "task" => Color::Rgb(100, 180, 255),      // Bright blue
+            "learning" => Color::Rgb(80, 255, 130),   // Bright green
+            "decision" => Color::Rgb(255, 230, 80),   // Bright yellow
+            "discovery" => Color::Rgb(255, 120, 255), // Bright magenta
+            "pattern" => Color::Rgb(255, 180, 80),    // Bright orange
+            "context" => Color::Rgb(255, 160, 100),   // Bright coral
+            "conversation" => Color::Rgb(220, 220, 220), // Bright white
+            _ => Color::Rgb(180, 180, 180),           // Light gray
+        }
+    }
+}
+
+/// Complete lineage trace result
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LineageTrace {
+    pub root_id: String,
+    pub direction: String,
+    pub edges: Vec<LineageEdge>,
+    pub nodes: HashMap<String, LineageNode>,
+    pub path: Vec<String>,
+    pub depth: usize,
 }

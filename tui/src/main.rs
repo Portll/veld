@@ -952,6 +952,139 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 g.rotate_graph_right();
                             }
                         }
+                        KeyCode::Char('L') => {
+                            // Trace lineage in Projects view
+                            if matches!(g.view_mode, ViewMode::Projects) {
+                                // Get memory_id from selected todo
+                                let memory_id: Option<String> = if g.focus_panel == FocusPanel::Right {
+                                    // Get selected todo's ID (use as memory ID for lineage)
+                                    g.get_selected_dashboard_todo().map(|t| t.id.clone())
+                                } else {
+                                    None
+                                };
+
+                                if let Some(ref mem_id) = memory_id {
+                                    let user_id = g.current_user.clone();
+                                    g.set_error("Tracing lineage...".to_string());
+                                    drop(g);
+
+                                    // Fetch lineage trace
+                                    let lineage_result = crate::stream::fetch_lineage_trace(
+                                        &base_url,
+                                        &api_key,
+                                        &user_id,
+                                        &mem_id,
+                                        "backward",
+                                        &state,
+                                    )
+                                    .await;
+
+                                    let mut g = state.lock().await;
+                                    match lineage_result {
+                                        Ok(()) => {
+                                            g.clear_error();
+                                        }
+                                        Err(e) => {
+                                            g.set_error(format!("Lineage: {}", e));
+                                        }
+                                    }
+                                } else {
+                                    g.set_error("Select a todo to trace lineage".to_string());
+                                }
+                            }
+                        }
+                        KeyCode::Char('C') => {
+                            // Confirm lineage edge in Projects view
+                            if matches!(g.view_mode, ViewMode::Projects) {
+                                if let Some(ref trace) = g.lineage_trace {
+                                    // Get first inferred edge to confirm
+                                    let edge_to_confirm = trace
+                                        .edges
+                                        .iter()
+                                        .find(|e| e.source == "Inferred")
+                                        .map(|e| e.id.clone());
+
+                                    if let Some(edge_id) = edge_to_confirm {
+                                        let user_id = g.current_user.clone();
+                                        drop(g);
+
+                                        let confirm_result = crate::stream::confirm_lineage_edge(
+                                            &base_url,
+                                            &api_key,
+                                            &user_id,
+                                            &edge_id,
+                                        )
+                                        .await;
+
+                                        let mut g = state.lock().await;
+                                        match confirm_result {
+                                            Ok(msg) => {
+                                                g.set_error(format!("✓ {}", msg));
+                                            }
+                                            Err(e) => {
+                                                g.set_error(format!("Confirm failed: {}", e));
+                                            }
+                                        }
+                                    } else {
+                                        g.set_error("No inferred edges to confirm".to_string());
+                                    }
+                                } else {
+                                    g.set_error("No lineage loaded. Press L first".to_string());
+                                }
+                            }
+                        }
+                        KeyCode::Char('X') => {
+                            // Reject lineage edge in Projects view
+                            if matches!(g.view_mode, ViewMode::Projects) {
+                                if let Some(ref trace) = g.lineage_trace {
+                                    // Get first inferred edge to reject
+                                    let edge_to_reject = trace
+                                        .edges
+                                        .iter()
+                                        .find(|e| e.source == "Inferred")
+                                        .map(|e| e.id.clone());
+
+                                    if let Some(edge_id) = edge_to_reject {
+                                        let user_id = g.current_user.clone();
+                                        drop(g);
+
+                                        let reject_result = crate::stream::reject_lineage_edge(
+                                            &base_url,
+                                            &api_key,
+                                            &user_id,
+                                            &edge_id,
+                                        )
+                                        .await;
+
+                                        let mut g = state.lock().await;
+                                        match reject_result {
+                                            Ok(msg) => {
+                                                g.set_error(format!("✗ {}", msg));
+                                            }
+                                            Err(e) => {
+                                                g.set_error(format!("Reject failed: {}", e));
+                                            }
+                                        }
+                                    } else {
+                                        g.set_error("No inferred edges to reject".to_string());
+                                    }
+                                } else {
+                                    g.set_error("No lineage loaded. Press L first".to_string());
+                                }
+                            }
+                        }
+                        KeyCode::Char('<') | KeyCode::Char(',') => {
+                            // Scroll lineage left in Projects view
+                            if matches!(g.view_mode, ViewMode::Projects) && g.lineage_trace.is_some() {
+                                g.lineage_scroll_left();
+                            }
+                        }
+                        KeyCode::Char('>') | KeyCode::Char('.') => {
+                            // Scroll lineage right in Projects view
+                            if matches!(g.view_mode, ViewMode::Projects) && g.lineage_trace.is_some() {
+                                g.lineage_scroll_right();
+                            }
+                        }
                         KeyCode::Char('w') => {
                             if matches!(g.view_mode, ViewMode::GraphMap) {
                                 g.tilt_graph(-0.1);

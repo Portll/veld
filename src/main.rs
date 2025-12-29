@@ -2368,6 +2368,28 @@ async fn remember(
         // Don't fail the request if graph processing fails
     }
 
+    // Auto-infer lineage edges in background (non-blocking)
+    // This builds the causal graph silently - users can trace when needed
+    {
+        let state_clone = state.clone();
+        let user_id = req.user_id.clone();
+        let new_memory_id = memory_id.clone();
+        let new_experience = experience.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                auto_infer_lineage(&state_clone, &user_id, &new_memory_id, &new_experience).await
+            {
+                tracing::debug!(
+                    "Auto-lineage inference failed for {}: {}",
+                    new_memory_id.0,
+                    e
+                );
+                // Silent failure - lineage is optional enhancement
+            }
+        });
+    }
+
     // Record metrics
     let duration = op_start.elapsed().as_secs_f64();
     metrics::MEMORY_STORE_DURATION.observe(duration);
@@ -3924,6 +3946,584 @@ async fn get_facts_stats(
     .map_err(AppError::Internal)?;
 
     Ok(Json(stats))
+}
+
+// =============================================================================
+// SHO-118: DECISION LINEAGE GRAPH API
+// =============================================================================
+
+/// Request to trace lineage from a memory
+#[derive(Debug, Deserialize)]
+struct LineageTraceRequest {
+    user_id: String,
+    memory_id: String,
+    #[serde(default = "lineage_direction_default")]
+    direction: String, // "backward", "forward", "both"
+    #[serde(default = "lineage_max_depth_default")]
+    max_depth: usize,
+}
+
+fn lineage_direction_default() -> String {
+    "backward".to_string()
+}
+
+fn lineage_max_depth_default() -> usize {
+    10
+}
+
+/// Request to confirm/reject an edge
+#[derive(Debug, Deserialize)]
+struct LineageEdgeRequest {
+    user_id: String,
+    edge_id: String,
+}
+
+/// Request to add an explicit lineage edge
+#[derive(Debug, Deserialize)]
+struct LineageAddEdgeRequest {
+    user_id: String,
+    from_memory_id: String,
+    to_memory_id: String,
+    relation: String, // "Caused", "ResolvedBy", "InformedBy", etc.
+}
+
+/// Request to list lineage edges
+#[derive(Debug, Deserialize)]
+struct LineageListRequest {
+    user_id: String,
+    #[serde(default = "lineage_list_limit_default")]
+    limit: usize,
+}
+
+fn lineage_list_limit_default() -> usize {
+    50
+}
+
+/// Request to create a branch
+#[derive(Debug, Deserialize)]
+struct LineageCreateBranchRequest {
+    user_id: String,
+    name: String,
+    parent_branch: String,
+    branch_point_memory_id: String,
+    description: Option<String>,
+}
+
+/// Response for lineage trace
+#[derive(Debug, Serialize)]
+struct LineageTraceResponse {
+    root: String,
+    direction: String,
+    edges: Vec<memory::LineageEdge>,
+    path: Vec<String>,
+    depth: usize,
+}
+
+/// Response for lineage edges list
+#[derive(Debug, Serialize)]
+struct LineageEdgesResponse {
+    edges: Vec<memory::LineageEdge>,
+    total: usize,
+}
+
+/// Response for branches list
+#[derive(Debug, Serialize)]
+struct LineageBranchesResponse {
+    branches: Vec<memory::LineageBranch>,
+    total: usize,
+}
+
+/// POST /api/lineage/trace - Trace lineage from a memory
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, memory_id = %req.memory_id))]
+async fn lineage_trace(
+    State(state): State<AppState>,
+    Json(req): Json<LineageTraceRequest>,
+) -> Result<Json<LineageTraceResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let memory_id_str = req.memory_id.clone();
+    let direction = req.direction.clone();
+    let max_depth = req.max_depth;
+
+    let trace = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        let memory_id = memory::MemoryId(
+            uuid::Uuid::parse_str(&memory_id_str)
+                .map_err(|e| anyhow::anyhow!("Invalid memory_id: {}", e))?,
+        );
+        let dir = match direction.as_str() {
+            "forward" => memory::TraceDirection::Forward,
+            "both" => memory::TraceDirection::Both,
+            _ => memory::TraceDirection::Backward,
+        };
+        memory_guard.trace_lineage(&user_id, &memory_id, dir, max_depth)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(LineageTraceResponse {
+        root: trace.root.0.to_string(),
+        direction: format!("{:?}", trace.direction),
+        edges: trace.edges,
+        path: trace.path.iter().map(|id| id.0.to_string()).collect(),
+        depth: trace.depth,
+    }))
+}
+
+/// POST /api/lineage/edges - List all lineage edges for a user
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+async fn lineage_list_edges(
+    State(state): State<AppState>,
+    Json(req): Json<LineageListRequest>,
+) -> Result<Json<LineageEdgesResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let limit = req.limit;
+
+    let edges = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        memory_guard.lineage_graph().list_edges(&user_id, limit)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let total = edges.len();
+    Ok(Json(LineageEdgesResponse { edges, total }))
+}
+
+/// POST /api/lineage/confirm - Confirm an inferred lineage edge
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, edge_id = %req.edge_id))]
+async fn lineage_confirm_edge(
+    State(state): State<AppState>,
+    Json(req): Json<LineageEdgeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let edge_id = req.edge_id.clone();
+
+    let confirmed = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        memory_guard
+            .lineage_graph()
+            .confirm_edge(&user_id, &edge_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({ "confirmed": confirmed })))
+}
+
+/// POST /api/lineage/reject - Reject (delete) an inferred lineage edge
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, edge_id = %req.edge_id))]
+async fn lineage_reject_edge(
+    State(state): State<AppState>,
+    Json(req): Json<LineageEdgeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let edge_id = req.edge_id.clone();
+
+    let rejected = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        memory_guard.lineage_graph().reject_edge(&user_id, &edge_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({ "rejected": rejected })))
+}
+
+/// POST /api/lineage/link - Add an explicit lineage edge
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+async fn lineage_add_edge(
+    State(state): State<AppState>,
+    Json(req): Json<LineageAddEdgeRequest>,
+) -> Result<Json<memory::LineageEdge>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let from_str = req.from_memory_id.clone();
+    let to_str = req.to_memory_id.clone();
+    let relation_str = req.relation.clone();
+
+    let edge = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        let from = memory::MemoryId(
+            uuid::Uuid::parse_str(&from_str)
+                .map_err(|e| anyhow::anyhow!("Invalid from_memory_id: {}", e))?,
+        );
+        let to = memory::MemoryId(
+            uuid::Uuid::parse_str(&to_str)
+                .map_err(|e| anyhow::anyhow!("Invalid to_memory_id: {}", e))?,
+        );
+        let relation = match relation_str.as_str() {
+            "Caused" => memory::CausalRelation::Caused,
+            "ResolvedBy" => memory::CausalRelation::ResolvedBy,
+            "InformedBy" => memory::CausalRelation::InformedBy,
+            "SupersededBy" => memory::CausalRelation::SupersededBy,
+            "TriggeredBy" => memory::CausalRelation::TriggeredBy,
+            "BranchedFrom" => memory::CausalRelation::BranchedFrom,
+            _ => memory::CausalRelation::RelatedTo,
+        };
+        memory_guard
+            .lineage_graph()
+            .add_explicit_edge(&user_id, from, to, relation)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(edge))
+}
+
+/// POST /api/lineage/stats - Get lineage statistics
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+async fn lineage_stats(
+    State(state): State<AppState>,
+    Json(req): Json<LineageListRequest>,
+) -> Result<Json<memory::LineageStats>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+
+    let stats = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        memory_guard.lineage_stats(&user_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(stats))
+}
+
+/// POST /api/lineage/branches - List all branches for a user
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+async fn lineage_list_branches(
+    State(state): State<AppState>,
+    Json(req): Json<LineageListRequest>,
+) -> Result<Json<LineageBranchesResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+
+    let branches = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        memory_guard.lineage_graph().list_branches(&user_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let total = branches.len();
+    Ok(Json(LineageBranchesResponse { branches, total }))
+}
+
+/// POST /api/lineage/branch - Create a new branch
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, name = %req.name))]
+async fn lineage_create_branch(
+    State(state): State<AppState>,
+    Json(req): Json<LineageCreateBranchRequest>,
+) -> Result<Json<memory::LineageBranch>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let name = req.name.clone();
+    let parent = req.parent_branch.clone();
+    let branch_point_str = req.branch_point_memory_id.clone();
+    let description = req.description.clone();
+
+    let branch = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        let branch_point = memory::MemoryId(
+            uuid::Uuid::parse_str(&branch_point_str)
+                .map_err(|e| anyhow::anyhow!("Invalid branch_point_memory_id: {}", e))?,
+        );
+        memory_guard.lineage_graph().create_branch(
+            &user_id,
+            &name,
+            &parent,
+            branch_point,
+            description.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(branch))
+}
+
+// =============================================================================
+// AUTO-LINEAGE INFERENCE (Background Task)
+// =============================================================================
+
+/// Automatically infer lineage edges when a new memory is created.
+/// Runs in background - never blocks the remember request.
+/// Looks at recent memories and creates edges based on:
+/// - Entity overlap (shared entities)
+/// - Temporal proximity (created close together)
+/// - Type patterns (Error→Task=Caused, Task→Learning=ResolvedBy, etc.)
+async fn auto_infer_lineage(
+    state: &AppState,
+    user_id: &str,
+    new_memory_id: &memory::MemoryId,
+    new_experience: &memory::Experience,
+) -> anyhow::Result<()> {
+    let memory = state.get_user_memory(user_id)?;
+
+    // Get recent memories to compare against (last 24 hours)
+    let recent_memories: Vec<memory::Memory> = {
+        let memory_guard = memory.read();
+
+        // Get all memories and filter by time
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let all_memories = memory_guard.get_all_memories()?;
+
+        all_memories
+            .into_iter()
+            .filter(|m| m.created_at > cutoff && m.id != *new_memory_id)
+            .take(50) // Limit to 50 most recent
+            .map(|arc_mem| (*arc_mem).clone())
+            .collect()
+    };
+
+    if recent_memories.is_empty() {
+        return Ok(()); // No candidates to link to
+    }
+
+    // Build a Memory struct for the new experience
+    let new_memory = memory::Memory::new(
+        new_memory_id.clone(),
+        new_experience.clone(),
+        0.5,  // importance
+        None, // agent_id
+        None, // run_id
+        None, // actor_id
+        Some(chrono::Utc::now()),
+    );
+
+    // Run inference to find potential edges
+    let inferred_edges = {
+        let memory_guard = memory.read();
+        memory_guard.infer_lineage_for_memory(user_id, &new_memory, &recent_memories)?
+    };
+
+    // Store inferred edges (if any)
+    if !inferred_edges.is_empty() {
+        let memory_guard = memory.read();
+        let lineage = memory_guard.lineage_graph();
+
+        for edge in inferred_edges {
+            // Only store if confidence is above threshold
+            if edge.confidence >= 0.4 {
+                if let Err(e) = lineage.store_edge(user_id, &edge) {
+                    tracing::debug!("Failed to store lineage edge: {}", e);
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Auto-inferred lineage for memory {}: found potential connections",
+            new_memory_id.0
+        );
+    }
+
+    Ok(())
+}
+
+/// Auto-generate post-mortem summary when a todo is completed.
+/// Searches for related memories created during the todo's lifetime,
+/// extracts learnings/decisions/errors, and stores a summary Learning.
+async fn auto_generate_post_mortem(
+    state: &AppState,
+    user_id: &str,
+    todo_content: &str,
+    todo_created_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<()> {
+    let memory = state.get_user_memory(user_id)?;
+
+    // Get memories created during the todo's lifetime
+    let related_memories: Vec<memory::Memory> = {
+        let memory_guard = memory.read();
+        let all_memories = memory_guard.get_all_memories()?;
+
+        all_memories
+            .into_iter()
+            .filter(|m| m.created_at >= todo_created_at)
+            .map(|arc_mem| (*arc_mem).clone())
+            .collect()
+    };
+
+    if related_memories.is_empty() {
+        return Ok(()); // No related work to summarize
+    }
+
+    // Categorize memories by type
+    let mut learnings = Vec::new();
+    let mut decisions = Vec::new();
+    let mut errors_resolved = Vec::new();
+    let mut patterns = Vec::new();
+
+    for mem in &related_memories {
+        match mem.experience.experience_type {
+            memory::ExperienceType::Learning => {
+                learnings.push(mem.experience.content.clone());
+            }
+            memory::ExperienceType::Decision => {
+                decisions.push(mem.experience.content.clone());
+            }
+            memory::ExperienceType::Error => {
+                errors_resolved.push(mem.experience.content.clone());
+            }
+            memory::ExperienceType::Pattern => {
+                patterns.push(mem.experience.content.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Only create post-mortem if we have significant content
+    let has_content = !learnings.is_empty()
+        || !decisions.is_empty()
+        || !errors_resolved.is_empty()
+        || !patterns.is_empty();
+
+    if !has_content {
+        return Ok(()); // Nothing significant to summarize
+    }
+
+    // Build post-mortem summary
+    let mut summary_parts = Vec::new();
+    summary_parts.push(format!("**Completed: {}**", todo_content));
+
+    if !learnings.is_empty() {
+        summary_parts.push(format!(
+            "📚 Learnings ({}):\n{}",
+            learnings.len(),
+            learnings
+                .iter()
+                .take(3)
+                .map(|l| format!("  • {}", truncate_content(l, 80)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if !decisions.is_empty() {
+        summary_parts.push(format!(
+            "🎯 Decisions ({}):\n{}",
+            decisions.len(),
+            decisions
+                .iter()
+                .take(3)
+                .map(|d| format!("  • {}", truncate_content(d, 80)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if !errors_resolved.is_empty() {
+        summary_parts.push(format!(
+            "🐛 Errors resolved ({}):\n{}",
+            errors_resolved.len(),
+            errors_resolved
+                .iter()
+                .take(3)
+                .map(|e| format!("  • {}", truncate_content(e, 80)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    if !patterns.is_empty() {
+        summary_parts.push(format!(
+            "🔄 Patterns ({}):\n{}",
+            patterns.len(),
+            patterns
+                .iter()
+                .take(2)
+                .map(|p| format!("  • {}", truncate_content(p, 80)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    let summary_content = summary_parts.join("\n\n");
+
+    // Store as a Learning memory
+    let experience = memory::Experience {
+        experience_type: memory::ExperienceType::Learning,
+        content: summary_content,
+        entities: vec!["post-mortem".to_string(), "task-completion".to_string()],
+        ..Default::default()
+    };
+
+    // Store the post-mortem memory
+    {
+        let memory_guard = memory.read();
+        memory_guard.remember(experience, None)?;
+    }
+
+    tracing::debug!(
+        user_id = %user_id,
+        todo = %todo_content,
+        learnings = learnings.len(),
+        decisions = decisions.len(),
+        errors = errors_resolved.len(),
+        "Generated post-mortem summary"
+    );
+
+    Ok(())
+}
+
+/// Truncate content to max length with ellipsis
+fn truncate_content(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
 }
 
 /// GET /api/context_summary - Get categorized context for session bootstrap
@@ -8814,6 +9414,24 @@ async fn complete_todo(
                 "Completed todo"
             );
 
+            // Auto-generate post-mortem in background (non-blocking)
+            let state_clone = state.clone();
+            let user_id_clone = req.user_id.clone();
+            let todo_content = completed.content.clone();
+            let todo_created_at = completed.created_at;
+            tokio::spawn(async move {
+                if let Err(e) = auto_generate_post_mortem(
+                    &state_clone,
+                    &user_id_clone,
+                    &todo_content,
+                    todo_created_at,
+                )
+                .await
+                {
+                    tracing::debug!("Auto post-mortem generation failed: {}", e);
+                }
+            });
+
             Ok(Json(TodoCompleteResponse {
                 success: true,
                 todo: Some(completed),
@@ -9554,6 +10172,15 @@ async fn main() -> Result<()> {
         .route("/api/facts/search", post(search_facts))
         .route("/api/facts/by-entity", post(facts_by_entity))
         .route("/api/facts/stats", post(get_facts_stats))
+        // Decision Lineage Graph API (SHO-118)
+        .route("/api/lineage/trace", post(lineage_trace))
+        .route("/api/lineage/edges", post(lineage_list_edges))
+        .route("/api/lineage/confirm", post(lineage_confirm_edge))
+        .route("/api/lineage/reject", post(lineage_reject_edge))
+        .route("/api/lineage/link", post(lineage_add_edge))
+        .route("/api/lineage/stats", post(lineage_stats))
+        .route("/api/lineage/branches", post(lineage_list_branches))
+        .route("/api/lineage/branch", post(lineage_create_branch))
         // List memories - Simple GET endpoint
         .route("/api/list/{user_id}", get(list_memories))
         // Streaming endpoints (moved from public to require auth - SHO-56)
