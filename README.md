@@ -55,6 +55,12 @@ Choose your platform:
 
 ## GTD Todo System
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/projects-todos.jpg" width="700" alt="Shodh Projects & Todos">
+</p>
+
+<p align="center"><i>Projects and todos with GTD workflow — contexts, priorities, due dates</i></p>
+
 Built-in task management following GTD (Getting Things Done) methodology:
 
 ```python
