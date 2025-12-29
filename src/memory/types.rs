@@ -2853,6 +2853,10 @@ pub struct Todo {
     /// Unique identifier
     pub id: TodoId,
 
+    /// Sequential user-facing number (SHO-1, SHO-2, etc.)
+    #[serde(default)]
+    pub seq_num: u32,
+
     /// User who owns this todo
     pub user_id: String,
 
@@ -2913,6 +2917,7 @@ impl Todo {
         let now = Utc::now();
         Self {
             id: TodoId::new(),
+            seq_num: 0, // Will be assigned by TodoStore on creation
             user_id,
             content,
             status: TodoStatus::Todo,
@@ -2929,6 +2934,16 @@ impl Todo {
             updated_at: now,
             completed_at: None,
             sort_order: 0,
+        }
+    }
+
+    /// Get the user-facing short ID (SHO-1, SHO-2, etc.)
+    pub fn short_id(&self) -> String {
+        if self.seq_num > 0 {
+            format!("SHO-{}", self.seq_num)
+        } else {
+            // Fallback for legacy todos without seq_num
+            self.id.short()
         }
     }
 
@@ -2987,11 +3002,6 @@ impl Todo {
             next.updated_at = Utc::now();
             next
         })
-    }
-
-    /// Get short ID
-    pub fn short_id(&self) -> String {
-        self.id.short()
     }
 }
 

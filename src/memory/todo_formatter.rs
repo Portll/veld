@@ -18,7 +18,7 @@ const LINE_WIDTH: usize = 70;
 pub fn format_todo_line(todo: &Todo, project_name: Option<&str>, show_meta: bool) -> String {
     let status = todo.status.icon();
     let priority = format!("{:3}", todo.priority.indicator());
-    let short_id = todo.id.short();
+    let short_id = todo.short_id();
 
     // First line: status, priority, ID, content, project
     let mut line = format!("  {} {} {}  {}", status, priority, short_id, todo.content);
@@ -98,7 +98,7 @@ fn format_section_header(label: &str) -> String {
 pub fn format_subtask_line(todo: &Todo, project_name: Option<&str>) -> String {
     let status = todo.status.icon();
     let priority = format!("{:3}", todo.priority.indicator());
-    let short_id = todo.id.short();
+    let short_id = todo.short_id();
 
     // Indented by 4 extra spaces for subtasks
     let mut line = format!(
@@ -263,7 +263,7 @@ pub fn format_due_todos(todos: &[Todo]) -> String {
     for todo in todos {
         let status = todo.status.icon();
         let priority = format!("{:3}", todo.priority.indicator());
-        let short_id = todo.id.short();
+        let short_id = todo.short_id();
 
         let due_text = todo
             .due_date
@@ -282,7 +282,7 @@ pub fn format_due_todos(todos: &[Todo]) -> String {
 
 /// Format created todo confirmation
 pub fn format_todo_created(todo: &Todo, project_name: Option<&str>) -> String {
-    let mut output = format!("✓ Created {}\n\n", todo.id.short());
+    let mut output = format!("✓ Created {}\n\n", todo.short_id());
     output.push_str(&format_todo_line(todo, project_name, true));
     output
 }
@@ -306,7 +306,7 @@ pub fn format_todo_completed(todo: &Todo, next: Option<&Todo>) -> String {
         })
         .unwrap_or_default();
 
-    let mut output = format!("✓ Completed {}\n\n", todo.id.short());
+    let mut output = format!("✓ Completed {}\n\n", todo.short_id());
     output.push_str(&format!(
         "  {} {}  {}",
         todo.status.icon(),
@@ -321,7 +321,7 @@ pub fn format_todo_completed(todo: &Todo, next: Option<&Todo>) -> String {
     if let Some(next_todo) = next {
         output.push_str(&format!(
             "\n\n  → Next occurrence: {} ({})",
-            next_todo.id.short(),
+            next_todo.short_id(),
             next_todo
                 .due_date
                 .map(|d| format_due_date(&d))
@@ -334,7 +334,7 @@ pub fn format_todo_completed(todo: &Todo, next: Option<&Todo>) -> String {
 
 /// Format todo updated confirmation
 pub fn format_todo_updated(todo: &Todo, project_name: Option<&str>) -> String {
-    let mut output = format!("✓ Updated {}\n\n", todo.id.short());
+    let mut output = format!("✓ Updated {}\n\n", todo.short_id());
     output.push_str(&format_todo_line(todo, project_name, true));
     output
 }

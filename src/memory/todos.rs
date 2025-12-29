@@ -61,24 +61,62 @@ impl TodoStore {
     }
 
     // =========================================================================
+    // SEQUENCE NUMBER MANAGEMENT
+    // =========================================================================
+
+    /// Get the next sequence number for a user and increment the counter
+    fn next_seq_num(&self, user_id: &str) -> Result<u32> {
+        let key = format!("seq:{}", user_id);
+        let current = match self.index_db.get(key.as_bytes())? {
+            Some(data) => {
+                if data.len() >= 4 {
+                    let bytes: [u8; 4] = [data[0], data[1], data[2], data[3]];
+                    u32::from_le_bytes(bytes)
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        let next = current + 1;
+        self.index_db.put(key.as_bytes(), &next.to_le_bytes())?;
+        Ok(next)
+    }
+
+    /// Assign a sequence number to a todo if it doesn't have one
+    pub fn assign_seq_num(&self, todo: &mut Todo) -> Result<()> {
+        if todo.seq_num == 0 {
+            todo.seq_num = self.next_seq_num(&todo.user_id)?;
+        }
+        Ok(())
+    }
+
+    // =========================================================================
     // TODO CRUD OPERATIONS
     // =========================================================================
 
-    /// Store a new todo
+    /// Store a new todo (assigns seq_num if needed)
     pub fn store_todo(&self, todo: &Todo) -> Result<()> {
-        let key = format!("{}:{}", todo.user_id, todo.id.0);
-        let value = serde_json::to_vec(todo).context("Failed to serialize todo")?;
+        // If seq_num is 0, assign one (for new todos)
+        let mut todo_to_store = todo.clone();
+        if todo_to_store.seq_num == 0 {
+            todo_to_store.seq_num = self.next_seq_num(&todo_to_store.user_id)?;
+        }
+
+        let key = format!("{}:{}", todo_to_store.user_id, todo_to_store.id.0);
+        let value = serde_json::to_vec(&todo_to_store).context("Failed to serialize todo")?;
 
         self.todo_db
             .put(key.as_bytes(), &value)
             .context("Failed to store todo")?;
 
-        self.update_todo_indices(todo)?;
+        self.update_todo_indices(&todo_to_store)?;
 
         tracing::debug!(
-            todo_id = %todo.id,
-            user_id = %todo.user_id,
-            status = ?todo.status,
+            todo_id = %todo_to_store.id,
+            seq_num = todo_to_store.seq_num,
+            user_id = %todo_to_store.user_id,
+            status = ?todo_to_store.status,
             "Stored todo"
         );
 
@@ -201,14 +239,28 @@ impl TodoStore {
         let clean_prefix = prefix
             .strip_prefix("SHO-")
             .or_else(|| prefix.strip_prefix("sho-"))
-            .unwrap_or(prefix)
-            .to_lowercase();
+            .unwrap_or(prefix);
 
         let todos = self.list_todos_for_user(user_id, None)?;
 
+        // Check if prefix is a number (e.g., "123" or "SHO-123")
+        if let Ok(seq_num) = clean_prefix.parse::<u32>() {
+            // Exact match on sequential number
+            if let Some(todo) = todos.iter().find(|t| t.seq_num == seq_num) {
+                return Ok(Some(todo.clone()));
+            }
+        }
+
+        // Fall back to UUID prefix matching (for legacy or if seq_num not found)
+        let clean_prefix_lower = clean_prefix.to_lowercase();
         let matches: Vec<_> = todos
             .into_iter()
-            .filter(|t| t.id.0.to_string().to_lowercase().starts_with(&clean_prefix))
+            .filter(|t| {
+                t.id.0
+                    .to_string()
+                    .to_lowercase()
+                    .starts_with(&clean_prefix_lower)
+            })
             .collect();
 
         match matches.len() {
