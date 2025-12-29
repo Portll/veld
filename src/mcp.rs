@@ -42,7 +42,11 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(long, env = "SHODH_API_KEY", default_value = "sk-shodh-dev-local-testing-key")]
+        #[arg(
+            long,
+            env = "SHODH_API_KEY",
+            default_value = "sk-shodh-dev-local-testing-key"
+        )]
         api_key: String,
 
         /// User ID for memory operations
@@ -66,7 +70,11 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(long, env = "SHODH_API_KEY", default_value = "sk-shodh-dev-local-testing-key")]
+        #[arg(
+            long,
+            env = "SHODH_API_KEY",
+            default_value = "sk-shodh-dev-local-testing-key"
+        )]
         api_key: String,
 
         /// User ID for memory operations
@@ -88,7 +96,11 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(long, env = "SHODH_API_KEY", default_value = "sk-shodh-dev-local-testing-key")]
+        #[arg(
+            long,
+            env = "SHODH_API_KEY",
+            default_value = "sk-shodh-dev-local-testing-key"
+        )]
         api_key: String,
 
         /// User ID for memory operations
@@ -304,7 +316,11 @@ fn output_hook(event_name: &str, context: &str) {
 // =============================================================================
 
 fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir: Option<&str>) {
-    let client = BlockingApiClient::new(api_url.to_string(), api_key.to_string(), user_id.to_string());
+    let client = BlockingApiClient::new(
+        api_url.to_string(),
+        api_key.to_string(),
+        user_id.to_string(),
+    );
 
     let dir_name = project_dir
         .and_then(|p| std::path::Path::new(p).file_name())
@@ -387,7 +403,11 @@ fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir
 }
 
 fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message: &str) {
-    let client = BlockingApiClient::new(api_url.to_string(), api_key.to_string(), user_id.to_string());
+    let client = BlockingApiClient::new(
+        api_url.to_string(),
+        api_key.to_string(),
+        user_id.to_string(),
+    );
 
     // Get proactive context based on user message
     let context_result: Result<ProactiveContextResponse> = client.post(
@@ -480,7 +500,9 @@ impl ShodhMcpServer {
         }
     }
 
-    #[tool(description = "Store a memory for future recall. Use this to remember important information, decisions, user preferences, project context, or anything you want to recall later.")]
+    #[tool(
+        description = "Store a memory for future recall. Use this to remember important information, decisions, user preferences, project context, or anything you want to recall later."
+    )]
     async fn remember(
         &self,
         Parameters(params): Parameters<RememberParams>,
@@ -511,7 +533,9 @@ impl ShodhMcpServer {
         }
     }
 
-    #[tool(description = "Search memories using semantic, associative, or hybrid retrieval. Modes: 'semantic' (vector similarity), 'associative' (graph traversal), 'hybrid' (combines both).")]
+    #[tool(
+        description = "Search memories using semantic, associative, or hybrid retrieval. Modes: 'semantic' (vector similarity), 'associative' (graph traversal), 'hybrid' (combines both)."
+    )]
     async fn recall(
         &self,
         Parameters(params): Parameters<RecallParams>,
@@ -551,7 +575,9 @@ impl ShodhMcpServer {
         }
     }
 
-    #[tool(description = "REQUIRED: Call this to surface relevant memories based on current context. Enables automatic memory surfacing and implicit feedback learning.")]
+    #[tool(
+        description = "REQUIRED: Call this to surface relevant memories based on current context. Enables automatic memory surfacing and implicit feedback learning."
+    )]
     async fn proactive_context(
         &self,
         Parameters(params): Parameters<ProactiveContextParams>,
