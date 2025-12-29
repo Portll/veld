@@ -1,6 +1,6 @@
 use crate::types::{
     AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiPriority, TuiProject, TuiTodo,
-    TuiTodoStatus,
+    TuiTodoComment, TuiTodoCommentType, TuiTodoStatus,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -94,6 +94,16 @@ struct TodoListResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+struct CommentApiItem {
+    id: String,
+    author: String,
+    content: String,
+    #[serde(default)]
+    comment_type: String,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct TodoApiItem {
     id: String,
     content: String,
@@ -107,6 +117,14 @@ struct TodoApiItem {
     created_at: String,
     #[serde(default)]
     parent_id: Option<String>,
+    #[serde(default)]
+    seq_num: u32,
+    #[serde(default)]
+    project_prefix: Option<String>,
+    #[serde(default)]
+    comments: Vec<CommentApiItem>,
+    #[serde(default)]
+    notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -117,6 +135,8 @@ struct ProjectApiItem {
     status: String,
     #[serde(default)]
     parent_id: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +275,23 @@ impl MemoryStream {
                         .find(|p| &p.id == pid)
                         .map(|p| p.name.clone())
                 });
+                let comments: Vec<TuiTodoComment> = t
+                    .comments
+                    .into_iter()
+                    .map(|c| TuiTodoComment {
+                        id: c.id,
+                        author: c.author,
+                        content: c.content,
+                        comment_type: match c.comment_type.as_str() {
+                            "progress" => TuiTodoCommentType::Progress,
+                            "resolution" => TuiTodoCommentType::Resolution,
+                            "activity" => TuiTodoCommentType::Activity,
+                            _ => TuiTodoCommentType::Comment,
+                        },
+                        created_at: c.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                    })
+                    .collect();
+
                 TuiTodo {
                     id: t.id,
                     content: t.content,
@@ -267,6 +304,10 @@ impl MemoryStream {
                     blocked_on: t.blocked_on,
                     created_at: t.created_at.parse().unwrap_or_else(|_| Utc::now()),
                     parent_id: t.parent_id,
+                    seq_num: t.seq_num,
+                    project_prefix: t.project_prefix,
+                    comments,
+                    notes: t.notes,
                 }
             })
             .collect();
@@ -282,6 +323,7 @@ impl MemoryStream {
                 todo_count: 0,
                 completed_count: 0,
                 parent_id: p.parent_id,
+                prefix: p.prefix,
             })
             .collect();
 
@@ -345,7 +387,10 @@ impl MemoryStream {
                         state.entity_stats.top_entities.push((tag.clone(), 1));
                     }
                 }
-                state.entity_stats.top_entities.sort_by(|a, b| b.1.cmp(&a.1));
+                state
+                    .entity_stats
+                    .top_entities
+                    .sort_by(|a, b| b.1.cmp(&a.1));
                 state.entity_stats.top_entities.truncate(10);
                 let short_id = if mem.id.len() > 8 {
                     mem.id[..8].to_string()
@@ -504,7 +549,9 @@ impl MemoryStream {
     }
 
     /// Fetch context sessions from Claude Code status line updates
-    async fn fetch_context_sessions(&self) -> Result<Vec<crate::types::ContextSession>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn fetch_context_sessions(
+        &self,
+    ) -> Result<Vec<crate::types::ContextSession>, Box<dyn std::error::Error + Send + Sync>> {
         let resp = self
             .client
             .get(format!("{}/api/context_status", self.base_url))
@@ -533,7 +580,8 @@ impl MemoryStream {
     async fn fetch_todos(
         &self,
         user_id: &str,
-    ) -> Result<(Vec<TuiTodo>, Vec<TuiProject>, TodoStats), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Vec<TuiTodo>, Vec<TuiProject>, TodoStats), Box<dyn std::error::Error + Send + Sync>>
+    {
         let resp = self
             .client
             .post(format!("{}/api/todos/list", self.base_url))
@@ -578,6 +626,23 @@ impl MemoryStream {
                         .find(|p| &p.id == pid)
                         .map(|p| p.name.clone())
                 });
+                let comments: Vec<TuiTodoComment> = t
+                    .comments
+                    .into_iter()
+                    .map(|c| TuiTodoComment {
+                        id: c.id,
+                        author: c.author,
+                        content: c.content,
+                        comment_type: match c.comment_type.as_str() {
+                            "progress" => TuiTodoCommentType::Progress,
+                            "resolution" => TuiTodoCommentType::Resolution,
+                            "activity" => TuiTodoCommentType::Activity,
+                            _ => TuiTodoCommentType::Comment,
+                        },
+                        created_at: c.created_at.parse().unwrap_or_else(|_| Utc::now()),
+                    })
+                    .collect();
+
                 TuiTodo {
                     id: t.id,
                     content: t.content,
@@ -590,6 +655,10 @@ impl MemoryStream {
                     blocked_on: t.blocked_on,
                     created_at: t.created_at.parse().unwrap_or_else(|_| Utc::now()),
                     parent_id: t.parent_id,
+                    seq_num: t.seq_num,
+                    project_prefix: t.project_prefix,
+                    comments,
+                    notes: t.notes,
                 }
             })
             .collect();
@@ -605,6 +674,7 @@ impl MemoryStream {
                 todo_count: 0,
                 completed_count: 0,
                 parent_id: p.parent_id,
+                prefix: p.prefix,
             })
             .collect();
 
@@ -695,8 +765,13 @@ impl MemoryStream {
 
                         // Refetch todos on todo or project events for live updates
                         if is_todo_event || is_project_event {
-                            if let Ok((todos, projects, stats)) =
-                                Self::poll_todos(&self.client, &self.base_url, &self.api_key, &self.user_id).await
+                            if let Ok((todos, projects, stats)) = Self::poll_todos(
+                                &self.client,
+                                &self.base_url,
+                                &self.api_key,
+                                &self.user_id,
+                            )
+                            .await
                             {
                                 let mut state = self.state.lock().await;
                                 state.todos = todos;
@@ -995,7 +1070,10 @@ pub async fn fetch_lineage_trace(
             LineageNode {
                 id: trace_resp.root.clone(),
                 short_id: trace_resp.root.chars().take(8).collect(),
-                content_preview: format!("Root {}", &trace_resp.root[..8.min(trace_resp.root.len())]),
+                content_preview: format!(
+                    "Root {}",
+                    &trace_resp.root[..8.min(trace_resp.root.len())]
+                ),
                 memory_type: "Unknown".to_string(),
             },
         );
@@ -1099,7 +1177,9 @@ pub async fn fetch_lineage_with_details(
     let mut nodes: HashMap<String, LineageNode> = HashMap::new();
     for node_id in &node_ids {
         // Try to get memory info
-        if let Ok(Some(node_info)) = fetch_memory_info(&client, base_url, api_key, user_id, node_id).await {
+        if let Ok(Some(node_info)) =
+            fetch_memory_info(&client, base_url, api_key, user_id, node_id).await
+        {
             nodes.insert(node_id.clone(), node_info);
         } else {
             // Fallback to placeholder

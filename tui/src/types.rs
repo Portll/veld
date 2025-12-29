@@ -440,7 +440,7 @@ pub enum FocusPanel {
     #[default]
     Left,
     Right,
-    Detail,  // Detail panel at bottom (notes/activity)
+    Detail, // Detail panel at bottom (notes/activity)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -856,13 +856,13 @@ pub struct MemoryEvent {
 impl MemoryEvent {
     pub fn event_color(&self) -> Color {
         match self.event_type.as_str() {
-            "CREATE" => Color::Rgb(180, 230, 180),      // Pastel green
-            "RETRIEVE" => Color::Rgb(255, 200, 150),   // Pastel orange
+            "CREATE" => Color::Rgb(180, 230, 180),   // Pastel green
+            "RETRIEVE" => Color::Rgb(255, 200, 150), // Pastel orange
             "DELETE" => Color::Red,
             "UPDATE" => Color::Yellow,
             "GRAPH_UPDATE" => Color::Magenta,
             "CONSOLIDATE" => Color::Rgb(180, 200, 255), // Pastel blue
-            "STRENGTHEN" => Color::Rgb(200, 255, 200), // Light pastel green
+            "STRENGTHEN" => Color::Rgb(200, 255, 200),  // Light pastel green
             "DECAY" => Color::Gray,
             "PROMOTE" => Color::LightYellow,
             "HISTORY" => Color::DarkGray,
@@ -1007,8 +1007,8 @@ impl MemoryOperationType {
 
     pub fn color(&self) -> Color {
         match self {
-            MemoryOperationType::Storing => Color::Rgb(180, 230, 180),      // Pastel green
-            MemoryOperationType::Recalling => Color::Rgb(255, 200, 150),    // Pastel orange
+            MemoryOperationType::Storing => Color::Rgb(180, 230, 180), // Pastel green
+            MemoryOperationType::Recalling => Color::Rgb(255, 200, 150), // Pastel orange
             MemoryOperationType::Consolidating => Color::Rgb(180, 200, 255), // Pastel blue
             MemoryOperationType::Strengthening => Color::Rgb(200, 255, 200), // Light green
             MemoryOperationType::Decaying => Color::Gray,
@@ -1151,18 +1151,17 @@ impl TypeStats {
 
     pub fn as_vec(&self) -> Vec<(&'static str, u32, Color)> {
         vec![
-            ("Context", self.context, Color::Rgb(255, 200, 150)),    // Pastel orange
-            ("Learning", self.learning, Color::Rgb(180, 230, 180)),  // Pastel green
+            ("Context", self.context, Color::Rgb(255, 200, 150)), // Pastel orange
+            ("Learning", self.learning, Color::Rgb(180, 230, 180)), // Pastel green
             ("Decision", self.decision, Color::Yellow),
             ("Discovery", self.discovery, Color::Magenta),
-            ("Task", self.task, Color::Rgb(180, 200, 255)),          // Pastel blue
-            ("Pattern", self.pattern, Color::Rgb(255, 220, 180)),    // Light pastel orange
+            ("Task", self.task, Color::Rgb(180, 200, 255)), // Pastel blue
+            ("Pattern", self.pattern, Color::Rgb(255, 220, 180)), // Light pastel orange
             ("Error", self.error, Color::Red),
             ("Conversation", self.conversation, Color::White),
         ]
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TODO/PROJECT TYPES (GTD System)
@@ -1197,7 +1196,7 @@ impl TuiTodoStatus {
             TuiTodoStatus::Todo => Color::White,
             TuiTodoStatus::InProgress => Color::Rgb(255, 215, 0),
             TuiTodoStatus::Blocked => Color::Red,
-            TuiTodoStatus::Done => Color::Rgb(180, 230, 180),  // Pastel green
+            TuiTodoStatus::Done => Color::Rgb(180, 230, 180), // Pastel green
             TuiTodoStatus::Cancelled => Color::DarkGray,
         }
     }
@@ -1617,8 +1616,8 @@ impl AppState {
             // Trigger connection animation
             self.connection_animation = Some(Animation::new(
                 AnimationType::Flash {
-                    color: Color::Rgb(180, 230, 180),  // Pastel green
-                    duration_ms: 1000, // Longer flash for visibility
+                    color: Color::Rgb(180, 230, 180), // Pastel green
+                    duration_ms: 1000,                // Longer flash for visibility
                 },
                 Easing::EaseOut,
             ));
@@ -1941,9 +1940,14 @@ impl AppState {
                 // Update ribbon: GRAPH UPDATE operation
                 let op = CurrentOperation::new(
                     MemoryOperationType::GraphUpdate,
-                    &format!("{} → {}",
-                        event.from_id.as_deref().unwrap_or("?")[..8.min(event.from_id.as_ref().map(|s| s.len()).unwrap_or(1))].to_string(),
-                        event.to_id.as_deref().unwrap_or("?")[..8.min(event.to_id.as_ref().map(|s| s.len()).unwrap_or(1))].to_string()
+                    &format!(
+                        "{} → {}",
+                        event.from_id.as_deref().unwrap_or("?")
+                            [..8.min(event.from_id.as_ref().map(|s| s.len()).unwrap_or(1))]
+                            .to_string(),
+                        event.to_id.as_deref().unwrap_or("?")
+                            [..8.min(event.to_id.as_ref().map(|s| s.len()).unwrap_or(1))]
+                            .to_string()
                     ),
                     None,
                 );
@@ -2310,15 +2314,23 @@ impl AppState {
     /// Get overdue/due today/blocked counts for attention bar
     pub fn attention_counts(&self) -> (usize, usize, usize) {
         let overdue = self.todos.iter().filter(|t| t.is_overdue()).count();
-        let due_today = self.todos.iter().filter(|t| {
-            if let Some(due) = &t.due_date {
-                let now = chrono::Utc::now();
-                due.date_naive() == now.date_naive() && !t.is_overdue()
-            } else {
-                false
-            }
-        }).count();
-        let blocked = self.todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked).count();
+        let due_today = self
+            .todos
+            .iter()
+            .filter(|t| {
+                if let Some(due) = &t.due_date {
+                    let now = chrono::Utc::now();
+                    due.date_naive() == now.date_naive() && !t.is_overdue()
+                } else {
+                    false
+                }
+            })
+            .count();
+        let blocked = self
+            .todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::Blocked)
+            .count();
         (overdue, due_today, blocked)
     }
 
@@ -2409,11 +2421,22 @@ impl AppState {
     pub fn visible_todos_right_panel(&self) -> Vec<&TuiTodo> {
         // Build visual order list (same order as sidebar: root projects, then sub-projects under each)
         let mut visual_order: Vec<&TuiProject> = Vec::new();
-        let root_projects: Vec<_> = self.projects.iter().filter(|p| p.parent_id.is_none()).collect();
-        let sub_projects: Vec<_> = self.projects.iter().filter(|p| p.parent_id.is_some()).collect();
+        let root_projects: Vec<_> = self
+            .projects
+            .iter()
+            .filter(|p| p.parent_id.is_none())
+            .collect();
+        let sub_projects: Vec<_> = self
+            .projects
+            .iter()
+            .filter(|p| p.parent_id.is_some())
+            .collect();
         for project in root_projects.iter() {
             visual_order.push(project);
-            for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+            for subproject in sub_projects
+                .iter()
+                .filter(|sp| sp.parent_id.as_ref() == Some(&project.id))
+            {
                 visual_order.push(subproject);
             }
         }
@@ -2424,7 +2447,10 @@ impl AppState {
 
             // If this is a parent project, also include todos from sub-projects
             if project.parent_id.is_none() {
-                for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+                for subproject in sub_projects
+                    .iter()
+                    .filter(|sp| sp.parent_id.as_ref() == Some(&project.id))
+                {
                     todos.extend(self.todos_for_project(&subproject.id));
                 }
             }
@@ -2437,41 +2463,71 @@ impl AppState {
         let mut result: Vec<&TuiTodo> = Vec::new();
 
         // In Progress (non-subtasks first, then their subtasks)
-        for todo in all_todos.iter().filter(|t| t.status == TuiTodoStatus::InProgress && t.parent_id.is_none()) {
+        for todo in all_todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::InProgress && t.parent_id.is_none())
+        {
             result.push(todo);
-            for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+            for subtask in all_todos
+                .iter()
+                .filter(|t| t.parent_id.as_ref() == Some(&todo.id))
+            {
                 result.push(subtask);
             }
         }
 
         // Todo (non-subtasks first, then their subtasks)
-        for todo in all_todos.iter().filter(|t| t.status == TuiTodoStatus::Todo && t.parent_id.is_none()) {
+        for todo in all_todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::Todo && t.parent_id.is_none())
+        {
             result.push(todo);
-            for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+            for subtask in all_todos
+                .iter()
+                .filter(|t| t.parent_id.as_ref() == Some(&todo.id))
+            {
                 result.push(subtask);
             }
         }
 
         // Blocked (non-subtasks first, then their subtasks)
-        for todo in all_todos.iter().filter(|t| t.status == TuiTodoStatus::Blocked && t.parent_id.is_none()) {
+        for todo in all_todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::Blocked && t.parent_id.is_none())
+        {
             result.push(todo);
-            for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+            for subtask in all_todos
+                .iter()
+                .filter(|t| t.parent_id.as_ref() == Some(&todo.id))
+            {
                 result.push(subtask);
             }
         }
 
         // Done (non-subtasks first, then their subtasks)
-        for todo in all_todos.iter().filter(|t| t.status == TuiTodoStatus::Done && t.parent_id.is_none()) {
+        for todo in all_todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::Done && t.parent_id.is_none())
+        {
             result.push(todo);
-            for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+            for subtask in all_todos
+                .iter()
+                .filter(|t| t.parent_id.as_ref() == Some(&todo.id))
+            {
                 result.push(subtask);
             }
         }
 
         // Backlog (non-subtasks first, then their subtasks)
-        for todo in all_todos.iter().filter(|t| t.status == TuiTodoStatus::Backlog && t.parent_id.is_none()) {
+        for todo in all_todos
+            .iter()
+            .filter(|t| t.status == TuiTodoStatus::Backlog && t.parent_id.is_none())
+        {
             result.push(todo);
-            for subtask in all_todos.iter().filter(|t| t.parent_id.as_ref() == Some(&todo.id)) {
+            for subtask in all_todos
+                .iter()
+                .filter(|t| t.parent_id.as_ref() == Some(&todo.id))
+            {
                 result.push(subtask);
             }
         }
@@ -2501,7 +2557,8 @@ impl AppState {
 
     /// Get count of todos for Dashboard navigation (all non-done todos)
     pub fn dashboard_todo_count(&self) -> usize {
-        self.todos.iter()
+        self.todos
+            .iter()
             .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
             .count()
     }
@@ -2525,8 +2582,12 @@ impl AppState {
     pub fn get_selected_dashboard_todo(&self) -> Option<&TuiTodo> {
         match self.view_mode {
             ViewMode::Dashboard => {
-                let active_todos: Vec<_> = self.todos.iter()
-                    .filter(|t| t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled)
+                let active_todos: Vec<_> = self
+                    .todos
+                    .iter()
+                    .filter(|t| {
+                        t.status != TuiTodoStatus::Done && t.status != TuiTodoStatus::Cancelled
+                    })
                     .collect();
                 active_todos.get(self.selected_todo).copied()
             }
@@ -2685,13 +2746,13 @@ impl LineageEdge {
     /// Get color for relation type
     pub fn relation_color(&self) -> Color {
         match self.relation.as_str() {
-            "Caused" => Color::Rgb(255, 100, 100),      // Bright red
-            "ResolvedBy" => Color::Rgb(100, 255, 150),  // Bright green
-            "InformedBy" => Color::Rgb(100, 180, 255),  // Bright blue
+            "Caused" => Color::Rgb(255, 100, 100),       // Bright red
+            "ResolvedBy" => Color::Rgb(100, 255, 150),   // Bright green
+            "InformedBy" => Color::Rgb(100, 180, 255),   // Bright blue
             "SupersededBy" => Color::Rgb(180, 180, 180), // Light gray
-            "TriggeredBy" => Color::Rgb(255, 220, 80),  // Bright yellow
+            "TriggeredBy" => Color::Rgb(255, 220, 80),   // Bright yellow
             "BranchedFrom" => Color::Rgb(255, 130, 255), // Bright magenta
-            "RelatedTo" => Color::Rgb(150, 150, 150),   // Medium gray
+            "RelatedTo" => Color::Rgb(150, 150, 150),    // Medium gray
             _ => Color::White,
         }
     }
@@ -2735,15 +2796,15 @@ impl LineageNode {
     /// Get color for memory type
     pub fn type_color(&self) -> Color {
         match self.memory_type.to_lowercase().as_str() {
-            "error" => Color::Rgb(255, 80, 80),       // Bright red
-            "task" => Color::Rgb(100, 180, 255),      // Bright blue
-            "learning" => Color::Rgb(80, 255, 130),   // Bright green
-            "decision" => Color::Rgb(255, 230, 80),   // Bright yellow
-            "discovery" => Color::Rgb(255, 120, 255), // Bright magenta
-            "pattern" => Color::Rgb(255, 180, 80),    // Bright orange
-            "context" => Color::Rgb(255, 160, 100),   // Bright coral
+            "error" => Color::Rgb(255, 80, 80),          // Bright red
+            "task" => Color::Rgb(100, 180, 255),         // Bright blue
+            "learning" => Color::Rgb(80, 255, 130),      // Bright green
+            "decision" => Color::Rgb(255, 230, 80),      // Bright yellow
+            "discovery" => Color::Rgb(255, 120, 255),    // Bright magenta
+            "pattern" => Color::Rgb(255, 180, 80),       // Bright orange
+            "context" => Color::Rgb(255, 160, 100),      // Bright coral
             "conversation" => Color::Rgb(220, 220, 220), // Bright white
-            _ => Color::Rgb(180, 180, 180),           // Light gray
+            _ => Color::Rgb(180, 180, 180),              // Light gray
         }
     }
 }

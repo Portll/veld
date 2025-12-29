@@ -22,7 +22,10 @@ mod types;
 mod widgets;
 
 use logo::{ELEPHANT, ELEPHANT_FRAMES, SHODH_GRADIENT, SHODH_TEXT};
-use stream::{MemoryStream, complete_todo, update_todo_status, update_todo_priority, reorder_todo, next_status, refresh_todos};
+use stream::{
+    complete_todo, next_status, refresh_todos, reorder_todo, update_todo_priority,
+    update_todo_status, MemoryStream,
+};
 use types::{AppState, FocusPanel, SearchMode, ViewMode};
 use widgets::{render_footer, render_header, render_main};
 
@@ -622,16 +625,30 @@ async fn run_statusline() -> Result<()> {
         .unwrap_or(200000);
 
     // Calculate token usage
-    let (current_tokens, percent) = if let Some(usage) = json.pointer("/context_window/current_usage") {
-        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_create = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let total = input_tokens + cache_create + cache_read;
-        let pct = if context_size > 0 { (total * 100 / context_size) as u8 } else { 0 };
-        (total, pct)
-    } else {
-        (0, 0)
-    };
+    let (current_tokens, percent) =
+        if let Some(usage) = json.pointer("/context_window/current_usage") {
+            let input_tokens = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_create = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = input_tokens + cache_create + cache_read;
+            let pct = if context_size > 0 {
+                (total * 100 / context_size) as u8
+            } else {
+                0
+            };
+            (total, pct)
+        } else {
+            (0, 0)
+        };
 
     // POST to shodh-memory backend (fire and forget)
     let client = reqwest::Client::new();
@@ -682,7 +699,10 @@ async fn run_statusline() -> Result<()> {
     };
 
     // Output status line
-    println!("{}{}%{} {}/{} | {} | {}", color, percent, reset, tokens_fmt, size_fmt, model, dir_name);
+    println!(
+        "{}{}%{} {}/{} | {} | {}",
+        color, percent, reset, tokens_fmt, size_fmt, model, dir_name
+    );
     io::stdout().flush()?;
 
     // Give the background POST a moment to complete
@@ -926,7 +946,8 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             g.set_error("Refreshing...".to_string());
                             drop(g);
 
-                            match refresh_todos(&base_url, &api_key, &user_id, &search_state).await {
+                            match refresh_todos(&base_url, &api_key, &user_id, &search_state).await
+                            {
                                 Ok(()) => {
                                     let mut g = search_state.lock().await;
                                     g.clear_error();
@@ -964,12 +985,13 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             // Trace lineage in Projects view
                             if matches!(g.view_mode, ViewMode::Projects) {
                                 // Get memory_id from selected todo
-                                let memory_id: Option<String> = if g.focus_panel == FocusPanel::Right {
-                                    // Get selected todo's ID (use as memory ID for lineage)
-                                    g.get_selected_dashboard_todo().map(|t| t.id.clone())
-                                } else {
-                                    None
-                                };
+                                let memory_id: Option<String> =
+                                    if g.focus_panel == FocusPanel::Right {
+                                        // Get selected todo's ID (use as memory ID for lineage)
+                                        g.get_selected_dashboard_todo().map(|t| t.id.clone())
+                                    } else {
+                                        None
+                                    };
 
                                 if let Some(ref mem_id) = memory_id {
                                     let user_id = g.current_user.clone();
@@ -978,12 +1000,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
 
                                     // Fetch lineage trace
                                     let lineage_result = crate::stream::fetch_lineage_trace(
-                                        &base_url,
-                                        &api_key,
-                                        &user_id,
-                                        &mem_id,
-                                        "backward",
-                                        &state,
+                                        &base_url, &api_key, &user_id, &mem_id, "backward", &state,
                                     )
                                     .await;
 
@@ -1017,10 +1034,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                         drop(g);
 
                                         let confirm_result = crate::stream::confirm_lineage_edge(
-                                            &base_url,
-                                            &api_key,
-                                            &user_id,
-                                            &edge_id,
+                                            &base_url, &api_key, &user_id, &edge_id,
                                         )
                                         .await;
 
@@ -1057,10 +1071,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                         drop(g);
 
                                         let reject_result = crate::stream::reject_lineage_edge(
-                                            &base_url,
-                                            &api_key,
-                                            &user_id,
-                                            &edge_id,
+                                            &base_url, &api_key, &user_id, &edge_id,
                                         )
                                         .await;
 
@@ -1083,13 +1094,17 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         }
                         KeyCode::Char('<') | KeyCode::Char(',') => {
                             // Scroll lineage left in Projects view
-                            if matches!(g.view_mode, ViewMode::Projects) && g.lineage_trace.is_some() {
+                            if matches!(g.view_mode, ViewMode::Projects)
+                                && g.lineage_trace.is_some()
+                            {
                                 g.lineage_scroll_left();
                             }
                         }
                         KeyCode::Char('>') | KeyCode::Char('.') => {
                             // Scroll lineage right in Projects view
-                            if matches!(g.view_mode, ViewMode::Projects) && g.lineage_trace.is_some() {
+                            if matches!(g.view_mode, ViewMode::Projects)
+                                && g.lineage_trace.is_some()
+                            {
                                 g.lineage_scroll_right();
                             }
                         }
@@ -1183,7 +1198,9 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     drop(g);
 
                                     // Call API to complete todo
-                                    match complete_todo(&base_url, &api_key, &user_id, &todo_id).await {
+                                    match complete_todo(&base_url, &api_key, &user_id, &todo_id)
+                                        .await
+                                    {
                                         Ok(()) => {
                                             // SSE will auto-refresh todos
                                         }
@@ -1208,7 +1225,11 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     drop(g);
 
                                     // Call API to update status
-                                    match update_todo_status(&base_url, &api_key, &user_id, &todo_id, new_status).await {
+                                    match update_todo_status(
+                                        &base_url, &api_key, &user_id, &todo_id, new_status,
+                                    )
+                                    .await
+                                    {
                                         Ok(()) => {
                                             // SSE will auto-refresh todos
                                         }
@@ -1227,7 +1248,10 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
                                     drop(g);
-                                    let _ = update_todo_priority(&base_url, &api_key, &user_id, &todo_id, "urgent").await;
+                                    let _ = update_todo_priority(
+                                        &base_url, &api_key, &user_id, &todo_id, "urgent",
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1237,7 +1261,10 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
                                     drop(g);
-                                    let _ = update_todo_priority(&base_url, &api_key, &user_id, &todo_id, "high").await;
+                                    let _ = update_todo_priority(
+                                        &base_url, &api_key, &user_id, &todo_id, "high",
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1247,7 +1274,10 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
                                     drop(g);
-                                    let _ = update_todo_priority(&base_url, &api_key, &user_id, &todo_id, "medium").await;
+                                    let _ = update_todo_priority(
+                                        &base_url, &api_key, &user_id, &todo_id, "medium",
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1257,7 +1287,10 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
                                     drop(g);
-                                    let _ = update_todo_priority(&base_url, &api_key, &user_id, &todo_id, "low").await;
+                                    let _ = update_todo_priority(
+                                        &base_url, &api_key, &user_id, &todo_id, "low",
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1268,7 +1301,9 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
                                     drop(g);
-                                    let _ = reorder_todo(&base_url, &api_key, &user_id, &todo_id, "up").await;
+                                    let _ =
+                                        reorder_todo(&base_url, &api_key, &user_id, &todo_id, "up")
+                                            .await;
                                 }
                             }
                         }
@@ -1278,13 +1313,18 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     let todo_id = todo.id.clone();
                                     let user_id = g.current_user.clone();
                                     drop(g);
-                                    let _ = reorder_todo(&base_url, &api_key, &user_id, &todo_id, "down").await;
+                                    let _ = reorder_todo(
+                                        &base_url, &api_key, &user_id, &todo_id, "down",
+                                    )
+                                    .await;
                                 }
                             }
                         }
                         KeyCode::Tab => {
                             // In Detail panel, Tab toggles between columns
-                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects) && g.focus_panel == FocusPanel::Detail {
+                            if matches!(g.view_mode, ViewMode::Dashboard | ViewMode::Projects)
+                                && g.focus_panel == FocusPanel::Detail
+                            {
                                 g.toggle_detail_column();
                             } else if matches!(g.view_mode, ViewMode::GraphMap) {
                                 g.toggle_graph_map_focus();
@@ -1293,25 +1333,21 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                         }
                         KeyCode::Up | KeyCode::Char('k') => match g.view_mode {
-                            ViewMode::Dashboard => {
-                                match g.focus_panel {
-                                    FocusPanel::Left => g.dashboard_todo_up(),
-                                    FocusPanel::Right => g.select_event_prev(),
-                                    FocusPanel::Detail => g.detail_scroll_up(),
-                                }
-                            }
+                            ViewMode::Dashboard => match g.focus_panel {
+                                FocusPanel::Left => g.dashboard_todo_up(),
+                                FocusPanel::Right => g.select_event_prev(),
+                                FocusPanel::Detail => g.detail_scroll_up(),
+                            },
                             ViewMode::ActivityLogs => g.select_event_prev(),
-                            ViewMode::Projects => {
-                                match g.focus_panel {
-                                    FocusPanel::Left => {
-                                        if g.projects_selected > 0 {
-                                            g.projects_selected -= 1;
-                                        }
+                            ViewMode::Projects => match g.focus_panel {
+                                FocusPanel::Left => {
+                                    if g.projects_selected > 0 {
+                                        g.projects_selected -= 1;
                                     }
-                                    FocusPanel::Right => g.right_panel_up(),
-                                    FocusPanel::Detail => g.detail_scroll_up(),
                                 }
-                            }
+                                FocusPanel::Right => g.right_panel_up(),
+                                FocusPanel::Detail => g.detail_scroll_up(),
+                            },
                             _ => g.scroll_up(),
                         },
                         KeyCode::Down | KeyCode::Char('j') => match g.view_mode {
@@ -1321,13 +1357,18 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     FocusPanel::Right => g.select_event_next(),
                                     FocusPanel::Detail => {
                                         // Calculate max scroll based on selected todo
-                                        let (max_notes, max_activity) = if let Some(todo) = g.get_selected_dashboard_todo() {
-                                            let notes_lines = todo.notes.as_ref().map(|n| n.len() / 40 + 1).unwrap_or(0);
-                                            let activity_count = todo.comments.len();
-                                            (notes_lines, activity_count)
-                                        } else {
-                                            (0, 0)
-                                        };
+                                        let (max_notes, max_activity) =
+                                            if let Some(todo) = g.get_selected_dashboard_todo() {
+                                                let notes_lines = todo
+                                                    .notes
+                                                    .as_ref()
+                                                    .map(|n| n.len() / 40 + 1)
+                                                    .unwrap_or(0);
+                                                let activity_count = todo.comments.len();
+                                                (notes_lines, activity_count)
+                                            } else {
+                                                (0, 0)
+                                            };
                                         g.detail_scroll_down(max_notes, max_activity);
                                     }
                                 }
@@ -1344,13 +1385,18 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     FocusPanel::Right => g.right_panel_down(),
                                     FocusPanel::Detail => {
                                         // Calculate max scroll based on selected todo
-                                        let (max_notes, max_activity) = if let Some(todo) = g.get_selected_dashboard_todo() {
-                                            let notes_lines = todo.notes.as_ref().map(|n| n.len() / 40 + 1).unwrap_or(0);
-                                            let activity_count = todo.comments.len();
-                                            (notes_lines, activity_count)
-                                        } else {
-                                            (0, 0)
-                                        };
+                                        let (max_notes, max_activity) =
+                                            if let Some(todo) = g.get_selected_dashboard_todo() {
+                                                let notes_lines = todo
+                                                    .notes
+                                                    .as_ref()
+                                                    .map(|n| n.len() / 40 + 1)
+                                                    .unwrap_or(0);
+                                                let activity_count = todo.comments.len();
+                                                (notes_lines, activity_count)
+                                            } else {
+                                                (0, 0)
+                                            };
                                         g.detail_scroll_down(max_notes, max_activity);
                                     }
                                 }
@@ -1463,7 +1509,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     g.selected_event = Some(0);
                                 }
                             }
-                        }
+                        },
                         KeyCode::Backspace => g.clear_event_selection(),
                         KeyCode::PageUp => {
                             for _ in 0..5 {
@@ -1476,17 +1522,15 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                         }
                                     }
                                     ViewMode::ActivityLogs => g.select_event_prev(),
-                                    ViewMode::Projects => {
-                                        match g.focus_panel {
-                                            FocusPanel::Left => {
-                                                if g.projects_selected > 0 {
-                                                    g.projects_selected -= 1;
-                                                }
+                                    ViewMode::Projects => match g.focus_panel {
+                                        FocusPanel::Left => {
+                                            if g.projects_selected > 0 {
+                                                g.projects_selected -= 1;
                                             }
-                                            FocusPanel::Right => g.right_panel_up(),
-                                            FocusPanel::Detail => {}
                                         }
-                                    }
+                                        FocusPanel::Right => g.right_panel_up(),
+                                        FocusPanel::Detail => {}
+                                    },
                                     _ => g.scroll_up(),
                                 }
                             }
@@ -1496,8 +1540,14 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 match g.view_mode {
                                     ViewMode::Dashboard => {
                                         if g.focus_panel == FocusPanel::Detail {
-                                            let (max_notes, max_activity) = if let Some(todo) = g.get_selected_dashboard_todo() {
-                                                let notes_lines = todo.notes.as_ref().map(|n| n.len() / 40 + 1).unwrap_or(0);
+                                            let (max_notes, max_activity) = if let Some(todo) =
+                                                g.get_selected_dashboard_todo()
+                                            {
+                                                let notes_lines = todo
+                                                    .notes
+                                                    .as_ref()
+                                                    .map(|n| n.len() / 40 + 1)
+                                                    .unwrap_or(0);
                                                 let activity_count = todo.comments.len();
                                                 (notes_lines, activity_count)
                                             } else {
@@ -1509,18 +1559,16 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                         }
                                     }
                                     ViewMode::ActivityLogs => g.select_event_next(),
-                                    ViewMode::Projects => {
-                                        match g.focus_panel {
-                                            FocusPanel::Left => {
-                                                let total_items = g.left_panel_flat_count();
-                                                if g.projects_selected < total_items.saturating_sub(1) {
-                                                    g.projects_selected += 1;
-                                                }
+                                    ViewMode::Projects => match g.focus_panel {
+                                        FocusPanel::Left => {
+                                            let total_items = g.left_panel_flat_count();
+                                            if g.projects_selected < total_items.saturating_sub(1) {
+                                                g.projects_selected += 1;
                                             }
-                                            FocusPanel::Right => g.right_panel_down(),
-                                            FocusPanel::Detail => {}
                                         }
-                                    }
+                                        FocusPanel::Right => g.right_panel_down(),
+                                        FocusPanel::Detail => {}
+                                    },
                                     _ => g.scroll_down(),
                                 }
                             }
@@ -1533,18 +1581,16 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                         g.selected_event = Some(0);
                                     }
                                 }
-                                ViewMode::Projects => {
-                                    match g.focus_panel {
-                                        FocusPanel::Left => {
-                                            g.projects_selected = 0;
-                                            g.projects_scroll = 0;
-                                        }
-                                        FocusPanel::Right => {
-                                            g.todos_selected = 0;
-                                        }
-                                        FocusPanel::Detail => {}
+                                ViewMode::Projects => match g.focus_panel {
+                                    FocusPanel::Left => {
+                                        g.projects_selected = 0;
+                                        g.projects_scroll = 0;
                                     }
-                                }
+                                    FocusPanel::Right => {
+                                        g.todos_selected = 0;
+                                    }
+                                    FocusPanel::Detail => {}
+                                },
                                 _ => {}
                             }
                         }
@@ -2016,9 +2062,9 @@ fn ui(f: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height), // Header with logo (dynamic for multi-session)
-            Constraint::Length(1),  // Spacer
-            Constraint::Min(10),    // Main content
-            Constraint::Length(3),  // Footer
+            Constraint::Length(1),             // Spacer
+            Constraint::Min(10),               // Main content
+            Constraint::Length(3),             // Footer
         ])
         .split(f.area());
     render_header(f, chunks[0], state);
