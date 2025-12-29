@@ -2521,7 +2521,7 @@ impl AppState {
         }
     }
 
-    /// Get the currently selected todo in Dashboard view
+    /// Get the currently selected todo in Dashboard or Projects view
     pub fn get_selected_dashboard_todo(&self) -> Option<&TuiTodo> {
         match self.view_mode {
             ViewMode::Dashboard => {
@@ -2531,9 +2531,9 @@ impl AppState {
                 active_todos.get(self.selected_todo).copied()
             }
             ViewMode::Projects => {
-                // In Projects view, get todo from right panel or selected project's expanded todo
-                if self.focus_panel == FocusPanel::Right {
-                    // Right panel shows project todos
+                // In Projects view, get todo from right panel (or Detail panel which uses right panel's selection)
+                if self.focus_panel == FocusPanel::Right || self.focus_panel == FocusPanel::Detail {
+                    // Right panel shows project todos - also used when in Detail panel
                     let todos = self.visible_todos_right_panel();
                     todos.get(self.todos_selected).copied()
                 } else {
