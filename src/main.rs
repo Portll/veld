@@ -9049,8 +9049,8 @@ async fn create_todo(
         todo.recurrence = parse_recurrence(recurrence_str);
     }
 
-    // Store the todo
-    state
+    // Store the todo (returns todo with assigned seq_num)
+    let todo = state
         .todo_store
         .store_todo(&todo)
         .map_err(AppError::Internal)?;
@@ -9072,6 +9072,7 @@ async fn create_todo(
     tracing::info!(
         user_id = %req.user_id,
         todo_id = %todo.id,
+        seq_num = todo.seq_num,
         content = %req.content,
         "Created todo"
     );

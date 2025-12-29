@@ -95,8 +95,8 @@ impl TodoStore {
     // TODO CRUD OPERATIONS
     // =========================================================================
 
-    /// Store a new todo (assigns seq_num if needed)
-    pub fn store_todo(&self, todo: &Todo) -> Result<()> {
+    /// Store a new todo (assigns seq_num if needed, returns stored todo)
+    pub fn store_todo(&self, todo: &Todo) -> Result<Todo> {
         // If seq_num is 0, assign one (for new todos)
         let mut todo_to_store = todo.clone();
         if todo_to_store.seq_num == 0 {
@@ -120,7 +120,7 @@ impl TodoStore {
             "Stored todo"
         );
 
-        Ok(())
+        Ok(todo_to_store)
     }
 
     /// Update todo indices
@@ -285,7 +285,7 @@ impl TodoStore {
             self.remove_todo_indices(&old_todo)?;
         }
 
-        self.store_todo(todo)
+        self.store_todo(todo).map(|_| ())
     }
 
     /// Delete a todo
@@ -316,17 +316,16 @@ impl TodoStore {
             todo.complete();
 
             // Store updated todo
-            self.store_todo(&todo)?;
+            let stored_todo = self.store_todo(&todo)?;
 
             // Create next recurrence if applicable
-            let next_todo = if let Some(next) = todo.create_next_recurrence() {
-                self.store_todo(&next)?;
-                Some(next)
+            let next_todo = if let Some(next) = stored_todo.create_next_recurrence() {
+                Some(self.store_todo(&next)?)
             } else {
                 None
             };
 
-            Ok(Some((todo, next_todo)))
+            Ok(Some((stored_todo, next_todo)))
         } else {
             Ok(None)
         }
