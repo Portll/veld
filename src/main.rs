@@ -10831,6 +10831,7 @@ struct FileListResponse {
 struct FileMemorySummary {
     id: String,
     path: String,
+    absolute_path: String,
     file_type: String,
     summary: String,
     key_items: Vec<String>,
@@ -10904,6 +10905,7 @@ async fn list_project_files(
             FileMemorySummary {
                 id: f.id.0.to_string(),
                 path: f.path,
+                absolute_path: f.absolute_path,
                 file_type: format!("{:?}", f.file_type),
                 summary: f.summary,
                 key_items: f.key_items,
@@ -11153,6 +11155,7 @@ async fn search_project_files(
             FileMemorySummary {
                 id: f.id.0.to_string(),
                 path: f.path,
+                absolute_path: f.absolute_path,
                 file_type: format!("{:?}", f.file_type),
                 summary: f.summary,
                 key_items: f.key_items,

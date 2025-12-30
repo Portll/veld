@@ -1224,11 +1224,11 @@ fn render_codebase_input(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(popup, popup_area);
 }
 
-/// Get tree node info for navigation (is_dir, folder_path)
-pub fn get_tree_node_info(files: &[TuiFileMemory], expanded: &std::collections::HashSet<String>) -> Vec<(bool, String)> {
+/// Get tree node info for navigation (is_dir, folder_path, absolute_path)
+pub fn get_tree_node_info(files: &[TuiFileMemory], expanded: &std::collections::HashSet<String>) -> Vec<(bool, String, String)> {
     build_file_tree(files, expanded)
         .into_iter()
-        .map(|node| (node.is_dir, node.folder_path))
+        .map(|node| (node.is_dir, node.folder_path, node.absolute_path))
         .collect()
 }
 
@@ -1301,6 +1301,7 @@ fn build_file_tree(files: &[TuiFileMemory], expanded: &std::collections::HashSet
                 is_dir: true,
                 name: name.to_string(),
                 folder_path: folder_path.clone(),
+                absolute_path: String::new(),
                 size: dir.total_size,
                 file_type: String::new(),
                 depth,
@@ -1336,6 +1337,7 @@ fn build_file_tree(files: &[TuiFileMemory], expanded: &std::collections::HashSet
                 is_dir: false,
                 name: name.clone(),
                 folder_path: file.path.clone(), // Full file path for lookup
+                absolute_path: file.absolute_path.clone(),
                 size: file.size_bytes,
                 file_type: file.file_type.clone(),
                 depth,
@@ -1355,7 +1357,8 @@ struct FileTreeNode {
     display: String,
     is_dir: bool,
     name: String,
-    folder_path: String, // Full path for folders, parent path for files
+    folder_path: String, // Full path for folders, relative path for files
+    absolute_path: String, // Absolute path for files (empty for folders)
     size: u64,
     file_type: String,
     #[allow(dead_code)]

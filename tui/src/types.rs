@@ -1385,6 +1385,8 @@ impl TuiProject {
 pub struct TuiFileMemory {
     pub id: String,
     pub path: String,
+    #[serde(default)]
+    pub absolute_path: String,
     pub file_type: String,
     pub summary: String,
     pub key_items: Vec<String>,

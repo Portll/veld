@@ -945,7 +945,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                     // Handle file popup navigation when visible
                     if g.file_popup_visible {
                         // Build tree to get current nodes for navigation
-                        let tree_nodes: Vec<(bool, String)> = if let Some(pid) = g.selected_project_id() {
+                        let tree_nodes: Vec<(bool, String, String)> = if let Some(pid) = g.selected_project_id() {
                             if let Some(files) = g.project_files.get(&pid) {
                                 crate::widgets::get_tree_node_info(files, &g.expanded_folders)
                             } else {
@@ -980,7 +980,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                                 // Toggle folder if folder, open preview if file
-                                if let Some((is_dir, path)) = tree_nodes.get(g.selected_file) {
+                                if let Some((is_dir, path, absolute_path)) = tree_nodes.get(g.selected_file) {
                                     if *is_dir {
                                         g.toggle_folder(path);
                                     } else {
@@ -993,7 +993,8 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
 
                                         if let Some(file) = file_clone {
                                             // Read file content
-                                            match crate::stream::read_file_content(path, 2000) {
+                                            let file_path = if absolute_path.is_empty() { path } else { absolute_path };
+                                            match crate::stream::read_file_content(file_path, 2000) {
                                                 Ok(content) => {
                                                     g.open_file_preview(&file, content);
                                                 }
@@ -1007,7 +1008,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                             }
                             KeyCode::Left | KeyCode::Char('h') => {
                                 // Collapse folder if selected item is a folder
-                                if let Some((is_dir, folder_path)) = tree_nodes.get(g.selected_file) {
+                                if let Some((is_dir, folder_path, _)) = tree_nodes.get(g.selected_file) {
                                     if *is_dir && g.is_folder_expanded(folder_path) {
                                         g.toggle_folder(folder_path);
                                     }

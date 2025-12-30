@@ -1420,6 +1420,8 @@ pub async fn fetch_project_files(
     struct FileApiItem {
         id: String,
         path: String,
+        #[serde(default)]
+        absolute_path: String,
         file_type: String,
         #[serde(default)]
         summary: String,
@@ -1468,6 +1470,7 @@ pub async fn fetch_project_files(
         .map(|f| TuiFileMemory {
             id: f.id,
             path: f.path,
+            absolute_path: f.absolute_path,
             file_type: f.file_type,
             summary: f.summary,
             key_items: f.key_items,
