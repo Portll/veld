@@ -1932,7 +1932,11 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
                     .await;
                 return;
             }
@@ -1947,7 +1951,11 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                 timestamp: chrono::Utc::now(),
             };
             let _ = sender
-                .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                .send(Message::Text(
+                    serde_json::to_string(&error)
+                        .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                        .into(),
+                ))
                 .await;
             return;
         }
@@ -1967,7 +1975,11 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
                     .await;
                 return;
             }
@@ -1980,7 +1992,11 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
             timestamp: chrono::Utc::now(),
         };
         if sender
-            .send(Message::Text(serde_json::to_string(&ack).unwrap_or_else(|_| r#"{"ack":true}"#.to_string()).into()))
+            .send(Message::Text(
+                serde_json::to_string(&ack)
+                    .unwrap_or_else(|_| r#"{"ack":true}"#.to_string())
+                    .into(),
+            ))
             .await
             .is_err()
         {
@@ -2052,7 +2068,11 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
                     .await;
                 continue;
             }
@@ -2065,7 +2085,8 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
             .await;
 
         // Send result
-        let response = serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string());
+        let response = serde_json::to_string(&result)
+            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string());
         if sender.send(Message::Text(response.into())).await.is_err() {
             break;
         }
@@ -5216,7 +5237,11 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
                     .await;
                 return;
             }
@@ -5231,7 +5256,11 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
                 timestamp: chrono::Utc::now(),
             };
             let _ = sender
-                .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                .send(Message::Text(
+                    serde_json::to_string(&error)
+                        .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                        .into(),
+                ))
                 .await;
             return;
         }
@@ -5247,7 +5276,11 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
             timestamp: chrono::Utc::now(),
         };
         if sender
-            .send(Message::Text(serde_json::to_string(&ack).unwrap_or_else(|_| r#"{"ack":true}"#.to_string()).into()))
+            .send(Message::Text(
+                serde_json::to_string(&ack)
+                    .unwrap_or_else(|_| r#"{"ack":true}"#.to_string())
+                    .into(),
+            ))
             .await
             .is_err()
         {
@@ -5316,7 +5349,11 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
                     .await;
                 continue;
             }
@@ -5382,7 +5419,9 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
         if !matches!(response, relevance::ContextMonitorResponse::None { .. }) {
             if sender
                 .send(Message::Text(
-                    serde_json::to_string(&response).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into(),
+                    serde_json::to_string(&response)
+                        .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                        .into(),
                 ))
                 .await
                 .is_err()
