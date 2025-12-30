@@ -9083,7 +9083,7 @@ async fn create_todo(
     // Set blocked_on
     todo.blocked_on = req.blocked_on;
 
-    // Set parent_id for subtasks
+    // Set parent_id for subtasks and inherit project from parent if not specified
     if let Some(ref parent_str) = req.parent_id {
         if let Some(parent) = state
             .todo_store
@@ -9091,6 +9091,16 @@ async fn create_todo(
             .map_err(AppError::Internal)?
         {
             todo.parent_id = Some(parent.id);
+            // Inherit project_id from parent if not explicitly specified
+            if todo.project_id.is_none() {
+                todo.project_id = parent.project_id;
+                // Also set project_name for the response/memory
+                if let Some(ref proj_id) = todo.project_id {
+                    if let Ok(Some(proj)) = state.todo_store.get_project(&req.user_id, proj_id) {
+                        project_name = Some(proj.name.clone());
+                    }
+                }
+            }
         }
     }
 
