@@ -408,6 +408,29 @@ impl FileMemoryStore {
             }
         };
 
+        // Commonly excluded directory names (checked explicitly for performance and reliability)
+        const EXCLUDED_DIR_NAMES: &[&str] = &[
+            ".git", ".svn", ".hg", ".bzr",           // VCS
+            "node_modules", "__pycache__", ".venv",  // Dependencies
+            "venv", "env", ".env", "virtualenv",     // More Python venvs
+            "site-packages", "Lib", "Scripts",       // Python internals
+            "target", "dist", "build", "out", "bin", // Build outputs
+            ".idea", ".vscode",                      // IDE
+            ".cache", ".tmp", "tmp",                 // Temp
+            "data", "logs", "coverage",              // Runtime data
+            "release-test", "test-wheel",            // Test artifacts
+        ];
+
+        // Directory name patterns to skip (suffix matching)
+        const EXCLUDED_DIR_SUFFIXES: &[&str] = &[
+            "_data",      // Any *_data directories (e.g., shodh_memory_data)
+            "_cache",     // Any *_cache directories
+            "_output",    // Any *_output directories
+            "_venv",      // Any *_venv directories
+            "_env",       // Any *_env directories
+            "_install",   // Any *_install directories (test installs)
+        ];
+
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
@@ -415,16 +438,44 @@ impl FileMemoryStore {
             };
 
             let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            // Quick check: skip commonly excluded directories by name
+            if path.is_dir() {
+                // Exact match exclusion
+                if EXCLUDED_DIR_NAMES.iter().any(|&name| file_name_str == name) {
+                    *result.skip_reasons.entry(format!("{}/", file_name_str)).or_insert(0) += 1;
+                    result.skipped_files += 1;
+                    continue;
+                }
+                // Suffix pattern exclusion (e.g., *_data, *_cache)
+                if EXCLUDED_DIR_SUFFIXES.iter().any(|&suffix| file_name_str.ends_with(suffix)) {
+                    *result.skip_reasons.entry(format!("*{}/", file_name_str.rsplit_once('_').map_or(&file_name_str[..], |(_, s)| s))).or_insert(0) += 1;
+                    result.skipped_files += 1;
+                    continue;
+                }
+            }
+
             let relative_path = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            // Check exclude patterns
+            // Check exclude patterns (for custom patterns and file patterns like *.lock)
             let mut excluded = false;
             for pattern in exclude_patterns {
-                if pattern.matches(&relative_path) || pattern.matches_path(&path) {
+                // For directory patterns (ending with /), check if relative path starts with it
+                let pattern_str = pattern.as_str();
+                if pattern_str.ends_with('/') {
+                    let dir_name = pattern_str.trim_end_matches('/');
+                    if relative_path == dir_name || relative_path.starts_with(&format!("{}/", dir_name)) {
+                        *result.skip_reasons.entry(pattern.to_string()).or_insert(0) += 1;
+                        excluded = true;
+                        break;
+                    }
+                } else if pattern.matches(&relative_path) || pattern.matches(&file_name_str) {
                     *result.skip_reasons.entry(pattern.to_string()).or_insert(0) += 1;
                     excluded = true;
                     break;

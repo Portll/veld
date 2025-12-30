@@ -10838,6 +10838,8 @@ struct FileMemorySummary {
     access_count: u32,
     last_accessed: String,
     heat_score: u8,
+    size_bytes: u64,
+    line_count: usize,
 }
 
 /// Response for scan operation
@@ -10909,6 +10911,8 @@ async fn list_project_files(
                 access_count: f.access_count,
                 last_accessed: f.last_accessed.to_rfc3339(),
                 heat_score,
+                size_bytes: f.size_bytes,
+                line_count: f.line_count,
             }
         })
         .collect();
@@ -11152,6 +11156,8 @@ async fn search_project_files(
                 access_count: f.access_count,
                 last_accessed: f.last_accessed.to_rfc3339(),
                 heat_score,
+                size_bytes: f.size_bytes,
+                line_count: f.line_count,
             }
         })
         .collect();

@@ -1391,6 +1391,10 @@ pub struct TuiFileMemory {
     pub access_count: u32,
     pub last_accessed: String,
     pub heat_score: u8,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub line_count: usize,
 }
 
 impl TuiFileMemory {
@@ -1415,6 +1419,18 @@ impl TuiFileMemory {
             3 => "🔥",
             2 => "🌡️",
             _ => "",
+        }
+    }
+
+    /// Format file size in human readable format
+    pub fn format_size(&self) -> String {
+        let bytes = self.size_bytes;
+        if bytes < 1024 {
+            format!("{} B", bytes)
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
         }
     }
 
@@ -1589,6 +1605,22 @@ pub struct AppState {
     pub file_popup_visible: bool,
     /// File popup scroll offset
     pub file_popup_scroll: usize,
+    /// Expanded folders in file tree (folder paths)
+    pub expanded_folders: std::collections::HashSet<String>,
+    /// File preview visible
+    pub file_preview_visible: bool,
+    /// File preview content (lines)
+    pub file_preview_content: Vec<String>,
+    /// File preview path
+    pub file_preview_path: String,
+    /// File preview scroll offset
+    pub file_preview_scroll: usize,
+    /// File preview key items
+    pub file_preview_key_items: Vec<String>,
+    /// File preview line count
+    pub file_preview_line_count: usize,
+    /// File preview file type
+    pub file_preview_file_type: String,
     /// Codebase path input active
     pub codebase_input_active: bool,
     /// Codebase path being entered
@@ -1699,6 +1731,14 @@ impl AppState {
             scanning_project: None,
             file_popup_visible: false,
             file_popup_scroll: 0,
+            expanded_folders: std::collections::HashSet::new(),
+            file_preview_visible: false,
+            file_preview_content: Vec::new(),
+            file_preview_path: String::new(),
+            file_preview_scroll: 0,
+            file_preview_key_items: Vec::new(),
+            file_preview_line_count: 0,
+            file_preview_file_type: String::new(),
             codebase_input_active: false,
             codebase_input_path: String::new(),
             codebase_input_project_id: None,
@@ -2463,6 +2503,52 @@ impl AppState {
         self.file_popup_visible = !self.file_popup_visible;
         if self.file_popup_visible {
             self.file_popup_scroll = 0;
+        }
+    }
+
+    /// Toggle folder expansion in file tree
+    pub fn toggle_folder(&mut self, folder_path: &str) {
+        if self.expanded_folders.contains(folder_path) {
+            self.expanded_folders.remove(folder_path);
+        } else {
+            self.expanded_folders.insert(folder_path.to_string());
+        }
+    }
+
+    /// Check if folder is expanded
+    pub fn is_folder_expanded(&self, folder_path: &str) -> bool {
+        self.expanded_folders.contains(folder_path)
+    }
+
+    /// Open file preview with content from TuiFileMemory
+    pub fn open_file_preview(&mut self, file: &TuiFileMemory, content: Vec<String>) {
+        self.file_preview_visible = true;
+        self.file_preview_path = file.path.clone();
+        self.file_preview_content = content;
+        self.file_preview_scroll = 0;
+        self.file_preview_key_items = file.key_items.clone();
+        self.file_preview_line_count = file.line_count;
+        self.file_preview_file_type = file.file_type.clone();
+    }
+
+    /// Close file preview
+    pub fn close_file_preview(&mut self) {
+        self.file_preview_visible = false;
+        self.file_preview_content.clear();
+    }
+
+    /// Scroll file preview up
+    pub fn file_preview_scroll_up(&mut self) {
+        if self.file_preview_scroll > 0 {
+            self.file_preview_scroll -= 1;
+        }
+    }
+
+    /// Scroll file preview down
+    pub fn file_preview_scroll_down(&mut self, visible_lines: usize) {
+        let max_scroll = self.file_preview_content.len().saturating_sub(visible_lines);
+        if self.file_preview_scroll < max_scroll {
+            self.file_preview_scroll += 1;
         }
     }
 

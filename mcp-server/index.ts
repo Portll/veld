@@ -1609,19 +1609,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           memory_types: Record<string, number>;
           total_importance: number;
           avg_importance: number;
+          average_importance: number; // API uses this name
           graph_nodes: number;
           graph_edges: number;
           indexed_vectors: number;
+          vector_index_count: number; // API uses this name
         }
 
         const result = await apiCall<MemoryStats>(`/api/users/${USER_ID}/stats`, "GET");
+
+        // Handle both old and new field names for compatibility
+        const indexedCount = result.vector_index_count ?? result.indexed_vectors ?? 0;
+        const avgImportance = result.average_importance ?? result.avg_importance ?? 0;
 
         let response = `🐘 Memory Statistics\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Total Memories: ${result.total_memories || 0}\n`;
         response += `Graph: ${result.graph_nodes || 0} nodes │ ${result.graph_edges || 0} edges\n`;
-        response += `Indexed Vectors: ${result.indexed_vectors || 0}\n`;
-        response += `Avg Importance: ${(result.avg_importance || 0).toFixed(2)}\n`;
+        response += `Indexed Vectors: ${indexedCount}\n`;
+        response += `Avg Importance: ${avgImportance.toFixed(2)}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
         if (result.memory_types && Object.keys(result.memory_types).length > 0) {

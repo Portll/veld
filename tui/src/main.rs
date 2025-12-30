@@ -908,24 +908,108 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         continue;
                     }
 
+                    // Handle file preview navigation when visible
+                    if g.file_preview_visible {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+                                g.close_file_preview();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                g.file_preview_scroll_up();
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                // Estimate visible lines (~30 for typical terminal)
+                                g.file_preview_scroll_down(30);
+                            }
+                            KeyCode::PageUp => {
+                                for _ in 0..10 {
+                                    g.file_preview_scroll_up();
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                for _ in 0..10 {
+                                    g.file_preview_scroll_down(30);
+                                }
+                            }
+                            KeyCode::Home => {
+                                g.file_preview_scroll = 0;
+                            }
+                            KeyCode::End => {
+                                g.file_preview_scroll = g.file_preview_content.len().saturating_sub(30);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Handle file popup navigation when visible
                     if g.file_popup_visible {
+                        // Build tree to get current nodes for navigation
+                        let tree_nodes: Vec<(bool, String)> = if let Some(pid) = g.selected_project_id() {
+                            if let Some(files) = g.project_files.get(&pid) {
+                                crate::widgets::get_tree_node_info(files, &g.expanded_folders)
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        };
+                        let tree_len = tree_nodes.len();
+
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('f') => {
                                 g.file_popup_visible = false;
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
-                                if g.file_popup_scroll > 0 {
-                                    g.file_popup_scroll -= 1;
+                                if g.selected_file > 0 {
+                                    g.selected_file -= 1;
+                                    // Adjust scroll if needed
+                                    if g.selected_file < g.file_popup_scroll {
+                                        g.file_popup_scroll = g.selected_file;
+                                    }
                                 }
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                if let Some(pid) = g.selected_project_id() {
-                                    if let Some(files) = g.project_files.get(&pid) {
-                                        let max_scroll = files.len().saturating_sub(10);
-                                        if g.file_popup_scroll < max_scroll {
-                                            g.file_popup_scroll += 1;
+                                if g.selected_file + 1 < tree_len {
+                                    g.selected_file += 1;
+                                    // Adjust scroll if needed (assuming ~20 visible lines)
+                                    if g.selected_file >= g.file_popup_scroll + 20 {
+                                        g.file_popup_scroll = g.selected_file.saturating_sub(19);
+                                    }
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                                // Toggle folder if folder, open preview if file
+                                if let Some((is_dir, path)) = tree_nodes.get(g.selected_file) {
+                                    if *is_dir {
+                                        g.toggle_folder(path);
+                                    } else {
+                                        // Find file info and open preview
+                                        // Clone the file data to avoid borrow conflict
+                                        let file_clone = g.selected_project_id()
+                                            .and_then(|pid| g.project_files.get(&pid))
+                                            .and_then(|files| files.iter().find(|f| f.path == *path))
+                                            .cloned();
+
+                                        if let Some(file) = file_clone {
+                                            // Read file content
+                                            match crate::stream::read_file_content(path, 2000) {
+                                                Ok(content) => {
+                                                    g.open_file_preview(&file, content);
+                                                }
+                                                Err(e) => {
+                                                    g.set_error(format!("Cannot read: {}", e));
+                                                }
+                                            }
                                         }
+                                    }
+                                }
+                            }
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                // Collapse folder if selected item is a folder
+                                if let Some((is_dir, folder_path)) = tree_nodes.get(g.selected_file) {
+                                    if *is_dir && g.is_folder_expanded(folder_path) {
+                                        g.toggle_folder(folder_path);
                                     }
                                 }
                             }
@@ -944,7 +1028,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 g.codebase_input_project_id = None;
                             }
                             KeyCode::Enter => {
-                                // Start scanning with entered path
+                                // Start scanning with entered path (spawn as background task)
                                 if let Some(pid) = g.codebase_input_project_id.take() {
                                     let root_path = g.codebase_input_path.clone();
                                     let user_id = g.current_user.clone();
@@ -952,48 +1036,56 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                     g.codebase_input_path.clear();
                                     g.start_scanning(&pid);
                                     g.set_error(format!("Scanning: {}...", root_path));
-                                    drop(g);
+                                    drop(g); // Release lock before spawning
 
-                                    // Scan
-                                    let scan_result = crate::stream::scan_project_codebase(
-                                        &base_url, &api_key, &user_id, &pid, &root_path,
-                                    )
-                                    .await;
+                                    // Spawn background task so UI can continue updating
+                                    let scan_state = Arc::clone(&state);
+                                    let scan_base_url = base_url.clone();
+                                    let scan_api_key = api_key.clone();
+                                    let scan_pid = pid.clone();
+                                    let scan_root = root_path.clone();
+                                    tokio::spawn(async move {
+                                        // Scan
+                                        let scan_result = crate::stream::scan_project_codebase(
+                                            &scan_base_url, &scan_api_key, &user_id, &scan_pid, &scan_root,
+                                        )
+                                        .await;
 
-                                    let mut g = state.lock().await;
-                                    match scan_result {
-                                        Ok(count) => {
-                                            g.set_error(format!("Scanned {} files, indexing...", count));
-                                            drop(g);
+                                        let mut g = scan_state.lock().await;
+                                        match scan_result {
+                                            Ok(count) => {
+                                                g.set_error(format!("Scanned {} files, indexing...", count));
+                                                drop(g);
 
-                                            // Index
-                                            let index_result = crate::stream::index_project_codebase(
-                                                &base_url, &api_key, &user_id, &pid, &root_path,
-                                            )
-                                            .await;
+                                                // Index
+                                                let index_result = crate::stream::index_project_codebase(
+                                                    &scan_base_url, &scan_api_key, &user_id, &scan_pid, &scan_root,
+                                                )
+                                                .await;
 
-                                            let mut g = state.lock().await;
-                                            g.stop_scanning();
-                                            match index_result {
-                                                Ok(indexed) => {
-                                                    g.set_error(format!(
-                                                        "✓ Indexed {} files. Press f to view.",
-                                                        indexed
-                                                    ));
-                                                    g.mark_project_indexed(&pid);
-                                                    g.project_files.remove(&pid);
-                                                    g.files_expanded_projects.insert(pid.clone());
-                                                }
-                                                Err(e) => {
-                                                    g.set_error(format!("Index failed: {}", e));
+                                                let mut g = scan_state.lock().await;
+                                                g.stop_scanning();
+                                                match index_result {
+                                                    Ok(indexed) => {
+                                                        g.set_error(format!(
+                                                            "✓ Indexed {} files. Press f to view.",
+                                                            indexed
+                                                        ));
+                                                        g.mark_project_indexed(&scan_pid);
+                                                        g.project_files.remove(&scan_pid);
+                                                        g.files_expanded_projects.insert(scan_pid.clone());
+                                                    }
+                                                    Err(e) => {
+                                                        g.set_error(format!("Index failed: {}", e));
+                                                    }
                                                 }
                                             }
+                                            Err(e) => {
+                                                g.stop_scanning();
+                                                g.set_error(format!("Scan failed: {}", e));
+                                            }
                                         }
-                                        Err(e) => {
-                                            g.stop_scanning();
-                                            g.set_error(format!("Scan failed: {}", e));
-                                        }
-                                    }
+                                    });
                                 }
                             }
                             KeyCode::Backspace => {

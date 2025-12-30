@@ -1431,11 +1431,15 @@ pub async fn fetch_project_files(
         last_accessed: String,
         #[serde(default)]
         heat_score: u8,
+        #[serde(default)]
+        size_bytes: u64,
+        #[serde(default)]
+        line_count: usize,
     }
 
     let request = FilesRequest {
         user_id: user_id.to_string(),
-        limit: Some(50), // Limit to 50 files for TUI display
+        limit: Some(1000), // Increased limit for tree view
     };
 
     let response = client
@@ -1470,6 +1474,8 @@ pub async fn fetch_project_files(
             access_count: f.access_count,
             last_accessed: f.last_accessed,
             heat_score: f.heat_score,
+            size_bytes: f.size_bytes,
+            line_count: f.line_count,
         })
         .collect())
 }
@@ -1580,4 +1586,30 @@ pub async fn index_project_codebase(
         .map_err(|e| format!("Parse error: {}", e))?;
 
     Ok(resp.files_indexed)
+}
+
+/// Read file content from disk for preview
+/// Returns lines with a reasonable limit to avoid memory issues
+pub fn read_file_content(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path).map_err(|e| format!("Cannot open file: {}", e))?;
+    let reader = BufReader::new(file);
+
+    let lines: Vec<String> = reader
+        .lines()
+        .take(max_lines)
+        .filter_map(|l| l.ok())
+        .map(|l| {
+            // Truncate very long lines for display
+            if l.len() > 200 {
+                format!("{}...", &l[..197])
+            } else {
+                l
+            }
+        })
+        .collect();
+
+    Ok(lines)
 }

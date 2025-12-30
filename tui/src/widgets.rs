@@ -1155,6 +1155,11 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
         render_file_popup(f, area, state);
     }
 
+    // Render file preview if visible (on top of file popup)
+    if state.file_preview_visible {
+        render_file_preview(f, area, state);
+    }
+
     // Render codebase path input if active
     if state.codebase_input_active {
         render_codebase_input(f, area, state);
@@ -1163,8 +1168,9 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
 
 /// Render codebase path input popup
 fn render_codebase_input(f: &mut Frame, area: Rect, state: &AppState) {
-    let popup_width = area.width.min(80);
-    let popup_height = 5;
+    // Use 90% of screen width
+    let popup_width = ((area.width as f32) * 0.9) as u16;
+    let popup_height = 7;
     let popup_x = (area.width - popup_width) / 2;
     let popup_y = (area.height - popup_height) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
@@ -1172,26 +1178,40 @@ fn render_codebase_input(f: &mut Frame, area: Rect, state: &AppState) {
     // Clear background
     f.render_widget(Clear, popup_area);
 
+    // Calculate visible path width (popup width minus borders and prefix)
+    let visible_width = popup_width.saturating_sub(8) as usize;
+    let path = &state.codebase_input_path;
+
+    // Show end of path if too long (so user sees what they're typing)
+    let display_path = if path.len() > visible_width {
+        format!("...{}", &path[path.len() - visible_width + 3..])
+    } else {
+        path.clone()
+    };
+
     let lines = vec![
         Line::from(Span::styled(
             " 📂 Enter codebase directory path: ",
             Style::default().fg(SAFFRON).add_modifier(Modifier::BOLD),
         )),
+        Line::from(Span::styled(
+            "    (edit path or press Enter to use default)",
+            Style::default().fg(TEXT_DISABLED),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled(" > ", Style::default().fg(TEXT_SECONDARY)),
-            Span::styled(
-                state.codebase_input_path.clone(),
-                Style::default().fg(TEXT_PRIMARY),
-            ),
+            Span::styled(display_path, Style::default().fg(TEXT_PRIMARY)),
             Span::styled("█", Style::default().fg(SAFFRON)), // Cursor
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Enter", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Enter", Style::default().fg(SAFFRON).add_modifier(Modifier::BOLD)),
             Span::styled("=scan  ", Style::default().fg(TEXT_DISABLED)),
             Span::styled("Esc", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
-            Span::styled("=cancel", Style::default().fg(TEXT_DISABLED)),
+            Span::styled("=cancel  ", Style::default().fg(TEXT_DISABLED)),
+            Span::styled("Backspace", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+            Span::styled("=delete", Style::default().fg(TEXT_DISABLED)),
         ]),
     ];
 
@@ -1204,19 +1224,183 @@ fn render_codebase_input(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(popup, popup_area);
 }
 
-/// Render file explorer popup (centered overlay)
+/// Get tree node info for navigation (is_dir, folder_path)
+pub fn get_tree_node_info(files: &[TuiFileMemory], expanded: &std::collections::HashSet<String>) -> Vec<(bool, String)> {
+    build_file_tree(files, expanded)
+        .into_iter()
+        .map(|node| (node.is_dir, node.folder_path))
+        .collect()
+}
+
+/// Build tree structure from flat file list with collapse/expand support
+fn build_file_tree(files: &[TuiFileMemory], expanded: &std::collections::HashSet<String>) -> Vec<FileTreeNode> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct DirEntry {
+        files: Vec<(String, TuiFileMemory)>, // (filename, file)
+        dirs: BTreeMap<String, DirEntry>,
+        total_size: u64,
+    }
+
+    // Build directory tree
+    let mut root = DirEntry::default();
+    for file in files {
+        let parts: Vec<&str> = file.path.split(['/', '\\']).collect();
+        let mut current = &mut root;
+
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                // It's a file
+                current.files.push((part.to_string(), file.clone()));
+                current.total_size += file.size_bytes;
+            } else {
+                // It's a directory
+                current.total_size += file.size_bytes;
+                current = current.dirs.entry(part.to_string()).or_default();
+            }
+        }
+    }
+
+    // Flatten to tree nodes with proper indentation
+    fn flatten(
+        entry: &DirEntry,
+        current_path: &str,
+        is_last_stack: &[bool],
+        depth: usize,
+        expanded: &std::collections::HashSet<String>,
+        nodes: &mut Vec<FileTreeNode>,
+    ) {
+        let dirs: Vec<_> = entry.dirs.iter().collect();
+        let total_items = dirs.len() + entry.files.len();
+        let mut item_idx = 0;
+
+        // Directories first
+        for (name, dir) in &dirs {
+            let is_last = item_idx == total_items - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+
+            // Build prefix from stack
+            let mut line_prefix = String::new();
+            for &was_last in is_last_stack.iter() {
+                line_prefix.push_str(if was_last { "    " } else { "│   " });
+            }
+
+            // Full path for this folder
+            let folder_path = if current_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", current_path, name)
+            };
+
+            let is_expanded = expanded.contains(&folder_path);
+            let folder_icon = if is_expanded { "▼ 📁" } else { "▶ 📁" };
+
+            nodes.push(FileTreeNode {
+                display: format!("{}{}{} {}/", line_prefix, connector, folder_icon, name),
+                is_dir: true,
+                name: name.to_string(),
+                folder_path: folder_path.clone(),
+                size: dir.total_size,
+                file_type: String::new(),
+                depth,
+            });
+
+            // Only recurse if expanded
+            if is_expanded {
+                let mut new_stack = is_last_stack.to_vec();
+                new_stack.push(is_last);
+                flatten(dir, &folder_path, &new_stack, depth + 1, expanded, nodes);
+            }
+
+            item_idx += 1;
+        }
+
+        // Then files (sorted by name)
+        let mut sorted_files: Vec<_> = entry.files.iter().collect();
+        sorted_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, file) in sorted_files {
+            let is_last = item_idx == total_items - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+
+            let mut line_prefix = String::new();
+            for &was_last in is_last_stack.iter() {
+                line_prefix.push_str(if was_last { "    " } else { "│   " });
+            }
+
+            // For files, folder_path is the FULL file path (used for lookup)
+            // Use the original path from the file struct to ensure exact match
+            nodes.push(FileTreeNode {
+                display: format!("{}{}   {} {}", line_prefix, connector, file.type_icon(), name),
+                is_dir: false,
+                name: name.clone(),
+                folder_path: file.path.clone(), // Full file path for lookup
+                size: file.size_bytes,
+                file_type: file.file_type.clone(),
+                depth,
+            });
+
+            item_idx += 1;
+        }
+    }
+
+    let mut nodes = Vec::new();
+    flatten(&root, "", &[], 0, expanded, &mut nodes);
+    nodes
+}
+
+/// A node in the file tree display
+struct FileTreeNode {
+    display: String,
+    is_dir: bool,
+    name: String,
+    folder_path: String, // Full path for folders, parent path for files
+    size: u64,
+    file_type: String,
+    #[allow(dead_code)]
+    depth: usize,
+}
+
+impl FileTreeNode {
+    fn format_size(&self) -> String {
+        let bytes = self.size;
+        if bytes == 0 {
+            String::new()
+        } else if bytes < 1024 {
+            format!("{} B", bytes)
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    }
+
+    fn type_color(&self) -> Color {
+        match self.file_type.to_lowercase().as_str() {
+            "rust" => Color::Rgb(220, 160, 120),
+            "typescript" | "javascript" => Color::Rgb(100, 180, 220),
+            "python" => Color::Rgb(160, 200, 100),
+            "go" => Color::Rgb(100, 200, 220),
+            "markdown" => Color::Rgb(180, 180, 220),
+            "json" | "yaml" | "toml" => Color::Rgb(200, 180, 140),
+            _ => TEXT_SECONDARY,
+        }
+    }
+}
+
+/// Render file explorer popup (centered overlay) - broot/nnn style tree view
 fn render_file_popup(f: &mut Frame, area: Rect, state: &AppState) {
-    // Create centered popup area (70% width, 80% height)
-    let popup_width = (area.width as f32 * 0.7) as u16;
-    let popup_height = (area.height as f32 * 0.8) as u16;
+    // Create centered popup area (85% width, 85% height)
+    let popup_width = (area.width as f32 * 0.85) as u16;
+    let popup_height = (area.height as f32 * 0.85) as u16;
     let popup_x = (area.width - popup_width) / 2;
     let popup_y = (area.height - popup_height) / 2;
 
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-    // Clear background with dark overlay
-    let overlay = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 15)));
-    f.render_widget(overlay, popup_area);
+    // Clear background
+    f.render_widget(Clear, popup_area);
 
     // Get project name and files
     let project_name = state
@@ -1229,163 +1413,253 @@ fn render_file_popup(f: &mut Frame, area: Rect, state: &AppState) {
         .selected_project_id()
         .and_then(|pid| state.get_project_files(&pid));
 
-    // Build popup content
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" 📁 {} - Codebase Files ", project_name),
-            Style::default()
-                .fg(SAFFRON)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from("─".repeat(popup_width as usize - 2)));
+    // Calculate content width for size alignment
+    let content_width = popup_width.saturating_sub(4) as usize;
 
     if let Some(files) = files {
         if files.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  No files indexed. Press S to scan codebase.",
+                " No files indexed. Press S to scan codebase.",
                 Style::default().fg(TEXT_DISABLED),
             )));
         } else {
-            // File stats
-            let total = files.len();
-            let hot_count = files.iter().filter(|f| f.heat_score >= 2).count();
+            // Build tree structure with collapse/expand
+            let tree_nodes = build_file_tree(files, &state.expanded_folders);
+
+            // Stats
+            let total_size: u64 = files.iter().map(|f| f.size_bytes).sum();
+            let total_size_str = if total_size < 1024 * 1024 {
+                format!("{:.1} KB", total_size as f64 / 1024.0)
+            } else {
+                format!("{:.1} MB", total_size as f64 / (1024.0 * 1024.0))
+            };
+
             lines.push(Line::from(vec![
+                Span::styled(" ", Style::default()),
                 Span::styled(
-                    format!("  {} files", total),
+                    format!("{} files", files.len()),
                     Style::default().fg(TEXT_SECONDARY),
                 ),
                 Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
-                Span::styled(
-                    format!("🔥 {} hot", hot_count),
-                    Style::default().fg(Color::Rgb(255, 140, 50)),
-                ),
+                Span::styled(total_size_str, Style::default().fg(SAFFRON)),
+                Span::styled(" total", Style::default().fg(TEXT_DISABLED)),
             ]));
             lines.push(Line::from(""));
 
-            // Column headers
-            lines.push(Line::from(vec![
-                Span::styled("     ", Style::default().fg(TEXT_DISABLED)),
-                Span::styled(
-                    format!("{:<52}", "File Path"),
-                    Style::default().fg(TEXT_DISABLED),
-                ),
-                Span::styled("   ", Style::default().fg(TEXT_DISABLED)),
-                Span::styled("Functions/Classes", Style::default().fg(TEXT_DISABLED)),
-            ]));
-            lines.push(Line::from(Span::styled(
-                "─".repeat(popup_width as usize - 2),
-                Style::default().fg(Color::Rgb(40, 40, 40)),
-            )));
-
-            // File list with scroll
-            let visible_height = popup_height.saturating_sub(10) as usize;
+            // Tree view with scroll
+            let visible_height = popup_height.saturating_sub(8) as usize;
             let scroll = state.file_popup_scroll;
-            for (i, file) in files.iter().skip(scroll).take(visible_height).enumerate() {
-                let is_selected = i == state.selected_file.saturating_sub(scroll);
+
+            for (i, node) in tree_nodes.iter().skip(scroll).take(visible_height).enumerate() {
+                let absolute_idx = scroll + i;
+                let is_selected = absolute_idx == state.selected_file;
                 let bg = if is_selected {
-                    SELECTION_BG
+                    Color::Rgb(45, 45, 55)
                 } else {
                     Color::Reset
                 };
 
-                let icon = file.type_icon();
-                let heat = file.heat_indicator();
-                // Show full relative path, truncated to fit
-                let path = truncate(&file.path, 50);
-                // Show key items if no summary, otherwise show summary
-                let info = if !file.key_items.is_empty() {
-                    truncate(&file.key_items.join(", "), 25)
-                } else if !file.summary.is_empty() {
-                    truncate(&file.summary, 25)
-                } else {
-                    String::new()
-                };
+                let size_str = node.format_size();
+                let display_len = node.display.chars().count();
+                let padding = content_width.saturating_sub(display_len + size_str.len() + 4);
 
-                // Type color
-                let type_color = match file.file_type.to_lowercase().as_str() {
-                    "rust" => Color::Rgb(220, 160, 120),
-                    "typescript" | "javascript" => Color::Rgb(100, 180, 220),
-                    "python" => Color::Rgb(160, 200, 100),
-                    "go" => Color::Rgb(100, 200, 220),
-                    _ => TEXT_SECONDARY,
-                };
-
-                lines.push(Line::from(vec![
+                // Selection indicator
+                let selector = if is_selected { "▸ " } else { "  " };
+                let mut spans = vec![
                     Span::styled(
-                        if is_selected { " ▸" } else { "  " },
+                        selector,
                         Style::default().fg(SAFFRON).bg(bg),
                     ),
-                    Span::styled(format!("{} ", icon), Style::default().fg(type_color).bg(bg)),
-                    Span::styled(
-                        format!("{:<52}", path),
-                        Style::default().fg(TEXT_PRIMARY).bg(bg),
-                    ),
-                    Span::styled(
-                        format!("{:<3}", heat),
-                        Style::default().fg(Color::Rgb(255, 140, 50)).bg(bg),
-                    ),
-                    Span::styled(info, Style::default().fg(TEXT_DISABLED).bg(bg)),
-                ]));
+                ];
+
+                // Split display into tree chars and name for coloring
+                if node.is_dir {
+                    spans.push(Span::styled(
+                        node.display.clone(),
+                        Style::default().fg(SAFFRON).bg(bg),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        node.display.clone(),
+                        Style::default().fg(node.type_color()).bg(bg),
+                    ));
+                }
+
+                // Padding dots or spaces
+                spans.push(Span::styled(
+                    " ".repeat(padding),
+                    Style::default().fg(Color::Rgb(40, 40, 40)).bg(bg),
+                ));
+
+                // Size right-aligned
+                spans.push(Span::styled(
+                    format!("{:>8}", size_str),
+                    Style::default().fg(TEXT_DISABLED).bg(bg),
+                ));
+
+                lines.push(Line::from(spans));
             }
 
             // Scroll indicator
-            if files.len() > visible_height {
+            if tree_nodes.len() > visible_height {
                 lines.push(Line::from(""));
+                let scroll_pct = (scroll as f32 / (tree_nodes.len() - visible_height) as f32 * 100.0) as usize;
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        "  ↑↓ to scroll ({}/{})",
-                        scroll + 1,
-                        files.len().saturating_sub(visible_height) + 1
-                    ),
+                    format!(" ↑↓ scroll │ {}/{} │ {}%", scroll + 1, tree_nodes.len(), scroll_pct.min(100)),
                     Style::default().fg(TEXT_DISABLED),
                 )));
             }
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "  Loading files...",
+            " Loading files...",
             Style::default().fg(TEXT_DISABLED),
         )));
     }
 
-    // Footer
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  Esc",
-            Style::default()
-                .fg(TEXT_SECONDARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" close  ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled(
-            "S",
-            Style::default()
-                .fg(TEXT_SECONDARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" rescan  ", Style::default().fg(Color::Rgb(60, 60, 60))),
-        Span::styled(
-            "Enter",
-            Style::default()
-                .fg(TEXT_SECONDARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" view file", Style::default().fg(Color::Rgb(60, 60, 60))),
-    ]));
+    // Build block with title
+    let title = format!(" 📁 {} ", project_name);
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().fg(SAFFRON).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(80, 80, 100)))
+        .style(Style::default().bg(Color::Rgb(18, 18, 22)));
 
-    // Render popup with border
-    let popup = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(80, 80, 100)))
-            .style(Style::default().bg(Color::Rgb(20, 20, 25))),
-    );
+    // Footer keybinds
+    let footer = Line::from(vec![
+        Span::styled(" ↑↓", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" nav  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Enter", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" open/expand  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("←", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" collapse  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Esc", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" close", Style::default().fg(Color::Rgb(60, 60, 60))),
+    ]);
+    lines.push(Line::from(""));
+    lines.push(footer);
+
+    let popup = Paragraph::new(lines).block(block);
+    f.render_widget(popup, popup_area);
+}
+
+/// Render file preview popup (shows file content with line numbers and key items)
+fn render_file_preview(f: &mut Frame, area: Rect, state: &AppState) {
+    // Create centered popup area (90% width, 90% height)
+    let popup_width = (area.width as f32 * 0.90) as u16;
+    let popup_height = (area.height as f32 * 0.90) as u16;
+    let popup_x = (area.width - popup_width) / 2;
+    let popup_y = (area.height - popup_height) / 2;
+
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear background
     f.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // File type icon
+    let type_icon = match state.file_preview_file_type.to_lowercase().as_str() {
+        "rust" => "🦀",
+        "typescript" | "javascript" => "📜",
+        "python" => "🐍",
+        "go" => "🐹",
+        "java" => "☕",
+        "c" | "cpp" | "c++" => "⚙️",
+        "markdown" => "📝",
+        "json" | "yaml" | "toml" => "📋",
+        _ => "📄",
+    };
+
+    // Header with key items
+    if !state.file_preview_key_items.is_empty() {
+        let key_items_str = state.file_preview_key_items.iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" │ ");
+        lines.push(Line::from(vec![
+            Span::styled(" Key: ", Style::default().fg(TEXT_DISABLED)),
+            Span::styled(key_items_str, Style::default().fg(SAFFRON)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // Content with line numbers
+    let visible_height = popup_height.saturating_sub(10) as usize;
+    let scroll = state.file_preview_scroll;
+    let total_lines = state.file_preview_content.len();
+    let line_num_width = total_lines.to_string().len();
+
+    for (i, line) in state.file_preview_content.iter()
+        .skip(scroll)
+        .take(visible_height)
+        .enumerate()
+    {
+        let line_num = scroll + i + 1;
+        let line_num_str = format!("{:>width$} ", line_num, width = line_num_width);
+
+        // Truncate long lines for display
+        let display_line = if line.len() > (popup_width as usize - line_num_width - 8) {
+            format!("{}...", &line[..popup_width as usize - line_num_width - 11])
+        } else {
+            line.clone()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(line_num_str, Style::default().fg(Color::Rgb(80, 80, 100))),
+            Span::styled("│ ", Style::default().fg(Color::Rgb(50, 50, 60))),
+            Span::styled(display_line, Style::default().fg(TEXT_PRIMARY)),
+        ]));
+    }
+
+    // Scroll info
+    if total_lines > visible_height {
+        lines.push(Line::from(""));
+        let scroll_pct = if total_lines > visible_height {
+            (scroll as f32 / (total_lines - visible_height) as f32 * 100.0) as usize
+        } else {
+            0
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" Line {}-{} of {} │ {}%",
+                scroll + 1,
+                (scroll + visible_height).min(total_lines),
+                total_lines,
+                scroll_pct.min(100)),
+            Style::default().fg(TEXT_DISABLED),
+        )));
+    }
+
+    // Build block with title
+    let filename = std::path::Path::new(&state.file_preview_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&state.file_preview_path);
+    let title = format!(" {} {} ({} lines) ", type_icon, filename, state.file_preview_line_count);
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().fg(SAFFRON).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(80, 80, 100)))
+        .style(Style::default().bg(Color::Rgb(18, 18, 22)));
+
+    // Footer keybinds
+    let footer = Line::from(vec![
+        Span::styled(" ↑↓/jk", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" scroll  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("PgUp/PgDn", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" page  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Home/End", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" jump  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled("Esc", Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" close", Style::default().fg(Color::Rgb(60, 60, 60))),
+    ]);
+    lines.push(Line::from(""));
+    lines.push(footer);
+
+    let popup = Paragraph::new(lines).block(block);
     f.render_widget(popup, popup_area);
 }
 
