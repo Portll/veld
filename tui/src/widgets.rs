@@ -3647,13 +3647,15 @@ fn render_project_line(
 
     // Codebase status indicator with animation for scanning
     let spinner_frames = ["◜", "◠", "◝", "◞", "◡", "◟"];
-    let (codebase_icon, codebase_color, codebase_hint) = if state.is_scanning(&project.id) {
+    let (codebase_icon, codebase_color, codebase_hint) = if indent_level > 0 {
+        ("", Color::Reset, "") // Sub-projects cannot be indexed
+    } else if state.is_scanning(&project.id) {
         let frame = spinner_frames[(state.animation_tick as usize / 2) % spinner_frames.len()];
         (frame, SAFFRON, " scanning...")
     } else if state.is_project_indexed(&project.id) {
         ("●", Color::Rgb(100, 200, 100), " [f]") // Green - indexed, hint to press f
     } else {
-        ("○", Color::Rgb(100, 100, 100), " [S]") // Gray - not indexed, hint to press S
+        ("●", Color::Rgb(200, 80, 80), " [S]") // Red - not indexed, hint to press S
     };
 
     // Indentation for sub-projects

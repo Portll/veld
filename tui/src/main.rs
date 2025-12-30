@@ -1347,17 +1347,27 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         }
                         KeyCode::Char('S') => {
                             // Open codebase path input for selected project (uppercase S)
+                            // Only allow indexing for root projects (not sub-projects)
                             if matches!(g.view_mode, ViewMode::Projects)
                                 && g.focus_panel == FocusPanel::Left
                             {
                                 if let Some(project_id) = g.selected_project_id() {
-                                    // Pre-fill with current directory
-                                    let default_path = std::env::current_dir()
-                                        .map(|p| p.display().to_string())
-                                        .unwrap_or_else(|_| ".".to_string());
-                                    g.codebase_input_active = true;
-                                    g.codebase_input_path = default_path;
-                                    g.codebase_input_project_id = Some(project_id);
+                                    // Check if this is a root project (no parent)
+                                    let is_root = g.projects.iter()
+                                        .find(|p| p.id == project_id)
+                                        .is_some_and(|p| p.parent_id.is_none());
+
+                                    if is_root {
+                                        // Pre-fill with current directory
+                                        let default_path = std::env::current_dir()
+                                            .map(|p| p.display().to_string())
+                                            .unwrap_or_else(|_| ".".to_string());
+                                        g.codebase_input_active = true;
+                                        g.codebase_input_path = default_path;
+                                        g.codebase_input_project_id = Some(project_id);
+                                    } else {
+                                        g.set_error("Indexing only available for root projects".to_string());
+                                    }
                                 }
                             }
                         }
