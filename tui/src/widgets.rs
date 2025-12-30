@@ -3315,13 +3315,15 @@ fn render_project_line(
         }
     };
 
-    // Codebase status indicator: 🟢 indexed, 🔴 not indexed, ◐ scanning
-    let (codebase_icon, codebase_color) = if state.is_scanning(&project.id) {
-        ("◐", SAFFRON) // Scanning animation
+    // Codebase status indicator with animation for scanning
+    let spinner_frames = ["◜", "◠", "◝", "◞", "◡", "◟"];
+    let (codebase_icon, codebase_color, codebase_hint) = if state.is_scanning(&project.id) {
+        let frame = spinner_frames[(state.animation_tick as usize / 2) % spinner_frames.len()];
+        (frame, SAFFRON, " scanning...")
     } else if state.is_project_indexed(&project.id) {
-        ("●", Color::Rgb(100, 200, 100)) // Green - indexed
+        ("●", Color::Rgb(100, 200, 100), " [f]") // Green - indexed, hint to press f
     } else {
-        ("○", Color::Rgb(100, 100, 100)) // Gray - not indexed
+        ("○", Color::Rgb(100, 100, 100), " [S]") // Gray - not indexed, hint to press S
     };
 
     // Indentation for sub-projects
@@ -3372,11 +3374,16 @@ fn render_project_line(
             Style::default().fg(TEXT_PRIMARY).bg(bg),
         ),
         Span::styled(
-            format!(" {} ", codebase_icon),
+            format!(" {}", codebase_icon),
             Style::default().fg(codebase_color).bg(bg),
         ),
         Span::styled(
-            format!("{:<12}", status_str),
+            codebase_hint,
+            Style::default().fg(TEXT_DISABLED).bg(bg),
+        ),
+        Span::styled(" ", Style::default().bg(bg)),
+        Span::styled(
+            format!("{:<10}", status_str),
             Style::default().fg(progress_color).bg(bg),
         ),
     ]));

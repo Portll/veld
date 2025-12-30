@@ -1556,7 +1556,7 @@ pub async fn index_project_codebase(
     let request = IndexRequest {
         user_id: user_id.to_string(),
         codebase_path: root_path.to_string(),
-        force: Some(false),
+        force: Some(true), // Always force re-index from TUI
     };
 
     let response = client
