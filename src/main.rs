@@ -4710,6 +4710,19 @@ struct ProactiveSurfacedMemory {
     tags: Vec<String>,
 }
 
+/// Todo item in proactive context response
+#[derive(Debug, Serialize)]
+struct ProactiveTodoItem {
+    id: String,
+    short_id: String,
+    content: String,
+    status: String,
+    priority: String,
+    project: Option<String>,
+    due_date: Option<String>,
+    relevance_reason: String,
+}
+
 /// Response for proactive context
 #[derive(Debug, Serialize)]
 struct ProactiveContextResponse {
@@ -4728,6 +4741,12 @@ struct ProactiveContextResponse {
     /// Feedback processing results (if previous_response was provided)
     #[serde(skip_serializing_if = "Option::is_none")]
     feedback_processed: Option<FeedbackProcessed>,
+    /// Relevant todos based on context
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    relevant_todos: Vec<ProactiveTodoItem>,
+    /// Todo count
+    #[serde(default)]
+    todo_count: usize,
 }
 
 /// POST /api/proactive_context - Combined recall + reminders for AI agents
@@ -5104,6 +5123,93 @@ async fn proactive_context(
         None
     };
 
+    // 5. Surface relevant todos based on context keywords
+    let relevant_todos: Vec<ProactiveTodoItem> = {
+        let context_lower = req.context.to_lowercase();
+        let context_words: std::collections::HashSet<_> = context_lower
+            .split_whitespace()
+            .filter(|w| w.len() > 3)
+            .collect();
+
+        // Get active todos (todo, in_progress, blocked)
+        let all_todos = state
+            .todo_store
+            .list_todos(&req.user_id, None)
+            .unwrap_or_default();
+
+        all_todos
+            .into_iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TodoStatus::Todo | TodoStatus::InProgress | TodoStatus::Blocked
+                )
+            })
+            .filter_map(|t| {
+                let content_lower = t.content.to_lowercase();
+                let content_words: std::collections::HashSet<_> = content_lower
+                    .split_whitespace()
+                    .filter(|w| w.len() > 3)
+                    .collect();
+
+                // Check for keyword overlap
+                let overlap: Vec<_> = context_words.intersection(&content_words).collect();
+
+                // Also check tags and project
+                let tag_match = t
+                    .tags
+                    .iter()
+                    .any(|tag| context_lower.contains(&tag.to_lowercase()));
+
+                // Get project name
+                let project_name = t.project_id.as_ref().and_then(|pid| {
+                    state
+                        .todo_store
+                        .get_project(&req.user_id, pid)
+                        .ok()
+                        .flatten()
+                        .map(|p| p.name)
+                });
+                let project_match = project_name
+                    .as_ref()
+                    .map_or(false, |p| context_lower.contains(&p.to_lowercase()));
+
+                if !overlap.is_empty() || tag_match || project_match {
+                    let reason = if !overlap.is_empty() {
+                        format!(
+                            "keyword: {}",
+                            overlap
+                                .into_iter()
+                                .take(2)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    } else if tag_match {
+                        "tag match".to_string()
+                    } else {
+                        "project match".to_string()
+                    };
+
+                    Some(ProactiveTodoItem {
+                        id: t.id.0.to_string(),
+                        short_id: t.short_id(),
+                        content: t.content.clone(),
+                        status: format!("{:?}", t.status).to_lowercase(),
+                        priority: t.priority.indicator().to_string(),
+                        project: project_name,
+                        due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                        relevance_reason: reason,
+                    })
+                } else {
+                    None
+                }
+            })
+            .take(5) // Limit to 5 relevant todos
+            .collect()
+    };
+    let todo_count = relevant_todos.len();
+
     let memory_count = memories.len();
     let reminder_count = due_reminders.len() + context_reminders.len();
 
@@ -5127,6 +5233,8 @@ async fn proactive_context(
         reminder_count,
         ingested_memory_id,
         feedback_processed,
+        relevant_todos,
+        todo_count,
     }))
 }
 
