@@ -137,6 +137,8 @@ struct ProjectApiItem {
     parent_id: Option<String>,
     #[serde(default)]
     prefix: Option<String>,
+    #[serde(default)]
+    codebase_file_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +326,7 @@ impl MemoryStream {
                 completed_count: 0,
                 parent_id: p.parent_id,
                 prefix: p.prefix,
+                codebase_file_count: p.codebase_file_count,
             })
             .collect();
 
@@ -533,6 +536,12 @@ impl MemoryStream {
             Ok((todos, projects, stats)) => {
                 let mut state = self.state.lock().await;
                 state.todos = todos;
+                // Mark projects with indexed files
+                for p in &projects {
+                    if p.codebase_file_count > 0 {
+                        state.indexed_projects.insert(p.id.clone());
+                    }
+                }
                 state.projects = projects;
                 state.todo_stats = stats;
             }
@@ -675,6 +684,7 @@ impl MemoryStream {
                 completed_count: 0,
                 parent_id: p.parent_id,
                 prefix: p.prefix,
+                codebase_file_count: p.codebase_file_count,
             })
             .collect();
 
@@ -775,6 +785,12 @@ impl MemoryStream {
                             {
                                 let mut state = self.state.lock().await;
                                 state.todos = todos;
+                                // Mark projects with indexed files
+                                for p in &projects {
+                                    if p.codebase_file_count > 0 {
+                                        state.indexed_projects.insert(p.id.clone());
+                                    }
+                                }
                                 state.projects = projects;
                                 state.todo_stats = stats;
                             }
@@ -954,6 +970,12 @@ pub async fn refresh_todos(
         Ok((todos, projects, stats)) => {
             let mut s = state.lock().await;
             s.todos = todos;
+            // Mark projects with indexed files
+            for p in &projects {
+                if p.codebase_file_count > 0 {
+                    s.indexed_projects.insert(p.id.clone());
+                }
+            }
             s.projects = projects;
             s.todo_stats = stats;
             Ok(())

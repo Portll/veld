@@ -1363,6 +1363,9 @@ pub struct TuiProject {
     /// Project prefix for todo IDs (e.g., "BOLT", "MEM")
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Number of indexed codebase files
+    #[serde(default)]
+    pub codebase_file_count: usize,
 }
 
 impl TuiProject {
