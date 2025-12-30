@@ -77,8 +77,7 @@ impl FileMemoryStore {
     /// Store a new file memory
     pub fn store(&self, file_memory: &FileMemory) -> Result<()> {
         let key = format!("{}:{}", file_memory.user_id, file_memory.id.0);
-        let value =
-            serde_json::to_vec(file_memory).context("Failed to serialize file memory")?;
+        let value = serde_json::to_vec(file_memory).context("Failed to serialize file memory")?;
 
         self.file_db
             .put(key.as_bytes(), &value)
@@ -102,8 +101,8 @@ impl FileMemoryStore {
 
         match self.file_db.get(key.as_bytes())? {
             Some(value) => {
-                let file_memory: FileMemory = serde_json::from_slice(&value)
-                    .context("Failed to deserialize file memory")?;
+                let file_memory: FileMemory =
+                    serde_json::from_slice(&value).context("Failed to deserialize file memory")?;
                 Ok(Some(file_memory))
             }
             None => Ok(None),
@@ -118,7 +117,12 @@ impl FileMemoryStore {
         path: &str,
     ) -> Result<Option<FileMemory>> {
         // Look up in path index
-        let path_key = format!("path:{}:{}:{}", user_id, project_id.0, Self::hash_path(path));
+        let path_key = format!(
+            "path:{}:{}:{}",
+            user_id,
+            project_id.0,
+            Self::hash_path(path)
+        );
 
         match self.index_db.get(path_key.as_bytes())? {
             Some(file_id_bytes) => {
@@ -410,25 +414,45 @@ impl FileMemoryStore {
 
         // Commonly excluded directory names (checked explicitly for performance and reliability)
         const EXCLUDED_DIR_NAMES: &[&str] = &[
-            ".git", ".svn", ".hg", ".bzr",           // VCS
-            "node_modules", "__pycache__", ".venv",  // Dependencies
-            "venv", "env", ".env", "virtualenv",     // More Python venvs
-            "site-packages", "Lib", "Scripts",       // Python internals
-            "target", "dist", "build", "out", "bin", // Build outputs
-            ".idea", ".vscode",                      // IDE
-            ".cache", ".tmp", "tmp",                 // Temp
-            "data", "logs", "coverage",              // Runtime data
-            "release-test", "test-wheel",            // Test artifacts
+            ".git",
+            ".svn",
+            ".hg",
+            ".bzr", // VCS
+            "node_modules",
+            "__pycache__",
+            ".venv", // Dependencies
+            "venv",
+            "env",
+            ".env",
+            "virtualenv", // More Python venvs
+            "site-packages",
+            "Lib",
+            "Scripts", // Python internals
+            "target",
+            "dist",
+            "build",
+            "out",
+            "bin", // Build outputs
+            ".idea",
+            ".vscode", // IDE
+            ".cache",
+            ".tmp",
+            "tmp", // Temp
+            "data",
+            "logs",
+            "coverage", // Runtime data
+            "release-test",
+            "test-wheel", // Test artifacts
         ];
 
         // Directory name patterns to skip (suffix matching)
         const EXCLUDED_DIR_SUFFIXES: &[&str] = &[
-            "_data",      // Any *_data directories (e.g., shodh_memory_data)
-            "_cache",     // Any *_cache directories
-            "_output",    // Any *_output directories
-            "_venv",      // Any *_venv directories
-            "_env",       // Any *_env directories
-            "_install",   // Any *_install directories (test installs)
+            "_data",    // Any *_data directories (e.g., shodh_memory_data)
+            "_cache",   // Any *_cache directories
+            "_output",  // Any *_output directories
+            "_venv",    // Any *_venv directories
+            "_env",     // Any *_env directories
+            "_install", // Any *_install directories (test installs)
         ];
 
         for entry in entries {
@@ -445,13 +469,27 @@ impl FileMemoryStore {
             if path.is_dir() {
                 // Exact match exclusion
                 if EXCLUDED_DIR_NAMES.iter().any(|&name| file_name_str == name) {
-                    *result.skip_reasons.entry(format!("{}/", file_name_str)).or_insert(0) += 1;
+                    *result
+                        .skip_reasons
+                        .entry(format!("{}/", file_name_str))
+                        .or_insert(0) += 1;
                     result.skipped_files += 1;
                     continue;
                 }
                 // Suffix pattern exclusion (e.g., *_data, *_cache)
-                if EXCLUDED_DIR_SUFFIXES.iter().any(|&suffix| file_name_str.ends_with(suffix)) {
-                    *result.skip_reasons.entry(format!("*{}/", file_name_str.rsplit_once('_').map_or(&file_name_str[..], |(_, s)| s))).or_insert(0) += 1;
+                if EXCLUDED_DIR_SUFFIXES
+                    .iter()
+                    .any(|&suffix| file_name_str.ends_with(suffix))
+                {
+                    *result
+                        .skip_reasons
+                        .entry(format!(
+                            "*{}/",
+                            file_name_str
+                                .rsplit_once('_')
+                                .map_or(&file_name_str[..], |(_, s)| s)
+                        ))
+                        .or_insert(0) += 1;
                     result.skipped_files += 1;
                     continue;
                 }
@@ -470,7 +508,9 @@ impl FileMemoryStore {
                 let pattern_str = pattern.as_str();
                 if pattern_str.ends_with('/') {
                     let dir_name = pattern_str.trim_end_matches('/');
-                    if relative_path == dir_name || relative_path.starts_with(&format!("{}/", dir_name)) {
+                    if relative_path == dir_name
+                        || relative_path.starts_with(&format!("{}/", dir_name))
+                    {
                         *result.skip_reasons.entry(pattern.to_string()).or_insert(0) += 1;
                         excluded = true;
                         break;
@@ -503,7 +543,10 @@ impl FileMemoryStore {
                 // Check file size
                 if let Ok(metadata) = path.metadata() {
                     if metadata.len() > config.max_file_size_for_embedding as u64 {
-                        *result.skip_reasons.entry("too_large".to_string()).or_insert(0) += 1;
+                        *result
+                            .skip_reasons
+                            .entry("too_large".to_string())
+                            .or_insert(0) += 1;
                         result.skipped_files += 1;
                         continue;
                     }
@@ -528,9 +571,9 @@ impl FileMemoryStore {
     fn is_likely_binary(path: &Path) -> bool {
         let binary_extensions = [
             "exe", "dll", "so", "dylib", "bin", "obj", "o", "a", "lib", "png", "jpg", "jpeg",
-            "gif", "bmp", "ico", "webp", "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac",
-            "zip", "tar", "gz", "rar", "7z", "pdf", "doc", "docx", "xls", "xlsx", "ppt",
-            "pptx", "woff", "woff2", "ttf", "otf", "eot", "class", "pyc", "pyo", "wasm",
+            "gif", "bmp", "ico", "webp", "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac", "zip",
+            "tar", "gz", "rar", "7z", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "woff",
+            "woff2", "ttf", "otf", "eot", "class", "pyc", "pyo", "wasm",
         ];
 
         path.extension()
@@ -730,9 +773,7 @@ impl FileMemoryStore {
                 // Extract func, type struct, type interface
                 for line in content.lines() {
                     let trimmed = line.trim();
-                    if trimmed.starts_with("func ")
-                        || trimmed.starts_with("type ")
-                    {
+                    if trimmed.starts_with("func ") || trimmed.starts_with("type ") {
                         if let Some(name) = Self::extract_go_name(trimmed) {
                             if !items.contains(&name) {
                                 items.push(name);
@@ -756,8 +797,7 @@ impl FileMemoryStore {
         // "pub fn foo(" -> "foo"
         // "pub struct Bar {" -> "Bar"
         // "impl Foo for Bar {" -> "Foo for Bar"
-        let line = line.trim_start_matches("pub ")
-            .trim_start_matches("async ");
+        let line = line.trim_start_matches("pub ").trim_start_matches("async ");
 
         if line.starts_with("fn ") {
             let rest = line.strip_prefix("fn ")?;
@@ -787,7 +827,8 @@ impl FileMemoryStore {
     fn extract_js_name(line: &str) -> Option<String> {
         // "export function foo(" -> "foo"
         // "export class Bar {" -> "Bar"
-        let line = line.trim_start_matches("export ")
+        let line = line
+            .trim_start_matches("export ")
             .trim_start_matches("default ")
             .trim_start_matches("async ");
 
@@ -1158,7 +1199,9 @@ mod tests {
             store.store(&file).unwrap();
         }
 
-        let files = store.list_by_project("test-user", &project_id, None).unwrap();
+        let files = store
+            .list_by_project("test-user", &project_id, None)
+            .unwrap();
         assert_eq!(files.len(), 5);
     }
 
@@ -1182,7 +1225,12 @@ mod tests {
 
         // Record access
         let updated = store
-            .record_access("test-user", &project_id, "src/main.rs", LearnedFrom::ReadAccess)
+            .record_access(
+                "test-user",
+                &project_id,
+                "src/main.rs",
+                LearnedFrom::ReadAccess,
+            )
             .unwrap()
             .unwrap();
 

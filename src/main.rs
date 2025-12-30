@@ -219,13 +219,12 @@ use memory::{
     },
     process_implicit_feedback,
     prospective::ProspectiveStore,
-    todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore,
-    FileMemoryStats, FileMemoryStore, IndexingResult,
-    GraphStats as VisualizationStats, Memory, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
-    PendingFeedback, Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask,
-    ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger, Query as MemoryQuery, Recurrence,
-    SharedMemory, SurfacedMemoryInfo, Todo, TodoComment, TodoCommentId, TodoCommentType, TodoId,
-    TodoPriority, TodoStatus, TodoStore, UserTodoStats,
+    todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore, FileMemoryStats,
+    FileMemoryStore, GraphStats as VisualizationStats, IndexingResult, Memory, MemoryConfig,
+    MemoryId, MemoryStats, MemorySystem, PendingFeedback, Project, ProjectId, ProjectStats,
+    ProjectStatus, ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger,
+    Query as MemoryQuery, Recurrence, SharedMemory, SurfacedMemoryInfo, Todo, TodoComment,
+    TodoCommentId, TodoCommentType, TodoId, TodoPriority, TodoStatus, TodoStore, UserTodoStats,
 };
 
 /// Audit event for history tracking
@@ -11068,7 +11067,9 @@ async fn index_project_codebase(
 
     let message = format!(
         "Indexed {} files ({} skipped, {} errors)",
-        result.indexed_files, result.skipped_files, result.errors.len()
+        result.indexed_files,
+        result.skipped_files,
+        result.errors.len()
     );
 
     // Emit SSE event
@@ -11136,7 +11137,9 @@ async fn search_project_files(
         .into_iter()
         .filter(|f| {
             f.path.to_lowercase().contains(&query_lower)
-                || f.key_items.iter().any(|k| k.to_lowercase().contains(&query_lower))
+                || f.key_items
+                    .iter()
+                    .any(|k| k.to_lowercase().contains(&query_lower))
                 || f.summary.to_lowercase().contains(&query_lower)
         })
         .take(req.limit)
@@ -11181,7 +11184,10 @@ async fn get_file_stats(
         .stats(&query.user_id)
         .map_err(AppError::Internal)?;
 
-    Ok(Json(FileStatsResponse { success: true, stats }))
+    Ok(Json(FileStatsResponse {
+        success: true,
+        stats,
+    }))
 }
 
 /// POST /api/todos/stats - Get todo statistics
@@ -11503,9 +11509,18 @@ async fn main() -> Result<()> {
         .route("/api/projects/{project_id}", delete(delete_project))
         // File memory / Codebase integration endpoints (MEM-33, MEM-34, MEM-35)
         .route("/api/projects/{project_id}/files", post(list_project_files))
-        .route("/api/projects/{project_id}/scan", post(scan_project_codebase))
-        .route("/api/projects/{project_id}/index", post(index_project_codebase))
-        .route("/api/projects/{project_id}/files/search", post(search_project_files))
+        .route(
+            "/api/projects/{project_id}/scan",
+            post(scan_project_codebase),
+        )
+        .route(
+            "/api/projects/{project_id}/index",
+            post(index_project_codebase),
+        )
+        .route(
+            "/api/projects/{project_id}/files/search",
+            post(search_project_files),
+        )
         .route("/api/files/stats", get(get_file_stats))
         .route("/api/todos/stats", post(get_todo_stats))
         // Apply auth middleware only to protected routes

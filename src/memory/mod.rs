@@ -62,6 +62,7 @@ pub use crate::memory::feedback::{
     process_implicit_feedback, ContextFingerprint, FeedbackMomentum, FeedbackStore,
     FeedbackStoreStats, PendingFeedback, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
 };
+pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{spreading_activation_retrieve, ActivatedMemory};
 pub use crate::memory::introspection::{
     AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
@@ -84,7 +85,6 @@ pub use crate::memory::retrieval::{
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
-pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]

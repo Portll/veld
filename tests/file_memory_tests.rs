@@ -447,7 +447,10 @@ fn test_scan_codebase() {
     // Should find: main.rs, lib.rs, index.ts, utils.py, server.go, test_main.rs
     // Should skip: image.png (binary), large.txt (too big)
     assert!(result.total_files >= 6, "Expected at least 6 files");
-    assert!(result.eligible_files >= 6, "Expected at least 6 eligible files");
+    assert!(
+        result.eligible_files >= 6,
+        "Expected at least 6 eligible files"
+    );
     assert!(!result.limit_reached, "Should not hit limit");
 
     // Check file paths include expected files
@@ -472,7 +475,10 @@ fn test_scan_codebase_with_limit() {
     // With only 2 max files, should hit limit since we have 6+ files
     assert!(result.limit_reached, "Should hit limit with max_files=2");
     // eligible_files may be >= limit due to how scan works
-    assert!(result.file_paths.len() >= 2, "Should have at least 2 eligible files");
+    assert!(
+        result.file_paths.len() >= 2,
+        "Should have at least 2 eligible files"
+    );
 }
 
 #[test]
@@ -491,14 +497,8 @@ fn test_scan_codebase_with_excludes() {
 
     // Should not include tests/test_main.rs or utils.py
     let paths = result.file_paths.join(" ");
-    assert!(
-        !paths.contains("test_main"),
-        "Should exclude tests"
-    );
-    assert!(
-        !paths.contains(".py"),
-        "Should exclude Python files"
-    );
+    assert!(!paths.contains("test_main"), "Should exclude tests");
+    assert!(!paths.contains(".py"), "Should exclude Python files");
 }
 
 // ============================================================================
@@ -587,9 +587,7 @@ fn test_key_item_extraction_typescript() {
     // index.ts contains: export class UserService, export interface User, export function validateUser
     let items = file_memory.key_items.join(" ");
     assert!(
-        items.contains("UserService")
-            || items.contains("User")
-            || items.contains("validateUser"),
+        items.contains("UserService") || items.contains("User") || items.contains("validateUser"),
         "Should extract TypeScript definitions: {}",
         items
     );
