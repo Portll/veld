@@ -7,8 +7,16 @@
 //! - Status-grouped lists with horizontal rules
 
 use chrono::{DateTime, Datelike, Utc};
+use std::sync::OnceLock;
 
 use super::todos::{ProjectStats, UserTodoStats};
+
+// Static regex for context extraction (compiled once)
+static CONTEXT_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+
+fn get_context_regex() -> &'static regex::Regex {
+    CONTEXT_REGEX.get_or_init(|| regex::Regex::new(r"@(\w+)").unwrap())
+}
 use super::types::{Project, ProjectStatus, Todo, TodoStatus};
 
 /// Width of formatted output
@@ -590,7 +598,7 @@ fn next_weekday(from: DateTime<Utc>, target_dow: u32) -> DateTime<Utc> {
 
 /// Extract @contexts from content string
 pub fn extract_contexts(content: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"@(\w+)").unwrap();
+    let re = get_context_regex();
     re.captures_iter(content)
         .map(|c| format!("@{}", &c[1].to_lowercase()))
         .collect()

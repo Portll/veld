@@ -1745,8 +1745,10 @@ fn parse_date_query(
 
     // Try YYYY-MM-DD format
     if let Ok(date) = chrono::NaiveDate::parse_from_str(&query, "%Y-%m-%d") {
-        let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        return Ok((start, now));
+        if let Some(datetime) = date.and_hms_opt(0, 0, 0) {
+            let start = datetime.and_utc();
+            return Ok((start, now));
+        }
     }
 
     // Try just a number as days

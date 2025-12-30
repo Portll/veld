@@ -15,8 +15,20 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::signal;
+
+// Static regexes for entity extraction (compiled once at startup)
+static ALLCAPS_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+static ISSUE_ID_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+
+fn get_allcaps_regex() -> &'static regex::Regex {
+    ALLCAPS_REGEX.get_or_init(|| regex::Regex::new(r"[A-Z]{2,}[A-Z0-9]*").unwrap())
+}
+
+fn get_issue_id_regex() -> &'static regex::Regex {
+    ISSUE_ID_REGEX.get_or_init(|| regex::Regex::new(r"([A-Z]{2,10}-\d+)").unwrap())
+}
 use tower::limit::ConcurrencyLimitLayer;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::services::ServeDir;
@@ -1920,7 +1932,7 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                     .await;
                 return;
             }
@@ -1935,7 +1947,7 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                 timestamp: chrono::Utc::now(),
             };
             let _ = sender
-                .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                 .await;
             return;
         }
@@ -1955,7 +1967,7 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                     .await;
                 return;
             }
@@ -1968,7 +1980,7 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
             timestamp: chrono::Utc::now(),
         };
         if sender
-            .send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+            .send(Message::Text(serde_json::to_string(&ack).unwrap_or_else(|_| r#"{"ack":true}"#.to_string()).into()))
             .await
             .is_err()
         {
@@ -2040,7 +2052,7 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                     .await;
                 continue;
             }
@@ -2053,7 +2065,7 @@ async fn handle_streaming_socket(socket: axum::extract::ws::WebSocket, state: Ap
             .await;
 
         // Send result
-        let response = serde_json::to_string(&result).unwrap();
+        let response = serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string());
         if sender.send(Message::Text(response.into())).await.is_err() {
             break;
         }
@@ -5204,7 +5216,7 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                     .await;
                 return;
             }
@@ -5219,7 +5231,7 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
                 timestamp: chrono::Utc::now(),
             };
             let _ = sender
-                .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                 .await;
             return;
         }
@@ -5235,7 +5247,7 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
             timestamp: chrono::Utc::now(),
         };
         if sender
-            .send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+            .send(Message::Text(serde_json::to_string(&ack).unwrap_or_else(|_| r#"{"ack":true}"#.to_string()).into()))
             .await
             .is_err()
         {
@@ -5304,7 +5316,7 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
                     timestamp: chrono::Utc::now(),
                 };
                 let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                    .send(Message::Text(serde_json::to_string(&error).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into()))
                     .await;
                 continue;
             }
@@ -5370,7 +5382,7 @@ async fn handle_context_monitor_socket(socket: axum::extract::ws::WebSocket, sta
         if !matches!(response, relevance::ContextMonitorResponse::None { .. }) {
             if sender
                 .send(Message::Text(
-                    serde_json::to_string(&response).unwrap().into(),
+                    serde_json::to_string(&response).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string()).into(),
                 ))
                 .await
                 .is_err()
