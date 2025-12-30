@@ -828,6 +828,11 @@ impl MemorySystem {
             }
         }
 
+        // Increment and persist retrieval counter
+        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+            self.stats.write().total_retrievals = count;
+        }
+
         Ok(memories)
     }
 

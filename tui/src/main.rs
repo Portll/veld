@@ -999,7 +999,7 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                                     g.open_file_preview(&file, content);
                                                 }
                                                 Err(e) => {
-                                                    g.set_error(format!("Cannot read: {}", e));
+                                                    g.set_error(format!("Cannot read '{}': {}", file_path, e));
                                                 }
                                             }
                                         }
