@@ -2822,9 +2822,15 @@ impl AppState {
     }
 
     /// Get the project ID if the current selection is on a project
+    /// Uses visual order: root projects first, then sub-projects under each parent
     pub fn selected_project_id(&self) -> Option<String> {
         let mut flat_idx = 0;
-        for project in &self.projects {
+
+        // Build visual order: root projects, then sub-projects under each
+        let root_projects: Vec<_> = self.projects.iter().filter(|p| p.parent_id.is_none()).collect();
+        let sub_projects: Vec<_> = self.projects.iter().filter(|p| p.parent_id.is_some()).collect();
+
+        for project in &root_projects {
             if self.projects_selected == flat_idx {
                 return Some(project.id.clone());
             }
@@ -2832,6 +2838,18 @@ impl AppState {
             if self.is_project_expanded(&project.id) {
                 let todos = self.todos_for_project(&project.id);
                 flat_idx += todos.len().min(5);
+            }
+
+            // Check sub-projects of this root project
+            for subproject in sub_projects.iter().filter(|sp| sp.parent_id.as_ref() == Some(&project.id)) {
+                if self.projects_selected == flat_idx {
+                    return Some(subproject.id.clone());
+                }
+                flat_idx += 1;
+                if self.is_project_expanded(&subproject.id) {
+                    let todos = self.todos_for_project(&subproject.id);
+                    flat_idx += todos.len().min(5);
+                }
             }
         }
         None

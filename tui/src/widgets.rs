@@ -1220,16 +1220,13 @@ fn render_file_popup(f: &mut Frame, area: Rect, state: &AppState) {
 
             // Column headers
             lines.push(Line::from(vec![
+                Span::styled("     ", Style::default().fg(TEXT_DISABLED)),
                 Span::styled(
-                    format!("  {:<4} ", "Type"),
+                    format!("{:<52}", "File Path"),
                     Style::default().fg(TEXT_DISABLED),
                 ),
-                Span::styled(
-                    format!("{:<40} ", "Path"),
-                    Style::default().fg(TEXT_DISABLED),
-                ),
-                Span::styled("Heat ", Style::default().fg(TEXT_DISABLED)),
-                Span::styled("Summary", Style::default().fg(TEXT_DISABLED)),
+                Span::styled("   ", Style::default().fg(TEXT_DISABLED)),
+                Span::styled("Functions/Classes", Style::default().fg(TEXT_DISABLED)),
             ]));
             lines.push(Line::from(Span::styled(
                 "─".repeat(popup_width as usize - 2),
@@ -1249,8 +1246,16 @@ fn render_file_popup(f: &mut Frame, area: Rect, state: &AppState) {
 
                 let icon = file.type_icon();
                 let heat = file.heat_indicator();
-                let path = truncate(&file.short_path(), 38);
-                let summary = truncate(&file.summary, 30);
+                // Show full relative path, truncated to fit
+                let path = truncate(&file.path, 50);
+                // Show key items if no summary, otherwise show summary
+                let info = if !file.key_items.is_empty() {
+                    truncate(&file.key_items.join(", "), 25)
+                } else if !file.summary.is_empty() {
+                    truncate(&file.summary, 25)
+                } else {
+                    String::new()
+                };
 
                 // Type color
                 let type_color = match file.file_type.to_lowercase().as_str() {
@@ -1266,16 +1271,16 @@ fn render_file_popup(f: &mut Frame, area: Rect, state: &AppState) {
                         if is_selected { " ▸" } else { "  " },
                         Style::default().fg(SAFFRON).bg(bg),
                     ),
-                    Span::styled(format!(" {} ", icon), Style::default().fg(type_color).bg(bg)),
+                    Span::styled(format!("{} ", icon), Style::default().fg(type_color).bg(bg)),
                     Span::styled(
-                        format!("{:<40} ", path),
+                        format!("{:<52}", path),
                         Style::default().fg(TEXT_PRIMARY).bg(bg),
                     ),
                     Span::styled(
-                        format!("{:<5}", heat),
+                        format!("{:<3}", heat),
                         Style::default().fg(Color::Rgb(255, 140, 50)).bg(bg),
                     ),
-                    Span::styled(summary, Style::default().fg(TEXT_SECONDARY).bg(bg)),
+                    Span::styled(info, Style::default().fg(TEXT_DISABLED).bg(bg)),
                 ]));
             }
 
