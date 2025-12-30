@@ -3186,6 +3186,25 @@ pub struct Project {
 
     /// When completed
     pub completed_at: Option<DateTime<Utc>>,
+
+    // =========================================================================
+    // CODEBASE INTEGRATION (MEM-30)
+    // =========================================================================
+    /// Absolute path to the codebase root directory
+    #[serde(default)]
+    pub codebase_path: Option<String>,
+
+    /// Whether the codebase has been indexed
+    #[serde(default)]
+    pub codebase_indexed: bool,
+
+    /// When the codebase was last indexed
+    #[serde(default)]
+    pub codebase_indexed_at: Option<DateTime<Utc>>,
+
+    /// Number of files indexed in the codebase
+    #[serde(default)]
+    pub codebase_file_count: usize,
 }
 
 impl Project {
@@ -3203,6 +3222,10 @@ impl Project {
             parent_id: None,
             created_at: Utc::now(),
             completed_at: None,
+            codebase_path: None,
+            codebase_indexed: false,
+            codebase_indexed_at: None,
+            codebase_file_count: 0,
         }
     }
 
@@ -3220,6 +3243,10 @@ impl Project {
             parent_id: Some(parent_id),
             created_at: Utc::now(),
             completed_at: None,
+            codebase_path: None,
+            codebase_indexed: false,
+            codebase_indexed_at: None,
+            codebase_file_count: 0,
         }
     }
 
@@ -3256,6 +3283,388 @@ impl Project {
         self.prefix
             .clone()
             .unwrap_or_else(|| Self::derive_prefix(&self.name))
+    }
+}
+
+// =============================================================================
+// FILE MEMORY TYPES (MEM-29)
+// Codebase integration - learned knowledge about files
+// =============================================================================
+
+/// Unique identifier for file memories
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FileMemoryId(pub Uuid);
+
+impl FileMemoryId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for FileMemoryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for FileMemoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Programming language / file type
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FileType {
+    Rust,
+    TypeScript,
+    JavaScript,
+    Python,
+    Go,
+    Java,
+    CSharp,
+    Cpp,
+    C,
+    Ruby,
+    Markdown,
+    Json,
+    Yaml,
+    Toml,
+    Html,
+    Css,
+    Sql,
+    Shell,
+    Other(String),
+}
+
+impl FileType {
+    /// Detect file type from extension
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_lowercase().as_str() {
+            "rs" => FileType::Rust,
+            "ts" | "tsx" => FileType::TypeScript,
+            "js" | "jsx" | "mjs" | "cjs" => FileType::JavaScript,
+            "py" | "pyi" => FileType::Python,
+            "go" => FileType::Go,
+            "java" => FileType::Java,
+            "cs" => FileType::CSharp,
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" => FileType::Cpp,
+            "c" | "h" => FileType::C,
+            "rb" => FileType::Ruby,
+            "md" | "mdx" => FileType::Markdown,
+            "json" => FileType::Json,
+            "yaml" | "yml" => FileType::Yaml,
+            "toml" => FileType::Toml,
+            "html" | "htm" => FileType::Html,
+            "css" | "scss" | "sass" | "less" => FileType::Css,
+            "sql" => FileType::Sql,
+            "sh" | "bash" | "zsh" | "fish" | "ps1" => FileType::Shell,
+            other => FileType::Other(other.to_string()),
+        }
+    }
+
+    /// Check if this is a code file (vs config/doc)
+    pub fn is_code(&self) -> bool {
+        matches!(
+            self,
+            FileType::Rust
+                | FileType::TypeScript
+                | FileType::JavaScript
+                | FileType::Python
+                | FileType::Go
+                | FileType::Java
+                | FileType::CSharp
+                | FileType::Cpp
+                | FileType::C
+                | FileType::Ruby
+                | FileType::Shell
+        )
+    }
+}
+
+impl Default for FileType {
+    fn default() -> Self {
+        FileType::Other("unknown".to_string())
+    }
+}
+
+/// How we learned about this file
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LearnedFrom {
+    /// User triggered batch indexing
+    ManualIndex,
+    /// AI read the file content
+    ReadAccess,
+    /// AI edited the file
+    EditAccess,
+    /// File was mentioned in conversation
+    Mentioned,
+}
+
+impl Default for LearnedFrom {
+    fn default() -> Self {
+        LearnedFrom::ManualIndex
+    }
+}
+
+/// Learned knowledge about a file in a codebase
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMemory {
+    /// Unique identifier
+    pub id: FileMemoryId,
+
+    /// Project this file belongs to
+    pub project_id: ProjectId,
+
+    /// User who owns this file memory
+    pub user_id: String,
+
+    // =========================================================================
+    // FILE IDENTIFICATION
+    // =========================================================================
+    /// Relative path from codebase root (e.g., "src/main.rs")
+    pub path: String,
+
+    /// Absolute path for file access
+    pub absolute_path: String,
+
+    /// SHA256 hash of content (for change detection)
+    pub file_hash: String,
+
+    // =========================================================================
+    // LEARNED CONTENT
+    // =========================================================================
+    /// AI-generated summary of what this file does
+    #[serde(default)]
+    pub summary: String,
+
+    /// Key items in the file (functions, classes, exports, constants)
+    #[serde(default)]
+    pub key_items: Vec<String>,
+
+    /// High-level purpose of this file
+    #[serde(default)]
+    pub purpose: Option<String>,
+
+    /// Related files (imports, dependencies)
+    #[serde(default)]
+    pub connections: Vec<String>,
+
+    /// Embedding vector for semantic search
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+
+    // =========================================================================
+    // METADATA
+    // =========================================================================
+    /// Detected file type
+    pub file_type: FileType,
+
+    /// Number of lines in the file
+    pub line_count: usize,
+
+    /// File size in bytes
+    pub size_bytes: u64,
+
+    // =========================================================================
+    // USAGE TRACKING
+    // =========================================================================
+    /// Number of times this file was accessed by AI
+    #[serde(default)]
+    pub access_count: u32,
+
+    /// When this file was last accessed
+    pub last_accessed: DateTime<Utc>,
+
+    /// When this FileMemory was created
+    pub created_at: DateTime<Utc>,
+
+    /// When this FileMemory was last updated
+    pub updated_at: DateTime<Utc>,
+
+    /// How we learned about this file
+    #[serde(default)]
+    pub learned_from: LearnedFrom,
+}
+
+impl FileMemory {
+    /// Create a new FileMemory from a file path
+    pub fn new(
+        project_id: ProjectId,
+        user_id: String,
+        path: String,
+        absolute_path: String,
+        file_hash: String,
+        file_type: FileType,
+        line_count: usize,
+        size_bytes: u64,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: FileMemoryId::new(),
+            project_id,
+            user_id,
+            path,
+            absolute_path,
+            file_hash,
+            summary: String::new(),
+            key_items: Vec::new(),
+            purpose: None,
+            connections: Vec::new(),
+            embedding: None,
+            file_type,
+            line_count,
+            size_bytes,
+            access_count: 1,
+            last_accessed: now,
+            created_at: now,
+            updated_at: now,
+            learned_from: LearnedFrom::ManualIndex,
+        }
+    }
+
+    /// Record an access to this file
+    pub fn record_access(&mut self, learned_from: LearnedFrom) {
+        self.access_count += 1;
+        self.last_accessed = Utc::now();
+        self.updated_at = Utc::now();
+        // Upgrade the learned_from if more meaningful
+        // EditAccess > ReadAccess > Mentioned > ManualIndex
+        let should_upgrade = match (&self.learned_from, &learned_from) {
+            (LearnedFrom::ManualIndex, _) => true,
+            (LearnedFrom::Mentioned, LearnedFrom::ReadAccess | LearnedFrom::EditAccess) => true,
+            (LearnedFrom::ReadAccess, LearnedFrom::EditAccess) => true,
+            _ => false,
+        };
+        if should_upgrade {
+            self.learned_from = learned_from;
+        }
+    }
+
+    /// Check if file content has changed (different hash)
+    pub fn has_changed(&self, new_hash: &str) -> bool {
+        self.file_hash != new_hash
+    }
+
+    /// Get a heat score (0-3) based on access count
+    /// Used for TUI display: ● (1), ●● (2), ●●● (3+)
+    pub fn heat_score(&self) -> u8 {
+        match self.access_count {
+            0..=2 => 1,
+            3..=10 => 2,
+            _ => 3,
+        }
+    }
+}
+
+/// Configuration for codebase indexing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodebaseConfig {
+    /// Maximum files to index per project
+    #[serde(default = "default_max_files")]
+    pub max_files_per_project: usize,
+
+    /// Maximum file size to embed (bytes)
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size_for_embedding: usize,
+
+    /// Patterns to exclude from indexing
+    #[serde(default = "default_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+
+    /// Whether to skip binary files
+    #[serde(default = "default_true")]
+    pub skip_binary: bool,
+}
+
+fn default_max_files() -> usize {
+    1000
+}
+
+fn default_max_file_size() -> usize {
+    524288 // 500KB
+}
+
+fn default_exclude_patterns() -> Vec<String> {
+    vec![
+        "target/".to_string(),
+        "node_modules/".to_string(),
+        ".git/".to_string(),
+        "__pycache__/".to_string(),
+        "dist/".to_string(),
+        "build/".to_string(),
+        "*.lock".to_string(),
+        "*.min.js".to_string(),
+        "*.min.css".to_string(),
+        "*.map".to_string(),
+    ]
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CodebaseConfig {
+    fn default() -> Self {
+        Self {
+            max_files_per_project: default_max_files(),
+            max_file_size_for_embedding: default_max_file_size(),
+            exclude_patterns: default_exclude_patterns(),
+            skip_binary: true,
+        }
+    }
+}
+
+/// Result of scanning a codebase directory
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodebaseScanResult {
+    /// Total files found (before filtering)
+    pub total_files: usize,
+    /// Files that passed filtering
+    pub eligible_files: usize,
+    /// Files skipped (excluded patterns, binary, etc.)
+    pub skipped_files: usize,
+    /// Reasons for skipping (pattern -> count)
+    pub skip_reasons: HashMap<String, usize>,
+    /// Whether limit was reached
+    pub limit_reached: bool,
+    /// List of eligible file paths
+    pub file_paths: Vec<String>,
+}
+
+/// Progress update during indexing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexingProgress {
+    /// Total files to process
+    pub total: usize,
+    /// Files processed so far
+    pub processed: usize,
+    /// Current file being processed
+    pub current_file: Option<String>,
+    /// Files that errored
+    pub errors: Vec<String>,
+    /// Whether indexing is complete
+    pub complete: bool,
+}
+
+impl IndexingProgress {
+    pub fn new(total: usize) -> Self {
+        Self {
+            total,
+            processed: 0,
+            current_file: None,
+            errors: Vec::new(),
+            complete: false,
+        }
+    }
+
+    pub fn percentage(&self) -> f32 {
+        if self.total == 0 {
+            100.0
+        } else {
+            (self.processed as f32 / self.total as f32) * 100.0
+        }
     }
 }
 

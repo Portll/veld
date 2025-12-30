@@ -1,6 +1,6 @@
 use crate::types::{
-    AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiPriority, TuiProject, TuiTodo,
-    TuiTodoComment, TuiTodoCommentType, TuiTodoStatus,
+    AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiFileMemory, TuiPriority,
+    TuiProject, TuiTodo, TuiTodoComment, TuiTodoCommentType, TuiTodoStatus,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -1388,4 +1388,196 @@ pub async fn reject_lineage_edge(
         .map_err(|e| format!("Parse error: {}", e))?;
 
     Ok(resp.message)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILE MEMORY / CODEBASE INTEGRATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Fetch files for a project
+pub async fn fetch_project_files(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    project_id: &str,
+) -> Result<Vec<TuiFileMemory>, String> {
+    let client = Client::new();
+    let url = format!("{}/api/projects/{}/files", base_url, project_id);
+
+    #[derive(serde::Serialize)]
+    struct FilesRequest {
+        user_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FilesResponse {
+        files: Vec<FileApiItem>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FileApiItem {
+        id: String,
+        path: String,
+        file_type: String,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        key_items: Vec<String>,
+        #[serde(default)]
+        access_count: u32,
+        #[serde(default)]
+        last_accessed: String,
+        #[serde(default)]
+        heat_score: u8,
+    }
+
+    let request = FilesRequest {
+        user_id: user_id.to_string(),
+        limit: Some(50), // Limit to 50 files for TUI display
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let resp: FilesResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(resp
+        .files
+        .into_iter()
+        .map(|f| TuiFileMemory {
+            id: f.id,
+            path: f.path,
+            file_type: f.file_type,
+            summary: f.summary,
+            key_items: f.key_items,
+            access_count: f.access_count,
+            last_accessed: f.last_accessed,
+            heat_score: f.heat_score,
+        })
+        .collect())
+}
+
+/// Scan project codebase (discover files)
+pub async fn scan_project_codebase(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    project_id: &str,
+    root_path: &str,
+) -> Result<usize, String> {
+    let client = Client::new();
+    let url = format!("{}/api/projects/{}/scan", base_url, project_id);
+
+    #[derive(serde::Serialize)]
+    struct ScanRequest {
+        user_id: String,
+        root_path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_files: Option<usize>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ScanResponse {
+        #[serde(default)]
+        file_paths: Vec<String>,
+    }
+
+    let request = ScanRequest {
+        user_id: user_id.to_string(),
+        root_path: root_path.to_string(),
+        max_files: Some(200),
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let resp: ScanResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(resp.file_paths.len())
+}
+
+/// Index project codebase (extract summaries and key items)
+pub async fn index_project_codebase(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    project_id: &str,
+    root_path: &str,
+) -> Result<usize, String> {
+    let client = Client::new();
+    let url = format!("{}/api/projects/{}/index", base_url, project_id);
+
+    #[derive(serde::Serialize)]
+    struct IndexRequest {
+        user_id: String,
+        root_path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        force: Option<bool>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct IndexResponse {
+        #[serde(default)]
+        files_indexed: usize,
+    }
+
+    let request = IndexRequest {
+        user_id: user_id.to_string(),
+        root_path: root_path.to_string(),
+        force: Some(false),
+    };
+
+    let response = client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, body));
+    }
+
+    let resp: IndexResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(resp.files_indexed)
 }

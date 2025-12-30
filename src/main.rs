@@ -220,6 +220,7 @@ use memory::{
     process_implicit_feedback,
     prospective::ProspectiveStore,
     todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore,
+    FileMemoryStats, FileMemoryStore, IndexingResult,
     GraphStats as VisualizationStats, Memory, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
     PendingFeedback, Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask,
     ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger, Query as MemoryQuery, Recurrence,
@@ -416,6 +417,10 @@ pub struct MultiUserMemoryManager {
     /// Handles todos, projects, and task management
     todo_store: Arc<TodoStore>,
 
+    /// File memory store for codebase integration (MEM-29)
+    /// Stores learned knowledge about files in codebases
+    file_store: Arc<FileMemoryStore>,
+
     /// Implicit feedback store for memory reinforcement
     feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
 
@@ -552,6 +557,10 @@ impl MultiUserMemoryManager {
         let todo_store = Arc::new(TodoStore::new(&base_path)?);
         info!("📋 Todo store initialized");
 
+        // Initialize file memory store (codebase integration)
+        let file_store = Arc::new(FileMemoryStore::new(&base_path)?);
+        info!("📁 File memory store initialized");
+
         // Initialize feedback store with persistence
         let feedback_store = Arc::new(parking_lot::RwLock::new(
             FeedbackStore::with_persistence(base_path.join("feedback")).unwrap_or_else(|e| {
@@ -576,6 +585,7 @@ impl MultiUserMemoryManager {
             streaming_extractor,
             prospective_store,
             todo_store,
+            file_store,
             feedback_store,
             context_sessions: Arc::new(DashMap::new()),
             context_broadcaster: {
@@ -10772,6 +10782,402 @@ async fn delete_project(
     }))
 }
 
+// =============================================================================
+// FILE MEMORY ENDPOINTS (MEM-33, MEM-34, MEM-35)
+// Codebase integration - learned knowledge about files
+// =============================================================================
+
+/// Request to list files for a project
+#[derive(Debug, Deserialize)]
+struct ListFilesRequest {
+    user_id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Request to scan/index a codebase
+#[derive(Debug, Deserialize)]
+struct IndexCodebaseRequest {
+    user_id: String,
+    /// Path to the codebase root directory
+    codebase_path: String,
+    /// Force re-index even if already indexed
+    #[serde(default)]
+    force: bool,
+}
+
+/// Request to search files
+#[derive(Debug, Deserialize)]
+struct SearchFilesRequest {
+    user_id: String,
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+/// Response for file list operations
+#[derive(Debug, Serialize)]
+struct FileListResponse {
+    success: bool,
+    files: Vec<FileMemorySummary>,
+    total: usize,
+}
+
+/// Summary of a file memory (for list responses)
+#[derive(Debug, Serialize)]
+struct FileMemorySummary {
+    id: String,
+    path: String,
+    file_type: String,
+    summary: String,
+    key_items: Vec<String>,
+    access_count: u32,
+    last_accessed: String,
+    heat_score: u8,
+}
+
+/// Response for scan operation
+#[derive(Debug, Serialize)]
+struct ScanResponse {
+    success: bool,
+    total_files: usize,
+    eligible_files: usize,
+    skipped_files: usize,
+    limit_reached: bool,
+    message: String,
+}
+
+/// Response for index operation
+#[derive(Debug, Serialize)]
+struct IndexResponse {
+    success: bool,
+    result: IndexingResult,
+    message: String,
+}
+
+/// Response for file stats
+#[derive(Debug, Serialize)]
+struct FileStatsResponse {
+    success: bool,
+    stats: FileMemoryStats,
+}
+
+/// POST /api/projects/{project_id}/files - List files for a project
+async fn list_project_files(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<ListFilesRequest>,
+) -> Result<Json<FileListResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Find project
+    let project = state
+        .todo_store
+        .find_project_by_name(&req.user_id, &project_id)
+        .map_err(AppError::Internal)?
+        .or_else(|| {
+            uuid::Uuid::parse_str(&project_id).ok().and_then(|uuid| {
+                state
+                    .todo_store
+                    .get_project(&req.user_id, &ProjectId(uuid))
+                    .ok()
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
+
+    let files = state
+        .file_store
+        .list_by_project(&req.user_id, &project.id, req.limit)
+        .map_err(AppError::Internal)?;
+
+    let total = files.len();
+    let summaries: Vec<FileMemorySummary> = files
+        .into_iter()
+        .map(|f| {
+            let heat_score = f.heat_score();
+            FileMemorySummary {
+                id: f.id.0.to_string(),
+                path: f.path,
+                file_type: format!("{:?}", f.file_type),
+                summary: f.summary,
+                key_items: f.key_items,
+                access_count: f.access_count,
+                last_accessed: f.last_accessed.to_rfc3339(),
+                heat_score,
+            }
+        })
+        .collect();
+
+    Ok(Json(FileListResponse {
+        success: true,
+        files: summaries,
+        total,
+    }))
+}
+
+/// POST /api/projects/{project_id}/scan - Scan codebase (preview before indexing)
+async fn scan_project_codebase(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<IndexCodebaseRequest>,
+) -> Result<Json<ScanResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Find project
+    let project = state
+        .todo_store
+        .find_project_by_name(&req.user_id, &project_id)
+        .map_err(AppError::Internal)?
+        .or_else(|| {
+            uuid::Uuid::parse_str(&project_id).ok().and_then(|uuid| {
+                state
+                    .todo_store
+                    .get_project(&req.user_id, &ProjectId(uuid))
+                    .ok()
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
+
+    // Verify path exists
+    let codebase_path = std::path::Path::new(&req.codebase_path);
+    if !codebase_path.exists() {
+        return Err(AppError::InvalidInput {
+            field: "codebase_path".to_string(),
+            reason: format!("Codebase path does not exist: {}", req.codebase_path),
+        });
+    }
+    if !codebase_path.is_dir() {
+        return Err(AppError::InvalidInput {
+            field: "codebase_path".to_string(),
+            reason: format!("Codebase path is not a directory: {}", req.codebase_path),
+        });
+    }
+
+    // Scan the codebase
+    let scan_result = state
+        .file_store
+        .scan_codebase(codebase_path, None)
+        .map_err(AppError::Internal)?;
+
+    let message = if scan_result.limit_reached {
+        format!(
+            "Found {} eligible files (limit reached). {} files skipped.",
+            scan_result.eligible_files, scan_result.skipped_files
+        )
+    } else {
+        format!(
+            "Found {} eligible files. {} files skipped.",
+            scan_result.eligible_files, scan_result.skipped_files
+        )
+    };
+
+    tracing::info!(
+        user_id = %req.user_id,
+        project_id = %project.id.0,
+        path = %req.codebase_path,
+        eligible = scan_result.eligible_files,
+        skipped = scan_result.skipped_files,
+        "Scanned codebase"
+    );
+
+    Ok(Json(ScanResponse {
+        success: true,
+        total_files: scan_result.total_files,
+        eligible_files: scan_result.eligible_files,
+        skipped_files: scan_result.skipped_files,
+        limit_reached: scan_result.limit_reached,
+        message,
+    }))
+}
+
+/// POST /api/projects/{project_id}/index - Index codebase files
+async fn index_project_codebase(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<IndexCodebaseRequest>,
+) -> Result<Json<IndexResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Find project
+    let mut project = state
+        .todo_store
+        .find_project_by_name(&req.user_id, &project_id)
+        .map_err(AppError::Internal)?
+        .or_else(|| {
+            uuid::Uuid::parse_str(&project_id).ok().and_then(|uuid| {
+                state
+                    .todo_store
+                    .get_project(&req.user_id, &ProjectId(uuid))
+                    .ok()
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
+
+    // Check if already indexed
+    if project.codebase_indexed && !req.force {
+        return Err(AppError::InvalidInput {
+            field: "force".to_string(),
+            reason: "Codebase already indexed. Use force=true to re-index.".to_string(),
+        });
+    }
+
+    // Verify path exists
+    let codebase_path = std::path::Path::new(&req.codebase_path);
+    if !codebase_path.exists() {
+        return Err(AppError::InvalidInput {
+            field: "codebase_path".to_string(),
+            reason: format!("Codebase path does not exist: {}", req.codebase_path),
+        });
+    }
+
+    // Delete existing files if re-indexing
+    if req.force && project.codebase_indexed {
+        state
+            .file_store
+            .delete_project_files(&req.user_id, &project.id)
+            .map_err(AppError::Internal)?;
+    }
+
+    // Index the codebase (without embeddings for now - faster)
+    let result = state
+        .file_store
+        .index_codebase(codebase_path, &project.id, &req.user_id, None)
+        .map_err(AppError::Internal)?;
+
+    // Update project with codebase info
+    project.codebase_path = Some(req.codebase_path.clone());
+    project.codebase_indexed = true;
+    project.codebase_indexed_at = Some(chrono::Utc::now());
+    project.codebase_file_count = result.indexed_files;
+
+    state
+        .todo_store
+        .store_project(&project)
+        .map_err(AppError::Internal)?;
+
+    let message = format!(
+        "Indexed {} files ({} skipped, {} errors)",
+        result.indexed_files, result.skipped_files, result.errors.len()
+    );
+
+    // Emit SSE event
+    state.emit_event(MemoryEvent {
+        event_type: "CODEBASE_INDEXED".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(project.id.0.to_string()),
+        content_preview: Some(format!("{} files indexed", result.indexed_files)),
+        memory_type: Some("Codebase".to_string()),
+        importance: None,
+        count: Some(result.indexed_files),
+    });
+
+    tracing::info!(
+        user_id = %req.user_id,
+        project_id = %project.id.0,
+        path = %req.codebase_path,
+        indexed = result.indexed_files,
+        skipped = result.skipped_files,
+        errors = result.errors.len(),
+        "Indexed codebase"
+    );
+
+    Ok(Json(IndexResponse {
+        success: true,
+        result,
+        message,
+    }))
+}
+
+/// POST /api/projects/{project_id}/files/search - Search files semantically
+async fn search_project_files(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<SearchFilesRequest>,
+) -> Result<Json<FileListResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Find project
+    let project = state
+        .todo_store
+        .find_project_by_name(&req.user_id, &project_id)
+        .map_err(AppError::Internal)?
+        .or_else(|| {
+            uuid::Uuid::parse_str(&project_id).ok().and_then(|uuid| {
+                state
+                    .todo_store
+                    .get_project(&req.user_id, &ProjectId(uuid))
+                    .ok()
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
+
+    // For now, simple text search on path and key_items
+    // TODO: Add semantic search using embeddings
+    let all_files = state
+        .file_store
+        .list_by_project(&req.user_id, &project.id, None)
+        .map_err(AppError::Internal)?;
+
+    let query_lower = req.query.to_lowercase();
+    let matching_files: Vec<_> = all_files
+        .into_iter()
+        .filter(|f| {
+            f.path.to_lowercase().contains(&query_lower)
+                || f.key_items.iter().any(|k| k.to_lowercase().contains(&query_lower))
+                || f.summary.to_lowercase().contains(&query_lower)
+        })
+        .take(req.limit)
+        .collect();
+
+    let total = matching_files.len();
+    let summaries: Vec<FileMemorySummary> = matching_files
+        .into_iter()
+        .map(|f| {
+            let heat_score = f.heat_score();
+            FileMemorySummary {
+                id: f.id.0.to_string(),
+                path: f.path,
+                file_type: format!("{:?}", f.file_type),
+                summary: f.summary,
+                key_items: f.key_items,
+                access_count: f.access_count,
+                last_accessed: f.last_accessed.to_rfc3339(),
+                heat_score,
+            }
+        })
+        .collect();
+
+    Ok(Json(FileListResponse {
+        success: true,
+        files: summaries,
+        total,
+    }))
+}
+
+/// GET /api/files/stats - Get file memory statistics
+async fn get_file_stats(
+    State(state): State<AppState>,
+    Query(query): Query<TodoQuery>,
+) -> Result<Json<FileStatsResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    let stats = state
+        .file_store
+        .stats(&query.user_id)
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(FileStatsResponse { success: true, stats }))
+}
+
 /// POST /api/todos/stats - Get todo statistics
 async fn get_todo_stats(
     State(state): State<AppState>,
@@ -11089,6 +11495,12 @@ async fn main() -> Result<()> {
         .route("/api/projects/{project_id}", get(get_project))
         .route("/api/projects/{project_id}/update", post(update_project))
         .route("/api/projects/{project_id}", delete(delete_project))
+        // File memory / Codebase integration endpoints (MEM-33, MEM-34, MEM-35)
+        .route("/api/projects/{project_id}/files", post(list_project_files))
+        .route("/api/projects/{project_id}/scan", post(scan_project_codebase))
+        .route("/api/projects/{project_id}/index", post(index_project_codebase))
+        .route("/api/projects/{project_id}/files/search", post(search_project_files))
+        .route("/api/files/stats", get(get_file_stats))
         .route("/api/todos/stats", post(get_todo_stats))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))

@@ -1380,6 +1380,65 @@ impl TuiProject {
     }
 }
 
+/// File memory summary for TUI display (codebase integration)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiFileMemory {
+    pub id: String,
+    pub path: String,
+    pub file_type: String,
+    pub summary: String,
+    pub key_items: Vec<String>,
+    pub access_count: u32,
+    pub last_accessed: String,
+    pub heat_score: u8,
+}
+
+impl TuiFileMemory {
+    /// Get icon for file type
+    pub fn type_icon(&self) -> &'static str {
+        match self.file_type.to_lowercase().as_str() {
+            "rust" => "🦀",
+            "typescript" | "javascript" => "📜",
+            "python" => "🐍",
+            "go" => "🐹",
+            "java" => "☕",
+            "c" | "cpp" | "c++" => "⚙️",
+            "markdown" => "📝",
+            "json" | "yaml" | "toml" => "📋",
+            _ => "📄",
+        }
+    }
+
+    /// Get heat indicator (🔥 for hot files)
+    pub fn heat_indicator(&self) -> &'static str {
+        match self.heat_score {
+            3 => "🔥",
+            2 => "🌡️",
+            _ => "",
+        }
+    }
+
+    /// Get short path (last 2 components)
+    pub fn short_path(&self) -> String {
+        let parts: Vec<&str> = self.path.split(['/', '\\']).collect();
+        if parts.len() <= 2 {
+            self.path.clone()
+        } else {
+            parts[parts.len() - 2..].join("/")
+        }
+    }
+}
+
+/// Codebase scan result for TUI
+#[derive(Debug, Clone, Default)]
+pub struct TuiCodebaseScan {
+    pub project_id: String,
+    pub file_count: usize,
+    pub scanning: bool,
+    pub indexing: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TodoStats {
     pub total: u32,
@@ -1512,6 +1571,24 @@ pub struct AppState {
     pub activity_focused: bool,
     /// Which detail column is focused (0 = notes/details, 1 = activity)
     pub detail_focus_column: u8,
+    /// Project files cache (project_id -> files)
+    pub project_files: HashMap<String, Vec<TuiFileMemory>>,
+    /// Projects with files section expanded (show codebase files)
+    pub files_expanded_projects: std::collections::HashSet<String>,
+    /// Current codebase scan state
+    pub codebase_scan: Option<TuiCodebaseScan>,
+    /// Selected file index in expanded project
+    pub selected_file: usize,
+    /// Files loading state (project_id being loaded)
+    pub files_loading: Option<String>,
+    /// Projects that have indexed codebase (for status indicator)
+    pub indexed_projects: std::collections::HashSet<String>,
+    /// Codebase scan in progress (project_id)
+    pub scanning_project: Option<String>,
+    /// File popup visible
+    pub file_popup_visible: bool,
+    /// File popup scroll offset
+    pub file_popup_scroll: usize,
 }
 
 /// Claude Code context session status
@@ -1607,6 +1684,15 @@ impl AppState {
             activity_scroll: 0,
             activity_focused: false,
             detail_focus_column: 0,
+            project_files: HashMap::new(),
+            files_expanded_projects: std::collections::HashSet::new(),
+            codebase_scan: None,
+            selected_file: 0,
+            files_loading: None,
+            indexed_projects: std::collections::HashSet::new(),
+            scanning_project: None,
+            file_popup_visible: false,
+            file_popup_scroll: 0,
         }
     }
 
@@ -2301,6 +2387,74 @@ impl AppState {
     /// Toggle expand_sections mode to show all todos in sections
     pub fn toggle_expand_sections(&mut self) {
         self.expand_sections = !self.expand_sections;
+    }
+
+    /// Toggle files display for a project
+    pub fn toggle_files_expansion(&mut self, project_id: &str) {
+        if self.files_expanded_projects.contains(project_id) {
+            self.files_expanded_projects.remove(project_id);
+        } else {
+            self.files_expanded_projects.insert(project_id.to_string());
+        }
+    }
+
+    /// Check if files are expanded for a project
+    pub fn is_files_expanded(&self, project_id: &str) -> bool {
+        self.files_expanded_projects.contains(project_id)
+    }
+
+    /// Get files for a project
+    pub fn get_project_files(&self, project_id: &str) -> Option<&Vec<TuiFileMemory>> {
+        self.project_files.get(project_id)
+    }
+
+    /// Set files for a project
+    pub fn set_project_files(&mut self, project_id: &str, files: Vec<TuiFileMemory>) {
+        self.project_files.insert(project_id.to_string(), files);
+        self.files_loading = None;
+    }
+
+    /// Check if files are loading for a project
+    pub fn is_files_loading(&self, project_id: &str) -> bool {
+        self.files_loading.as_ref().map(|id| id == project_id).unwrap_or(false)
+    }
+
+    /// Start loading files for a project
+    pub fn start_files_loading(&mut self, project_id: &str) {
+        self.files_loading = Some(project_id.to_string());
+    }
+
+    /// Check if project has indexed codebase
+    pub fn is_project_indexed(&self, project_id: &str) -> bool {
+        self.indexed_projects.contains(project_id)
+    }
+
+    /// Mark project as indexed
+    pub fn mark_project_indexed(&mut self, project_id: &str) {
+        self.indexed_projects.insert(project_id.to_string());
+    }
+
+    /// Check if scanning is in progress for a project
+    pub fn is_scanning(&self, project_id: &str) -> bool {
+        self.scanning_project.as_ref().map(|id| id == project_id).unwrap_or(false)
+    }
+
+    /// Start scanning a project
+    pub fn start_scanning(&mut self, project_id: &str) {
+        self.scanning_project = Some(project_id.to_string());
+    }
+
+    /// Stop scanning
+    pub fn stop_scanning(&mut self) {
+        self.scanning_project = None;
+    }
+
+    /// Toggle file popup
+    pub fn toggle_file_popup(&mut self) {
+        self.file_popup_visible = !self.file_popup_visible;
+        if self.file_popup_visible {
+            self.file_popup_scroll = 0;
+        }
     }
 
     /// Get in-progress todos for NOW bar

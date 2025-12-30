@@ -8,6 +8,7 @@
 
 pub mod compression;
 pub mod context;
+pub mod files;
 pub mod introspection;
 pub mod prospective;
 pub mod query_parser;
@@ -83,6 +84,7 @@ pub use crate::memory::retrieval::{
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
+pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]

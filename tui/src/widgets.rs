@@ -1,8 +1,8 @@
 use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, SHODH_GRADIENT, SHODH_TEXT};
 use crate::types::{
     AppState, DisplayEvent, FocusPanel, LineageEdge, LineageNode, LineageTrace, SearchMode,
-    SearchResult, TuiPriority, TuiProject, TuiTodo, TuiTodoComment, TuiTodoCommentType,
-    TuiTodoStatus, ViewMode, VERSION,
+    SearchResult, TuiFileMemory, TuiPriority, TuiProject, TuiTodo, TuiTodoComment,
+    TuiTodoCommentType, TuiTodoStatus, ViewMode, VERSION,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -1149,6 +1149,191 @@ fn render_projects_view(f: &mut Frame, area: Rect, state: &AppState) {
 
     // Render lineage chain at bottom
     render_lineage_chain(f, main_split[2], state);
+
+    // Render file popup if visible
+    if state.file_popup_visible {
+        render_file_popup(f, area, state);
+    }
+}
+
+/// Render file explorer popup (centered overlay)
+fn render_file_popup(f: &mut Frame, area: Rect, state: &AppState) {
+    // Create centered popup area (70% width, 80% height)
+    let popup_width = (area.width as f32 * 0.7) as u16;
+    let popup_height = (area.height as f32 * 0.8) as u16;
+    let popup_x = (area.width - popup_width) / 2;
+    let popup_y = (area.height - popup_height) / 2;
+
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    // Clear background with dark overlay
+    let overlay = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 15)));
+    f.render_widget(overlay, popup_area);
+
+    // Get project name and files
+    let project_name = state
+        .selected_project_id()
+        .and_then(|pid| state.projects.iter().find(|p| p.id == pid))
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "Project".to_string());
+
+    let files = state
+        .selected_project_id()
+        .and_then(|pid| state.get_project_files(&pid));
+
+    // Build popup content
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" 📁 {} - Codebase Files ", project_name),
+            Style::default()
+                .fg(SAFFRON)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from("─".repeat(popup_width as usize - 2)));
+
+    if let Some(files) = files {
+        if files.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No files indexed. Press S to scan codebase.",
+                Style::default().fg(TEXT_DISABLED),
+            )));
+        } else {
+            // File stats
+            let total = files.len();
+            let hot_count = files.iter().filter(|f| f.heat_score >= 2).count();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} files", total),
+                    Style::default().fg(TEXT_SECONDARY),
+                ),
+                Span::styled(" │ ", Style::default().fg(Color::Rgb(60, 60, 60))),
+                Span::styled(
+                    format!("🔥 {} hot", hot_count),
+                    Style::default().fg(Color::Rgb(255, 140, 50)),
+                ),
+            ]));
+            lines.push(Line::from(""));
+
+            // Column headers
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<4} ", "Type"),
+                    Style::default().fg(TEXT_DISABLED),
+                ),
+                Span::styled(
+                    format!("{:<40} ", "Path"),
+                    Style::default().fg(TEXT_DISABLED),
+                ),
+                Span::styled("Heat ", Style::default().fg(TEXT_DISABLED)),
+                Span::styled("Summary", Style::default().fg(TEXT_DISABLED)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(popup_width as usize - 2),
+                Style::default().fg(Color::Rgb(40, 40, 40)),
+            )));
+
+            // File list with scroll
+            let visible_height = popup_height.saturating_sub(10) as usize;
+            let scroll = state.file_popup_scroll;
+            for (i, file) in files.iter().skip(scroll).take(visible_height).enumerate() {
+                let is_selected = i == state.selected_file.saturating_sub(scroll);
+                let bg = if is_selected {
+                    SELECTION_BG
+                } else {
+                    Color::Reset
+                };
+
+                let icon = file.type_icon();
+                let heat = file.heat_indicator();
+                let path = truncate(&file.short_path(), 38);
+                let summary = truncate(&file.summary, 30);
+
+                // Type color
+                let type_color = match file.file_type.to_lowercase().as_str() {
+                    "rust" => Color::Rgb(220, 160, 120),
+                    "typescript" | "javascript" => Color::Rgb(100, 180, 220),
+                    "python" => Color::Rgb(160, 200, 100),
+                    "go" => Color::Rgb(100, 200, 220),
+                    _ => TEXT_SECONDARY,
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if is_selected { " ▸" } else { "  " },
+                        Style::default().fg(SAFFRON).bg(bg),
+                    ),
+                    Span::styled(format!(" {} ", icon), Style::default().fg(type_color).bg(bg)),
+                    Span::styled(
+                        format!("{:<40} ", path),
+                        Style::default().fg(TEXT_PRIMARY).bg(bg),
+                    ),
+                    Span::styled(
+                        format!("{:<5}", heat),
+                        Style::default().fg(Color::Rgb(255, 140, 50)).bg(bg),
+                    ),
+                    Span::styled(summary, Style::default().fg(TEXT_SECONDARY).bg(bg)),
+                ]));
+            }
+
+            // Scroll indicator
+            if files.len() > visible_height {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ↑↓ to scroll ({}/{})",
+                        scroll + 1,
+                        files.len().saturating_sub(visible_height) + 1
+                    ),
+                    Style::default().fg(TEXT_DISABLED),
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Loading files...",
+            Style::default().fg(TEXT_DISABLED),
+        )));
+    }
+
+    // Footer
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Esc",
+            Style::default()
+                .fg(TEXT_SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled(
+            "S",
+            Style::default()
+                .fg(TEXT_SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" rescan  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(TEXT_SECONDARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" view file", Style::default().fg(Color::Rgb(60, 60, 60))),
+    ]));
+
+    // Render popup with border
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(80, 80, 100)))
+            .style(Style::default().bg(Color::Rgb(20, 20, 25))),
+    );
+    f.render_widget(Clear, popup_area);
+    f.render_widget(popup, popup_area);
 }
 
 /// Full-width status ribbon showing current work context
@@ -1598,18 +1783,81 @@ fn render_projects_sidebar(f: &mut Frame, area: Rect, state: &AppState) {
         }
     }
 
+    // FILES section - show files for selected project if expanded
+    if let Some(project_id) = state.selected_project_id() {
+        if state.is_files_expanded(&project_id) && lines.len() < inner.height as usize - 2 {
+            lines.push(Line::from("")); // breathing room
+
+            let files = state.get_project_files(&project_id);
+            let file_count = files.map(|f| f.len()).unwrap_or(0);
+            let loading = state.is_files_loading(&project_id);
+
+            let files_line = "─".repeat(width.saturating_sub(12));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" FILES {} ", file_count),
+                    Style::default().fg(TEXT_SECONDARY),
+                ),
+                Span::styled(files_line, Style::default().fg(Color::Rgb(40, 40, 40))),
+            ]));
+            lines.push(Line::from("")); // breathing room
+
+            if loading {
+                lines.push(Line::from(Span::styled(
+                    "  ◐ Loading files...",
+                    Style::default().fg(TEXT_DISABLED),
+                )));
+            } else if let Some(files) = files {
+                let max_files = if state.expand_sections { files.len() } else { 8 };
+                for (i, file) in files.iter().take(max_files).enumerate() {
+                    if lines.len() >= inner.height as usize {
+                        break;
+                    }
+                    let is_file_selected = i == state.selected_file;
+                    lines.push(render_file_line(file, width, is_file_selected, is_left_focused));
+                }
+                if files.len() > max_files {
+                    lines.push(Line::from(Span::styled(
+                        format!("       +{} more (press e to expand)", files.len() - max_files),
+                        Style::default().fg(TEXT_DISABLED),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  No files indexed. Press S to scan.",
+                    Style::default().fg(TEXT_DISABLED),
+                )));
+            }
+        }
+    }
+
     f.render_widget(Paragraph::new(lines), inner);
 
-    // Footer shows panel focus state
+    // Footer shows panel focus state with codebase actions
     let footer = if is_left_focused {
+        // Check if selected project has codebase indexed
+        let codebase_hint = if let Some(pid) = state.selected_project_id() {
+            if state.is_scanning(&pid) {
+                Span::styled("◐ scanning...", Style::default().fg(SAFFRON))
+            } else if state.is_project_indexed(&pid) {
+                Span::styled("f=files ", Style::default().fg(Color::Rgb(100, 200, 100)))
+            } else {
+                Span::styled("S=scan ", Style::default().fg(Color::Rgb(255, 180, 100)))
+            }
+        } else {
+            Span::styled("", Style::default())
+        };
+
         Line::from(vec![
             Span::styled(" ▸ ", Style::default().fg(SAFFRON)),
             Span::styled("↑↓", Style::default().fg(TEXT_SECONDARY)),
-            Span::styled(" navigate  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled(" nav ", Style::default().fg(Color::Rgb(60, 60, 60))),
             Span::styled("→", Style::default().fg(TEXT_SECONDARY)),
-            Span::styled(" todos  ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled(" todos ", Style::default().fg(Color::Rgb(60, 60, 60))),
             Span::styled("Enter", Style::default().fg(TEXT_SECONDARY)),
-            Span::styled(" expand", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled(" expand ", Style::default().fg(Color::Rgb(60, 60, 60))),
+            Span::styled("│ ", Style::default().fg(Color::Rgb(50, 50, 50))),
+            codebase_hint,
         ])
     } else {
         Line::from(vec![
@@ -2189,6 +2437,59 @@ fn render_action_bar(todo: &TuiTodo) -> Line<'static> {
     spans.push(Span::styled(format!("{:>80}", " "), bar_style));
 
     Line::from(spans)
+}
+
+/// Render file line in sidebar (codebase integration)
+fn render_file_line(
+    file: &TuiFileMemory,
+    width: usize,
+    is_selected: bool,
+    is_panel_focused: bool,
+) -> Line<'static> {
+    // File type icon based on language
+    let icon = file.type_icon();
+    let heat = file.heat_indicator();
+
+    // Selection indicator
+    let sel = if is_selected { "  ▸ " } else { "    " };
+    let sel_color = if is_selected && is_panel_focused {
+        SAFFRON
+    } else if is_selected {
+        TEXT_DISABLED
+    } else {
+        Color::Reset
+    };
+    let bg = if is_selected {
+        SELECTION_BG
+    } else {
+        Color::Reset
+    };
+
+    // Get short path for display
+    let short_path = file.short_path();
+    let path_width = width.saturating_sub(20);
+
+    // File type color
+    let type_color = match file.file_type.to_lowercase().as_str() {
+        "rust" => Color::Rgb(220, 160, 120), // Rust orange
+        "typescript" | "javascript" => Color::Rgb(100, 180, 220), // JS blue
+        "python" => Color::Rgb(160, 200, 100), // Python green
+        "go" => Color::Rgb(100, 200, 220), // Go cyan
+        _ => TEXT_SECONDARY,
+    };
+
+    Line::from(vec![
+        Span::styled(sel, Style::default().fg(sel_color).bg(bg)),
+        Span::styled(format!("{} ", icon), Style::default().fg(type_color).bg(bg)),
+        Span::styled(
+            truncate(&short_path, path_width),
+            Style::default().fg(TEXT_SECONDARY).bg(bg),
+        ),
+        Span::styled(
+            format!(" {}", heat),
+            Style::default().fg(Color::Rgb(255, 140, 50)).bg(bg),
+        ),
+    ])
 }
 
 /// Empty spacer line for visual breathing room between todos
@@ -3014,6 +3315,15 @@ fn render_project_line(
         }
     };
 
+    // Codebase status indicator: 🟢 indexed, 🔴 not indexed, ◐ scanning
+    let (codebase_icon, codebase_color) = if state.is_scanning(&project.id) {
+        ("◐", SAFFRON) // Scanning animation
+    } else if state.is_project_indexed(&project.id) {
+        ("●", Color::Rgb(100, 200, 100)) // Green - indexed
+    } else {
+        ("○", Color::Rgb(100, 100, 100)) // Gray - not indexed
+    };
+
     // Indentation for sub-projects
     let indent_str = "   ".repeat(indent_level);
 
@@ -3026,7 +3336,7 @@ fn render_project_line(
     } else {
         Color::Reset
     };
-    let name_width = width.saturating_sub(28 + indent_level * 3);
+    let name_width = width.saturating_sub(32 + indent_level * 3); // Extra space for codebase icon
     let name = truncate(&project.name, name_width);
 
     // Progress percentage
@@ -3055,14 +3365,18 @@ fn render_project_line(
 
     lines.push(Line::from(vec![
         Span::styled(sel, Style::default().fg(sel_color).bg(bg)),
-        Span::styled(indent_str, Style::default().bg(bg)),
+        Span::styled(indent_str.clone(), Style::default().bg(bg)),
         Span::styled(format!("{} ", folder), Style::default().bg(bg)),
         Span::styled(
             format!("{:<w$}", name, w = name_width),
             Style::default().fg(TEXT_PRIMARY).bg(bg),
         ),
         Span::styled(
-            format!(" {:<12}", status_str),
+            format!(" {} ", codebase_icon),
+            Style::default().fg(codebase_color).bg(bg),
+        ),
+        Span::styled(
+            format!("{:<12}", status_str),
             Style::default().fg(progress_color).bg(bg),
         ),
     ]));

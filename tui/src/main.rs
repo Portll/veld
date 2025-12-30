@@ -908,6 +908,33 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                         continue;
                     }
 
+                    // Handle file popup navigation when visible
+                    if g.file_popup_visible {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('f') => {
+                                g.file_popup_visible = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if g.file_popup_scroll > 0 {
+                                    g.file_popup_scroll -= 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if let Some(pid) = g.selected_project_id() {
+                                    if let Some(files) = g.project_files.get(&pid) {
+                                        let max_scroll = files.len().saturating_sub(10);
+                                        if g.file_popup_scroll < max_scroll {
+                                            g.file_popup_scroll += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('q') => break,
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Normal mode keybindings
                     match key.code {
                         KeyCode::Char('q') => break,
@@ -1106,6 +1133,118 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<()> {
                                 && g.lineage_trace.is_some()
                             {
                                 g.lineage_scroll_right();
+                            }
+                        }
+                        KeyCode::Char('f') => {
+                            // Open file popup for indexed project in Projects view
+                            if matches!(g.view_mode, ViewMode::Projects)
+                                && g.focus_panel == FocusPanel::Left
+                            {
+                                if let Some(project_id) = g.selected_project_id() {
+                                    if g.is_project_indexed(&project_id) {
+                                        // Fetch files if not already loaded
+                                        if g.get_project_files(&project_id).is_none()
+                                            && !g.is_files_loading(&project_id)
+                                        {
+                                            g.start_files_loading(&project_id);
+                                            let user_id = g.current_user.clone();
+                                            let pid = project_id.clone();
+                                            drop(g);
+
+                                            let files_result = crate::stream::fetch_project_files(
+                                                &base_url, &api_key, &user_id, &pid,
+                                            )
+                                            .await;
+
+                                            let mut g = state.lock().await;
+                                            match files_result {
+                                                Ok(files) => {
+                                                    g.set_project_files(&pid, files);
+                                                    // Open popup after loading files
+                                                    g.file_popup_visible = true;
+                                                    g.file_popup_scroll = 0;
+                                                }
+                                                Err(e) => {
+                                                    g.set_error(format!("Files: {}", e));
+                                                    g.files_loading = None;
+                                                }
+                                            }
+                                        } else {
+                                            // Files already loaded, just open popup
+                                            g.file_popup_visible = true;
+                                            g.file_popup_scroll = 0;
+                                        }
+                                    } else {
+                                        g.set_error("Press S to scan codebase first".to_string());
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('S') => {
+                            // Scan codebase for selected project (uppercase S)
+                            if matches!(g.view_mode, ViewMode::Projects)
+                                && g.focus_panel == FocusPanel::Left
+                            {
+                                if let Some(project_id) = g.selected_project_id() {
+                                    let user_id = g.current_user.clone();
+                                    let pid = project_id.clone();
+
+                                    // Set scanning state
+                                    g.start_scanning(&pid);
+                                    g.set_error("Scanning codebase...".to_string());
+                                    drop(g);
+
+                                    // Use current directory as root path
+                                    let root_path =
+                                        std::env::current_dir()
+                                            .map(|p| p.display().to_string())
+                                            .unwrap_or_else(|_| ".".to_string());
+
+                                    // Scan and index
+                                    let scan_result = crate::stream::scan_project_codebase(
+                                        &base_url, &api_key, &user_id, &pid, &root_path,
+                                    )
+                                    .await;
+
+                                    let mut g = state.lock().await;
+                                    match scan_result {
+                                        Ok(count) => {
+                                            g.set_error(format!("Scanned {} files, indexing...", count));
+                                            drop(g);
+
+                                            // Now index the files
+                                            let index_result =
+                                                crate::stream::index_project_codebase(
+                                                    &base_url, &api_key, &user_id, &pid, &root_path,
+                                                )
+                                                .await;
+
+                                            let mut g = state.lock().await;
+                                            g.stop_scanning();
+                                            match index_result {
+                                                Ok(indexed) => {
+                                                    g.set_error(format!(
+                                                        "✓ Indexed {} files. Press f to view.",
+                                                        indexed
+                                                    ));
+                                                    // Mark project as indexed
+                                                    g.mark_project_indexed(&pid);
+                                                    // Clear cached files to force reload
+                                                    g.project_files.remove(&pid);
+                                                    // Auto-expand files section
+                                                    g.files_expanded_projects.insert(pid.clone());
+                                                }
+                                                Err(e) => {
+                                                    g.set_error(format!("Index failed: {}", e));
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            g.stop_scanning();
+                                            g.set_error(format!("Scan failed: {}", e));
+                                        }
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('w') => {
