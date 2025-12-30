@@ -29,6 +29,151 @@ fn get_allcaps_regex() -> &'static regex::Regex {
 fn get_issue_id_regex() -> &'static regex::Regex {
     ISSUE_ID_REGEX.get_or_init(|| regex::Regex::new(r"([A-Z]{2,10}-\d+)").unwrap())
 }
+
+/// Classify experience type from text content using keyword patterns.
+/// Returns the most likely ExperienceType based on linguistic signals.
+fn classify_experience_type(content: &str) -> memory::ExperienceType {
+    let lower = content.to_lowercase();
+
+    // Decision signals - choices, preferences, commitments
+    const DECISION_PATTERNS: &[&str] = &[
+        "decided",
+        "will use",
+        "going with",
+        "chose",
+        "chosen",
+        "prefer",
+        "i'll",
+        "we'll",
+        "let's use",
+        "selected",
+        "picking",
+        "opting for",
+        "the approach is",
+        "strategy is",
+        "plan is to",
+        "going to use",
+    ];
+
+    // Learning signals - new knowledge acquired
+    const LEARNING_PATTERNS: &[&str] = &[
+        "learned",
+        "realized",
+        "discovered",
+        "found out",
+        "turns out",
+        "til ",
+        "today i learned",
+        "now i know",
+        "understanding is",
+        "figured out",
+        "the reason is",
+        "because",
+        "works because",
+        "key insight",
+        "important to note",
+        "remember that",
+    ];
+
+    // Error signals - bugs, issues, problems
+    const ERROR_PATTERNS: &[&str] = &[
+        "bug",
+        "error",
+        "fix",
+        "fixed",
+        "broken",
+        "issue",
+        "problem",
+        "crash",
+        "fail",
+        "exception",
+        "resolved",
+        "workaround",
+        "the solution was",
+        "root cause",
+        "debugging",
+    ];
+
+    // Discovery signals - findings, observations
+    const DISCOVERY_PATTERNS: &[&str] = &[
+        "found",
+        "noticed",
+        "interesting",
+        "surprisingly",
+        "unexpected",
+        "turns out",
+        "apparently",
+        "it seems",
+        "observation",
+    ];
+
+    // Context signals - user preferences, settings, environment
+    const CONTEXT_PATTERNS: &[&str] = &[
+        "prefers",
+        "preference",
+        "wants",
+        "likes",
+        "user",
+        "setting",
+        "configuration",
+        "environment",
+        "workspace",
+        "setup",
+    ];
+
+    // Pattern signals - recurring behaviors, habits
+    const PATTERN_PATTERNS: &[&str] = &[
+        "pattern",
+        "always",
+        "usually",
+        "tends to",
+        "whenever",
+        "every time",
+        "consistently",
+        "habit",
+        "recurring",
+    ];
+
+    // Score each type
+    let decision_score = DECISION_PATTERNS
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
+    let learning_score = LEARNING_PATTERNS
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
+    let error_score = ERROR_PATTERNS.iter().filter(|p| lower.contains(*p)).count();
+    let discovery_score = DISCOVERY_PATTERNS
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
+    let context_score = CONTEXT_PATTERNS
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
+    let pattern_score = PATTERN_PATTERNS
+        .iter()
+        .filter(|p| lower.contains(*p))
+        .count();
+
+    // Find highest scoring type (require at least 1 match)
+    let scores = [
+        (decision_score, memory::ExperienceType::Decision),
+        (learning_score, memory::ExperienceType::Learning),
+        (error_score, memory::ExperienceType::Error),
+        (discovery_score, memory::ExperienceType::Discovery),
+        (context_score, memory::ExperienceType::Context),
+        (pattern_score, memory::ExperienceType::Pattern),
+    ];
+
+    scores
+        .into_iter()
+        .filter(|(score, _)| *score > 0)
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, typ)| typ)
+        .unwrap_or(memory::ExperienceType::Conversation) // Default if no patterns match
+}
 use tower::limit::ConcurrencyLimitLayer;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::services::ServeDir;
@@ -5097,7 +5242,7 @@ async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // 4. Auto-ingest context as Conversation memory (optional)
+    // 4. Auto-ingest context with auto-classified type (optional)
     let ingested_memory_id = if req.auto_ingest && !req.context.trim().is_empty() {
         let context = req.context.clone();
         let memory = memory_system.clone();
@@ -5105,9 +5250,12 @@ async fn proactive_context(
         let memory_id = tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
 
+            // Classify BEFORE moving context into Experience
+            let experience_type = classify_experience_type(&context);
+
             let experience = Experience {
                 content: context,
-                experience_type: ExperienceType::Conversation,
+                experience_type,
                 entities: vec![],
                 tags: vec![],
                 ..Default::default()
@@ -5134,7 +5282,7 @@ async fn proactive_context(
         // Get active todos (todo, in_progress, blocked)
         let all_todos = state
             .todo_store
-            .list_todos(&req.user_id, None)
+            .list_todos_for_user(&req.user_id, None)
             .unwrap_or_default();
 
         all_todos
