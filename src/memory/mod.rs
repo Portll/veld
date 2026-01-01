@@ -75,9 +75,6 @@ pub use crate::memory::lineage::{
     LineageStats, LineageTrace, PostMortem, TraceDirection,
 };
 pub use crate::memory::prospective::ProspectiveStore;
-pub use crate::memory::segmentation::{
-    AtomicMemory, DeduplicationEngine, DeduplicationResult, InputSource, SegmentationEngine,
-};
 pub use crate::memory::replay::{
     InterferenceCheckResult, InterferenceDetector, InterferenceRecord, ReplayCandidate,
     ReplayCycleResult, ReplayManager,
@@ -86,6 +83,9 @@ use crate::memory::retrieval::RetrievalEngine;
 pub use crate::memory::retrieval::{
     AnticipatoryPrefetch, IndexHealth, MemoryGraphStats, PrefetchContext, PrefetchReason,
     PrefetchResult, ReinforcementStats, RetrievalFeedback, RetrievalOutcome, TrackedRetrieval,
+};
+pub use crate::memory::segmentation::{
+    AtomicMemory, DeduplicationEngine, DeduplicationResult, InputSource, SegmentationEngine,
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
@@ -446,6 +446,88 @@ impl MemorySystem {
         // Trigger background consolidation if needed
         self.consolidate_if_needed()?;
 
+        Ok(memory_id)
+    }
+
+    /// Remember with agent context for multi-agent systems
+    ///
+    /// Same as `remember` but tracks which agent created the memory,
+    /// enabling agent-specific retrieval and hierarchical memory tracking.
+    pub fn remember_with_agent(
+        &self,
+        mut experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<MemoryId> {
+        // CRITICAL: Check resource limits before recording to prevent OOM
+        self.check_resource_limits()?;
+
+        let memory_id = MemoryId(Uuid::new_v4());
+
+        // Calculate importance
+        let importance = self.calculate_importance(&experience);
+
+        // PERFORMANCE: Content embedding cache
+        if experience.embeddings.is_none() {
+            let content_hash = Self::sha256_hash(&experience.content);
+            if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
+                experience.embeddings = Some(cached_embedding.clone());
+                EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
+            } else {
+                EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
+                if let Ok(embedding) = self.embedder.encode(&experience.content) {
+                    self.content_cache.insert(content_hash, embedding.clone());
+                    EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.len() as i64);
+                    experience.embeddings = Some(embedding);
+                }
+            }
+        }
+
+        // Create memory with agent context
+        let memory = Arc::new(Memory::new(
+            memory_id.clone(),
+            experience,
+            importance,
+            agent_id,
+            run_id,
+            None, // actor_id
+            created_at,
+        ));
+
+        // Persist to RocksDB storage
+        self.long_term_memory.store(&memory)?;
+        self.logger.write().log_created(&memory, "working");
+
+        // Add to working memory
+        self.working_memory
+            .write()
+            .add_shared(Arc::clone(&memory))?;
+
+        // Index for semantic search
+        if let Err(e) = self.retriever.index_memory(&memory) {
+            tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+        }
+
+        // Add to knowledge graph
+        self.retriever.add_to_graph(&memory);
+
+        // If important enough, add to session memory
+        if importance > self.config.importance_threshold {
+            self.session_memory
+                .write()
+                .add_shared(Arc::clone(&memory))?;
+        }
+
+        // Update stats
+        {
+            let mut stats = self.stats.write();
+            stats.total_memories += 1;
+            stats.long_term_memory_count += 1;
+            stats.working_memory_count += 1;
+        }
+
+        self.consolidate_if_needed()?;
         Ok(memory_id)
     }
 

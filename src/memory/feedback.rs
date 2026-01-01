@@ -1293,8 +1293,12 @@ mod tests {
         let signals_entity_only = process_implicit_feedback(&pending, response, None);
 
         // Process with semantic similarity
-        let signals_with_semantic =
-            process_implicit_feedback_with_semantics(&pending, response, None, Some(&response_embedding));
+        let signals_with_semantic = process_implicit_feedback_with_semantics(
+            &pending,
+            response,
+            None,
+            Some(&response_embedding),
+        );
 
         // First memory should score higher with semantic (response embedding matches memory embedding)
         let (id1, sig1_entity) = &signals_entity_only[0];

@@ -707,7 +707,8 @@ mod tests {
         assert!((compute_file_match(&memory_files, &context_files2) - 0.3).abs() < 0.01); // Same dir
 
         let context_files3 = vec!["tests/test.rs".to_string()];
-        assert!((compute_file_match(&memory_files, &context_files3) - 0.0).abs() < 0.01); // Different dir
+        assert!((compute_file_match(&memory_files, &context_files3) - 0.0).abs() < 0.01);
+        // Different dir
     }
 
     #[test]

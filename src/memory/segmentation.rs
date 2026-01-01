@@ -290,9 +290,9 @@ impl SegmentationEngine {
     fn is_likely_abbreviation(s: &str) -> bool {
         let lower = s.to_lowercase();
         let abbreviations = [
-            "e.g.", "i.e.", "etc.", "vs.", "dr.", "mr.", "mrs.", "ms.", "jr.", "sr.",
-            "inc.", "ltd.", "corp.", "co.", "st.", "ave.", "rd.", "blvd.",
-            "fig.", "ref.", "vol.", "no.", "pp.", "ed.", "rev.",
+            "e.g.", "i.e.", "etc.", "vs.", "dr.", "mr.", "mrs.", "ms.", "jr.", "sr.", "inc.",
+            "ltd.", "corp.", "co.", "st.", "ave.", "rd.", "blvd.", "fig.", "ref.", "vol.", "no.",
+            "pp.", "ed.", "rev.",
         ];
 
         for abbr in &abbreviations {
@@ -429,18 +429,16 @@ impl SegmentationEngine {
     /// Simple entity extraction (words > 2 chars, excluding stopwords)
     fn extract_simple_entities(&self, content: &str) -> Vec<String> {
         let stopwords: HashSet<&str> = [
-            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-            "have", "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "must", "shall", "can", "need", "dare",
-            "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
-            "from", "as", "into", "through", "during", "before", "after", "above",
-            "below", "between", "under", "again", "further", "then", "once",
-            "here", "there", "when", "where", "why", "how", "all", "each", "few",
-            "more", "most", "other", "some", "such", "no", "nor", "not", "only",
-            "own", "same", "so", "than", "too", "very", "just", "and", "but",
-            "or", "if", "because", "while", "although", "this", "that", "these",
-            "those", "i", "you", "he", "she", "it", "we", "they", "what", "which",
-            "who", "whom", "its", "his", "her", "their", "my", "your", "our",
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has",
+            "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "must",
+            "shall", "can", "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with",
+            "at", "by", "from", "as", "into", "through", "during", "before", "after", "above",
+            "below", "between", "under", "again", "further", "then", "once", "here", "there",
+            "when", "where", "why", "how", "all", "each", "few", "more", "most", "other", "some",
+            "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just",
+            "and", "but", "or", "if", "because", "while", "although", "this", "that", "these",
+            "those", "i", "you", "he", "she", "it", "we", "they", "what", "which", "who", "whom",
+            "its", "his", "her", "their", "my", "your", "our",
         ]
         .into_iter()
         .collect();
@@ -578,8 +576,10 @@ mod tests {
     fn test_type_detection_decision() {
         let engine = SegmentationEngine::new();
 
-        let (exp_type, confidence) =
-            engine.detect_type("I decided to use Rust for this project", InputSource::UserApi);
+        let (exp_type, confidence) = engine.detect_type(
+            "I decided to use Rust for this project",
+            InputSource::UserApi,
+        );
 
         assert!(matches!(exp_type, ExperienceType::Decision));
         assert!(confidence > 0.9);
@@ -663,7 +663,8 @@ mod tests {
     fn test_entity_extraction() {
         let engine = SegmentationEngine::new();
 
-        let entities = engine.extract_simple_entities("I decided to use Rust for the shodh-memory project");
+        let entities =
+            engine.extract_simple_entities("I decided to use Rust for the shodh-memory project");
 
         assert!(entities.contains(&"rust".to_string()));
         assert!(entities.contains(&"shodh-memory".to_string()));
@@ -686,8 +687,16 @@ mod tests {
 
     #[test]
     fn test_entity_overlap() {
-        let entities1 = vec!["rust".to_string(), "memory".to_string(), "project".to_string()];
-        let entities2 = vec!["rust".to_string(), "memory".to_string(), "performance".to_string()];
+        let entities1 = vec![
+            "rust".to_string(),
+            "memory".to_string(),
+            "project".to_string(),
+        ];
+        let entities2 = vec![
+            "rust".to_string(),
+            "memory".to_string(),
+            "performance".to_string(),
+        ];
 
         let overlap = DeduplicationEngine::calculate_entity_overlap(&entities1, &entities2);
 
@@ -700,7 +709,8 @@ mod tests {
         let mut engine = SegmentationEngine::new();
         engine.max_segment_length = 100;
 
-        let long_input = "This is a very long decision that I made about using Rust for the backend. \
+        let long_input =
+            "This is a very long decision that I made about using Rust for the backend. \
             I also decided to use Axum for the web framework because it has great performance. \
             Additionally I chose RocksDB for storage due to its reliability and speed.";
 
