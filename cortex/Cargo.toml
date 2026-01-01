@@ -1,0 +1,47 @@
+[package]
+name = "shodh-cortex"
+version = "0.1.0"
+edition = "2021"
+description = "Claude API proxy with transparent memory injection"
+authors = ["Shodh"]
+license = "Apache-2.0"
+
+[[bin]]
+name = "shodh-cortex"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Streaming
+bytes = "1.5"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Session storage
+dashmap = "6.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# Keep out of parent workspace
+[workspace]
