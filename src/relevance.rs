@@ -73,7 +73,7 @@ pub struct RelevanceConfig {
 }
 
 fn default_semantic_threshold() -> f32 {
-    0.65
+    0.45 // Lowered from 0.65 - composite relevance scores blend semantic, entity, recency
 }
 
 fn default_entity_threshold() -> f32 {
@@ -972,7 +972,7 @@ mod tests {
     #[test]
     fn test_relevance_config_defaults() {
         let config = RelevanceConfig::default();
-        assert_eq!(config.semantic_threshold, 0.65);
+        assert_eq!(config.semantic_threshold, 0.45);
         assert_eq!(config.entity_threshold, 0.5);
         assert_eq!(config.max_results, 5);
         assert!(config.enable_entity_matching);

@@ -719,13 +719,20 @@ pub struct StreamingMemoryExtractor {
 
     /// Active sessions
     sessions: Arc<RwLock<HashMap<String, StreamSession>>>,
+
+    /// Feedback store for memory relevance scoring
+    feedback_store: Arc<parking_lot::RwLock<crate::memory::FeedbackStore>>,
 }
 
 impl StreamingMemoryExtractor {
-    pub fn new(neural_ner: Arc<NeuralNer>) -> Self {
+    pub fn new(
+        neural_ner: Arc<NeuralNer>,
+        feedback_store: Arc<parking_lot::RwLock<crate::memory::FeedbackStore>>,
+    ) -> Self {
         Self {
             neural_ner,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            feedback_store,
         }
     }
 
@@ -1258,12 +1265,14 @@ impl StreamingMemoryExtractor {
         let surfaced: Vec<SurfacedStreamMemory> = {
             let memory = memory_system.clone();
             let graph = graph_memory.clone();
+            let feedback = self.feedback_store.clone();
             let sessions = self.sessions.clone();
             let session_id_owned = session_id.to_string();
 
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory.read();
                 let graph_guard = graph.read();
+                let feedback_guard = feedback.read();
                 let now = Utc::now();
 
                 // Semantic query
@@ -1284,10 +1293,18 @@ impl StreamingMemoryExtractor {
                             .get_memory_hebbian_strength(&m.id)
                             .unwrap_or(0.3);
 
+                        // Get feedback momentum EMA (0.0 if no feedback history)
+                        // Negative values indicate often-ignored memories → suppression
+                        let feedback_momentum = feedback_guard
+                            .get_momentum(&m.id)
+                            .map(|fm| fm.ema)
+                            .unwrap_or(0.0);
+
                         let input = RelevanceInput {
                             memory_embedding: memory_embedding.clone(),
                             created_at: m.created_at,
                             hebbian_strength,
+                            feedback_momentum,
                             ..Default::default()
                         };
 

@@ -59,6 +59,17 @@ enum Commands {
         #[command(subcommand)]
         hook_type: HookType,
     },
+
+    /// Launch Claude Code with Shodh Cortex proxy (transparent memory injection)
+    Claude {
+        /// Port for the shodh-memory server
+        #[arg(long, default_value = "3030")]
+        port: u16,
+
+        /// Additional arguments to pass to claude
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1013,7 +1024,104 @@ async fn main() -> Result<()> {
                 handle_prompt_submit(&api_url, &api_key, &user_id, &message);
             }
         },
+
+        Commands::Claude { port, args } => {
+            handle_claude_launch(port, args).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Launch Claude Code with Shodh Cortex proxy
+async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
+    let server_url = format!("http://127.0.0.1:{}", port);
+
+    // Check if server is running
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+
+    let health_url = format!("{}/health", server_url);
+    let server_running = client.get(&health_url).send().await.is_ok();
+
+    if !server_running {
+        eprintln!("🧠 Starting shodh-memory server on port {}...", port);
+
+        // Start server in background
+        let server_binary = std::env::current_exe()?
+            .parent()
+            .unwrap()
+            .join("shodh-memory-server");
+
+        #[cfg(windows)]
+        let server_binary = server_binary.with_extension("exe");
+
+        if !server_binary.exists() {
+            // Try finding in PATH
+            eprintln!("⚠️  shodh-memory-server not found at {:?}", server_binary);
+            eprintln!("   Please ensure shodh-memory-server is installed and in PATH");
+            std::process::exit(1);
+        }
+
+        let mut cmd = std::process::Command::new(&server_binary);
+        cmd.env("SHODH_PORT", port.to_string());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0); // Detach from parent
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        }
+
+        cmd.spawn().expect("Failed to start shodh-memory-server");
+
+        // Wait for server to be ready
+        eprintln!("   Waiting for server to be ready...");
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if client.get(&health_url).send().await.is_ok() {
+                eprintln!("   ✓ Server ready");
+                break;
+            }
+        }
+    } else {
+        eprintln!("🧠 Shodh-memory server already running on port {}", port);
+    }
+
+    // Launch claude with ANTHROPIC_API_BASE pointing to Cortex proxy
+    eprintln!("🚀 Launching Claude Code with Shodh Cortex...");
+    eprintln!("   ANTHROPIC_API_BASE={}", server_url);
+    eprintln!();
+
+    let mut claude_cmd = std::process::Command::new("claude");
+    claude_cmd.env("ANTHROPIC_API_BASE", &server_url);
+    claude_cmd.args(&args);
+
+    // Replace current process with claude
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = claude_cmd.exec();
+        eprintln!("Failed to exec claude: {}", err);
+        std::process::exit(1);
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows, npm-installed commands need cmd /c to resolve .cmd wrappers
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/c").arg("claude");
+        cmd.env("ANTHROPIC_API_BASE", &server_url);
+        cmd.args(&args);
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
