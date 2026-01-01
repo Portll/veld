@@ -4,7 +4,7 @@
 - Production grade code only, no TODOs, no placeholders, no mocks, no stubs
 - Understand context, take a bird's eye view, understand architecture and data flow before fixing anything
 - Don't build, don't trunk serve - user runs in background
-- Clean git commit messages only (no signatures, no co-authored-by)
+- DO NOT add "Generated with Claude Code" signature or "Co-Authored-By" lines to git commits - clean commit messages only
 
 ---
 
