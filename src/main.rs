@@ -174,12 +174,203 @@ fn classify_experience_type(content: &str) -> memory::ExperienceType {
         .map(|(_, typ)| typ)
         .unwrap_or(memory::ExperienceType::Conversation) // Default if no patterns match
 }
+
+/// Strip system noise from context to extract meaningful user content.
+/// Removes <system-reminder>, <shodh-context>, Claude Code system prompts, and code blocks.
+fn strip_system_noise(content: &str) -> String {
+    let mut result = content.to_string();
+
+    // Remove <system-reminder>...</system-reminder> blocks (handles multiline)
+    while let Some(start) = result.find("<system-reminder>") {
+        if let Some(end) = result.find("</system-reminder>") {
+            let end_pos = end + "</system-reminder>".len();
+            result = format!("{}{}", &result[..start], &result[end_pos..]);
+        } else {
+            break;
+        }
+    }
+
+    // Remove <shodh-context>...</shodh-context> blocks (our own injected context)
+    while let Some(start) = result.find("<shodh-context") {
+        if let Some(end) = result.find("</shodh-context>") {
+            let end_pos = end + "</shodh-context>".len();
+            result = format!("{}{}", &result[..start], &result[end_pos..]);
+        } else {
+            break;
+        }
+    }
+
+    // Remove Claude Code file content blocks - Windows paths
+    while let Some(start) = result.find("Contents of C:\\") {
+        let search_area = &result[start..];
+        let end_offset = search_area.find("\n\n")
+            .or_else(|| search_area.find("\r\n\r\n"))
+            .unwrap_or(search_area.len().min(2000));
+        result = format!("{}{}", &result[..start], &result[start + end_offset..]);
+    }
+
+    // Remove Claude Code file content blocks - Unix paths
+    while let Some(start) = result.find("Contents of /") {
+        let search_area = &result[start..];
+        let end_offset = search_area.find("\n\n")
+            .or_else(|| search_area.find("\r\n\r\n"))
+            .unwrap_or(search_area.len().min(2000));
+        result = format!("{}{}", &result[..start], &result[start + end_offset..]);
+    }
+
+    // Remove fenced code blocks (```...```) - these are often tool outputs, not memories
+    while let Some(start) = result.find("```") {
+        if let Some(end) = result[start + 3..].find("```") {
+            let end_pos = start + 3 + end + 3;
+            result = format!("{}{}", &result[..start], &result[end_pos..]);
+        } else {
+            // Unclosed code block - remove from start to end
+            result = result[..start].to_string();
+            break;
+        }
+    }
+
+    // Clean up excessive whitespace
+    let result = result.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // If result is mostly empty or very short after cleaning, return empty
+    // to prevent storing noise
+    let trimmed = result.trim();
+    if trimmed.len() < 10 || trimmed.chars().filter(|c| c.is_alphabetic()).count() < 5 {
+        return String::new();
+    }
+
+    trimmed.to_string()
+}
+
+/// Check if content is a bare question (not worth storing as memory).
+/// Questions like "what is X?" or "how do I Y?" without context are low-value.
+/// Extended to catch longer questions that still lack substance.
+fn is_bare_question(content: &str) -> bool {
+    let trimmed = content.trim();
+    let lower = trimmed.to_lowercase();
+
+    // Question word starters
+    let question_starters = [
+        "what", "how", "why", "where", "when", "who", "can", "could",
+        "is", "are", "do", "does", "will", "would", "should", "have",
+    ];
+    let starts_with_question = question_starters.iter().any(|q| lower.starts_with(q));
+    let ends_with_question = trimmed.ends_with('?');
+
+    // Short content - apply looser filter
+    if trimmed.len() < 100 {
+        if starts_with_question || ends_with_question {
+            return true;
+        }
+    }
+
+    // Medium content (100-300 chars) - check if it's purely a question without context
+    if trimmed.len() < 300 && (starts_with_question || ends_with_question) {
+        // Check for substance indicators that make it worth storing
+        let has_substance = lower.contains("because")
+            || lower.contains("the reason")
+            || lower.contains("i think")
+            || lower.contains("i believe")
+            || lower.contains("we should")
+            || lower.contains("decided")
+            || lower.contains("learned")
+            || lower.contains("found that")
+            || lower.contains("the issue")
+            || lower.contains("the problem")
+            || lower.contains("the solution");
+
+        if !has_substance {
+            // Count sentences - pure questions are typically single sentence
+            let sentence_count = trimmed.matches('.').count()
+                + trimmed.matches('!').count()
+                + trimmed.matches('?').count();
+
+            if sentence_count <= 2 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if assistant response is boilerplate/low-value content.
+/// Filters out generic greetings, offers to help, and repetitive patterns.
+fn is_boilerplate_response(content: &str) -> bool {
+    let lower = content.to_lowercase();
+
+    // Generic greeting/ready-to-help patterns (high confidence noise)
+    let boilerplate_starts = [
+        "i'm ready to help",
+        "i am ready to help",
+        "i'm here to help",
+        "i am here to help",
+        "i can help you",
+        "i'd be happy to help",
+        "i would be happy to help",
+        "let me help you",
+        "i understand. i'm ready",
+        "i understand. i am ready",
+        "sure, i can",
+        "sure! i can",
+        "absolutely! i",
+        "of course! i",
+        "great question!",
+        "good question!",
+    ];
+
+    if boilerplate_starts.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+
+    // Generic offer patterns anywhere in short responses (<500 chars)
+    if lower.len() < 500 {
+        let generic_offers = [
+            "what would you like me to",
+            "let me know if you",
+            "let me know what you",
+            "feel free to ask",
+            "don't hesitate to",
+            "i'm happy to",
+            "just let me know",
+            "how can i assist",
+            "how may i help",
+            "is there anything else",
+        ];
+
+        let offer_count = generic_offers.iter().filter(|p| lower.contains(*p)).count();
+        // If more than half the response is generic offers, filter it
+        if offer_count >= 2 {
+            return true;
+        }
+    }
+
+    // Check for responses that are mostly bullet points of capabilities
+    // Pattern: "I can:\n- X\n- Y\n- Z" without actual content
+    if lower.contains("i can:") || lower.contains("i'm able to:") {
+        let bullet_count = content.matches("\n-").count() + content.matches("\n•").count();
+        let has_substance = lower.contains("because")
+            || lower.contains("the reason")
+            || lower.contains("specifically")
+            || lower.contains("for example");
+
+        // Capability list without substance = boilerplate
+        if bullet_count >= 3 && !has_substance {
+            return true;
+        }
+    }
+
+    false
+}
+
 use tower::limit::ConcurrencyLimitLayer;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::services::ServeDir;
 use tracing::info;
 
 mod auth;
+mod backup;
 mod config;
 mod constants;
 mod decay;
@@ -219,6 +410,7 @@ use memory::{
     },
     process_implicit_feedback,
     prospective::ProspectiveStore,
+    segmentation::{InputSource, SegmentationEngine},
     todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore, FileMemoryStats,
     FileMemoryStore, GraphStats as VisualizationStats, IndexingResult, Memory, MemoryConfig,
     MemoryId, MemoryStats, MemorySystem, PendingFeedback, Project, ProjectId, ProjectStats,
@@ -423,6 +615,9 @@ pub struct MultiUserMemoryManager {
     /// Implicit feedback store for memory reinforcement
     feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
 
+    /// Backup engine for automated and manual backups
+    backup_engine: Arc<backup::ShodhBackupEngine>,
+
     /// Context status from Claude Code sessions (keyed by session_id)
     /// Multiple Claude windows can run simultaneously, each with own context
     context_sessions: Arc<ContextSessions>,
@@ -569,6 +764,19 @@ impl MultiUserMemoryManager {
         ));
         info!("🔄 Feedback store initialized");
 
+        // Initialize backup engine
+        let backup_path = base_path.join("backups");
+        let backup_engine = Arc::new(backup::ShodhBackupEngine::new(backup_path)?);
+        if server_config.backup_enabled {
+            info!(
+                "💾 Backup engine initialized (interval: {}h, keep: {})",
+                server_config.backup_interval_secs / 3600,
+                server_config.backup_max_count
+            );
+        } else {
+            info!("💾 Backup engine initialized (auto-backup disabled)");
+        }
+
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -586,6 +794,7 @@ impl MultiUserMemoryManager {
             todo_store,
             file_store,
             feedback_store,
+            backup_engine,
             context_sessions: Arc::new(DashMap::new()),
             context_broadcaster: {
                 let (tx, _) = tokio::sync::broadcast::channel(16);
@@ -1311,6 +1520,76 @@ impl MultiUserMemoryManager {
     /// Get the streaming extractor for session management
     pub fn streaming_extractor(&self) -> &Arc<streaming::StreamingMemoryExtractor> {
         &self.streaming_extractor
+    }
+
+    /// Get the backup engine
+    pub fn backup_engine(&self) -> &Arc<backup::ShodhBackupEngine> {
+        &self.backup_engine
+    }
+
+    /// Run backups for all active users
+    ///
+    /// This is called by the backup scheduler to create automated backups.
+    /// Returns the number of users backed up successfully.
+    pub fn run_backup_all_users(&self, max_backups: usize) -> usize {
+        let mut backed_up = 0;
+
+        // Get all user directories from the base path
+        let users_path = &self.base_path;
+        if let Ok(entries) = std::fs::read_dir(users_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // Skip non-directories and special directories
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || name == "audit_logs" || name == "backups" {
+                    continue;
+                }
+
+                // Check if this is a user directory with a RocksDB database
+                let db_path = path.join("memory.db");
+                if !db_path.exists() {
+                    continue;
+                }
+
+                // Try to get or create the user's memory system to access their DB
+                if let Ok(memory_lock) = self.get_user_memory(name) {
+                    let memory = memory_lock.read();
+                    let db = memory.get_db();
+                    match self.backup_engine.create_backup(&db, name) {
+                        Ok(metadata) => {
+                            tracing::info!(
+                                user_id = name,
+                                backup_id = metadata.backup_id,
+                                size_mb = metadata.size_bytes / 1024 / 1024,
+                                "Backup created successfully"
+                            );
+                            backed_up += 1;
+
+                            // Purge old backups for this user
+                            if let Err(e) = self.backup_engine.purge_old_backups(name, max_backups) {
+                                tracing::warn!(
+                                    user_id = name,
+                                    error = %e,
+                                    "Failed to purge old backups"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                user_id = name,
+                                error = %e,
+                                "Failed to create backup"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        backed_up
     }
 }
 
@@ -3619,6 +3898,18 @@ async fn recall(
             count: Some(count),
         });
 
+        // Audit log for semantic recall
+        state.log_event(
+            &req.user_id,
+            "RECALL",
+            "mode:semantic",
+            &format!(
+                "Query='{}' returned {} memories (semantic)",
+                query_text_clone.chars().take(50).collect::<String>(),
+                count
+            ),
+        );
+
         return Ok(Json(RecallResponse {
             memories: recall_memories,
             count,
@@ -3821,6 +4112,19 @@ async fn recall(
         importance: None,
         count: Some(count),
     });
+
+    // Audit log for recall operations
+    state.log_event(
+        &req.user_id,
+        "RECALL",
+        &format!("mode:{}", mode),
+        &format!(
+            "Query='{}' returned {} memories (mode={})",
+            query_text_clone.chars().take(50).collect::<String>(),
+            count,
+            mode
+        ),
+    );
 
     Ok(Json(RecallResponse {
         memories: recall_memories,
@@ -4844,7 +5148,7 @@ fn default_proactive_max_results() -> usize {
     5
 }
 fn default_semantic_threshold() -> f32 {
-    0.65
+    0.45 // Lowered from 0.65 - composite relevance scores blend multiple signals
 }
 fn default_entity_weight() -> f32 {
     0.4
@@ -4862,6 +5166,9 @@ struct ProactiveSurfacedMemory {
     score: f32,
     created_at: String,
     tags: Vec<String>,
+    /// Embedding for semantic feedback (not serialized to response)
+    #[serde(skip)]
+    embedding: Vec<f32>,
 }
 
 /// Todo item in proactive context response
@@ -4929,6 +5236,7 @@ async fn proactive_context(
         let user_id_for_feedback = req.user_id.clone();
         let response_text = prev_response.clone();
         let followup = req.user_followup.clone();
+        let memory_for_embed = memory_system.clone();
 
         // Process feedback and collect memory IDs for reinforcement
         let (result, helpful_ids, misleading_ids) = tokio::task::spawn_blocking(move || {
@@ -4936,11 +5244,18 @@ async fn proactive_context(
 
             // Take pending feedback for this user
             if let Some(pending) = store.take_pending(&user_id_for_feedback) {
-                // Process the feedback
-                let signals = crate::memory::feedback::process_implicit_feedback(
+                // Compute response embedding for semantic similarity feedback
+                let response_embedding: Option<Vec<f32>> = {
+                    let memory_guard = memory_for_embed.read();
+                    memory_guard.compute_embedding(&response_text).ok()
+                };
+
+                // Process the feedback with semantic similarity
+                let signals = crate::memory::feedback::process_implicit_feedback_with_semantics(
                     &pending,
                     &response_text,
                     followup.as_deref(),
+                    response_embedding.as_deref(),
                 );
 
                 let mut reinforced = Vec::new();
@@ -5106,15 +5421,17 @@ async fn proactive_context(
                     // Get embedding (skip if none)
                     let memory_embedding = m.experience.embeddings.as_ref()?.clone();
 
-                    // Get Hebbian strength from graph (default 0.5 if not found)
+                    // Get Hebbian strength from graph (default 0.3 if not found)
+                    // Lower default prevents new memories from scoring too high
                     let hebbian_strength = graph_guard
                         .get_memory_hebbian_strength(&m.id)
-                        .unwrap_or(0.5);
+                        .unwrap_or(0.3);
 
                     let input = RelevanceInput {
                         memory_embedding,
                         created_at: m.created_at,
                         hebbian_strength,
+                        ..Default::default()
                     };
 
                     let score =
@@ -5138,6 +5455,7 @@ async fn proactive_context(
                     score,
                     created_at: m.created_at.to_rfc3339(),
                     tags: m.experience.entities.clone(),
+                    embedding: m.experience.embeddings.clone().unwrap_or_default(),
                 })
                 .collect()
         })
@@ -5181,7 +5499,7 @@ async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // 4. Store pending feedback for next call
+    // 4. Store pending feedback for next call (with embeddings for semantic feedback)
     {
         let surfaced_infos: Vec<crate::memory::feedback::SurfacedMemoryInfo> = memories
             .iter()
@@ -5192,6 +5510,7 @@ async fn proactive_context(
                     entities: crate::memory::feedback::extract_entities_simple(&m.content),
                     content_preview: m.content.chars().take(100).collect(),
                     score: m.score,
+                    embedding: m.embedding.clone(),
                 }
             })
             .collect();
@@ -5251,26 +5570,84 @@ async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // 4. Auto-ingest context with auto-classified type (optional)
-    let ingested_memory_id = if req.auto_ingest && !req.context.trim().is_empty() {
-        let context = req.context.clone();
+    // 4. Auto-ingest previous assistant response (if provided and meaningful)
+    // Uses segmentation engine for Hebbian-optimal atomic memories
+    if req.auto_ingest {
+        if let Some(ref prev_response) = req.previous_response {
+            // Only store meaningful responses (not empty, not just tool calls, not boilerplate)
+            let response_text = prev_response.trim();
+            let is_meaningful = response_text.len() > 100
+                && response_text.len() < 3000  // Skip very long responses (often tool outputs)
+                && !response_text.starts_with("```")
+                && !is_boilerplate_response(response_text);
+
+            if is_meaningful {
+                let response_text_owned = response_text.to_string();
+                let memory = memory_system.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    let memory_guard = memory.read();
+                    let segmenter = SegmentationEngine::new();
+
+                    // Segment assistant response into atomic memories
+                    let segments = segmenter.segment(&response_text_owned, InputSource::AutoIngest);
+
+                    for segment in segments {
+                        // Format content with type prefix for clarity
+                        let content = format!("[Assistant: {:?}] {}", segment.experience_type, segment.content);
+                        let experience = Experience {
+                            content,
+                            experience_type: segment.experience_type,
+                            entities: segment.entities,
+                            tags: vec!["assistant-response".to_string(), "auto-captured".to_string()],
+                            ..Default::default()
+                        };
+                        let _ = memory_guard.remember(experience, None);
+                    }
+                })
+                .await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
+            }
+        }
+    }
+
+    // 5. Auto-ingest user context with segmentation for Hebbian-optimal storage
+    // Apply quality filters before storing
+    let clean_context = strip_system_noise(&req.context);
+    let should_ingest = req.auto_ingest
+        && clean_context.len() > 50           // Minimum meaningful length
+        && clean_context.len() < 5000         // Allow larger contexts now (segmentation handles splitting)
+        && !is_bare_question(&clean_context); // Don't store standalone questions
+
+    let ingested_memory_id = if should_ingest {
+        let context = clean_context;
         let memory = memory_system.clone();
 
         let memory_id = tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
+            let segmenter = SegmentationEngine::new();
 
-            // Classify BEFORE moving context into Experience
-            let experience_type = classify_experience_type(&context);
+            // Segment user context into atomic memories
+            let segments = segmenter.segment(&context, InputSource::AutoIngest);
 
-            let experience = Experience {
-                content: context,
-                experience_type,
-                entities: vec![],
-                tags: vec![],
-                ..Default::default()
-            };
+            // Store each segment, return the first memory ID
+            let mut first_id = None;
+            for segment in segments {
+                let experience = Experience {
+                    content: segment.content,
+                    experience_type: segment.experience_type,
+                    entities: segment.entities,
+                    tags: vec!["auto-captured".to_string()],
+                    ..Default::default()
+                };
 
-            memory_guard.remember(experience, None).ok()
+                if let Ok(id) = memory_guard.remember(experience, None) {
+                    if first_id.is_none() {
+                        first_id = Some(id);
+                    }
+                }
+            }
+            first_id
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
@@ -5280,7 +5657,7 @@ async fn proactive_context(
         None
     };
 
-    // 5. Surface relevant todos based on context keywords
+    // 6. Surface relevant todos based on context keywords
     let relevant_todos: Vec<ProactiveTodoItem> = {
         let context_lower = req.context.to_lowercase();
         let context_words: std::collections::HashSet<_> = context_lower
@@ -5381,6 +5758,21 @@ async fn proactive_context(
         importance: None,
         count: Some(memory_count + reminder_count),
     });
+
+    // Audit log for proactive context operations
+    state.log_event(
+        &req.user_id,
+        "PROACTIVE_CONTEXT",
+        ingested_memory_id.as_deref().unwrap_or("none"),
+        &format!(
+            "Context='{}' surfaced {} memories, {} reminders, {} todos (auto_ingest={})",
+            req.context.chars().take(50).collect::<String>(),
+            memory_count,
+            reminder_count,
+            todo_count,
+            req.auto_ingest
+        ),
+    );
 
     Ok(Json(ProactiveContextResponse {
         memories,
@@ -7173,6 +7565,174 @@ async fn rebuild_index(
     }))
 }
 
+// ============================================================================
+// BACKUP & RESTORE ENDPOINTS
+// ============================================================================
+
+/// Create backup request
+#[derive(Debug, Deserialize)]
+struct CreateBackupRequest {
+    user_id: String,
+}
+
+/// Backup metadata response
+#[derive(Debug, Serialize)]
+struct BackupResponse {
+    success: bool,
+    backup: Option<backup::BackupMetadata>,
+    message: String,
+}
+
+/// List backups request
+#[derive(Debug, Deserialize)]
+struct ListBackupsRequest {
+    user_id: String,
+}
+
+/// List backups response
+#[derive(Debug, Serialize)]
+struct ListBackupsResponse {
+    success: bool,
+    backups: Vec<backup::BackupMetadata>,
+    count: usize,
+}
+
+/// Verify backup request
+#[derive(Debug, Deserialize)]
+struct VerifyBackupRequest {
+    user_id: String,
+    backup_id: u32,
+}
+
+/// Verify backup response
+#[derive(Debug, Serialize)]
+struct VerifyBackupResponse {
+    success: bool,
+    is_valid: bool,
+    message: String,
+}
+
+/// Purge backups request
+#[derive(Debug, Deserialize)]
+struct PurgeBackupsRequest {
+    user_id: String,
+    keep_count: usize,
+}
+
+/// Purge backups response
+#[derive(Debug, Serialize)]
+struct PurgeBackupsResponse {
+    success: bool,
+    purged_count: usize,
+}
+
+/// Create a backup for a user
+async fn create_backup(
+    State(state): State<AppState>,
+    Json(req): Json<CreateBackupRequest>,
+) -> Result<Json<BackupResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+    let db = memory_guard.get_db();
+
+    match state.backup_engine().create_backup(&db, &req.user_id) {
+        Ok(metadata) => {
+            state.log_event(
+                &req.user_id,
+                "BACKUP_CREATED",
+                &metadata.backup_id.to_string(),
+                &format!("Backup created: {} bytes", metadata.size_bytes),
+            );
+            Ok(Json(BackupResponse {
+                success: true,
+                backup: Some(metadata),
+                message: "Backup created successfully".to_string(),
+            }))
+        }
+        Err(e) => Ok(Json(BackupResponse {
+            success: false,
+            backup: None,
+            message: format!("Backup failed: {}", e),
+        })),
+    }
+}
+
+/// List all backups for a user
+async fn list_backups(
+    State(state): State<AppState>,
+    Json(req): Json<ListBackupsRequest>,
+) -> Result<Json<ListBackupsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    match state.backup_engine().list_backups(&req.user_id) {
+        Ok(backups) => {
+            let count = backups.len();
+            Ok(Json(ListBackupsResponse {
+                success: true,
+                backups,
+                count,
+            }))
+        }
+        Err(e) => Err(AppError::Internal(e)),
+    }
+}
+
+/// Verify backup integrity
+async fn verify_backup(
+    State(state): State<AppState>,
+    Json(req): Json<VerifyBackupRequest>,
+) -> Result<Json<VerifyBackupResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    match state.backup_engine().verify_backup(&req.user_id, req.backup_id) {
+        Ok(is_valid) => Ok(Json(VerifyBackupResponse {
+            success: true,
+            is_valid,
+            message: if is_valid {
+                "Backup integrity verified".to_string()
+            } else {
+                "Backup checksum mismatch - may be corrupted".to_string()
+            },
+        })),
+        Err(e) => Ok(Json(VerifyBackupResponse {
+            success: false,
+            is_valid: false,
+            message: format!("Verification failed: {}", e),
+        })),
+    }
+}
+
+/// Purge old backups
+async fn purge_backups(
+    State(state): State<AppState>,
+    Json(req): Json<PurgeBackupsRequest>,
+) -> Result<Json<PurgeBackupsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    match state.backup_engine().purge_old_backups(&req.user_id, req.keep_count) {
+        Ok(purged_count) => {
+            if purged_count > 0 {
+                state.log_event(
+                    &req.user_id,
+                    "BACKUP_PURGE",
+                    &format!("keep_{}", req.keep_count),
+                    &format!("Purged {} old backups", purged_count),
+                );
+            }
+            Ok(Json(PurgeBackupsResponse {
+                success: true,
+                purged_count,
+            }))
+        }
+        Err(e) => Err(AppError::Internal(e)),
+    }
+}
+
 /// Forget memories by age
 #[derive(Debug, Deserialize)]
 struct ForgetByAgeRequest {
@@ -8076,6 +8636,14 @@ async fn add_entity(
         count: None,
     });
 
+    // Audit log for entity creation
+    state.log_event(
+        &req.user_id,
+        "ENTITY_ADD",
+        &entity_uuid.to_string(),
+        &format!("Added entity '{}' label={}", req.name, req.label),
+    );
+
     Ok(Json(serde_json::json!({
         "success": true,
         "entity_uuid": entity_uuid.to_string(),
@@ -8186,6 +8754,17 @@ async fn add_relationship(
         importance: None,
         count: None,
     });
+
+    // Audit log for relationship creation
+    state.log_event(
+        &req.user_id,
+        "RELATIONSHIP_ADD",
+        &edge_uuid.to_string(),
+        &format!(
+            "Added relationship '{}' --[{}]--> '{}'",
+            req.from_entity_name, req.relation_type, req.to_entity_name
+        ),
+    );
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -8670,6 +9249,18 @@ async fn create_reminder(
         reminder_id = %task.id,
         trigger_type = trigger_type,
         "Created prospective memory (reminder)"
+    );
+
+    // Audit log for reminder creation
+    state.log_event(
+        &req.user_id,
+        "REMINDER_CREATE",
+        &task.id.to_string(),
+        &format!(
+            "Created reminder trigger={}: '{}'",
+            trigger_type,
+            req.content.chars().take(50).collect::<String>()
+        ),
     );
 
     Ok(Json(CreateReminderResponse {
@@ -9501,6 +10092,19 @@ async fn create_todo(
         "Created todo"
     );
 
+    // Audit log for todo creation
+    state.log_event(
+        &req.user_id,
+        "TODO_CREATE",
+        &todo.id.0.to_string(),
+        &format!(
+            "Created todo [{}] project={}: '{}'",
+            todo.short_id(),
+            project_name.as_deref().unwrap_or("none"),
+            req.content.chars().take(50).collect::<String>()
+        ),
+    );
+
     Ok(Json(TodoResponse {
         success: true,
         todo: Some(todo),
@@ -9882,6 +10486,18 @@ async fn update_todo(
         "Updated todo"
     );
 
+    // Audit log for todo update
+    state.log_event(
+        &req.user_id,
+        "TODO_UPDATE",
+        &todo.id.0.to_string(),
+        &format!(
+            "Updated todo [{}]: {}",
+            todo.short_id(),
+            if update_description.is_empty() { "no changes" } else { &update_description }
+        ),
+    );
+
     Ok(Json(TodoResponse {
         success: true,
         todo: Some(todo),
@@ -9951,6 +10567,19 @@ async fn complete_todo(
                     tracing::debug!("Auto post-mortem generation failed: {}", e);
                 }
             });
+
+            // Audit log for todo completion
+            state.log_event(
+                &req.user_id,
+                "TODO_COMPLETE",
+                &completed.id.0.to_string(),
+                &format!(
+                    "Completed todo [{}]: '{}' (recurrence={})",
+                    completed.short_id(),
+                    completed.content.chars().take(40).collect::<String>(),
+                    next.is_some()
+                ),
+            );
 
             Ok(Json(TodoCompleteResponse {
                 success: true,
@@ -11330,6 +11959,43 @@ async fn main() -> Result<()> {
         maintenance_interval
     );
 
+    // Start backup scheduler if enabled
+    if server_config.backup_enabled && server_config.backup_interval_secs > 0 {
+        let backup_interval = server_config.backup_interval_secs;
+        let max_backups = server_config.backup_max_count;
+        let manager_for_backup = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(backup_interval));
+
+            // Skip the first immediate tick - let the system warm up
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                info!("💾 Starting scheduled backup run...");
+                let manager_clone = Arc::clone(&manager_for_backup);
+                let backed_up = tokio::task::spawn_blocking(move || {
+                    manager_clone.run_backup_all_users(max_backups)
+                })
+                .await
+                .unwrap_or(0);
+
+                if backed_up > 0 {
+                    info!("💾 Scheduled backup completed: {} users backed up", backed_up);
+                } else {
+                    tracing::debug!("💾 Scheduled backup: no users to backup");
+                }
+            }
+        });
+        info!(
+            "💾 Automatic backup scheduler started (interval: {}h, keep: {} backups)",
+            backup_interval / 3600,
+            max_backups
+        );
+    }
+
     // Configure rate limiting from config
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(server_config.rate_limit_per_second)
@@ -11526,6 +12192,11 @@ async fn main() -> Result<()> {
         )
         .route("/api/files/stats", get(get_file_stats))
         .route("/api/todos/stats", post(get_todo_stats))
+        // Backup & Restore endpoints
+        .route("/api/backup/create", post(create_backup))
+        .route("/api/backups", post(list_backups))
+        .route("/api/backup/verify", post(verify_backup))
+        .route("/api/backups/purge", post(purge_backups))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         // Apply rate limiting to API routes only (not health/metrics/static)
@@ -11563,7 +12234,10 @@ async fn main() -> Result<()> {
     // Combine public and protected routes
     // - public_routes: health, metrics, static - NO auth, NO rate limiting
     // - protected_routes: API endpoints including streaming - API key auth, rate limited
-    let app = Router::new().merge(public_routes).merge(protected_routes);
+    // Note: Cortex (Claude API proxy) is now a separate binary - see cortex/
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(protected_routes);
 
     // Conditionally add trace propagation middleware only when telemetry feature is enabled
     #[cfg(feature = "telemetry")]

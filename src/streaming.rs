@@ -1279,14 +1279,16 @@ impl StreamingMemoryExtractor {
                     .into_iter()
                     .filter_map(|m| {
                         let memory_embedding = m.experience.embeddings.as_ref()?.clone();
+                        // Default 0.3 prevents new memories from scoring too high
                         let hebbian_strength = graph_guard
                             .get_memory_hebbian_strength(&m.id)
-                            .unwrap_or(0.5);
+                            .unwrap_or(0.3);
 
                         let input = RelevanceInput {
                             memory_embedding: memory_embedding.clone(),
                             created_at: m.created_at,
                             hebbian_strength,
+                            ..Default::default()
                         };
 
                         // Compute individual components for breakdown

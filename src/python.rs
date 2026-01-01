@@ -1731,14 +1731,14 @@ impl PyMemorySystem {
     ///
     /// Args:
     ///     context: Current conversation context or user message
-    ///     semantic_threshold: Minimum similarity score (0.0-1.0, default: 0.65)
+    ///     semantic_threshold: Minimum similarity score (0.0-1.0, default: 0.45)
     ///     max_results: Maximum memories to return (default: 5)
     ///     memory_types: Filter to specific types (empty = all)
     ///     auto_ingest: Store context as Conversation memory (default: true)
     ///     recency_weight: Weight for recency boost (0.0-1.0, default: 0.2)
     #[pyo3(signature = (
         context,
-        semantic_threshold=0.65,
+        semantic_threshold=0.45,
         max_results=5,
         memory_types=None,
         auto_ingest=true,
@@ -1833,7 +1833,7 @@ impl PyMemorySystem {
 
                 let final_score = base_score * recency_boost;
 
-                if final_score >= semantic_threshold * 0.5 {
+                if final_score >= semantic_threshold {
                     let reason = if recency_factor > 0.5 {
                         "recent_and_relevant".to_string()
                     } else {

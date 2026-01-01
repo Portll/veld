@@ -28,11 +28,19 @@ const MAX_CONTEXT_FINGERPRINTS: usize = 100;
 const OVERLAP_STRONG_THRESHOLD: f32 = 0.5;
 const OVERLAP_WEAK_THRESHOLD: f32 = 0.2;
 
+/// Semantic similarity thresholds
+const SEMANTIC_STRONG_THRESHOLD: f32 = 0.7;
+const SEMANTIC_WEAK_THRESHOLD: f32 = 0.4;
+
 /// Signal value multipliers
 const SIGNAL_STRONG_MULTIPLIER: f32 = 0.8;
 const SIGNAL_WEAK_MULTIPLIER: f32 = 0.3;
 const SIGNAL_NO_OVERLAP_PENALTY: f32 = -0.1;
 const SIGNAL_NEGATIVE_KEYWORD_PENALTY: f32 = -0.5;
+
+/// Weights for combining entity and semantic signals
+const ENTITY_WEIGHT: f32 = 0.4;
+const SEMANTIC_WEIGHT: f32 = 0.6;
 
 /// Stability adjustment rates
 const STABILITY_INCREMENT: f32 = 0.05;
@@ -506,6 +514,9 @@ pub struct SurfacedMemoryInfo {
     pub entities: HashSet<String>,
     pub content_preview: String,
     pub score: f32,
+    /// Memory embedding for semantic similarity feedback
+    #[serde(default)]
+    pub embedding: Vec<f32>,
 }
 
 /// Pending feedback for a user - tracks what was surfaced, awaiting response
@@ -567,6 +578,34 @@ pub fn calculate_entity_overlap(
     intersection / memory_entities.len() as f32
 }
 
+/// Calculate cosine similarity between two embedding vectors
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+}
+
+/// Create signal from semantic similarity
+fn signal_from_semantic_similarity(similarity: f32) -> (f32, f32) {
+    if similarity >= SEMANTIC_STRONG_THRESHOLD {
+        (SIGNAL_STRONG_MULTIPLIER * similarity, 0.9)
+    } else if similarity >= SEMANTIC_WEAK_THRESHOLD {
+        (SIGNAL_WEAK_MULTIPLIER * similarity, 0.6)
+    } else {
+        (SIGNAL_NO_OVERLAP_PENALTY * 0.5, 0.3) // Lighter penalty for semantic
+    }
+}
+
 /// Detect negative keywords in user's followup message
 pub fn detect_negative_keywords(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
@@ -578,18 +617,84 @@ pub fn detect_negative_keywords(text: &str) -> Vec<String> {
 }
 
 /// Process feedback for surfaced memories based on agent response
+/// Uses both entity overlap and semantic similarity for more accurate signals
 pub fn process_implicit_feedback(
     pending: &PendingFeedback,
     response_text: &str,
     user_followup: Option<&str>,
 ) -> Vec<(MemoryId, SignalRecord)> {
+    // For backwards compatibility, call enhanced version with no response embedding
+    process_implicit_feedback_with_semantics(pending, response_text, user_followup, None)
+}
+
+/// Enhanced feedback processing using both entity overlap and semantic similarity
+///
+/// When response_embedding is provided, combines entity overlap (40%) with
+/// semantic similarity (60%) for a more robust feedback signal. This helps
+/// detect when a memory was genuinely useful vs just sharing some words.
+pub fn process_implicit_feedback_with_semantics(
+    pending: &PendingFeedback,
+    response_text: &str,
+    user_followup: Option<&str>,
+    response_embedding: Option<&[f32]>,
+) -> Vec<(MemoryId, SignalRecord)> {
     let response_entities = extract_entities_simple(response_text);
     let mut signals = Vec::new();
 
-    // Calculate entity overlap signals for each memory
+    // Calculate combined signals for each memory
     for memory in &pending.surfaced_memories {
-        let overlap = calculate_entity_overlap(&memory.entities, &response_entities);
-        let mut signal = SignalRecord::from_entity_overlap(overlap);
+        // Entity overlap signal
+        let entity_overlap = calculate_entity_overlap(&memory.entities, &response_entities);
+        let (entity_value, entity_conf) = if entity_overlap >= OVERLAP_STRONG_THRESHOLD {
+            (SIGNAL_STRONG_MULTIPLIER * entity_overlap, 0.9)
+        } else if entity_overlap >= OVERLAP_WEAK_THRESHOLD {
+            (SIGNAL_WEAK_MULTIPLIER * entity_overlap, 0.6)
+        } else {
+            (SIGNAL_NO_OVERLAP_PENALTY, 0.4)
+        };
+
+        // Semantic similarity signal (if embeddings available)
+        let (semantic_value, semantic_conf, has_semantic) =
+            if let Some(resp_emb) = response_embedding {
+                if !memory.embedding.is_empty() {
+                    let similarity = cosine_similarity(&memory.embedding, resp_emb);
+                    let (val, conf) = signal_from_semantic_similarity(similarity);
+                    (val, conf, true)
+                } else {
+                    (0.0, 0.0, false)
+                }
+            } else {
+                (0.0, 0.0, false)
+            };
+
+        // Combine signals with weights
+        let (combined_value, combined_confidence, trigger) = if has_semantic {
+            let value = (ENTITY_WEIGHT * entity_value) + (SEMANTIC_WEIGHT * semantic_value);
+            let confidence = (ENTITY_WEIGHT * entity_conf) + (SEMANTIC_WEIGHT * semantic_conf);
+
+            // Use semantic similarity as trigger since it's the primary signal
+            let similarity = if let Some(resp_emb) = response_embedding {
+                cosine_similarity(&memory.embedding, resp_emb)
+            } else {
+                0.0
+            };
+            (
+                value,
+                confidence,
+                SignalTrigger::SemanticSimilarity { similarity },
+            )
+        } else {
+            // Fallback to entity-only signal
+            (
+                entity_value,
+                entity_conf,
+                SignalTrigger::EntityOverlap {
+                    overlap_ratio: entity_overlap,
+                },
+            )
+        };
+
+        let mut signal = SignalRecord::new(combined_value, combined_confidence, trigger);
 
         // Apply negative keyword penalty if detected in followup
         if let Some(followup) = user_followup {
@@ -597,6 +702,7 @@ pub fn process_implicit_feedback(
             if !negative.is_empty() {
                 signal.value += SIGNAL_NEGATIVE_KEYWORD_PENALTY;
                 signal.value = signal.value.clamp(-1.0, 1.0);
+                signal.confidence = 0.95; // High confidence on explicit correction
             }
         }
 
@@ -972,6 +1078,7 @@ mod tests {
                 entities: ["rust", "memory"].iter().map(|s| s.to_string()).collect(),
                 content_preview: "Test memory".to_string(),
                 score: 0.8,
+                embedding: Vec::new(),
             }],
         );
         store.set_pending(pending);
@@ -1032,12 +1139,14 @@ mod tests {
                         .collect(),
                     content_preview: "Rust async with tokio".to_string(),
                     score: 0.9,
+                    embedding: Vec::new(),
                 },
                 SurfacedMemoryInfo {
                     id: memory_id2.clone(),
                     entities: ["python", "django"].iter().map(|s| s.to_string()).collect(),
                     content_preview: "Python Django web".to_string(),
                     score: 0.3,
+                    embedding: Vec::new(),
                 },
             ],
         );
@@ -1073,6 +1182,7 @@ mod tests {
                 entities: ["async", "code"].iter().map(|s| s.to_string()).collect(),
                 content_preview: "Async code".to_string(),
                 score: 0.9,
+                embedding: Vec::new(),
             }],
         );
 
@@ -1139,5 +1249,93 @@ mod tests {
         let stats = store.stats();
         assert_eq!(stats.total_momentum_entries, 5);
         assert!((stats.avg_ema - 0.4).abs() < 0.01); // (0+0.2+0.4+0.6+0.8)/5 = 0.4
+    }
+
+    #[test]
+    fn test_process_feedback_with_semantic_similarity() {
+        let memory_id1 = MemoryId(Uuid::new_v4());
+        let memory_id2 = MemoryId(Uuid::new_v4());
+
+        // Create embeddings: similar embeddings for related content
+        let rust_embedding: Vec<f32> = (0..384).map(|i| (i as f32) * 0.01).collect();
+        let python_embedding: Vec<f32> = (0..384).map(|i| 1.0 - (i as f32) * 0.01).collect();
+
+        let pending = PendingFeedback::new(
+            "user1".to_string(),
+            "How do I use async in Rust?".to_string(),
+            vec![0.1; 384],
+            vec![
+                SurfacedMemoryInfo {
+                    id: memory_id1.clone(),
+                    entities: ["rust", "async", "tokio"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    content_preview: "Rust async with tokio".to_string(),
+                    score: 0.9,
+                    embedding: rust_embedding.clone(),
+                },
+                SurfacedMemoryInfo {
+                    id: memory_id2.clone(),
+                    entities: ["python", "django"].iter().map(|s| s.to_string()).collect(),
+                    content_preview: "Python Django web".to_string(),
+                    score: 0.3,
+                    embedding: python_embedding.clone(),
+                },
+            ],
+        );
+
+        // Response embedding similar to rust_embedding
+        let response = "Here is how to use async/await in Rust with tokio runtime.";
+        let response_embedding = rust_embedding; // Similar to memory 1
+
+        // Process without semantic (backwards compat)
+        let signals_entity_only = process_implicit_feedback(&pending, response, None);
+
+        // Process with semantic similarity
+        let signals_with_semantic =
+            process_implicit_feedback_with_semantics(&pending, response, None, Some(&response_embedding));
+
+        // First memory should score higher with semantic (response embedding matches memory embedding)
+        let (id1, sig1_entity) = &signals_entity_only[0];
+        let (_, sig1_semantic) = &signals_with_semantic[0];
+        assert_eq!(id1, &memory_id1);
+
+        // Semantic signal should use SemanticSimilarity trigger
+        match &sig1_semantic.trigger {
+            SignalTrigger::SemanticSimilarity { similarity } => {
+                assert!(*similarity > 0.9); // High similarity since embeddings are same
+            }
+            _ => panic!("Expected SemanticSimilarity trigger"),
+        }
+
+        // Second memory (python) should have low semantic score since embedding is different
+        let (id2, sig2_semantic) = &signals_with_semantic[1];
+        assert_eq!(id2, &memory_id2);
+        match &sig2_semantic.trigger {
+            SignalTrigger::SemanticSimilarity { similarity } => {
+                assert!(*similarity < 0.5); // Low similarity - different embeddings
+            }
+            _ => panic!("Expected SemanticSimilarity trigger"),
+        }
+    }
+
+    #[test]
+    fn test_cosine_similarity_basic() {
+        // Identical vectors = 1.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+
+        // Orthogonal vectors = 0.0
+        let c = vec![0.0, 1.0, 0.0];
+        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 0.001);
+
+        // Opposite vectors = -1.0
+        let d = vec![-1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 0.001);
+
+        // Empty vectors = 0.0
+        assert!((cosine_similarity(&[], &[]) - 0.0).abs() < 0.001);
     }
 }

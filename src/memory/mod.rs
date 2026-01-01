@@ -25,6 +25,7 @@ pub mod feedback;
 pub mod graph_retrieval;
 pub mod injection;
 pub mod lineage;
+pub mod segmentation;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -74,6 +75,9 @@ pub use crate::memory::lineage::{
     LineageStats, LineageTrace, PostMortem, TraceDirection,
 };
 pub use crate::memory::prospective::ProspectiveStore;
+pub use crate::memory::segmentation::{
+    AtomicMemory, DeduplicationEngine, DeduplicationResult, InputSource, SegmentationEngine,
+};
 pub use crate::memory::replay::{
     InterferenceCheckResult, InterferenceDetector, InterferenceRecord, ReplayCandidate,
     ReplayCycleResult, ReplayManager,
@@ -1844,6 +1848,15 @@ impl MemorySystem {
         self.retriever.save()?;
 
         Ok(())
+    }
+
+    /// Get the underlying RocksDB database handle for backup operations
+    ///
+    /// # Warning
+    /// This provides direct access to the database. Use with caution.
+    /// Primarily intended for backup/restore operations.
+    pub fn get_db(&self) -> std::sync::Arc<rocksdb::DB> {
+        self.long_term_memory.db()
     }
 
     /// Advanced search using storage criteria
