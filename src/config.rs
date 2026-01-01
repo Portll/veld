@@ -209,6 +209,18 @@ pub struct ServerConfig {
     /// Activation decay factor per maintenance cycle (default: 0.95)
     /// Memories lose 5% activation each cycle: A_new = A_old * 0.95
     pub activation_decay_factor: f32,
+
+    /// Backup configuration
+    /// Automatic backup interval in seconds (default: 86400 = 24 hours)
+    /// Set to 0 to disable automatic backups
+    pub backup_interval_secs: u64,
+
+    /// Maximum backups to keep per user (default: 7)
+    /// Older backups are automatically purged
+    pub backup_max_count: usize,
+
+    /// Whether backups are enabled (default: true in production, false in dev)
+    pub backup_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -227,6 +239,9 @@ impl Default for ServerConfig {
             cors: CorsConfig::default(),
             maintenance_interval_secs: 300, // 5 minutes
             activation_decay_factor: 0.95,  // 5% decay per cycle
+            backup_interval_secs: 86400,    // 24 hours
+            backup_max_count: 7,            // Keep 7 backups (1 week of daily backups)
+            backup_enabled: false,          // Disabled by default, auto-enabled in production
         }
     }
 }
@@ -313,6 +328,27 @@ impl ServerConfig {
             }
         }
 
+        // Backup configuration
+        if let Ok(val) = env::var("SHODH_BACKUP_INTERVAL") {
+            if let Ok(n) = val.parse() {
+                config.backup_interval_secs = n;
+            }
+        }
+
+        if let Ok(val) = env::var("SHODH_BACKUP_MAX_COUNT") {
+            if let Ok(n) = val.parse() {
+                config.backup_max_count = n;
+            }
+        }
+
+        // Auto-enable backups in production mode unless explicitly disabled
+        if let Ok(val) = env::var("SHODH_BACKUP_ENABLED") {
+            config.backup_enabled = val.to_lowercase() == "true" || val == "1";
+        } else if config.is_production {
+            // Auto-enable in production
+            config.backup_enabled = true;
+        }
+
         config
     }
 
@@ -345,6 +381,15 @@ impl ServerConfig {
             "   Maintenance interval: {}s (decay factor: {:.2})",
             self.maintenance_interval_secs, self.activation_decay_factor
         );
+        if self.backup_enabled {
+            let interval_hours = self.backup_interval_secs / 3600;
+            info!(
+                "   Backup: enabled (every {}h, keep {})",
+                interval_hours, self.backup_max_count
+            );
+        } else {
+            info!("   Backup: disabled");
+        }
     }
 }
 
@@ -377,6 +422,11 @@ pub fn print_env_help() {
     println!("  SHODH_CORS_HEADERS     - Comma-separated allowed headers (default: Content-Type,Authorization,X-Request-ID)");
     println!("  SHODH_CORS_CREDENTIALS - Allow credentials true/false (default: false)");
     println!("  SHODH_CORS_MAX_AGE     - Preflight cache seconds (default: 86400)");
+    println!();
+    println!("Backup Configuration:");
+    println!("  SHODH_BACKUP_ENABLED   - Enable automatic backups true/false (default: auto in production)");
+    println!("  SHODH_BACKUP_INTERVAL  - Backup interval in seconds (default: 86400 = 24 hours)");
+    println!("  SHODH_BACKUP_MAX_COUNT - Max backups to keep per user (default: 7)");
     println!();
     println!("  RUST_LOG               - Log level (e.g., info, debug, trace)");
     println!();
