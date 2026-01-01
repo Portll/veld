@@ -1,5 +1,5 @@
 //! Production-grade retrieval engine for memory search
-//! Integrated with Vamana HNSW and MiniLM embeddings for robotics/drones
+//! Integrated with Vamana graph-based ANN and MiniLM embeddings
 //!
 //! Features Hebbian-inspired adaptive learning:
 //! - Outcome feedback: Memories that help complete tasks get reinforced
@@ -70,49 +70,98 @@ pub struct RetrievalEngine {
 }
 
 /// Bidirectional mapping between memory IDs and vector IDs
+///
+/// Supports multiple vectors per memory for chunked embeddings.
+/// When long content is split into chunks, each chunk gets its own vector ID,
+/// but all map back to the same MemoryId.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct IdMapping {
-    memory_to_vector: HashMap<MemoryId, u32>,
+    /// Maps each memory to ALL its vector IDs (supports chunked embeddings)
+    memory_to_vectors: HashMap<MemoryId, Vec<u32>>,
+    /// Maps each vector ID back to its parent memory
     vector_to_memory: HashMap<u32, MemoryId>,
 }
 
 impl IdMapping {
     fn new() -> Self {
         Self {
-            memory_to_vector: HashMap::new(),
+            memory_to_vectors: HashMap::new(),
             vector_to_memory: HashMap::new(),
         }
     }
 
+    /// Insert a single vector for a memory (legacy/simple case)
     fn insert(&mut self, memory_id: MemoryId, vector_id: u32) {
-        self.memory_to_vector.insert(memory_id.clone(), vector_id);
+        self.memory_to_vectors
+            .entry(memory_id.clone())
+            .or_default()
+            .push(vector_id);
         self.vector_to_memory.insert(vector_id, memory_id);
+    }
+
+    /// Insert multiple vectors for a memory (chunked embedding case)
+    fn insert_chunks(&mut self, memory_id: MemoryId, vector_ids: Vec<u32>) {
+        for &vid in &vector_ids {
+            self.vector_to_memory.insert(vid, memory_id.clone());
+        }
+        self.memory_to_vectors
+            .entry(memory_id)
+            .or_default()
+            .extend(vector_ids);
     }
 
     fn get_memory_id(&self, vector_id: u32) -> Option<&MemoryId> {
         self.vector_to_memory.get(&vector_id)
     }
 
+    /// Get the first/primary vector ID for a memory (backwards compatibility)
     fn get_vector_id(&self, memory_id: &MemoryId) -> Option<u32> {
-        self.memory_to_vector.get(memory_id).copied()
+        self.memory_to_vectors
+            .get(memory_id)
+            .and_then(|v| v.first().copied())
     }
 
-    /// Remove a memory from the mapping, returns the vector_id if it existed
+    /// Get ALL vector IDs for a memory (chunked case)
+    fn get_vector_ids(&self, memory_id: &MemoryId) -> Option<&Vec<u32>> {
+        self.memory_to_vectors.get(memory_id)
+    }
+
+    /// Remove a memory from the mapping, returns all vector_ids if it existed
     fn remove(&mut self, memory_id: &MemoryId) -> Option<u32> {
-        if let Some(vector_id) = self.memory_to_vector.remove(memory_id) {
-            self.vector_to_memory.remove(&vector_id);
-            Some(vector_id)
+        if let Some(vector_ids) = self.memory_to_vectors.remove(memory_id) {
+            for vid in &vector_ids {
+                self.vector_to_memory.remove(vid);
+            }
+            vector_ids.first().copied()
         } else {
             None
         }
     }
 
+    /// Remove a memory and return ALL its vector IDs
+    fn remove_all(&mut self, memory_id: &MemoryId) -> Vec<u32> {
+        if let Some(vector_ids) = self.memory_to_vectors.remove(memory_id) {
+            for vid in &vector_ids {
+                self.vector_to_memory.remove(vid);
+            }
+            vector_ids
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Number of unique memories in the mapping
     fn len(&self) -> usize {
-        self.memory_to_vector.len()
+        self.memory_to_vectors.len()
+    }
+
+    /// Total number of vectors (may be > len() due to chunking)
+    fn vector_count(&self) -> usize {
+        self.vector_to_memory.len()
     }
 
     fn clear(&mut self) {
-        self.memory_to_vector.clear();
+        self.memory_to_vectors.clear();
         self.vector_to_memory.clear();
     }
 }
@@ -288,33 +337,69 @@ impl RetrievalEngine {
     pub fn get_indexed_memory_ids(&self) -> HashSet<MemoryId> {
         self.id_mapping
             .read()
-            .memory_to_vector
+            .memory_to_vectors
             .keys()
             .cloned()
             .collect()
     }
 
     /// Add memory to vector index (call when storing new memory)
+    ///
+    /// For long content, this chunks the text and creates multiple embeddings
+    /// to ensure ALL content is searchable, not just the first 256 tokens.
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
-        // Use pre-computed embedding if available, otherwise generate
-        let embedding = if let Some(emb) = &memory.experience.embeddings {
-            emb.clone()
+        use crate::embeddings::chunking::{chunk_text, ChunkConfig};
+
+        let text = Self::extract_searchable_text(memory);
+        let chunk_config = ChunkConfig::default();
+        let chunk_result = chunk_text(&text, &chunk_config);
+
+        if chunk_result.was_chunked {
+            // Long content: embed each chunk separately
+            let mut vector_ids = Vec::with_capacity(chunk_result.chunks.len());
+            let mut index = self.vector_index.write();
+
+            for chunk in &chunk_result.chunks {
+                let embedding = self
+                    .embedder
+                    .encode(chunk)
+                    .context("Failed to generate chunk embedding")?;
+
+                let vector_id = index
+                    .add_vector(embedding)
+                    .context("Failed to add chunk vector to index")?;
+
+                vector_ids.push(vector_id);
+            }
+
+            // Map all chunk vectors to this memory
+            self.id_mapping
+                .write()
+                .insert_chunks(memory.id.clone(), vector_ids);
+
+            tracing::debug!(
+                "Indexed memory {} with {} chunks (original: {} chars)",
+                memory.id.0,
+                chunk_result.chunks.len(),
+                chunk_result.original_length
+            );
         } else {
-            // Generate embedding if not provided
-            let text = Self::extract_searchable_text(memory);
-            self.embedder
-                .encode(&text)
-                .context("Failed to generate embedding")?
-        };
+            // Short content: single embedding (use pre-computed if available)
+            let embedding = if let Some(emb) = &memory.experience.embeddings {
+                emb.clone()
+            } else {
+                self.embedder
+                    .encode(&text)
+                    .context("Failed to generate embedding")?
+            };
 
-        // Add to Vamana index
-        let mut index = self.vector_index.write();
-        let vector_id = index
-            .add_vector(embedding)
-            .context("Failed to add vector to index")?;
+            let mut index = self.vector_index.write();
+            let vector_id = index
+                .add_vector(embedding)
+                .context("Failed to add vector to index")?;
 
-        // Map memory ID to vector ID
-        self.id_mapping.write().insert(memory.id.clone(), vector_id);
+            self.id_mapping.write().insert(memory.id.clone(), vector_id);
+        }
 
         Ok(())
     }
@@ -326,22 +411,28 @@ impl RetrievalEngine {
     ///
     /// Strategy: Remove old vector and add new one (Vamana doesn't support update-in-place)
     pub fn reindex_memory(&self, memory: &Memory) -> Result<()> {
-        // Check if memory is already indexed
-        let existing_vector_id = {
+        // Check if memory is already indexed (may have multiple vectors from chunking)
+        let existing_vector_ids = {
             let mapping = self.id_mapping.read();
-            mapping.memory_to_vector.get(&memory.id).copied()
+            mapping
+                .memory_to_vectors
+                .get(&memory.id)
+                .cloned()
+                .unwrap_or_default()
         };
 
-        if let Some(vector_id) = existing_vector_id {
-            // Remove old mapping (vector stays in index but becomes orphaned - acceptable for HNSW)
-            // Note: Vamana/HNSW doesn't support true deletion, but this is fine for upsert scenarios
-            // The old vector will be ignored during search since ID mapping points to new vector
+        if !existing_vector_ids.is_empty() {
+            // Remove old mappings (vectors stay in index but become orphaned - acceptable for Vamana)
+            // Note: Vamana doesn't support true deletion, but this is fine for upsert scenarios
+            // The old vectors will be ignored during search since ID mapping points to new vectors
             let mut mapping = self.id_mapping.write();
-            mapping.memory_to_vector.remove(&memory.id);
-            mapping.vector_to_memory.remove(&vector_id);
+            mapping.memory_to_vectors.remove(&memory.id);
+            for vector_id in existing_vector_ids {
+                mapping.vector_to_memory.remove(&vector_id);
+            }
         }
 
-        // Add with new embedding
+        // Add with new embedding (may create multiple chunks)
         self.index_memory(memory)
     }
 
@@ -448,6 +539,10 @@ impl RetrievalEngine {
     }
 
     /// Search for memory IDs only (for cache-aware retrieval)
+    ///
+    /// With chunked embeddings, multiple vectors can map to the same memory.
+    /// This function deduplicates by MemoryId, keeping the highest-scoring chunk.
+    ///
     /// Returns (MemoryId, similarity_score) pairs
     pub fn search_ids(&self, query: &Query, limit: usize) -> Result<Vec<(MemoryId, f32)>> {
         // BUG-006 FIX: Log warning for empty queries
@@ -462,24 +557,38 @@ impl RetrievalEngine {
             return Ok(Vec::new());
         };
 
-        // Search vector index
-        // Use VECTOR_SEARCH_CANDIDATE_MULTIPLIER to retrieve extra candidates for filtering
-        // This accounts for ~50% filter rejection rate in typical queries
+        // Search vector index - fetch more candidates for chunk deduplication
         let index = self.vector_index.read();
         let results = index
-            .search(&query_embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER)
+            .search(
+                &query_embedding,
+                limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2,
+            )
             .context("Vector search failed")?;
 
-        // Map vector IDs to memory IDs
+        // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest score)
         let id_mapping = self.id_mapping.read();
-        let memory_ids: Vec<(MemoryId, f32)> = results
-            .into_iter()
-            .filter_map(|(vector_id, distance)| {
-                id_mapping
-                    .get_memory_id(vector_id)
-                    .map(|id| (id.clone(), distance))
-            })
-            .collect();
+        let mut best_scores: std::collections::HashMap<MemoryId, f32> =
+            std::collections::HashMap::new();
+
+        for (vector_id, similarity) in results {
+            if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
+                // Keep the highest score for each memory (best matching chunk)
+                best_scores
+                    .entry(memory_id.clone())
+                    .and_modify(|score| {
+                        if similarity > *score {
+                            *score = similarity;
+                        }
+                    })
+                    .or_insert(similarity);
+            }
+        }
+
+        // Convert to vec and sort by score descending
+        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
+        memory_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        memory_ids.truncate(limit);
 
         Ok(memory_ids)
     }
@@ -494,6 +603,9 @@ impl RetrievalEngine {
     /// Used for interference detection to find memories similar to a new memory.
     /// Optionally excludes a specific memory ID from results.
     ///
+    /// With chunked embeddings, multiple vectors can map to the same memory.
+    /// This function deduplicates by MemoryId, keeping the highest-scoring chunk.
+    ///
     /// Returns (MemoryId, similarity_score) pairs
     pub fn search_by_embedding(
         &self,
@@ -501,29 +613,42 @@ impl RetrievalEngine {
         limit: usize,
         exclude_id: Option<&MemoryId>,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        // Search vector index
+        // Search vector index - fetch more candidates to account for chunk deduplication
         let index = self.vector_index.read();
         let results = index
-            .search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER)
+            .search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
             .context("Vector search by embedding failed")?;
 
-        // Map vector IDs to memory IDs, excluding specified ID if provided
+        // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest score)
         let id_mapping = self.id_mapping.read();
-        let memory_ids: Vec<(MemoryId, f32)> = results
-            .into_iter()
-            .filter_map(|(vector_id, similarity)| {
-                id_mapping.get_memory_id(vector_id).and_then(|id| {
-                    // Exclude the specified memory ID if provided
-                    if let Some(exclude) = exclude_id {
-                        if *id == *exclude {
-                            return None;
-                        }
+        let mut best_scores: std::collections::HashMap<MemoryId, f32> =
+            std::collections::HashMap::new();
+
+        for (vector_id, similarity) in results {
+            if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
+                // Skip excluded ID
+                if let Some(exclude) = exclude_id {
+                    if memory_id == exclude {
+                        continue;
                     }
-                    Some((id.clone(), similarity))
-                })
-            })
-            .take(limit)
-            .collect();
+                }
+
+                // Keep the highest score for each memory (best matching chunk)
+                best_scores
+                    .entry(memory_id.clone())
+                    .and_modify(|score| {
+                        if similarity > *score {
+                            *score = similarity;
+                        }
+                    })
+                    .or_insert(similarity);
+            }
+        }
+
+        // Convert to vec and sort by score descending
+        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
+        memory_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        memory_ids.truncate(limit);
 
         Ok(memory_ids)
     }
@@ -546,7 +671,7 @@ impl RetrievalEngine {
         Ok(results)
     }
 
-    /// PRODUCTION: Similarity search using Vamana HNSW (sub-millisecond, zero-copy)
+    /// PRODUCTION: Similarity search using Vamana graph-based ANN (sub-millisecond, zero-copy)
     fn similarity_search(&self, query: &Query, limit: usize) -> Result<Vec<SharedMemory>> {
         // BUG-006 FIX: Log warning for empty queries
         let query_embedding = if let Some(embedding) = &query.query_embedding {

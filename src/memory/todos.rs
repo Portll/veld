@@ -1070,17 +1070,33 @@ mod tests {
         let (store, _temp) = setup_store();
 
         let todo = Todo::new("test_user".to_string(), "Test task".to_string());
-        let short_id = todo.id.short();
-        store.store_todo(&todo).unwrap();
+        // store_todo assigns seq_num and returns the updated todo
+        let stored = store.store_todo(&todo).unwrap();
 
-        // Find by full SHO-xxxx
+        // Use short_id() which returns "SHO-1" format (sequence-based)
+        let short_id = stored.short_id();
+
+        // Find by full SHO-N format
         let found = store.find_todo_by_prefix("test_user", &short_id).unwrap();
-        assert!(found.is_some());
+        assert!(
+            found.is_some(),
+            "Should find by full short_id: {}",
+            short_id
+        );
 
-        // Find by just the hex part
-        let hex_part = short_id.strip_prefix("SHO-").unwrap();
-        let found2 = store.find_todo_by_prefix("test_user", hex_part).unwrap();
-        assert!(found2.is_some());
+        // Find by just the sequence number
+        let seq_str = stored.seq_num.to_string();
+        let found2 = store.find_todo_by_prefix("test_user", &seq_str).unwrap();
+        assert!(found2.is_some(), "Should find by seq_num: {}", seq_str);
+
+        // Also test UUID prefix fallback for legacy compatibility
+        let uuid_prefix = &stored.id.0.to_string()[..8];
+        let found3 = store.find_todo_by_prefix("test_user", uuid_prefix).unwrap();
+        assert!(
+            found3.is_some(),
+            "Should find by UUID prefix: {}",
+            uuid_prefix
+        );
     }
 
     #[test]

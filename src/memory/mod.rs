@@ -775,12 +775,19 @@ impl MemorySystem {
         let mut storage_fetches = 0;
         let mut filtered_out = 0;
 
-        for (memory_id, _score) in memory_ids {
-            // Try working memory first (hot cache, zero-copy Arc clone)
+        for (memory_id, score) in memory_ids {
+            // Helper to clone memory with score set (Arc<Memory> is immutable)
+            let with_score = |mem: &SharedMemory, s: f32| -> SharedMemory {
+                let mut cloned: Memory = mem.as_ref().clone();
+                cloned.set_score(s);
+                Arc::new(cloned)
+            };
+
+            // Try working memory first (hot cache)
             if let Some(memory) = self.working_memory.read().get(&memory_id) {
                 // CRITICAL FIX: Apply filters before adding to results
                 if self.retriever.matches_filters(&memory, &vector_query) {
-                    memories.push(memory);
+                    memories.push(with_score(&memory, score));
                     if !sources.contains(&"working") {
                         sources.push("working");
                     }
@@ -791,11 +798,11 @@ impl MemorySystem {
                 continue;
             }
 
-            // Try session memory second (warm cache, zero-copy Arc clone)
+            // Try session memory second (warm cache)
             if let Some(memory) = self.session_memory.read().get(&memory_id) {
                 // CRITICAL FIX: Apply filters before adding to results
                 if self.retriever.matches_filters(&memory, &vector_query) {
-                    memories.push(memory);
+                    memories.push(with_score(&memory, score));
                     if !sources.contains(&"session") {
                         sources.push("session");
                     }
@@ -808,9 +815,10 @@ impl MemorySystem {
 
             // Cold path: Fetch from RocksDB storage (expensive deserialization)
             match self.retriever.get_from_storage(&memory_id) {
-                Ok(memory) => {
+                Ok(mut memory) => {
                     // CRITICAL FIX: Apply filters before adding to results
                     if self.retriever.matches_filters(&memory, &vector_query) {
+                        memory.set_score(score);
                         memories.push(Arc::new(memory));
                         if !sources.contains(&"longterm") {
                             sources.push("longterm");

@@ -16,10 +16,14 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod chunking;
 pub mod circuit_breaker;
 pub mod downloader;
 pub mod minilm;
 pub mod ner;
+
+// Re-export chunking types
+pub use chunking::{chunk_text, ChunkConfig, ChunkResult};
 
 use anyhow::Result;
 

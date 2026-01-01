@@ -203,7 +203,8 @@ fn strip_system_noise(content: &str) -> String {
     // Remove Claude Code file content blocks - Windows paths
     while let Some(start) = result.find("Contents of C:\\") {
         let search_area = &result[start..];
-        let end_offset = search_area.find("\n\n")
+        let end_offset = search_area
+            .find("\n\n")
             .or_else(|| search_area.find("\r\n\r\n"))
             .unwrap_or(search_area.len().min(2000));
         result = format!("{}{}", &result[..start], &result[start + end_offset..]);
@@ -212,7 +213,8 @@ fn strip_system_noise(content: &str) -> String {
     // Remove Claude Code file content blocks - Unix paths
     while let Some(start) = result.find("Contents of /") {
         let search_area = &result[start..];
-        let end_offset = search_area.find("\n\n")
+        let end_offset = search_area
+            .find("\n\n")
             .or_else(|| search_area.find("\r\n\r\n"))
             .unwrap_or(search_area.len().min(2000));
         result = format!("{}{}", &result[..start], &result[start + end_offset..]);
@@ -252,8 +254,8 @@ fn is_bare_question(content: &str) -> bool {
 
     // Question word starters
     let question_starters = [
-        "what", "how", "why", "where", "when", "who", "can", "could",
-        "is", "are", "do", "does", "will", "would", "should", "have",
+        "what", "how", "why", "where", "when", "who", "can", "could", "is", "are", "do", "does",
+        "will", "would", "should", "have",
     ];
     let starts_with_question = question_starters.iter().any(|q| lower.starts_with(q));
     let ends_with_question = trimmed.ends_with('?');
@@ -709,10 +711,6 @@ impl MultiUserMemoryManager {
             }
         };
 
-        // Initialize streaming memory extractor
-        let streaming_extractor =
-            Arc::new(streaming::StreamingMemoryExtractor::new(neural_ner.clone()));
-
         // Eviction counter for metrics (shared with cache eviction listener)
         let user_evictions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let evictions_clone = user_evictions.clone();
@@ -763,6 +761,13 @@ impl MultiUserMemoryManager {
             }),
         ));
         info!("🔄 Feedback store initialized");
+
+        // Initialize streaming memory extractor (needs feedback_store for relevance scoring)
+        let streaming_extractor = Arc::new(streaming::StreamingMemoryExtractor::new(
+            neural_ner.clone(),
+            feedback_store.clone(),
+        ));
+        info!("📡 Streaming memory extractor initialized");
 
         // Initialize backup engine
         let backup_path = base_path.join("backups");
@@ -1569,7 +1574,8 @@ impl MultiUserMemoryManager {
                             backed_up += 1;
 
                             // Purge old backups for this user
-                            if let Err(e) = self.backup_engine.purge_old_backups(name, max_backups) {
+                            if let Err(e) = self.backup_engine.purge_old_backups(name, max_backups)
+                            {
                                 tracing::warn!(
                                     user_id = name,
                                     error = %e,
@@ -1685,6 +1691,20 @@ struct RememberRequest {
     /// ID of the preceding memory (for temporal chains)
     #[serde(default)]
     preceding_memory_id: Option<String>,
+
+    /// Agent ID for multi-agent systems (e.g., "explore-abc123", "plan-def456")
+    /// Used to track which agent created this memory
+    #[serde(default)]
+    agent_id: Option<String>,
+
+    /// Parent agent ID for hierarchical agent tracking
+    /// Links child agent memories to parent context
+    #[serde(default)]
+    parent_agent_id: Option<String>,
+
+    /// Run ID for grouping memories within a single agent execution
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 /// Simplified remember response
@@ -2819,9 +2839,17 @@ async fn remember(
         let memory = memory.clone();
         let exp_clone = experience.clone();
         let created_at = req.created_at;
+        let agent_id = req.agent_id.clone();
+        let run_id = req.run_id.clone();
+
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            memory_guard.remember(exp_clone, created_at)
+            // Use agent-aware method if agent context is provided
+            if agent_id.is_some() || run_id.is_some() {
+                memory_guard.remember_with_agent(exp_clone, created_at, agent_id, run_id)
+            } else {
+                memory_guard.remember(exp_clone, created_at)
+            }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
@@ -5399,12 +5427,14 @@ async fn proactive_context(
     let max_results = req.max_results;
     let context_emb_for_scoring = context_embedding.clone();
     let injection_config = InjectionConfig::default();
+    let feedback_store_for_scoring = state.feedback_store.clone();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
         let graph = graph_memory.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
             let graph_guard = graph.read();
+            let feedback_guard = feedback_store_for_scoring.read();
             let now = chrono::Utc::now();
 
             let query = MemoryQuery {
@@ -5427,10 +5457,18 @@ async fn proactive_context(
                         .get_memory_hebbian_strength(&m.id)
                         .unwrap_or(0.3);
 
+                    // Get feedback momentum EMA (0.0 if no feedback history)
+                    // Negative values indicate often-ignored memories → suppression
+                    let feedback_momentum = feedback_guard
+                        .get_momentum(&m.id)
+                        .map(|fm| fm.ema)
+                        .unwrap_or(0.0);
+
                     let input = RelevanceInput {
                         memory_embedding,
                         created_at: m.created_at,
                         hebbian_strength,
+                        feedback_momentum,
                         ..Default::default()
                     };
 
@@ -5594,12 +5632,18 @@ async fn proactive_context(
 
                     for segment in segments {
                         // Format content with type prefix for clarity
-                        let content = format!("[Assistant: {:?}] {}", segment.experience_type, segment.content);
+                        let content = format!(
+                            "[Assistant: {:?}] {}",
+                            segment.experience_type, segment.content
+                        );
                         let experience = Experience {
                             content,
                             experience_type: segment.experience_type,
                             entities: segment.entities,
-                            tags: vec!["assistant-response".to_string(), "auto-captured".to_string()],
+                            tags: vec![
+                                "assistant-response".to_string(),
+                                "auto-captured".to_string(),
+                            ],
                             ..Default::default()
                         };
                         let _ = memory_guard.remember(experience, None);
@@ -6736,6 +6780,22 @@ async fn get_user_stats(
     Ok(Json(stats))
 }
 
+/// GET /api/stats - OpenAPI spec compatible stats endpoint
+#[derive(Debug, Deserialize)]
+struct StatsQuery {
+    user_id: String,
+}
+
+async fn get_stats_query(
+    State(state): State<AppState>,
+    Query(query): Query<StatsQuery>,
+) -> Result<Json<MemoryStats>, AppError> {
+    let stats = state
+        .get_stats(&query.user_id)
+        .map_err(AppError::Internal)?;
+    Ok(Json(stats))
+}
+
 /// Response for user deletion
 #[derive(Debug, Serialize)]
 struct DeleteUserResponse {
@@ -7029,6 +7089,84 @@ async fn get_all_memories(
     // Convert Arc<Memory> to owned Memory for response
     let memories: Vec<Memory> = shared_memories.iter().map(|m| (**m).clone()).collect();
 
+    let count = memories.len();
+
+    Ok(Json(RetrieveResponse { memories, count }))
+}
+
+/// GET version of get_all_memories for OpenAPI spec compatibility
+/// Uses query parameters instead of JSON body
+#[derive(Debug, Deserialize)]
+struct GetAllQuery {
+    user_id: String,
+    limit: Option<usize>,
+    importance_threshold: Option<f32>,
+    /// Comma-separated tags
+    tags: Option<String>,
+    memory_type: Option<String>,
+    created_after: Option<String>,
+    created_before: Option<String>,
+}
+
+async fn get_all_memories_get(
+    State(state): State<AppState>,
+    Query(query): Query<GetAllQuery>,
+) -> Result<Json<RetrieveResponse>, AppError> {
+    let memory = state
+        .get_user_memory(&query.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory.read();
+
+    // Parse memory_type string to ExperienceType if provided
+    let experience_types = query.memory_type.as_ref().map(|type_str| {
+        vec![match type_str.to_lowercase().as_str() {
+            "observation" => ExperienceType::Observation,
+            "decision" => ExperienceType::Decision,
+            "learning" => ExperienceType::Learning,
+            "error" => ExperienceType::Error,
+            "discovery" => ExperienceType::Discovery,
+            "pattern" => ExperienceType::Pattern,
+            "context" => ExperienceType::Context,
+            "task" => ExperienceType::Task,
+            "codeedit" => ExperienceType::CodeEdit,
+            "fileaccess" => ExperienceType::FileAccess,
+            "search" => ExperienceType::Search,
+            "command" => ExperienceType::Command,
+            "conversation" => ExperienceType::Conversation,
+            _ => ExperienceType::Observation,
+        }]
+    });
+
+    // Parse comma-separated tags
+    let tags = query
+        .tags
+        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+
+    // Parse time range
+    let created_after = query.created_after.as_ref().and_then(|s| s.parse().ok());
+    let created_before = query.created_before.as_ref().and_then(|s| s.parse().ok());
+
+    let time_range = match (created_after, created_before) {
+        (Some(after), Some(before)) => Some((after, before)),
+        (Some(after), None) => Some((after, chrono::Utc::now())),
+        (None, Some(before)) => Some((chrono::DateTime::<chrono::Utc>::MIN_UTC, before)),
+        (None, None) => None,
+    };
+
+    let mem_query = MemoryQuery {
+        max_results: query.limit.unwrap_or(100),
+        importance_threshold: query.importance_threshold,
+        tags,
+        experience_types,
+        time_range,
+        ..Default::default()
+    };
+
+    let shared_memories = memory_guard
+        .recall(&mem_query)
+        .map_err(AppError::Internal)?;
+    let memories: Vec<Memory> = shared_memories.iter().map(|m| (**m).clone()).collect();
     let count = memories.len();
 
     Ok(Json(RetrieveResponse { memories, count }))
@@ -7689,7 +7827,10 @@ async fn verify_backup(
 ) -> Result<Json<VerifyBackupResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    match state.backup_engine().verify_backup(&req.user_id, req.backup_id) {
+    match state
+        .backup_engine()
+        .verify_backup(&req.user_id, req.backup_id)
+    {
         Ok(is_valid) => Ok(Json(VerifyBackupResponse {
             success: true,
             is_valid,
@@ -7714,7 +7855,10 @@ async fn purge_backups(
 ) -> Result<Json<PurgeBackupsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    match state.backup_engine().purge_old_backups(&req.user_id, req.keep_count) {
+    match state
+        .backup_engine()
+        .purge_old_backups(&req.user_id, req.keep_count)
+    {
         Ok(purged_count) => {
             if purged_count > 0 {
                 state.log_event(
@@ -10494,7 +10638,11 @@ async fn update_todo(
         &format!(
             "Updated todo [{}]: {}",
             todo.short_id(),
-            if update_description.is_empty() { "no changes" } else { &update_description }
+            if update_description.is_empty() {
+                "no changes"
+            } else {
+                &update_description
+            }
         ),
     );
 
@@ -11983,7 +12131,10 @@ async fn main() -> Result<()> {
                 .unwrap_or(0);
 
                 if backed_up > 0 {
-                    info!("💾 Scheduled backup completed: {} users backed up", backed_up);
+                    info!(
+                        "💾 Scheduled backup completed: {} users backed up",
+                        backed_up
+                    );
                 } else {
                     tracing::debug!("💾 Scheduled backup: no users to backup");
                 }
@@ -12043,16 +12194,19 @@ async fn main() -> Result<()> {
         // User management
         .route("/api/users", get(list_users))
         .route("/api/users/{user_id}/stats", get(get_user_stats))
+        .route("/api/stats", get(get_stats_query)) // OpenAPI spec alias
         .route("/api/users/{user_id}", delete(delete_user))
         // Memory CRUD
         .route("/api/memory/{memory_id}", get(get_memory))
         .route("/api/memory/{memory_id}", axum::routing::put(update_memory))
         .route("/api/memory/{memory_id}", delete(delete_memory))
+        .route("/api/forget/{memory_id}", delete(delete_memory)) // OpenAPI spec alias
         .route(
             "/api/memory/{memory_id}",
             axum::routing::patch(patch_memory),
         )
         .route("/api/memories", post(get_all_memories))
+        .route("/api/memories", get(get_all_memories_get)) // OpenAPI spec GET alias
         .route("/api/memories/history", post(get_history))
         .route("/api/memories/bulk", post(bulk_delete_memories))
         .route("/api/memories/clear", post(clear_all_memories))
@@ -12074,6 +12228,7 @@ async fn main() -> Result<()> {
         .route("/api/forget/date", post(forget_by_date))
         // Recall by filters (tag/date convenience endpoints)
         .route("/api/recall/tags", post(recall_by_tags))
+        .route("/api/recall/by-tags", post(recall_by_tags)) // OpenAPI spec alias
         .route("/api/recall/date", post(recall_by_date))
         // Advanced Search
         .route("/api/search/advanced", post(advanced_search))
@@ -12115,6 +12270,7 @@ async fn main() -> Result<()> {
         .route("/api/context_summary", post(context_summary))
         // Proactive Context (SHO-116) - Combined recall + reminders for MCP
         .route("/api/proactive_context", post(proactive_context))
+        .route("/api/context", post(proactive_context)) // OpenAPI spec alias
         // Proactive Memory Surfacing (SHO-29) - Push-based relevance
         .route("/api/relevant", post(surface_relevant))
         // Context Monitor WebSocket (SHO-29) - Streaming context surfacing
@@ -12235,9 +12391,7 @@ async fn main() -> Result<()> {
     // - public_routes: health, metrics, static - NO auth, NO rate limiting
     // - protected_routes: API endpoints including streaming - API key auth, rate limited
     // Note: Cortex (Claude API proxy) is now a separate binary - see cortex/
-    let app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes);
+    let app = Router::new().merge(public_routes).merge(protected_routes);
 
     // Conditionally add trace propagation middleware only when telemetry feature is enabled
     #[cfg(feature = "telemetry")]
