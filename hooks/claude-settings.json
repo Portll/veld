@@ -1,0 +1,51 @@
+{
+  "$schema": "https://claude.ai/settings-schema.json",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts SessionStart"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts UserPromptSubmit"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts Stop"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": {
+          "tool_name": ["Edit", "Write", "Bash", "TodoWrite"]
+        },
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts PostToolUse"
+          }
+        ]
+      }
+    ]
+  }
+}

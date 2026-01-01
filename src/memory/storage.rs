@@ -819,14 +819,22 @@ impl MemoryStorage {
     }
 
     /// Get all memories from long-term storage
+    ///
+    /// Only returns entries with valid 16-byte UUID keys (consistent with get_stats)
     pub fn get_all(&self) -> Result<Vec<Memory>> {
         let mut memories = Vec::new();
 
         // Iterate through all memories
         let iter = self.db.iterator(IteratorMode::Start);
-        for (_, value) in iter.log_errors() {
-            if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
-                memories.push(memory);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Only process valid 16-byte UUID keys (consistent with get_stats)
+                if key.len() != 16 {
+                    continue;
+                }
+                if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
+                    memories.push(memory);
+                }
             }
         }
 
@@ -838,10 +846,16 @@ impl MemoryStorage {
 
         // Iterate through all memories
         let iter = self.db.iterator(IteratorMode::Start);
-        for (_, value) in iter.log_errors() {
-            if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
-                if !memory.compressed && memory.created_at < cutoff {
-                    memories.push(memory);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Only process valid 16-byte UUID keys
+                if key.len() != 16 {
+                    continue;
+                }
+                if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
+                    if !memory.compressed && memory.created_at < cutoff {
+                        memories.push(memory);
+                    }
                 }
             }
         }
@@ -858,22 +872,28 @@ impl MemoryStorage {
         write_opts.set_sync(true);
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.log_errors() {
-            if let Ok(mut memory) = bincode::deserialize::<Memory>(&value) {
-                if memory.created_at < cutoff {
-                    // Add forgotten flag to metadata
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten".to_string(), "true".to_string());
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Only process valid 16-byte UUID keys
+                if key.len() != 16 {
+                    continue;
+                }
+                if let Ok(mut memory) = bincode::deserialize::<Memory>(&value) {
+                    if memory.created_at < cutoff {
+                        // Add forgotten flag to metadata
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten".to_string(), "true".to_string());
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
 
-                    let updated_value = bincode::serialize(&memory)?;
-                    self.db.put_opt(&key, updated_value, &write_opts)?;
-                    count += 1;
+                        let updated_value = bincode::serialize(&memory)?;
+                        self.db.put_opt(&key, updated_value, &write_opts)?;
+                        count += 1;
+                    }
                 }
             }
         }
@@ -890,21 +910,27 @@ impl MemoryStorage {
         write_opts.set_sync(true);
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.log_errors() {
-            if let Ok(mut memory) = bincode::deserialize::<Memory>(&value) {
-                if memory.importance() < threshold {
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten".to_string(), "true".to_string());
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Only process valid 16-byte UUID keys
+                if key.len() != 16 {
+                    continue;
+                }
+                if let Ok(mut memory) = bincode::deserialize::<Memory>(&value) {
+                    if memory.importance() < threshold {
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten".to_string(), "true".to_string());
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
 
-                    let updated_value = bincode::serialize(&memory)?;
-                    self.db.put_opt(&key, updated_value, &write_opts)?;
-                    count += 1;
+                        let updated_value = bincode::serialize(&memory)?;
+                        self.db.put_opt(&key, updated_value, &write_opts)?;
+                        count += 1;
+                    }
                 }
             }
         }
@@ -918,11 +944,17 @@ impl MemoryStorage {
         let mut to_delete = Vec::new();
 
         let iter = self.db.iterator(IteratorMode::Start);
-        for (key, value) in iter.log_errors() {
-            if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
-                if regex.is_match(&memory.experience.content) {
-                    to_delete.push(key.to_vec());
-                    count += 1;
+        for item in iter {
+            if let Ok((key, value)) = item {
+                // Only process valid 16-byte UUID keys
+                if key.len() != 16 {
+                    continue;
+                }
+                if let Ok(memory) = bincode::deserialize::<Memory>(&value) {
+                    if regex.is_match(&memory.experience.content) {
+                        to_delete.push(key.to_vec());
+                        count += 1;
+                    }
                 }
             }
         }
@@ -954,13 +986,28 @@ impl MemoryStorage {
     pub fn get_stats(&self) -> Result<StorageStats> {
         let mut stats = StorageStats::default();
         let mut raw_count = 0;
+        let mut skipped_non_memory = 0;
         let mut deserialize_errors = 0;
+        let stats_prefix = b"stats:";
 
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
             match item {
                 Ok((key, value)) => {
                     raw_count += 1;
+
+                    // Skip stats entries - they use a different format
+                    if key.starts_with(stats_prefix) {
+                        skipped_non_memory += 1;
+                        continue;
+                    }
+
+                    // Valid memory keys should be exactly 16 bytes (UUID bytes)
+                    if key.len() != 16 {
+                        skipped_non_memory += 1;
+                        continue;
+                    }
+
                     match bincode::deserialize::<Memory>(&value) {
                         Ok(memory) => {
                             stats.total_count += 1;
@@ -973,7 +1020,7 @@ impl MemoryStorage {
                         Err(e) => {
                             deserialize_errors += 1;
                             tracing::warn!(
-                                "Failed to deserialize memory (key len: {}, value len: {}): {}",
+                                "Corrupted memory entry (key len: {}, value len: {}): {}",
                                 key.len(),
                                 value.len(),
                                 e
@@ -988,9 +1035,10 @@ impl MemoryStorage {
         }
 
         tracing::debug!(
-            "get_stats: raw_count={}, deserialized={}, errors={}",
+            "get_stats: raw_count={}, memories={}, skipped={}, corrupted={}",
             raw_count,
             stats.total_count,
+            skipped_non_memory,
             deserialize_errors
         );
 
@@ -1030,13 +1078,42 @@ impl MemoryStorage {
 
     /// Remove corrupted memories that fail to deserialize
     /// Returns the number of entries deleted
+    ///
+    /// This function safely cleans up:
+    /// 1. Entries with keys that are not valid 16-byte UUIDs (corrupted/misplaced)
+    /// 2. Entries with valid UUID keys but corrupted values that fail to deserialize
+    ///
+    /// It preserves:
+    /// - Valid Memory entries
+    /// - Stats entries (keys starting with "stats:")
     pub fn cleanup_corrupted(&self) -> Result<usize> {
         let mut to_delete = Vec::new();
+        let stats_prefix = b"stats:";
 
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
             if let Ok((key, value)) = item {
-                if bincode::deserialize::<Memory>(&value).is_err() {
+                // Skip stats entries - they use a different format
+                if key.starts_with(stats_prefix) {
+                    continue;
+                }
+
+                // Valid memory keys should be exactly 16 bytes (UUID bytes)
+                let is_valid_memory_key = key.len() == 16;
+
+                if !is_valid_memory_key {
+                    // Key is not a valid UUID - this is a corrupted or misplaced entry
+                    tracing::debug!(
+                        "Marking for deletion: invalid key length {} (expected 16)",
+                        key.len()
+                    );
+                    to_delete.push(key.to_vec());
+                } else if bincode::deserialize::<Memory>(&value).is_err() {
+                    // Key is valid but value is corrupted
+                    tracing::debug!(
+                        "Marking for deletion: valid key but corrupted value ({} bytes)",
+                        value.len()
+                    );
                     to_delete.push(key.to_vec());
                 }
             }

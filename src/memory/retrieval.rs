@@ -351,6 +351,8 @@ impl RetrievalEngine {
     /// in the Vamana index. The vector is excluded from search results immediately.
     /// Physical deletion occurs on next index rebuild.
     ///
+    /// The ID mapping is persisted immediately to survive restarts.
+    ///
     /// Returns true if the memory was found and removed, false if not indexed.
     pub fn remove_memory(&self, memory_id: &MemoryId) -> bool {
         // Remove from ID mapping and get the vector ID
@@ -363,6 +365,11 @@ impl RetrievalEngine {
             // Also remove from memory graph if present
             self.graph.write().remove_memory(memory_id);
 
+            // Persist the updated ID mapping immediately so deletion survives restart
+            if let Err(e) = self.persist_id_mapping() {
+                tracing::warn!("Failed to persist ID mapping after removal: {}", e);
+            }
+
             tracing::debug!(
                 "Removed memory {:?} from vector index (vector_id={})",
                 memory_id,
@@ -373,6 +380,20 @@ impl RetrievalEngine {
             tracing::debug!("Memory {:?} not found in vector index", memory_id);
             false
         }
+    }
+
+    /// Persist just the ID mapping to disk (lightweight operation)
+    fn persist_id_mapping(&self) -> Result<()> {
+        let index_path = self.storage_path.join("vector_index");
+        fs::create_dir_all(&index_path)?;
+
+        let mapping_file = index_path.join("id_mapping.bin");
+        let id_mapping = self.id_mapping.read();
+        let file = File::create(&mapping_file).context("Failed to create ID mapping file")?;
+        let writer = BufWriter::new(file);
+        bincode::serialize_into(writer, &*id_mapping).context("Failed to serialize ID mapping")?;
+
+        Ok(())
     }
 
     /// Extract searchable text from memory
