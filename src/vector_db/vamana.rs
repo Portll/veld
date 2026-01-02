@@ -103,9 +103,17 @@ pub(crate) struct VamanaNode {
 /// Threshold for recommending index rebuild (number of incremental inserts)
 pub const REBUILD_THRESHOLD: usize = 10_000;
 
+/// Threshold for incremental repair (lighter maintenance, more frequent)
+/// Repairs neighborhoods of recently inserted nodes without full rebuild
+pub const REPAIR_THRESHOLD: usize = 1_000;
+
 /// Threshold for recommending index rebuild based on deletion ratio
 /// When 30% or more of vectors are soft-deleted, compaction is recommended
 pub const DELETION_RATIO_THRESHOLD: f32 = 0.30;
+
+/// Minimum recall for acceptable index quality (used in quality estimation)
+/// Below this threshold, rebuild is strongly recommended
+pub const MIN_ACCEPTABLE_RECALL: f32 = 0.85;
 
 /// Main Vamana index
 pub struct VamanaIndex {
@@ -948,6 +956,233 @@ impl VamanaIndex {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Check if incremental repair is recommended
+    ///
+    /// Repair is lighter than full rebuild - only re-prunes neighborhoods of
+    /// recently inserted nodes. Recommended every 1,000 inserts.
+    pub fn needs_repair(&self) -> bool {
+        let inserts = self
+            .incremental_inserts
+            .load(std::sync::atomic::Ordering::Relaxed);
+        inserts >= REPAIR_THRESHOLD && inserts < REBUILD_THRESHOLD
+    }
+
+    /// Perform incremental repair on recently inserted nodes
+    ///
+    /// This is faster than full rebuild (~10x) and maintains index quality
+    /// by re-pruning neighborhoods using proper α-RNG strategy instead of
+    /// the simplified truncation used during incremental insert.
+    ///
+    /// Call when `needs_repair()` returns true.
+    ///
+    /// # Algorithm
+    /// 1. Identify nodes inserted since last repair (last REPAIR_THRESHOLD nodes)
+    /// 2. For each such node, re-run robust_prune on its neighborhood
+    /// 3. Update bidirectional edges
+    ///
+    /// # Returns
+    /// Number of nodes repaired
+    pub fn incremental_repair(&self) -> Result<usize> {
+        let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
+        if n == 0 {
+            return Ok(0);
+        }
+
+        let inserts_since = self
+            .incremental_inserts
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        if inserts_since < REPAIR_THRESHOLD {
+            return Ok(0);
+        }
+
+        // Repair the last REPAIR_THRESHOLD nodes (most recently inserted)
+        let repair_count = inserts_since.min(REPAIR_THRESHOLD).min(n);
+        let start_id = (n - repair_count) as u32;
+
+        info!(
+            "Incremental repair: re-pruning {} recently inserted nodes",
+            repair_count
+        );
+
+        let medoid = *self.medoid.read();
+        let mut repaired = 0;
+
+        for node_id in start_id..(n as u32) {
+            // Get vector for this node
+            let query = match self.get_vector(node_id) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Search for fresh neighbors using current graph state
+            let candidates = self.greedy_search(&query, self.config.search_list_size, medoid)?;
+
+            // Re-prune using proper α-RNG strategy
+            let pruned = self.robust_prune(node_id, &candidates)?;
+
+            // Update graph
+            let mut graph = self.graph.write();
+            let old_neighbors = graph[node_id as usize].neighbors.clone();
+
+            if old_neighbors != pruned {
+                graph[node_id as usize].neighbors = pruned.clone();
+                repaired += 1;
+
+                // Update bidirectional edges
+                // Remove back-edges from old neighbors not in new set
+                for &old_neighbor in &old_neighbors {
+                    if !pruned.contains(&old_neighbor) && (old_neighbor as usize) < graph.len() {
+                        graph[old_neighbor as usize]
+                            .neighbors
+                            .retain(|&x| x != node_id);
+                    }
+                }
+
+                // Add back-edges to new neighbors
+                for &new_neighbor in &pruned {
+                    if (new_neighbor as usize) < graph.len()
+                        && !graph[new_neighbor as usize].neighbors.contains(&node_id)
+                    {
+                        graph[new_neighbor as usize].neighbors.push(node_id);
+
+                        // Prune if exceeds max degree
+                        if graph[new_neighbor as usize].neighbors.len() > self.config.max_degree {
+                            graph[new_neighbor as usize]
+                                .neighbors
+                                .truncate(self.config.max_degree);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reset counter after repair (but not to 0 - track cumulative for rebuild)
+        let new_count = inserts_since.saturating_sub(REPAIR_THRESHOLD);
+        self.incremental_inserts
+            .store(new_count, std::sync::atomic::Ordering::Relaxed);
+
+        info!("Incremental repair complete: {} nodes updated", repaired);
+        Ok(repaired)
+    }
+
+    /// Estimate current recall@k using random sampling
+    ///
+    /// Performs brute-force search on a sample of vectors and compares
+    /// against ANN results to estimate recall degradation.
+    ///
+    /// # Arguments
+    /// * `sample_size` - Number of random queries (default: 100)
+    /// * `k` - Number of neighbors to check (default: 10)
+    ///
+    /// # Returns
+    /// Estimated recall as f32 in range [0.0, 1.0]
+    pub fn estimate_recall(&self, sample_size: usize, k: usize) -> Result<f32> {
+        let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
+        if n < 2 {
+            return Ok(1.0); // Perfect recall for trivial cases
+        }
+
+        let sample_size = sample_size.min(n / 2).max(1);
+        let k = k.min(n - 1);
+
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+
+        // Sample random query indices
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.shuffle(&mut rng);
+        let sample_indices: Vec<usize> = indices.into_iter().take(sample_size).collect();
+
+        let mut total_recall = 0.0;
+
+        for &query_idx in &sample_indices {
+            let query = self.get_vector(query_idx as u32)?;
+
+            // Get ANN results
+            let ann_results = self.search(&query, k)?;
+            let ann_ids: HashSet<u32> = ann_results.iter().map(|(id, _)| *id).collect();
+
+            // Get exact brute-force results
+            let exact_results = self.brute_force_search(&query, k)?;
+            let exact_ids: HashSet<u32> = exact_results.iter().map(|(id, _)| *id).collect();
+
+            // Calculate recall for this query
+            let overlap = ann_ids.intersection(&exact_ids).count();
+            total_recall += overlap as f32 / k as f32;
+        }
+
+        Ok(total_recall / sample_size as f32)
+    }
+
+    /// Brute-force k-NN search (for recall estimation)
+    fn brute_force_search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
+        let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
+        let deleted = self.deleted_ids.read();
+
+        let mut distances: Vec<(u32, f32)> = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let id = i as u32;
+            if deleted.contains(&id) {
+                continue;
+            }
+
+            let vec = self.get_vector(id)?;
+            let dist = self.distance(query, &vec);
+            distances.push((id, dist));
+        }
+
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        distances.truncate(k);
+
+        Ok(distances)
+    }
+
+    /// Check if index quality has degraded below acceptable threshold
+    ///
+    /// Uses sampling to estimate recall without expensive full evaluation.
+    /// Returns true if estimated recall@10 < MIN_ACCEPTABLE_RECALL (85%).
+    pub fn quality_degraded(&self) -> Result<bool> {
+        let n = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
+        if n < 100 {
+            return Ok(false); // Too small to meaningfully measure
+        }
+
+        // Quick check: if no incremental inserts, quality is fine
+        if self.incremental_insert_count() == 0 {
+            return Ok(false);
+        }
+
+        // Sample-based recall estimation (50 samples, recall@10)
+        let recall = self.estimate_recall(50, 10)?;
+        Ok(recall < MIN_ACCEPTABLE_RECALL)
+    }
+
+    /// Automatic maintenance: repair or rebuild as needed
+    ///
+    /// Checks index state and performs appropriate maintenance:
+    /// 1. If needs_repair() → incremental_repair()
+    /// 2. If needs_rebuild() → auto_rebuild_if_needed()
+    ///
+    /// Returns description of action taken
+    pub fn auto_maintain(&self) -> Result<String> {
+        if self.needs_rebuild() {
+            if self.auto_rebuild_if_needed()? {
+                return Ok("full_rebuild".to_string());
+            } else {
+                return Ok("rebuild_skipped".to_string());
+            }
+        }
+
+        if self.needs_repair() {
+            let repaired = self.incremental_repair()?;
+            return Ok(format!("repaired_{}_nodes", repaired));
+        }
+
+        Ok("no_action".to_string())
+    }
+
     /// Extract all vectors from the index for rebuilding
     ///
     /// Returns a clone of all vectors currently in the index.
@@ -1373,5 +1608,89 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 0); // Closest to [1,0,0,0]
+    }
+
+    #[test]
+    fn test_incremental_repair() {
+        let mut index = VamanaIndex::new(VamanaConfig {
+            dimension: 4,
+            max_degree: 3,
+            search_list_size: 10,
+            alpha: 1.2,
+            use_mmap: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Build initial index
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        index.build(vectors).unwrap();
+
+        // Should not need repair initially
+        assert!(!index.needs_repair());
+        assert_eq!(index.incremental_insert_count(), 0);
+
+        // Add some vectors incrementally
+        for i in 0..5 {
+            let v = vec![0.1 * i as f32, 0.1, 0.1, 0.1];
+            index.add_vector(v).unwrap();
+        }
+
+        assert_eq!(index.incremental_insert_count(), 5);
+        assert!(!index.needs_repair()); // Still below threshold
+
+        // Repair should do nothing below threshold
+        let repaired = index.incremental_repair().unwrap();
+        assert_eq!(repaired, 0);
+    }
+
+    #[test]
+    fn test_estimate_recall() {
+        let mut index = VamanaIndex::new(VamanaConfig {
+            dimension: 4,
+            max_degree: 3,
+            search_list_size: 10,
+            alpha: 1.2,
+            use_mmap: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.5, 0.5, 0.0, 0.0],
+        ];
+        index.build(vectors).unwrap();
+
+        // Freshly built index should have high recall
+        let recall = index.estimate_recall(3, 2).unwrap();
+        assert!(recall >= 0.8, "Expected high recall, got {}", recall);
+    }
+
+    #[test]
+    fn test_auto_maintain() {
+        let mut index = VamanaIndex::new(VamanaConfig {
+            dimension: 4,
+            max_degree: 3,
+            search_list_size: 10,
+            alpha: 1.2,
+            use_mmap: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let vectors = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
+        index.build(vectors).unwrap();
+
+        // Should take no action on fresh index
+        let result = index.auto_maintain().unwrap();
+        assert_eq!(result, "no_action");
     }
 }
