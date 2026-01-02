@@ -26,6 +26,7 @@ pub mod graph_retrieval;
 pub mod injection;
 pub mod lineage;
 pub mod segmentation;
+pub mod sessions;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -59,10 +60,11 @@ pub use crate::memory::compression::{
 };
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
-    apply_context_pattern_signals, calculate_entity_overlap, detect_negative_keywords,
-    extract_entities_simple, process_implicit_feedback, process_implicit_feedback_with_semantics,
-    ContextFingerprint, FeedbackMomentum, FeedbackStore, FeedbackStoreStats, PendingFeedback,
-    PreviousContext, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
+    apply_context_pattern_signals, calculate_entity_flow, calculate_entity_overlap,
+    detect_negative_keywords, extract_entities_simple, process_implicit_feedback,
+    process_implicit_feedback_with_semantics, signal_from_entity_flow, ContextFingerprint,
+    FeedbackMomentum, FeedbackStore, FeedbackStoreStats, PendingFeedback, PreviousContext,
+    SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
 };
 pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{spreading_activation_retrieve, ActivatedMemory};
@@ -90,6 +92,10 @@ pub use crate::memory::segmentation::{
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
+pub use crate::memory::sessions::{
+    Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore,
+    SessionStoreStats, SessionSummary, TemporalContext, TimeOfDay,
+};
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]

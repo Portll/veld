@@ -98,6 +98,17 @@ pub enum SignalTrigger {
     /// Memory was surfaced but completely ignored
     /// Action: response has no relation to memory
     Ignored { overlap_ratio: f32 },
+
+    /// FBK-8: Entity flow tracking
+    /// Measures how response builds on memory entities
+    /// - derived_ratio: proportion of response entities that came from memory
+    /// - novel_ratio: proportion of response entities that are new
+    EntityFlow {
+        derived_ratio: f32,
+        novel_ratio: f32,
+        memory_entities_used: usize,
+        response_entities_total: usize,
+    },
 }
 
 /// A single feedback signal
@@ -627,6 +638,85 @@ pub fn detect_negative_keywords(text: &str) -> Vec<String> {
         .filter(|&&kw| lower.contains(kw))
         .map(|&s| s.to_string())
         .collect()
+}
+
+/// FBK-8: Calculate entity flow between memory and response
+///
+/// Tracks how the response builds on memory entities:
+/// - derived_ratio: How many response entities came from the memory (0.0 to 1.0)
+/// - novel_ratio: How many response entities are new/not from memory (0.0 to 1.0)
+///
+/// High derived_ratio = response uses memory knowledge = positive signal
+/// High novel_ratio with low derived = memory might not have been relevant
+pub fn calculate_entity_flow(
+    memory_entities: &HashSet<String>,
+    response_entities: &HashSet<String>,
+) -> (f32, f32, usize, usize) {
+    if response_entities.is_empty() {
+        return (0.0, 0.0, 0, 0);
+    }
+
+    // Count how many response entities came from the memory
+    let derived: HashSet<_> = response_entities
+        .intersection(memory_entities)
+        .cloned()
+        .collect();
+    let derived_count = derived.len();
+
+    // Count novel entities (in response but not in memory)
+    let novel_count = response_entities.len() - derived_count;
+
+    let derived_ratio = derived_count as f32 / response_entities.len() as f32;
+    let novel_ratio = novel_count as f32 / response_entities.len() as f32;
+
+    (
+        derived_ratio,
+        novel_ratio,
+        derived_count,
+        response_entities.len(),
+    )
+}
+
+/// FBK-8: Create signal from entity flow analysis
+pub fn signal_from_entity_flow(
+    derived_ratio: f32,
+    novel_ratio: f32,
+    memory_entities_used: usize,
+    response_entities_total: usize,
+) -> SignalRecord {
+    // Signal value based on how much the response builds on memory
+    // High derived ratio = memory was useful
+    // Low derived ratio with high novel = memory might be irrelevant
+    let value = if derived_ratio >= 0.5 {
+        // Response heavily uses memory entities - strong positive
+        0.6 + (derived_ratio - 0.5) * 0.4
+    } else if derived_ratio >= 0.2 {
+        // Response somewhat uses memory entities - weak positive
+        derived_ratio * 1.5
+    } else if novel_ratio >= 0.8 {
+        // Response mostly novel, memory barely used - slight negative
+        -0.1
+    } else {
+        // Mixed - neutral
+        0.0
+    };
+
+    let confidence = if response_entities_total >= 3 {
+        0.8 // Good sample size
+    } else {
+        0.5 // Small sample, lower confidence
+    };
+
+    SignalRecord::new(
+        value,
+        confidence,
+        SignalTrigger::EntityFlow {
+            derived_ratio,
+            novel_ratio,
+            memory_entities_used,
+            response_entities_total,
+        },
+    )
 }
 
 /// Process feedback for surfaced memories based on agent response
@@ -1526,5 +1616,81 @@ mod tests {
 
         // Empty vectors = 0.0
         assert!((cosine_similarity(&[], &[]) - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_entity_flow() {
+        use std::collections::HashSet;
+
+        // Case 1: Response heavily derived from memory
+        let memory_entities: HashSet<String> =
+            ["rust", "async", "tokio", "futures"].iter().map(|s| s.to_string()).collect();
+        let response_entities: HashSet<String> =
+            ["rust", "async", "tokio", "runtime"].iter().map(|s| s.to_string()).collect();
+
+        let (derived_ratio, novel_ratio, derived_count, total) =
+            calculate_entity_flow(&memory_entities, &response_entities);
+
+        assert_eq!(derived_count, 3); // rust, async, tokio
+        assert_eq!(total, 4);
+        assert!((derived_ratio - 0.75).abs() < 0.01);
+        assert!((novel_ratio - 0.25).abs() < 0.01);
+
+        // Case 2: Response mostly novel (memory not used)
+        let response_novel: HashSet<String> =
+            ["python", "django", "flask", "web"].iter().map(|s| s.to_string()).collect();
+
+        let (derived_ratio2, novel_ratio2, derived_count2, _) =
+            calculate_entity_flow(&memory_entities, &response_novel);
+
+        assert_eq!(derived_count2, 0);
+        assert!((derived_ratio2 - 0.0).abs() < 0.01);
+        assert!((novel_ratio2 - 1.0).abs() < 0.01);
+
+        // Case 3: Empty response
+        let empty: HashSet<String> = HashSet::new();
+        let (dr, nr, dc, total) = calculate_entity_flow(&memory_entities, &empty);
+        assert_eq!(dc, 0);
+        assert_eq!(total, 0);
+        assert!((dr - 0.0).abs() < 0.01);
+        assert!((nr - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_signal_from_entity_flow() {
+        // Case 1: High derived ratio (>=0.5) = strong positive
+        let sig1 = signal_from_entity_flow(0.75, 0.25, 3, 4);
+        assert!(sig1.value > 0.5); // Strong positive
+        assert!((sig1.confidence - 0.8).abs() < 0.01); // Good sample size
+
+        // Case 2: Medium derived ratio (0.2 to 0.5) = weak positive
+        let sig2 = signal_from_entity_flow(0.3, 0.7, 1, 4);
+        assert!(sig2.value > 0.0 && sig2.value <= 0.5); // Weak positive
+        assert!((sig2.confidence - 0.8).abs() < 0.01);
+
+        // Case 3: Low derived, high novel = slight negative
+        let sig3 = signal_from_entity_flow(0.1, 0.9, 0, 4);
+        assert!(sig3.value < 0.0); // Negative
+        assert!((sig3.value - (-0.1)).abs() < 0.01);
+
+        // Case 4: Small sample size = lower confidence
+        let sig4 = signal_from_entity_flow(0.5, 0.5, 1, 2);
+        assert!((sig4.confidence - 0.5).abs() < 0.01);
+
+        // Verify trigger variant
+        match sig1.trigger {
+            SignalTrigger::EntityFlow {
+                derived_ratio,
+                novel_ratio,
+                memory_entities_used,
+                response_entities_total,
+            } => {
+                assert!((derived_ratio - 0.75).abs() < 0.01);
+                assert!((novel_ratio - 0.25).abs() < 0.01);
+                assert_eq!(memory_entities_used, 3);
+                assert_eq!(response_entities_total, 4);
+            }
+            _ => panic!("Expected EntityFlow trigger"),
+        }
     }
 }
