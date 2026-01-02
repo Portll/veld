@@ -232,6 +232,9 @@ impl LazyNerModel {
     }
 }
 
+/// Cache size for NER results (number of unique texts)
+const NER_CACHE_SIZE: u64 = 1000;
+
 /// Neural NER model using BERT + ONNX Runtime
 pub struct NeuralNer {
     config: NerConfig,
@@ -240,12 +243,20 @@ pub struct NeuralNer {
     use_fallback: bool,
     /// Lazy-loaded EntityExtractor for comprehensive rule-based fallback
     entity_extractor: OnceLock<crate::graph_memory::EntityExtractor>,
+    /// LRU cache for extracted entities (keyed by text hash)
+    /// Avoids re-processing identical texts
+    entity_cache: moka::sync::Cache<u64, Vec<NerEntity>>,
 }
 
 impl NeuralNer {
     /// Create new NER model with lazy loading
     pub fn new(config: NerConfig) -> Result<Self> {
         let model_available = config.model_path.exists() && config.tokenizer_path.exists();
+
+        let cache = moka::sync::Cache::builder()
+            .max_capacity(NER_CACHE_SIZE)
+            .time_to_live(std::time::Duration::from_secs(3600)) // 1 hour TTL
+            .build();
 
         if !model_available {
             tracing::warn!(
@@ -257,6 +268,7 @@ impl NeuralNer {
                 lazy_model: OnceLock::new(),
                 use_fallback: true,
                 entity_extractor: OnceLock::new(),
+                entity_cache: cache,
             });
         }
 
@@ -265,6 +277,7 @@ impl NeuralNer {
             lazy_model: OnceLock::new(),
             use_fallback: false,
             entity_extractor: OnceLock::new(),
+            entity_cache: cache,
         })
     }
 
@@ -275,6 +288,10 @@ impl NeuralNer {
             lazy_model: OnceLock::new(),
             use_fallback: true,
             entity_extractor: OnceLock::new(),
+            entity_cache: moka::sync::Cache::builder()
+                .max_capacity(NER_CACHE_SIZE)
+                .time_to_live(std::time::Duration::from_secs(3600))
+                .build(),
         }
     }
 
@@ -301,23 +318,282 @@ impl NeuralNer {
         self.use_fallback
     }
 
-    /// Extract entities using neural NER
+    /// Compute cache key from text (FNV-1a hash for speed)
+    fn cache_key(text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Extract entities using neural NER (with caching)
     pub fn extract(&self, text: &str) -> Result<Vec<NerEntity>> {
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        if self.use_fallback {
-            return self.extract_fallback(text);
+        // Check cache first
+        let cache_key = Self::cache_key(text);
+        if let Some(cached) = self.entity_cache.get(&cache_key) {
+            return Ok(cached);
         }
 
-        match self.extract_neural(text) {
-            Ok(entities) => Ok(entities),
-            Err(e) => {
-                tracing::warn!("Neural NER failed: {}. Using fallback.", e);
-                self.extract_fallback(text)
+        // Extract entities
+        let entities = if self.use_fallback {
+            self.extract_fallback(text)?
+        } else {
+            match self.extract_neural(text) {
+                Ok(entities) => entities,
+                Err(e) => {
+                    tracing::warn!("Neural NER failed: {}. Using fallback.", e);
+                    self.extract_fallback(text)?
+                }
+            }
+        };
+
+        // Cache the result
+        self.entity_cache.insert(cache_key, entities.clone());
+
+        Ok(entities)
+    }
+
+    /// Extract entities from multiple texts in batch
+    ///
+    /// More efficient than calling extract() repeatedly because:
+    /// 1. Checks cache for all texts first
+    /// 2. Batches uncached texts for ONNX inference
+    /// 3. Reduces lock contention on the ONNX session
+    ///
+    /// # Arguments
+    /// * `texts` - Slice of texts to process
+    ///
+    /// # Returns
+    /// Vector of entity vectors, one per input text
+    pub fn extract_batch(&self, texts: &[&str]) -> Result<Vec<Vec<NerEntity>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = vec![Vec::new(); texts.len()];
+        let mut uncached_indices = Vec::new();
+        let mut uncached_texts = Vec::new();
+
+        // First pass: check cache
+        for (i, &text) in texts.iter().enumerate() {
+            if text.trim().is_empty() {
+                continue;
+            }
+
+            let cache_key = Self::cache_key(text);
+            if let Some(cached) = self.entity_cache.get(&cache_key) {
+                results[i] = cached;
+            } else {
+                uncached_indices.push(i);
+                uncached_texts.push(text);
             }
         }
+
+        // Process uncached texts
+        if !uncached_texts.is_empty() {
+            if self.use_fallback {
+                // Fallback mode: process one by one (rule-based is fast anyway)
+                for (idx, text) in uncached_indices.iter().zip(uncached_texts.iter()) {
+                    let entities = self.extract_fallback(text)?;
+                    self.entity_cache
+                        .insert(Self::cache_key(text), entities.clone());
+                    results[*idx] = entities;
+                }
+            } else {
+                // Neural mode: batch inference
+                match self.extract_neural_batch(&uncached_texts) {
+                    Ok(batch_results) => {
+                        for ((idx, text), entities) in uncached_indices
+                            .iter()
+                            .zip(uncached_texts.iter())
+                            .zip(batch_results.into_iter())
+                        {
+                            self.entity_cache
+                                .insert(Self::cache_key(text), entities.clone());
+                            results[*idx] = entities;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Batch NER failed: {}. Using fallback.", e);
+                        for (idx, text) in uncached_indices.iter().zip(uncached_texts.iter()) {
+                            let entities = self.extract_fallback(text)?;
+                            self.entity_cache
+                                .insert(Self::cache_key(text), entities.clone());
+                            results[*idx] = entities;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Batch neural extraction using ONNX model
+    ///
+    /// Processes multiple texts in a single ONNX inference call.
+    /// More efficient than sequential calls due to GPU/CPU parallelism.
+    fn extract_neural_batch(&self, texts: &[&str]) -> Result<Vec<Vec<NerEntity>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // For small batches, sequential is actually faster (avoids tensor reshaping overhead)
+        if texts.len() <= 2 {
+            let mut results = Vec::with_capacity(texts.len());
+            for text in texts {
+                results.push(self.extract_neural(text)?);
+            }
+            return Ok(results);
+        }
+
+        let model = self.ensure_model_loaded()?;
+        let max_length = self.config.max_length;
+        let batch_size = texts.len();
+
+        // Tokenize all texts
+        let mut all_encodings = Vec::with_capacity(batch_size);
+        for text in texts {
+            let encoding = model
+                .tokenizer
+                .encode(*text, true)
+                .map_err(|e| anyhow::anyhow!("NER batch tokenization failed: {e}"))?;
+            all_encodings.push(encoding);
+        }
+
+        // Prepare batched input tensors
+        let mut input_ids = vec![0i64; batch_size * max_length];
+        let mut attention_mask = vec![0i64; batch_size * max_length];
+        let token_type_ids = vec![0i64; batch_size * max_length];
+
+        for (batch_idx, encoding) in all_encodings.iter().enumerate() {
+            let tokens = encoding.get_ids();
+            let attention = encoding.get_attention_mask();
+            let base = batch_idx * max_length;
+
+            for (i, &token) in tokens.iter().take(max_length).enumerate() {
+                input_ids[base + i] = token as i64;
+            }
+            for (i, &mask) in attention.iter().take(max_length).enumerate() {
+                attention_mask[base + i] = mask as i64;
+            }
+        }
+
+        // Create ONNX input tensors
+        let input_ids_value = Value::from_array((vec![batch_size, max_length], input_ids.clone()))
+            .context("Failed to create batched input_ids tensor")?;
+        let attention_mask_value =
+            Value::from_array((vec![batch_size, max_length], attention_mask.clone()))
+                .context("Failed to create batched attention_mask tensor")?;
+        let token_type_ids_value =
+            Value::from_array((vec![batch_size, max_length], token_type_ids))
+                .context("Failed to create batched token_type_ids tensor")?;
+
+        // Run batch inference
+        let mut session = model.session.lock();
+        let outputs = session
+            .run(ort::inputs![
+                "input_ids" => &input_ids_value,
+                "attention_mask" => &attention_mask_value,
+                "token_type_ids" => &token_type_ids_value,
+            ])
+            .context("NER batch inference failed")?;
+
+        // Extract logits - shape: [batch_size, seq_len, num_labels]
+        let output_tensor = outputs[0]
+            .try_extract_tensor::<f32>()
+            .context("Failed to extract NER batch output tensor")?;
+        let (_shape, logits) = output_tensor;
+
+        // Decode entities for each text in batch
+        let num_labels = 9;
+        let mut all_entities = Vec::with_capacity(batch_size);
+
+        for (batch_idx, encoding) in all_encodings.iter().enumerate() {
+            let text = texts[batch_idx];
+            let offsets = encoding.get_offsets();
+            let tokens = encoding.get_ids();
+            let seq_len = tokens.len().min(max_length);
+
+            let batch_offset = batch_idx * max_length * num_labels;
+            let batch_attention = &attention_mask[batch_idx * max_length..];
+
+            let mut entities = Vec::new();
+            let mut current_entity: Option<(NerTag, Vec<usize>, f32)> = None;
+
+            for i in 0..seq_len {
+                if i == 0 || batch_attention[i] == 0 {
+                    continue;
+                }
+
+                let start_idx = batch_offset + i * num_labels;
+                let token_logits = &logits[start_idx..start_idx + num_labels];
+                let probs = softmax(token_logits);
+
+                let (best_idx, best_prob) = probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .unwrap();
+
+                let tag = NerTag::from_index(best_idx);
+
+                match (&current_entity, tag.is_begin(), tag.is_inside()) {
+                    (None, true, _) => {
+                        current_entity = Some((tag, vec![i], *best_prob));
+                    }
+                    (Some((prev_tag, indices, acc_prob)), _, true)
+                        if tag.matches_type(prev_tag) =>
+                    {
+                        let mut new_indices = indices.clone();
+                        new_indices.push(i);
+                        current_entity = Some((*prev_tag, new_indices, acc_prob + best_prob));
+                    }
+                    (Some((prev_tag, indices, acc_prob)), _, _) => {
+                        if let Some(entity) =
+                            self.build_entity(text, prev_tag, indices, *acc_prob, offsets)
+                        {
+                            if entity.confidence >= self.config.confidence_threshold {
+                                entities.push(entity);
+                            }
+                        }
+                        if tag.is_begin() {
+                            current_entity = Some((tag, vec![i], *best_prob));
+                        } else {
+                            current_entity = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some((tag, indices, acc_prob)) = current_entity {
+                if let Some(entity) = self.build_entity(text, &tag, &indices, acc_prob, offsets) {
+                    if entity.confidence >= self.config.confidence_threshold {
+                        entities.push(entity);
+                    }
+                }
+            }
+
+            let entities = self.deduplicate_entities(entities);
+            all_entities.push(entities);
+        }
+
+        Ok(all_entities)
+    }
+
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> (u64, u64) {
+        (self.entity_cache.entry_count(), NER_CACHE_SIZE)
+    }
+
+    /// Clear the entity cache
+    pub fn clear_cache(&self) {
+        self.entity_cache.invalidate_all();
     }
 
     /// Neural extraction using ONNX model
