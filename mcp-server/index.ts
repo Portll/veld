@@ -19,6 +19,9 @@ import {
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
@@ -422,6 +425,7 @@ const server = new Server(
     capabilities: {
       tools: {},
       resources: {},
+      prompts: {},
     },
   }
 );
@@ -597,6 +601,51 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      // Backup & Restore tools
+      {
+        name: "backup_create",
+        description: "Create a backup of all memories. Returns backup metadata including ID, size, and checksum. Backups are stored locally and can be restored later.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "backup_list",
+        description: "List all available backups for this user. Returns backup history with IDs, timestamps, and sizes.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "backup_verify",
+        description: "Verify backup integrity using SHA-256 checksum. Use to check if a backup is corrupted before restoring.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            backup_id: {
+              type: "number",
+              description: "The backup ID to verify",
+            },
+          },
+          required: ["backup_id"],
+        },
+      },
+      {
+        name: "backup_purge",
+        description: "Purge old backups, keeping only the most recent N. Useful for managing disk space.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            keep_count: {
+              type: "number",
+              description: "Number of backups to keep (default: 7)",
+              default: 7,
+            },
+          },
         },
       },
       {
@@ -1722,6 +1771,156 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (result.failed > 0) {
           response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
           response += `⚠️ ${result.failed} could not be repaired`;
+        }
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      // =========================================================================
+      // BACKUP & RESTORE TOOLS
+      // =========================================================================
+
+      case "backup_create": {
+        interface BackupMetadata {
+          backup_id: number;
+          created_at: string;
+          user_id: string;
+          backup_type: string;
+          size_bytes: number;
+          checksum: string;
+          memory_count: number;
+          sequence_number: number;
+        }
+
+        interface BackupResponse {
+          success: boolean;
+          backup?: BackupMetadata;
+          message: string;
+        }
+
+        const result = await apiCall<BackupResponse>("/api/backup/create", "POST", {
+          user_id: USER_ID,
+        });
+
+        let response = `🐘 Backup Created\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        if (result.success && result.backup) {
+          const b = result.backup;
+          const sizeMB = (b.size_bytes / (1024 * 1024)).toFixed(2);
+          response += `✓ Backup ID: ${b.backup_id}\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `Type: ${b.backup_type}\n`;
+          response += `Memories: ${b.memory_count}\n`;
+          response += `Size: ${sizeMB} MB\n`;
+          response += `Checksum: ${b.checksum.slice(0, 16)}...\n`;
+          response += `Created: ${new Date(b.created_at).toLocaleString()}\n`;
+        } else {
+          response += `✗ Failed: ${result.message}\n`;
+        }
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "backup_list": {
+        interface BackupMetadata {
+          backup_id: number;
+          created_at: string;
+          user_id: string;
+          backup_type: string;
+          size_bytes: number;
+          checksum: string;
+          memory_count: number;
+          sequence_number: number;
+        }
+
+        interface ListBackupsResponse {
+          success: boolean;
+          backups: BackupMetadata[];
+          count: number;
+        }
+
+        const result = await apiCall<ListBackupsResponse>("/api/backups", "POST", {
+          user_id: USER_ID,
+        });
+
+        let response = `🐘 Available Backups\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        if (result.backups.length === 0) {
+          response += `No backups available.\n`;
+          response += `Use backup_create to create your first backup.`;
+        } else {
+          response += `Found: ${result.count} backup(s)\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+          for (const b of result.backups) {
+            const sizeMB = (b.size_bytes / (1024 * 1024)).toFixed(2);
+            const date = new Date(b.created_at).toLocaleString();
+            response += `📦 Backup #${b.backup_id}\n`;
+            response += `   Type: ${b.backup_type} │ Memories: ${b.memory_count} │ Size: ${sizeMB} MB\n`;
+            response += `   Created: ${date}\n\n`;
+          }
+        }
+
+        return {
+          content: [{ type: "text", text: response.trimEnd() }],
+        };
+      }
+
+      case "backup_verify": {
+        const { backup_id } = args as { backup_id: number };
+
+        interface VerifyBackupResponse {
+          success: boolean;
+          is_valid: boolean;
+          message: string;
+        }
+
+        const result = await apiCall<VerifyBackupResponse>("/api/backup/verify", "POST", {
+          user_id: USER_ID,
+          backup_id,
+        });
+
+        const statusIcon = result.is_valid ? "✓" : "✗";
+        const statusText = result.is_valid ? "VALID" : "INVALID";
+
+        let response = `🐘 Backup Verification\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += `${statusIcon} Backup #${backup_id}: ${statusText}\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        response += result.message;
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "backup_purge": {
+        const { keep_count = 7 } = args as { keep_count?: number };
+
+        interface PurgeBackupsResponse {
+          success: boolean;
+          purged_count: number;
+        }
+
+        const result = await apiCall<PurgeBackupsResponse>("/api/backups/purge", "POST", {
+          user_id: USER_ID,
+          keep_count,
+        });
+
+        let response = `🐘 Backup Purge\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        if (result.purged_count === 0) {
+          response += `No backups purged (keeping ${keep_count}, none exceeded limit)`;
+        } else {
+          response += `✓ Purged ${result.purged_count} old backup(s)\n`;
+          response += `Kept ${keep_count} most recent backup(s)`;
         }
 
         return {
@@ -3004,37 +3203,223 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// List resources (memories as browsable resources)
+// List resources (static commands + dynamic memories)
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  // Static resources - always available, appear first in @ autocomplete
+  const staticResources = [
+    {
+      uri: "shodh://commands",
+      name: "Available Commands",
+      mimeType: "text/markdown",
+      description: "List all shodh-memory commands and their usage",
+    },
+    {
+      uri: "shodh://summary",
+      name: "Session Summary",
+      mimeType: "text/plain",
+      description: "Recent learnings, decisions, and context",
+    },
+    {
+      uri: "shodh://todos",
+      name: "Pending Work",
+      mimeType: "text/plain",
+      description: "Your todo list and incomplete tasks",
+    },
+    {
+      uri: "shodh://stats",
+      name: "Memory Stats",
+      mimeType: "application/json",
+      description: "Memory system statistics and health",
+    },
+  ];
+
   try {
     const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
       user_id: USER_ID,
     });
 
     const memories = result.memories || [];
+    const memoryResources = memories.slice(0, 30).map((m) => {
+      const content = getContent(m);
+      return {
+        uri: `memory://${m.id}`,
+        name: content.slice(0, 50) + (content.length > 50 ? "..." : ""),
+        mimeType: "text/plain",
+        description: `Type: ${getType(m)}`,
+      };
+    });
 
     return {
-      resources: memories.slice(0, 50).map((m) => {
-        const content = getContent(m);
-        return {
-          uri: `memory://${m.id}`,
-          name: content.slice(0, 50) + (content.length > 50 ? "..." : ""),
-          mimeType: "text/plain",
-          description: `Type: ${getType(m)}`,
-        };
-      }),
+      resources: [...staticResources, ...memoryResources],
     };
   } catch {
-    return { resources: [] };
+    return { resources: staticResources };
   }
 });
 
-// Read a specific memory resource
+// Read a specific resource (shodh:// or memory://)
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri;
-  const memoryId = uri.replace("memory://", "");
 
   try {
+    // Handle shodh:// static resources
+    if (uri.startsWith("shodh://")) {
+      const resource = uri.replace("shodh://", "");
+
+      switch (resource) {
+        case "commands": {
+          const commandList = `# Shodh-Memory Commands
+
+## Memory Tools
+- **remember** - Store a memory (observation, decision, learning, etc.)
+- **recall** - Search memories (semantic, associative, or hybrid mode)
+- **recall_by_tags** - Find memories by tags
+- **recall_by_date** - Find memories in a date range
+- **forget** - Delete a specific memory
+- **context_summary** - Get recent learnings, decisions, and context
+- **proactive_context** - Surface relevant memories for current context
+- **list_memories** - List all stored memories
+- **memory_stats** - Get memory system statistics
+
+## Todo Tools
+- **add_todo** - Add a task to your todo list
+- **list_todos** - View pending tasks
+- **update_todo** - Modify a todo
+- **complete_todo** - Mark a todo as done
+- **delete_todo** - Remove a todo
+- **list_projects** - View project hierarchy
+- **add_project** - Create a new project
+- **todo_stats** - Get todo statistics
+
+## System Tools
+- **verify_index** - Check memory index health
+- **repair_index** - Fix orphaned memories
+- **streaming_status** - Check streaming connection
+- **token_status** - Check context window usage
+- **reset_token_session** - Reset token tracking
+
+## Reminders
+- **set_reminder** - Set a future reminder
+- **list_reminders** - View pending reminders
+- **dismiss_reminder** - Mark reminder as handled
+
+## Slash Commands (type / in chat)
+- **/mcp__shodh-memory__quick_recall** - Search memories
+- **/mcp__shodh-memory__session_summary** - Session overview
+- **/mcp__shodh-memory__what_i_know** - Everything about a topic
+- **/mcp__shodh-memory__pending_work** - View todos
+- **/mcp__shodh-memory__recent_memories** - Recent memories
+- **/mcp__shodh-memory__memory_health** - System status
+`;
+          return {
+            contents: [{ uri, mimeType: "text/markdown", text: commandList }],
+          };
+        }
+
+        case "summary": {
+          const result = await apiCall<{
+            learnings: Memory[];
+            decisions: Memory[];
+            context: Memory[];
+          }>("/api/context_summary", "POST", {
+            user_id: USER_ID,
+            include_learnings: true,
+            include_decisions: true,
+            include_context: true,
+            max_items: 5,
+          });
+
+          const parts: string[] = ["Session Summary\n"];
+          if (result.learnings?.length) {
+            parts.push("\nRecent Learnings:");
+            result.learnings.forEach((m) => parts.push(`- ${getContent(m)}`));
+          }
+          if (result.decisions?.length) {
+            parts.push("\nRecent Decisions:");
+            result.decisions.forEach((m) => parts.push(`- ${getContent(m)}`));
+          }
+          if (result.context?.length) {
+            parts.push("\nCurrent Context:");
+            result.context.forEach((m) => parts.push(`- ${getContent(m)}`));
+          }
+
+          return {
+            contents: [{
+              uri,
+              mimeType: "text/plain",
+              text: parts.length > 1 ? parts.join("\n") : "No recent memories.",
+            }],
+          };
+        }
+
+        case "todos": {
+          const result = await apiCall<{
+            todos: Array<{
+              id: string;
+              content: string;
+              status: string;
+              priority: string;
+              project?: string;
+            }>;
+          }>("/api/todos", "POST", {
+            user_id: USER_ID,
+            status: ["backlog", "todo", "in_progress", "blocked"],
+          });
+
+          const todos = result.todos || [];
+          if (todos.length === 0) {
+            return {
+              contents: [{ uri, mimeType: "text/plain", text: "No pending tasks." }],
+            };
+          }
+
+          const byStatus: Record<string, typeof todos> = {};
+          todos.forEach((t) => {
+            if (!byStatus[t.status]) byStatus[t.status] = [];
+            byStatus[t.status].push(t);
+          });
+
+          const parts: string[] = ["Pending Work\n"];
+          ["in_progress", "blocked", "todo", "backlog"].forEach((status) => {
+            if (byStatus[status]?.length) {
+              parts.push(`\n${status.replace("_", " ").toUpperCase()}:`);
+              byStatus[status].forEach((t) => {
+                const priority = t.priority !== "medium" ? ` [${t.priority}]` : "";
+                const project = t.project ? ` (${t.project})` : "";
+                parts.push(`- ${t.content}${priority}${project}`);
+              });
+            }
+          });
+
+          return {
+            contents: [{ uri, mimeType: "text/plain", text: parts.join("\n") }],
+          };
+        }
+
+        case "stats": {
+          const stats = await apiCall<{
+            total_memories: number;
+            memories_by_type: Record<string, number>;
+            memories_last_24h: number;
+            memories_last_7d: number;
+          }>(`/api/users/${USER_ID}/stats`, "GET");
+
+          return {
+            contents: [{
+              uri,
+              mimeType: "application/json",
+              text: JSON.stringify(stats, null, 2),
+            }],
+          };
+        }
+
+        default:
+          throw new Error(`Unknown resource: ${resource}`);
+      }
+    }
+
+    // Handle memory:// resources
+    const memoryId = uri.replace("memory://", "");
     const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
       user_id: USER_ID,
     });
@@ -3058,8 +3443,386 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to read memory: ${message}`);
+    throw new Error(`Failed to read resource: ${message}`);
   }
+});
+
+// =============================================================================
+// MCP PROMPTS - Discoverable commands via /mcp__shodh-memory__<name>
+// =============================================================================
+
+// Define available prompts (these become slash commands in Claude Code)
+const SHODH_PROMPTS = [
+  {
+    name: "quick_recall",
+    description: "Search your memories for relevant context",
+    arguments: [
+      {
+        name: "query",
+        description: "What to search for in memories",
+        required: true,
+      },
+    ],
+  },
+  {
+    name: "session_summary",
+    description: "Get a summary of recent learnings, decisions, and context",
+    arguments: [],
+  },
+  {
+    name: "what_i_know",
+    description: "Surface everything related to a topic",
+    arguments: [
+      {
+        name: "topic",
+        description: "The topic to explore",
+        required: true,
+      },
+    ],
+  },
+  {
+    name: "pending_work",
+    description: "Show todos and incomplete tasks",
+    arguments: [],
+  },
+  {
+    name: "recent_memories",
+    description: "Show recently created memories",
+    arguments: [
+      {
+        name: "count",
+        description: "Number of memories (default: 10)",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "memory_health",
+    description: "Check memory system status and statistics",
+    arguments: [],
+  },
+];
+
+// List available prompts
+server.setRequestHandler(ListPromptsRequestSchema, async () => {
+  return {
+    prompts: SHODH_PROMPTS.map((p) => ({
+      name: p.name,
+      description: p.description,
+      arguments: p.arguments,
+    })),
+  };
+});
+
+// Get prompt content
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  const promptName = request.params.name;
+  const args = request.params.arguments || {};
+
+  try {
+    switch (promptName) {
+      case "quick_recall": {
+        const query = args.query as string;
+        if (!query) {
+          return {
+            messages: [
+              {
+                role: "user",
+                content: { type: "text", text: "Please provide a search query." },
+              },
+            ],
+          };
+        }
+        const result = await apiCall<{ memories: Memory[] }>("/api/recall", "POST", {
+          user_id: USER_ID,
+          query,
+          mode: "hybrid",
+          limit: 5,
+        });
+        const memories = result.memories || [];
+        const memoryText = memories.length > 0
+          ? memories.map((m) => `- ${getContent(m)} (${getType(m)})`).join("\n")
+          : "No memories found.";
+        return {
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `Here's what I found about "${query}":\n\n${memoryText}`,
+              },
+            },
+          ],
+        };
+      }
+
+      case "session_summary": {
+        const result = await apiCall<{
+          learnings: Memory[];
+          decisions: Memory[];
+          context: Memory[];
+        }>("/api/context_summary", "POST", {
+          user_id: USER_ID,
+          include_learnings: true,
+          include_decisions: true,
+          include_context: true,
+          max_items: 5,
+        });
+
+        const parts: string[] = [];
+        if (result.learnings?.length) {
+          parts.push("**Recent Learnings:**");
+          result.learnings.forEach((m) => parts.push(`- ${getContent(m)}`));
+        }
+        if (result.decisions?.length) {
+          parts.push("\n**Recent Decisions:**");
+          result.decisions.forEach((m) => parts.push(`- ${getContent(m)}`));
+        }
+        if (result.context?.length) {
+          parts.push("\n**Current Context:**");
+          result.context.forEach((m) => parts.push(`- ${getContent(m)}`));
+        }
+
+        const summaryText = parts.length > 0 ? parts.join("\n") : "No recent memories.";
+        return {
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: `Session Summary:\n\n${summaryText}` },
+            },
+          ],
+        };
+      }
+
+      case "what_i_know": {
+        const topic = args.topic as string;
+        if (!topic) {
+          return {
+            messages: [
+              {
+                role: "user",
+                content: { type: "text", text: "Please specify a topic to explore." },
+              },
+            ],
+          };
+        }
+        const result = await apiCall<{ memories: Memory[] }>("/api/recall", "POST", {
+          user_id: USER_ID,
+          query: topic,
+          mode: "hybrid",
+          limit: 10,
+        });
+        const memories = result.memories || [];
+        const grouped: Record<string, Memory[]> = {};
+        memories.forEach((m) => {
+          const type = getType(m);
+          if (!grouped[type]) grouped[type] = [];
+          grouped[type].push(m);
+        });
+
+        const parts: string[] = [`Everything I know about "${topic}":\n`];
+        Object.entries(grouped).forEach(([type, mems]) => {
+          parts.push(`\n**${type}s:**`);
+          mems.forEach((m) => parts.push(`- ${getContent(m)}`));
+        });
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: memories.length > 0 ? parts.join("\n") : `No memories found about "${topic}".`,
+              },
+            },
+          ],
+        };
+      }
+
+      case "pending_work": {
+        const result = await apiCall<{
+          todos: Array<{
+            id: string;
+            content: string;
+            status: string;
+            priority: string;
+            project?: string;
+          }>;
+        }>("/api/todos", "POST", {
+          user_id: USER_ID,
+          status: ["backlog", "todo", "in_progress", "blocked"],
+        });
+        const todos = result.todos || [];
+        if (todos.length === 0) {
+          return {
+            messages: [
+              {
+                role: "user",
+                content: { type: "text", text: "No pending tasks. You're all caught up!" },
+              },
+            ],
+          };
+        }
+
+        const byStatus: Record<string, typeof todos> = {};
+        todos.forEach((t) => {
+          if (!byStatus[t.status]) byStatus[t.status] = [];
+          byStatus[t.status].push(t);
+        });
+
+        const parts: string[] = ["**Pending Work:**\n"];
+        ["in_progress", "blocked", "todo", "backlog"].forEach((status) => {
+          if (byStatus[status]?.length) {
+            parts.push(`\n*${status.replace("_", " ").toUpperCase()}:*`);
+            byStatus[status].forEach((t) => {
+              const priority = t.priority !== "medium" ? ` [${t.priority}]` : "";
+              const project = t.project ? ` (${t.project})` : "";
+              parts.push(`- ${t.content}${priority}${project}`);
+            });
+          }
+        });
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: parts.join("\n") },
+            },
+          ],
+        };
+      }
+
+      case "recent_memories": {
+        const count = parseInt((args.count as string) || "10", 10);
+        const result = await apiCall<{ memories: Memory[] }>("/api/memories", "POST", {
+          user_id: USER_ID,
+          limit: count,
+        });
+        const memories = result.memories || [];
+        if (memories.length === 0) {
+          return {
+            messages: [
+              {
+                role: "user",
+                content: { type: "text", text: "No memories found." },
+              },
+            ],
+          };
+        }
+
+        const parts: string[] = [`**${memories.length} Recent Memories:**\n`];
+        memories.forEach((m) => {
+          const content = getContent(m);
+          const type = getType(m);
+          const preview = content.length > 100 ? content.slice(0, 100) + "..." : content;
+          parts.push(`- [${type}] ${preview}`);
+        });
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: parts.join("\n") },
+            },
+          ],
+        };
+      }
+
+      case "memory_health": {
+        const statsResult = await apiCall<{
+          total_memories: number;
+          memories_by_type: Record<string, number>;
+          memories_last_24h: number;
+          memories_last_7d: number;
+        }>(`/api/users/${USER_ID}/stats`, "GET");
+
+        const verifyResult = await apiCall<{
+          healthy: boolean;
+          orphaned_count: number;
+        }>("/api/index/verify", "POST", { user_id: USER_ID });
+
+        const parts: string[] = ["**Memory System Health:**\n"];
+        parts.push(`Total memories: ${statsResult.total_memories || 0}`);
+        parts.push(`Last 24h: ${statsResult.memories_last_24h || 0}`);
+        parts.push(`Last 7 days: ${statsResult.memories_last_7d || 0}`);
+        parts.push(`\nIndex status: ${verifyResult.healthy ? "✓ Healthy" : "⚠ Needs repair"}`);
+        if (verifyResult.orphaned_count > 0) {
+          parts.push(`Orphaned entries: ${verifyResult.orphaned_count}`);
+        }
+
+        if (statsResult.memories_by_type) {
+          parts.push("\n**By Type:**");
+          Object.entries(statsResult.memories_by_type).forEach(([type, count]) => {
+            parts.push(`- ${type}: ${count}`);
+          });
+        }
+
+        return {
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: parts.join("\n") },
+            },
+          ],
+        };
+      }
+
+      default:
+        return {
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: `Unknown prompt: ${promptName}` },
+            },
+          ],
+        };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      messages: [
+        {
+          role: "user",
+          content: { type: "text", text: `Error: ${message}` },
+        },
+      ],
+    };
+  }
+});
+
+// =============================================================================
+// RESOURCE TEMPLATES - Pattern-based resource access
+// =============================================================================
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+  return {
+    resourceTemplates: [
+      {
+        uriTemplate: "memory://{id}",
+        name: "Memory by ID",
+        description: "Access a specific memory by its ID",
+        mimeType: "text/plain",
+      },
+      {
+        uriTemplate: "shodh://stats",
+        name: "Memory Statistics",
+        description: "Current memory system statistics",
+        mimeType: "application/json",
+      },
+      {
+        uriTemplate: "shodh://todos",
+        name: "Todo List",
+        description: "Your pending tasks and work items",
+        mimeType: "text/plain",
+      },
+      {
+        uriTemplate: "shodh://search/{query}",
+        name: "Search Memories",
+        description: "Search memories for a specific query",
+        mimeType: "text/plain",
+      },
+    ],
+  };
 });
 
 // =============================================================================
