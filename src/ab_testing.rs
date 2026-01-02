@@ -1478,4 +1478,124 @@ mod tests {
             .iter()
             .any(|r| r.contains("Treatment")));
     }
+
+    #[test]
+    fn test_ab_demo_with_numbers() {
+        println!("\n========================================");
+        println!("       A/B TESTING DEMO WITH NUMBERS");
+        println!("========================================\n");
+
+        // Scenario 1: Clear winner
+        println!("📊 SCENARIO 1: Clear Winner (Treatment significantly better)");
+        println!("   Control:   1000 impressions, 100 clicks (10.0% CTR)");
+        println!("   Treatment: 1000 impressions, 200 clicks (20.0% CTR)");
+
+        let (chi_sq, p_value) = ABTestAnalyzer::chi_squared_test(1000, 100, 1000, 200);
+        let (ci_low, ci_high) = ABTestAnalyzer::calculate_confidence_interval(1000, 100, 1000, 200);
+
+        println!("\n   RESULTS:");
+        println!("   ├─ Chi-squared statistic: {:.4}", chi_sq);
+        println!("   ├─ P-value: {:.6}", p_value);
+        println!(
+            "   ├─ Significant (p < 0.05): {}",
+            if p_value < 0.05 { "YES ✓" } else { "NO ✗" }
+        );
+        println!(
+            "   ├─ 95% Confidence Interval: ({:.4}, {:.4})",
+            ci_low, ci_high
+        );
+        println!(
+            "   └─ Relative improvement: {:.1}%",
+            ((0.20 - 0.10) / 0.10) * 100.0
+        );
+
+        // Scenario 2: No significant difference
+        println!("\n📊 SCENARIO 2: No Significant Difference (Sample too small)");
+        println!("   Control:   50 impressions, 5 clicks (10.0% CTR)");
+        println!("   Treatment: 50 impressions, 6 clicks (12.0% CTR)");
+
+        let (chi_sq2, p_value2) = ABTestAnalyzer::chi_squared_test(50, 5, 50, 6);
+        let (ci_low2, ci_high2) = ABTestAnalyzer::calculate_confidence_interval(50, 5, 50, 6);
+
+        println!("\n   RESULTS:");
+        println!("   ├─ Chi-squared statistic: {:.4}", chi_sq2);
+        println!("   ├─ P-value: {:.6}", p_value2);
+        println!(
+            "   ├─ Significant (p < 0.05): {}",
+            if p_value2 < 0.05 { "YES ✓" } else { "NO ✗" }
+        );
+        println!(
+            "   ├─ 95% Confidence Interval: ({:.4}, {:.4})",
+            ci_low2, ci_high2
+        );
+        println!(
+            "   └─ CI includes 0: {} (effect may be due to chance)",
+            if ci_low2 < 0.0 && ci_high2 > 0.0 {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
+
+        // Scenario 3: Full analysis with recommendations
+        println!("\n📊 SCENARIO 3: Full Analysis with Recommendations");
+        let mut test = ABTest::builder("semantic_weight_test")
+            .with_min_impressions(100)
+            .build();
+
+        test.control_metrics.impressions = 5000;
+        test.control_metrics.clicks = 500; // 10% CTR
+        test.control_metrics.positive_feedback = 400;
+        test.control_metrics.negative_feedback = 50;
+
+        test.treatment_metrics.impressions = 5000;
+        test.treatment_metrics.clicks = 750; // 15% CTR
+        test.treatment_metrics.positive_feedback = 600;
+        test.treatment_metrics.negative_feedback = 30;
+
+        let results = ABTestAnalyzer::analyze(&test);
+
+        println!("   Test: Comparing semantic weight emphasis");
+        println!("   Control:   5000 impressions, 500 clicks (10.0% CTR)");
+        println!("   Treatment: 5000 impressions, 750 clicks (15.0% CTR)");
+        println!("\n   STATISTICAL RESULTS:");
+        println!("   ├─ Chi-squared: {:.4}", results.chi_squared);
+        println!("   ├─ P-value: {:.8}", results.p_value);
+        println!(
+            "   ├─ Confidence Level: {:.2}%",
+            results.confidence_level * 100.0
+        );
+        println!(
+            "   ├─ Significant: {}",
+            if results.is_significant {
+                "YES ✓"
+            } else {
+                "NO ✗"
+            }
+        );
+        println!("   ├─ Winner: {:?}", results.winner);
+        println!(
+            "   ├─ Relative Improvement: {:.2}%",
+            results.relative_improvement
+        );
+        println!("   ├─ Control CTR: {:.2}%", results.control_ctr * 100.0);
+        println!("   ├─ Treatment CTR: {:.2}%", results.treatment_ctr * 100.0);
+        println!(
+            "   └─ 95% CI: ({:.4}, {:.4})",
+            results.confidence_interval.0, results.confidence_interval.1
+        );
+
+        println!("\n   RECOMMENDATIONS:");
+        for (i, rec) in results.recommendations.iter().enumerate() {
+            println!("   {}. {}", i + 1, rec);
+        }
+
+        println!("\n========================================");
+        println!("        END OF A/B TESTING DEMO");
+        println!("========================================\n");
+
+        // Assertions to make sure the test still works
+        assert!(results.is_significant);
+        assert_eq!(results.winner, Some(ABTestVariant::Treatment));
+    }
 }
