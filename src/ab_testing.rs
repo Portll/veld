@@ -71,6 +71,158 @@ const CHI_SQUARED_CRITICAL_005: f64 = 3.841;
 const CHI_SQUARED_CRITICAL_001: f64 = 6.635;
 const CHI_SQUARED_CRITICAL_0001: f64 = 10.828;
 
+/// Sample Ratio Mismatch threshold (5% deviation triggers warning)
+const SRM_THRESHOLD: f64 = 0.05;
+
+/// Minimum effect size (Cohen's h) for practical significance
+const MIN_PRACTICAL_EFFECT_SIZE: f64 = 0.1;
+
+/// O'Brien-Fleming alpha spending function bounds
+const OBRIEN_FLEMING_ALPHA_SPENT: [f64; 5] = [0.0001, 0.001, 0.01, 0.025, 0.05];
+
+// =============================================================================
+// ADVANCED STATISTICAL TYPES
+// =============================================================================
+
+/// Bayesian analysis results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BayesianAnalysis {
+    /// Probability that treatment is better than control (0-1)
+    pub prob_treatment_better: f64,
+    /// Probability that control is better than treatment (0-1)
+    pub prob_control_better: f64,
+    /// Expected lift of treatment over control
+    pub expected_lift: f64,
+    /// Credible interval for treatment effect (95%)
+    pub credible_interval: (f64, f64),
+    /// Risk of choosing treatment if it's actually worse
+    pub risk_treatment: f64,
+    /// Risk of choosing control if treatment is actually better
+    pub risk_control: f64,
+}
+
+/// Effect size metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectSize {
+    /// Cohen's h for proportions (0.2 = small, 0.5 = medium, 0.8 = large)
+    pub cohens_h: f64,
+    /// Interpretation of effect size
+    pub interpretation: EffectSizeInterpretation,
+    /// Relative risk (treatment rate / control rate)
+    pub relative_risk: f64,
+    /// Odds ratio
+    pub odds_ratio: f64,
+    /// Number needed to treat (NNT) - how many users to see one additional success
+    pub nnt: f64,
+}
+
+/// Effect size interpretation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectSizeInterpretation {
+    Negligible,
+    Small,
+    Medium,
+    Large,
+}
+
+impl std::fmt::Display for EffectSizeInterpretation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Negligible => write!(f, "negligible"),
+            Self::Small => write!(f, "small"),
+            Self::Medium => write!(f, "medium"),
+            Self::Large => write!(f, "large"),
+        }
+    }
+}
+
+/// Sample Ratio Mismatch detection result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SRMCheck {
+    /// Whether SRM is detected (data quality issue)
+    pub srm_detected: bool,
+    /// Expected ratio based on traffic split
+    pub expected_ratio: f64,
+    /// Observed ratio
+    pub observed_ratio: f64,
+    /// Chi-squared statistic for SRM test
+    pub chi_squared: f64,
+    /// P-value for SRM test
+    pub p_value: f64,
+    /// Severity of the mismatch
+    pub severity: SRMSeverity,
+}
+
+/// Severity of sample ratio mismatch
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SRMSeverity {
+    None,
+    Warning,
+    Critical,
+}
+
+/// Sequential testing state for valid early stopping
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequentialTest {
+    /// Current analysis number (1, 2, 3, ...)
+    pub analysis_number: u32,
+    /// Total planned analyses
+    pub planned_analyses: u32,
+    /// Alpha spent so far
+    pub alpha_spent: f64,
+    /// Current significance threshold (adjusted for multiple looks)
+    pub current_alpha: f64,
+    /// Can we stop early?
+    pub can_stop_early: bool,
+    /// Reason for stopping (if applicable)
+    pub stop_reason: Option<String>,
+}
+
+/// Guardrail metric that must not degrade
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailMetric {
+    /// Name of the metric
+    pub name: String,
+    /// Baseline value (control)
+    pub baseline: f64,
+    /// Current value (treatment)
+    pub current: f64,
+    /// Maximum allowed degradation (e.g., 0.05 = 5%)
+    pub max_degradation: f64,
+    /// Is the guardrail breached?
+    pub is_breached: bool,
+    /// P-value for degradation test
+    pub degradation_p_value: f64,
+}
+
+/// Multi-Armed Bandit state for adaptive allocation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanditState {
+    /// Algorithm type
+    pub algorithm: BanditAlgorithm,
+    /// Alpha parameter for each arm (successes + 1)
+    pub alphas: Vec<f64>,
+    /// Beta parameter for each arm (failures + 1)
+    pub betas: Vec<f64>,
+    /// Current allocation probabilities
+    pub allocation_probs: Vec<f64>,
+    /// Total reward collected
+    pub total_reward: f64,
+    /// Regret estimate
+    pub estimated_regret: f64,
+}
+
+/// Bandit algorithm type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BanditAlgorithm {
+    /// Thompson Sampling (Bayesian)
+    ThompsonSampling,
+    /// Upper Confidence Bound
+    UCB1,
+    /// Epsilon-greedy
+    EpsilonGreedy,
+}
+
 // =============================================================================
 // CORE TYPES
 // =============================================================================
@@ -889,6 +1041,401 @@ impl ABTestAnalyzer {
                 / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
         }
     }
+
+    // =========================================================================
+    // ADVANCED ANALYSIS METHODS
+    // =========================================================================
+
+    /// Perform Bayesian analysis using Beta-Binomial model
+    ///
+    /// Returns probability that treatment is better, expected lift, and credible intervals
+    pub fn bayesian_analysis(test: &ABTest) -> BayesianAnalysis {
+        let control = &test.control_metrics;
+        let treatment = &test.treatment_metrics;
+
+        // Beta distribution parameters (using Jeffreys prior: alpha=0.5, beta=0.5)
+        let alpha_c = control.clicks as f64 + 0.5;
+        let beta_c = (control.impressions - control.clicks) as f64 + 0.5;
+        let alpha_t = treatment.clicks as f64 + 0.5;
+        let beta_t = (treatment.impressions - treatment.clicks) as f64 + 0.5;
+
+        // Monte Carlo simulation for probability of being better
+        let n_samples = 10000;
+        let mut treatment_wins = 0;
+        let mut lift_sum = 0.0;
+        let mut lifts = Vec::with_capacity(n_samples);
+
+        // Simple random sampling using linear congruential generator
+        let mut seed = 12345u64;
+        let lcg = |s: &mut u64| -> f64 {
+            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (*s as f64) / (u64::MAX as f64)
+        };
+
+        for _ in 0..n_samples {
+            // Sample from Beta distributions using inverse transform
+            let p_c = Self::beta_sample(alpha_c, beta_c, &mut seed, &lcg);
+            let p_t = Self::beta_sample(alpha_t, beta_t, &mut seed, &lcg);
+
+            if p_t > p_c {
+                treatment_wins += 1;
+            }
+
+            let lift = if p_c > 0.0 { (p_t - p_c) / p_c } else { 0.0 };
+            lift_sum += lift;
+            lifts.push(lift);
+        }
+
+        lifts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let prob_treatment_better = treatment_wins as f64 / n_samples as f64;
+        let expected_lift = lift_sum / n_samples as f64;
+
+        // 95% credible interval
+        let ci_low = lifts[(n_samples as f64 * 0.025) as usize];
+        let ci_high = lifts[(n_samples as f64 * 0.975) as usize];
+
+        // Expected loss (risk) calculation
+        let risk_treatment =
+            lifts.iter().filter(|&&l| l < 0.0).map(|l| -l).sum::<f64>() / n_samples as f64;
+        let risk_control = lifts.iter().filter(|&&l| l > 0.0).sum::<f64>() / n_samples as f64;
+
+        BayesianAnalysis {
+            prob_treatment_better,
+            prob_control_better: 1.0 - prob_treatment_better,
+            expected_lift,
+            credible_interval: (ci_low, ci_high),
+            risk_treatment,
+            risk_control,
+        }
+    }
+
+    /// Sample from Beta distribution using inverse transform sampling
+    fn beta_sample(alpha: f64, beta: f64, seed: &mut u64, lcg: &impl Fn(&mut u64) -> f64) -> f64 {
+        // Use ratio of gamma samples for Beta
+        let gamma_a = Self::gamma_sample(alpha, seed, lcg);
+        let gamma_b = Self::gamma_sample(beta, seed, lcg);
+        gamma_a / (gamma_a + gamma_b)
+    }
+
+    /// Sample from Gamma distribution using Marsaglia and Tsang's method
+    fn gamma_sample(alpha: f64, seed: &mut u64, lcg: &impl Fn(&mut u64) -> f64) -> f64 {
+        if alpha < 1.0 {
+            // For alpha < 1, use rejection method
+            return Self::gamma_sample(alpha + 1.0, seed, lcg) * lcg(seed).powf(1.0 / alpha);
+        }
+
+        let d = alpha - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+
+        loop {
+            let x = Self::normal_sample(seed, lcg);
+            let v = (1.0 + c * x).powi(3);
+            if v > 0.0 {
+                let u = lcg(seed);
+                if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x.powi(2) + d * (1.0 - v + v.ln())
+                {
+                    return d * v;
+                }
+            }
+        }
+    }
+
+    /// Sample from standard normal using Box-Muller transform
+    fn normal_sample(seed: &mut u64, lcg: &impl Fn(&mut u64) -> f64) -> f64 {
+        let u1 = lcg(seed);
+        let u2 = lcg(seed);
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Calculate effect size metrics (Cohen's h, relative risk, odds ratio, NNT)
+    pub fn calculate_effect_size(test: &ABTest) -> EffectSize {
+        let p1 = test.control_metrics.ctr();
+        let p2 = test.treatment_metrics.ctr();
+
+        // Cohen's h for proportions
+        let phi1 = 2.0 * p1.sqrt().asin();
+        let phi2 = 2.0 * p2.sqrt().asin();
+        let cohens_h = (phi2 - phi1).abs();
+
+        // Interpretation based on Cohen's conventions
+        let interpretation = if cohens_h < 0.2 {
+            EffectSizeInterpretation::Negligible
+        } else if cohens_h < 0.5 {
+            EffectSizeInterpretation::Small
+        } else if cohens_h < 0.8 {
+            EffectSizeInterpretation::Medium
+        } else {
+            EffectSizeInterpretation::Large
+        };
+
+        // Relative risk
+        let relative_risk = if p1 > 0.0 { p2 / p1 } else { 0.0 };
+
+        // Odds ratio
+        let odds_c = if p1 < 1.0 {
+            p1 / (1.0 - p1)
+        } else {
+            f64::INFINITY
+        };
+        let odds_t = if p2 < 1.0 {
+            p2 / (1.0 - p2)
+        } else {
+            f64::INFINITY
+        };
+        let odds_ratio = if odds_c > 0.0 && odds_c.is_finite() {
+            odds_t / odds_c
+        } else {
+            0.0
+        };
+
+        // Number needed to treat
+        let ard = (p2 - p1).abs(); // Absolute risk difference
+        let nnt = if ard > 0.0 { 1.0 / ard } else { f64::INFINITY };
+
+        EffectSize {
+            cohens_h,
+            interpretation,
+            relative_risk,
+            odds_ratio,
+            nnt,
+        }
+    }
+
+    /// Check for Sample Ratio Mismatch (data quality issue)
+    ///
+    /// SRM occurs when the observed traffic split differs from expected,
+    /// indicating a bug in randomization or data collection
+    pub fn check_srm(test: &ABTest) -> SRMCheck {
+        let expected_ratio = test.config.traffic_split as f64;
+        let total = test.control_metrics.impressions + test.treatment_metrics.impressions;
+
+        if total == 0 {
+            return SRMCheck {
+                srm_detected: false,
+                expected_ratio,
+                observed_ratio: 0.5,
+                chi_squared: 0.0,
+                p_value: 1.0,
+                severity: SRMSeverity::None,
+            };
+        }
+
+        let observed_ratio = test.treatment_metrics.impressions as f64 / total as f64;
+
+        // Expected counts
+        let expected_control = total as f64 * (1.0 - expected_ratio);
+        let expected_treatment = total as f64 * expected_ratio;
+
+        // Chi-squared test for SRM
+        let chi_sq = (test.control_metrics.impressions as f64 - expected_control).powi(2)
+            / expected_control
+            + (test.treatment_metrics.impressions as f64 - expected_treatment).powi(2)
+                / expected_treatment;
+
+        let p_value = Self::chi_squared_p_value(chi_sq);
+
+        // Determine severity
+        let deviation = (observed_ratio - expected_ratio).abs();
+        let severity = if p_value > 0.01 {
+            SRMSeverity::None
+        } else if deviation < SRM_THRESHOLD {
+            SRMSeverity::Warning
+        } else {
+            SRMSeverity::Critical
+        };
+
+        SRMCheck {
+            srm_detected: p_value < 0.01,
+            expected_ratio,
+            observed_ratio,
+            chi_squared: chi_sq,
+            p_value,
+            severity,
+        }
+    }
+
+    /// Sequential testing with O'Brien-Fleming alpha spending
+    ///
+    /// Allows valid early stopping while controlling Type I error
+    pub fn sequential_analysis(
+        test: &ABTest,
+        analysis_number: u32,
+        planned_analyses: u32,
+    ) -> SequentialTest {
+        let fraction = analysis_number as f64 / planned_analyses as f64;
+
+        // O'Brien-Fleming alpha spending function
+        // Spends very little alpha early, more as test progresses
+        let alpha = test.config.significance_level;
+        let alpha_spent = 2.0
+            * (1.0
+                - Self::normal_cdf(Self::inverse_normal_cdf(1.0 - alpha / 2.0) / fraction.sqrt()));
+
+        // Current significance threshold
+        let current_alpha = alpha_spent / analysis_number as f64;
+
+        // Perform test at current threshold
+        let (_, p_value) = Self::chi_squared_test(
+            test.control_metrics.impressions,
+            test.control_metrics.clicks,
+            test.treatment_metrics.impressions,
+            test.treatment_metrics.clicks,
+        );
+
+        let can_stop_early = p_value < current_alpha
+            && test.control_metrics.impressions >= test.config.min_impressions / 2
+            && test.treatment_metrics.impressions >= test.config.min_impressions / 2;
+
+        let stop_reason = if can_stop_early {
+            let effect = Self::calculate_effect_size(test);
+            if effect.interpretation == EffectSizeInterpretation::Negligible {
+                Some("Futility: Effect size too small to be practically significant".to_string())
+            } else {
+                Some(format!(
+                    "Efficacy: Significant result with {} effect",
+                    effect.interpretation
+                ))
+            }
+        } else {
+            None
+        };
+
+        SequentialTest {
+            analysis_number,
+            planned_analyses,
+            alpha_spent,
+            current_alpha,
+            can_stop_early,
+            stop_reason,
+        }
+    }
+
+    /// Normal CDF approximation
+    fn normal_cdf(x: f64) -> f64 {
+        0.5 * (1.0 + Self::erf(x / 2.0_f64.sqrt()))
+    }
+
+    /// Comprehensive analysis combining all methods
+    ///
+    /// Returns actionable insights focused on what matters for users:
+    /// - Should we ship this change?
+    /// - Is the effect meaningful (not just statistically significant)?
+    /// - Are there data quality issues?
+    /// - What's the risk of making the wrong decision?
+    pub fn comprehensive_analysis(test: &ABTest) -> ComprehensiveAnalysis {
+        let frequentist = Self::analyze(test);
+        let bayesian = Self::bayesian_analysis(test);
+        let effect_size = Self::calculate_effect_size(test);
+        let srm = Self::check_srm(test);
+        let sequential = Self::sequential_analysis(test, 1, 5);
+
+        // Decision logic: combine statistical and practical significance
+        let is_practically_significant = effect_size.cohens_h >= MIN_PRACTICAL_EFFECT_SIZE;
+        let has_data_quality_issues = srm.srm_detected;
+        let high_confidence =
+            bayesian.prob_treatment_better > 0.95 || bayesian.prob_control_better > 0.95;
+        let low_risk = bayesian.risk_treatment < 0.01 || bayesian.risk_control < 0.01;
+
+        // Ship decision
+        let should_ship = frequentist.is_significant
+            && is_practically_significant
+            && !has_data_quality_issues
+            && high_confidence
+            && low_risk
+            && frequentist.winner == Some(ABTestVariant::Treatment);
+
+        // Generate user-focused insights
+        let mut insights = Vec::new();
+
+        // Primary insight
+        if should_ship {
+            insights.push(format!(
+                "✅ SHIP IT: Treatment is {:.1}% better with {:.1}% confidence and {} effect size",
+                bayesian.expected_lift * 100.0,
+                bayesian.prob_treatment_better * 100.0,
+                effect_size.interpretation
+            ));
+        } else if frequentist.winner == Some(ABTestVariant::Control) && frequentist.is_significant {
+            insights.push(format!(
+                "❌ DO NOT SHIP: Control is {:.1}% better. Treatment would hurt users.",
+                -bayesian.expected_lift * 100.0
+            ));
+        } else {
+            insights.push("⏳ KEEP TESTING: Not enough evidence to make a decision".to_string());
+        }
+
+        // Explain why
+        if !frequentist.is_significant {
+            insights.push(format!(
+                "📊 p-value = {:.4} (need < {:.2})",
+                frequentist.p_value, test.config.significance_level
+            ));
+        }
+
+        if !is_practically_significant {
+            insights.push(format!(
+                "📏 Effect is {} (Cohen's h = {:.3}) - may not matter to users",
+                effect_size.interpretation, effect_size.cohens_h
+            ));
+        }
+
+        if has_data_quality_issues {
+            insights.push(format!(
+                "⚠️ DATA QUALITY: Sample ratio mismatch detected ({:.1}% vs expected {:.1}%)",
+                srm.observed_ratio * 100.0,
+                srm.expected_ratio * 100.0
+            ));
+        }
+
+        // Risk assessment
+        if bayesian.risk_treatment > 0.01 {
+            insights.push(format!(
+                "🎲 Risk if shipping treatment: {:.2}% expected loss",
+                bayesian.risk_treatment * 100.0
+            ));
+        }
+
+        // User impact
+        if effect_size.nnt.is_finite() && effect_size.nnt < 1000.0 {
+            insights.push(format!(
+                "👥 Impact: 1 in {:.0} users will benefit from this change",
+                effect_size.nnt
+            ));
+        }
+
+        ComprehensiveAnalysis {
+            frequentist,
+            bayesian,
+            effect_size,
+            srm,
+            sequential,
+            should_ship,
+            is_practically_significant,
+            insights,
+        }
+    }
+}
+
+/// Comprehensive analysis result combining all statistical methods
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComprehensiveAnalysis {
+    /// Frequentist analysis results
+    pub frequentist: ABTestResults,
+    /// Bayesian analysis results
+    pub bayesian: BayesianAnalysis,
+    /// Effect size metrics
+    pub effect_size: EffectSize,
+    /// Sample ratio mismatch check
+    pub srm: SRMCheck,
+    /// Sequential testing state
+    pub sequential: SequentialTest,
+    /// Final recommendation: should we ship?
+    pub should_ship: bool,
+    /// Is the effect practically significant (not just statistically)?
+    pub is_practically_significant: bool,
+    /// User-focused insights and recommendations
+    pub insights: Vec<String>,
 }
 
 // =============================================================================
@@ -1597,5 +2144,238 @@ mod tests {
         // Assertions to make sure the test still works
         assert!(results.is_significant);
         assert_eq!(results.winner, Some(ABTestVariant::Treatment));
+    }
+
+    #[test]
+    fn test_comprehensive_analysis_demo() {
+        println!("\n========================================");
+        println!("    COMPREHENSIVE A/B ANALYSIS DEMO");
+        println!("    (User-Focused Decision Making)");
+        println!("========================================\n");
+
+        let mut test = ABTest::builder("relevance_weights_experiment")
+            .with_description("Testing new semantic-heavy relevance scoring")
+            .with_min_impressions(100)
+            .with_traffic_split(0.5)
+            .build();
+
+        // Simulate a successful experiment
+        test.control_metrics.impressions = 3000;
+        test.control_metrics.clicks = 300; // 10% CTR
+        test.control_metrics.unique_users = 2500;
+        test.control_metrics.positive_feedback = 240;
+        test.control_metrics.negative_feedback = 30;
+
+        test.treatment_metrics.impressions = 3100; // Slight SRM (3.3% vs 50%)
+        test.treatment_metrics.clicks = 465; // 15% CTR
+        test.treatment_metrics.unique_users = 2600;
+        test.treatment_metrics.positive_feedback = 380;
+        test.treatment_metrics.negative_feedback = 20;
+
+        let analysis = ABTestAnalyzer::comprehensive_analysis(&test);
+
+        println!("📊 TEST CONFIGURATION:");
+        println!("   ├─ Control:   3000 impressions, 300 clicks (10.0% CTR)");
+        println!("   └─ Treatment: 3100 impressions, 465 clicks (15.0% CTR)\n");
+
+        println!("🔬 FREQUENTIST ANALYSIS:");
+        println!("   ├─ Chi-squared: {:.4}", analysis.frequentist.chi_squared);
+        println!("   ├─ P-value: {:.6}", analysis.frequentist.p_value);
+        println!(
+            "   ├─ Significant: {}",
+            if analysis.frequentist.is_significant {
+                "YES ✓"
+            } else {
+                "NO ✗"
+            }
+        );
+        println!("   └─ Winner: {:?}\n", analysis.frequentist.winner);
+
+        println!("🎲 BAYESIAN ANALYSIS:");
+        println!(
+            "   ├─ P(Treatment better): {:.2}%",
+            analysis.bayesian.prob_treatment_better * 100.0
+        );
+        println!(
+            "   ├─ Expected lift: {:.2}%",
+            analysis.bayesian.expected_lift * 100.0
+        );
+        println!(
+            "   ├─ 95% Credible Interval: ({:.2}%, {:.2}%)",
+            analysis.bayesian.credible_interval.0 * 100.0,
+            analysis.bayesian.credible_interval.1 * 100.0
+        );
+        println!(
+            "   ├─ Risk if shipping treatment: {:.3}%",
+            analysis.bayesian.risk_treatment * 100.0
+        );
+        println!(
+            "   └─ Risk if keeping control: {:.3}%\n",
+            analysis.bayesian.risk_control * 100.0
+        );
+
+        println!("📏 EFFECT SIZE:");
+        println!("   ├─ Cohen's h: {:.4}", analysis.effect_size.cohens_h);
+        println!(
+            "   ├─ Interpretation: {}",
+            analysis.effect_size.interpretation
+        );
+        println!(
+            "   ├─ Relative Risk: {:.2}x",
+            analysis.effect_size.relative_risk
+        );
+        println!("   ├─ Odds Ratio: {:.2}", analysis.effect_size.odds_ratio);
+        if analysis.effect_size.nnt.is_finite() {
+            println!(
+                "   └─ NNT (Number Needed to Treat): {:.0}\n",
+                analysis.effect_size.nnt
+            );
+        } else {
+            println!("   └─ NNT: N/A (no effect)\n");
+        }
+
+        println!("⚖️ DATA QUALITY (SRM Check):");
+        println!(
+            "   ├─ Expected ratio: {:.1}%",
+            analysis.srm.expected_ratio * 100.0
+        );
+        println!(
+            "   ├─ Observed ratio: {:.1}%",
+            analysis.srm.observed_ratio * 100.0
+        );
+        println!(
+            "   ├─ SRM Detected: {}",
+            if analysis.srm.srm_detected {
+                "YES ⚠️"
+            } else {
+                "NO ✓"
+            }
+        );
+        println!("   └─ Severity: {:?}\n", analysis.srm.severity);
+
+        println!("📈 SEQUENTIAL TESTING:");
+        println!(
+            "   ├─ Analysis #{} of {}",
+            analysis.sequential.analysis_number, analysis.sequential.planned_analyses
+        );
+        println!("   ├─ Alpha spent: {:.4}", analysis.sequential.alpha_spent);
+        println!(
+            "   ├─ Current threshold: {:.4}",
+            analysis.sequential.current_alpha
+        );
+        println!(
+            "   └─ Can stop early: {}\n",
+            if analysis.sequential.can_stop_early {
+                "YES ✓"
+            } else {
+                "NO - Continue testing"
+            }
+        );
+
+        println!("═══════════════════════════════════════");
+        println!("🎯 FINAL DECISION:");
+        println!("═══════════════════════════════════════");
+        println!(
+            "   Should ship: {}",
+            if analysis.should_ship {
+                "YES ✅"
+            } else {
+                "NO ❌"
+            }
+        );
+        println!(
+            "   Practically significant: {}",
+            if analysis.is_practically_significant {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
+        println!("\n📋 USER-FOCUSED INSIGHTS:");
+        for insight in &analysis.insights {
+            println!("   • {}", insight);
+        }
+
+        println!("\n========================================");
+        println!("     END OF COMPREHENSIVE ANALYSIS");
+        println!("========================================\n");
+
+        // Assertions
+        assert!(analysis.frequentist.is_significant);
+        assert!(analysis.bayesian.prob_treatment_better > 0.95);
+        assert!(analysis.is_practically_significant);
+        assert!(analysis.effect_size.cohens_h > MIN_PRACTICAL_EFFECT_SIZE);
+        assert!(!analysis.insights.is_empty());
+    }
+
+    #[test]
+    fn test_bayesian_analysis() {
+        let mut test = ABTest::builder("bayesian_test").build();
+
+        test.control_metrics.impressions = 1000;
+        test.control_metrics.clicks = 100; // 10%
+        test.treatment_metrics.impressions = 1000;
+        test.treatment_metrics.clicks = 150; // 15%
+
+        let bayesian = ABTestAnalyzer::bayesian_analysis(&test);
+
+        // Treatment should have high probability of being better
+        assert!(bayesian.prob_treatment_better > 0.9);
+        assert!(bayesian.expected_lift > 0.0);
+        // Credible interval should not include large negative values
+        assert!(bayesian.credible_interval.0 > -0.5);
+    }
+
+    #[test]
+    fn test_effect_size_calculation() {
+        let mut test = ABTest::builder("effect_test").build();
+
+        test.control_metrics.impressions = 1000;
+        test.control_metrics.clicks = 100; // 10%
+        test.treatment_metrics.impressions = 1000;
+        test.treatment_metrics.clicks = 200; // 20%
+
+        let effect = ABTestAnalyzer::calculate_effect_size(&test);
+
+        // 10% to 20% should be a small-to-medium effect
+        assert!(effect.cohens_h > 0.2);
+        assert!(effect.relative_risk > 1.5);
+        // NNT should be 10 (1/(0.2-0.1))
+        assert!((effect.nnt - 10.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_srm_detection() {
+        let mut test = ABTest::builder("srm_test").with_traffic_split(0.5).build();
+
+        // Severe SRM: expected 50/50, got 70/30
+        test.control_metrics.impressions = 700;
+        test.treatment_metrics.impressions = 300;
+
+        let srm = ABTestAnalyzer::check_srm(&test);
+
+        // Should detect SRM
+        assert!(srm.srm_detected);
+        assert_eq!(srm.severity, SRMSeverity::Critical);
+    }
+
+    #[test]
+    fn test_sequential_analysis() {
+        let mut test = ABTest::builder("sequential_test")
+            .with_min_impressions(100)
+            .build();
+
+        test.control_metrics.impressions = 500;
+        test.control_metrics.clicks = 25; // 5%
+        test.treatment_metrics.impressions = 500;
+        test.treatment_metrics.clicks = 75; // 15%
+
+        // Early look (analysis 1 of 5)
+        let seq = ABTestAnalyzer::sequential_analysis(&test, 1, 5);
+
+        assert_eq!(seq.analysis_number, 1);
+        assert_eq!(seq.planned_analyses, 5);
+        // O'Brien-Fleming is very conservative early
+        assert!(seq.alpha_spent < 0.01);
     }
 }
