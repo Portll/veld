@@ -102,6 +102,7 @@ uuid = { version = "1.4", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 lru = "0.12"
 regex = "1.10"
+rust-stemmers = "1.2"  # Porter2 stemming for linguistic analysis
 dirs = "5.0"  # Platform-specific directory paths
 glob = "0.3"  # Pattern matching for file paths
 
