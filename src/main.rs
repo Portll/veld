@@ -495,7 +495,7 @@ impl MultiUserMemoryManagerRotationHelper {
                     break;
                 }
 
-                if let Ok(event) = bincode::deserialize::<AuditEvent>(&value) {
+                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(&value, bincode::config::standard()) {
                     let timestamp_nanos = event.timestamp.timestamp_nanos_opt().unwrap_or(0);
                     events.push((key.to_vec(), event, timestamp_nanos));
                 }
@@ -836,7 +836,7 @@ impl MultiUserMemoryManager {
             user_id,
             event.timestamp.timestamp_nanos_opt().unwrap_or(0)
         );
-        if let Ok(serialized) = bincode::serialize(&event) {
+        if let Ok(serialized) = bincode::serde::encode_to_vec(&event, bincode::config::standard()) {
             let db = self.audit_db.clone();
             let key_bytes = key.into_bytes();
 
@@ -942,7 +942,7 @@ impl MultiUserMemoryManager {
                 }
 
                 // Deserialize event
-                if let Ok(event) = bincode::deserialize::<AuditEvent>(&value) {
+                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(&value, bincode::config::standard()) {
                     events.push(event);
                 }
             }
@@ -1015,11 +1015,22 @@ impl MultiUserMemoryManager {
         Ok(())
     }
 
-    /// Get statistics for a user
+    /// Get statistics for a user (includes memory + graph stats)
     pub fn get_stats(&self, user_id: &str) -> Result<MemoryStats> {
         let memory = self.get_user_memory(user_id)?;
         let memory_guard = memory.read();
-        Ok(memory_guard.stats())
+        let mut stats = memory_guard.stats();
+
+        // Add graph stats
+        if let Ok(graph) = self.get_user_graph(user_id) {
+            let graph_guard = graph.read();
+            if let Ok(graph_stats) = graph_guard.get_stats() {
+                stats.graph_nodes = graph_stats.entity_count;
+                stats.graph_edges = graph_stats.relationship_count;
+            }
+        }
+
+        Ok(stats)
     }
 
     /// List all users (scans data directory for user folders)
@@ -1052,7 +1063,7 @@ impl MultiUserMemoryManager {
                 if !key_str.starts_with(&prefix) {
                     break;
                 }
-                if let Ok(event) = bincode::deserialize::<AuditEvent>(&value) {
+                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(&value, bincode::config::standard()) {
                     events.push(event);
                 }
             }
@@ -3881,16 +3892,19 @@ async fn recall(
             .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         };
 
-        let total = semantic_memories.len();
         let recall_memories: Vec<RecallMemory> = semantic_memories
             .into_iter()
-            .enumerate()
-            .map(|(rank, m)| {
-                // Score based on rank position and salience
-                // Higher rank = higher score, combined with memory salience
-                let rank_score = 1.0 - (rank as f32 / total.max(1) as f32);
-                let salience = m.salience_score_with_access();
-                let score = rank_score * 0.7 + salience * 0.3;
+            .map(|m| {
+                // Use actual similarity score from vector search, not manufactured rank-based score
+                // This is the real cosine similarity from MiniLM embeddings
+                let score = m.get_score().unwrap_or_else(|| {
+                    // Fallback: use salience if score wasn't set (shouldn't happen)
+                    tracing::warn!(
+                        memory_id = %m.id.0,
+                        "Memory missing similarity score in semantic search"
+                    );
+                    m.salience_score_with_access()
+                });
                 RecallMemory {
                     id: m.id.0.to_string(),
                     experience: RecallExperience {
@@ -3947,6 +3961,24 @@ async fn recall(
                 count
             ),
         );
+
+        // Record memory co-activation in GraphMemory (Hebbian learning)
+        if count >= 2 {
+            let memory_ids: Vec<uuid::Uuid> = recall_memories
+                .iter()
+                .filter_map(|m| uuid::Uuid::parse_str(&m.id).ok())
+                .collect();
+
+            if memory_ids.len() >= 2 {
+                let graph = graph_memory.clone();
+                tokio::task::spawn(async move {
+                    let graph_guard = graph.write();
+                    if let Err(e) = graph_guard.record_memory_coactivation(&memory_ids) {
+                        tracing::debug!("Failed to record memory coactivation: {}", e);
+                    }
+                });
+            }
+        }
 
         return Ok(Json(RecallResponse {
             memories: recall_memories,
@@ -4055,9 +4087,16 @@ async fn recall(
             (0.50, 0.35, 0.15) // Legacy fixed weights
         };
 
-    // Add semantic results with their position-based score
-    for (rank, memory) in semantic_memories.iter().enumerate() {
-        let semantic_score = 1.0 / (rank as f32 + 1.0); // Reciprocal rank
+    // Add semantic results with their actual similarity score
+    for memory in semantic_memories.iter() {
+        // Use actual cosine similarity from vector search, not rank-based approximation
+        let semantic_score = memory.get_score().unwrap_or_else(|| {
+            tracing::warn!(
+                memory_id = %memory.id.0,
+                "Memory missing similarity score in hybrid search"
+            );
+            memory.salience_score_with_access()
+        });
         let hybrid_score = semantic_weight * semantic_score;
         scored_memories.insert(memory.id.0, (hybrid_score, memory.clone()));
     }
@@ -4133,7 +4172,7 @@ async fn recall(
         .with_label_values(&[&mode])
         .observe(duration);
     metrics::MEMORY_RETRIEVE_TOTAL
-        .with_label_values(&[&mode, "success"])
+        .with_label_values(&[&mode, &String::from("success")])
         .inc();
     metrics::MEMORY_RETRIEVE_RESULTS
         .with_label_values(&[&mode])
@@ -4163,6 +4202,25 @@ async fn recall(
             mode
         ),
     );
+
+    // Record memory co-activation in GraphMemory (Hebbian learning)
+    // When memories are retrieved together, they form associations
+    if count >= 2 {
+        let memory_ids: Vec<uuid::Uuid> = recall_memories
+            .iter()
+            .filter_map(|m| uuid::Uuid::parse_str(&m.id).ok())
+            .collect();
+
+        if memory_ids.len() >= 2 {
+            let graph = graph_memory.clone();
+            tokio::task::spawn(async move {
+                let graph_guard = graph.write();
+                if let Err(e) = graph_guard.record_memory_coactivation(&memory_ids) {
+                    tracing::debug!("Failed to record memory coactivation: {}", e);
+                }
+            });
+        }
+    }
 
     Ok(Json(RecallResponse {
         memories: recall_memories,
@@ -6421,7 +6479,7 @@ async fn reinforce_feedback(
         .with_label_values(&[&outcome_label])
         .observe(duration);
     metrics::HEBBIAN_REINFORCE_TOTAL
-        .with_label_values(&[&outcome_label, "success"])
+        .with_label_values(&[&outcome_label, &String::from("success")])
         .inc();
 
     Ok(Json(ReinforceFeedbackResponse {

@@ -286,6 +286,9 @@ pub enum RelationType {
     RelatedTo,
     AssociatedWith,
 
+    /// Memory co-retrieval (Hebbian association between memories)
+    CoRetrieved,
+
     /// Custom relationship
     Custom(String),
 }
@@ -313,6 +316,7 @@ impl RelationType {
             Self::Teaches => "Teaches",
             Self::RelatedTo => "RelatedTo",
             Self::AssociatedWith => "AssociatedWith",
+            Self::CoRetrieved => "CoRetrieved",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -484,7 +488,7 @@ impl GraphMemory {
             let entity_iter = entities_db.iterator(rocksdb::IteratorMode::Start);
             let mut migrated_count = 0;
             for (_, value) in entity_iter.flatten() {
-                if let Ok(entity) = bincode::deserialize::<EntityNode>(&value) {
+                if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
                     // Store in index DB: name -> UUID bytes
                     index_db.put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
                     index.insert(entity.name.clone(), entity.uuid);
@@ -618,7 +622,7 @@ impl GraphMemory {
 
         // Now store entity in database
         let key = entity.uuid.as_bytes();
-        let value = bincode::serialize(&entity)?;
+        let value = bincode::serde::encode_to_vec(&entity, bincode::config::standard())?;
         self.entities_db.put(key, value)?;
 
         // Increment counter only for truly new entities
@@ -634,7 +638,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.entities_db.get(key)? {
             Some(value) => {
-                let entity: EntityNode = bincode::deserialize(&value)?;
+                let (entity, _): (EntityNode, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 Ok(Some(entity))
             }
             None => Ok(None),
@@ -675,7 +679,7 @@ impl GraphMemory {
 
         // Store relationship
         let key = edge.uuid.as_bytes();
-        let value = bincode::serialize(&edge)?;
+        let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
         self.relationships_db.put(key, value)?;
 
         // Increment relationship counter
@@ -726,7 +730,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.relationships_db.get(key)? {
             Some(value) => {
-                let edge: RelationshipEdge = bincode::deserialize(&value)?;
+                let (edge, _): (RelationshipEdge, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 Ok(Some(edge))
             }
             None => Ok(None),
@@ -745,7 +749,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.relationships_db.get(key)? {
             Some(value) => {
-                let mut edge: RelationshipEdge = bincode::deserialize(&value)?;
+                let (mut edge, _): (RelationshipEdge, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 // Apply effective strength calculation (doesn't persist)
                 edge.strength = edge.effective_strength();
                 Ok(Some(edge))
@@ -757,7 +761,7 @@ impl GraphMemory {
     /// Add an episodic node
     pub fn add_episode(&self, episode: EpisodicNode) -> Result<Uuid> {
         let key = episode.uuid.as_bytes();
-        let value = bincode::serialize(&episode)?;
+        let value = bincode::serde::encode_to_vec(&episode, bincode::config::standard())?;
         self.episodes_db.put(key, value)?;
 
         // Increment episode counter
@@ -783,7 +787,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.episodes_db.get(key)? {
             Some(value) => {
-                let episode: EpisodicNode = bincode::deserialize(&value)?;
+                let (episode, _): (EpisodicNode, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 Ok(Some(episode))
             }
             None => Ok(None),
@@ -919,7 +923,7 @@ impl GraphMemory {
             edge.invalidated_at = Some(Utc::now());
 
             let key = edge.uuid.as_bytes();
-            let value = bincode::serialize(&edge)?;
+            let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
             self.relationships_db.put(key, value)?;
         }
 
@@ -940,7 +944,7 @@ impl GraphMemory {
             edge.strengthen();
 
             let key = edge.uuid.as_bytes();
-            let value = bincode::serialize(&edge)?;
+            let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
             self.relationships_db.put(key, value)?;
         }
 
@@ -969,7 +973,7 @@ impl GraphMemory {
                 edge.strengthen();
 
                 let key = edge.uuid.as_bytes();
-                match bincode::serialize(&edge) {
+                match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
                     Ok(value) => {
                         batch.put(key, value);
                         strengthened += 1;
@@ -987,6 +991,159 @@ impl GraphMemory {
         }
 
         Ok(strengthened)
+    }
+
+    /// Record co-retrieval of memories (Hebbian learning between memories)
+    ///
+    /// When memories are retrieved together, they form associations.
+    /// This creates or strengthens CoRetrieved edges between all pairs of memories.
+    ///
+    /// Note: Limits to top N memories to avoid O(n²) explosion on large retrievals.
+    /// Returns the number of edges created/strengthened.
+    pub fn record_memory_coactivation(&self, memory_ids: &[Uuid]) -> Result<usize> {
+        const MAX_COACTIVATION_SIZE: usize = 20;
+
+        // Limit to top N to bound worst-case complexity
+        let memories_to_process = if memory_ids.len() > MAX_COACTIVATION_SIZE {
+            &memory_ids[..MAX_COACTIVATION_SIZE]
+        } else {
+            memory_ids
+        };
+
+        if memories_to_process.len() < 2 {
+            return Ok(0);
+        }
+
+        let _guard = self.synapse_update_lock.lock();
+        let mut batch = WriteBatch::default();
+        let mut edges_updated = 0;
+
+        // Process all pairs
+        for i in 0..memories_to_process.len() {
+            for j in (i + 1)..memories_to_process.len() {
+                let mem_a = memories_to_process[i];
+                let mem_b = memories_to_process[j];
+
+                // Try to find existing edge between these memories
+                let existing_edge = self.find_edge_between_entities(&mem_a, &mem_b)?;
+
+                if let Some(mut edge) = existing_edge {
+                    // Strengthen existing edge
+                    edge.strengthen();
+                    let key = edge.uuid.as_bytes();
+                    if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                        batch.put(key, value);
+                        edges_updated += 1;
+                    }
+                } else {
+                    // Create new CoRetrieved edge (bidirectional represented as single edge)
+                    let edge = RelationshipEdge {
+                        uuid: Uuid::new_v4(),
+                        from_entity: mem_a,
+                        to_entity: mem_b,
+                        relation_type: RelationType::CoRetrieved,
+                        strength: 0.5, // Initial strength
+                        created_at: Utc::now(),
+                        valid_at: Utc::now(),
+                        invalidated_at: None,
+                        source_episode_id: None,
+                        context: String::new(),
+                        last_activated: Utc::now(),
+                        activation_count: 1,
+                        potentiated: false,
+                    };
+
+                    let key = edge.uuid.as_bytes();
+                    if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                        batch.put(key, value);
+
+                        // Also index in the reverse direction for lookup
+                        let idx_key_fwd = format!("mem_edge:{}:{}", mem_a, mem_b);
+                        let idx_key_rev = format!("mem_edge:{}:{}", mem_b, mem_a);
+                        batch.put(idx_key_fwd.as_bytes(), edge.uuid.as_bytes());
+                        batch.put(idx_key_rev.as_bytes(), edge.uuid.as_bytes());
+
+                        edges_updated += 1;
+                    }
+                }
+            }
+        }
+
+        if edges_updated > 0 {
+            self.relationships_db.write(batch)?;
+        }
+
+        Ok(edges_updated)
+    }
+
+    /// Find an edge between two entities/memories (in either direction)
+    fn find_edge_between_entities(&self, entity_a: &Uuid, entity_b: &Uuid) -> Result<Option<RelationshipEdge>> {
+        // Check forward index
+        let idx_key = format!("mem_edge:{}:{}", entity_a, entity_b);
+        if let Some(edge_uuid_bytes) = self.relationships_db.get(idx_key.as_bytes())? {
+            if edge_uuid_bytes.len() == 16 {
+                let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
+                return self.get_relationship(&edge_uuid);
+            }
+        }
+
+        // Check reverse index
+        let idx_key_rev = format!("mem_edge:{}:{}", entity_b, entity_a);
+        if let Some(edge_uuid_bytes) = self.relationships_db.get(idx_key_rev.as_bytes())? {
+            if edge_uuid_bytes.len() == 16 {
+                let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
+                return self.get_relationship(&edge_uuid);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Find memories associated with a given memory through co-retrieval
+    ///
+    /// Uses weighted graph traversal prioritizing stronger associations.
+    /// Returns memory UUIDs sorted by association strength.
+    pub fn find_memory_associations(&self, memory_id: &Uuid, max_results: usize) -> Result<Vec<(Uuid, f32)>> {
+        let mut associations: Vec<(Uuid, f32)> = Vec::new();
+
+        // Scan for edges involving this memory
+        let prefix_fwd = format!("mem_edge:{}:", memory_id);
+
+        let iter = self.relationships_db.prefix_iterator(prefix_fwd.as_bytes());
+        for item in iter {
+            let (key, value) = item?;
+
+            // Check if this is our prefix (RocksDB prefix_iterator may return extra)
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix_fwd) {
+                break;
+            }
+
+            // Get edge UUID from value and look up edge
+            if value.len() == 16 {
+                let edge_uuid = Uuid::from_slice(&value)?;
+                if let Some(edge) = self.get_relationship(&edge_uuid)? {
+                    // Get the other memory in this edge
+                    let other_id = if edge.from_entity == *memory_id {
+                        edge.to_entity
+                    } else {
+                        edge.from_entity
+                    };
+
+                    // Get effective strength with decay
+                    let effective_strength = edge.effective_strength();
+                    if effective_strength > LTP_MIN_STRENGTH {
+                        associations.push((other_id, effective_strength));
+                    }
+                }
+            }
+        }
+
+        // Sort by strength descending and limit
+        associations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        associations.truncate(max_results);
+
+        Ok(associations)
     }
 
     /// Get average Hebbian strength for a memory based on its entity relationships
@@ -1069,7 +1226,7 @@ impl GraphMemory {
             let should_prune = edge.decay();
 
             let key = edge.uuid.as_bytes();
-            let value = bincode::serialize(&edge)?;
+            let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
             self.relationships_db.put(key, value)?;
 
             return Ok(should_prune);
@@ -1097,7 +1254,7 @@ impl GraphMemory {
                 let should_prune = edge.decay();
 
                 let key = edge.uuid.as_bytes();
-                match bincode::serialize(&edge) {
+                match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
                     Ok(value) => {
                         batch.put(key, value);
                         if should_prune {
@@ -1229,7 +1386,7 @@ impl GraphMemory {
 
         let iter = self.entities_db.iterator(rocksdb::IteratorMode::Start);
         for (_, value) in iter.flatten() {
-            if let Ok(entity) = bincode::deserialize::<EntityNode>(&value) {
+            if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
                 entities.push(entity);
             }
         }
@@ -1246,7 +1403,7 @@ impl GraphMemory {
 
         let iter = self.relationships_db.iterator(rocksdb::IteratorMode::Start);
         for (_, value) in iter.flatten() {
-            if let Ok(edge) = bincode::deserialize::<RelationshipEdge>(&value) {
+            if let Ok(edge) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
                 // Only include non-invalidated relationships
                 if edge.invalidated_at.is_none() {
                     relationships.push(edge);

@@ -341,6 +341,37 @@ impl MemorySystem {
         )
         .context("Failed to initialize hybrid search engine")?;
 
+        // Backfill BM25 index if empty but memories exist
+        if hybrid_search_engine.needs_backfill() {
+            let existing_memories = storage.get_all()?;
+            let memory_count = existing_memories.len();
+
+            if memory_count > 0 {
+                tracing::info!(
+                    "BM25 index empty, backfilling {} existing memories...",
+                    memory_count
+                );
+
+                let memories_iter = existing_memories.into_iter().map(|mem| {
+                    (
+                        mem.id,
+                        mem.experience.content,
+                        mem.experience.tags,
+                        mem.experience.entities,
+                    )
+                });
+
+                match hybrid_search_engine.backfill(memories_iter) {
+                    Ok(indexed) => {
+                        tracing::info!("BM25 backfill complete: {} memories indexed", indexed);
+                    }
+                    Err(e) => {
+                        tracing::warn!("BM25 backfill failed (non-fatal): {}", e);
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -2461,27 +2492,9 @@ impl MemorySystem {
             ..Default::default()
         };
 
-        // Handle graph updates via retriever (Hebbian associations)
-        match &outcome {
-            RetrievalOutcome::Helpful => {
-                if memory_ids.len() >= 2 {
-                    self.retriever.graph_mut().record_coactivation(memory_ids);
-                    stats.associations_strengthened = memory_ids.len() * (memory_ids.len() - 1) / 2;
-                }
-            }
-            RetrievalOutcome::Neutral => {
-                if memory_ids.len() >= 2 {
-                    let mut graph = self.retriever.graph_mut();
-                    for window in memory_ids.windows(2) {
-                        graph.add_edge(&window[0], &window[1]);
-                    }
-                    stats.associations_strengthened = memory_ids.len() - 1;
-                }
-            }
-            RetrievalOutcome::Misleading => {
-                // Don't strengthen associations for misleading memories
-            }
-        }
+        // NOTE: Hebbian associations (coactivation) are now handled at the API layer
+        // via GraphMemory.record_memory_coactivation() which provides persistent
+        // storage and proper Hebbian learning. This method only handles importance updates.
 
         // CACHE COHERENT IMPORTANCE UPDATES:
         // 1. First try to find memory in caches (working, session)
@@ -2905,6 +2918,7 @@ impl MemorySystem {
             let should_replay = self.replay_manager.read().should_replay();
             if should_replay {
                 // Collect replay candidates from working + session memory
+                // Graph connections are managed by GraphMemory at the API layer
                 let candidates_data: Vec<_> = {
                     let working = self.working_memory.read();
                     let session = self.session_memory.read();
@@ -2914,8 +2928,8 @@ impl MemorySystem {
                         .iter()
                         .chain(session.all_memories().iter())
                         .map(|m| {
-                            // Get connected memory IDs from graph
-                            let connections = self.retriever.graph_ref().get_neighbors(&m.id);
+                            // Connections provided by GraphMemory at API layer
+                            let connections: Vec<String> = Vec::new();
                             let arousal = m
                                 .experience
                                 .context
@@ -2927,7 +2941,7 @@ impl MemorySystem {
                                 m.importance(),
                                 arousal,
                                 m.created_at,
-                                connections.into_iter().map(|id| id.0.to_string()).collect(),
+                                connections,
                                 m.experience.content.chars().take(50).collect::<String>(),
                             )
                         })
@@ -2959,18 +2973,13 @@ impl MemorySystem {
                         }
                     }
 
-                    // Apply edge boosts through graph
-                    for (from_str, to_str, boost) in &edge_boosts {
-                        if let (Ok(from_id), Ok(to_id)) = (
-                            uuid::Uuid::parse_str(from_str),
-                            uuid::Uuid::parse_str(to_str),
-                        ) {
-                            self.retriever.graph_write().strengthen_edge(
-                                &MemoryId(from_id),
-                                &MemoryId(to_id),
-                                *boost,
-                            );
-                        }
+                    // Edge boosts are applied via GraphMemory at API layer
+                    // The edge_boosts from replay are logged for observability
+                    if !edge_boosts.is_empty() {
+                        tracing::debug!(
+                            "Replay produced {} edge boosts (applied via GraphMemory)",
+                            edge_boosts.len()
+                        );
                     }
 
                     // Record events

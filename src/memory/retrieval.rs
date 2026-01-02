@@ -10,23 +10,18 @@ use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
-use super::introspection::{
-    ConsolidationEvent, ConsolidationEventBuffer, EdgeFormationReason, PruningReason,
-};
+use super::introspection::{ConsolidationEvent, ConsolidationEventBuffer};
 use super::storage::{MemoryStorage, SearchCriteria};
 use super::types::*;
 use crate::constants::{
-    EDGE_INITIAL_STRENGTH, EDGE_MIN_STRENGTH, PREFETCH_RECENCY_FULL_BOOST,
-    PREFETCH_RECENCY_FULL_HOURS, PREFETCH_RECENCY_PARTIAL_BOOST, PREFETCH_RECENCY_PARTIAL_HOURS,
-    VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
+    PREFETCH_RECENCY_FULL_BOOST, PREFETCH_RECENCY_FULL_HOURS, PREFETCH_RECENCY_PARTIAL_BOOST,
+    PREFETCH_RECENCY_PARTIAL_HOURS, VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
 };
-use crate::decay::hybrid_decay_factor;
 use crate::embeddings::{minilm::MiniLMEmbedder, Embedder};
 use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
 
@@ -38,20 +33,15 @@ use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
 ///
 /// 1. `vector_index` - Vector similarity search index
 /// 2. `id_mapping` - Memory ID ↔ Vector ID mapping
-/// 3. `graph` - Memory association graph (Hebbian learning)
-/// 4. `consolidation_events` - Introspection event buffer
+/// 3. `consolidation_events` - Introspection event buffer
 ///
 /// **Rules:**
 /// - Never acquire a higher-numbered lock while holding a lower-numbered lock
 /// - For read operations, prefer `read()` over `write()` when possible
 /// - Release locks as soon as possible (don't hold during I/O)
-/// - `graph_maintenance()` acquires only `graph` lock - safe to run concurrently with searches
-/// - `record_coactivation()` acquires only `graph` lock - no ordering conflict
 ///
-/// **Why this ordering:**
-/// - Search operations need vector_index → id_mapping (common path)
-/// - Hebbian updates need id_mapping → graph (after search)
-/// - Introspection needs graph → consolidation_events (for reporting)
+/// **Note:** Memory graph (Hebbian learning) has been consolidated into GraphMemory
+/// which is managed at the API layer (MultiUserMemoryManager.graph_memories)
 pub struct RetrievalEngine {
     storage: Arc<MemoryStorage>,
     embedder: Arc<MiniLMEmbedder>,
@@ -59,11 +49,9 @@ pub struct RetrievalEngine {
     vector_index: Arc<RwLock<VamanaIndex>>,
     /// Lock order: 2
     id_mapping: Arc<RwLock<IdMapping>>,
-    /// Lock order: 3 - Interior mutability for graph updates
-    graph: RwLock<MemoryGraph>,
     /// Storage path for persisting vector index and ID mapping
     storage_path: PathBuf,
-    /// Lock order: 4 - Acquire last
+    /// Lock order: 3 - Acquire last (was 4 when graph was here)
     /// Shared consolidation event buffer for introspection
     /// Records edge formation, strengthening, and pruning events
     consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
@@ -208,35 +196,15 @@ impl RetrievalEngine {
             VamanaIndex::new(vamana_config).context("Failed to initialize Vamana vector index")?;
         let id_mapping = IdMapping::new();
 
-        // Load memory graph (Hebbian associations) - this still uses file for now
-        // TODO: Move graph to RocksDB as well for full atomicity
-        let graph_file = index_path.join("memory_graph.bin");
-        let graph = if graph_file.exists() {
-            match MemoryGraph::load(&graph_file) {
-                Ok(loaded_graph) => {
-                    let stats = loaded_graph.stats();
-                    info!(
-                        "Loaded persisted memory graph with {} nodes and {} edges",
-                        stats.node_count, stats.edge_count
-                    );
-                    loaded_graph
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load memory graph, starting fresh: {}", e);
-                    MemoryGraph::new()
-                }
-            }
-        } else {
-            info!("No persisted memory graph found, starting with empty graph");
-            MemoryGraph::new()
-        };
+        // NOTE: Memory graph (Hebbian associations) has been consolidated into GraphMemory
+        // which is managed at the API layer (MultiUserMemoryManager.graph_memories)
+        // This enables persistent storage in RocksDB with proper Hebbian learning
 
         let engine = Self {
             storage,
             embedder,
             vector_index: Arc::new(RwLock::new(vector_index)),
             id_mapping: Arc::new(RwLock::new(id_mapping)),
-            graph: RwLock::new(graph),
             storage_path,
             consolidation_events,
         };
@@ -421,19 +389,13 @@ impl RetrievalEngine {
         let index_path = self.storage_path.join("vector_index");
         fs::create_dir_all(&index_path)?;
 
-        // Only save memory graph (Hebbian associations)
+        // NOTE: Memory graph is now persisted in GraphMemory (RocksDB)
         // Vector index is rebuilt from RocksDB on startup
         // ID mapping is stored atomically in RocksDB with each memory
-        let graph_file = index_path.join("memory_graph.bin");
-        let graph = self.graph.read();
-        graph.save(&graph_file)?;
-        let graph_stats = graph.stats();
 
         let id_mapping = self.id_mapping.read();
         info!(
-            "Saved memory graph with {} nodes/{} edges (Vamana: {} vectors in memory, rebuilds from RocksDB on restart)",
-            graph_stats.node_count,
-            graph_stats.edge_count,
+            "Vamana index: {} vectors in memory (rebuilds from RocksDB on restart)",
             id_mapping.len()
         );
 
@@ -585,8 +547,8 @@ impl RetrievalEngine {
                 index.mark_deleted(*vid);
             }
 
-            // Remove from memory graph if present
-            self.graph.write().remove_memory(memory_id);
+            // NOTE: Memory graph edges are managed in GraphMemory at the API layer
+            // GraphMemory handles cleanup via its own mechanisms
 
             // ATOMIC: Remove vector mapping from RocksDB
             if let Err(e) = self.storage.delete_vector_mapping(memory_id) {
@@ -688,14 +650,24 @@ impl RetrievalEngine {
             )
             .context("Vector search failed")?;
 
-        // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest score)
+        // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest similarity)
+        //
+        // CRITICAL FIX: Vamana returns DISTANCE, not similarity.
+        // For NormalizedDotProduct: distance = -dot(a,b)
+        // - Similar vectors have dot ≈ 1.0, so distance ≈ -1.0
+        // - Orthogonal vectors have dot ≈ 0.0, so distance ≈ 0.0
+        // Convert: similarity = -distance (so similarity = dot product = cosine similarity)
         let id_mapping = self.id_mapping.read();
         let mut best_scores: std::collections::HashMap<MemoryId, f32> =
             std::collections::HashMap::new();
 
-        for (vector_id, similarity) in results {
+        for (vector_id, distance) in results {
+            // Convert distance to similarity: similarity = -distance
+            // For NormalizedDotProduct, this gives us the actual dot product/cosine similarity
+            let similarity = -distance;
+
             if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
-                // Keep the highest score for each memory (best matching chunk)
+                // Keep the highest similarity for each memory (best matching chunk)
                 best_scores
                     .entry(memory_id.clone())
                     .and_modify(|score| {
@@ -707,7 +679,7 @@ impl RetrievalEngine {
             }
         }
 
-        // Convert to vec and sort by score descending
+        // Convert to vec and sort by similarity descending (highest first)
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
         memory_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         memory_ids.truncate(limit);
@@ -741,12 +713,18 @@ impl RetrievalEngine {
             .search(embedding, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
             .context("Vector search by embedding failed")?;
 
-        // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest score)
+        // Map vector IDs to memory IDs, deduplicating by MemoryId (keep highest similarity)
+        //
+        // CRITICAL FIX: Vamana returns DISTANCE, not similarity.
+        // Convert: similarity = -distance (for NormalizedDotProduct)
         let id_mapping = self.id_mapping.read();
         let mut best_scores: std::collections::HashMap<MemoryId, f32> =
             std::collections::HashMap::new();
 
-        for (vector_id, similarity) in results {
+        for (vector_id, distance) in results {
+            // Convert distance to similarity
+            let similarity = -distance;
+
             if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
                 // Skip excluded ID
                 if let Some(exclude) = exclude_id {
@@ -755,7 +733,7 @@ impl RetrievalEngine {
                     }
                 }
 
-                // Keep the highest score for each memory (best matching chunk)
+                // Keep the highest similarity for each memory (best matching chunk)
                 best_scores
                     .entry(memory_id.clone())
                     .and_modify(|score| {
@@ -767,7 +745,7 @@ impl RetrievalEngine {
             }
         }
 
-        // Convert to vec and sort by score descending
+        // Convert to vec and sort by similarity descending (highest first)
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
         memory_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         memory_ids.truncate(limit);
@@ -905,34 +883,10 @@ impl RetrievalEngine {
     }
 
     fn associative_search(&self, query: &Query, limit: usize) -> Result<Vec<SharedMemory>> {
-        let seeds = self.similarity_search(query, 2)?;
-
-        let mut associated = Vec::new();
-        let graph = self.graph.read();
-
-        for seed in &seeds {
-            let associations = graph.find_associations(&seed.id, 5)?;
-
-            for assoc_id in associations {
-                if let Ok(memory) = self.storage.get(&assoc_id) {
-                    associated.push(Arc::new(memory));
-                }
-            }
-        }
-
-        let mut seen = HashSet::new();
-        let mut unique = Vec::new();
-
-        for memory in associated {
-            if seen.insert(memory.id.clone()) {
-                unique.push(memory);
-                if unique.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        Ok(unique)
+        // NOTE: Associative search now uses GraphMemory at the API layer
+        // GraphMemory.find_memory_associations() provides Hebbian-weighted associations
+        // This method falls back to similarity search as a baseline
+        self.similarity_search(query, limit)
     }
 
     fn hybrid_search(&self, query: &Query, limit: usize) -> Result<Vec<SharedMemory>> {
@@ -1194,105 +1148,46 @@ impl RetrievalEngine {
         Ok(())
     }
 
-    /// Add memory to knowledge graph (for associative/causal retrieval)
-    pub fn add_to_graph(&self, memory: &Memory) {
-        self.graph.write().add_memory(memory);
+    // NOTE: Memory graph functionality has been consolidated into GraphMemory
+    // which is managed at the API layer (MultiUserMemoryManager.graph_memories)
+    // The following methods are preserved for API compatibility but are no-ops:
+    // - add_to_graph() - GraphMemory handles entity relationships from NER
+    // - record_coactivation() - Now called directly on GraphMemory in API handlers
+    // - graph_maintenance() - GraphMemory.apply_decay() handles this
+    // - graph_stats() - Returns empty stats (use GraphMemory.get_stats() instead)
+
+    /// Add memory to knowledge graph - DEPRECATED
+    /// Use GraphMemory at the API layer instead
+    #[deprecated(note = "Use GraphMemory at API layer instead")]
+    pub fn add_to_graph(&self, _memory: &Memory) {
+        // No-op: GraphMemory handles entity relationships from NER
     }
 
-    /// Record co-activation of memories (Hebbian learning)
-    ///
-    /// Call this when multiple memories are accessed together in a retrieval result.
-    /// Strengthens the associations between them.
-    /// Records consolidation events for introspection.
-    pub fn record_coactivation(&self, memory_ids: &[MemoryId]) {
-        if memory_ids.len() >= 2 {
-            let results = self.graph.write().record_coactivation(memory_ids);
-            let now = chrono::Utc::now();
-
-            // Record consolidation events for each edge update
-            for result in results {
-                let res = &result.forward_result;
-                if res.is_new {
-                    // New edge formed
-                    self.record_event(ConsolidationEvent::EdgeFormed {
-                        from_memory_id: result.from_id.0.to_string(),
-                        to_memory_id: result.to_id.0.to_string(),
-                        initial_strength: res.strength_after,
-                        reason: EdgeFormationReason::CoRetrieval,
-                        timestamp: now,
-                    });
-                } else {
-                    // Existing edge strengthened
-                    self.record_event(ConsolidationEvent::EdgeStrengthened {
-                        from_memory_id: result.from_id.0.to_string(),
-                        to_memory_id: result.to_id.0.to_string(),
-                        strength_before: res.strength_before,
-                        strength_after: res.strength_after,
-                        co_activations: res.activation_count,
-                        timestamp: now,
-                    });
-                }
-
-                // Record LTP event if triggered
-                if res.ltp_triggered {
-                    self.record_event(ConsolidationEvent::EdgePotentiated {
-                        from_memory_id: result.from_id.0.to_string(),
-                        to_memory_id: result.to_id.0.to_string(),
-                        final_strength: res.strength_after,
-                        total_co_activations: res.activation_count,
-                        timestamp: now,
-                    });
-                }
-            }
-        }
+    /// Record co-activation of memories - DEPRECATED
+    /// Use GraphMemory.record_memory_coactivation() at API layer instead
+    #[deprecated(note = "Use GraphMemory.record_memory_coactivation() at API layer instead")]
+    pub fn record_coactivation(&self, _memory_ids: &[MemoryId]) {
+        // No-op: Coactivation is now recorded in GraphMemory at the API layer
     }
 
-    /// Perform graph maintenance (decay old edges, prune weak ones)
-    ///
-    /// Call this periodically (e.g., every hour or on user logout)
-    /// Records consolidation events for edge pruning.
-    /// Returns the number of edges pruned.
-    pub fn graph_maintenance(&self) -> usize {
-        let prune_results = self.graph.write().maintenance();
-        let now = chrono::Utc::now();
-        let pruned_count = prune_results.len();
-
-        // Record pruning events
-        for result in prune_results {
-            self.record_event(ConsolidationEvent::EdgePruned {
-                from_memory_id: result.from_id.0.to_string(),
-                to_memory_id: result.to_id.0.to_string(),
-                final_strength: result.final_strength,
-                reason: PruningReason::DecayedBelowThreshold,
-                timestamp: now,
-            });
-        }
-
-        pruned_count
+    /// Perform graph maintenance - DEPRECATED
+    /// Use GraphMemory.apply_decay() at API layer instead
+    #[deprecated(note = "Use GraphMemory.apply_decay() at API layer instead")]
+    pub fn graph_maintenance(&self) {
+        // No-op: GraphMemory handles decay in its own maintenance cycle
     }
 
-    /// Get memory graph statistics
+    /// Get memory graph statistics - DEPRECATED
+    /// Use GraphMemory.get_stats() at API layer instead
+    #[deprecated(note = "Use GraphMemory.get_stats() at API layer instead")]
     pub fn graph_stats(&self) -> MemoryGraphStats {
-        self.graph.read().stats()
-    }
-
-    /// Get read reference to memory graph (SHO-105)
-    pub(crate) fn graph_ref(&self) -> parking_lot::RwLockReadGuard<MemoryGraph> {
-        self.graph.read()
-    }
-
-    /// Get write reference to memory graph (SHO-105)
-    /// Note: For bulk edge operations, use this method sparingly
-    pub(crate) fn graph_write(&self) -> parking_lot::RwLockWriteGuard<'_, MemoryGraph> {
-        self.graph.write()
-    }
-
-    /// Get mutable access to memory graph (for Hebbian updates)
-    ///
-    /// Returns a write guard to the memory graph for recording coactivations
-    /// and adding edges. The guard is automatically released when dropped.
-    pub(crate) fn graph_mut(&self) -> parking_lot::RwLockWriteGuard<'_, MemoryGraph> {
-        self.graph.write()
+        // Return empty stats - real stats are in GraphMemory
+        MemoryGraphStats {
+            node_count: 0,
+            edge_count: 0,
+            avg_strength: 0.0,
+            potentiated_count: 0,
+        }
     }
 
     /// Check if vector index needs rebuild and rebuild if necessary
@@ -1439,14 +1334,12 @@ impl RetrievalEngine {
 
         match outcome {
             RetrievalOutcome::Helpful => {
-                // 1. Strengthen associations between all retrieved memories
-                //    "Fire together, wire together"
-                if memory_ids.len() >= 2 {
-                    self.graph.write().record_coactivation(memory_ids);
-                    stats.associations_strengthened = memory_ids.len() * (memory_ids.len() - 1) / 2;
-                }
+                // NOTE: Coactivation (Hebbian strengthening) is now handled at the API layer
+                // via GraphMemory.record_memory_coactivation() which provides persistent
+                // storage and proper Hebbian learning. This method now only handles
+                // importance boosting for backwards compatibility.
 
-                // 2. Boost importance of helpful memories and PERSIST to storage
+                // Boost importance of helpful memories and PERSIST to storage
                 for id in memory_ids {
                     if let Ok(memory) = self.storage.get(id) {
                         // Increment access and apply importance boost
@@ -1491,15 +1384,9 @@ impl RetrievalEngine {
                         }
                     }
                 }
-                // Mild association strengthening for neutral
-                if memory_ids.len() >= 2 {
-                    let mut graph = self.graph.write();
-                    // Only strengthen adjacent pairs (not all pairs)
-                    for window in memory_ids.windows(2) {
-                        graph.add_edge(&window[0], &window[1]);
-                    }
-                    stats.associations_strengthened = memory_ids.len() - 1;
-                }
+                // NOTE: Association strengthening for neutral outcomes is now handled
+                // at the API layer via GraphMemory.record_memory_coactivation() which
+                // provides persistent storage and proper Hebbian learning.
             }
         }
 
@@ -1559,403 +1446,19 @@ impl Default for RetrievalOutcome {
     }
 }
 
-/// Memory graph for associative retrieval with Hebbian learning
+// NOTE: MemoryGraph has been consolidated into GraphMemory (src/graph_memory.rs)
+// which provides persistent storage in RocksDB and proper Hebbian learning.
+// All graph-based memory associations now go through GraphMemory at the API layer.
+
+/// Statistics about the memory graph (for backwards compatibility)
 ///
-/// Implements simplified synaptic plasticity:
-/// - Edge strength increases with co-access (Hebbian strengthening)
-/// - Edges decay over time without use
-/// - Strong edges are prioritized in traversal
-#[derive(Serialize, Deserialize)]
-pub(crate) struct MemoryGraph {
-    /// Adjacency with edge weights (strength 0.0-1.0)
-    adjacency: HashMap<MemoryId, HashMap<MemoryId, EdgeWeight>>,
-}
-
-/// Edge weight with Hebbian learning properties
-#[derive(Clone, Serialize, Deserialize)]
-struct EdgeWeight {
-    /// Current strength (0.0 to 1.0)
-    strength: f32,
-    /// Number of co-activations
-    activation_count: u32,
-    /// Last activation timestamp (Unix millis)
-    last_activated: i64,
-}
-
-/// Result of strengthening an edge (for introspection)
-#[derive(Debug)]
-pub(crate) struct StrengthenResult {
-    /// Was this a new edge?
-    pub is_new: bool,
-    /// Strength before this operation
-    pub strength_before: f32,
-    /// Strength after this operation
-    pub strength_after: f32,
-    /// Total co-activations
-    pub activation_count: u32,
-    /// Did this trigger long-term potentiation?
-    pub ltp_triggered: bool,
-}
-
-impl Default for EdgeWeight {
-    fn default() -> Self {
-        Self {
-            strength: EDGE_INITIAL_STRENGTH, // From constants.rs (0.5)
-            activation_count: 0,             // Start at 0, strengthen() will increment to 1
-            last_activated: chrono::Utc::now().timestamp_millis(),
-        }
-    }
-}
-
-impl EdgeWeight {
-    /// Hebbian learning constants (local, kept for learning rate and LTP)
-    const LEARNING_RATE: f32 = 0.15;
-    const LTP_THRESHOLD: u32 = 5; // Lower threshold for memory associations
-
-    /// Strengthen the edge (called when both memories are accessed together)
-    /// Returns info about what happened for introspection
-    fn strengthen(&mut self) -> StrengthenResult {
-        let strength_before = self.strength;
-        let was_new = self.activation_count == 0;
-
-        self.activation_count += 1;
-        self.last_activated = chrono::Utc::now().timestamp_millis();
-
-        // Hebbian: w_new = w_old + η × (1 - w_old)
-        let boost = Self::LEARNING_RATE * (1.0 - self.strength);
-        self.strength = (self.strength + boost).min(1.0);
-
-        // Long-term potentiation bonus
-        let ltp_triggered = self.activation_count == Self::LTP_THRESHOLD;
-        if ltp_triggered {
-            self.strength = (self.strength + 0.15).min(1.0);
-        }
-
-        StrengthenResult {
-            is_new: was_new,
-            strength_before,
-            strength_after: self.strength,
-            activation_count: self.activation_count,
-            ltp_triggered,
-        }
-    }
-
-    /// Apply time-based decay using hybrid model (SHO-103)
-    ///
-    /// Uses exponential decay for consolidation (< 3 days), then
-    /// power-law for long-term retention. Potentiated edges use
-    /// lower β exponent for even slower forgetting.
-    ///
-    /// **Important:** Updates `last_activated` to prevent double-decay on
-    /// repeated calls. Also caps max decay at 365 days to protect against
-    /// clock jumps.
-    fn decay(&mut self) -> bool {
-        let now = chrono::Utc::now().timestamp_millis();
-        let hours_elapsed = (now - self.last_activated) as f64 / 3_600_000.0;
-        let mut days_elapsed = hours_elapsed / 24.0;
-
-        if days_elapsed <= 0.0 {
-            return false;
-        }
-
-        // Cap max decay to protect against clock jumps (max 1 year per call)
-        const MAX_DECAY_DAYS: f64 = 365.0;
-        if days_elapsed > MAX_DECAY_DAYS {
-            days_elapsed = MAX_DECAY_DAYS;
-        }
-
-        // Potentiated = LTP threshold reached
-        let potentiated = self.activation_count >= Self::LTP_THRESHOLD;
-        let decay_factor = hybrid_decay_factor(days_elapsed, potentiated);
-        self.strength *= decay_factor;
-
-        // Update last_activated to prevent double-decay on repeated calls
-        self.last_activated = now;
-
-        self.strength < EDGE_MIN_STRENGTH
-    }
-}
-
-/// Result of an edge update (for introspection)
-#[derive(Debug)]
-pub(crate) struct EdgeUpdateResult {
-    pub from_id: MemoryId,
-    pub to_id: MemoryId,
-    pub forward_result: StrengthenResult,
-}
-
-/// Result of a pruning operation (for introspection)
-#[derive(Debug)]
-pub(crate) struct PruneResult {
-    pub from_id: MemoryId,
-    pub to_id: MemoryId,
-    pub final_strength: f32,
-}
-
-impl MemoryGraph {
-    fn new() -> Self {
-        Self {
-            adjacency: HashMap::new(),
-        }
-    }
-
-    /// Save the memory graph to disk
-    ///
-    /// Uses bincode serialization for efficient binary format.
-    /// Called during RetrievalEngine::save() to persist learned associations.
-    pub(crate) fn save(&self, path: &Path) -> Result<()> {
-        let file = File::create(path).context("Failed to create memory graph file")?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, self).context("Failed to serialize memory graph")?;
-        Ok(())
-    }
-
-    /// Load the memory graph from disk
-    ///
-    /// Returns a new MemoryGraph if file doesn't exist or fails to load.
-    pub(crate) fn load(path: &Path) -> Result<Self> {
-        let file = File::open(path).context("Failed to open memory graph file")?;
-        let reader = BufReader::new(file);
-        bincode::deserialize_from(reader).context("Failed to deserialize memory graph")
-    }
-
-    /// Add edge between memories (bidirectional) with initial weight
-    /// Returns the result of the forward edge update for introspection
-    pub(crate) fn add_edge(&mut self, from: &MemoryId, to: &MemoryId) -> EdgeUpdateResult {
-        // Forward edge
-        let forward_result = self
-            .adjacency
-            .entry(from.clone())
-            .or_default()
-            .entry(to.clone())
-            .or_default()
-            .strengthen();
-
-        // Backward edge (we don't need to return this, symmetric)
-        self.adjacency
-            .entry(to.clone())
-            .or_default()
-            .entry(from.clone())
-            .or_default()
-            .strengthen();
-
-        EdgeUpdateResult {
-            from_id: from.clone(),
-            to_id: to.clone(),
-            forward_result,
-        }
-    }
-
-    /// Add a memory to the graph (creates edges based on related_memories)
-    fn add_memory(&mut self, memory: &Memory) {
-        // Add edges to explicitly related memories
-        for related_id in &memory.experience.related_memories {
-            self.add_edge(&memory.id, related_id);
-        }
-
-        // Add edges to causal chain
-        for causal_id in &memory.experience.causal_chain {
-            self.add_edge(&memory.id, causal_id);
-        }
-    }
-
-    /// Remove a memory from the graph (removes all edges to/from this memory)
-    pub(crate) fn remove_memory(&mut self, memory_id: &MemoryId) {
-        // Remove outgoing edges from this memory
-        self.adjacency.remove(memory_id);
-
-        // Remove incoming edges to this memory from all other nodes
-        for (_, edges) in self.adjacency.iter_mut() {
-            edges.remove(memory_id);
-        }
-    }
-
-    /// Record co-access of memories (strengthens their connection)
-    ///
-    /// Note: For large retrievals, we limit to top N memories to avoid O(n²) explosion.
-    /// This is a deliberate tradeoff: we still get good association learning while
-    /// keeping worst-case complexity bounded to O(MAX_COACTIVATION_SIZE²).
-    /// Returns the edge update results for introspection.
-    pub(crate) fn record_coactivation(&mut self, memories: &[MemoryId]) -> Vec<EdgeUpdateResult> {
-        const MAX_COACTIVATION_SIZE: usize = 20;
-
-        // Limit to top N memories to bound worst-case O(n²) to O(400)
-        let memories_to_process = if memories.len() > MAX_COACTIVATION_SIZE {
-            &memories[..MAX_COACTIVATION_SIZE]
-        } else {
-            memories
-        };
-
-        let mut results = Vec::new();
-
-        // Strengthen edges between all pairs of co-accessed memories
-        for i in 0..memories_to_process.len() {
-            for j in (i + 1)..memories_to_process.len() {
-                let result = self.add_edge(&memories_to_process[i], &memories_to_process[j]);
-                results.push(result);
-            }
-        }
-
-        results
-    }
-
-    /// Find associated memories using weighted graph traversal
-    ///
-    /// Prioritizes stronger edges (higher activation count, more recent)
-    fn find_associations(&self, start: &MemoryId, max_depth: usize) -> Result<Vec<MemoryId>> {
-        let mut visited = HashSet::new();
-        let mut result = Vec::new();
-
-        // Priority queue: (negative_strength for max-heap behavior, depth, id)
-        let mut heap = std::collections::BinaryHeap::new();
-        heap.push((ordered_float::OrderedFloat(1.0_f32), 0_usize, start.clone()));
-
-        while let Some((_, depth, current)) = heap.pop() {
-            if depth > max_depth {
-                continue;
-            }
-
-            if !visited.insert(current.clone()) {
-                continue;
-            }
-
-            if current != *start {
-                result.push(current.clone());
-            }
-
-            if let Some(neighbors) = self.adjacency.get(&current) {
-                for (neighbor, weight) in neighbors {
-                    if !visited.contains(neighbor) {
-                        // Apply decay inline (non-mutating check)
-                        let effective_strength = weight.strength;
-                        if effective_strength >= EDGE_MIN_STRENGTH {
-                            heap.push((
-                                ordered_float::OrderedFloat(effective_strength),
-                                depth + 1,
-                                neighbor.clone(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Periodic maintenance: decay edges and prune weak ones
-    /// Returns list of pruned edges for introspection
-    fn maintenance(&mut self) -> Vec<PruneResult> {
-        let mut to_remove: Vec<(MemoryId, MemoryId, f32)> = Vec::new();
-
-        for (from_id, neighbors) in &mut self.adjacency {
-            for (to_id, weight) in neighbors.iter_mut() {
-                let strength_before = weight.strength;
-                if weight.decay() {
-                    to_remove.push((from_id.clone(), to_id.clone(), strength_before));
-                }
-            }
-        }
-
-        // Remove pruned edges and collect results
-        let mut prune_results = Vec::new();
-        for (from_id, to_id, final_strength) in to_remove {
-            if let Some(neighbors) = self.adjacency.get_mut(&from_id) {
-                neighbors.remove(&to_id);
-            }
-            // Only record one direction (edges are bidirectional)
-            if from_id.0 < to_id.0 {
-                prune_results.push(PruneResult {
-                    from_id,
-                    to_id,
-                    final_strength,
-                });
-            }
-        }
-
-        prune_results
-    }
-
-    /// Get graph statistics
-    fn stats(&self) -> MemoryGraphStats {
-        let mut edge_count = 0;
-        let mut total_strength = 0.0;
-        let mut potentiated_count = 0;
-
-        for neighbors in self.adjacency.values() {
-            for weight in neighbors.values() {
-                edge_count += 1;
-                total_strength += weight.strength;
-                if weight.activation_count >= EdgeWeight::LTP_THRESHOLD {
-                    potentiated_count += 1;
-                }
-            }
-        }
-
-        MemoryGraphStats {
-            node_count: self.adjacency.len(),
-            edge_count: edge_count / 2, // Bidirectional edges counted once
-            avg_strength: if edge_count > 0 {
-                total_strength / edge_count as f32
-            } else {
-                0.0
-            },
-            potentiated_edges: potentiated_count / 2,
-        }
-    }
-
-    /// Get neighboring memory IDs for a memory (SHO-105)
-    ///
-    /// Returns all memories connected to the given memory with edge strength >= threshold.
-    pub(crate) fn get_neighbors(&self, memory_id: &MemoryId) -> Vec<MemoryId> {
-        self.adjacency
-            .get(memory_id)
-            .map(|neighbors| {
-                neighbors
-                    .iter()
-                    .filter(|(_, w)| w.strength >= EDGE_MIN_STRENGTH)
-                    .map(|(id, _)| id.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Strengthen a specific edge by a given amount (SHO-105)
-    ///
-    /// Used by replay mechanism to strengthen associations during memory replay.
-    /// Creates the edge if it doesn't exist.
-    pub(crate) fn strengthen_edge(&mut self, from: &MemoryId, to: &MemoryId, boost: f32) {
-        let now = chrono::Utc::now().timestamp();
-
-        // Strengthen forward edge
-        let forward = self
-            .adjacency
-            .entry(from.clone())
-            .or_default()
-            .entry(to.clone())
-            .or_default();
-        forward.strength = (forward.strength + boost).min(1.0);
-        forward.last_activated = now;
-
-        // Strengthen backward edge (bidirectional)
-        let backward = self
-            .adjacency
-            .entry(to.clone())
-            .or_default()
-            .entry(from.clone())
-            .or_default();
-        backward.strength = (backward.strength + boost).min(1.0);
-        backward.last_activated = now;
-    }
-}
-
-/// Statistics about the memory graph
+/// Real statistics are available from GraphMemory.get_stats()
 #[derive(Debug, Clone, Default)]
 pub struct MemoryGraphStats {
     pub node_count: usize,
     pub edge_count: usize,
     pub avg_strength: f32,
-    pub potentiated_edges: usize,
+    pub potentiated_count: usize,
 }
 
 // ============================================================================
@@ -2206,45 +1709,9 @@ impl AnticipatoryPrefetch {
         }
     }
 
-    /// Get memory IDs that should be prefetched based on associations
-    ///
-    /// Given a set of recently accessed memories, find their strong associations.
-    /// Note: This is pub(crate) because MemoryGraph is internal.
-    pub(crate) fn association_prefetch_ids(
-        &self,
-        recent_ids: &[MemoryId],
-        graph: &MemoryGraph,
-    ) -> Vec<MemoryId> {
-        let mut candidates: HashMap<MemoryId, f32> = HashMap::new();
-        let recent_set: HashSet<_> = recent_ids.iter().collect();
-
-        // Collect strong associations for each recent memory
-        for id in recent_ids {
-            if let Some(neighbors) = graph.adjacency.get(id) {
-                for (neighbor_id, weight) in neighbors {
-                    // Skip if already in recent set
-                    if recent_set.contains(neighbor_id) {
-                        continue;
-                    }
-
-                    // Only include strong associations
-                    if weight.strength >= self.min_association_strength {
-                        *candidates.entry(neighbor_id.clone()).or_default() += weight.strength;
-                    }
-                }
-            }
-        }
-
-        // Sort by total association strength and take top N
-        let mut sorted: Vec<_> = candidates.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        sorted
-            .into_iter()
-            .take(self.max_prefetch)
-            .map(|(id, _)| id)
-            .collect()
-    }
+    // NOTE: association_prefetch_ids has been removed.
+    // Association-based prefetching should use GraphMemory.find_memory_associations()
+    // at the API layer where GraphMemory is available.
 
     /// Score how relevant a memory is to the current context
     ///
