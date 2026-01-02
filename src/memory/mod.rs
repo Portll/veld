@@ -59,9 +59,10 @@ pub use crate::memory::compression::{
 };
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
-    calculate_entity_overlap, detect_negative_keywords, extract_entities_simple,
-    process_implicit_feedback, ContextFingerprint, FeedbackMomentum, FeedbackStore,
-    FeedbackStoreStats, PendingFeedback, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
+    apply_context_pattern_signals, calculate_entity_overlap, detect_negative_keywords,
+    extract_entities_simple, process_implicit_feedback, process_implicit_feedback_with_semantics,
+    ContextFingerprint, FeedbackMomentum, FeedbackStore, FeedbackStoreStats, PendingFeedback,
+    PreviousContext, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
 };
 pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{spreading_activation_retrieve, ActivatedMemory};

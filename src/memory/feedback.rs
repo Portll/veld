@@ -25,18 +25,25 @@ const MAX_RECENT_SIGNALS: usize = 20;
 const MAX_CONTEXT_FINGERPRINTS: usize = 100;
 
 /// Entity overlap thresholds
-const OVERLAP_STRONG_THRESHOLD: f32 = 0.5;
-const OVERLAP_WEAK_THRESHOLD: f32 = 0.2;
+/// FBK-4: Lowered thresholds so weak signals (0.06-0.15 range) actually affect learning
+const OVERLAP_STRONG_THRESHOLD: f32 = 0.4;
+const OVERLAP_WEAK_THRESHOLD: f32 = 0.1;
 
 /// Semantic similarity thresholds
-const SEMANTIC_STRONG_THRESHOLD: f32 = 0.7;
-const SEMANTIC_WEAK_THRESHOLD: f32 = 0.4;
+/// FBK-4: Lowered to catch more meaningful signals
+const SEMANTIC_STRONG_THRESHOLD: f32 = 0.6;
+const SEMANTIC_WEAK_THRESHOLD: f32 = 0.3;
 
-/// Signal value multipliers
+/// Signal value multipliers (ACT-R inspired)
 const SIGNAL_STRONG_MULTIPLIER: f32 = 0.8;
 const SIGNAL_WEAK_MULTIPLIER: f32 = 0.3;
-const SIGNAL_NO_OVERLAP_PENALTY: f32 = -0.1;
+const SIGNAL_NO_OVERLAP_PENALTY: f32 = -0.2; // Strengthened: was -0.1 (FBK-3)
 const SIGNAL_NEGATIVE_KEYWORD_PENALTY: f32 = -0.5;
+
+/// Action-based signals (FBK-1, FBK-2)
+const SIGNAL_REPETITION_PENALTY: f32 = -0.4; // User asked again = memories failed
+const SIGNAL_TOPIC_CHANGE_BOOST: f32 = 0.2; // User moved on = task might be complete
+const SIGNAL_IGNORED_PENALTY: f32 = -0.2; // Memory shown but completely unused
 
 /// Weights for combining entity and semantic signals
 const ENTITY_WEIGHT: f32 = 0.4;
@@ -81,10 +88,16 @@ pub enum SignalTrigger {
     NegativeKeywords { keywords: Vec<String> },
 
     /// User repeated the same question (retrieval failed)
+    /// Action: user asked again → memories didn't help
     UserRepetition { similarity: f32 },
 
     /// Topic changed successfully (task completed)
-    TopicChange,
+    /// Action: user moved on → memories may have helped
+    TopicChange { similarity: f32 },
+
+    /// Memory was surfaced but completely ignored
+    /// Action: response has no relation to memory
+    Ignored { overlap_ratio: f32 },
 }
 
 /// A single feedback signal
@@ -712,9 +725,94 @@ pub fn process_implicit_feedback_with_semantics(
     signals
 }
 
+/// Apply context pattern signals (repetition/topic change) to existing signals
+///
+/// This function modifies signal values based on detected user actions:
+/// - Repetition (user asked same thing again): negative signal (memories failed)
+/// - Topic change (user moved on): positive signal (task might be complete)
+/// - Ignored (memory shown but no overlap): negative signal
+///
+/// # Arguments
+/// - `signals`: Existing signals from process_implicit_feedback
+/// - `is_repetition`: User is asking the same question again
+/// - `is_topic_change`: User has moved to a different topic
+/// - `context_similarity`: Similarity between current and previous context
+pub fn apply_context_pattern_signals(
+    signals: &mut [(MemoryId, SignalRecord)],
+    is_repetition: bool,
+    is_topic_change: bool,
+    _context_similarity: f32,
+) {
+    for (memory_id, signal) in signals.iter_mut() {
+        if is_repetition {
+            // User asked the same thing again - memories didn't help
+            // Apply penalty proportional to how irrelevant the memory was
+            // FBK-4: Lowered threshold from 0.3 to 0.15 so more signals affect learning
+            if signal.value < 0.15 {
+                // Memory wasn't used in response AND user is re-asking
+                signal.value += SIGNAL_REPETITION_PENALTY;
+                signal.value = signal.value.clamp(-1.0, 1.0);
+                signal.trigger = SignalTrigger::UserRepetition {
+                    similarity: _context_similarity,
+                };
+                signal.confidence = 0.85; // High confidence - clear action signal
+                tracing::debug!(
+                    "Repetition detected for memory {:?}: applied penalty",
+                    memory_id
+                );
+            }
+        } else if is_topic_change {
+            // User moved on to different topic - task might be complete
+            // Apply boost to memories that were used in the response
+            // FBK-4: Lowered threshold from 0.1 to 0.05 so more signals affect learning
+            if signal.value > 0.05 {
+                // Memory was somewhat used - boost it
+                signal.value += SIGNAL_TOPIC_CHANGE_BOOST;
+                signal.value = signal.value.clamp(-1.0, 1.0);
+                signal.trigger = SignalTrigger::TopicChange {
+                    similarity: _context_similarity,
+                };
+                signal.confidence = 0.7; // Moderate confidence
+                tracing::debug!(
+                    "Topic change detected for memory {:?}: applied boost",
+                    memory_id
+                );
+            }
+        }
+
+        // Apply ignored penalty for memories with very low overlap
+        // regardless of repetition/topic change
+        if signal.value < -0.05 && signal.value > -0.3 {
+            // Memory was surfaced but not used - strengthen the penalty
+            signal.value = SIGNAL_IGNORED_PENALTY.min(signal.value);
+            if !matches!(signal.trigger, SignalTrigger::UserRepetition { .. }) {
+                signal.trigger = SignalTrigger::Ignored {
+                    overlap_ratio: match &signal.trigger {
+                        SignalTrigger::EntityOverlap { overlap_ratio } => *overlap_ratio,
+                        _ => 0.0,
+                    },
+                };
+            }
+        }
+    }
+}
+
 // =============================================================================
 // FEEDBACK STORE
 // =============================================================================
+
+/// Previous context for a user - used for repetition/topic change detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviousContext {
+    /// The query/context text
+    pub context: String,
+    /// Embedding of the context for similarity comparison
+    pub embedding: Vec<f32>,
+    /// When this context was recorded
+    pub timestamp: DateTime<Utc>,
+    /// Memory IDs that were surfaced for this context
+    pub surfaced_memory_ids: Vec<MemoryId>,
+}
 
 /// Persistent store for feedback momentum with in-memory cache
 pub struct FeedbackStore {
@@ -723,6 +821,10 @@ pub struct FeedbackStore {
 
     /// Pending feedback per user: user_id -> PendingFeedback (in-memory only)
     pending: HashMap<String, PendingFeedback>,
+
+    /// Previous context per user: for repetition/topic change detection
+    /// Tracks what the user asked last time to detect patterns
+    previous_context: HashMap<String, PreviousContext>,
 
     /// Persistent storage for momentum data
     db: Option<Arc<DB>>,
@@ -736,6 +838,7 @@ impl std::fmt::Debug for FeedbackStore {
         f.debug_struct("FeedbackStore")
             .field("momentum_count", &self.momentum.len())
             .field("pending_count", &self.pending.len())
+            .field("previous_context_count", &self.previous_context.len())
             .field("has_db", &self.db.is_some())
             .field("dirty_count", &self.dirty.len())
             .finish()
@@ -747,6 +850,7 @@ impl Default for FeedbackStore {
         Self {
             momentum: HashMap::new(),
             pending: HashMap::new(),
+            previous_context: HashMap::new(),
             db: None,
             dirty: HashSet::new(),
         }
@@ -809,9 +913,31 @@ impl FeedbackStore {
             pending.len()
         );
 
+        // Load previous context entries
+        let mut previous_context = HashMap::new();
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if key_str.starts_with("prev_ctx:") {
+                        if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
+                            let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
+                            previous_context.insert(user_id.to_string(), ctx);
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded {} previous context entries from disk",
+            previous_context.len()
+        );
+
         Ok(Self {
             momentum,
             pending,
+            previous_context,
             db: Some(db),
             dirty: HashSet::new(),
         })
@@ -890,6 +1016,65 @@ impl FeedbackStore {
         self.pending.retain(|_, p| !p.is_expired());
     }
 
+    /// Set previous context for a user (for repetition/topic change detection)
+    /// Called when memories are surfaced to track what the user asked
+    pub fn set_previous_context(
+        &mut self,
+        user_id: &str,
+        context: String,
+        embedding: Vec<f32>,
+        surfaced_memory_ids: Vec<MemoryId>,
+    ) {
+        let prev_ctx = PreviousContext {
+            context,
+            embedding,
+            timestamp: Utc::now(),
+            surfaced_memory_ids,
+        };
+
+        self.previous_context
+            .insert(user_id.to_string(), prev_ctx.clone());
+
+        // Persist to disk
+        if let Some(ref db) = self.db {
+            let key = format!("prev_ctx:{}", user_id);
+            if let Ok(value) = serde_json::to_vec(&prev_ctx) {
+                if let Err(e) = db.put(key.as_bytes(), &value) {
+                    tracing::warn!("Failed to persist previous context: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Get previous context for a user
+    pub fn get_previous_context(&self, user_id: &str) -> Option<&PreviousContext> {
+        self.previous_context.get(user_id)
+    }
+
+    /// Compare current context to previous and detect action patterns
+    /// Returns: (is_repetition, is_topic_change, similarity)
+    /// - Repetition: similarity > 0.8 means user is asking same thing again (memories failed)
+    /// - Topic change: similarity < 0.3 means user moved on (task might be complete)
+    pub fn detect_context_pattern(
+        &self,
+        user_id: &str,
+        current_embedding: &[f32],
+    ) -> Option<(bool, bool, f32)> {
+        let prev = self.previous_context.get(user_id)?;
+
+        if prev.embedding.is_empty() || current_embedding.is_empty() {
+            return None;
+        }
+
+        let similarity = cosine_similarity(&prev.embedding, current_embedding);
+
+        // ACT-R inspired thresholds
+        let is_repetition = similarity > 0.8; // High similarity = re-asking
+        let is_topic_change = similarity < 0.3; // Low similarity = moved on
+
+        Some((is_repetition, is_topic_change, similarity))
+    }
+
     /// Flush dirty entries to disk
     pub fn flush(&mut self) -> anyhow::Result<usize> {
         let Some(ref db) = self.db else {
@@ -949,18 +1134,18 @@ mod tests {
 
     #[test]
     fn test_signal_from_entity_overlap() {
-        // Strong overlap
+        // Strong overlap (>= 0.4 after FBK-4 threshold adjustment)
         let signal = SignalRecord::from_entity_overlap(0.7);
         assert!(signal.value > 0.5);
         assert!(signal.confidence > 0.8);
 
-        // Weak overlap
+        // Weak overlap (>= 0.1 after FBK-4 threshold adjustment)
         let signal = SignalRecord::from_entity_overlap(0.3);
         assert!(signal.value > 0.0);
         assert!(signal.value < 0.5);
 
-        // No overlap
-        let signal = SignalRecord::from_entity_overlap(0.1);
+        // No overlap (< 0.1 after FBK-4 threshold adjustment)
+        let signal = SignalRecord::from_entity_overlap(0.05);
         assert!(signal.value < 0.0);
     }
 
@@ -1020,7 +1205,7 @@ mod tests {
             signals.push_back(SignalRecord::new(
                 i as f32 * 0.15, // 0, 0.15, 0.3, ... gives slope ~0.15
                 1.0,
-                SignalTrigger::TopicChange,
+                SignalTrigger::TopicChange { similarity: 0.2 },
             ));
         }
         assert_eq!(Trend::from_signals(&signals), Trend::Improving);
@@ -1031,7 +1216,7 @@ mod tests {
             signals.push_back(SignalRecord::new(
                 i as f32 * 0.15, // 1.35, 1.2, ... 0 gives slope ~-0.15
                 1.0,
-                SignalTrigger::TopicChange,
+                SignalTrigger::TopicChange { similarity: 0.2 },
             ));
         }
         assert_eq!(Trend::from_signals(&signals), Trend::Declining);

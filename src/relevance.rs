@@ -38,16 +38,23 @@ use crate::memory::{Memory, MemorySystem};
 // =============================================================================
 
 /// Default weight for semantic similarity in score fusion
-const DEFAULT_SEMANTIC_WEIGHT: f32 = 0.4;
+/// FBK-5: Adjusted to make room for momentum weight
+const DEFAULT_SEMANTIC_WEIGHT: f32 = 0.35;
 
 /// Default weight for entity matching in score fusion
-const DEFAULT_ENTITY_WEIGHT: f32 = 0.35;
+/// FBK-5: Adjusted to make room for momentum weight
+const DEFAULT_ENTITY_WEIGHT: f32 = 0.30;
 
 /// Default weight for tag matching in score fusion
-const DEFAULT_TAG_WEIGHT: f32 = 0.15;
+/// FBK-5: Adjusted to make room for momentum weight
+const DEFAULT_TAG_WEIGHT: f32 = 0.10;
 
 /// Default weight for importance in score fusion
 const DEFAULT_IMPORTANCE_WEIGHT: f32 = 0.10;
+
+/// Default weight for feedback momentum EMA in score fusion (FBK-5)
+/// This incorporates learned behavior from past feedback signals
+const DEFAULT_MOMENTUM_WEIGHT: f32 = 0.15;
 
 /// Learning rate for weight updates from feedback
 const WEIGHT_LEARNING_RATE: f32 = 0.05;
@@ -99,6 +106,15 @@ pub struct RelevanceConfig {
     /// Recency boost multiplier (1.0 = no boost)
     #[serde(default = "default_recency_multiplier")]
     pub recency_boost_multiplier: f32,
+
+    /// Graph connectivity boost multiplier (FBK-7)
+    /// Applied to memories that have graph relationships with detected entities
+    #[serde(default = "default_graph_boost_multiplier")]
+    pub graph_boost_multiplier: f32,
+}
+
+fn default_graph_boost_multiplier() -> f32 {
+    1.15 // 15% boost for graph-connected memories
 }
 
 fn default_semantic_threshold() -> f32 {
@@ -141,6 +157,7 @@ impl Default for RelevanceConfig {
             min_importance: default_min_importance(),
             recency_boost_hours: default_recency_hours(),
             recency_boost_multiplier: default_recency_multiplier(),
+            graph_boost_multiplier: default_graph_boost_multiplier(),
         }
     }
 }
@@ -285,6 +302,7 @@ struct EntityIndexEntry {
 /// - entity: Entity name overlap between query and memory
 /// - tag: Tag overlap between query context and memory tags
 /// - importance: Memory's stored importance score
+/// - momentum: Feedback momentum EMA (FBK-5) - learned from past interactions
 ///
 /// Weights are normalized to sum to 1.0 and updated via gradient descent
 /// when user provides feedback on surfaced memories.
@@ -298,10 +316,19 @@ pub struct LearnedWeights {
     pub tag: f32,
     /// Weight for importance score
     pub importance: f32,
+    /// Weight for feedback momentum EMA (FBK-5)
+    /// Higher momentum = memory has been consistently helpful
+    /// Lower/negative momentum = memory has been consistently misleading
+    #[serde(default = "default_momentum_weight")]
+    pub momentum: f32,
     /// Number of feedback updates applied
     pub update_count: u32,
     /// Last time weights were updated
     pub last_updated: Option<DateTime<Utc>>,
+}
+
+fn default_momentum_weight() -> f32 {
+    DEFAULT_MOMENTUM_WEIGHT
 }
 
 impl Default for LearnedWeights {
@@ -311,6 +338,7 @@ impl Default for LearnedWeights {
             entity: DEFAULT_ENTITY_WEIGHT,
             tag: DEFAULT_TAG_WEIGHT,
             importance: DEFAULT_IMPORTANCE_WEIGHT,
+            momentum: DEFAULT_MOMENTUM_WEIGHT,
             update_count: 0,
             last_updated: None,
         }
@@ -320,12 +348,13 @@ impl Default for LearnedWeights {
 impl LearnedWeights {
     /// Normalize weights to sum to 1.0
     pub fn normalize(&mut self) {
-        let sum = self.semantic + self.entity + self.tag + self.importance;
+        let sum = self.semantic + self.entity + self.tag + self.importance + self.momentum;
         if sum > 0.0 {
             self.semantic /= sum;
             self.entity /= sum;
             self.tag /= sum;
             self.importance /= sum;
+            self.momentum /= sum;
         }
     }
 
@@ -375,17 +404,47 @@ impl LearnedWeights {
         tag_score: f32,
         importance_score: f32,
     ) -> f32 {
+        // Use the new method with momentum = 0 (neutral) for backwards compatibility
+        self.fuse_scores_with_momentum(semantic_score, entity_score, tag_score, importance_score, 0.0)
+    }
+
+    /// Calculate fused score from component scores including momentum EMA (FBK-5)
+    ///
+    /// # Arguments
+    /// - `semantic_score`: Cosine similarity from vector search (0.0 to 1.0)
+    /// - `entity_score`: Entity name overlap score (0.0 to 1.0)
+    /// - `tag_score`: Tag overlap score (0.0 to 1.0)
+    /// - `importance_score`: Memory's importance score (0.0 to 1.0)
+    /// - `momentum_ema`: Feedback momentum EMA (-1.0 to 1.0, 0.0 = neutral)
+    ///   - Positive: Memory has been consistently helpful
+    ///   - Negative: Memory has been consistently misleading
+    pub fn fuse_scores_with_momentum(
+        &self,
+        semantic_score: f32,
+        entity_score: f32,
+        tag_score: f32,
+        importance_score: f32,
+        momentum_ema: f32,
+    ) -> f32 {
         // Calibrate each score using sigmoid to normalize different scales
         let calibrated_semantic = calibrate_score(semantic_score);
         let calibrated_entity = calibrate_score(entity_score);
         let calibrated_tag = calibrate_score(tag_score);
         let calibrated_importance = calibrate_score(importance_score);
 
+        // Transform momentum from [-1, 1] to [0, 1] range for calibration
+        // EMA of -1.0 (always misleading) -> 0.0
+        // EMA of  0.0 (neutral)           -> 0.5
+        // EMA of  1.0 (always helpful)    -> 1.0
+        let normalized_momentum = (momentum_ema + 1.0) / 2.0;
+        let calibrated_momentum = calibrate_score(normalized_momentum);
+
         // Weighted sum
         self.semantic * calibrated_semantic
             + self.entity * calibrated_entity
             + self.tag * calibrated_tag
             + self.importance * calibrated_importance
+            + self.momentum * calibrated_momentum
     }
 }
 
@@ -615,12 +674,19 @@ impl RelevanceEngine {
                     };
 
                     // Apply recency boost
-                    let final_score = self.apply_recency_boost(
+                    let recency_boosted = self.apply_recency_boost(
                         fused_score,
                         memory.created_at,
                         config.recency_boost_hours,
                         config.recency_boost_multiplier,
                     );
+
+                    // FBK-7: Apply graph boost for memories found via entity matching
+                    let final_score = if entity_score > 0.0 {
+                        (recency_boosted * config.graph_boost_multiplier).min(1.0)
+                    } else {
+                        recency_boosted
+                    };
 
                     Some(SurfacedMemory {
                         id: memory.id.0.to_string(),
@@ -650,6 +716,194 @@ impl RelevanceEngine {
         });
 
         // Truncate to max results
+        results.truncate(config.max_results);
+
+        debug.ranking_ms = ranking_start.elapsed().as_secs_f64() * 1000.0;
+
+        let total_latency = start.elapsed().as_secs_f64() * 1000.0;
+        let latency_target_met = total_latency < 30.0;
+
+        Ok(RelevanceResponse {
+            memories: results,
+            detected_entities,
+            latency_ms: total_latency,
+            latency_target_met,
+            debug: if cfg!(debug_assertions) {
+                Some(debug)
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Surface relevant memories with feedback momentum integration (FBK-5)
+    ///
+    /// This variant incorporates momentum EMA from past feedback into scoring.
+    /// Memories with positive momentum (consistently helpful) get boosted.
+    /// Memories with negative momentum (consistently misleading) get penalized.
+    ///
+    /// # Arguments
+    /// - `context`: Current context/query text
+    /// - `memory_system`: Memory storage
+    /// - `graph_memory`: Optional graph memory for entity lookup
+    /// - `config`: Relevance configuration
+    /// - `momentum_lookup`: Map of memory_id -> momentum EMA (-1.0 to 1.0)
+    pub fn surface_relevant_with_momentum(
+        &self,
+        context: &str,
+        memory_system: &MemorySystem,
+        graph_memory: Option<&GraphMemory>,
+        config: &RelevanceConfig,
+        momentum_lookup: &HashMap<Uuid, f32>,
+    ) -> Result<RelevanceResponse> {
+        let start = Instant::now();
+        let mut debug = RelevanceDebug {
+            ner_ms: 0.0,
+            entity_match_ms: 0.0,
+            semantic_search_ms: 0.0,
+            ranking_ms: 0.0,
+            memories_scanned: 0,
+            entity_matches: 0,
+            semantic_matches: 0,
+        };
+
+        // Phase 1: Entity extraction (if enabled)
+        let ner_start = Instant::now();
+        let detected_entities = if config.enable_entity_matching {
+            self.extract_entities(context)
+        } else {
+            Vec::new()
+        };
+        debug.ner_ms = ner_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 2: Parallel entity + semantic search
+        let mut candidate_memories: HashMap<Uuid, (Memory, f32, f32, Vec<String>)> = HashMap::new();
+
+        // 2a: Entity-based matching
+        if config.enable_entity_matching && !detected_entities.is_empty() {
+            let entity_start = Instant::now();
+            let entity_matches =
+                self.match_by_entities(&detected_entities, memory_system, graph_memory, config)?;
+            debug.entity_match_ms = entity_start.elapsed().as_secs_f64() * 1000.0;
+            debug.entity_matches = entity_matches.len();
+
+            for (memory, score, matched) in entity_matches {
+                let id = memory.id.0;
+                candidate_memories.insert(id, (memory, 0.0, score, matched));
+            }
+        }
+
+        // 2b: Semantic similarity matching
+        if config.enable_semantic_matching {
+            let semantic_start = Instant::now();
+            let semantic_matches = self.match_by_semantic(context, memory_system, config)?;
+            debug.semantic_search_ms = semantic_start.elapsed().as_secs_f64() * 1000.0;
+            debug.semantic_matches = semantic_matches.len();
+
+            for (memory, score) in semantic_matches {
+                let id = memory.id.0;
+                if let Some((_, semantic_score, _entity_score, _matched)) =
+                    candidate_memories.get_mut(&id)
+                {
+                    *semantic_score = score;
+                } else {
+                    candidate_memories.insert(id, (memory, score, 0.0, Vec::new()));
+                }
+            }
+        }
+
+        debug.memories_scanned = candidate_memories.len();
+
+        // Phase 3: Rank with momentum-aware scoring
+        let ranking_start = Instant::now();
+        let weights = self.learned_weights.read().clone();
+
+        let mut results: Vec<SurfacedMemory> = candidate_memories
+            .into_iter()
+            .filter_map(
+                |(id, (memory, semantic_score, entity_score, matched_entities))| {
+                    let importance = memory.importance();
+                    if importance < config.min_importance {
+                        return None;
+                    }
+
+                    if !config.memory_types.is_empty() {
+                        let mem_type = format!("{:?}", memory.experience.experience_type);
+                        if !config
+                            .memory_types
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case(&mem_type))
+                        {
+                            return None;
+                        }
+                    }
+
+                    let tag_score = self.calculate_tag_score(context, &memory.experience.tags);
+
+                    // FBK-5: Look up momentum EMA for this memory
+                    let momentum_ema = momentum_lookup.get(&id).copied().unwrap_or(0.0);
+
+                    // Use momentum-aware score fusion
+                    let fused_score = weights.fuse_scores_with_momentum(
+                        semantic_score,
+                        entity_score,
+                        tag_score,
+                        importance,
+                        momentum_ema,
+                    );
+
+                    let reason = if semantic_score > 0.0 && entity_score > 0.0 {
+                        RelevanceReason::Combined
+                    } else if entity_score > 0.0 {
+                        RelevanceReason::EntityMatch
+                    } else if semantic_score > 0.0 {
+                        RelevanceReason::SemanticSimilarity
+                    } else {
+                        RelevanceReason::RecentImportant
+                    };
+
+                    // Apply recency boost
+                    let recency_boosted = self.apply_recency_boost(
+                        fused_score,
+                        memory.created_at,
+                        config.recency_boost_hours,
+                        config.recency_boost_multiplier,
+                    );
+
+                    // FBK-7: Apply graph boost for memories found via entity matching
+                    // Entity matching uses the knowledge graph, so entity_score > 0 indicates graph relevance
+                    let final_score = if entity_score > 0.0 {
+                        (recency_boosted * config.graph_boost_multiplier).min(1.0)
+                    } else {
+                        recency_boosted
+                    };
+
+                    Some(SurfacedMemory {
+                        id: memory.id.0.to_string(),
+                        content: memory.experience.content.clone(),
+                        memory_type: format!("{:?}", memory.experience.experience_type),
+                        importance,
+                        relevance_score: final_score,
+                        relevance_reason: reason.clone(),
+                        matched_entities,
+                        semantic_similarity: if semantic_score > 0.0 {
+                            Some(semantic_score)
+                        } else {
+                            None
+                        },
+                        created_at: memory.created_at,
+                        tags: memory.experience.tags.clone(),
+                    })
+                },
+            )
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         results.truncate(config.max_results);
 
         debug.ranking_ms = ranking_start.elapsed().as_secs_f64() * 1000.0;
@@ -1367,8 +1621,8 @@ mod tests {
     fn test_learned_weights_default() {
         let weights = LearnedWeights::default();
 
-        // Should sum to 1.0
-        let sum = weights.semantic + weights.entity + weights.tag + weights.importance;
+        // Should sum to 1.0 (FBK-5: now includes momentum)
+        let sum = weights.semantic + weights.entity + weights.tag + weights.importance + weights.momentum;
         assert!((sum - 1.0).abs() < 0.001);
 
         // Check default values
@@ -1376,6 +1630,7 @@ mod tests {
         assert_eq!(weights.entity, DEFAULT_ENTITY_WEIGHT);
         assert_eq!(weights.tag, DEFAULT_TAG_WEIGHT);
         assert_eq!(weights.importance, DEFAULT_IMPORTANCE_WEIGHT);
+        assert_eq!(weights.momentum, DEFAULT_MOMENTUM_WEIGHT);
     }
 
     #[test]
@@ -1385,15 +1640,16 @@ mod tests {
             entity: 0.5,
             tag: 0.5,
             importance: 0.5,
+            momentum: 0.5, // FBK-5: added momentum
             update_count: 0,
             last_updated: None,
         };
 
         weights.normalize();
 
-        let sum = weights.semantic + weights.entity + weights.tag + weights.importance;
+        let sum = weights.semantic + weights.entity + weights.tag + weights.importance + weights.momentum;
         assert!((sum - 1.0).abs() < 0.001);
-        assert!((weights.semantic - 0.25).abs() < 0.001);
+        assert!((weights.semantic - 0.2).abs() < 0.001); // 0.5/2.5 = 0.2
     }
 
     #[test]
@@ -1410,8 +1666,8 @@ mod tests {
         assert_eq!(weights.update_count, 1);
         assert!(weights.last_updated.is_some());
 
-        // Weights should still sum to 1.0
-        let sum = weights.semantic + weights.entity + weights.tag + weights.importance;
+        // Weights should still sum to 1.0 (FBK-5: includes momentum)
+        let sum = weights.semantic + weights.entity + weights.tag + weights.importance + weights.momentum;
         assert!((sum - 1.0).abs() < 0.001);
 
         // Semantic + entity together should have gained relative weight
@@ -1427,8 +1683,8 @@ mod tests {
         // Negative feedback - semantic was the main signal
         weights.apply_feedback(true, false, false, false);
 
-        // Weights should still sum to 1.0
-        let sum = weights.semantic + weights.entity + weights.tag + weights.importance;
+        // Weights should still sum to 1.0 (FBK-5: includes momentum)
+        let sum = weights.semantic + weights.entity + weights.tag + weights.importance + weights.momentum;
         assert!((sum - 1.0).abs() < 0.001);
     }
 
@@ -1493,8 +1749,9 @@ mod tests {
         let mut weights = LearnedWeights {
             semantic: 0.1,
             entity: MIN_WEIGHT + 0.01,
-            tag: 0.7,
+            tag: 0.6,
             importance: 0.1,
+            momentum: 0.1, // FBK-5: added momentum
             update_count: 0,
             last_updated: None,
         };
@@ -1506,7 +1763,7 @@ mod tests {
         assert!(weights.entity >= MIN_WEIGHT);
 
         // Still normalized
-        let sum = weights.semantic + weights.entity + weights.tag + weights.importance;
+        let sum = weights.semantic + weights.entity + weights.tag + weights.importance + weights.momentum;
         assert!((sum - 1.0).abs() < 0.001);
     }
 }
