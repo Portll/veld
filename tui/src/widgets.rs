@@ -265,10 +265,17 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(chunks[2]);
 
-    let version_line = Line::from(vec![Span::styled(
-        format!("v{}", VERSION),
-        Style::default().fg(Color::DarkGray),
-    )]);
+    // Current date and time with version
+    let now = chrono::Local::now();
+    let time_str = now.format("%b %d, %Y  %I:%M %p").to_string();
+    let version_line = Line::from(vec![
+        Span::styled(time_str, Style::default().fg(TEXT_SECONDARY)),
+        Span::styled("  │  ", Style::default().fg(BORDER_DIVIDER)),
+        Span::styled(
+            format!("v{}", VERSION),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
     f.render_widget(
         Paragraph::new(version_line).alignment(Alignment::Right),
         right_chunks[0],
