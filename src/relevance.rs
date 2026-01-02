@@ -411,6 +411,9 @@ pub struct RelevanceEngine {
 
     /// Learned weights for score fusion, adapted via feedback
     learned_weights: Arc<RwLock<LearnedWeights>>,
+
+    /// Active A/B test ID (if any) for this engine
+    active_ab_test: Arc<RwLock<Option<String>>>,
 }
 
 impl RelevanceEngine {
@@ -421,7 +424,20 @@ impl RelevanceEngine {
             entity_index: Arc::new(RwLock::new(HashMap::new())),
             entity_index_timestamp: Arc::new(RwLock::new(None)),
             learned_weights: Arc::new(RwLock::new(LearnedWeights::default())),
+            active_ab_test: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set active A/B test for this engine
+    ///
+    /// When set, the engine will use weights from the A/B test based on user assignment.
+    pub fn set_active_ab_test(&self, test_id: Option<String>) {
+        *self.active_ab_test.write() = test_id;
+    }
+
+    /// Get active A/B test ID
+    pub fn get_active_ab_test(&self) -> Option<String> {
+        self.active_ab_test.read().clone()
     }
 
     /// Get current learned weights
@@ -652,6 +668,109 @@ impl RelevanceEngine {
                 None
             },
         })
+    }
+
+    /// Surface relevant memories with A/B test integration
+    ///
+    /// When an A/B test manager is provided, this method:
+    /// 1. Assigns the user to a variant (control or treatment)
+    /// 2. Uses weights from the assigned variant
+    /// 3. Records impressions for the test
+    ///
+    /// Returns the variant used along with the response for tracking.
+    pub fn surface_relevant_with_ab_test(
+        &self,
+        context: &str,
+        user_id: &str,
+        memory_system: &MemorySystem,
+        graph_memory: Option<&GraphMemory>,
+        config: &RelevanceConfig,
+        ab_manager: &crate::ab_testing::ABTestManager,
+    ) -> Result<(RelevanceResponse, Option<crate::ab_testing::ABTestVariant>)> {
+        let start = Instant::now();
+
+        // Check if we have an active A/B test
+        let active_test = self.get_active_ab_test();
+
+        let (weights, variant) = if let Some(ref test_id) = active_test {
+            // Get weights from A/B test based on user assignment
+            match ab_manager.get_weights_for_user(test_id, user_id) {
+                Ok(w) => {
+                    let v = ab_manager.get_variant(test_id, user_id).ok();
+                    (w, v)
+                }
+                Err(_) => {
+                    // Fall back to learned weights if test error
+                    (self.get_weights(), None)
+                }
+            }
+        } else {
+            // No active test, use learned weights
+            (self.get_weights(), None)
+        };
+
+        // Temporarily set weights for this request
+        let original_weights = self.get_weights();
+        self.set_weights(weights);
+
+        // Run the actual surfacing
+        let response = self.surface_relevant(context, memory_system, graph_memory, config)?;
+
+        // Restore original weights
+        self.set_weights(original_weights);
+
+        // Record impression for A/B test if active
+        if let (Some(ref test_id), Some(ref _v)) = (&active_test, &variant) {
+            let latency_us = start.elapsed().as_micros() as u64;
+            let avg_score = if response.memories.is_empty() {
+                0.0
+            } else {
+                response
+                    .memories
+                    .iter()
+                    .map(|m| m.relevance_score as f64)
+                    .sum::<f64>()
+                    / response.memories.len() as f64
+            };
+
+            let _ = ab_manager.record_impression(test_id, user_id, avg_score, latency_us);
+        }
+
+        Ok((response, variant))
+    }
+
+    /// Record a click for A/B testing
+    ///
+    /// Call this when a user interacts with a surfaced memory.
+    pub fn record_ab_click(
+        &self,
+        user_id: &str,
+        memory_id: Uuid,
+        ab_manager: &crate::ab_testing::ABTestManager,
+    ) -> Result<()> {
+        if let Some(test_id) = self.get_active_ab_test() {
+            ab_manager
+                .record_click(&test_id, user_id, memory_id)
+                .map_err(|e| anyhow::anyhow!("Failed to record A/B click: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Record feedback for A/B testing
+    ///
+    /// Call this when a user provides explicit feedback on a surfaced memory.
+    pub fn record_ab_feedback(
+        &self,
+        user_id: &str,
+        positive: bool,
+        ab_manager: &crate::ab_testing::ABTestManager,
+    ) -> Result<()> {
+        if let Some(test_id) = self.get_active_ab_test() {
+            ab_manager
+                .record_feedback(&test_id, user_id, positive)
+                .map_err(|e| anyhow::anyhow!("Failed to record A/B feedback: {}", e))?;
+        }
+        Ok(())
     }
 
     /// Extract entities from context using NER

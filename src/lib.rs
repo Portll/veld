@@ -15,6 +15,7 @@
 //! - RocksDB embedded storage (no external database)
 //! - Full offline operation
 
+pub mod ab_testing;
 pub mod auth;
 pub mod backup;
 pub mod constants;
