@@ -84,7 +84,8 @@ impl SemanticFactStore {
         let key = format!("facts:{}:{}", user_id, fact_id);
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let (fact, _): (SemanticFact, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                let (fact, _): (SemanticFact, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
                 Ok(Some(fact))
             }
             None => Ok(None),
@@ -154,7 +155,12 @@ impl SemanticFactStore {
                 continue;
             }
 
-            if let Ok(fact) = bincode::serde::decode_from_slice::<SemanticFact, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+            if let Ok(fact) = bincode::serde::decode_from_slice::<SemanticFact, _>(
+                &value,
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            {
                 facts.push(fact);
                 if facts.len() >= limit {
                     break;

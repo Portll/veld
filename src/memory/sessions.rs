@@ -220,9 +220,7 @@ pub enum SessionStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     /// Session started
-    SessionStart {
-        timestamp: DateTime<Utc>,
-    },
+    SessionStart { timestamp: DateTime<Utc> },
 
     /// Memory was created
     MemoryCreated {
@@ -672,7 +670,11 @@ impl SessionStore {
         {
             let completed = self.completed.read();
             if let Some(sessions) = completed.get(user_id) {
-                for session in sessions.iter().rev().take(limit.saturating_sub(result.len())) {
+                for session in sessions
+                    .iter()
+                    .rev()
+                    .take(limit.saturating_sub(result.len()))
+                {
                     result.push(session.summary());
                 }
             }

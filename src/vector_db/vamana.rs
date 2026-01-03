@@ -1520,7 +1520,8 @@ impl VamanaIndex {
             num_vectors: usize,
         }
 
-        let data: VamanaData = bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard())?;
+        let data: VamanaData =
+            bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard())?;
 
         // Update internal state
         *self.graph.write() = data.graph;
@@ -1653,7 +1654,7 @@ mod tests {
     fn test_estimate_recall() {
         let mut index = VamanaIndex::new(VamanaConfig {
             dimension: 4,
-            max_degree: 4, // Higher degree for better connectivity
+            max_degree: 4,        // Higher degree for better connectivity
             search_list_size: 20, // Larger search list for better recall
             alpha: 1.2,
             use_mmap: false,

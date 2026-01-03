@@ -1688,10 +1688,14 @@ mod tests {
         use std::collections::HashSet;
 
         // Case 1: Response heavily derived from memory
-        let memory_entities: HashSet<String> =
-            ["rust", "async", "tokio", "futures"].iter().map(|s| s.to_string()).collect();
-        let response_entities: HashSet<String> =
-            ["rust", "async", "tokio", "runtime"].iter().map(|s| s.to_string()).collect();
+        let memory_entities: HashSet<String> = ["rust", "async", "tokio", "futures"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let response_entities: HashSet<String> = ["rust", "async", "tokio", "runtime"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let (derived_ratio, novel_ratio, derived_count, total) =
             calculate_entity_flow(&memory_entities, &response_entities);
@@ -1702,8 +1706,10 @@ mod tests {
         assert!((novel_ratio - 0.25).abs() < 0.01);
 
         // Case 2: Response mostly novel (memory not used)
-        let response_novel: HashSet<String> =
-            ["python", "django", "flask", "web"].iter().map(|s| s.to_string()).collect();
+        let response_novel: HashSet<String> = ["python", "django", "flask", "web"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let (derived_ratio2, novel_ratio2, derived_count2, _) =
             calculate_entity_flow(&memory_entities, &response_novel);

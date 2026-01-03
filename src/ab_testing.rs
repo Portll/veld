@@ -2187,24 +2187,21 @@ mod tests {
         // Treatment should deprioritize these based on momentum/access/graph signals
         let memory_corpus: Vec<(f32, f32, f32, f32, f32, u32, f32, bool)> = vec![
             // === HIGH-VALUE: Good signals + good track record ===
-            (0.8, 0.7, 0.5, 0.8, 0.9, 15, 0.9, true),   // Consistently helpful, frequently accessed
-            (0.7, 0.8, 0.6, 0.7, 0.8, 12, 0.85, true),  // Strong entity match, proven value
-            (0.9, 0.6, 0.4, 0.9, 0.7, 10, 0.8, true),   // High semantic, good track record
-            (0.6, 0.9, 0.7, 0.6, 0.85, 8, 0.75, true),  // Entity-heavy, reliable
-
+            (0.8, 0.7, 0.5, 0.8, 0.9, 15, 0.9, true), // Consistently helpful, frequently accessed
+            (0.7, 0.8, 0.6, 0.7, 0.8, 12, 0.85, true), // Strong entity match, proven value
+            (0.9, 0.6, 0.4, 0.9, 0.7, 10, 0.8, true), // High semantic, good track record
+            (0.6, 0.9, 0.7, 0.6, 0.85, 8, 0.75, true), // Entity-heavy, reliable
             // === TRAPS: Look good but misleading (control will surface these, treatment won't) ===
-            (0.95, 0.9, 0.8, 0.9, -0.6, 1, 0.15, false),  // BEST semantic/entity but terrible momentum
-            (0.9, 0.85, 0.7, 0.85, -0.4, 0, 0.1, false),  // High scores, never accessed, weak graph
-            (0.88, 0.82, 0.6, 0.8, -0.5, 1, 0.2, false),  // Looks great, proven misleading
+            (0.95, 0.9, 0.8, 0.9, -0.6, 1, 0.15, false), // BEST semantic/entity but terrible momentum
+            (0.9, 0.85, 0.7, 0.85, -0.4, 0, 0.1, false), // High scores, never accessed, weak graph
+            (0.88, 0.82, 0.6, 0.8, -0.5, 1, 0.2, false), // Looks great, proven misleading
             (0.85, 0.88, 0.75, 0.82, -0.3, 2, 0.25, false), // Strong traditional signals, poor history
-
             // === MEDIUM: Mixed signals ===
-            (0.7, 0.5, 0.3, 0.6, 0.4, 4, 0.5, true),    // Decent, somewhat proven
-            (0.5, 0.6, 0.4, 0.5, 0.3, 3, 0.45, true),   // Moderate all around
+            (0.7, 0.5, 0.3, 0.6, 0.4, 4, 0.5, true), // Decent, somewhat proven
+            (0.5, 0.6, 0.4, 0.5, 0.3, 3, 0.45, true), // Moderate all around
             (0.6, 0.55, 0.35, 0.55, 0.35, 3, 0.4, true), // Average
-
             // === LOW-VALUE: Poor across the board ===
-            (0.4, 0.3, 0.2, 0.4, 0.1, 1, 0.2, false),   // Low everything
+            (0.4, 0.3, 0.2, 0.4, 0.1, 1, 0.2, false), // Low everything
             (0.35, 0.4, 0.25, 0.35, -0.1, 1, 0.15, false), // Below average
         ];
 
@@ -2234,13 +2231,33 @@ mod tests {
         println!("🔍 RANKING COMPARISON (top 8):");
         println!("   Control ranking:");
         for (rank, (idx, score, relevant)) in control_ranked.iter().take(8).enumerate() {
-            let status = if *relevant { "✓ relevant" } else { "✗ TRAP" };
-            println!("      #{}: memory[{}] score={:.3} {}", rank + 1, idx, score, status);
+            let status = if *relevant {
+                "✓ relevant"
+            } else {
+                "✗ TRAP"
+            };
+            println!(
+                "      #{}: memory[{}] score={:.3} {}",
+                rank + 1,
+                idx,
+                score,
+                status
+            );
         }
         println!("   Treatment ranking:");
         for (rank, (idx, score, relevant)) in treatment_ranked.iter().take(8).enumerate() {
-            let status = if *relevant { "✓ relevant" } else { "✗ TRAP" };
-            println!("      #{}: memory[{}] score={:.3} {}", rank + 1, idx, score, status);
+            let status = if *relevant {
+                "✓ relevant"
+            } else {
+                "✗ TRAP"
+            };
+            println!(
+                "      #{}: memory[{}] score={:.3} {}",
+                rank + 1,
+                idx,
+                score,
+                status
+            );
         }
         println!();
 
@@ -2251,8 +2268,16 @@ mod tests {
         let memories_surfaced = 5;
 
         // Count relevant vs trap in top K for each variant
-        let control_top_k: Vec<bool> = control_ranked.iter().take(memories_surfaced).map(|x| x.2).collect();
-        let treatment_top_k: Vec<bool> = treatment_ranked.iter().take(memories_surfaced).map(|x| x.2).collect();
+        let control_top_k: Vec<bool> = control_ranked
+            .iter()
+            .take(memories_surfaced)
+            .map(|x| x.2)
+            .collect();
+        let treatment_top_k: Vec<bool> = treatment_ranked
+            .iter()
+            .take(memories_surfaced)
+            .map(|x| x.2)
+            .collect();
 
         let control_relevant_count = control_top_k.iter().filter(|&&r| r).count();
         let treatment_relevant_count = treatment_top_k.iter().filter(|&&r| r).count();
@@ -2264,10 +2289,18 @@ mod tests {
         let treatment_trap_ratio = treatment_trap_count as f32 / memories_surfaced as f32;
 
         println!("📈 CONTEXT QUALITY (top {}):", memories_surfaced);
-        println!("   Control:   {} relevant, {} traps ({:.0}% trap ratio)",
-            control_relevant_count, control_trap_count, control_trap_ratio * 100.0);
-        println!("   Treatment: {} relevant, {} traps ({:.0}% trap ratio)\n",
-            treatment_relevant_count, treatment_trap_count, treatment_trap_ratio * 100.0);
+        println!(
+            "   Control:   {} relevant, {} traps ({:.0}% trap ratio)",
+            control_relevant_count,
+            control_trap_count,
+            control_trap_ratio * 100.0
+        );
+        println!(
+            "   Treatment: {} relevant, {} traps ({:.0}% trap ratio)\n",
+            treatment_relevant_count,
+            treatment_trap_count,
+            treatment_trap_ratio * 100.0
+        );
 
         // Deterministic seeding for reproducibility (LCG PRNG)
         let mut rng_state: u64 = 42;
@@ -2307,7 +2340,9 @@ mod tests {
 
         // Build test with dynamic results
         let mut test = ABTest::builder("relevance_weights_experiment")
-            .with_description("CTX-3: Quality over quantity - momentum, access_count, graph_strength")
+            .with_description(
+                "CTX-3: Quality over quantity - momentum, access_count, graph_strength",
+            )
             .with_control(control_weights)
             .with_treatment(treatment_weights)
             .with_min_impressions(100)
@@ -2332,12 +2367,22 @@ mod tests {
         let analysis = ABTestAnalyzer::comprehensive_analysis(&test);
 
         println!("📊 DYNAMIC SIMULATION RESULTS:");
-        println!("   ├─ Control:   {} impressions, {} clicks ({:.1}% CTR)",
-            num_impressions, control_clicks, control_ctr);
-        println!("   │            positive={}, negative={}", control_positive, control_negative);
-        println!("   └─ Treatment: {} impressions, {} clicks ({:.1}% CTR)",
-            num_impressions, treatment_clicks, treatment_ctr);
-        println!("                 positive={}, negative={}\n", treatment_positive, treatment_negative);
+        println!(
+            "   ├─ Control:   {} impressions, {} clicks ({:.1}% CTR)",
+            num_impressions, control_clicks, control_ctr
+        );
+        println!(
+            "   │            positive={}, negative={}",
+            control_positive, control_negative
+        );
+        println!(
+            "   └─ Treatment: {} impressions, {} clicks ({:.1}% CTR)",
+            num_impressions, treatment_clicks, treatment_ctr
+        );
+        println!(
+            "                 positive={}, negative={}\n",
+            treatment_positive, treatment_negative
+        );
 
         println!("🔬 FREQUENTIST ANALYSIS:");
         println!("   ├─ Chi-squared: {:.4}", analysis.frequentist.chi_squared);
@@ -2461,8 +2506,12 @@ mod tests {
         let ard = (treatment_ctr - control_ctr) / 100.0; // Absolute Risk Difference
         let nnt = if ard > 0.0 { 1.0 / ard } else { f64::INFINITY };
         println!("\n🎯 KEY METRIC:");
-        println!("   ├─ CTR Improvement: {:.1}% → {:.1}% (+{:.1}%)",
-            control_ctr, treatment_ctr, treatment_ctr - control_ctr);
+        println!(
+            "   ├─ CTR Improvement: {:.1}% → {:.1}% (+{:.1}%)",
+            control_ctr,
+            treatment_ctr,
+            treatment_ctr - control_ctr
+        );
         println!("   ├─ ARD (Absolute Risk Difference): {:.2}%", ard * 100.0);
         if nnt.is_finite() && nnt < 100.0 {
             println!("   └─ NNT (Number Needed to Treat): {:.0}", nnt);
@@ -2479,12 +2528,14 @@ mod tests {
         assert!(
             treatment_clicks >= control_clicks,
             "Treatment ({} clicks) should outperform Control ({} clicks)",
-            treatment_clicks, control_clicks
+            treatment_clicks,
+            control_clicks
         );
         assert!(
             treatment_ctr >= control_ctr,
             "Treatment CTR ({:.1}%) should be >= Control CTR ({:.1}%)",
-            treatment_ctr, control_ctr
+            treatment_ctr,
+            control_ctr
         );
         // Treatment should have better positive/negative ratio
         let control_quality = if control_negative > 0 {
@@ -2500,7 +2551,8 @@ mod tests {
         assert!(
             treatment_quality >= control_quality * 0.9, // Allow 10% tolerance
             "Treatment quality ratio ({:.2}) should be >= Control ({:.2})",
-            treatment_quality, control_quality
+            treatment_quality,
+            control_quality
         );
         assert!(!analysis.insights.is_empty());
     }

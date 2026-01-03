@@ -488,7 +488,12 @@ impl GraphMemory {
             let entity_iter = entities_db.iterator(rocksdb::IteratorMode::Start);
             let mut migrated_count = 0;
             for (_, value) in entity_iter.flatten() {
-                if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+                if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(
+                    &value,
+                    bincode::config::standard(),
+                )
+                .map(|(v, _)| v)
+                {
                     // Store in index DB: name -> UUID bytes
                     index_db.put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
                     index.insert(entity.name.clone(), entity.uuid);
@@ -638,7 +643,8 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.entities_db.get(key)? {
             Some(value) => {
-                let (entity, _): (EntityNode, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (entity, _): (EntityNode, _) =
+                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 Ok(Some(entity))
             }
             None => Ok(None),
@@ -730,7 +736,8 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.relationships_db.get(key)? {
             Some(value) => {
-                let (edge, _): (RelationshipEdge, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (edge, _): (RelationshipEdge, _) =
+                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 Ok(Some(edge))
             }
             None => Ok(None),
@@ -749,7 +756,8 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.relationships_db.get(key)? {
             Some(value) => {
-                let (mut edge, _): (RelationshipEdge, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (mut edge, _): (RelationshipEdge, _) =
+                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 // Apply effective strength calculation (doesn't persist)
                 edge.strength = edge.effective_strength();
                 Ok(Some(edge))
@@ -811,7 +819,8 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.episodes_db.get(key)? {
             Some(value) => {
-                let (episode, _): (EpisodicNode, _) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (episode, _): (EpisodicNode, _) =
+                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
                 Ok(Some(episode))
             }
             None => Ok(None),
@@ -1055,7 +1064,9 @@ impl GraphMemory {
                     // Strengthen existing edge
                     edge.strengthen();
                     let key = edge.uuid.as_bytes();
-                    if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                    if let Ok(value) =
+                        bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                    {
                         batch.put(key, value);
                         edges_updated += 1;
                     }
@@ -1078,7 +1089,9 @@ impl GraphMemory {
                     };
 
                     let key = edge.uuid.as_bytes();
-                    if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                    if let Ok(value) =
+                        bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                    {
                         batch.put(key, value);
 
                         // Also index in the reverse direction for lookup
@@ -1101,7 +1114,11 @@ impl GraphMemory {
     }
 
     /// Find an edge between two entities/memories (in either direction)
-    fn find_edge_between_entities(&self, entity_a: &Uuid, entity_b: &Uuid) -> Result<Option<RelationshipEdge>> {
+    fn find_edge_between_entities(
+        &self,
+        entity_a: &Uuid,
+        entity_b: &Uuid,
+    ) -> Result<Option<RelationshipEdge>> {
         // Check forward index
         let idx_key = format!("mem_edge:{}:{}", entity_a, entity_b);
         if let Some(edge_uuid_bytes) = self.relationships_db.get(idx_key.as_bytes())? {
@@ -1161,7 +1178,8 @@ impl GraphMemory {
                 // Strengthen existing edge
                 edge.strengthen();
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                {
                     batch.put(key, value);
                     strengthened += 1;
                 }
@@ -1172,7 +1190,7 @@ impl GraphMemory {
                     from_entity: from_uuid,
                     to_entity: to_uuid,
                     relation_type: RelationType::CoRetrieved, // Replay strengthens co-retrieval associations
-                    strength: 0.5, // Initial strength
+                    strength: 0.5,                            // Initial strength
                     created_at: Utc::now(),
                     valid_at: Utc::now(),
                     invalidated_at: None,
@@ -1184,7 +1202,8 @@ impl GraphMemory {
                 };
 
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                {
                     batch.put(key, value);
 
                     // Index both directions
@@ -1200,7 +1219,10 @@ impl GraphMemory {
 
         if strengthened > 0 {
             self.relationships_db.write(batch)?;
-            tracing::debug!("Applied {} edge boosts from replay consolidation", strengthened);
+            tracing::debug!(
+                "Applied {} edge boosts from replay consolidation",
+                strengthened
+            );
         }
 
         Ok(strengthened)
@@ -1210,7 +1232,11 @@ impl GraphMemory {
     ///
     /// Uses weighted graph traversal prioritizing stronger associations.
     /// Returns memory UUIDs sorted by association strength.
-    pub fn find_memory_associations(&self, memory_id: &Uuid, max_results: usize) -> Result<Vec<(Uuid, f32)>> {
+    pub fn find_memory_associations(
+        &self,
+        memory_id: &Uuid,
+        max_results: usize,
+    ) -> Result<Vec<(Uuid, f32)>> {
         let mut associations: Vec<(Uuid, f32)> = Vec::new();
 
         // Scan for edges involving this memory
@@ -1534,7 +1560,12 @@ impl GraphMemory {
 
         let iter = self.entities_db.iterator(rocksdb::IteratorMode::Start);
         for (_, value) in iter.flatten() {
-            if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+            if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(
+                &value,
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            {
                 entities.push(entity);
             }
         }
@@ -1551,7 +1582,12 @@ impl GraphMemory {
 
         let iter = self.relationships_db.iterator(rocksdb::IteratorMode::Start);
         for (_, value) in iter.flatten() {
-            if let Ok(edge) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+            if let Ok(edge) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                &value,
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            {
                 // Only include non-invalidated relationships
                 if edge.invalidated_at.is_none() {
                     relationships.push(edge);

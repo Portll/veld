@@ -335,7 +335,8 @@ impl LineageGraph {
         let key = format!("lineage:edges:{}:{}", user_id, edge_id);
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let (edge, _): (LineageEdge, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                let (edge, _): (LineageEdge, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
                 Ok(Some(edge))
             }
             None => Ok(None),
@@ -418,7 +419,12 @@ impl LineageGraph {
                 break;
             }
 
-            if let Ok(edge) = bincode::serde::decode_from_slice::<LineageEdge, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+            if let Ok(edge) = bincode::serde::decode_from_slice::<LineageEdge, _>(
+                &value,
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            {
                 edges.push(edge);
                 if edges.len() >= limit {
                     break;
@@ -448,7 +454,8 @@ impl LineageGraph {
         let key = format!("lineage:branches:{}:{}", user_id, branch_id);
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let (branch, _): (LineageBranch, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                let (branch, _): (LineageBranch, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
                 Ok(Some(branch))
             }
             None => Ok(None),
@@ -473,7 +480,12 @@ impl LineageGraph {
                 break;
             }
 
-            if let Ok(branch) = bincode::serde::decode_from_slice::<LineageBranch, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+            if let Ok(branch) = bincode::serde::decode_from_slice::<LineageBranch, _>(
+                &value,
+                bincode::config::standard(),
+            )
+            .map(|(v, _)| v)
+            {
                 branches.push(branch);
             }
         }

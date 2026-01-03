@@ -68,6 +68,10 @@ pub use crate::memory::feedback::{
 };
 pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{spreading_activation_retrieve, ActivatedMemory};
+pub use crate::memory::hybrid_search::{
+    BM25Index, CrossEncoderReranker, HybridSearchConfig, HybridSearchEngine, HybridSearchResult,
+    RRFusion,
+};
 pub use crate::memory::introspection::{
     AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
     ConsolidationStats, EdgeFormationReason, FactChange, InterferenceEvent, InterferenceType,
@@ -90,16 +94,12 @@ pub use crate::memory::retrieval::{
 pub use crate::memory::segmentation::{
     AtomicMemory, DeduplicationEngine, DeduplicationResult, InputSource, SegmentationEngine,
 };
+pub use crate::memory::sessions::{
+    Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore, SessionStoreStats,
+    SessionSummary, TemporalContext, TimeOfDay,
+};
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
-pub use crate::memory::sessions::{
-    Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore,
-    SessionStoreStats, SessionSummary, TemporalContext, TimeOfDay,
-};
-pub use crate::memory::hybrid_search::{
-    BM25Index, CrossEncoderReranker, HybridSearchConfig, HybridSearchEngine, HybridSearchResult,
-    RRFusion,
-};
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,7 +314,7 @@ impl MemorySystem {
                 long_term_memory_count: storage_stats.total_count,
                 vector_index_count: vector_count,
                 compressed_count: storage_stats.compressed_count,
-                promotions_to_session: 0, // Runtime counter, not persisted
+                promotions_to_session: 0,  // Runtime counter, not persisted
                 promotions_to_longterm: 0, // Runtime counter, not persisted
                 total_retrievals: storage_stats.total_retrievals,
                 average_importance: storage_stats.average_importance,
@@ -947,11 +947,17 @@ impl MemorySystem {
                 if let Some(m) = self.session_memory.read().get(id) {
                     return Some(m.experience.content.clone());
                 }
-                self.long_term_memory.get(id).ok().map(|m| m.experience.content.clone())
+                self.long_term_memory
+                    .get(id)
+                    .ok()
+                    .map(|m| m.experience.content.clone())
             };
 
             // Run hybrid search (BM25 + RRF + optional reranking)
-            match self.hybrid_search.search(query_text, vector_results.clone(), get_content) {
+            match self
+                .hybrid_search
+                .search(query_text, vector_results.clone(), get_content)
+            {
                 Ok(hybrid_results) => {
                     // Convert HybridSearchResult to (MemoryId, score) pairs
                     hybrid_results

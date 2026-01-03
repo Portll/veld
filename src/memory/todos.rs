@@ -21,8 +21,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::types::{
-    Project, ProjectId, ProjectStatus, Todo, TodoComment, TodoCommentId,
-    TodoCommentType, TodoId, TodoStatus,
+    Project, ProjectId, ProjectStatus, Todo, TodoComment, TodoCommentId, TodoCommentType, TodoId,
+    TodoStatus,
 };
 use crate::vector_db::{VamanaConfig, VamanaIndex};
 
@@ -96,7 +96,12 @@ impl TodoStore {
 
     /// Add or update a todo in the vector index
     /// Returns the vector ID assigned to this todo
-    pub fn index_todo_embedding(&self, user_id: &str, _todo_id: &TodoId, embedding: &[f32]) -> Result<u32> {
+    pub fn index_todo_embedding(
+        &self,
+        user_id: &str,
+        _todo_id: &TodoId,
+        embedding: &[f32],
+    ) -> Result<u32> {
         self.get_or_create_index(user_id)?;
 
         let mut indices = self.vector_indices.write();
@@ -109,7 +114,12 @@ impl TodoStore {
     }
 
     /// Search for similar todos by embedding
-    pub fn search_similar(&self, user_id: &str, query_embedding: &[f32], limit: usize) -> Result<Vec<(Todo, f32)>> {
+    pub fn search_similar(
+        &self,
+        user_id: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(Todo, f32)>> {
         let indices = self.vector_indices.read();
         if let Some(index) = indices.get(user_id) {
             let results = index.search(query_embedding, limit)?;
@@ -140,9 +150,15 @@ impl TodoStore {
     }
 
     /// Store the mapping from vector_id to todo_id
-    pub fn store_vector_id_mapping(&self, user_id: &str, vector_id: u32, todo_id: &TodoId) -> Result<()> {
+    pub fn store_vector_id_mapping(
+        &self,
+        user_id: &str,
+        vector_id: u32,
+        todo_id: &TodoId,
+    ) -> Result<()> {
         let key = format!("vector_id:{}:{}", user_id, vector_id);
-        self.index_db.put(key.as_bytes(), todo_id.0.to_string().as_bytes())?;
+        self.index_db
+            .put(key.as_bytes(), todo_id.0.to_string().as_bytes())?;
         Ok(())
     }
 

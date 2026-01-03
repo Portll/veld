@@ -418,12 +418,12 @@ use memory::{
     segmentation::{InputSource, SegmentationEngine},
     todo_formatter, ActivatedMemory, EpisodeContext, Experience, ExperienceType, FeedbackStore,
     FileMemoryStats, FileMemoryStore, GraphStats as VisualizationStats, IndexingResult, Memory,
-    MemoryConfig, MemoryId, MemoryStats, MemorySystem, PendingFeedback, PostMortem, Project, ProjectId,
-    ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus,
-    ProspectiveTrigger, Query as MemoryQuery, Recurrence, Session, SessionEvent, SessionId,
-    SessionStatus, SessionStore, SessionStoreStats, SessionSummary, SharedMemory, SurfacedMemoryInfo, Todo,
-    TodoComment, TodoCommentId, TodoCommentType, TodoId, TodoPriority, TodoStatus, TodoStore, TraceDirection,
-    UserTodoStats,
+    MemoryConfig, MemoryId, MemoryStats, MemorySystem, PendingFeedback, PostMortem, Project,
+    ProjectId, ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId,
+    ProspectiveTaskStatus, ProspectiveTrigger, Query as MemoryQuery, Recurrence, Session,
+    SessionEvent, SessionId, SessionStatus, SessionStore, SessionStoreStats, SessionSummary,
+    SharedMemory, SurfacedMemoryInfo, Todo, TodoComment, TodoCommentId, TodoCommentType, TodoId,
+    TodoPriority, TodoStatus, TodoStore, TraceDirection, UserTodoStats,
 };
 
 /// Audit event for history tracking
@@ -499,7 +499,10 @@ impl MultiUserMemoryManagerRotationHelper {
                     break;
                 }
 
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(&value, bincode::config::standard()) {
+                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     let timestamp_nanos = event.timestamp.timestamp_nanos_opt().unwrap_or(0);
                     events.push((key.to_vec(), event, timestamp_nanos));
                 }
@@ -965,7 +968,10 @@ impl MultiUserMemoryManager {
                 }
 
                 // Deserialize event
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(&value, bincode::config::standard()) {
+                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     events.push(event);
                 }
             }
@@ -1086,7 +1092,10 @@ impl MultiUserMemoryManager {
                 if !key_str.starts_with(&prefix) {
                     break;
                 }
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(&value, bincode::config::standard()) {
+                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     events.push(event);
                 }
             }
@@ -2764,11 +2773,7 @@ async fn record_experience(
             ctx.updated_at = chrono::Utc::now();
             Some(ctx)
         } else {
-            Some(
-                ContextBuilder::new()
-                    .with_episode(episode)
-                    .build(),
-            )
+            Some(ContextBuilder::new().with_episode(episode).build())
         }
     } else {
         req.experience.context.clone()
@@ -4022,7 +4027,9 @@ async fn search_todos_for_recall(
     let query_clone = query.to_string();
     let query_embedding: Vec<f32> = match tokio::task::spawn_blocking(move || {
         let memory_guard = memory_system.read();
-        memory_guard.compute_embedding(&query_clone).unwrap_or_default()
+        memory_guard
+            .compute_embedding(&query_clone)
+            .unwrap_or_default()
     })
     .await
     {
@@ -4046,9 +4053,7 @@ async fn search_todos_for_recall(
     // Convert to RecallTodo format (filter out completed/cancelled)
     search_results
         .into_iter()
-        .filter(|(todo, _)| {
-            todo.status != TodoStatus::Done && todo.status != TodoStatus::Cancelled
-        })
+        .filter(|(todo, _)| todo.status != TodoStatus::Done && todo.status != TodoStatus::Cancelled)
         .map(|(todo, score)| {
             let project = todo.project_id.as_ref().and_then(|pid| {
                 state
@@ -4216,7 +4221,11 @@ async fn recall(
 
         // Search todos using same embedding
         let recall_todos = search_todos_for_recall(&state, &req.user_id, &query_text, 5).await;
-        let todo_count = if recall_todos.is_empty() { None } else { Some(recall_todos.len()) };
+        let todo_count = if recall_todos.is_empty() {
+            None
+        } else {
+            Some(recall_todos.len())
+        };
 
         return Ok(Json(RecallResponse {
             memories: recall_memories,
@@ -4489,7 +4498,11 @@ async fn recall(
 
     // Search todos using same query
     let recall_todos = search_todos_for_recall(&state, &req.user_id, &req.query, 5).await;
-    let todo_count = if recall_todos.is_empty() { None } else { Some(recall_todos.len()) };
+    let todo_count = if recall_todos.is_empty() {
+        None
+    } else {
+        Some(recall_todos.len())
+    };
 
     Ok(Json(RecallResponse {
         memories: recall_memories,
@@ -5258,12 +5271,13 @@ async fn auto_generate_post_mortem(
     };
 
     // Step 2: Trace lineage from seed memories to find causally connected memories
-    let mut lineage_memory_ids: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
-    
+    let mut lineage_memory_ids: std::collections::HashSet<MemoryId> =
+        std::collections::HashSet::new();
+
     {
         let memory_guard = memory.read();
         let lineage_graph = memory_guard.lineage_graph();
-        
+
         for seed_id in &seed_memories {
             // Trace backward to find causes/context
             if let Ok(trace) = lineage_graph.trace(user_id, seed_id, TraceDirection::Backward, 5) {
@@ -5281,8 +5295,9 @@ async fn auto_generate_post_mortem(
     }
 
     // Step 3: Build memory map and collect related memories
-    let mut memories_map: std::collections::HashMap<MemoryId, Memory> = std::collections::HashMap::new();
-    
+    let mut memories_map: std::collections::HashMap<MemoryId, Memory> =
+        std::collections::HashMap::new();
+
     let related_memories: Vec<Memory> = {
         let memory_guard = memory.read();
         let all_memories = memory_guard.get_all_memories()?;
@@ -5290,11 +5305,11 @@ async fn auto_generate_post_mortem(
         let mut result = Vec::new();
         for arc_mem in all_memories {
             let mem = (*arc_mem).clone();
-            
+
             // Include if: in lineage chain OR created during todo lifetime
             let in_lineage = lineage_memory_ids.contains(&mem.id);
             let in_timeframe = mem.created_at >= todo_created_at;
-            
+
             if in_lineage || in_timeframe {
                 memories_map.insert(mem.id.clone(), mem.clone());
                 result.push(mem);
@@ -5310,7 +5325,10 @@ async fn auto_generate_post_mortem(
     // Step 4: Build lineage trace for PostMortem::from_trace
     let trace_path: Vec<MemoryId> = related_memories.iter().map(|m| m.id.clone()).collect();
     let synthetic_trace = memory::LineageTrace {
-        root: trace_path.first().cloned().unwrap_or_else(|| MemoryId(uuid::Uuid::new_v4())),
+        root: trace_path
+            .first()
+            .cloned()
+            .unwrap_or_else(|| MemoryId(uuid::Uuid::new_v4())),
         direction: TraceDirection::Both,
         edges: vec![], // We don't need edges for PostMortem extraction
         path: trace_path,
@@ -5319,7 +5337,8 @@ async fn auto_generate_post_mortem(
 
     // Step 5: Generate PostMortem using lineage-aware extraction
     let task_id = MemoryId(uuid::Uuid::new_v4());
-    let post_mortem = PostMortem::from_trace(task_id, todo_content, &synthetic_trace, &memories_map);
+    let post_mortem =
+        PostMortem::from_trace(task_id, todo_content, &synthetic_trace, &memories_map);
 
     // Only create post-mortem if we have significant content
     let has_content = !post_mortem.learnings.is_empty()
@@ -6128,7 +6147,10 @@ async fn proactive_context(
             match (a_in_progress, b_in_progress) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => b.similarity_score.partial_cmp(&a.similarity_score).unwrap_or(std::cmp::Ordering::Equal),
+                _ => b
+                    .similarity_score
+                    .partial_cmp(&a.similarity_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
             }
         });
 
@@ -6845,7 +6867,10 @@ async fn consolidate_memories(
 
     // AUD-7: Store extracted facts in the semantic fact store
     if !result.new_facts.is_empty() {
-        match state.fact_store.store_batch(&req.user_id, &result.new_facts) {
+        match state
+            .fact_store
+            .store_batch(&req.user_id, &result.new_facts)
+        {
             Ok(stored) => {
                 tracing::info!(
                     user_id = %req.user_id,
@@ -6884,7 +6909,10 @@ async fn consolidate_memories(
             chrono::Utc::now() - chrono::Duration::hours(1),
             Some(chrono::Utc::now()),
         );
-        (report.statistics.memories_replayed, report.statistics.edges_strengthened)
+        (
+            report.statistics.memories_replayed,
+            report.statistics.edges_strengthened,
+        )
     };
 
     tracing::info!(
@@ -8718,28 +8746,47 @@ async fn export_mif(
 
                 // Apply PII redaction if enabled
                 let (content, redactions) = if let Some(ref patterns) = pii_patterns {
-                    let (redacted_content, redaction_records, found_pii) = patterns.redact(&m.experience.content);
+                    let (redacted_content, redaction_records, found_pii) =
+                        patterns.redact(&m.experience.content);
                     if found_pii {
                         pii_detected.set(true);
                         // Check if any are API keys/secrets
-                        if redaction_records.iter().any(|r| r.redaction_type == "api_key") {
+                        if redaction_records
+                            .iter()
+                            .any(|r| r.redaction_type == "api_key")
+                        {
                             secrets_detected.set(true);
                         }
                     }
-                    (redacted_content, if redaction_records.is_empty() { None } else { Some(redaction_records) })
+                    (
+                        redacted_content,
+                        if redaction_records.is_empty() {
+                            None
+                        } else {
+                            Some(redaction_records)
+                        },
+                    )
                 } else {
                     (m.experience.content.clone(), None)
                 };
 
                 // Convert entity strings to MifEntity objects
-                let entities: Vec<MifEntity> = m.experience.entities.iter().map(|e| MifEntity {
-                    text: e.clone(),
-                    entity_type: "UNKNOWN".to_string(),
-                    confidence: 1.0,
-                }).collect();
+                let entities: Vec<MifEntity> = m
+                    .experience
+                    .entities
+                    .iter()
+                    .map(|e| MifEntity {
+                        text: e.clone(),
+                        entity_type: "UNKNOWN".to_string(),
+                        confidence: 1.0,
+                    })
+                    .collect();
 
                 // Extract source info from RichContext if available
-                let (source_type, session_id) = m.experience.context.as_ref()
+                let (source_type, session_id) = m
+                    .experience
+                    .context
+                    .as_ref()
                     .map(|ctx| {
                         let src = format!("{:?}", ctx.source.source_type).to_lowercase();
                         let sess = ctx.episode.episode_id.clone();
@@ -8748,7 +8795,9 @@ async fn export_mif(
                     .unwrap_or_else(|| ("conversation".to_string(), None));
 
                 // Extract tags from metadata
-                let tags: Vec<String> = m.experience.metadata
+                let tags: Vec<String> = m
+                    .experience
+                    .metadata
                     .get("tags")
                     .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
                     .unwrap_or_default();
@@ -8772,8 +8821,17 @@ async fn export_mif(
                     entities,
                     embedding,
                     relations: MifRelations {
-                        related_memories: m.experience.related_memories.iter().map(|id| format!("mem_{}", id.0)).collect(),
-                        related_todos: m.related_todo_ids.iter().map(|id| format!("todo_{}", id.0)).collect(),
+                        related_memories: m
+                            .experience
+                            .related_memories
+                            .iter()
+                            .map(|id| format!("mem_{}", id.0))
+                            .collect(),
+                        related_todos: m
+                            .related_todo_ids
+                            .iter()
+                            .map(|id| format!("todo_{}", id.0))
+                            .collect(),
                     },
                     redactions,
                 }
@@ -8802,11 +8860,16 @@ async fn export_mif(
         .into_iter()
         .map(|t| {
             let project = t.project_id.as_ref().and_then(|pid| {
-                state.todo_store.get_project(&user_id, pid).ok().flatten().map(|p| MifProject {
-                    id: p.id.0.to_string(),
-                    name: p.name,
-                    prefix: p.prefix.unwrap_or_else(|| "TODO".to_string()),
-                })
+                state
+                    .todo_store
+                    .get_project(&user_id, pid)
+                    .ok()
+                    .flatten()
+                    .map(|p| MifProject {
+                        id: p.id.0.to_string(),
+                        name: p.name,
+                        prefix: p.prefix.unwrap_or_else(|| "TODO".to_string()),
+                    })
             });
 
             MifTodo {
@@ -8827,7 +8890,11 @@ async fn export_mif(
                 subtask_ids: vec![], // Would need to query
                 blocked_on: t.blocked_on,
                 recurrence: t.recurrence.map(|r| format!("{:?}", r).to_lowercase()),
-                related_memory_ids: t.related_memory_ids.iter().map(|id| format!("mem_{}", id.0)).collect(),
+                related_memory_ids: t
+                    .related_memory_ids
+                    .iter()
+                    .map(|id| format!("mem_{}", id.0))
+                    .collect(),
                 comments: vec![], // Would need separate query
             }
         })
@@ -8853,7 +8920,9 @@ async fn export_mif(
         // Add entity nodes from graph
         if let Ok(entities) = graph_guard.get_all_entities() {
             for entity in entities {
-                let entity_type = entity.labels.first()
+                let entity_type = entity
+                    .labels
+                    .first()
                     .map(|l| format!("{:?}", l))
                     .unwrap_or_else(|| "UNKNOWN".to_string());
                 nodes.push(MifNode {
@@ -8906,20 +8975,27 @@ async fn export_mif(
     };
 
     // Build metadata
-    let mut memory_types: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut memory_types: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for m in &memories {
         *memory_types.entry(m.memory_type.clone()).or_insert(0) += 1;
     }
 
     // Get projects with todo counts
-    let all_todos_for_count = state.todo_store.list_todos_for_user(&user_id, None).unwrap_or_default();
+    let all_todos_for_count = state
+        .todo_store
+        .list_todos_for_user(&user_id, None)
+        .unwrap_or_default();
     let projects: Vec<MifProjectStats> = state
         .todo_store
         .list_projects(&user_id)
         .unwrap_or_default()
         .into_iter()
         .map(|p| {
-            let todo_count = all_todos_for_count.iter().filter(|t| t.project_id.as_ref() == Some(&p.id)).count();
+            let todo_count = all_todos_for_count
+                .iter()
+                .filter(|t| t.project_id.as_ref() == Some(&p.id))
+                .count();
             MifProjectStats {
                 id: p.id.0.to_string(),
                 name: p.name,
@@ -8929,8 +9005,18 @@ async fn export_mif(
         .collect();
 
     // Date range
-    let earliest = memories.iter().map(|m| &m.created_at).min().cloned().unwrap_or_default();
-    let latest = memories.iter().map(|m| &m.created_at).max().cloned().unwrap_or_default();
+    let earliest = memories
+        .iter()
+        .map(|m| &m.created_at)
+        .min()
+        .cloned()
+        .unwrap_or_default();
+    let latest = memories
+        .iter()
+        .map(|m| &m.created_at)
+        .max()
+        .cloned()
+        .unwrap_or_default();
 
     let metadata = MifMetadata {
         total_memories: memories.len(),
@@ -8947,13 +9033,21 @@ async fn export_mif(
     };
 
     // Generate export ID and checksum
-    let export_id = format!("exp_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..12].to_string());
+    let export_id = format!(
+        "exp_{}",
+        uuid::Uuid::new_v4().to_string().replace("-", "")[..12].to_string()
+    );
     let now = chrono::Utc::now();
 
     // Compute checksum of content
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(format!("{}{}{}", memories.len(), todos.len(), now.to_rfc3339()));
+    hasher.update(format!(
+        "{}{}{}",
+        memories.len(),
+        todos.len(),
+        now.to_rfc3339()
+    ));
     let checksum = format!("sha256:{}", hex::encode(hasher.finalize()));
 
     let export = MifExport {
@@ -8979,7 +9073,10 @@ async fn export_mif(
         &user_id,
         "MIF_EXPORT",
         &export.export.id,
-        &format!("Exported {} memories, {} todos", export.metadata.total_memories, export.metadata.total_todos),
+        &format!(
+            "Exported {} memories, {} todos",
+            export.metadata.total_memories, export.metadata.total_todos
+        ),
     );
 
     Ok(Json(export))
@@ -9022,7 +9119,10 @@ async fn import_mif(
     if !req.data.mif_version.starts_with("1.") {
         return Err(AppError::InvalidInput {
             field: "mif_version".to_string(),
-            reason: format!("Unsupported MIF version: {}. Only 1.x is supported.", req.data.mif_version),
+            reason: format!(
+                "Unsupported MIF version: {}. Only 1.x is supported.",
+                req.data.mif_version
+            ),
         });
     }
 
@@ -9060,7 +9160,8 @@ async fn import_mif(
             .ok();
 
         // Build experience with tags in metadata
-        let mut metadata: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut metadata: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         if !mif_mem.tags.is_empty() {
             metadata.insert("tags".to_string(), mif_mem.tags.join(","));
         }
@@ -9086,7 +9187,10 @@ async fn import_mif(
                 };
                 let existing = guard.recall(&query).unwrap_or_default();
 
-                if existing.iter().any(|m| m.experience.content == mif_mem.content) {
+                if existing
+                    .iter()
+                    .any(|m| m.experience.content == mif_mem.content)
+                {
                     skipped.duplicates += 1;
                     false
                 } else {
@@ -9137,14 +9241,16 @@ async fn import_mif(
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now());
 
-        let due_date = mif_todo.due_date.as_ref()
+        let due_date = mif_todo
+            .due_date
+            .as_ref()
             .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
 
         // Create todo with all required fields
         let todo = memory::Todo {
             id: memory::TodoId(uuid::Uuid::new_v4()),
-            seq_num: 0, // Will be assigned by store_todo
+            seq_num: 0,           // Will be assigned by store_todo
             project_prefix: None, // Will be set if project is assigned
             user_id: req.user_id.clone(),
             content: mif_todo.content.clone(),
@@ -9178,7 +9284,9 @@ async fn import_mif(
 
     // Import graph edges if present
     if let Some(ref graph) = req.data.graph {
-        let graph_memory = state.get_user_graph(&req.user_id).map_err(AppError::Internal)?;
+        let graph_memory = state
+            .get_user_graph(&req.user_id)
+            .map_err(AppError::Internal)?;
         let mut graph_guard = graph_memory.write();
 
         for edge in &graph.edges {
@@ -9199,8 +9307,7 @@ async fn import_mif(
         "import",
         &format!(
             "Imported {} memories, {} todos, {} edges. Skipped: {} duplicates, {} invalid",
-            imported.memories, imported.todos, imported.edges,
-            skipped.duplicates, skipped.invalid
+            imported.memories, imported.todos, imported.edges, skipped.duplicates, skipped.invalid
         ),
     );
 
@@ -9232,7 +9339,10 @@ impl PiiPatterns {
             email: regex::Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap(),
             phone: regex::Regex::new(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b").unwrap(),
             ssn: regex::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
-            api_key: regex::Regex::new(r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[\w-]{16,}['"]?"#).unwrap(),
+            api_key: regex::Regex::new(
+                r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[\w-]{16,}['"]?"#,
+            )
+            .unwrap(),
             credit_card: regex::Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").unwrap(),
             ip_address: regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap(),
         }
@@ -9253,7 +9363,10 @@ impl PiiPatterns {
                 position: (m.start(), m.end()),
             });
         }
-        redacted = self.email.replace_all(&redacted, "[REDACTED:email]").to_string();
+        redacted = self
+            .email
+            .replace_all(&redacted, "[REDACTED:email]")
+            .to_string();
 
         // Phone
         for m in self.phone.find_iter(content) {
@@ -9264,7 +9377,10 @@ impl PiiPatterns {
                 position: (m.start(), m.end()),
             });
         }
-        redacted = self.phone.replace_all(&redacted, "[REDACTED:phone]").to_string();
+        redacted = self
+            .phone
+            .replace_all(&redacted, "[REDACTED:phone]")
+            .to_string();
 
         // SSN
         for m in self.ssn.find_iter(content) {
@@ -9275,7 +9391,10 @@ impl PiiPatterns {
                 position: (m.start(), m.end()),
             });
         }
-        redacted = self.ssn.replace_all(&redacted, "[REDACTED:ssn]").to_string();
+        redacted = self
+            .ssn
+            .replace_all(&redacted, "[REDACTED:ssn]")
+            .to_string();
 
         // API keys
         for m in self.api_key.find_iter(content) {
@@ -9286,7 +9405,10 @@ impl PiiPatterns {
                 position: (m.start(), m.end()),
             });
         }
-        redacted = self.api_key.replace_all(&redacted, "[REDACTED:api_key]").to_string();
+        redacted = self
+            .api_key
+            .replace_all(&redacted, "[REDACTED:api_key]")
+            .to_string();
 
         // Credit card
         for m in self.credit_card.find_iter(content) {
@@ -9297,7 +9419,10 @@ impl PiiPatterns {
                 position: (m.start(), m.end()),
             });
         }
-        redacted = self.credit_card.replace_all(&redacted, "[REDACTED:credit_card]").to_string();
+        redacted = self
+            .credit_card
+            .replace_all(&redacted, "[REDACTED:credit_card]")
+            .to_string();
 
         (redacted, redactions, pii_found)
     }
@@ -9321,14 +9446,17 @@ struct MifEncryptionMeta {
     algorithm: String,
     key_derivation: String,
     encrypted_payload: String, // Base64-encoded ciphertext
-    iv: String,               // Base64-encoded IV (12 bytes for GCM)
-    auth_tag: String,         // Base64-encoded auth tag (16 bytes)
+    iv: String,                // Base64-encoded IV (12 bytes for GCM)
+    auth_tag: String,          // Base64-encoded auth tag (16 bytes)
 }
 
 /// Encrypt MIF export data using AES-256-GCM
-fn encrypt_mif_data(data: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, [u8; 12], [u8; 16]), anyhow::Error> {
+fn encrypt_mif_data(
+    data: &[u8],
+    key: &[u8; 32],
+) -> Result<(Vec<u8>, [u8; 12], [u8; 16]), anyhow::Error> {
     use aes_gcm::{
-        aead::{Aead, KeyInit, generic_array::GenericArray},
+        aead::{generic_array::GenericArray, Aead, KeyInit},
         Aes256Gcm, Nonce,
     };
     use rand::RngCore;
@@ -9342,7 +9470,8 @@ fn encrypt_mif_data(data: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, [u8; 12], [
     let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
 
     // Encrypt
-    let ciphertext = cipher.encrypt(nonce, data)
+    let ciphertext = cipher
+        .encrypt(nonce, data)
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
     // Extract auth tag (last 16 bytes of ciphertext in aes-gcm)
@@ -9354,9 +9483,14 @@ fn encrypt_mif_data(data: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, [u8; 12], [
 }
 
 /// Decrypt MIF export data using AES-256-GCM
-fn decrypt_mif_data(ciphertext: &[u8], key: &[u8; 32], nonce: &[u8; 12], auth_tag: &[u8; 16]) -> Result<Vec<u8>, anyhow::Error> {
+fn decrypt_mif_data(
+    ciphertext: &[u8],
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    auth_tag: &[u8; 16],
+) -> Result<Vec<u8>, anyhow::Error> {
     use aes_gcm::{
-        aead::{Aead, KeyInit, generic_array::GenericArray},
+        aead::{generic_array::GenericArray, Aead, KeyInit},
         Aes256Gcm, Nonce,
     };
 
@@ -9369,7 +9503,8 @@ fn decrypt_mif_data(ciphertext: &[u8], key: &[u8; 32], nonce: &[u8; 12], auth_ta
     let nonce = Nonce::from_slice(nonce);
 
     // Decrypt
-    cipher.decrypt(nonce, ct_with_tag.as_slice())
+    cipher
+        .decrypt(nonce, ct_with_tag.as_slice())
         .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))
 }
 
@@ -12088,9 +12223,15 @@ async fn create_todo(
             todo.embedding = Some(embedding.clone());
 
             // Index in vector store for semantic search
-            if let Ok(vector_id) = state.todo_store.index_todo_embedding(&req.user_id, &todo.id, &embedding) {
+            if let Ok(vector_id) =
+                state
+                    .todo_store
+                    .index_todo_embedding(&req.user_id, &todo.id, &embedding)
+            {
                 // Store vector_id to todo_id mapping
-                let _ = state.todo_store.store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
+                let _ = state
+                    .todo_store
+                    .store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
             }
         }
     }
@@ -12107,7 +12248,9 @@ async fn create_todo(
     } else {
         "Created".to_string()
     };
-    let _ = state.todo_store.add_activity(&req.user_id, &todo.id, activity_msg);
+    let _ = state
+        .todo_store
+        .add_activity(&req.user_id, &todo.id, activity_msg);
 
     // Create a memory from this todo - future plans affect how we function
     let memory_content = if let Some(ref proj) = project_name {
@@ -12248,7 +12391,9 @@ async fn list_todos(
             let query_clone = query.clone();
             let query_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_system.read();
-                memory_guard.compute_embedding(&query_clone).unwrap_or_default()
+                memory_guard
+                    .compute_embedding(&query_clone)
+                    .unwrap_or_default()
             })
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding failed: {e}")))?;
@@ -12264,7 +12409,10 @@ async fn list_todos(
                     .map_err(AppError::Internal)?;
 
                 // Extract todos (already sorted by similarity)
-                search_results.into_iter().map(|(todo, _score)| todo).collect()
+                search_results
+                    .into_iter()
+                    .map(|(todo, _score)| todo)
+                    .collect()
             }
         }
     } else if let Some(ref statuses) = status_filter {
@@ -12551,8 +12699,15 @@ async fn update_todo(
                 todo.embedding = Some(embedding.clone());
 
                 // Re-index in vector store
-                if let Ok(vector_id) = state.todo_store.index_todo_embedding(&req.user_id, &todo.id, &embedding) {
-                    let _ = state.todo_store.store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
+                if let Ok(vector_id) =
+                    state
+                        .todo_store
+                        .index_todo_embedding(&req.user_id, &todo.id, &embedding)
+                {
+                    let _ =
+                        state
+                            .todo_store
+                            .store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
                 }
             }
         }
@@ -12592,9 +12747,11 @@ async fn update_todo(
 
     // Add activity log entry to the todo itself (for todo activity view)
     if !update_description.is_empty() {
-        let _ = state
-            .todo_store
-            .add_activity(&req.user_id, &todo.id, format!("Updated: {}", update_description));
+        let _ = state.todo_store.add_activity(
+            &req.user_id,
+            &todo.id,
+            format!("Updated: {}", update_description),
+        );
     }
 
     if !update_description.is_empty() {
@@ -12721,7 +12878,9 @@ async fn complete_todo(
     if result.is_some() {
         let days_taken = (chrono::Utc::now() - todo.created_at).num_hours() as f64 / 24.0;
         let activity_msg = format!("Marked complete after {:.1} days", days_taken);
-        let _ = state.todo_store.add_activity(&req.user_id, &todo.id, activity_msg.clone());
+        let _ = state
+            .todo_store
+            .add_activity(&req.user_id, &todo.id, activity_msg.clone());
 
         // Create searchable memory for this completion event
         let memory_content = format!(
@@ -14337,7 +14496,9 @@ async fn list_sessions(
 ) -> Result<Json<ListSessionsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let sessions = state.session_store.get_user_sessions(&req.user_id, req.limit);
+    let sessions = state
+        .session_store
+        .get_user_sessions(&req.user_id, req.limit);
     let count = sessions.len();
 
     Ok(Json(ListSessionsResponse {
@@ -14355,8 +14516,10 @@ async fn get_session(
 ) -> Result<Json<GetSessionResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let uuid = uuid::Uuid::parse_str(&session_id)
-        .map_err(|e| AppError::InvalidInput { field: "session_id".to_string(), reason: format!("Invalid UUID: {e}") })?;
+    let uuid = uuid::Uuid::parse_str(&session_id).map_err(|e| AppError::InvalidInput {
+        field: "session_id".to_string(),
+        reason: format!("Invalid UUID: {e}"),
+    })?;
     let sid = SessionId(uuid);
     let session = state.session_store.get_session(&sid);
 
@@ -14500,14 +14663,22 @@ async fn main() -> Result<()> {
             let extractor = manager_for_maintenance.streaming_extractor().clone();
             let cleaned = extractor.cleanup_stale_sessions().await;
             if cleaned > 0 {
-                tracing::debug!("Streaming session cleanup: removed {} stale sessions", cleaned);
+                tracing::debug!(
+                    "Streaming session cleanup: removed {} stale sessions",
+                    cleaned
+                );
             }
 
             // Clean up stale user activity sessions (SessionStore)
             // Sessions that have been inactive for too long are auto-ended
-            let session_cleaned = manager_for_maintenance.session_store.cleanup_stale_sessions();
+            let session_cleaned = manager_for_maintenance
+                .session_store
+                .cleanup_stale_sessions();
             if session_cleaned > 0 {
-                tracing::debug!("User session cleanup: ended {} stale sessions", session_cleaned);
+                tracing::debug!(
+                    "User session cleanup: ended {} stale sessions",
+                    session_cleaned
+                );
             }
 
             // Run maintenance + periodic flush in blocking thread pool

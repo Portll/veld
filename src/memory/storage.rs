@@ -274,13 +274,17 @@ impl MemoryStorage {
     pub fn get(&self, id: &MemoryId) -> Result<Memory> {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
-            Some(value) => bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()).map(|(v, _)| v).with_context(|| {
-                format!(
-                    "Failed to deserialize memory {} ({} bytes)",
-                    id.0,
-                    value.len()
-                )
-            }),
+            Some(value) => {
+                bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard())
+                    .map(|(v, _)| v)
+                    .with_context(|| {
+                        format!(
+                            "Failed to deserialize memory {} ({} bytes)",
+                            id.0,
+                            value.len()
+                        )
+                    })
+            }
             None => Err(anyhow!("Memory not found: {id:?}")),
         }
     }
@@ -832,7 +836,10 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()) {
+                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     memories.push(memory);
                 }
             }
@@ -852,7 +859,10 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()) {
+                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     if !memory.compressed && memory.created_at < cutoff {
                         memories.push(memory);
                     }
@@ -878,7 +888,10 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok((mut memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()) {
+                if let Ok((mut memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     if memory.created_at < cutoff {
                         // Add forgotten flag to metadata
                         memory
@@ -890,7 +903,8 @@ impl MemoryStorage {
                             .metadata
                             .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
 
-                        let updated_value = bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
+                        let updated_value =
+                            bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
                         self.db.put_opt(&key, updated_value, &write_opts)?;
                         count += 1;
                     }
@@ -916,7 +930,10 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok((mut memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()) {
+                if let Ok((mut memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     if memory.importance() < threshold {
                         memory
                             .experience
@@ -927,7 +944,8 @@ impl MemoryStorage {
                             .metadata
                             .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
 
-                        let updated_value = bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
+                        let updated_value =
+                            bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
                         self.db.put_opt(&key, updated_value, &write_opts)?;
                         count += 1;
                     }
@@ -950,7 +968,10 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()) {
+                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     if regex.is_match(&memory.experience.content) {
                         to_delete.push(key.to_vec());
                         count += 1;
@@ -1008,7 +1029,12 @@ impl MemoryStorage {
                         continue;
                     }
 
-                    match bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
+                    match bincode::serde::decode_from_slice::<Memory, _>(
+                        &value,
+                        bincode::config::standard(),
+                    )
+                    .map(|(v, _)| v)
+                    {
                         Ok(memory) => {
                             stats.total_count += 1;
                             stats.total_size_bytes += value.len();
@@ -1108,7 +1134,12 @@ impl MemoryStorage {
                         key.len()
                     );
                     to_delete.push(key.to_vec());
-                } else if bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()).is_err() {
+                } else if bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                )
+                .is_err()
+                {
                     // Key is valid but value is corrupted
                     tracing::debug!(
                         "Marking for deletion: valid key but corrupted value ({} bytes)",
@@ -1450,15 +1481,14 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", memory.id.0);
 
         // Load existing mapping (for adding new modality to existing memory)
-        let mut mapping_entry = self
-            .get_vector_mapping(&memory.id)?
-            .unwrap_or_default();
+        let mut mapping_entry = self.get_vector_mapping(&memory.id)?.unwrap_or_default();
 
         // Add/update the modality vectors
         mapping_entry.add_modality(modality, vector_ids);
 
-        let mapping_value = bincode::serde::encode_to_vec(&mapping_entry, bincode::config::standard())
-            .context("Failed to serialize vector mapping")?;
+        let mapping_value =
+            bincode::serde::encode_to_vec(&mapping_entry, bincode::config::standard())
+                .context("Failed to serialize vector mapping")?;
         batch.put(mapping_key.as_bytes(), &mapping_value);
 
         // 3. Atomic write - both succeed or both fail
@@ -1481,8 +1511,9 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", memory_id.0);
         match self.db.get(mapping_key.as_bytes())? {
             Some(data) => {
-                let (entry, _): (VectorMappingEntry, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                    .context("Failed to deserialize vector mapping")?;
+                let (entry, _): (VectorMappingEntry, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())
+                        .context("Failed to deserialize vector mapping")?;
                 Ok(Some(entry))
             }
             None => Ok(None),
@@ -1497,10 +1528,9 @@ impl MemoryStorage {
         let mut mappings = Vec::new();
         let prefix = b"vmapping:";
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix,
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
 
         for item in iter {
             match item {
@@ -1513,7 +1543,12 @@ impl MemoryStorage {
                     // Extract memory_id from key
                     if let Some(id_str) = key_str.strip_prefix("vmapping:") {
                         if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                            if let Ok((entry, _)) = bincode::serde::decode_from_slice::<VectorMappingEntry, _>(&value, bincode::config::standard()) {
+                            if let Ok((entry, _)) =
+                                bincode::serde::decode_from_slice::<VectorMappingEntry, _>(
+                                    &value,
+                                    bincode::config::standard(),
+                                )
+                            {
                                 mappings.push((MemoryId(uuid), entry));
                             }
                         }
@@ -1556,18 +1591,18 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", memory_id.0);
 
         // Load existing mapping to preserve other modalities
-        let mut mapping_entry = self
-            .get_vector_mapping(memory_id)?
-            .unwrap_or_default();
+        let mut mapping_entry = self.get_vector_mapping(memory_id)?.unwrap_or_default();
 
         // Update the specific modality
         mapping_entry.add_modality(modality, vector_ids);
 
-        let mapping_value = bincode::serde::encode_to_vec(&mapping_entry, bincode::config::standard())?;
+        let mapping_value =
+            bincode::serde::encode_to_vec(&mapping_entry, bincode::config::standard())?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.db.put_opt(mapping_key.as_bytes(), &mapping_value, &write_opts)?;
+        self.db
+            .put_opt(mapping_key.as_bytes(), &mapping_value, &write_opts)?;
         Ok(())
     }
 
@@ -1598,10 +1633,9 @@ impl MemoryStorage {
     /// Count memories with vector mappings (for health checks)
     pub fn count_vector_mappings(&self) -> usize {
         let prefix = b"vmapping:";
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix,
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
 
         let mut count = 0;
         for item in iter {
@@ -1632,7 +1666,10 @@ impl MemoryStorage {
                 }
 
                 // Try to deserialize as memory
-                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(&value, bincode::config::standard()) {
+                if let Ok((memory, _)) = bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
                     // Check if vector mapping exists and has text vectors
                     let has_mapping = match self.get_vector_mapping(&memory.id) {
                         Ok(Some(entry)) => entry.text_vectors().is_some_and(|v| !v.is_empty()),

@@ -145,7 +145,10 @@ pub static MEMORY_RETRIEVE_RESULTS: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// Embedding generation operations
 pub static EMBEDDING_GENERATE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("shodh_embedding_generate_total", "Total embedding generations"),
+        Opts::new(
+            "shodh_embedding_generate_total",
+            "Total embedding generations",
+        ),
         &["mode", "result"], // mode: "onnx" or "simplified"
     )
     .expect("EMBEDDING_GENERATE_TOTAL metric must be valid at compile time")
@@ -158,7 +161,9 @@ pub static EMBEDDING_GENERATE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|
             "shodh_embedding_generate_duration_seconds",
             "Embedding generation duration",
         )
-        .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]),
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ]),
         &["mode"],
     )
     .expect("EMBEDDING_GENERATE_DURATION metric must be valid at compile time")
@@ -220,7 +225,10 @@ pub static VECTOR_INDEX_SIZE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Vector search operations
 pub static VECTOR_SEARCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("shodh_vector_search_total", "Total vector search operations"),
+        Opts::new(
+            "shodh_vector_search_total",
+            "Total vector search operations",
+        ),
         &["result"],
     )
     .expect("VECTOR_SEARCH_TOTAL metric must be valid at compile time")
@@ -384,7 +392,9 @@ pub static BATCH_STORE_SIZE: LazyLock<Histogram> = LazyLock::new(|| {
             "shodh_batch_store_size",
             "Number of memories in batch store operations",
         )
-        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]),
+        .buckets(vec![
+            1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+        ]),
     )
     .expect("BATCH_STORE_SIZE metric must be valid at compile time")
 });

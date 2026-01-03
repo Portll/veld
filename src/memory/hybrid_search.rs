@@ -257,7 +257,13 @@ impl BM25Index {
             Err(e) => {
                 debug!("BM25 query parse error for '{}': {}", query, e);
                 // Fall back to simple term query
-                let escaped = query.replace([':', '^', '~', '*', '?', '[', ']', '{', '}', '(', ')', '"', '\\', '/', '+', '-', '!', '&', '|'], " ");
+                let escaped = query.replace(
+                    [
+                        ':', '^', '~', '*', '?', '[', ']', '{', '}', '(', ')', '"', '\\', '/', '+',
+                        '-', '!', '&', '|',
+                    ],
+                    " ",
+                );
                 match query_parser.parse_query(&escaped) {
                     Ok(q) => q,
                     Err(_) => return Ok(Vec::new()),
@@ -329,7 +335,10 @@ impl RRFusion {
             vec![1.0 / weights.len() as f32; weights.len()]
         };
 
-        Self { k, weights: normalized }
+        Self {
+            k,
+            weights: normalized,
+        }
     }
 
     /// Fuse multiple ranked lists into a single ranking
@@ -351,9 +360,9 @@ impl RRFusion {
                 *scores.entry(memory_id.clone()).or_insert(0.0) += rrf_contribution;
 
                 // Track original scores for debugging
-                let orig = original_scores.entry(memory_id.clone()).or_insert_with(|| {
-                    vec![None; ranked_lists.len()]
-                });
+                let orig = original_scores
+                    .entry(memory_id.clone())
+                    .or_insert_with(|| vec![None; ranked_lists.len()]);
                 if list_idx < orig.len() {
                     orig[list_idx] = Some(*score);
                 }
@@ -594,7 +603,9 @@ impl HybridSearchEngine {
 
                 // Re-sort by final score
                 results.sort_by(|a, b| {
-                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
 
                 results
@@ -673,7 +684,8 @@ impl HybridSearchEngine {
         const BATCH_SIZE: usize = 100;
 
         for (memory_id, content, tags, entities) in memories {
-            self.bm25_index.upsert(&memory_id, &content, &tags, &entities)?;
+            self.bm25_index
+                .upsert(&memory_id, &content, &tags, &entities)?;
             count += 1;
             batch_count += 1;
 
@@ -711,18 +723,10 @@ mod tests {
         let id3 = MemoryId(uuid::Uuid::new_v4());
 
         // List 1: id1 > id2 > id3
-        let list1 = vec![
-            (id1.clone(), 0.9),
-            (id2.clone(), 0.7),
-            (id3.clone(), 0.5),
-        ];
+        let list1 = vec![(id1.clone(), 0.9), (id2.clone(), 0.7), (id3.clone(), 0.5)];
 
         // List 2: id2 > id1 > id3
-        let list2 = vec![
-            (id2.clone(), 0.95),
-            (id1.clone(), 0.6),
-            (id3.clone(), 0.4),
-        ];
+        let list2 = vec![(id2.clone(), 0.95), (id1.clone(), 0.6), (id3.clone(), 0.4)];
 
         let fused = rrf.fuse(vec![list1, list2]);
 
@@ -737,11 +741,20 @@ mod tests {
         let id3_score = fused.iter().find(|(id, _)| *id == id3).unwrap().1;
 
         // id1 and id2 should have equal scores (symmetric ranking)
-        assert!((id1_score - id2_score).abs() < 0.0001, "id1 and id2 should have equal RRF scores");
+        assert!(
+            (id1_score - id2_score).abs() < 0.0001,
+            "id1 and id2 should have equal RRF scores"
+        );
 
         // id3 should be last (lowest score)
-        assert!(id3_score < id1_score, "id3 should have lower score than id1");
-        assert!(id3_score < id2_score, "id3 should have lower score than id2");
+        assert!(
+            id3_score < id1_score,
+            "id3 should have lower score than id1"
+        );
+        assert!(
+            id3_score < id2_score,
+            "id3 should have lower score than id2"
+        );
         assert_eq!(fused[2].0, id3, "id3 should be ranked last");
     }
 
@@ -909,7 +922,10 @@ mod tests {
 
         // With vector weighted higher, id2 should win
         let fused_vector = rrf_vector_heavy.fuse(vec![bm25_list, vector_list]);
-        assert_eq!(fused_vector[0].0, id2, "Vector-heavy should favor vector winner");
+        assert_eq!(
+            fused_vector[0].0, id2,
+            "Vector-heavy should favor vector winner"
+        );
     }
 
     #[test]
@@ -926,16 +942,8 @@ mod tests {
         // id1 is #1 in list1, #3 in list2
         // id3 is #3 in list1, #1 in list2
         // id2 is #2 in both lists
-        let list1 = vec![
-            (id1.clone(), 0.9),
-            (id2.clone(), 0.7),
-            (id3.clone(), 0.5),
-        ];
-        let list2 = vec![
-            (id3.clone(), 0.9),
-            (id2.clone(), 0.7),
-            (id1.clone(), 0.5),
-        ];
+        let list1 = vec![(id1.clone(), 0.9), (id2.clone(), 0.7), (id3.clone(), 0.5)];
+        let list2 = vec![(id3.clone(), 0.9), (id2.clone(), 0.7), (id1.clone(), 0.5)];
 
         let fused_low_k = rrf_low_k.fuse(vec![list1.clone(), list2.clone()]);
         let fused_high_k = rrf_high_k.fuse(vec![list1, list2]);

@@ -329,7 +329,10 @@ impl RetrievalEngine {
                         id_mapping.insert(memory.id.clone(), vector_id);
 
                         // Store mapping in RocksDB for future startups
-                        if let Err(e) = self.storage.update_vector_mapping(&memory.id, vec![vector_id]) {
+                        if let Err(e) = self
+                            .storage
+                            .update_vector_mapping(&memory.id, vec![vector_id])
+                        {
                             tracing::warn!("Failed to persist mapping for {}: {}", memory.id.0, e);
                             failed += 1;
                         } else {

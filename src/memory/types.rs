@@ -2221,7 +2221,8 @@ impl SessionMemory {
 
     /// Add shared memory (zero-copy)
     pub fn add_shared(&mut self, memory: SharedMemory) -> anyhow::Result<()> {
-        let memory_size = bincode::serde::encode_to_vec(&*memory, bincode::config::standard())?.len();
+        let memory_size =
+            bincode::serde::encode_to_vec(&*memory, bincode::config::standard())?.len();
 
         // Check if adding would exceed limit
         if self.current_size_bytes + memory_size > self.max_size_mb * 1024 * 1024 {
