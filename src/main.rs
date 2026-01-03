@@ -407,19 +407,23 @@ use graph_memory::{
     RelationType, RelationshipEdge,
 };
 use memory::{
+    context::ContextBuilder,
     extract_entities_simple,
+    facts::SemanticFactStore,
     injection::{
         compute_relevance, InjectionCandidate, InjectionConfig, InjectionEngine, RelevanceInput,
     },
     process_implicit_feedback,
     prospective::ProspectiveStore,
     segmentation::{InputSource, SegmentationEngine},
-    todo_formatter, ActivatedMemory, Experience, ExperienceType, FeedbackStore, FileMemoryStats,
-    FileMemoryStore, GraphStats as VisualizationStats, IndexingResult, Memory, MemoryConfig,
-    MemoryId, MemoryStats, MemorySystem, PendingFeedback, Project, ProjectId, ProjectStats,
-    ProjectStatus, ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger,
-    Query as MemoryQuery, Recurrence, SharedMemory, SurfacedMemoryInfo, Todo, TodoComment,
-    TodoCommentId, TodoCommentType, TodoId, TodoPriority, TodoStatus, TodoStore, UserTodoStats,
+    todo_formatter, ActivatedMemory, EpisodeContext, Experience, ExperienceType, FeedbackStore,
+    FileMemoryStats, FileMemoryStore, GraphStats as VisualizationStats, IndexingResult, Memory,
+    MemoryConfig, MemoryId, MemoryStats, MemorySystem, PendingFeedback, Project, ProjectId,
+    ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus,
+    ProspectiveTrigger, Query as MemoryQuery, Recurrence, Session, SessionEvent, SessionId,
+    SessionStore, SessionStoreStats, SessionSummary, SharedMemory, SurfacedMemoryInfo, Todo,
+    TodoComment, TodoCommentId, TodoCommentType, TodoId, TodoPriority, TodoStatus, TodoStore,
+    UserTodoStats,
 };
 
 /// Audit event for history tracking
@@ -630,6 +634,14 @@ pub struct MultiUserMemoryManager {
 
     /// A/B testing manager for relevance scoring experiments
     ab_test_manager: Arc<ab_testing::ABTestManager>,
+
+    /// Semantic fact store for durable knowledge (AUD-7)
+    /// Stores facts extracted from episodic memories during consolidation
+    fact_store: Arc<SemanticFactStore>,
+
+    /// Session tracking store for user sessions
+    /// Tracks session lifecycle, events, and statistics
+    session_store: Arc<SessionStore>,
 }
 
 impl MultiUserMemoryManager {
@@ -786,6 +798,15 @@ impl MultiUserMemoryManager {
             info!("💾 Backup engine initialized (auto-backup disabled)");
         }
 
+        // Initialize semantic fact store for durable knowledge (AUD-7)
+        let facts_path = base_path.join("semantic_facts");
+        let mut facts_opts = rocksdb::Options::default();
+        facts_opts.create_if_missing(true);
+        facts_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        let facts_db = Arc::new(rocksdb::DB::open(&facts_opts, &facts_path)?);
+        let fact_store = Arc::new(SemanticFactStore::new(facts_db));
+        info!("🧠 Semantic fact store initialized");
+
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -810,6 +831,8 @@ impl MultiUserMemoryManager {
                 tx
             },
             ab_test_manager: Arc::new(ab_testing::ABTestManager::new()),
+            fact_store,
+            session_store: Arc::new(SessionStore::new()),
         };
 
         // Perform initial audit log rotation on startup
@@ -1548,15 +1571,43 @@ impl MultiUserMemoryManager {
         let user_count = user_ids.len();
 
         let mut edges_decayed = 0;
+        let mut edges_strengthened = 0;
 
         for user_id in user_ids {
             // Re-acquire memory for each user (may have been evicted)
-            if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+            let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
                 match memory.run_maintenance(decay_factor) {
-                    Ok(count) => total_processed += count,
+                    Ok(result) => {
+                        total_processed += result.decayed_count;
+                        Some(result)
+                    }
                     Err(e) => {
                         tracing::warn!("Maintenance failed for user {}: {}", user_id, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Apply Hebbian edge boosts from replay consolidation
+            if let Some(ref result) = maintenance_result {
+                if !result.edge_boosts.is_empty() {
+                    if let Ok(graph) = self.get_user_graph(&user_id) {
+                        let graph_guard = graph.write();
+                        match graph_guard.strengthen_memory_edges(&result.edge_boosts) {
+                            Ok(count) => {
+                                edges_strengthened += count;
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Edge boost application failed for user {}: {}",
+                                    user_id,
+                                    e
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1576,8 +1627,9 @@ impl MultiUserMemoryManager {
         }
 
         tracing::info!(
-            "Maintenance complete: {} memories processed, {} weak edges pruned across {} users",
+            "Maintenance complete: {} memories processed, {} edges strengthened, {} weak edges pruned across {} users",
             total_processed,
+            edges_strengthened,
             edges_decayed,
             user_count
         );
@@ -1672,6 +1724,9 @@ impl MultiUserMemoryManager {
 struct RecordRequest {
     user_id: String,
     experience: Experience,
+    /// Optional session ID for linking memory to a Claude Code session (AUD-8)
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2069,6 +2124,10 @@ struct ConsolidateResponse {
     facts_extracted: usize,
     facts_reinforced: usize,
     fact_ids: Vec<String>,
+    /// AUD-9: Replay manager stats
+    memories_replayed: usize,
+    edges_strengthened: usize,
+    memories_decayed: usize,
 }
 
 /// Application state
@@ -2687,9 +2746,38 @@ async fn record_experience(
         }
     }
 
-    // Create experience with merged entities
+    // AUD-8: Create context with session_id if provided
+    let context = if let Some(ref session_id) = req.session_id {
+        // Build episode context with session_id
+        let episode = EpisodeContext {
+            episode_id: Some(session_id.clone()),
+            episode_type: Some("session".to_string()),
+            episode_start: Some(chrono::Utc::now()),
+            is_episode_start: true,
+            ..Default::default()
+        };
+
+        // If experience already has context, update its episode field
+        // Otherwise create a new context with just the episode
+        if let Some(mut ctx) = req.experience.context.clone() {
+            ctx.episode = episode;
+            ctx.updated_at = chrono::Utc::now();
+            Some(ctx)
+        } else {
+            Some(
+                ContextBuilder::new()
+                    .with_episode(episode)
+                    .build(),
+            )
+        }
+    } else {
+        req.experience.context.clone()
+    };
+
+    // Create experience with merged entities and session context
     let experience_with_entities = Experience {
         entities: merged_entities,
+        context,
         ..req.experience.clone()
     };
 
@@ -2977,6 +3065,19 @@ async fn remember(
     metrics::MEMORY_STORE_TOTAL
         .with_label_values(&["success"])
         .inc();
+
+    // Track session event (get-or-create session for user)
+    let session_id = state.session_store.get_or_create_session(&req.user_id);
+    state.session_store.add_event(
+        &session_id,
+        SessionEvent::MemoryCreated {
+            timestamp: chrono::Utc::now(),
+            memory_id: memory_id.0.to_string(),
+            memory_type: experience_type_str.clone(),
+            content_preview: req.content.chars().take(100).collect(),
+            entities: req.tags.clone(),
+        },
+    );
 
     // Broadcast CREATE event for real-time dashboard
     state.emit_event(MemoryEvent {
@@ -5698,11 +5799,12 @@ async fn proactive_context(
                         .get_memory_hebbian_strength(&m.id)
                         .unwrap_or(0.3);
 
-                    // Get feedback momentum EMA (0.0 if no feedback history)
+                    // Get feedback momentum EMA with time decay (0.0 if no feedback history)
                     // Negative values indicate often-ignored memories → suppression
+                    // AUD-6: Apply time-based decay so stale momentum fades
                     let feedback_momentum = feedback_guard
                         .get_momentum(&m.id)
-                        .map(|fm| fm.ema)
+                        .map(|fm| fm.ema_with_decay())
                         .unwrap_or(0.0);
 
                     let input = RelevanceInput {
@@ -6070,6 +6172,27 @@ async fn proactive_context(
             req.auto_ingest
         ),
     );
+
+    // Track session event for memories surfaced
+    if memory_count > 0 {
+        let session_id = state.session_store.get_or_create_session(&req.user_id);
+        let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+        let avg_score = if !memories.is_empty() {
+            memories.iter().map(|m| m.score).sum::<f32>() / memories.len() as f32
+        } else {
+            0.0
+        };
+        state.session_store.add_event(
+            &session_id,
+            SessionEvent::MemoriesSurfaced {
+                timestamp: chrono::Utc::now(),
+                query_preview: req.context.chars().take(100).collect(),
+                memory_count,
+                memory_ids,
+                avg_score,
+            },
+        );
+    }
 
     Ok(Json(ProactiveContextResponse {
         memories,
@@ -6727,12 +6850,59 @@ async fn consolidate_memories(
         .map_err(AppError::Internal)?
     };
 
+    // AUD-7: Store extracted facts in the semantic fact store
+    if !result.new_facts.is_empty() {
+        match state.fact_store.store_batch(&req.user_id, &result.new_facts) {
+            Ok(stored) => {
+                tracing::info!(
+                    user_id = %req.user_id,
+                    facts_stored = stored,
+                    "Stored extracted facts in semantic fact store"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %req.user_id,
+                    error = %e,
+                    "Failed to store extracted facts"
+                );
+            }
+        }
+    }
+
+    // AUD-9: Run memory replay/maintenance cycle
+    // This includes: tier consolidation, decay, graph maintenance, and memory replay
+    let maintenance_result = {
+        let memory = memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let memory_guard = memory.read();
+            // run_maintenance returns the number of decayed memories
+            memory_guard.run_maintenance(0.95) // 5% decay factor
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Maintenance task panicked: {e}")))?
+        .unwrap_or(0)
+    };
+
+    // Get replay stats from the consolidation report (last cycle)
+    let (memories_replayed, edges_strengthened) = {
+        let memory_guard = memory.read();
+        let report = memory_guard.get_consolidation_report(
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            Some(chrono::Utc::now()),
+        );
+        (report.statistics.memories_replayed, report.statistics.edges_strengthened)
+    };
+
     tracing::info!(
         user_id = %req.user_id,
         memories_processed = result.memories_processed,
         facts_extracted = result.facts_extracted,
         facts_reinforced = result.facts_reinforced,
-        "Semantic consolidation complete"
+        memories_replayed = memories_replayed,
+        edges_strengthened = edges_strengthened,
+        memories_decayed = maintenance_result,
+        "Semantic consolidation and replay complete"
     );
 
     // Record metrics
@@ -6747,6 +6917,9 @@ async fn consolidate_memories(
         facts_extracted: result.facts_extracted,
         facts_reinforced: result.facts_reinforced,
         fact_ids: result.new_fact_ids,
+        memories_replayed,
+        edges_strengthened,
+        memories_decayed: maintenance_result,
     }))
 }
 
@@ -11935,6 +12108,14 @@ async fn create_todo(
         .store_todo(&todo)
         .map_err(AppError::Internal)?;
 
+    // Add creation activity log
+    let activity_msg = if let Some(ref proj) = project_name {
+        format!("Created in project '{}'", proj)
+    } else {
+        "Created".to_string()
+    };
+    let _ = state.todo_store.add_activity(&req.user_id, &todo.id, activity_msg);
+
     // Create a memory from this todo - future plans affect how we function
     let memory_content = if let Some(ref proj) = project_name {
         format!(
@@ -12004,6 +12185,18 @@ async fn create_todo(
         importance: None,
         count: None,
     });
+
+    // Track session event for todo creation
+    let session_id = state.session_store.get_or_create_session(&req.user_id);
+    state.session_store.add_event(
+        &session_id,
+        SessionEvent::TodoCreated {
+            timestamp: chrono::Utc::now(),
+            todo_id: todo.id.0.to_string(),
+            content: todo.content.chars().take(100).collect(),
+            project: project_name.clone(),
+        },
+    );
 
     tracing::info!(
         user_id = %req.user_id,
@@ -12404,6 +12597,13 @@ async fn update_todo(
         changes.join(", ")
     };
 
+    // Add activity log entry to the todo itself (for todo activity view)
+    if !update_description.is_empty() {
+        let _ = state
+            .todo_store
+            .add_activity(&req.user_id, &todo.id, format!("Updated: {}", update_description));
+    }
+
     if !update_description.is_empty() {
         let memory_content = format!(
             "[{}] Todo updated ({}): {}",
@@ -12524,6 +12724,68 @@ async fn complete_todo(
         .complete_todo(&req.user_id, &todo.id)
         .map_err(AppError::Internal)?;
 
+    // Add activity log for completion and create indexed memory
+    if result.is_some() {
+        let days_taken = (chrono::Utc::now() - todo.created_at).num_hours() as f64 / 24.0;
+        let activity_msg = format!("Marked complete after {:.1} days", days_taken);
+        let _ = state.todo_store.add_activity(&req.user_id, &todo.id, activity_msg.clone());
+
+        // Create searchable memory for this completion event
+        let memory_content = format!(
+            "[{}] Todo completed: {} (took {:.1} days)",
+            todo.short_id(),
+            todo.content,
+            days_taken
+        );
+
+        let mut tags = vec![
+            format!("todo:{}", todo.short_id()),
+            "todo-completed".to_string(),
+            "completion".to_string(),
+        ];
+        if let Some(ref project_id) = todo.project_id {
+            if let Ok(Some(project)) = state.todo_store.get_project(&req.user_id, project_id) {
+                tags.push(format!("project:{}", project.name));
+            }
+        }
+
+        let experience = Experience {
+            content: memory_content,
+            experience_type: ExperienceType::Task,
+            tags,
+            ..Default::default()
+        };
+
+        // Store as indexed memory (async, non-blocking)
+        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+            let memory_clone = memory.clone();
+            let exp_clone = experience.clone();
+            let state_clone = state.clone();
+            let user_id = req.user_id.clone();
+
+            tokio::spawn(async move {
+                let memory_result = tokio::task::spawn_blocking(move || {
+                    let memory_guard = memory_clone.read();
+                    memory_guard.remember(exp_clone, None)
+                })
+                .await;
+
+                if let Ok(Ok(memory_id)) = memory_result {
+                    if let Err(e) =
+                        state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                    {
+                        tracing::debug!(
+                            "Graph processing failed for todo completion memory {}: {}",
+                            memory_id.0,
+                            e
+                        );
+                    }
+                    tracing::debug!(memory_id = %memory_id.0, "Todo completion stored as searchable memory");
+                }
+            });
+        }
+    }
+
     match result {
         Some((completed, next)) => {
             let formatted = todo_formatter::format_todo_completed(&completed, next.as_ref());
@@ -12539,6 +12801,16 @@ async fn complete_todo(
                 importance: None,
                 count: None,
             });
+
+            // Track session event for todo completion
+            let session_id = state.session_store.get_or_create_session(&req.user_id);
+            state.session_store.add_event(
+                &session_id,
+                SessionEvent::TodoCompleted {
+                    timestamp: chrono::Utc::now(),
+                    todo_id: completed.id.0.to_string(),
+                },
+            );
 
             tracing::info!(
                 user_id = %req.user_id,
@@ -12627,6 +12899,63 @@ async fn delete_todo(
             importance: None,
             count: None,
         });
+
+        // Create searchable memory for deletion event (todo itself is gone, but we remember the action)
+        let days_existed = (chrono::Utc::now() - todo.created_at).num_hours() as f64 / 24.0;
+        let memory_content = format!(
+            "[{}] Todo deleted: {} (existed {:.1} days, status was {:?})",
+            todo.short_id(),
+            todo.content,
+            days_existed,
+            todo.status
+        );
+
+        let mut tags = vec![
+            format!("todo:{}", todo.short_id()),
+            "todo-deleted".to_string(),
+            "deletion".to_string(),
+        ];
+        if let Some(ref project_id) = todo.project_id {
+            if let Ok(Some(project)) = state.todo_store.get_project(&query.user_id, project_id) {
+                tags.push(format!("project:{}", project.name));
+            }
+        }
+
+        let experience = Experience {
+            content: memory_content,
+            experience_type: ExperienceType::Context,
+            tags,
+            ..Default::default()
+        };
+
+        // Store as indexed memory (async, non-blocking)
+        if let Ok(memory) = state.get_user_memory(&query.user_id) {
+            let memory_clone = memory.clone();
+            let exp_clone = experience.clone();
+            let state_clone = state.clone();
+            let user_id = query.user_id.clone();
+
+            tokio::spawn(async move {
+                let memory_result = tokio::task::spawn_blocking(move || {
+                    let memory_guard = memory_clone.read();
+                    memory_guard.remember(exp_clone, None)
+                })
+                .await;
+
+                if let Ok(Ok(memory_id)) = memory_result {
+                    if let Err(e) =
+                        state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                    {
+                        tracing::debug!(
+                            "Graph processing failed for todo deletion memory {}: {}",
+                            memory_id.0,
+                            e
+                        );
+                    }
+                    tracing::debug!(memory_id = %memory_id.0, "Todo deletion stored as searchable memory");
+                }
+            });
+        }
 
         tracing::info!(
             user_id = %query.user_id,
@@ -13022,6 +13351,59 @@ async fn update_todo_comment(
             reason: "Comment not found".to_string(),
         })?;
 
+    // Create searchable memory for comment edit
+    let memory_content = format!(
+        "[{}] Comment updated on todo '{}': {}",
+        todo.short_id(),
+        todo.content.chars().take(50).collect::<String>(),
+        req.content
+    );
+
+    let mut tags = vec![
+        format!("todo:{}", todo.short_id()),
+        "todo-comment-updated".to_string(),
+    ];
+    if let Some(ref project_id) = todo.project_id {
+        if let Ok(Some(project)) = state.todo_store.get_project(&req.user_id, project_id) {
+            tags.push(format!("project:{}", project.name));
+        }
+    }
+
+    let experience = Experience {
+        content: memory_content,
+        experience_type: ExperienceType::Context,
+        tags,
+        ..Default::default()
+    };
+
+    // Store as indexed memory (async, non-blocking)
+    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        let memory_clone = memory.clone();
+        let exp_clone = experience.clone();
+        let state_clone = state.clone();
+        let user_id = req.user_id.clone();
+
+        tokio::spawn(async move {
+            let memory_result = tokio::task::spawn_blocking(move || {
+                let memory_guard = memory_clone.read();
+                memory_guard.remember(exp_clone, None)
+            })
+            .await;
+
+            if let Ok(Ok(memory_id)) = memory_result {
+                if let Err(e) =
+                    state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                {
+                    tracing::debug!(
+                        "Graph processing failed for comment update memory {}: {}",
+                        memory_id.0,
+                        e
+                    );
+                }
+            }
+        });
+    }
+
     let formatted = format!(
         "✓ Updated comment on {}\n\n  Updated content:\n  {}",
         todo.short_id(),
@@ -13087,6 +13469,58 @@ async fn delete_todo_comment(
             importance: None,
             count: None,
         });
+
+        // Create searchable memory for comment deletion
+        let memory_content = format!(
+            "[{}] Comment deleted from todo '{}'",
+            todo.short_id(),
+            todo.content.chars().take(50).collect::<String>()
+        );
+
+        let mut tags = vec![
+            format!("todo:{}", todo.short_id()),
+            "todo-comment-deleted".to_string(),
+        ];
+        if let Some(ref project_id) = todo.project_id {
+            if let Ok(Some(project)) = state.todo_store.get_project(&query.user_id, project_id) {
+                tags.push(format!("project:{}", project.name));
+            }
+        }
+
+        let experience = Experience {
+            content: memory_content,
+            experience_type: ExperienceType::Context,
+            tags,
+            ..Default::default()
+        };
+
+        // Store as indexed memory (async, non-blocking)
+        if let Ok(memory) = state.get_user_memory(&query.user_id) {
+            let memory_clone = memory.clone();
+            let exp_clone = experience.clone();
+            let state_clone = state.clone();
+            let user_id = query.user_id.clone();
+
+            tokio::spawn(async move {
+                let memory_result = tokio::task::spawn_blocking(move || {
+                    let memory_guard = memory_clone.read();
+                    memory_guard.remember(exp_clone, None)
+                })
+                .await;
+
+                if let Ok(Ok(memory_id)) = memory_result {
+                    if let Err(e) =
+                        state_clone.process_experience_into_graph(&user_id, &experience, &memory_id)
+                    {
+                        tracing::debug!(
+                            "Graph processing failed for comment delete memory {}: {}",
+                            memory_id.0,
+                            e
+                        );
+                    }
+                }
+            });
+        }
     }
 
     tracing::debug!(
@@ -13840,6 +14274,142 @@ async fn get_todo_stats(
     }))
 }
 
+// =============================================================================
+// SESSION MANAGEMENT - Track user sessions with timeline and statistics
+// =============================================================================
+
+/// Request for listing user sessions
+#[derive(Debug, Deserialize)]
+struct ListSessionsRequest {
+    user_id: String,
+    #[serde(default = "default_sessions_limit")]
+    limit: usize,
+}
+
+fn default_sessions_limit() -> usize {
+    10
+}
+
+/// Response for listing sessions
+#[derive(Debug, Serialize)]
+struct ListSessionsResponse {
+    success: bool,
+    sessions: Vec<SessionSummary>,
+    count: usize,
+}
+
+/// Request for getting a specific session
+#[derive(Debug, Deserialize)]
+struct GetSessionRequest {
+    user_id: String,
+}
+
+/// Response for getting a session
+#[derive(Debug, Serialize)]
+struct GetSessionResponse {
+    success: bool,
+    session: Option<Session>,
+}
+
+/// Request for ending a session
+#[derive(Debug, Deserialize)]
+struct EndSessionRequest {
+    user_id: String,
+    #[serde(default = "default_end_reason")]
+    reason: String,
+}
+
+fn default_end_reason() -> String {
+    "user_ended".to_string()
+}
+
+/// Response for ending a session
+#[derive(Debug, Serialize)]
+struct EndSessionResponse {
+    success: bool,
+    session: Option<Session>,
+}
+
+/// Response for session store stats
+#[derive(Debug, Serialize)]
+struct SessionStoreStatsResponse {
+    success: bool,
+    stats: SessionStoreStats,
+}
+
+/// POST /api/sessions - List sessions for a user
+async fn list_sessions(
+    State(state): State<AppState>,
+    Json(req): Json<ListSessionsRequest>,
+) -> Result<Json<ListSessionsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let sessions = state.session_store.get_user_sessions(&req.user_id, req.limit);
+    let count = sessions.len();
+
+    Ok(Json(ListSessionsResponse {
+        success: true,
+        sessions,
+        count,
+    }))
+}
+
+/// GET /api/sessions/{session_id} - Get a specific session
+async fn get_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(req): Query<GetSessionRequest>,
+) -> Result<Json<GetSessionResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let sid = SessionId(session_id);
+    let session = state.session_store.get_session(&sid);
+
+    Ok(Json(GetSessionResponse {
+        success: session.is_some(),
+        session,
+    }))
+}
+
+/// POST /api/sessions/end - End the current/active session for a user
+async fn end_session(
+    State(state): State<AppState>,
+    Json(req): Json<EndSessionRequest>,
+) -> Result<Json<EndSessionResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Get the current active session for this user
+    let sessions = state.session_store.get_user_sessions(&req.user_id, 1);
+    let active_session = sessions
+        .into_iter()
+        .find(|s| matches!(s.status, SessionStatus::Active));
+
+    if let Some(summary) = active_session {
+        let session = state.session_store.end_session(&summary.id, &req.reason);
+        Ok(Json(EndSessionResponse {
+            success: session.is_some(),
+            session,
+        }))
+    } else {
+        Ok(Json(EndSessionResponse {
+            success: false,
+            session: None,
+        }))
+    }
+}
+
+/// GET /api/sessions/stats - Get overall session store statistics
+async fn get_session_stats(
+    State(state): State<AppState>,
+) -> Result<Json<SessionStoreStatsResponse>, AppError> {
+    let stats = state.session_store.stats();
+
+    Ok(Json(SessionStoreStatsResponse {
+        success: true,
+        stats,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file if present (silently ignore if not found)
@@ -13935,7 +14505,14 @@ async fn main() -> Result<()> {
             let extractor = manager_for_maintenance.streaming_extractor().clone();
             let cleaned = extractor.cleanup_stale_sessions().await;
             if cleaned > 0 {
-                tracing::debug!("Session cleanup: removed {} stale sessions", cleaned);
+                tracing::debug!("Streaming session cleanup: removed {} stale sessions", cleaned);
+            }
+
+            // Clean up stale user activity sessions (SessionStore)
+            // Sessions that have been inactive for too long are auto-ended
+            let session_cleaned = manager_for_maintenance.session_store.cleanup_stale_sessions();
+            if session_cleaned > 0 {
+                tracing::debug!("User session cleanup: ended {} stale sessions", session_cleaned);
             }
 
             // Run maintenance + periodic flush in blocking thread pool
@@ -14224,6 +14801,11 @@ async fn main() -> Result<()> {
         .route("/api/ab/tests/{test_id}/click", post(record_ab_click))
         .route("/api/ab/tests/{test_id}/feedback", post(record_ab_feedback))
         .route("/api/ab/summary", get(get_ab_summary))
+        // Session management endpoints
+        .route("/api/sessions", post(list_sessions))
+        .route("/api/sessions/stats", get(get_session_stats))
+        .route("/api/sessions/end", post(end_session))
+        .route("/api/sessions/{session_id}", get(get_session))
         // Apply auth middleware only to protected routes
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         // Apply rate limiting to API routes only (not health/metrics/static)

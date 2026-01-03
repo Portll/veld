@@ -2855,7 +2855,7 @@ impl MemorySystem {
     ///
     /// Returns the number of memories processed for activation decay.
     /// Also records consolidation events for introspection.
-    pub fn run_maintenance(&self, decay_factor: f32) -> Result<usize> {
+    pub fn run_maintenance(&self, decay_factor: f32) -> Result<MaintenanceResult> {
         let start_time = std::time::Instant::now();
         let now = chrono::Utc::now();
 
@@ -2992,12 +2992,12 @@ impl MemorySystem {
                         }
                     }
 
-                    // Edge boosts are applied via GraphMemory at API layer
-                    // The edge_boosts from replay are logged for observability
-                    if !edge_boosts.is_empty() {
+                    // Collect edge boosts to return - will be applied via GraphMemory at API layer
+                    replay_result.edge_boosts = edge_boosts;
+                    if !replay_result.edge_boosts.is_empty() {
                         tracing::debug!(
-                            "Replay produced {} edge boosts (applied via GraphMemory)",
-                            edge_boosts.len()
+                            "Replay produced {} edge boosts (to be applied via GraphMemory)",
+                            replay_result.edge_boosts.len()
                         );
                     }
 
@@ -3048,7 +3048,12 @@ impl MemorySystem {
             duration_ms
         );
 
-        Ok(decayed_count)
+        Ok(MaintenanceResult {
+            decayed_count,
+            edge_boosts: replay_result.edge_boosts,
+            memories_replayed: replay_result.memories_replayed,
+            total_priority_score: replay_result.total_priority_score,
+        })
     }
 
     // =========================================================================

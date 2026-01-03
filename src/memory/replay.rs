@@ -47,6 +47,9 @@ pub struct ReplayCycleResult {
     pub edges_strengthened: usize,
     pub total_priority_score: f32,
     pub events: Vec<ConsolidationEvent>,
+    /// Edge boosts: (from_memory_id, to_memory_id, boost_value)
+    /// To be applied via GraphMemory at API layer
+    pub edge_boosts: Vec<(String, String, f32)>,
 }
 
 /// Manager for memory replay during consolidation

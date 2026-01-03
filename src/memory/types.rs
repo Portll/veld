@@ -3782,6 +3782,20 @@ impl IndexingProgress {
     }
 }
 
+/// Result of maintenance cycle including edge boosts for Hebbian learning
+#[derive(Debug, Clone, Default)]
+pub struct MaintenanceResult {
+    /// Number of memories that had decay applied
+    pub decayed_count: usize,
+    /// Edge boosts from replay: (from_memory_id, to_memory_id, boost_value)
+    /// These should be applied via GraphMemory.strengthen_memory_edge()
+    pub edge_boosts: Vec<(String, String, f32)>,
+    /// Number of memories replayed during consolidation
+    pub memories_replayed: usize,
+    /// Total priority score of replayed memories
+    pub total_priority_score: f32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

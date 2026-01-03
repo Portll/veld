@@ -758,6 +758,30 @@ impl GraphMemory {
         }
     }
 
+    /// Delete a relationship by UUID
+    ///
+    /// Removes the relationship from storage and decrements the counter.
+    /// Returns true if the relationship was found and deleted.
+    pub fn delete_relationship(&self, uuid: &Uuid) -> Result<bool> {
+        let key = uuid.as_bytes();
+
+        // Get the edge first to find the from_entity for index cleanup
+        let edge = match self.get_relationship(uuid)? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        // Delete from main storage
+        self.relationships_db.delete(key)?;
+        self.relationship_count.fetch_sub(1, Ordering::Relaxed);
+
+        // Also remove from entity_edges index
+        let index_key = format!("{}:{}", edge.from_entity, uuid);
+        let _ = self.entity_edges_db.delete(index_key.as_bytes());
+
+        Ok(true)
+    }
+
     /// Add an episodic node
     pub fn add_episode(&self, episode: EpisodicNode) -> Result<Uuid> {
         let key = episode.uuid.as_bytes();
@@ -1099,6 +1123,89 @@ impl GraphMemory {
         Ok(None)
     }
 
+    /// Batch strengthen edges between memory pairs from replay consolidation
+    ///
+    /// Takes edge boosts from memory replay and applies Hebbian strengthening.
+    /// Creates edges if they don't exist, strengthens if they do.
+    /// Returns the number of edges successfully strengthened.
+    pub fn strengthen_memory_edges(&self, edge_boosts: &[(String, String, f32)]) -> Result<usize> {
+        if edge_boosts.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self.synapse_update_lock.lock();
+        let mut batch = WriteBatch::default();
+        let mut strengthened = 0;
+
+        for (from_id_str, to_id_str, _boost) in edge_boosts {
+            // Parse UUIDs
+            let from_uuid = match Uuid::parse_str(from_id_str) {
+                Ok(u) => u,
+                Err(_) => {
+                    tracing::debug!("Invalid from_id UUID: {}", from_id_str);
+                    continue;
+                }
+            };
+            let to_uuid = match Uuid::parse_str(to_id_str) {
+                Ok(u) => u,
+                Err(_) => {
+                    tracing::debug!("Invalid to_id UUID: {}", to_id_str);
+                    continue;
+                }
+            };
+
+            // Find or create edge
+            let existing_edge = self.find_edge_between_entities(&from_uuid, &to_uuid)?;
+
+            if let Some(mut edge) = existing_edge {
+                // Strengthen existing edge
+                edge.strengthen();
+                let key = edge.uuid.as_bytes();
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                    batch.put(key, value);
+                    strengthened += 1;
+                }
+            } else {
+                // Create new ReplayStrengthened edge
+                let edge = RelationshipEdge {
+                    uuid: Uuid::new_v4(),
+                    from_entity: from_uuid,
+                    to_entity: to_uuid,
+                    relation_type: RelationType::CoRetrieved, // Replay strengthens co-retrieval associations
+                    strength: 0.5, // Initial strength
+                    created_at: Utc::now(),
+                    valid_at: Utc::now(),
+                    invalidated_at: None,
+                    source_episode_id: None,
+                    context: "replay_strengthened".to_string(),
+                    last_activated: Utc::now(),
+                    activation_count: 1,
+                    potentiated: false,
+                };
+
+                let key = edge.uuid.as_bytes();
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                    batch.put(key, value);
+
+                    // Index both directions
+                    let idx_key_fwd = format!("mem_edge:{}:{}", from_uuid, to_uuid);
+                    let idx_key_rev = format!("mem_edge:{}:{}", to_uuid, from_uuid);
+                    batch.put(idx_key_fwd.as_bytes(), edge.uuid.as_bytes());
+                    batch.put(idx_key_rev.as_bytes(), edge.uuid.as_bytes());
+
+                    strengthened += 1;
+                }
+            }
+        }
+
+        if strengthened > 0 {
+            self.relationships_db.write(batch)?;
+            tracing::debug!("Applied {} edge boosts from replay consolidation", strengthened);
+        }
+
+        Ok(strengthened)
+    }
+
     /// Find memories associated with a given memory through co-retrieval
     ///
     /// Uses weighted graph traversal prioritizing stronger associations.
@@ -1272,6 +1379,47 @@ impl GraphMemory {
         self.relationships_db.write(batch)?;
 
         Ok(to_prune)
+    }
+
+    /// Apply decay to all synapses and prune weak edges (AUD-2)
+    ///
+    /// Called during maintenance cycle to:
+    /// 1. Apply time-based decay to all edge strengths
+    /// 2. Remove edges that have decayed below threshold
+    ///
+    /// Returns the number of edges pruned.
+    pub fn apply_decay(&self) -> Result<usize> {
+        // Get all edge UUIDs
+        let edge_uuids: Vec<Uuid> = self
+            .get_all_relationships()?
+            .into_iter()
+            .map(|e| e.uuid)
+            .collect();
+
+        if edge_uuids.is_empty() {
+            return Ok(0);
+        }
+
+        // Apply decay and get edges to prune
+        let to_prune = self.batch_decay_synapses(&edge_uuids)?;
+
+        // Delete pruned edges
+        let mut pruned_count = 0;
+        for edge_uuid in &to_prune {
+            if self.delete_relationship(edge_uuid)? {
+                pruned_count += 1;
+            }
+        }
+
+        if pruned_count > 0 {
+            tracing::debug!(
+                "Graph decay: {} edges pruned (of {} total)",
+                pruned_count,
+                edge_uuids.len()
+            );
+        }
+
+        Ok(pruned_count)
     }
 
     /// Get graph statistics - O(1) using atomic counters
