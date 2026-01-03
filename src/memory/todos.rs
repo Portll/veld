@@ -984,6 +984,20 @@ impl TodoStore {
     // STATS
     // =========================================================================
 
+    /// Flush all RocksDB databases to disk (critical for graceful shutdown)
+    pub fn flush(&self) -> Result<()> {
+        self.todo_db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush todo_db: {e}"))?;
+        self.project_db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush project_db: {e}"))?;
+        self.index_db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush index_db: {e}"))?;
+        Ok(())
+    }
+
     /// Get overall todo stats for a user
     pub fn get_user_stats(&self, user_id: &str) -> Result<UserTodoStats> {
         let todos = self.list_todos_for_user(user_id, None)?;

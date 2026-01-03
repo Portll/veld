@@ -70,6 +70,17 @@ impl FileMemoryStore {
         self
     }
 
+    /// Flush all RocksDB databases to disk (critical for graceful shutdown)
+    pub fn flush(&self) -> Result<()> {
+        self.file_db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush file_db: {e}"))?;
+        self.index_db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush file index_db: {e}"))?;
+        Ok(())
+    }
+
     // =========================================================================
     // CRUD OPERATIONS
     // =========================================================================

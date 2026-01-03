@@ -648,6 +648,54 @@ impl HybridSearchEngine {
     pub fn bm25_doc_count(&self) -> usize {
         self.bm25_index.len()
     }
+
+    /// Check if BM25 index is empty (needs backfill)
+    pub fn needs_backfill(&self) -> bool {
+        self.bm25_index.is_empty()
+    }
+
+    /// Backfill BM25 index from existing memories
+    ///
+    /// Call this on startup if the BM25 index is empty but memories exist.
+    /// This indexes all memories into BM25 for hybrid search.
+    ///
+    /// # Arguments
+    /// * `memories` - Iterator of (memory_id, content, tags, entities)
+    ///
+    /// # Returns
+    /// Number of memories indexed
+    pub fn backfill<I>(&self, memories: I) -> Result<usize>
+    where
+        I: Iterator<Item = (MemoryId, String, Vec<String>, Vec<String>)>,
+    {
+        let mut count = 0;
+        let mut batch_count = 0;
+        const BATCH_SIZE: usize = 100;
+
+        for (memory_id, content, tags, entities) in memories {
+            self.bm25_index.upsert(&memory_id, &content, &tags, &entities)?;
+            count += 1;
+            batch_count += 1;
+
+            // Commit in batches to avoid holding locks too long
+            if batch_count >= BATCH_SIZE {
+                self.bm25_index.commit()?;
+                batch_count = 0;
+                debug!("BM25 backfill: indexed {} memories", count);
+            }
+        }
+
+        // Final commit
+        if batch_count > 0 {
+            self.bm25_index.commit()?;
+        }
+
+        // Reload reader to see new documents
+        self.bm25_index.reload()?;
+
+        info!("BM25 backfill complete: indexed {} memories", count);
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

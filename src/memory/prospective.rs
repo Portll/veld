@@ -71,6 +71,17 @@ impl ProspectiveStore {
         Ok(Self { db, index_db })
     }
 
+    /// Flush all RocksDB databases to disk (critical for graceful shutdown)
+    pub fn flush(&self) -> Result<()> {
+        self.db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush prospective_db: {e}"))?;
+        self.index_db
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush prospective index_db: {e}"))?;
+        Ok(())
+    }
+
     /// Store a new prospective task
     pub fn store(&self, task: &ProspectiveTask) -> Result<()> {
         let key = format!("{}:{}", task.user_id, task.id);

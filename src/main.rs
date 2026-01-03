@@ -1081,6 +1081,35 @@ impl MultiUserMemoryManager {
         self.audit_db
             .flush()
             .map_err(|e| anyhow::anyhow!("Failed to flush audit database: {e}"))?;
+        info!("  ✓ Audit database flushed");
+
+        // Flush todo store (todo_db, project_db, index_db)
+        if let Err(e) = self.todo_store.flush() {
+            tracing::warn!("  Failed to flush todo store: {}", e);
+        } else {
+            info!("  ✓ Todo store flushed (todos, projects, indices)");
+        }
+
+        // Flush file memory store (file_db, index_db)
+        if let Err(e) = self.file_store.flush() {
+            tracing::warn!("  Failed to flush file store: {}", e);
+        } else {
+            info!("  ✓ File memory store flushed");
+        }
+
+        // Flush prospective store (reminders - db, index_db)
+        if let Err(e) = self.prospective_store.flush() {
+            tracing::warn!("  Failed to flush prospective store: {}", e);
+        } else {
+            info!("  ✓ Prospective store flushed (reminders)");
+        }
+
+        // Flush feedback store (momentum data with WAL)
+        if let Err(e) = self.feedback_store.write().flush() {
+            tracing::warn!("  Failed to flush feedback store: {}", e);
+        } else {
+            info!("  ✓ Feedback store flushed (momentum, pending)");
+        }
 
         // Flush all user memory databases (lock-free iteration)
         let user_entries: Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> = self
@@ -1097,7 +1126,6 @@ impl MultiUserMemoryManager {
                 if let Err(e) = guard.flush_storage() {
                     tracing::warn!("  Failed to flush database for user {}: {}", user_id, e);
                 } else {
-                    info!("  Flushed database for user: {}", user_id);
                     flushed += 1;
                 }
             } else {
@@ -1105,7 +1133,10 @@ impl MultiUserMemoryManager {
             }
         }
 
-        info!("✅ Flushed 1 audit database and {} user databases", flushed);
+        info!(
+            "✅ All databases flushed: audit, todos, files, prospective, feedback, {} user memories",
+            flushed
+        );
 
         Ok(())
     }
@@ -1516,6 +1547,8 @@ impl MultiUserMemoryManager {
 
         let user_count = user_ids.len();
 
+        let mut edges_decayed = 0;
+
         for user_id in user_ids {
             // Re-acquire memory for each user (may have been evicted)
             if let Ok(memory_lock) = self.get_user_memory(&user_id) {
@@ -1527,11 +1560,25 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
+
+            // AUD-2: Apply graph decay to GraphMemory edges
+            if let Ok(graph) = self.get_user_graph(&user_id) {
+                let graph_guard = graph.write();
+                match graph_guard.apply_decay() {
+                    Ok(pruned) => {
+                        edges_decayed += pruned;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Graph decay failed for user {}: {}", user_id, e);
+                    }
+                }
+            }
         }
 
         tracing::info!(
-            "Maintenance complete: {} memories processed across {} users",
+            "Maintenance complete: {} memories processed, {} weak edges pruned across {} users",
             total_processed,
+            edges_decayed,
             user_count
         );
 
@@ -4217,6 +4264,31 @@ async fn recall(
                 let graph_guard = graph.write();
                 if let Err(e) = graph_guard.record_memory_coactivation(&memory_ids) {
                     tracing::debug!("Failed to record memory coactivation: {}", e);
+                }
+            });
+        }
+    }
+
+    // AUD-1: Hebbian strengthening of edges traversed during spreading activation
+    // Strengthen entity-entity edges that were used in successful graph retrieval
+    if let Some(ref stats) = final_stats {
+        if !stats.traversed_edges.is_empty() {
+            let graph = graph_memory.clone();
+            let edges = stats.traversed_edges.clone();
+            tokio::task::spawn(async move {
+                let graph_guard = graph.write();
+                match graph_guard.batch_strengthen_synapses(&edges) {
+                    Ok(strengthened) => {
+                        if strengthened > 0 {
+                            tracing::debug!(
+                                "Hebbian strengthening: {} edges reinforced",
+                                strengthened
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to strengthen synapses: {}", e);
+                    }
                 }
             });
         }

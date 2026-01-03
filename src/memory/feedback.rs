@@ -1165,7 +1165,7 @@ impl FeedbackStore {
         Some((is_repetition, is_topic_change, similarity))
     }
 
-    /// Flush dirty entries to disk
+    /// Flush dirty entries to disk and ensure WAL is persisted
     pub fn flush(&mut self) -> anyhow::Result<usize> {
         let Some(ref db) = self.db else {
             return Ok(0);
@@ -1180,6 +1180,17 @@ impl FeedbackStore {
                 flushed += 1;
             }
         }
+
+        // Also persist any pending feedback entries
+        for (user_id, pending) in &self.pending {
+            let key = format!("pending:{}", user_id);
+            let value = serde_json::to_vec(pending)?;
+            db.put(key.as_bytes(), &value)?;
+        }
+
+        // Flush the RocksDB WAL to ensure data persistence (critical for graceful shutdown)
+        db.flush()
+            .map_err(|e| anyhow::anyhow!("Failed to flush feedback_db WAL: {e}"))?;
 
         if flushed > 0 {
             tracing::debug!("Flushed {} feedback momentum entries to disk", flushed);

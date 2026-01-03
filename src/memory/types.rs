@@ -2190,7 +2190,7 @@ impl SessionMemory {
 
     /// Add shared memory (zero-copy)
     pub fn add_shared(&mut self, memory: SharedMemory) -> anyhow::Result<()> {
-        let memory_size = bincode::serialize(&*memory)?.len();
+        let memory_size = bincode::serde::encode_to_vec(&*memory, bincode::config::standard())?.len();
 
         // Check if adding would exceed limit
         if self.current_size_bytes + memory_size > self.max_size_mb * 1024 * 1024 {
@@ -2379,6 +2379,12 @@ pub struct MemoryStats {
     pub promotions_to_longterm: usize,
     pub total_retrievals: usize,
     pub average_importance: f32,
+    /// Knowledge graph entity count
+    #[serde(default)]
+    pub graph_nodes: usize,
+    /// Knowledge graph relationship count
+    #[serde(default)]
+    pub graph_edges: usize,
 }
 
 /// Report from index integrity verification
@@ -2440,6 +2446,11 @@ pub struct RetrievalStats {
 
     /// Time spent on graph traversal (microseconds)
     pub graph_time_us: u64,
+
+    /// Edge UUIDs traversed during spreading activation (for Hebbian strengthening)
+    /// Not serialized - internal use only for wiring strengthening calls
+    #[serde(skip)]
+    pub traversed_edges: Vec<uuid::Uuid>,
 }
 
 // =============================================================================
@@ -2592,6 +2603,15 @@ pub struct ProspectiveTask {
     /// Optional priority (1-5, higher = more important)
     #[serde(default = "default_priority")]
     pub priority: u8,
+
+    /// Vector embedding for semantic search and context matching (MiniLM-L6-v2, 384 dimensions)
+    /// Used for semantic similarity matching on context triggers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+
+    /// Related memory IDs for bidirectional linking
+    #[serde(default)]
+    pub related_memory_ids: Vec<MemoryId>,
 }
 
 fn default_priority() -> u8 {
@@ -2612,6 +2632,8 @@ impl ProspectiveTask {
             dismissed_at: None,
             tags: Vec::new(),
             priority: default_priority(),
+            embedding: None,
+            related_memory_ids: Vec::new(),
         }
     }
 
@@ -3005,6 +3027,16 @@ pub struct Todo {
     /// Comments and activity history for this todo
     #[serde(default)]
     pub comments: Vec<TodoComment>,
+
+    /// Vector embedding for semantic search (MiniLM-L6-v2, 384 dimensions)
+    /// Computed from content + notes + tags for similarity matching
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+
+    /// Related memory IDs for bidirectional linking
+    /// Memories that are semantically or explicitly linked to this todo
+    #[serde(default)]
+    pub related_memory_ids: Vec<MemoryId>,
 }
 
 impl Todo {
@@ -3032,6 +3064,8 @@ impl Todo {
             completed_at: None,
             sort_order: 0,
             comments: Vec::new(),
+            embedding: None,
+            related_memory_ids: Vec::new(),
         }
     }
 
@@ -3205,6 +3239,30 @@ pub struct Project {
     /// Number of files indexed in the codebase
     #[serde(default)]
     pub codebase_file_count: usize,
+
+    /// Vector embedding for semantic search (MiniLM-L6-v2, 384 dimensions)
+    /// Computed from name + description for similarity matching
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+
+    /// Related memory IDs for project-level context
+    #[serde(default)]
+    pub related_memory_ids: Vec<MemoryId>,
+
+    /// Aggregated todo count by status (cached for quick display)
+    #[serde(default)]
+    pub todo_counts: ProjectTodoCounts,
+}
+
+/// Cached todo counts for quick project display
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProjectTodoCounts {
+    pub total: usize,
+    pub backlog: usize,
+    pub todo: usize,
+    pub in_progress: usize,
+    pub blocked: usize,
+    pub done: usize,
 }
 
 impl Project {
@@ -3226,6 +3284,9 @@ impl Project {
             codebase_indexed: false,
             codebase_indexed_at: None,
             codebase_file_count: 0,
+            embedding: None,
+            related_memory_ids: Vec::new(),
+            todo_counts: ProjectTodoCounts::default(),
         }
     }
 
@@ -3247,6 +3308,9 @@ impl Project {
             codebase_indexed: false,
             codebase_indexed_at: None,
             codebase_file_count: 0,
+            embedding: None,
+            related_memory_ids: Vec::new(),
+            todo_counts: ProjectTodoCounts::default(),
         }
     }
 

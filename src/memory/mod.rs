@@ -2700,6 +2700,19 @@ impl MemorySystem {
                 );
             }
 
+            // Re-index in BM25 with updated content
+            if let Err(e) = self.hybrid_search.index_memory(
+                &memory_id,
+                &existing.experience.content,
+                &existing.experience.tags,
+                &existing.experience.entities,
+            ) {
+                tracing::warn!("Failed to reindex memory {} in BM25: {}", memory_id.0, e);
+            }
+            if let Err(e) = self.hybrid_search.commit() {
+                tracing::warn!("Failed to commit BM25 index: {}", e);
+            }
+
             // Update in working/session memory if cached
             {
                 let mut working = self.working_memory.write();
