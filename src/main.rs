@@ -10707,6 +10707,35 @@ async fn create_todo(
         todo.recurrence = parse_recurrence(recurrence_str);
     }
 
+    // Compute embedding for semantic search (non-blocking)
+    let embedding_text = format!(
+        "{} {} {}",
+        todo.content,
+        todo.notes.as_deref().unwrap_or(""),
+        todo.tags.join(" ")
+    );
+
+    if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        let memory_clone = memory_system.clone();
+        let embedding_text_clone = embedding_text.clone();
+
+        if let Ok(embedding) = tokio::task::spawn_blocking(move || {
+            let memory_guard = memory_clone.read();
+            memory_guard.compute_embedding(&embedding_text_clone)
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?
+        {
+            todo.embedding = Some(embedding.clone());
+
+            // Index in vector store for semantic search
+            if let Ok(vector_id) = state.todo_store.index_todo_embedding(&req.user_id, &todo.id, &embedding) {
+                // Store vector_id to todo_id mapping
+                let _ = state.todo_store.store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
+            }
+        }
+    }
+
     // Store the todo (returns todo with assigned seq_num)
     let todo = state
         .todo_store
@@ -11077,6 +11106,37 @@ async fn update_todo(
     }
 
     todo.updated_at = chrono::Utc::now();
+
+    // Re-compute embedding if content, notes, or tags changed
+    let needs_reindex = req.content.is_some() || req.notes.is_some() || req.tags.is_some();
+    if needs_reindex {
+        let embedding_text = format!(
+            "{} {} {}",
+            todo.content,
+            todo.notes.as_deref().unwrap_or(""),
+            todo.tags.join(" ")
+        );
+
+        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+            let memory_clone = memory_system.clone();
+            let embedding_text_clone = embedding_text.clone();
+
+            if let Ok(embedding) = tokio::task::spawn_blocking(move || {
+                let memory_guard = memory_clone.read();
+                memory_guard.compute_embedding(&embedding_text_clone)
+            })
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?
+            {
+                todo.embedding = Some(embedding.clone());
+
+                // Re-index in vector store
+                if let Ok(vector_id) = state.todo_store.index_todo_embedding(&req.user_id, &todo.id, &embedding) {
+                    let _ = state.todo_store.store_vector_id_mapping(&req.user_id, vector_id, &todo.id);
+                }
+            }
+        }
+    }
 
     state
         .todo_store
