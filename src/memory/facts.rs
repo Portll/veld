@@ -46,7 +46,7 @@ impl SemanticFactStore {
     pub fn store(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
         // Primary storage
         let key = format!("facts:{}:{}", user_id, fact.id);
-        let value = bincode::serialize(fact)?;
+        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
         self.db.put(key.as_bytes(), &value)?;
 
         // Entity index - index by each related entity
@@ -84,7 +84,7 @@ impl SemanticFactStore {
         let key = format!("facts:{}:{}", user_id, fact_id);
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let fact: SemanticFact = bincode::deserialize(&data)?;
+                let (fact, _): (SemanticFact, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
                 Ok(Some(fact))
             }
             None => Ok(None),
@@ -95,7 +95,7 @@ impl SemanticFactStore {
     pub fn update(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
         // Simply overwrite - indices stay valid since ID doesn't change
         let key = format!("facts:{}:{}", user_id, fact.id);
-        let value = bincode::serialize(fact)?;
+        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
         self.db.put(key.as_bytes(), &value)?;
         Ok(())
     }
@@ -154,7 +154,7 @@ impl SemanticFactStore {
                 continue;
             }
 
-            if let Ok(fact) = bincode::deserialize::<SemanticFact>(&value) {
+            if let Ok(fact) = bincode::serde::decode_from_slice::<SemanticFact, _>(&value, bincode::config::standard()).map(|(v, _)| v) {
                 facts.push(fact);
                 if facts.len() >= limit {
                     break;

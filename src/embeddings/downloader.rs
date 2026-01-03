@@ -224,11 +224,13 @@ fn download_file_with_checksum(
         .context(format!("Failed to download from {url}"))?;
 
     let total_size = response
-        .header("content-length")
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let mut reader = response.into_reader();
+    let mut reader = response.into_body().into_reader();
     let mut file = fs::File::create(path).context("Failed to create output file")?;
 
     // Compute checksum while downloading for efficiency

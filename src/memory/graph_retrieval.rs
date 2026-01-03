@@ -231,6 +231,9 @@ pub fn spreading_activation_retrieve_with_stats(
     // With importance-weighted decay (SHO-26) and adaptive limits
     let graph_start = Instant::now();
 
+    // Track traversed edges for Hebbian strengthening (AUD-1)
+    let mut traversed_edges: Vec<Uuid> = Vec::new();
+
     // Adaptive threshold: start strict, relax if too few candidates
     let mut current_threshold = SPREADING_ACTIVATION_THRESHOLD;
 
@@ -273,6 +276,12 @@ pub fn spreading_activation_retrieve_with_stats(
                 // Accumulate activation
                 let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
                 *new_activation += spread_amount;
+
+                // Track traversed edges for Hebbian strengthening (AUD-1)
+                // Only track edges that contributed meaningful activation
+                if spread_amount > 0.01 {
+                    traversed_edges.push(edge.uuid);
+                }
 
                 // Track newly activated entities
                 if *new_activation >= current_threshold
@@ -422,14 +431,20 @@ pub fn spreading_activation_retrieve_with_stats(
 
     stats.retrieval_time_us = start_time.elapsed().as_micros() as u64;
 
+    // Deduplicate traversed edges (same edge may be traversed multiple times across hops)
+    traversed_edges.sort();
+    traversed_edges.dedup();
+    stats.traversed_edges = traversed_edges;
+
     tracing::info!(
-        "🎯 Returning {} memories (top scores: {:?})",
+        "🎯 Returning {} memories (top scores: {:?}), {} edges traversed",
         scored_memories.len(),
         scored_memories
             .iter()
             .take(3)
             .map(|m| m.final_score)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>(),
+        stats.traversed_edges.len()
     );
 
     Ok((scored_memories, stats))

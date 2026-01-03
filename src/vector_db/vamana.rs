@@ -1486,7 +1486,8 @@ impl VamanaIndex {
         // Save as binary
         let index_file = path.join("vamana_index.bin");
         let file = File::create(&index_file)?;
-        bincode::serialize_into(BufWriter::new(file), &data)?;
+        let mut writer = BufWriter::new(file);
+        bincode::serde::encode_into_std_write(&data, &mut writer, bincode::config::standard())?;
 
         info!(
             "Saved Vamana index with {} vectors to {:?}",
@@ -1509,7 +1510,7 @@ impl VamanaIndex {
 
         // Load serialized data
         let file = File::open(&index_file)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
 
         #[derive(Serialize, Deserialize)]
         struct VamanaData {
@@ -1519,7 +1520,7 @@ impl VamanaIndex {
             num_vectors: usize,
         }
 
-        let data: VamanaData = bincode::deserialize_from(reader)?;
+        let data: VamanaData = bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard())?;
 
         // Update internal state
         *self.graph.write() = data.graph;

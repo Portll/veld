@@ -1,17 +1,12 @@
 {
   "mcpServers": {
-    "shodh-memory": {
-      "command": "C:\\Users\\Varun Sharma\\.bun\\bin\\bun.exe",
-      "args": ["run", "C:\\Users\\Varun Sharma\\OneDrive\\Documents\\Roshera\\Vector-DB\\vectora\\kalki-v2\\shodh-memory\\mcp-server\\index.ts"],
-      "env": {
-        "SHODH_API_URL": "http://127.0.0.1:3030",
-        "SHODH_API_KEY": "sk-shodh-dev-local-testing-key",
-        "SHODH_USER_ID": "claude-code"
-      }
-    },
     "linear": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"]
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.linear.app/mcp"
+      ]
     }
   }
 }

@@ -1293,11 +1293,12 @@ impl StreamingMemoryExtractor {
                             .get_memory_hebbian_strength(&m.id)
                             .unwrap_or(0.3);
 
-                        // Get feedback momentum EMA (0.0 if no feedback history)
+                        // Get feedback momentum EMA with time decay (0.0 if no feedback history)
                         // Negative values indicate often-ignored memories → suppression
+                        // AUD-6: Apply time-based decay so stale momentum fades
                         let feedback_momentum = feedback_guard
                             .get_momentum(&m.id)
-                            .map(|fm| fm.ema)
+                            .map(|fm| fm.ema_with_decay())
                             .unwrap_or(0.0);
 
                         let input = RelevanceInput {
