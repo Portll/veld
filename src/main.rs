@@ -418,11 +418,11 @@ use memory::{
     segmentation::{InputSource, SegmentationEngine},
     todo_formatter, ActivatedMemory, EpisodeContext, Experience, ExperienceType, FeedbackStore,
     FileMemoryStats, FileMemoryStore, GraphStats as VisualizationStats, IndexingResult, Memory,
-    MemoryConfig, MemoryId, MemoryStats, MemorySystem, PendingFeedback, Project, ProjectId,
+    MemoryConfig, MemoryId, MemoryStats, MemorySystem, PendingFeedback, PostMortem, Project, ProjectId,
     ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus,
     ProspectiveTrigger, Query as MemoryQuery, Recurrence, Session, SessionEvent, SessionId,
-    SessionStore, SessionStoreStats, SessionSummary, SharedMemory, SurfacedMemoryInfo, Todo,
-    TodoComment, TodoCommentId, TodoCommentType, TodoId, TodoPriority, TodoStatus, TodoStore,
+    SessionStatus, SessionStore, SessionStoreStats, SessionSummary, SharedMemory, SurfacedMemoryInfo, Todo,
+    TodoComment, TodoCommentId, TodoCommentType, TodoId, TodoPriority, TodoStatus, TodoStore, TraceDirection,
     UserTodoStats,
 };
 
@@ -5231,8 +5231,8 @@ async fn auto_infer_lineage(
 }
 
 /// Auto-generate post-mortem summary when a todo is completed.
-/// Searches for related memories created during the todo's lifetime,
-/// extracts learnings/decisions/errors, and stores a summary Learning.
+/// Uses lineage tracing to find causally connected memories, falling back
+/// to time-based filtering. Extracts learnings/decisions/errors/patterns.
 async fn auto_generate_post_mortem(
     state: &AppState,
     user_id: &str,
@@ -5241,119 +5241,109 @@ async fn auto_generate_post_mortem(
 ) -> anyhow::Result<()> {
     let memory = state.get_user_memory(user_id)?;
 
-    // Get memories created during the todo's lifetime
-    let related_memories: Vec<memory::Memory> = {
+    // Step 1: Find semantically related memories to use as lineage seeds
+    let seed_memories: Vec<MemoryId> = {
+        let memory_guard = memory.read();
+        // Search for memories related to the todo content
+        let query = memory::Query {
+            query_text: Some(todo_content.to_string()),
+            max_results: 10,
+            ..Default::default()
+        };
+        if let Ok(results) = memory_guard.recall(&query) {
+            results.iter().map(|m| m.id.clone()).collect()
+        } else {
+            vec![]
+        }
+    };
+
+    // Step 2: Trace lineage from seed memories to find causally connected memories
+    let mut lineage_memory_ids: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+    
+    {
+        let memory_guard = memory.read();
+        let lineage_graph = memory_guard.lineage_graph();
+        
+        for seed_id in &seed_memories {
+            // Trace backward to find causes/context
+            if let Ok(trace) = lineage_graph.trace(user_id, seed_id, TraceDirection::Backward, 5) {
+                for mem_id in trace.path {
+                    lineage_memory_ids.insert(mem_id);
+                }
+            }
+            // Also trace forward to find effects
+            if let Ok(trace) = lineage_graph.trace(user_id, seed_id, TraceDirection::Forward, 3) {
+                for mem_id in trace.path {
+                    lineage_memory_ids.insert(mem_id);
+                }
+            }
+        }
+    }
+
+    // Step 3: Build memory map and collect related memories
+    let mut memories_map: std::collections::HashMap<MemoryId, Memory> = std::collections::HashMap::new();
+    
+    let related_memories: Vec<Memory> = {
         let memory_guard = memory.read();
         let all_memories = memory_guard.get_all_memories()?;
 
-        all_memories
-            .into_iter()
-            .filter(|m| m.created_at >= todo_created_at)
-            .map(|arc_mem| (*arc_mem).clone())
-            .collect()
+        let mut result = Vec::new();
+        for arc_mem in all_memories {
+            let mem = (*arc_mem).clone();
+            
+            // Include if: in lineage chain OR created during todo lifetime
+            let in_lineage = lineage_memory_ids.contains(&mem.id);
+            let in_timeframe = mem.created_at >= todo_created_at;
+            
+            if in_lineage || in_timeframe {
+                memories_map.insert(mem.id.clone(), mem.clone());
+                result.push(mem);
+            }
+        }
+        result
     };
 
     if related_memories.is_empty() {
         return Ok(()); // No related work to summarize
     }
 
-    // Categorize memories by type
-    let mut learnings = Vec::new();
-    let mut decisions = Vec::new();
-    let mut errors_resolved = Vec::new();
-    let mut patterns = Vec::new();
+    // Step 4: Build lineage trace for PostMortem::from_trace
+    let trace_path: Vec<MemoryId> = related_memories.iter().map(|m| m.id.clone()).collect();
+    let synthetic_trace = memory::LineageTrace {
+        root: trace_path.first().cloned().unwrap_or_else(|| MemoryId(uuid::Uuid::new_v4())),
+        direction: TraceDirection::Both,
+        edges: vec![], // We don't need edges for PostMortem extraction
+        path: trace_path,
+        depth: related_memories.len(),
+    };
 
-    for mem in &related_memories {
-        match mem.experience.experience_type {
-            memory::ExperienceType::Learning => {
-                learnings.push(mem.experience.content.clone());
-            }
-            memory::ExperienceType::Decision => {
-                decisions.push(mem.experience.content.clone());
-            }
-            memory::ExperienceType::Error => {
-                errors_resolved.push(mem.experience.content.clone());
-            }
-            memory::ExperienceType::Pattern => {
-                patterns.push(mem.experience.content.clone());
-            }
-            _ => {}
-        }
-    }
+    // Step 5: Generate PostMortem using lineage-aware extraction
+    let task_id = MemoryId(uuid::Uuid::new_v4());
+    let post_mortem = PostMortem::from_trace(task_id, todo_content, &synthetic_trace, &memories_map);
 
     // Only create post-mortem if we have significant content
-    let has_content = !learnings.is_empty()
-        || !decisions.is_empty()
-        || !errors_resolved.is_empty()
-        || !patterns.is_empty();
+    let has_content = !post_mortem.learnings.is_empty()
+        || !post_mortem.decisions.is_empty()
+        || !post_mortem.errors_resolved.is_empty()
+        || !post_mortem.patterns.is_empty();
 
     if !has_content {
         return Ok(()); // Nothing significant to summarize
     }
 
-    // Build post-mortem summary
-    let mut summary_parts = Vec::new();
-    summary_parts.push(format!("**Completed: {}**", todo_content));
+    // Step 6: Use PostMortem's markdown format or build custom summary
+    let summary_content = post_mortem.to_markdown();
 
-    if !learnings.is_empty() {
-        summary_parts.push(format!(
-            "📚 Learnings ({}):\n{}",
-            learnings.len(),
-            learnings
-                .iter()
-                .take(3)
-                .map(|l| format!("  • {}", truncate_content(l, 80)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
+    // Store as a Learning memory with lineage context
+    let mut entities = vec!["post-mortem".to_string(), "task-completion".to_string()];
+    if !lineage_memory_ids.is_empty() {
+        entities.push("lineage-traced".to_string());
     }
 
-    if !decisions.is_empty() {
-        summary_parts.push(format!(
-            "🎯 Decisions ({}):\n{}",
-            decisions.len(),
-            decisions
-                .iter()
-                .take(3)
-                .map(|d| format!("  • {}", truncate_content(d, 80)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-
-    if !errors_resolved.is_empty() {
-        summary_parts.push(format!(
-            "🐛 Errors resolved ({}):\n{}",
-            errors_resolved.len(),
-            errors_resolved
-                .iter()
-                .take(3)
-                .map(|e| format!("  • {}", truncate_content(e, 80)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-
-    if !patterns.is_empty() {
-        summary_parts.push(format!(
-            "🔄 Patterns ({}):\n{}",
-            patterns.len(),
-            patterns
-                .iter()
-                .take(2)
-                .map(|p| format!("  • {}", truncate_content(p, 80)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-
-    let summary_content = summary_parts.join("\n\n");
-
-    // Store as a Learning memory
     let experience = memory::Experience {
         experience_type: memory::ExperienceType::Learning,
         content: summary_content,
-        entities: vec!["post-mortem".to_string(), "task-completion".to_string()],
+        entities,
         ..Default::default()
     };
 
@@ -5366,10 +5356,13 @@ async fn auto_generate_post_mortem(
     tracing::debug!(
         user_id = %user_id,
         todo = %todo_content,
-        learnings = learnings.len(),
-        decisions = decisions.len(),
-        errors = errors_resolved.len(),
-        "Generated post-mortem summary"
+        learnings = post_mortem.learnings.len(),
+        decisions = post_mortem.decisions.len(),
+        errors = post_mortem.errors_resolved.len(),
+        patterns = post_mortem.patterns.len(),
+        lineage_memories = lineage_memory_ids.len(),
+        total_memories = related_memories.len(),
+        "Generated lineage-aware post-mortem summary"
     );
 
     Ok(())
@@ -6881,7 +6874,7 @@ async fn consolidate_memories(
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Maintenance task panicked: {e}")))?
-        .unwrap_or(0)
+        .unwrap_or_default()
     };
 
     // Get replay stats from the consolidation report (last cycle)
@@ -6901,7 +6894,7 @@ async fn consolidate_memories(
         facts_reinforced = result.facts_reinforced,
         memories_replayed = memories_replayed,
         edges_strengthened = edges_strengthened,
-        memories_decayed = maintenance_result,
+        memories_decayed = maintenance_result.decayed_count,
         "Semantic consolidation and replay complete"
     );
 
@@ -6919,7 +6912,7 @@ async fn consolidate_memories(
         fact_ids: result.new_fact_ids,
         memories_replayed,
         edges_strengthened,
-        memories_decayed: maintenance_result,
+        memories_decayed: maintenance_result.decayed_count,
     }))
 }
 
@@ -14362,7 +14355,9 @@ async fn get_session(
 ) -> Result<Json<GetSessionResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let sid = SessionId(session_id);
+    let uuid = uuid::Uuid::parse_str(&session_id)
+        .map_err(|e| AppError::InvalidInput { field: "session_id".to_string(), reason: format!("Invalid UUID: {e}") })?;
+    let sid = SessionId(uuid);
     let session = state.session_store.get_session(&sid);
 
     Ok(Json(GetSessionResponse {
