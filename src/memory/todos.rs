@@ -8,18 +8,26 @@
 //! - Project grouping
 //! - Recurring tasks with automatic next instance creation
 //! - Due date tracking with overdue detection
+//! - Vector embeddings for semantic search (MiniLM-L6-v2)
+//! - Vamana HNSW index for fast similarity search
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use parking_lot::RwLock;
 use rocksdb::{Options, WriteBatch, DB};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use super::types::{
-    Project, ProjectId, ProjectStatus, Recurrence, Todo, TodoComment, TodoCommentId,
+    Project, ProjectId, ProjectStatus, Todo, TodoComment, TodoCommentId,
     TodoCommentType, TodoId, TodoStatus,
 };
+use crate::vector_db::{VamanaConfig, VamanaIndex};
+
+/// Embedding dimension (MiniLM-L6-v2)
+const EMBEDDING_DIM: usize = 384;
 
 /// Storage and query engine for todos and projects
 pub struct TodoStore {
@@ -29,6 +37,10 @@ pub struct TodoStore {
     project_db: Arc<DB>,
     /// Index database for efficient queries
     index_db: Arc<DB>,
+    /// Vector index for semantic search (per-user indices)
+    vector_indices: RwLock<HashMap<String, VamanaIndex>>,
+    /// Storage path for persisting vector indices
+    storage_path: std::path::PathBuf,
 }
 
 impl TodoStore {
@@ -60,7 +72,118 @@ impl TodoStore {
             todo_db,
             project_db,
             index_db,
+            vector_indices: RwLock::new(HashMap::new()),
+            storage_path: todos_path,
         })
+    }
+
+    /// Get or create a Vamana vector index for a user
+    fn get_or_create_index(&self, user_id: &str) -> Result<()> {
+        let mut indices = self.vector_indices.write();
+        if !indices.contains_key(user_id) {
+            let config = VamanaConfig {
+                dimension: EMBEDDING_DIM,
+                max_degree: 32,
+                search_list_size: 75,
+                alpha: 1.2,
+                ..Default::default()
+            };
+            let index = VamanaIndex::new(config)?;
+            indices.insert(user_id.to_string(), index);
+        }
+        Ok(())
+    }
+
+    /// Add or update a todo in the vector index
+    /// Returns the vector ID assigned to this todo
+    pub fn index_todo_embedding(&self, user_id: &str, _todo_id: &TodoId, embedding: &[f32]) -> Result<u32> {
+        self.get_or_create_index(user_id)?;
+
+        let mut indices = self.vector_indices.write();
+        if let Some(index) = indices.get_mut(user_id) {
+            // Add vector and get assigned ID
+            let vector_id = index.add_vector(embedding.to_vec())?;
+            return Ok(vector_id);
+        }
+        anyhow::bail!("Failed to get vector index for user: {}", user_id)
+    }
+
+    /// Search for similar todos by embedding
+    pub fn search_similar(&self, user_id: &str, query_embedding: &[f32], limit: usize) -> Result<Vec<(Todo, f32)>> {
+        let indices = self.vector_indices.read();
+        if let Some(index) = indices.get(user_id) {
+            let results = index.search(query_embedding, limit)?;
+
+            // Find todos by vector_id (stored in index_db)
+            let mut todo_results = Vec::new();
+            for (vector_id, score) in results {
+                if let Some(todo) = self.get_todo_by_vector_id(user_id, vector_id)? {
+                    todo_results.push((todo, score));
+                }
+            }
+            Ok(todo_results)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Get a todo by its vector index ID (stored in index_db)
+    fn get_todo_by_vector_id(&self, user_id: &str, vector_id: u32) -> Result<Option<Todo>> {
+        let key = format!("vector_id:{}:{}", user_id, vector_id);
+        if let Some(data) = self.index_db.get(key.as_bytes())? {
+            let todo_id_str = String::from_utf8_lossy(&data);
+            if let Ok(uuid) = Uuid::parse_str(&todo_id_str) {
+                return self.get_todo(user_id, &TodoId(uuid));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Store the mapping from vector_id to todo_id
+    pub fn store_vector_id_mapping(&self, user_id: &str, vector_id: u32, todo_id: &TodoId) -> Result<()> {
+        let key = format!("vector_id:{}:{}", user_id, vector_id);
+        self.index_db.put(key.as_bytes(), todo_id.0.to_string().as_bytes())?;
+        Ok(())
+    }
+
+    /// Save vector indices to disk
+    pub fn save_vector_indices(&self) -> Result<()> {
+        let indices = self.vector_indices.read();
+        for (user_id, index) in indices.iter() {
+            let index_path = self.storage_path.join("vectors").join(user_id);
+            std::fs::create_dir_all(&index_path)?;
+            index.save(&index_path)?;
+        }
+        Ok(())
+    }
+
+    /// Load vector indices from disk
+    pub fn load_vector_indices(&self) -> Result<()> {
+        let vectors_path = self.storage_path.join("vectors");
+        if !vectors_path.exists() {
+            return Ok(());
+        }
+
+        let mut indices = self.vector_indices.write();
+        for entry in std::fs::read_dir(&vectors_path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let user_id = entry.file_name().to_string_lossy().to_string();
+                let index_path = entry.path();
+
+                // Create a new index and load from disk
+                let config = VamanaConfig {
+                    dimension: EMBEDDING_DIM,
+                    ..Default::default()
+                };
+                let mut index = VamanaIndex::new(config)?;
+                if index.load(&index_path).is_ok() {
+                    indices.insert(user_id.clone(), index);
+                    tracing::debug!("Loaded todo vector index for user: {}", user_id);
+                }
+            }
+        }
+        Ok(())
     }
 
     // =========================================================================
@@ -984,8 +1107,9 @@ impl TodoStore {
     // STATS
     // =========================================================================
 
-    /// Flush all RocksDB databases to disk (critical for graceful shutdown)
+    /// Flush all RocksDB databases and save vector indices to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
+        // Flush RocksDB databases
         self.todo_db
             .flush()
             .map_err(|e| anyhow::anyhow!("Failed to flush todo_db: {e}"))?;
@@ -995,6 +1119,11 @@ impl TodoStore {
         self.index_db
             .flush()
             .map_err(|e| anyhow::anyhow!("Failed to flush index_db: {e}"))?;
+
+        // Save vector indices
+        self.save_vector_indices()
+            .map_err(|e| anyhow::anyhow!("Failed to save todo vector indices: {e}"))?;
+
         Ok(())
     }
 
