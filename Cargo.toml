@@ -67,20 +67,20 @@ path = "src/mcp.rs"
 
 [dependencies]
 # MCP Protocol
-rmcp = { version = "0.8", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 # Core
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 dotenvy = "0.15"  # Load .env files
 
 # Async runtime & web server
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }  # SSE event streaming (sync for BroadcastStream)
 futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
-tower = { version = "0.4", features = ["limit", "buffer", "load-shed"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower_governor = { version = "0.8", features = ["axum"] }
 
 # Serialization
@@ -88,22 +88,22 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Storage
-rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
-bincode = "1.3"
-lz4 = "1.24"
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
+lz4 = "1.28"
 
 # Concurrency
 parking_lot = "0.12"
-dashmap = "5.5"
+dashmap = "6.1"
 moka = { version = "0.12", features = ["sync"] }  # Lock-free concurrent cache with LRU eviction
 
 # Utilities
-uuid = { version = "1.4", features = ["v4", "serde"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 lru = "0.12"
-regex = "1.10"
+regex = "1.12"
 rust-stemmers = "1.2"  # Porter2 stemming for linguistic analysis
-dirs = "5.0"  # Platform-specific directory paths
+dirs = "6.0"  # Platform-specific directory paths
 glob = "0.3"  # Pattern matching for file paths
 
 # Logging
@@ -111,17 +111,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Observability (P1.1)
-prometheus = "0.13"
-lazy_static = "1.4"
+prometheus = "0.14"
 
 # Distributed Tracing (P1.6) - OPTIONAL (heavy, ~200 packages, not needed for edge)
-tracing-opentelemetry = { version = "0.22", optional = true }
-opentelemetry = { version = "0.21", features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.14", features = ["trace"], optional = true }
-opentelemetry_sdk = { version = "0.21", features = ["trace", "rt-tokio"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry = { version = "0.28", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.28", features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.28", features = ["trace", "rt-tokio"], optional = true }
 
 # Vector operations (lightweight)
-ordered-float = "4.0"
+ordered-float = "5.0"
 
 # Vector database (Vamana HNSW)
 memmap2 = "0.9"
@@ -131,17 +130,17 @@ rand = "0.8"
 # Using load-dynamic for runtime DLL loading (bundled in wheels)
 # CRT conflicts solved via .cargo/config.toml: -crt-static
 ort = { version = "2.0.0-rc.10", default-features = false, features = ["load-dynamic", "half"] }
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
-ndarray = "0.15"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ndarray = "0.16"
 
 # Graph visualization
 petgraph = "0.8"
 
 # Full-text search (BM25)
-tantivy = "0.22"
+tantivy = "0.25"
 
 # Bloom filter
-bloomfilter = "1.0"
+bloomfilter = "3.0"
 
 # Base64 encoding
 base64 = "0.22"
@@ -150,23 +149,26 @@ base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
 
+# MIF encryption (AES-256-GCM)
+aes-gcm = "0.10"
+
 # External integrations (SHO-40)
 hmac = "0.12"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # Auto-download for models and ONNX runtime
-ureq = { version = "2.9", features = ["json"] }
-zip = { version = "2.1", default-features = false, features = ["deflate"] }
-flate2 = "1.0"
+ureq = { version = "3.0", features = ["json"] }
+zip = { version = "7.0", default-features = false, features = ["deflate"] }
+flate2 = "1.1"
 tar = "0.4"
 
 # Python bindings (optional)
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
-numpy = { version = "0.22", optional = true }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"], optional = true }
+numpy = { version = "0.23", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3.8"
+tempfile = "3.24"
 
 [[bench]]
 name = "memory_benchmarks"
