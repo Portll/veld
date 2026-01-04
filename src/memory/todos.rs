@@ -453,6 +453,15 @@ impl TodoStore {
         }
     }
 
+    /// Find todo by external ID (e.g., "todoist:123", "linear:SHO-39")
+    /// Used for two-way sync with external todo/task management systems
+    pub fn find_by_external_id(&self, user_id: &str, external_id: &str) -> Result<Option<Todo>> {
+        let todos = self.list_todos_for_user(user_id, None)?;
+        Ok(todos
+            .into_iter()
+            .find(|t| t.external_id.as_deref() == Some(external_id)))
+    }
+
     /// Update a todo
     pub fn update_todo(&self, todo: &Todo) -> Result<()> {
         // Get old todo to remove old indices
@@ -1204,6 +1213,7 @@ pub struct UserTodoStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::types::Recurrence;
     use tempfile::TempDir;
 
     fn setup_store() -> (TodoStore, TempDir) {

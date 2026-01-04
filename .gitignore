@@ -71,3 +71,22 @@ python/shodh_memory/models/minilm-l6/*.json
 python/shodh_memory/models/bert-tiny-ner/*.onnx
 python/shodh_memory/models/bert-tiny-ner/*.json
 experiments/
+
+# Node.js
+node_modules/
+bun.lock
+package-lock.json
+yarn.lock
+
+# Temp/test directories
+.venv/
+test_*/
+release-test/
+temp_*/
+
+# Credentials (never commit)
+.mcpregistry_*
+*.token
+
+# Windows artifacts
+nul

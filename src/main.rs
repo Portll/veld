@@ -8108,6 +8108,20 @@ async fn cleanup_corrupted(
         .cleanup_corrupted()
         .map_err(AppError::Internal)?;
 
+    // Broadcast DELETE event for real-time dashboard so TUI updates its count
+    if deleted_count > 0 {
+        state.emit_event(MemoryEvent {
+            event_type: "DELETE".to_string(),
+            timestamp: chrono::Utc::now(),
+            user_id: req.user_id.clone(),
+            memory_id: None,
+            content_preview: Some(format!("cleanup: {} corrupted entries", deleted_count)),
+            memory_type: None,
+            importance: None,
+            count: Some(deleted_count),
+        });
+    }
+
     Ok(Json(CleanupCorruptedResponse {
         success: true,
         deleted_count,
@@ -11896,6 +11910,9 @@ struct CreateTodoRequest {
     notes: Option<String>,
     #[serde(default)]
     recurrence: Option<String>,
+    /// External ID for linking to external systems (e.g., "todoist:123", "linear:SHO-39")
+    #[serde(default)]
+    external_id: Option<String>,
 }
 
 /// Response for todo operations
@@ -12015,6 +12032,9 @@ struct UpdateTodoRequest {
     sort_order: Option<i32>,
     #[serde(default)]
     parent_id: Option<String>,
+    /// External ID for linking to external systems (e.g., "todoist:123", "linear:SHO-39")
+    #[serde(default)]
+    external_id: Option<String>,
 }
 
 /// Request to reorder a todo (move up/down)
@@ -12195,6 +12215,9 @@ async fn create_todo(
     // Set tags and notes
     todo.tags = req.tags.unwrap_or_default();
     todo.notes = req.notes;
+
+    // Set external_id for external system linking (e.g., todoist:123)
+    todo.external_id = req.external_id;
 
     // Parse and set recurrence
     if let Some(ref recurrence_str) = req.recurrence {
@@ -12649,6 +12672,9 @@ async fn update_todo(
     }
     if let Some(ref tags) = req.tags {
         todo.tags = tags.clone();
+    }
+    if let Some(ref external_id) = req.external_id {
+        todo.external_id = Some(external_id.clone());
     }
     if let Some(ref parent_id_str) = req.parent_id {
         // Resolve parent todo by prefix

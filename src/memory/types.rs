@@ -3031,6 +3031,11 @@ pub struct Todo {
     #[serde(default)]
     pub tags: Vec<String>,
 
+    /// External ID for linking to external systems (e.g., "todoist:123", "linear:SHO-39")
+    /// Used for two-way sync with external todo/task management systems
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+
     /// Due date/time (optional)
     pub due_date: Option<DateTime<Utc>>,
 
@@ -3087,6 +3092,7 @@ impl Todo {
             parent_id: None,
             contexts: Vec::new(),
             tags: Vec::new(),
+            external_id: None,
             due_date: None,
             recurrence: None,
             blocked_on: None,
