@@ -9285,6 +9285,7 @@ async fn import_mif(
             comments: Vec::new(),
             embedding: None,
             related_memory_ids: Vec::new(),
+            external_id: None,
         };
 
         match state.todo_store.store_todo(&todo) {
