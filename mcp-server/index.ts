@@ -1486,7 +1486,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const m = memories[i];
             const content = getContent(m);
             const score = ((m.score || 0) * 100).toFixed(0);
-            const matchBar = '█'.repeat(Math.round((m.score || 0) * 10)) + '░'.repeat(10 - Math.round((m.score || 0) * 10));
+            const filled = Math.max(0, Math.min(10, Math.round((m.score || 0) * 10)));
+            const matchBar = '█'.repeat(filled) + '░'.repeat(10 - filled);
             const timeStr = formatTime(m.created_at);
 
             response += `• ${matchBar} ${score}% │ ${timeStr}\n`;
@@ -1503,7 +1504,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           for (let i = 0; i < todos.length; i++) {
             const t = todos[i];
             const score = ((t.score || 0) * 100).toFixed(0);
-            const matchBar = '█'.repeat(Math.round((t.score || 0) * 10)) + '░'.repeat(10 - Math.round((t.score || 0) * 10));
+            const filled = Math.max(0, Math.min(10, Math.round((t.score || 0) * 10)));
+            const matchBar = '█'.repeat(filled) + '░'.repeat(10 - filled);
             const statusIcon = t.status === 'done' ? '✓' : t.status === 'in_progress' ? '▶' : t.status === 'blocked' ? '⊗' : '○';
             const timeStr = formatTime(t.created_at);
 

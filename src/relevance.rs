@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use regex::Regex;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,26 @@ use uuid::Uuid;
 use crate::embeddings::NeuralNer;
 use crate::graph_memory::GraphMemory;
 use crate::memory::{Memory, MemorySystem};
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Check if a word appears as a complete word in text (not as substring).
+/// Uses word boundary matching to avoid false positives like "MIT" matching "submit".
+fn contains_word(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    // Build regex pattern with word boundaries
+    // Escape special regex characters in the word
+    let escaped = regex::escape(word);
+    let pattern = format!(r"(?i)\b{}\b", escaped);
+    match Regex::new(&pattern) {
+        Ok(re) => re.is_match(text),
+        Err(_) => text.contains(word), // Fallback to substring if regex fails
+    }
+}
 
 // =============================================================================
 // LEARNED WEIGHT CONSTANTS
@@ -838,7 +859,12 @@ impl RelevanceEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Truncate to max results
+        // Quality-based filtering: only return memories above minimum relevance
+        // This prevents returning low-quality matches just to fill max_results
+        const MIN_RELEVANCE_SCORE: f32 = 0.25;
+        results.retain(|r| r.relevance_score >= MIN_RELEVANCE_SCORE);
+
+        // Cap at max_results (but may return fewer if quality threshold filters them)
         results.truncate(config.max_results);
 
         debug.ranking_ms = ranking_start.elapsed().as_secs_f64() * 1000.0;
@@ -1037,6 +1063,11 @@ impl RelevanceEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Quality-based filtering: only return memories above minimum relevance
+        const MIN_RELEVANCE_SCORE: f32 = 0.25;
+        results.retain(|r| r.relevance_score >= MIN_RELEVANCE_SCORE);
+
+        // Cap at max_results (but may return fewer if quality threshold filters them)
         results.truncate(config.max_results);
 
         debug.ranking_ms = ranking_start.elapsed().as_secs_f64() * 1000.0;
@@ -1282,9 +1313,9 @@ impl RelevanceEngine {
             let mut matched: Vec<String> = Vec::new();
             let mut match_score = 0.0f32;
 
-            // Check direct text matches
+            // Check direct text matches with word boundaries
             for (name_lower, entity, weight) in &entity_lookup {
-                if content_lower.contains(name_lower) {
+                if contains_word(&content_lower, name_lower) {
                     matched.push(entity.name.clone());
                     match_score += entity.confidence * weight;
                 }
