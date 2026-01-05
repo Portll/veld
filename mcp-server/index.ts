@@ -3010,7 +3010,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const result = await apiCall<ProjectResponse>(`/api/projects/${encodeURIComponent(project)}/update`, "POST", {
           user_id: USER_ID,
-          status: "Archived",
+          status: "archived",
         });
 
         return {
