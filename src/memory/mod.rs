@@ -47,7 +47,10 @@ use crate::metrics::{
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
     DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, ESTIMATED_BYTES_PER_MEMORY,
-    HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING,
+    HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING, POTENTIATION_ACCESS_THRESHOLD,
+    POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
+    TIER_PROMOTION_SESSION_IMPORTANCE, TIER_PROMOTION_WORKING_AGE_SECS,
+    TIER_PROMOTION_WORKING_IMPORTANCE,
 };
 
 use crate::memory::storage::MemoryStorage;
@@ -199,6 +202,11 @@ pub struct MemorySystem {
     /// Hybrid search engine (BM25 + Vector + RRF + Reranking)
     /// Combines keyword matching with semantic similarity for better retrieval
     hybrid_search: Arc<hybrid_search::HybridSearchEngine>,
+
+    /// Optional graph memory for entity relationships and spreading activation
+    /// When set, entities are extracted and added to the knowledge graph on remember()
+    /// This enables spreading activation retrieval and Hebbian co-activation learning
+    graph_memory: Option<Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>>,
 }
 
 impl MemorySystem {
@@ -411,7 +419,31 @@ impl MemorySystem {
             lineage_graph,
             // Hybrid search engine (always enabled)
             hybrid_search: Arc::new(hybrid_search_engine),
+            // Graph memory is optional - wire up with set_graph_memory() for entity relationships
+            graph_memory: None,
         })
+    }
+
+    /// Wire up GraphMemory for entity relationships and spreading activation
+    ///
+    /// When GraphMemory is set, the remember() method will:
+    /// 1. Extract entities from memory content
+    /// 2. Add them to the knowledge graph
+    /// 3. Create edges between co-occurring entities
+    ///
+    /// This enables spreading activation retrieval and Hebbian learning
+    pub fn set_graph_memory(
+        &mut self,
+        graph: Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>,
+    ) {
+        self.graph_memory = Some(graph);
+    }
+
+    /// Get reference to the optional graph memory
+    pub fn graph_memory(
+        &self,
+    ) -> Option<&Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>> {
+        self.graph_memory.as_ref()
     }
 
     /// Store a new memory (takes ownership to avoid clones)
@@ -494,8 +526,28 @@ impl MemorySystem {
             true
         };
 
-        // Add to knowledge graph for associative/causal retrieval
-        self.retriever.add_to_graph(&memory);
+        // Add entities to knowledge graph for associative/causal retrieval
+        if let Some(graph) = &self.graph_memory {
+            let mut graph_guard = graph.write();
+            for entity_name in &memory.experience.entities {
+                let entity = crate::graph_memory::EntityNode {
+                    uuid: Uuid::new_v4(),
+                    name: entity_name.clone(),
+                    labels: vec![crate::graph_memory::EntityLabel::Concept], // Default label
+                    created_at: chrono::Utc::now(),
+                    last_seen_at: chrono::Utc::now(),
+                    mention_count: 1,
+                    summary: String::new(),
+                    attributes: std::collections::HashMap::new(),
+                    name_embedding: None,
+                    salience: 0.5, // Default salience
+                    is_proper_noun: entity_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false),
+                };
+                if let Err(e) = graph_guard.add_entity(entity) {
+                    tracing::debug!("Failed to add entity '{}' to graph: {}", entity_name, e);
+                }
+            }
+        }
 
         // Index in BM25 for hybrid search (keyword + semantic)
         if let Err(e) = self.hybrid_search.index_memory(
@@ -605,11 +657,11 @@ impl MemorySystem {
         // Trigger background consolidation if needed
         self.consolidate_if_needed()?;
 
-        // Commit BM25 index changes (makes documents searchable)
+        // Commit and reload BM25 index changes (makes documents searchable immediately)
         // Note: This is done per-memory for immediate searchability.
         // For high-throughput scenarios, consider batching commits.
-        if let Err(e) = self.hybrid_search.commit() {
-            tracing::warn!("Failed to commit BM25 index: {}", e);
+        if let Err(e) = self.hybrid_search.commit_and_reload() {
+            tracing::warn!("Failed to commit/reload BM25 index: {}", e);
         }
 
         Ok(memory_id)
@@ -675,8 +727,28 @@ impl MemorySystem {
             tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
         }
 
-        // Add to knowledge graph
-        self.retriever.add_to_graph(&memory);
+        // Add entities to knowledge graph
+        if let Some(graph) = &self.graph_memory {
+            let mut graph_guard = graph.write();
+            for entity_name in &memory.experience.entities {
+                let entity = crate::graph_memory::EntityNode {
+                    uuid: Uuid::new_v4(),
+                    name: entity_name.clone(),
+                    labels: vec![crate::graph_memory::EntityLabel::Concept],
+                    created_at: chrono::Utc::now(),
+                    last_seen_at: chrono::Utc::now(),
+                    mention_count: 1,
+                    summary: String::new(),
+                    attributes: std::collections::HashMap::new(),
+                    name_embedding: None,
+                    salience: 0.5,
+                    is_proper_noun: entity_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false),
+                };
+                if let Err(e) = graph_guard.add_entity(entity) {
+                    tracing::debug!("Failed to add entity '{}' to graph: {}", entity_name, e);
+                }
+            }
+        }
 
         // Index in BM25 for hybrid search
         if let Err(e) = self.hybrid_search.index_memory(
@@ -705,9 +777,9 @@ impl MemorySystem {
 
         self.consolidate_if_needed()?;
 
-        // Commit BM25 index changes
-        if let Err(e) = self.hybrid_search.commit() {
-            tracing::warn!("Failed to commit BM25 index: {}", e);
+        // Commit and reload BM25 index changes
+        if let Err(e) = self.hybrid_search.commit_and_reload() {
+            tracing::warn!("Failed to commit/reload BM25 index: {}", e);
         }
 
         Ok(memory_id)
@@ -1601,20 +1673,17 @@ impl MemorySystem {
         importance
     }
 
-    /// Consolidate memories when thresholds are reached
+    /// Consolidate memories based on Cowan's model (importance + time, not size)
+    ///
+    /// Tier promotion criteria:
+    /// - Working → Session: importance >= 0.4 AND age >= 5 minutes
+    /// - Session → LongTerm: importance >= 0.6 AND age >= 1 hour
     fn consolidate_if_needed(&self) -> Result<()> {
-        let working_size = self.working_memory.read().size();
+        // Promote eligible memories from working to session (importance + time based)
+        self.promote_working_to_session()?;
 
-        // If working memory is full, move to session
-        if working_size >= self.config.working_memory_size {
-            self.promote_working_to_session()?;
-        }
-
-        // If session memory is large, compress and move to long-term
-        let session_size = self.session_memory.read().size_mb();
-        if session_size >= self.config.session_memory_size_mb {
-            self.promote_session_to_longterm()?;
-        }
+        // Promote eligible memories from session to long-term (importance + time based)
+        self.promote_session_to_longterm()?;
 
         // Compress old memories if auto-compress is enabled
         if self.config.auto_compress {
@@ -1624,14 +1693,35 @@ impl MemorySystem {
         Ok(())
     }
 
-    /// Move memories from working to session memory
+    /// Move memories from working to session memory (Cowan's model)
+    ///
+    /// Promotion criteria: importance >= TIER_PROMOTION_WORKING_IMPORTANCE
+    /// AND age >= TIER_PROMOTION_WORKING_AGE_SECS
     fn promote_working_to_session(&self) -> Result<()> {
+        let now = chrono::Utc::now();
+        let min_age = chrono::Duration::seconds(TIER_PROMOTION_WORKING_AGE_SECS);
+
+        // Find eligible memories (importance + time threshold)
+        let to_promote: Vec<SharedMemory> = {
+            let working = self.working_memory.read();
+            working
+                .all_memories()
+                .into_iter()
+                .filter(|m| {
+                    let age = now - m.created_at;
+                    let importance = m.importance();
+                    importance >= TIER_PROMOTION_WORKING_IMPORTANCE && age >= min_age
+                })
+                .collect()
+        };
+
+        if to_promote.is_empty() {
+            return Ok(());
+        }
+
+        let count = to_promote.len();
         let mut working = self.working_memory.write();
         let mut session = self.session_memory.write();
-
-        // Get least recently used memories
-        let to_promote = working.get_lru(self.config.working_memory_size / 2)?;
-        let count = to_promote.len();
 
         for memory in &to_promote {
             // Log promotion
@@ -1646,17 +1736,46 @@ impl MemorySystem {
             working.remove(&memory.id)?;
         }
 
-        self.stats.write().promotions_to_session += 1;
+        if count > 0 {
+            self.stats.write().promotions_to_session += count;
+            tracing::debug!(
+                "Promoted {} memories from working to session (importance >= {}, age >= {}s)",
+                count,
+                TIER_PROMOTION_WORKING_IMPORTANCE,
+                TIER_PROMOTION_WORKING_AGE_SECS
+            );
+        }
         Ok(())
     }
 
-    /// Move memories from session to long-term storage
+    /// Move memories from session to long-term storage (Cowan's model)
+    ///
+    /// Promotion criteria: importance >= TIER_PROMOTION_SESSION_IMPORTANCE
+    /// AND age >= TIER_PROMOTION_SESSION_AGE_SECS
     fn promote_session_to_longterm(&self) -> Result<()> {
-        let mut session = self.session_memory.write();
+        let now = chrono::Utc::now();
+        let min_age = chrono::Duration::seconds(TIER_PROMOTION_SESSION_AGE_SECS);
 
-        // Get memories to promote (important ones)
-        let to_promote = session.get_important(self.config.importance_threshold)?;
+        // Find eligible memories (importance + time threshold)
+        let to_promote: Vec<SharedMemory> = {
+            let session = self.session_memory.read();
+            session
+                .all_memories()
+                .into_iter()
+                .filter(|m| {
+                    let age = now - m.created_at;
+                    let importance = m.importance();
+                    importance >= TIER_PROMOTION_SESSION_IMPORTANCE && age >= min_age
+                })
+                .collect()
+        };
+
+        if to_promote.is_empty() {
+            return Ok(());
+        }
+
         let count = to_promote.len();
+        let mut session = self.session_memory.write();
 
         for memory in &to_promote {
             // Log promotion
@@ -1692,7 +1811,15 @@ impl MemorySystem {
             session.remove(&memory.id)?;
         }
 
-        self.stats.write().promotions_to_longterm += 1;
+        if count > 0 {
+            self.stats.write().promotions_to_longterm += count;
+            tracing::debug!(
+                "Promoted {} memories from session to long-term (importance >= {}, age >= {}s)",
+                count,
+                TIER_PROMOTION_SESSION_IMPORTANCE,
+                TIER_PROMOTION_SESSION_AGE_SECS
+            );
+        }
         Ok(())
     }
 
@@ -2730,8 +2857,8 @@ impl MemorySystem {
             ) {
                 tracing::warn!("Failed to reindex memory {} in BM25: {}", memory_id.0, e);
             }
-            if let Err(e) = self.hybrid_search.commit() {
-                tracing::warn!("Failed to commit BM25 index: {}", e);
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!("Failed to commit/reload BM25 index: {}", e);
             }
 
             // Update in working/session memory if cached
@@ -2809,8 +2936,28 @@ impl MemorySystem {
                 tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
             }
 
-            // Add to knowledge graph
-            self.retriever.add_to_graph(&memory);
+            // Add entities to knowledge graph
+            if let Some(graph) = &self.graph_memory {
+                let mut graph_guard = graph.write();
+                for entity_name in &memory.experience.entities {
+                    let entity = crate::graph_memory::EntityNode {
+                        uuid: Uuid::new_v4(),
+                        name: entity_name.clone(),
+                        labels: vec![crate::graph_memory::EntityLabel::Concept],
+                        created_at: chrono::Utc::now(),
+                        last_seen_at: chrono::Utc::now(),
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: std::collections::HashMap::new(),
+                        name_embedding: None,
+                        salience: 0.5,
+                        is_proper_noun: entity_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false),
+                    };
+                    if let Err(e) = graph_guard.add_entity(entity) {
+                        tracing::debug!("Failed to add entity '{}' to graph: {}", entity_name, e);
+                    }
+                }
+            }
 
             // Index in BM25 for hybrid search
             if let Err(e) = self.hybrid_search.index_memory(
@@ -2821,8 +2968,8 @@ impl MemorySystem {
             ) {
                 tracing::warn!("Failed to index memory {} in BM25: {}", memory.id.0, e);
             }
-            if let Err(e) = self.hybrid_search.commit() {
-                tracing::warn!("Failed to commit BM25 index: {}", e);
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!("Failed to commit/reload BM25 index: {}", e);
             }
 
             // Add to session if important
@@ -2938,6 +3085,59 @@ impl MemorySystem {
                     });
                 }
             }
+        }
+
+        // 2.5 Potentiation: boost ALL memories based on access count (Hebbian LTP)
+        // This implements "neurons that fire together wire together" - memories
+        // that are accessed frequently get importance boosts during maintenance
+        let mut potentiated_count = 0;
+        {
+            // Potentiate working memory
+            let working = self.working_memory.read();
+            for memory in working.all_memories() {
+                if memory.access_count() >= POTENTIATION_ACCESS_THRESHOLD {
+                    let activation_before = memory.importance();
+                    memory.boost_importance(POTENTIATION_MAINTENANCE_BOOST);
+                    potentiated_count += 1;
+
+                    self.record_consolidation_event(ConsolidationEvent::MemoryStrengthened {
+                        memory_id: memory.id.0.to_string(),
+                        content_preview: memory.experience.content.chars().take(50).collect(),
+                        activation_before,
+                        activation_after: memory.importance(),
+                        reason: StrengtheningReason::MaintenancePotentiation,
+                        timestamp: now,
+                    });
+                }
+            }
+        }
+        {
+            // Potentiate session memory
+            let session = self.session_memory.read();
+            for memory in session.all_memories() {
+                if memory.access_count() >= POTENTIATION_ACCESS_THRESHOLD {
+                    let activation_before = memory.importance();
+                    memory.boost_importance(POTENTIATION_MAINTENANCE_BOOST);
+                    potentiated_count += 1;
+
+                    self.record_consolidation_event(ConsolidationEvent::MemoryStrengthened {
+                        memory_id: memory.id.0.to_string(),
+                        content_preview: memory.experience.content.chars().take(50).collect(),
+                        activation_before,
+                        activation_after: memory.importance(),
+                        reason: StrengtheningReason::MaintenancePotentiation,
+                        timestamp: now,
+                    });
+                }
+            }
+        }
+
+        if potentiated_count > 0 {
+            tracing::debug!(
+                "Potentiated {} memories during maintenance (access >= {})",
+                potentiated_count,
+                POTENTIATION_ACCESS_THRESHOLD
+            );
         }
 
         // 3. Graph maintenance: prune weak edges

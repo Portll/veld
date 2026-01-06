@@ -211,6 +211,8 @@ pub enum StrengtheningReason {
     ExplicitBoost,
     /// Co-retrieved with another memory
     CoRetrieval,
+    /// Potentiated during maintenance (Hebbian LTP for frequently accessed memories)
+    MaintenancePotentiation,
 }
 
 /// Reasons for edge formation

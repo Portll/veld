@@ -9,19 +9,19 @@
 // produce stable learning. Large changes cause instability.
 // =============================================================================
 
-/// Importance boost for helpful memories (+5%)
+/// Importance boost for helpful memories (+2.5%)
 ///
 /// When a memory helps complete a task successfully (RetrievalOutcome::Helpful),
 /// its importance is increased by this amount.
 ///
 /// Justification:
-/// - 5% is small enough to require multiple successful uses for significant impact
-/// - Matches biological synaptic strengthening (~3-7% per successful activation)
-/// - 20 successful uses → importance increases from 0.5 to ~0.8 (compound effect)
-/// - Prevents single lucky retrieval from dominating future searches
+/// - 2.5% is conservative to require many successful uses for significant impact
+/// - Below biological synaptic strengthening (~3-7% per successful activation)
+/// - 40 successful uses → importance increases from 0.5 to ~0.7 (compound effect)
+/// - Prevents "rich get richer" effect where early memories dominate
 ///
 /// Reference: Bi & Poo (1998) "Synaptic Modifications in Cultured Hippocampal Neurons"
-pub const HEBBIAN_BOOST_HELPFUL: f32 = 0.05;
+pub const HEBBIAN_BOOST_HELPFUL: f32 = 0.025;
 
 /// Importance decay for misleading memories (-10%)
 ///
@@ -395,6 +395,71 @@ pub const DEFAULT_MAX_HEAP_PER_USER_MB: usize = 500;
 
 /// Default importance threshold for long-term storage
 pub const DEFAULT_IMPORTANCE_THRESHOLD: f32 = 0.7;
+
+// =============================================================================
+// COWAN'S MODEL TIER PROMOTION CONSTANTS
+// Based on Cowan (1988) "Evolving conceptions of memory storage"
+// and memory consolidation research (Rasch & Born, 2013)
+// Tier promotion is based on importance + time, not size
+// =============================================================================
+
+/// Minimum importance for Working → Session promotion
+/// Memories must reach this threshold through Hebbian strengthening
+/// or initial high-importance assignment before promotion
+///
+/// Justification:
+/// - 0.35 allows moderately important memories to consolidate
+/// - Combined with time threshold, prevents noise from entering session memory
+/// - Matches ~65th percentile of memories by initial importance
+pub const TIER_PROMOTION_WORKING_IMPORTANCE: f32 = 0.35;
+
+/// Minimum age in seconds for Working → Session promotion
+/// Based on early consolidation window in hippocampal memory formation
+///
+/// Justification:
+/// - 30 minutes (1800s) matches synaptic consolidation window
+/// - Allows for replay/rehearsal before promotion
+/// - Short enough for practical use, long enough for consolidation
+///
+/// Reference: McGaugh (2000) "Memory - a century of consolidation"
+pub const TIER_PROMOTION_WORKING_AGE_SECS: i64 = 1800; // 30 minutes
+
+/// Minimum importance for Session → LongTerm promotion
+/// Higher threshold ensures only well-consolidated memories persist
+///
+/// Justification:
+/// - 0.5 requires either high initial importance or Hebbian strengthening
+/// - Memories must prove their value through access patterns
+/// - Matches median importance threshold for durable memories
+pub const TIER_PROMOTION_SESSION_IMPORTANCE: f32 = 0.5;
+
+/// Minimum age in seconds for Session → LongTerm promotion
+/// Based on hippocampal-cortical memory transfer timeline
+///
+/// Justification:
+/// - 24 hours (86400s) matches sleep-dependent consolidation cycle
+/// - Allows for multiple replay cycles before permanent storage
+/// - Hippocampal → cortical transfer primarily occurs during sleep
+///
+/// Reference: Rasch & Born (2013) "About Sleep's Role in Memory"
+pub const TIER_PROMOTION_SESSION_AGE_SECS: i64 = 86400; // 24 hours
+
+/// Potentiation boost applied during each maintenance cycle
+/// Applied to ALL memories based on access count (Hebbian strengthening)
+///
+/// Justification:
+/// - 0.5% per cycle is gradual (requires ~40 cycles for noticeable effect)
+/// - Prevents runaway importance inflation
+/// - Matches slow synaptic strengthening in biological systems
+pub const POTENTIATION_MAINTENANCE_BOOST: f32 = 0.005; // 0.5% per cycle
+
+/// Access count threshold for potentiation boost
+/// Memories accessed more than this get a maintenance boost
+///
+/// Justification:
+/// - 3 accesses indicates pattern of use, not single retrieval
+/// - Prevents potentiation of noise/rarely-used memories
+pub const POTENTIATION_ACCESS_THRESHOLD: u32 = 3;
 
 /// Default compression age (days)
 pub const DEFAULT_COMPRESSION_AGE_DAYS: u32 = 7;
