@@ -120,7 +120,10 @@ impl ProductQuantizer {
 
         tracing::info!(
             "Training PQ: {} vectors, {} subvectors, {} centroids, {} iterations",
-            n_vectors, n_subvectors, n_centroids, iterations
+            n_vectors,
+            n_subvectors,
+            n_centroids,
+            iterations
         );
 
         // Initialize centroids storage
@@ -132,10 +135,8 @@ impl ProductQuantizer {
             let end = start + subvec_dim;
 
             // Extract subvectors for this subspace
-            let subvectors: Vec<Vec<f32>> = vectors
-                .iter()
-                .map(|v| v[start..end].to_vec())
-                .collect();
+            let subvectors: Vec<Vec<f32>> =
+                vectors.iter().map(|v| v[start..end].to_vec()).collect();
 
             // Run k-means clustering
             let centroids = self.kmeans(&subvectors, n_centroids, iterations)?;
@@ -365,10 +366,7 @@ impl ProductQuantizer {
 /// Squared L2 distance between two vectors
 #[inline]
 fn squared_l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
 /// Squared L2 distance for slices (same as above but clearer intent)
@@ -415,7 +413,9 @@ impl CompressedVectorStore {
 
     /// Decode a vector back to approximate floats
     pub fn decode(&self, vector_id: u32) -> Result<Vec<f32>> {
-        let codes = self.codes.get(&vector_id)
+        let codes = self
+            .codes
+            .get(&vector_id)
             .ok_or_else(|| anyhow!("Vector {} not found", vector_id))?;
         self.quantizer.decode(codes)
     }
@@ -426,7 +426,8 @@ impl CompressedVectorStore {
         let table = self.quantizer.build_distance_table(query)?;
 
         // Compute distances to all vectors
-        let mut distances: Vec<(u32, f32)> = self.codes
+        let mut distances: Vec<(u32, f32)> = self
+            .codes
             .iter()
             .map(|(&id, codes)| (id, self.quantizer.distance_with_table(&table, codes)))
             .collect();
@@ -482,10 +483,12 @@ mod tests {
         assert_eq!(decoded.len(), 384);
 
         // Decoded should be close to original (not exact due to quantization)
-        let mse: f32 = original.iter()
+        let mse: f32 = original
+            .iter()
             .zip(decoded.iter())
             .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>() / 384.0;
+            .sum::<f32>()
+            / 384.0;
 
         // MSE should be reasonably low
         assert!(mse < 0.1, "MSE too high: {}", mse);
@@ -497,7 +500,7 @@ mod tests {
         let pq = ProductQuantizer::new(config);
 
         assert_eq!(pq.original_size(), 384 * 4); // 1536 bytes
-        assert_eq!(pq.compressed_size(), 48);    // 48 bytes
+        assert_eq!(pq.compressed_size(), 48); // 48 bytes
         assert!((pq.compression_ratio() - 32.0).abs() < 0.01);
     }
 
@@ -541,6 +544,9 @@ mod tests {
         assert_eq!(results.len(), 10);
         // The query should be among the top results (within first few)
         let query_in_top_results = results.iter().take(5).any(|(id, _)| *id == 0);
-        assert!(query_in_top_results, "Query vector not found in top 5 results");
+        assert!(
+            query_in_top_results,
+            "Query vector not found in top 5 results"
+        );
     }
 }

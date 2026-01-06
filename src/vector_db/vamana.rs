@@ -831,7 +831,11 @@ impl VamanaIndex {
             VectorStorage::Memory(vecs) => {
                 vecs.push(vector.clone());
             }
-            VectorStorage::Mmap { mmap, num_vectors, dimension } => {
+            VectorStorage::Mmap {
+                mmap,
+                num_vectors,
+                dimension,
+            } => {
                 // Convert mmap to memory storage for incremental updates
                 tracing::info!(
                     "Converting mmap storage ({} vectors) to memory for incremental indexing",

@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use regex::Regex;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
