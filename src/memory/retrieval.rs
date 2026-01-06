@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::introspection::{ConsolidationEvent, ConsolidationEventBuffer};
 use super::storage::{MemoryStorage, SearchCriteria};
@@ -24,6 +24,9 @@ use crate::constants::{
 };
 use crate::embeddings::{minilm::MiniLMEmbedder, Embedder};
 use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
+
+/// Filename for persisted Vamana index (instant startup)
+const VAMANA_INDEX_FILE: &str = "vamana.idx";
 
 /// Multi-modal retrieval engine with production vector search
 ///
@@ -215,19 +218,33 @@ impl RetrievalEngine {
         Ok(engine)
     }
 
-    /// Rebuild Vamana index from RocksDB mappings
+    /// Initialize Vamana index from persisted file or rebuild from RocksDB
     ///
-    /// This is the key to atomic storage: RocksDB is THE source of truth.
-    /// On startup, we rebuild the in-memory Vamana index from stored mappings.
+    /// INSTANT STARTUP ARCHITECTURE:
+    /// 1. Try loading .vamana file (instant, ~10ms for 500k vectors)
+    /// 2. Fall back to RocksDB rebuild (slow, ~seconds for 500k vectors)
     ///
-    /// Two strategies:
-    /// 1. Fast path: If mappings exist in RocksDB, load them directly
-    /// 2. Slow path: If no mappings (migration), rebuild from embeddings
-    ///
-    /// MULTIMODALITY NOTE: Currently only rebuilds text embeddings (384-dim).
-    /// Future modalities will have their own Vamana indices with matching dimensions.
+    /// RocksDB remains the source of truth for ID mappings.
+    /// The .vamana file is a cache that can be regenerated.
     fn rebuild_from_rocksdb(&self) -> Result<()> {
         let start_time = std::time::Instant::now();
+
+        // Try instant startup from persisted Vamana file
+        let vamana_path = self.storage_path.join("vector_index").join(VAMANA_INDEX_FILE);
+        if vamana_path.exists() {
+            if let Ok(loaded) = self.try_load_persisted_vamana(&vamana_path) {
+                if loaded {
+                    info!(
+                        "Instant startup: loaded Vamana in {:.2}ms",
+                        start_time.elapsed().as_secs_f64() * 1000.0
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fall back to rebuilding from RocksDB
+        info!("No valid .vamana file, rebuilding from RocksDB...");
 
         // Get all vector mappings from RocksDB
         let mappings = self.storage.get_all_vector_mappings()?;
@@ -371,6 +388,85 @@ impl RetrievalEngine {
         Ok(())
     }
 
+    /// Try loading Vamana from persisted file for instant startup
+    ///
+    /// Returns Ok(true) if successfully loaded, Ok(false) if should fall back to rebuild.
+    /// Verifies checksum and cross-checks with RocksDB mappings.
+    fn try_load_persisted_vamana(&self, vamana_path: &Path) -> Result<bool> {
+        // Verify file integrity first
+        if !VamanaIndex::verify_index_file(vamana_path)? {
+            warn!("Vamana file checksum mismatch, will rebuild");
+            return Ok(false);
+        }
+
+        // Load the persisted index
+        let loaded_index = match VamanaIndex::load_from_file(vamana_path) {
+            Ok(idx) => idx,
+            Err(e) => {
+                warn!("Failed to load Vamana file: {}, will rebuild", e);
+                return Ok(false);
+            }
+        };
+
+        let loaded_count = loaded_index.len();
+
+        // Get mappings from RocksDB to rebuild IdMapping
+        let mappings = self.storage.get_all_vector_mappings()?;
+        let rocksdb_count = mappings
+            .iter()
+            .filter(|(_, e)| e.text_vectors().is_some())
+            .count();
+
+        // Check for significant drift (>10% difference suggests corruption or data loss)
+        let drift_ratio = if loaded_count > 0 {
+            (loaded_count as f64 - rocksdb_count as f64).abs() / loaded_count as f64
+        } else {
+            0.0
+        };
+
+        if drift_ratio > 0.1 && loaded_count > 100 {
+            warn!(
+                "Vamana/RocksDB drift too high ({:.1}%): {} vs {}, will rebuild",
+                drift_ratio * 100.0,
+                loaded_count,
+                rocksdb_count
+            );
+            return Ok(false);
+        }
+
+        // Replace the vector index with the loaded one
+        {
+            let mut index = self.vector_index.write();
+            *index = loaded_index;
+        }
+
+        // Rebuild IdMapping from RocksDB (fast - just HashMap operations)
+        let mut id_mapping = self.id_mapping.write();
+        id_mapping.clear();
+
+        for (memory_id, entry) in mappings.iter() {
+            if let Some(vector_ids) = entry.text_vectors() {
+                if !vector_ids.is_empty() {
+                    // Use the first vector_id for simple case
+                    // For chunked, we'd need to store all of them
+                    if vector_ids.len() == 1 {
+                        id_mapping.insert(memory_id.clone(), vector_ids[0]);
+                    } else {
+                        id_mapping.insert_chunks(memory_id.clone(), vector_ids.clone());
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Loaded {} vectors from .vamana, {} mappings from RocksDB",
+            self.vector_index.read().len(),
+            id_mapping.len()
+        );
+
+        Ok(true)
+    }
+
     /// Set the consolidation event buffer (for late binding after construction)
     pub fn set_consolidation_events(&mut self, events: Arc<RwLock<ConsolidationEventBuffer>>) {
         self.consolidation_events = Some(events);
@@ -383,24 +479,43 @@ impl RetrievalEngine {
         }
     }
 
-    /// Save memory graph to disk
+    /// Save Vamana index to disk for instant startup
     ///
-    /// ATOMIC ARCHITECTURE: Only saves the Hebbian graph to disk.
-    /// Vector index and ID mappings are stored in RocksDB atomically with memories.
-    /// Vamana is rebuilt from RocksDB on startup - no separate persistence needed.
+    /// HYBRID ARCHITECTURE:
+    /// - RocksDB: Source of truth for memories and ID mappings
+    /// - .vamana file: Persisted graph for instant startup (skip rebuild)
+    ///
+    /// On next startup, if .vamana exists and is valid, we load it directly.
+    /// Otherwise, we fall back to rebuilding from RocksDB.
     pub fn save(&self) -> Result<()> {
         let index_path = self.storage_path.join("vector_index");
         fs::create_dir_all(&index_path)?;
 
-        // NOTE: Memory graph is now persisted in GraphMemory (RocksDB)
-        // Vector index is rebuilt from RocksDB on startup
-        // ID mapping is stored atomically in RocksDB with each memory
-
+        let vamana_path = index_path.join(VAMANA_INDEX_FILE);
         let id_mapping = self.id_mapping.read();
-        info!(
-            "Vamana index: {} vectors in memory (rebuilds from RocksDB on restart)",
-            id_mapping.len()
-        );
+        let vector_count = id_mapping.len();
+
+        // Persist Vamana index for instant startup
+        let vector_index = self.vector_index.read();
+        if vector_count > 0 {
+            match vector_index.save_to_file(&vamana_path) {
+                Ok(()) => {
+                    info!(
+                        "Saved Vamana index: {} vectors to {} (instant startup enabled)",
+                        vector_count,
+                        vamana_path.display()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to save Vamana index (will rebuild on restart): {}",
+                        e
+                    );
+                }
+            }
+        } else {
+            info!("Vamana index empty, skipping persistence");
+        }
 
         Ok(())
     }
@@ -1134,20 +1249,6 @@ impl RetrievalEngine {
             self.len()
         );
 
-        Ok(())
-    }
-
-    /// Save vector index to disk (for persistence)
-    pub fn save_index(&self, path: &Path) -> Result<()> {
-        let index = self.vector_index.read();
-        index.save(path).context("Failed to save vector index")?;
-        Ok(())
-    }
-
-    /// Load vector index from disk
-    pub fn load_index(&self, path: &Path) -> Result<()> {
-        let mut index = self.vector_index.write();
-        index.load(path).context("Failed to load vector index")?;
         Ok(())
     }
 

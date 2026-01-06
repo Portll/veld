@@ -94,10 +94,10 @@ impl Default for VamanaConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VamanaNode {
     /// Node ID
-    id: u32,
+    pub(crate) id: u32,
 
     /// Neighbor IDs sorted by distance
-    neighbors: Vec<u32>,
+    pub(crate) neighbors: Vec<u32>,
 }
 
 /// Threshold for recommending index rebuild (number of incremental inserts)
@@ -132,19 +132,19 @@ pub struct VamanaIndex {
     pub(crate) num_vectors: std::sync::atomic::AtomicUsize,
 
     /// Storage path for mmap files (unique per index instance)
-    storage_path: Option<PathBuf>,
+    pub(crate) storage_path: Option<PathBuf>,
 
     /// Counter for incremental inserts since last rebuild
     /// Used to track index quality degradation
-    incremental_inserts: std::sync::atomic::AtomicUsize,
+    pub(crate) incremental_inserts: std::sync::atomic::AtomicUsize,
 
     /// Flag to prevent concurrent rebuilds
-    rebuilding: std::sync::atomic::AtomicBool,
+    pub(crate) rebuilding: std::sync::atomic::AtomicBool,
 
     /// Soft-deleted vector IDs (filtered from search results)
     /// These vectors remain in the graph but are excluded from results.
     /// Physically removed on next rebuild.
-    deleted_ids: Arc<RwLock<HashSet<u32>>>,
+    pub(crate) deleted_ids: Arc<RwLock<HashSet<u32>>>,
 }
 
 /// Vector storage abstraction

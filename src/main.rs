@@ -1016,15 +1016,7 @@ impl MultiUserMemoryManager {
 
         info!("Created memory system for user: {}", user_id);
 
-        // Initialize vector index (load from disk or rebuild)
-        if let Err(e) = self.init_user_vector_index(user_id) {
-            tracing::warn!(
-                "Vector index initialization failed for user {}: {}",
-                user_id,
-                e
-            );
-            // Don't fail user creation if indexing fails - semantic search will be unavailable
-        }
+        // Vector index is now loaded automatically via Vamana persistence in RetrievalEngine::new()
 
         Ok(memory_arc)
     }
@@ -1203,48 +1195,7 @@ impl MultiUserMemoryManager {
         Ok(())
     }
 
-    /// Load or rebuild vector index for a user (production initialization)
-    pub fn init_user_vector_index(&self, user_id: &str) -> Result<()> {
-        let memory = self.get_user_memory(user_id)?;
-        let memory_guard = memory.read();
 
-        let index_path = self.base_path.join(user_id).join("vector_index");
-
-        // Try to load existing index first
-        if index_path.exists() {
-            info!("📊 Loading vector index for user {} from disk...", user_id);
-            match memory_guard.load_vector_index(&index_path) {
-                Ok(_) => {
-                    info!("✅ Loaded vector index for user: {}", user_id);
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load vector index for user {}: {}. Rebuilding...",
-                        user_id,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Index doesn't exist or load failed - rebuild from storage
-        info!("🔨 Rebuilding vector index for user {}...", user_id);
-        match memory_guard.rebuild_vector_index() {
-            Ok(_) => {
-                info!("✅ Rebuilt vector index for user: {}", user_id);
-                // Save the newly built index
-                if let Err(e) = memory_guard.save_vector_index(&index_path) {
-                    tracing::warn!("Failed to save vector index for user {}: {}", user_id, e);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!("Failed to rebuild vector index for user {}: {}", user_id, e);
-                Ok(()) // Don't fail startup if indexing fails
-            }
-        }
-    }
 
     /// Rotate audit logs for all users (removes old entries)
     fn rotate_all_audit_logs(&self) -> Result<()> {
@@ -15075,15 +15026,23 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Run the server - it will wait until shutdown signal is received
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    // Run server until shutdown signal, then proceed immediately to cleanup
+    // Don't wait for graceful connection close - it can hang on SSE/WebSocket
+    tokio::select! {
+        result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => {
+            if let Err(e) = result {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = shutdown_signal() => {
+            info!("🛑 Shutdown signal received");
+        }
+    }
 
-    info!("🔒 Shutdown signal received, flushing databases...");
+    info!("🔒 Proceeding with database flush...");
 
     // P0.11: Wrap cleanup process with timeout for production resilience
     let cleanup_future = async {

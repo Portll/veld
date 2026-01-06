@@ -69,14 +69,14 @@ pub const ELEPHANT_FRAMES: &[&[&str]] = &[
     ],
 ];
 
-/// Gradient colors for elephant (top to bottom: dark -> bright orange)
+/// Website orange color #f0883e - solid to match website branding
 pub const ELEPHANT_GRADIENT: &[(u8, u8, u8)] = &[
-    (150, 50, 20),  // Dark burnt orange
-    (200, 70, 25),  // Deep orange
-    (235, 90, 35),  // Bright orange
-    (255, 110, 45), // Orange
-    (255, 135, 60), // Light orange
-    (255, 160, 85), // Pale orange/gold
+    (240, 136, 62), // #f0883e
+    (240, 136, 62),
+    (240, 136, 62),
+    (240, 136, 62),
+    (240, 136, 62),
+    (240, 136, 62),
 ];
 
 /// SHODH text in big block letters
@@ -89,15 +89,15 @@ pub const SHODH_TEXT: &[&str] = &[
     "╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝",
 ];
 
-/// Gradient colors for SHODH text
+/// Website orange color #f0883e - solid to match website branding
 pub const SHODH_GRADIENT: &[(u8, u8, u8)] = &[
-    (255, 80, 30),  // Bright orange-red
-    (255, 100, 40), // Orange
-    (255, 120, 50), // Light orange
-    (255, 100, 40), // Orange
-    (255, 80, 30),  // Bright orange-red
-    (200, 60, 20),  // Dark orange
+    (240, 136, 62), // #f0883e
+    (240, 136, 62),
+    (240, 136, 62),
+    (240, 136, 62),
+    (240, 136, 62),
+    (240, 136, 62),
 ];
 
-/// Tagline
-pub const TAGLINE: &str = "M E M O R Y   S Y S T E M";
+/// Tagline - matches website
+pub const TAGLINE: &str = "M E M O R Y";

@@ -27,6 +27,7 @@
 pub mod distance_inline;
 pub mod pq;
 pub mod vamana;
+pub mod vamana_persist;
 
 // Re-export key types for convenient access
 pub use pq::{CompressedVectorStore, PQConfig, ProductQuantizer};

@@ -2351,15 +2351,10 @@ impl MemorySystem {
     }
 
     /// Save vector index to disk (shutdown persistence)
-    pub fn save_vector_index(&self, path: &Path) -> Result<()> {
-        self.retriever.save_index(path)
+    /// Uses Vamana persistence format for instant startup on restart
+    pub fn save_vector_index(&self, _path: &Path) -> Result<()> {
+        self.retriever.save()
     }
-
-    /// Load vector index from disk (startup restoration)
-    pub fn load_vector_index(&self, path: &Path) -> Result<()> {
-        self.retriever.load_index(path)
-    }
-
     /// Get vector index health information
     ///
     /// Returns metrics about the Vamana index including total vectors,
@@ -3484,12 +3479,8 @@ impl MemorySystem {
 /// all in-memory state (vector index, ID mappings) must be persisted to disk.
 impl Drop for MemorySystem {
     fn drop(&mut self) {
-        // Persist vector index and ID mapping for restart recovery
-        if let Err(e) = self.retriever.save() {
-            tracing::error!("Failed to persist vector index on shutdown: {}", e);
-        } else {
-            tracing::info!("Vector index persisted successfully on shutdown");
-        }
+        // Vector index saved via explicit shutdown (save_all_vector_indices)
+        // Do NOT save here - Drop fires for temporary instances, overwriting valid saves
 
         // Flush RocksDB WAL to ensure all writes are durable
         if let Err(e) = self.long_term_memory.flush() {
