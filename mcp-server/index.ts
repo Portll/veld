@@ -2791,7 +2791,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           formatted: string;
         }
 
-        const result = await apiCall<TodoResponse>("/api/todos", "POST", {
+        const result = await apiCall<TodoResponse>("/api/todos/add", "POST", {
           user_id: USER_ID,
           content: todoContent,
           status,
