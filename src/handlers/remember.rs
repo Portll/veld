@@ -9,8 +9,8 @@ use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     types::{
-        ChangeType, ContextId, EmotionalContext, EpisodeContext, RichContext,
-        SourceContext, SourceType,
+        ChangeType, ContextId, EmotionalContext, EpisodeContext, RichContext, SourceContext,
+        SourceType,
     },
     Experience, ExperienceType, SessionEvent,
 };
@@ -439,8 +439,11 @@ pub async fn batch_remember(
     let neural_ner = state.get_neural_ner();
 
     // Build experiences
-    let mut experiences_with_index: Vec<(usize, Experience, Option<chrono::DateTime<chrono::Utc>>)> =
-        Vec::with_capacity(valid_items.len());
+    let mut experiences_with_index: Vec<(
+        usize,
+        Experience,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = Vec::with_capacity(valid_items.len());
 
     for (index, item) in valid_items {
         let experience_type = parse_experience_type(item.memory_type.as_ref());
@@ -628,7 +631,10 @@ pub async fn upsert_memory(
         let mid = memory_id.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            memory_guard.get_memory(&mid).map(|m| m.version).unwrap_or(1)
+            memory_guard
+                .get_memory(&mid)
+                .map(|m| m.version)
+                .unwrap_or(1)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?

@@ -1405,7 +1405,10 @@ pub async fn add_entity(
     let mut attributes = std::collections::HashMap::new();
     if let Some(attrs) = &req.attributes {
         for (key, value) in attrs {
-            attributes.insert(key.clone(), serde_json::to_string(value).unwrap_or_default());
+            attributes.insert(
+                key.clone(),
+                serde_json::to_string(value).unwrap_or_default(),
+            );
         }
     }
 
@@ -1423,9 +1426,7 @@ pub async fn add_entity(
         is_proper_noun: true,
     };
 
-    graph_guard
-        .add_entity(entity)
-        .map_err(AppError::Internal)?;
+    graph_guard.add_entity(entity).map_err(AppError::Internal)?;
 
     state.log_event(
         &req.user_id,

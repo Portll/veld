@@ -16,8 +16,7 @@ use shodh_memory::{
     auth,
     config::ServerConfig,
     handlers::{self, AppState, MultiUserMemoryManager},
-    metrics,
-    middleware,
+    metrics, middleware,
 };
 
 #[cfg(feature = "telemetry")]
@@ -69,7 +68,10 @@ async fn main() -> Result<()> {
     let manager_for_shutdown = Arc::clone(&manager);
 
     // Start background maintenance scheduler
-    start_maintenance_scheduler(Arc::clone(&manager), server_config.maintenance_interval_secs);
+    start_maintenance_scheduler(
+        Arc::clone(&manager),
+        server_config.maintenance_interval_secs,
+    );
 
     // Start backup scheduler if enabled
     if server_config.backup_enabled && server_config.backup_interval_secs > 0 {
@@ -197,7 +199,10 @@ fn start_maintenance_scheduler(manager: AppState, interval_secs: u64) {
         }
     });
 
-    info!("Background maintenance scheduler started (interval: {}s)", interval_secs);
+    info!(
+        "Background maintenance scheduler started (interval: {}s)",
+        interval_secs
+    );
 }
 
 fn start_backup_scheduler(manager: AppState, interval_secs: u64, max_backups: usize) {

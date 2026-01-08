@@ -266,7 +266,8 @@ fn test_tier_preserved_on_serialization() {
     memory.tier = MemoryTier::LongTerm;
 
     let serialized = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
-    let (deserialized, _): (Memory, _) = bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
+    let (deserialized, _): (Memory, _) =
+        bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
 
     assert_eq!(deserialized.tier, MemoryTier::LongTerm);
 }
@@ -290,8 +291,10 @@ fn test_all_tiers_serialize() {
         );
         memory.tier = tier;
 
-        let serialized = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
-        let (deserialized, _): (Memory, _) = bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
+        let serialized =
+            bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+        let (deserialized, _): (Memory, _) =
+            bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
 
         assert_eq!(deserialized.tier, tier);
     }
@@ -472,7 +475,8 @@ fn test_compressed_flag_serializes() {
     memory.compressed = true;
 
     let serialized = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
-    let (deserialized, _): (Memory, _) = bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
+    let (deserialized, _): (Memory, _) =
+        bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
 
     assert!(deserialized.compressed);
 }

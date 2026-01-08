@@ -272,7 +272,9 @@ impl BM25Index {
         let boosted_query = if let Some(weights) = term_weights {
             let mut boosted_terms: Vec<String> = Vec::new();
             for word in query.split_whitespace() {
-                let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                let clean_word = word
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase();
                 if clean_word.is_empty() {
                     continue;
                 }

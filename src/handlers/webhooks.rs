@@ -4,8 +4,14 @@
 //! memory streaming, context monitoring, and event broadcasting.
 
 use axum::{
-    extract::{State, ws::{WebSocket, WebSocketUpgrade, Message}},
-    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
 };
 use futures::{SinkExt, StreamExt};
 use std::convert::Infallible;
@@ -500,7 +506,12 @@ async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_sys.read();
                 let graph_guard = graph_memory.read();
-                engine.surface_relevant(&context, &*memory_guard, Some(&*graph_guard), &effective_config)
+                engine.surface_relevant(
+                    &context,
+                    &*memory_guard,
+                    Some(&*graph_guard),
+                    &effective_config,
+                )
             })
             .await
         };
@@ -529,7 +540,11 @@ async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
         // Send response
         let response_json = serde_json::to_string(&response)
             .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string());
-        if sender.send(Message::Text(response_json.into())).await.is_err() {
+        if sender
+            .send(Message::Text(response_json.into()))
+            .await
+            .is_err()
+        {
             break;
         }
     }

@@ -14,16 +14,16 @@ use crate::ab_testing;
 use crate::backup;
 use crate::config::ServerConfig;
 use crate::embeddings::{
-    are_ner_models_downloaded, download_ner_models, get_ner_models_dir,
-    ner::NerEntityType, NerConfig, NeuralNer,
+    are_ner_models_downloaded, download_ner_models, get_ner_models_dir, ner::NerEntityType,
+    NerConfig, NeuralNer,
 };
 use crate::graph_memory::{
     EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats, RelationType,
     RelationshipEdge,
 };
 use crate::memory::{
-    facts::SemanticFactStore, Experience, FeedbackStore, FileMemoryStore, MemoryConfig,
-    MemoryId, MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
+    facts::SemanticFactStore, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId,
+    MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::streaming;
 
@@ -204,10 +204,7 @@ impl MultiUserMemoryManager {
             };
             match NeuralNer::new(config) {
                 Ok(ner) => {
-                    info!(
-                        "Neural NER initialized (TinyBERT model at {:?})",
-                        ner_dir
-                    );
+                    info!("Neural NER initialized (TinyBERT model at {:?})", ner_dir);
                     Arc::new(ner)
                 }
                 Err(e) => {
@@ -278,10 +275,7 @@ impl MultiUserMemoryManager {
         let graph_memories = moka::sync::Cache::builder()
             .max_capacity(server_config.max_users_in_memory as u64)
             .eviction_listener(move |key: Arc<String>, _value, _cause| {
-                info!(
-                    "Evicted graph for user '{}' from memory cache (LRU)",
-                    key
-                );
+                info!("Evicted graph for user '{}' from memory cache (LRU)", key);
             })
             .build();
 
@@ -949,7 +943,8 @@ impl MultiUserMemoryManager {
 
     /// Get user evictions count
     pub fn user_evictions(&self) -> usize {
-        self.user_evictions.load(std::sync::atomic::Ordering::Relaxed)
+        self.user_evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get users in cache count

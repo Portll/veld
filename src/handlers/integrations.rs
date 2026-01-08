@@ -2,11 +2,7 @@
 //!
 //! Handlers for Linear and GitHub webhook integrations and bulk sync.
 
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    response::Json,
-};
+use axum::{extract::State, http::HeaderMap, response::Json};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
@@ -45,9 +41,7 @@ pub async fn linear_webhook(
         }
     }
 
-    let payload = webhook
-        .parse_payload(&body)
-        .map_err(AppError::Internal)?;
+    let payload = webhook.parse_payload(&body).map_err(AppError::Internal)?;
 
     if payload.entity_type != "Issue" {
         return Ok(Json(serde_json::json!({
@@ -261,9 +255,7 @@ pub async fn github_webhook(
         })));
     }
 
-    let payload = webhook
-        .parse_payload(&body)
-        .map_err(AppError::Internal)?;
+    let payload = webhook.parse_payload(&body).map_err(AppError::Internal)?;
 
     let user_id =
         std::env::var("GITHUB_SYNC_USER_ID").unwrap_or_else(|_| "github-sync".to_string());
@@ -373,12 +365,7 @@ pub async fn github_sync(
     // Sync issues
     if req.sync_issues {
         let issues = client
-            .fetch_issues(
-                &req.owner,
-                &req.repo,
-                &req.state,
-                req.limit,
-            )
+            .fetch_issues(&req.owner, &req.repo, &req.state, req.limit)
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to fetch issues: {}", e)))?;
 
@@ -436,12 +423,7 @@ pub async fn github_sync(
     // Sync PRs
     if req.sync_prs {
         let prs = client
-            .fetch_pull_requests(
-                &req.owner,
-                &req.repo,
-                &req.state,
-                req.limit,
-            )
+            .fetch_pull_requests(&req.owner, &req.repo, &req.state, req.limit)
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to fetch PRs: {}", e)))?;
 

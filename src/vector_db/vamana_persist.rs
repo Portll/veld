@@ -217,7 +217,10 @@ impl VamanaIndex {
         for node in graph.iter() {
             graph_section_size += 2 + node.neighbors.len() * 4; // u16 count + u32 per neighbor
         }
-        let vectors_offset = align_to(HEADER_SIZE + deleted_section_size + graph_section_size, ALIGNMENT);
+        let vectors_offset = align_to(
+            HEADER_SIZE + deleted_section_size + graph_section_size,
+            ALIGNMENT,
+        );
         let vectors_section_size = vector_data.len() * 4;
         let total_size = vectors_offset + vectors_section_size;
 

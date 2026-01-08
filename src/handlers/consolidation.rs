@@ -6,7 +6,6 @@
 use axum::{extract::State, response::Json};
 
 use super::state::MultiUserMemoryManager;
-use crate::errors::{AppError, ValidationErrorExt};
 use super::types::{
     BackupResponse, CleanupCorruptedRequest, CleanupCorruptedResponse, ConsolidateRequest,
     ConsolidateResponse, CreateBackupRequest, ListBackupsRequest, ListBackupsResponse, MemoryEvent,
@@ -14,6 +13,7 @@ use super::types::{
     RepairIndexRequest, RepairIndexResponse, VerifyBackupRequest, VerifyBackupResponse,
     VerifyIndexRequest,
 };
+use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
 use crate::metrics;
 use crate::validation;

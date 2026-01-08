@@ -511,7 +511,12 @@ impl SpannIndex {
             }
 
             if iter % 5 == 0 {
-                info!("K-means iter {}/{}: {} assignments changed", iter + 1, iterations, changed);
+                info!(
+                    "K-means iter {}/{}: {} assignments changed",
+                    iter + 1,
+                    iterations,
+                    changed
+                );
             }
 
             // Early termination if converged
@@ -545,9 +550,7 @@ impl SpannIndex {
     #[inline]
     fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
         match self.config.distance_metric {
-            DistanceMetric::Euclidean => {
-                a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
-            }
+            DistanceMetric::Euclidean => a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum(),
             DistanceMetric::NormalizedDotProduct | DistanceMetric::Cosine => {
                 // For normalized vectors, 1 - dot_product gives distance
                 let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -603,7 +606,10 @@ impl SpannIndex {
                     let dist = if let (Some(ref table), Some(ref codes)) =
                         (&distance_table, &entry.pq_codes)
                     {
-                        quantizer.as_ref().unwrap().distance_with_table(table, codes)
+                        quantizer
+                            .as_ref()
+                            .unwrap()
+                            .distance_with_table(table, codes)
                     } else {
                         // Would need original vectors - skip for now
                         continue;
@@ -632,7 +638,10 @@ impl SpannIndex {
                         let dist = if let (Some(ref table), Some(ref codes)) =
                             (&distance_table, &entry.pq_codes)
                         {
-                            quantizer.as_ref().unwrap().distance_with_table(table, codes)
+                            quantizer
+                                .as_ref()
+                                .unwrap()
+                                .distance_with_table(table, codes)
                         } else {
                             continue;
                         };
@@ -647,10 +656,7 @@ impl SpannIndex {
         }
 
         // Convert heap to sorted results (smallest distance first)
-        let mut results: Vec<(u32, f32)> = heap
-            .into_iter()
-            .map(|(d, id)| (id, d.0))
-            .collect();
+        let mut results: Vec<(u32, f32)> = heap.into_iter().map(|(d, id)| (id, d.0)).collect();
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         Ok(results)
@@ -701,7 +707,10 @@ impl SpannIndex {
                 None
             };
 
-            entries.push(PostingEntry { vector_id, pq_codes });
+            entries.push(PostingEntry {
+                vector_id,
+                pq_codes,
+            });
         }
 
         Ok(entries)
@@ -744,7 +753,10 @@ impl SpannIndex {
 
         // Calculate posting data size
         let entry_size = PostingEntry::serialized_size(pq_subvectors);
-        let posting_data_size: usize = partitions.iter().map(|p| p.entries.len() * entry_size).sum();
+        let posting_data_size: usize = partitions
+            .iter()
+            .map(|p| p.entries.len() * entry_size)
+            .sum();
 
         let total_size = posting_data_offset + posting_data_size;
 

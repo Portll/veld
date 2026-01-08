@@ -2,10 +2,7 @@
 //!
 //! Handlers for advanced memory search with entity filtering, date ranges, and importance.
 
-use axum::{
-    extract::State,
-    response::Json,
-};
+use axum::{extract::State, response::Json};
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;

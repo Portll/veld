@@ -590,10 +590,7 @@ impl GraphMemory {
                 stemmed_db.put(stemmed_name.as_bytes(), uuid.as_bytes())?;
                 index.insert(stemmed_name, *uuid);
             }
-            tracing::info!(
-                "Migrated {} entities to stemmed index DB",
-                name_index.len()
-            );
+            tracing::info!("Migrated {} entities to stemmed index DB", name_index.len());
         }
 
         Ok(index)
@@ -884,7 +881,9 @@ impl GraphMemory {
     /// strengthens the same synapse rather than creating parallel connections.
     pub fn add_relationship(&self, mut edge: RelationshipEdge) -> Result<Uuid> {
         // Check for existing relationship between these entities
-        if let Some(mut existing) = self.find_relationship_between(&edge.from_entity, &edge.to_entity)? {
+        if let Some(mut existing) =
+            self.find_relationship_between(&edge.from_entity, &edge.to_entity)?
+        {
             // Strengthen existing edge instead of creating duplicate
             existing.strengthen();
             existing.last_activated = Utc::now();

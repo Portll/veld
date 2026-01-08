@@ -16,14 +16,14 @@ use serde::{Deserialize, Serialize};
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{Experience, ExperienceType};
-use crate::memory::{
-    ProspectiveTask, ProspectiveTaskStatus, ProspectiveTrigger, ProspectiveTaskId,
-    Project, ProjectId, ProjectStats, ProjectStatus, Recurrence, Todo, TodoComment,
-    TodoCommentId, TodoCommentType, TodoPriority, TodoStatus, UserTodoStats,
-};
 use crate::memory::sessions::SessionEvent;
 use crate::memory::todo_formatter;
+use crate::memory::{Experience, ExperienceType};
+use crate::memory::{
+    Project, ProjectId, ProjectStats, ProjectStatus, ProspectiveTask, ProspectiveTaskId,
+    ProspectiveTaskStatus, ProspectiveTrigger, Recurrence, Todo, TodoComment, TodoCommentId,
+    TodoCommentType, TodoPriority, TodoStatus, UserTodoStats,
+};
 use crate::validation;
 
 /// Application state type alias
@@ -53,8 +53,12 @@ fn default_reminder_priority() -> u8 {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReminderTriggerRequest {
-    Time { at: chrono::DateTime<chrono::Utc> },
-    Duration { after_seconds: u64 },
+    Time {
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    Duration {
+        after_seconds: u64,
+    },
     Context {
         keywords: Vec<String>,
         #[serde(default = "default_context_threshold")]

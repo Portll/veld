@@ -11,9 +11,8 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, compression, consolidation, crud, facts, files, graph, health,
-    integrations, lineage, mif, recall, remember, search, sessions, todos, users,
-    visualization, webhooks,
+    ab_testing, compression, consolidation, crud, facts, files, graph, health, integrations,
+    lineage, mif, recall, remember, search, sessions, todos, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -116,7 +115,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // COMPRESSION
         // =================================================================
         .route("/api/memory/compress", post(compression::compress_memory))
-        .route("/api/memory/decompress", post(compression::decompress_memory))
+        .route(
+            "/api/memory/decompress",
+            post(compression::decompress_memory),
+        )
         .route("/api/storage/stats", get(compression::get_storage_stats))
         // =================================================================
         // ADVANCED SEARCH
@@ -126,16 +128,34 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // STORAGE & INDEX MANAGEMENT
         // =================================================================
         .route("/api/storage/uncompressed", post(mif::get_uncompressed_old))
-        .route("/api/index/verify", post(consolidation::verify_index_integrity))
-        .route("/api/index/repair", post(consolidation::repair_vector_index))
+        .route(
+            "/api/index/verify",
+            post(consolidation::verify_index_integrity),
+        )
+        .route(
+            "/api/index/repair",
+            post(consolidation::repair_vector_index),
+        )
         .route("/api/index/rebuild", post(consolidation::rebuild_index))
-        .route("/api/storage/cleanup", post(consolidation::cleanup_corrupted))
+        .route(
+            "/api/storage/cleanup",
+            post(consolidation::cleanup_corrupted),
+        )
         // =================================================================
         // CONSOLIDATION & BACKUPS
         // =================================================================
-        .route("/api/consolidate", post(consolidation::consolidate_memories))
-        .route("/api/consolidation/report", post(consolidation::get_consolidation_report))
-        .route("/api/consolidation/events", get(consolidation::get_consolidation_events))
+        .route(
+            "/api/consolidate",
+            post(consolidation::consolidate_memories),
+        )
+        .route(
+            "/api/consolidation/report",
+            post(consolidation::get_consolidation_report),
+        )
+        .route(
+            "/api/consolidation/events",
+            get(consolidation::get_consolidation_events),
+        )
         .route("/api/backup/create", post(consolidation::create_backup))
         .route("/api/backup/list", get(consolidation::list_backups))
         .route("/api/backup/verify", post(consolidation::verify_backup))
@@ -156,18 +176,33 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/lineage/reject", post(lineage::lineage_reject_edge))
         .route("/api/lineage/link", post(lineage::lineage_add_edge))
         .route("/api/lineage/stats", post(lineage::lineage_stats))
-        .route("/api/lineage/branches", post(lineage::lineage_list_branches))
+        .route(
+            "/api/lineage/branches",
+            post(lineage::lineage_list_branches),
+        )
         .route("/api/lineage/branch", post(lineage::lineage_create_branch))
         // =================================================================
         // KNOWLEDGE GRAPH (ADVANCED)
         // =================================================================
         .route("/api/graph/{user_id}/stats", get(graph::get_graph_stats))
-        .route("/api/graph/{user_id}/universe", get(graph::get_memory_universe))
-        .route("/api/graph/{user_id}/clear", delete(graph::clear_user_graph))
-        .route("/api/graph/{user_id}/rebuild", post(graph::rebuild_user_graph))
+        .route(
+            "/api/graph/{user_id}/universe",
+            get(graph::get_memory_universe),
+        )
+        .route(
+            "/api/graph/{user_id}/clear",
+            delete(graph::clear_user_graph),
+        )
+        .route(
+            "/api/graph/{user_id}/rebuild",
+            post(graph::rebuild_user_graph),
+        )
         .route("/api/graph/entity/find", post(graph::find_entity))
         .route("/api/graph/entities/all", post(graph::get_all_entities))
-        .route("/api/graph/relationship/invalidate", post(graph::invalidate_relationship))
+        .route(
+            "/api/graph/relationship/invalidate",
+            post(graph::invalidate_relationship),
+        )
         .route("/api/graph/traverse", post(graph::traverse_graph))
         .route("/api/graph/episode/get", post(graph::get_episode))
         // =================================================================
@@ -179,9 +214,18 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // VISUALIZATION
         // =================================================================
         .route("/api/brain/{user_id}", get(visualization::get_brain_state))
-        .route("/api/visualization/{user_id}/stats", get(visualization::get_visualization_stats))
-        .route("/api/visualization/{user_id}/dot", get(visualization::get_visualization_dot))
-        .route("/api/visualization/build", post(visualization::build_visualization))
+        .route(
+            "/api/visualization/{user_id}/stats",
+            get(visualization::get_visualization_stats),
+        )
+        .route(
+            "/api/visualization/{user_id}/dot",
+            get(visualization::get_visualization_dot),
+        )
+        .route(
+            "/api/visualization/build",
+            post(visualization::build_visualization),
+        )
         // =================================================================
         // TODOS
         // =================================================================
@@ -199,10 +243,22 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/todos/{todo_id}/complete", post(todos::complete_todo)) // TUI path style
         .route("/api/todos/{todo_id}/reorder", post(todos::reorder_todo)) // TUI path style
         .route("/api/todos/{todo_id}/subtasks", get(todos::list_subtasks))
-        .route("/api/todos/{todo_id}/comments", get(todos::list_todo_comments))
-        .route("/api/todos/{todo_id}/comments", post(todos::add_todo_comment))
-        .route("/api/todos/{todo_id}/comments/{comment_id}", put(todos::update_todo_comment))
-        .route("/api/todos/{todo_id}/comments/{comment_id}", delete(todos::delete_todo_comment))
+        .route(
+            "/api/todos/{todo_id}/comments",
+            get(todos::list_todo_comments),
+        )
+        .route(
+            "/api/todos/{todo_id}/comments",
+            post(todos::add_todo_comment),
+        )
+        .route(
+            "/api/todos/{todo_id}/comments/{comment_id}",
+            put(todos::update_todo_comment),
+        )
+        .route(
+            "/api/todos/{todo_id}/comments/{comment_id}",
+            delete(todos::delete_todo_comment),
+        )
         .route("/api/todos/stats", post(todos::get_todo_stats)) // TUI uses POST
         // =================================================================
         // PROJECTS
@@ -215,10 +271,22 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         // FILE MEMORY / CODEBASE INTEGRATION
         // =================================================================
-        .route("/api/projects/{project_id}/files", post(files::list_project_files))
-        .route("/api/projects/{project_id}/scan", post(files::scan_project_codebase))
-        .route("/api/projects/{project_id}/index", post(files::index_project_codebase))
-        .route("/api/projects/{project_id}/files/search", post(files::search_project_files))
+        .route(
+            "/api/projects/{project_id}/files",
+            post(files::list_project_files),
+        )
+        .route(
+            "/api/projects/{project_id}/scan",
+            post(files::scan_project_codebase),
+        )
+        .route(
+            "/api/projects/{project_id}/index",
+            post(files::index_project_codebase),
+        )
+        .route(
+            "/api/projects/{project_id}/files/search",
+            post(files::search_project_files),
+        )
         .route("/api/files/stats", get(files::get_file_stats))
         // =================================================================
         // REMINDERS
@@ -242,15 +310,42 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/ab/tests", get(ab_testing::list_ab_tests))
         .route("/api/ab/tests", post(ab_testing::create_ab_test))
         .route("/api/ab/tests/{test_id}", get(ab_testing::get_ab_test))
-        .route("/api/ab/tests/{test_id}", delete(ab_testing::delete_ab_test))
-        .route("/api/ab/tests/{test_id}/start", post(ab_testing::start_ab_test))
-        .route("/api/ab/tests/{test_id}/pause", post(ab_testing::pause_ab_test))
-        .route("/api/ab/tests/{test_id}/resume", post(ab_testing::resume_ab_test))
-        .route("/api/ab/tests/{test_id}/complete", post(ab_testing::complete_ab_test))
-        .route("/api/ab/tests/{test_id}/analyze", get(ab_testing::analyze_ab_test))
-        .route("/api/ab/tests/{test_id}/impression", post(ab_testing::record_ab_impression))
-        .route("/api/ab/tests/{test_id}/click", post(ab_testing::record_ab_click))
-        .route("/api/ab/tests/{test_id}/feedback", post(ab_testing::record_ab_feedback))
+        .route(
+            "/api/ab/tests/{test_id}",
+            delete(ab_testing::delete_ab_test),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/start",
+            post(ab_testing::start_ab_test),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/pause",
+            post(ab_testing::pause_ab_test),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/resume",
+            post(ab_testing::resume_ab_test),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/complete",
+            post(ab_testing::complete_ab_test),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/analyze",
+            get(ab_testing::analyze_ab_test),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/impression",
+            post(ab_testing::record_ab_impression),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/click",
+            post(ab_testing::record_ab_click),
+        )
+        .route(
+            "/api/ab/tests/{test_id}/feedback",
+            post(ab_testing::record_ab_feedback),
+        )
         .route("/api/ab/summary", get(ab_testing::get_ab_summary))
         // =================================================================
         // EXTERNAL INTEGRATIONS (BULK SYNC)
@@ -285,7 +380,5 @@ pub fn build_router(state: AppState) -> Router {
     let public = build_public_routes(state.clone());
     let protected = build_protected_routes(state);
 
-    Router::new()
-        .merge(public)
-        .merge(protected)
+    Router::new().merge(public).merge(protected)
 }

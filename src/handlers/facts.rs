@@ -2,10 +2,7 @@
 //!
 //! Handlers for semantic facts extracted from episodic memories.
 
-use axum::{
-    extract::State,
-    response::Json,
-};
+use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;

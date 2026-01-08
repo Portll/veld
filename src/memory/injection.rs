@@ -78,16 +78,16 @@ pub struct RelevanceWeights {
 impl Default for RelevanceWeights {
     fn default() -> Self {
         Self {
-            semantic: 0.40,           // Primary signal - semantic similarity
-            recency: 0.08,            // Recent memories get boost
-            strength: 0.08,           // Hebbian edge weight (from graph)
-            entity_overlap: 0.08,     // Entity Jaccard similarity
-            type_boost: 0.06,         // Decision/Learning type boost
-            file_match: 0.04,         // File path matching
-            suppression: 0.02,        // Negative feedback penalty
-            episode_coherence: 0.06,  // Same-episode boost (prevents bleeding)
-            graph_activation: 0.10,   // Spreading activation from graph traversal
-            linguistic_score: 0.08,   // Query analysis (focal entities, modifiers)
+            semantic: 0.40,          // Primary signal - semantic similarity
+            recency: 0.08,           // Recent memories get boost
+            strength: 0.08,          // Hebbian edge weight (from graph)
+            entity_overlap: 0.08,    // Entity Jaccard similarity
+            type_boost: 0.06,        // Decision/Learning type boost
+            file_match: 0.04,        // File path matching
+            suppression: 0.02,       // Negative feedback penalty
+            episode_coherence: 0.06, // Same-episode boost (prevents bleeding)
+            graph_activation: 0.10,  // Spreading activation from graph traversal
+            linguistic_score: 0.08,  // Query analysis (focal entities, modifiers)
         }
     }
 }
@@ -259,10 +259,8 @@ pub fn compute_relevance(
     let suppression = compute_suppression(input.feedback_momentum);
 
     // Episode coherence (SHO-temporal) - prevents episode bleeding
-    let episode_coherence = compute_episode_coherence(
-        input.episode_id.as_ref(),
-        input.query_episode_id.as_ref(),
-    );
+    let episode_coherence =
+        compute_episode_coherence(input.episode_id.as_ref(), input.query_episode_id.as_ref());
 
     // Graph and linguistic signals (unified scoring)
     let graph_activation = input.graph_activation;
@@ -393,8 +391,8 @@ fn compute_episode_coherence(
     match (memory_episode_id, query_episode_id) {
         (Some(mem), Some(query)) if mem == query => 1.0, // Same episode: full coherence
         (Some(_), None) | (None, Some(_)) => 0.0,        // Mismatched: no boost
-        (None, None) => 0.0,                              // Both missing: no boost
-        _ => 0.0,                                         // Different episodes: no boost
+        (None, None) => 0.0,                             // Both missing: no boost
+        _ => 0.0,                                        // Different episodes: no boost
     }
 }
 

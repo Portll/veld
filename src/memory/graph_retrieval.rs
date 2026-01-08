@@ -401,7 +401,12 @@ pub fn spreading_activation_retrieve_with_stats(
         .focal_entities
         .iter()
         .map(|e| e.text.clone())
-        .chain(analysis.discriminative_modifiers.iter().map(|m| m.text.clone()))
+        .chain(
+            analysis
+                .discriminative_modifiers
+                .iter()
+                .map(|m| m.text.clone()),
+        )
         .collect();
 
     for (_episode_uuid, (graph_activation, episode)) in activated_memories {
@@ -445,8 +450,8 @@ pub fn spreading_activation_retrieve_with_stats(
                 episode_id,
                 query_episode_id: query.episode_id.clone(),
                 sequence_number,
-                graph_activation,   // Spreading activation score
-                linguistic_score,   // IC-weighted entity matches
+                graph_activation, // Spreading activation score
+                linguistic_score, // IC-weighted entity matches
             };
 
             let final_score = compute_relevance(&input, &query_embedding, now, &injection_config);

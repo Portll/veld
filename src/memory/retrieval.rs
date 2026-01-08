@@ -230,7 +230,10 @@ impl RetrievalEngine {
         let start_time = std::time::Instant::now();
 
         // Try instant startup from persisted Vamana file
-        let vamana_path = self.storage_path.join("vector_index").join(VAMANA_INDEX_FILE);
+        let vamana_path = self
+            .storage_path
+            .join("vector_index")
+            .join(VAMANA_INDEX_FILE);
         if vamana_path.exists() {
             if let Ok(loaded) = self.try_load_persisted_vamana(&vamana_path) {
                 if loaded {
@@ -762,18 +765,28 @@ impl RetrievalEngine {
         // TEMPORAL PRE-FILTER: If episode_id is provided, narrow search to that episode
         // This implements the architecture: Temporal → Graph → Semantic
         // Episode filtering happens FIRST to "point in the right direction"
-        let episode_candidates: Option<HashSet<MemoryId>> = if let Some(episode_id) = &query.episode_id {
-            let episode_memories = self.storage.search(SearchCriteria::ByEpisode(episode_id.clone()))?;
-            if episode_memories.is_empty() {
-                tracing::debug!("No memories found in episode {}, falling back to global search", episode_id);
-                None
+        let episode_candidates: Option<HashSet<MemoryId>> =
+            if let Some(episode_id) = &query.episode_id {
+                let episode_memories = self
+                    .storage
+                    .search(SearchCriteria::ByEpisode(episode_id.clone()))?;
+                if episode_memories.is_empty() {
+                    tracing::debug!(
+                        "No memories found in episode {}, falling back to global search",
+                        episode_id
+                    );
+                    None
+                } else {
+                    tracing::debug!(
+                        "Episode {} has {} memories, using as temporal filter",
+                        episode_id,
+                        episode_memories.len()
+                    );
+                    Some(episode_memories.into_iter().map(|m| m.id).collect())
+                }
             } else {
-                tracing::debug!("Episode {} has {} memories, using as temporal filter", episode_id, episode_memories.len());
-                Some(episode_memories.into_iter().map(|m| m.id).collect())
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         // Search vector index - fetch more candidates for chunk deduplication
         let index = self.vector_index.read();
@@ -1003,10 +1016,16 @@ impl RetrievalEngine {
             // Episode search already returns in sequence order from storage
             // But verify ordering by sequence_number if available
             memories.sort_by(|a, b| {
-                let seq_a = a.experience.context.as_ref()
+                let seq_a = a
+                    .experience
+                    .context
+                    .as_ref()
                     .and_then(|c| c.episode.sequence_number)
                     .unwrap_or(0);
-                let seq_b = b.experience.context.as_ref()
+                let seq_b = b
+                    .experience
+                    .context
+                    .as_ref()
                     .and_then(|c| c.episode.sequence_number)
                     .unwrap_or(0);
                 seq_a.cmp(&seq_b)

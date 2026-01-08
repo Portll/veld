@@ -544,7 +544,8 @@ impl MemoryStorage {
                 min_sequence,
                 max_sequence,
             } => {
-                memory_ids = self.search_by_episode_sequence(&episode_id, min_sequence, max_sequence)?;
+                memory_ids =
+                    self.search_by_episode_sequence(&episode_id, min_sequence, max_sequence)?;
             }
 
             // === Robotics Criteria ===
@@ -802,10 +803,9 @@ impl MemoryStorage {
             if let Some(rest) = key_str.strip_prefix(&prefix) {
                 let parts: Vec<&str> = rest.splitn(2, ':').collect();
                 if parts.len() == 2 {
-                    if let (Ok(seq), Ok(uuid)) = (
-                        parts[0].parse::<u32>(),
-                        uuid::Uuid::parse_str(parts[1]),
-                    ) {
+                    if let (Ok(seq), Ok(uuid)) =
+                        (parts[0].parse::<u32>(), uuid::Uuid::parse_str(parts[1]))
+                    {
                         // Apply sequence filters
                         let passes_min = min_sequence.map_or(true, |min| seq >= min);
                         let passes_max = max_sequence.map_or(true, |max| seq <= max);

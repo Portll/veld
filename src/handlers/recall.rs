@@ -19,14 +19,14 @@ use super::types::{
 };
 use super::utils::{is_bare_question, is_boilerplate_response, strip_system_noise};
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{Experience, ExperienceType, Query as MemoryQuery, SharedMemory};
-use crate::memory::{ProspectiveTrigger, TodoStatus};
 use crate::memory::feedback;
 use crate::memory::injection::{compute_relevance, InjectionConfig, RelevanceInput};
 use crate::memory::segmentation::{InputSource, SegmentationEngine};
 use crate::memory::sessions::SessionEvent;
 use crate::memory::storage::SearchCriteria;
 use crate::memory::types::MemoryId;
+use crate::memory::{Experience, ExperienceType, Query as MemoryQuery, SharedMemory};
+use crate::memory::{ProspectiveTrigger, TodoStatus};
 use crate::metrics;
 use crate::relevance;
 use crate::validation;
@@ -297,7 +297,8 @@ pub async fn recall(
             .into_iter()
             .map(|task| {
                 // Extract keywords from trigger for signals
-                let keywords = if let ProspectiveTrigger::OnContext { keywords, .. } = &task.trigger {
+                let keywords = if let ProspectiveTrigger::OnContext { keywords, .. } = &task.trigger
+                {
                     keywords.clone()
                 } else {
                     vec![]
@@ -320,7 +321,14 @@ pub async fn recall(
             })
             .collect();
 
-        (reminders, if signals.is_empty() { None } else { Some(signals) })
+        (
+            reminders,
+            if signals.is_empty() {
+                None
+            } else {
+                Some(signals)
+            },
+        )
     };
 
     let triggered_reminder_count = triggered_reminders.len();
@@ -454,7 +462,9 @@ pub async fn recall(
 
         // Also extract simple entities from the query itself
         for word in req.query.split_whitespace() {
-            let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            let clean_word = word
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
             if clean_word.len() > 2 {
                 all_entities.insert(clean_word);
             }
@@ -483,7 +493,11 @@ pub async fn recall(
             unique_facts.entry(fact.id.clone()).or_insert(fact);
         }
         let mut sorted_facts: Vec<RecallFact> = unique_facts.into_values().collect();
-        sorted_facts.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_facts.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted_facts.truncate(5);
         sorted_facts
     };

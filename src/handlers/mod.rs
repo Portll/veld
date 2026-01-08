@@ -4,24 +4,24 @@
 //! Each submodule handles a specific domain of functionality.
 
 // Core modules
-pub mod types;
-pub mod state;
 pub mod router;
+pub mod state;
+pub mod types;
 
 // Health and utilities
 pub mod health;
 pub mod utils;
 
 // Memory core operations
-pub mod remember;
-pub mod recall;
 pub mod crud;
+pub mod recall;
+pub mod remember;
 
 // Advanced memory operations
-pub mod search;
 pub mod compression;
 pub mod facts;
 pub mod lineage;
+pub mod search;
 
 // Knowledge graph
 pub mod graph;
@@ -51,6 +51,6 @@ pub mod consolidation;
 pub mod ab_testing;
 
 // Re-export commonly used items
+pub use router::{build_protected_routes, build_public_routes, build_router, AppState};
 pub use state::MultiUserMemoryManager;
 pub use types::*;
-pub use router::{build_router, build_public_routes, build_protected_routes, AppState};

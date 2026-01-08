@@ -427,7 +427,9 @@ mod tests {
 
     #[test]
     fn test_is_boilerplate() {
-        assert!(is_boilerplate_response("I'm ready to help! What would you like me to do?"));
+        assert!(is_boilerplate_response(
+            "I'm ready to help! What would you like me to do?"
+        ));
         assert!(!is_boilerplate_response(
             "The issue is caused by a race condition in the authentication middleware."
         ));

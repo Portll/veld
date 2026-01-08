@@ -1340,10 +1340,7 @@ impl RelevanceEngine {
         let mut graph_results = results;
         if let Some(graph) = graph_memory {
             // Build set of already-found memory IDs to avoid duplicates
-            let found_ids: HashSet<Uuid> = graph_results
-                .iter()
-                .map(|(m, _, _)| m.id.0)
-                .collect();
+            let found_ids: HashSet<Uuid> = graph_results.iter().map(|(m, _, _)| m.id.0).collect();
 
             // Limit graph lookups to avoid latency spikes
             let max_graph_lookups = 5;
@@ -1358,7 +1355,9 @@ impl RelevanceEngine {
                     if let Ok(traversal) = graph.traverse_from_entity(&entity_node.uuid, 2) {
                         for traversed in &traversal.entities {
                             // Get episodes (memories) connected to this entity
-                            if let Ok(episodes) = graph.get_episodes_by_entity(&traversed.entity.uuid) {
+                            if let Ok(episodes) =
+                                graph.get_episodes_by_entity(&traversed.entity.uuid)
+                            {
                                 for episode in episodes.iter().take(10) {
                                     // Episode UUID = Memory ID (we store it this way in remember())
                                     let memory_id = crate::memory::MemoryId(episode.uuid);
@@ -1370,14 +1369,19 @@ impl RelevanceEngine {
 
                                     // Score = confidence * salience * decay_factor
                                     // decay_factor accounts for hop distance (0.7^hop)
-                                    let score = entity.confidence * traversed.entity.salience * traversed.decay_factor;
+                                    let score = entity.confidence
+                                        * traversed.entity.salience
+                                        * traversed.decay_factor;
                                     if score >= config.entity_threshold {
                                         // Direct memory lookup by ID (fast!)
                                         if let Ok(memory) = memory_system.get_memory(&memory_id) {
                                             graph_results.push((
                                                 memory,
                                                 score,
-                                                vec![entity.name.clone(), traversed.entity.name.clone()],
+                                                vec![
+                                                    entity.name.clone(),
+                                                    traversed.entity.name.clone(),
+                                                ],
                                             ));
                                         }
                                     }

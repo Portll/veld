@@ -42,7 +42,10 @@ fn generate_rust_memories() -> Vec<String> {
     for i in 0..25 {
         memories.push(format!("Rust ownership lesson {}: The borrow checker ensures memory safety at compile time without garbage collection.", i));
         memories.push(format!("Rust lifetime annotation {}: Explicit lifetimes connect reference validity to scope boundaries.", i));
-        memories.push(format!("Rust move semantics {}: Values are moved by default, preventing use-after-free bugs.", i));
+        memories.push(format!(
+            "Rust move semantics {}: Values are moved by default, preventing use-after-free bugs.",
+            i
+        ));
         memories.push(format!("Rust RAII pattern {}: Resources automatically cleaned up when owner goes out of scope.", i));
     }
 
@@ -111,8 +114,14 @@ fn generate_project_memories() -> Vec<String> {
     for i in 0..50 {
         memories.push(format!("Shodh project cognitive architecture {}: Brain-inspired memory system with working, episodic, and semantic tiers.", i));
         memories.push(format!("Shodh Hebbian learning {}: Neurons that fire together wire together strengthens co-activated memories.", i));
-        memories.push(format!("API gateway rate limiting {}: Token bucket algorithm throttles requests per client.", i));
-        memories.push(format!("Search engine inverted index {}: Maps terms to document IDs for fast text retrieval.", i));
+        memories.push(format!(
+            "API gateway rate limiting {}: Token bucket algorithm throttles requests per client.",
+            i
+        ));
+        memories.push(format!(
+            "Search engine inverted index {}: Maps terms to document IDs for fast text retrieval.",
+            i
+        ));
     }
 
     memories.truncate(MEMORIES_PER_DOMAIN);
@@ -143,7 +152,9 @@ fn setup_memory_system(working_size: usize) -> (MemorySystem, TempDir) {
     // Wire up GraphMemory for entity relationships and spreading activation
     let graph_path = temp_dir.path().join("graph");
     let graph_memory = GraphMemory::new(&graph_path).expect("Failed to create graph memory");
-    memory_system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(graph_memory)));
+    memory_system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(
+        graph_memory,
+    )));
 
     (memory_system, temp_dir)
 }
@@ -167,7 +178,10 @@ fn create_experience(content: &str, ner: &NeuralNer, exp_type: ExperienceType) -
 fn test_cognitive_layer_at_scale() {
     println!("\n{}", "═".repeat(80));
     println!("  SHODH-MEMORY COGNITIVE LAYER STRESS TEST");
-    println!("  Testing {} memories across {} domains", TOTAL_MEMORIES, NUM_DOMAINS);
+    println!(
+        "  Testing {} memories across {} domains",
+        TOTAL_MEMORIES, NUM_DOMAINS
+    );
     println!("{}\n", "═".repeat(80));
 
     let test_start = Instant::now();
@@ -213,7 +227,12 @@ fn test_cognitive_layer_at_scale() {
             all_ids.push(id);
         }
 
-        println!("  ✓ {}: {} memories in {:?}", domain_name, memories.len(), domain_start.elapsed());
+        println!(
+            "  ✓ {}: {} memories in {:?}",
+            domain_name,
+            memories.len(),
+            domain_start.elapsed()
+        );
         domain_ids.insert(domain_name, ids);
     }
 
@@ -221,7 +240,11 @@ fn test_cognitive_layer_at_scale() {
     let memories_per_sec = all_ids.len() as f64 / ingest_time.as_secs_f64();
 
     println!();
-    println!("  Total: {} memories, {} entities extracted", all_ids.len(), total_entities);
+    println!(
+        "  Total: {} memories, {} entities extracted",
+        all_ids.len(),
+        total_entities
+    );
     println!("  Throughput: {:.1} memories/sec", memories_per_sec);
     println!("  Time: {:?}", ingest_time);
     println!();
@@ -235,20 +258,76 @@ fn test_cognitive_layer_at_scale() {
 
     let quality_tests = [
         // (query, expected_keywords, domain) - keywords should match content prefixes
-        ("Rust ownership borrow checker", vec!["rust", "ownership", "borrow"], "Rust"),
-        ("Rust async await tokio", vec!["rust", "async", "tokio"], "Rust"),
-        ("Rust RAII memory safety", vec!["rust", "raii", "memory"], "Rust"),
-        ("Machine learning neural network", vec!["machine learning", "neural", "backpropagation"], "ML/AI"),
-        ("Deep learning gradient descent", vec!["deep learning", "gradient", "training"], "ML/AI"),
-        ("Transformer attention BERT GPT", vec!["transformer", "attention", "bert", "gpt"], "ML/AI"),
-        ("Database B-tree LSM storage", vec!["database", "b-tree", "lsm"], "Databases"),
-        ("Database ACID transaction", vec!["database", "acid", "transaction"], "Databases"),
-        ("Database MVCC sharding", vec!["database", "mvcc", "sharding"], "Databases"),
-        ("Operating system kernel scheduler", vec!["operating system", "kernel", "scheduler"], "Systems"),
-        ("TCP IP networking protocol", vec!["tcp", "networking", "protocol"], "Systems"),
-        ("Docker Kubernetes container", vec!["docker", "kubernetes", "container"], "Systems"),
-        ("Shodh project cognitive Hebbian", vec!["shodh", "cognitive", "hebbian"], "Projects"),
-        ("API gateway rate limiting", vec!["api", "gateway", "rate"], "Projects"),
+        (
+            "Rust ownership borrow checker",
+            vec!["rust", "ownership", "borrow"],
+            "Rust",
+        ),
+        (
+            "Rust async await tokio",
+            vec!["rust", "async", "tokio"],
+            "Rust",
+        ),
+        (
+            "Rust RAII memory safety",
+            vec!["rust", "raii", "memory"],
+            "Rust",
+        ),
+        (
+            "Machine learning neural network",
+            vec!["machine learning", "neural", "backpropagation"],
+            "ML/AI",
+        ),
+        (
+            "Deep learning gradient descent",
+            vec!["deep learning", "gradient", "training"],
+            "ML/AI",
+        ),
+        (
+            "Transformer attention BERT GPT",
+            vec!["transformer", "attention", "bert", "gpt"],
+            "ML/AI",
+        ),
+        (
+            "Database B-tree LSM storage",
+            vec!["database", "b-tree", "lsm"],
+            "Databases",
+        ),
+        (
+            "Database ACID transaction",
+            vec!["database", "acid", "transaction"],
+            "Databases",
+        ),
+        (
+            "Database MVCC sharding",
+            vec!["database", "mvcc", "sharding"],
+            "Databases",
+        ),
+        (
+            "Operating system kernel scheduler",
+            vec!["operating system", "kernel", "scheduler"],
+            "Systems",
+        ),
+        (
+            "TCP IP networking protocol",
+            vec!["tcp", "networking", "protocol"],
+            "Systems",
+        ),
+        (
+            "Docker Kubernetes container",
+            vec!["docker", "kubernetes", "container"],
+            "Systems",
+        ),
+        (
+            "Shodh project cognitive Hebbian",
+            vec!["shodh", "cognitive", "hebbian"],
+            "Projects",
+        ),
+        (
+            "API gateway rate limiting",
+            vec!["api", "gateway", "rate"],
+            "Projects",
+        ),
     ];
 
     let mut total_quality = 0.0;
@@ -279,18 +358,34 @@ fn test_cognitive_layer_at_scale() {
             }
         }
 
-        let quality = if results.is_empty() { 0.0 } else { relevant as f32 / results.len() as f32 };
+        let quality = if results.is_empty() {
+            0.0
+        } else {
+            relevant as f32 / results.len() as f32
+        };
         total_quality += quality;
 
-        let status = if quality >= SEARCH_QUALITY_THRESHOLD { "✓" } else { "✗" };
-        println!("  {} [{}] \"{}\": {:.0}% ({}/{}) in {:.2}ms",
-                 status, domain, query_text, quality * 100.0, relevant, results.len(), query_time);
+        let status = if quality >= SEARCH_QUALITY_THRESHOLD {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "  {} [{}] \"{}\": {:.0}% ({}/{}) in {:.2}ms",
+            status,
+            domain,
+            query_text,
+            quality * 100.0,
+            relevant,
+            results.len(),
+            query_time
+        );
 
         // Debug: Show first 3 results for failed queries
         if quality < SEARCH_QUALITY_THRESHOLD && !results.is_empty() {
             for (i, r) in results.iter().take(3).enumerate() {
                 let preview: String = r.experience.content.chars().take(60).collect();
-                println!("      → #{}: {}...", i+1, preview);
+                println!("      → #{}: {}...", i + 1, preview);
             }
         }
     }
@@ -304,9 +399,15 @@ fn test_cognitive_layer_at_scale() {
     };
 
     println!();
-    println!("  Search Quality: {:.1}% (threshold: {:.0}%)", avg_quality * 100.0, SEARCH_QUALITY_THRESHOLD * 100.0);
-    println!("  Avg Latency: {:.2}ms | P99: {:.2}ms (threshold: {:.0}ms)",
-             avg_latency, p99_latency, RETRIEVAL_LATENCY_THRESHOLD_MS);
+    println!(
+        "  Search Quality: {:.1}% (threshold: {:.0}%)",
+        avg_quality * 100.0,
+        SEARCH_QUALITY_THRESHOLD * 100.0
+    );
+    println!(
+        "  Avg Latency: {:.2}ms | P99: {:.2}ms (threshold: {:.0}ms)",
+        avg_latency, p99_latency, RETRIEVAL_LATENCY_THRESHOLD_MS
+    );
     println!("  Time: {:?}", quality_start.elapsed());
     println!();
 
@@ -383,7 +484,9 @@ fn test_cognitive_layer_at_scale() {
         }
     }
 
-    let avg_ltp_gain = if importance_gains.is_empty() { 0.0 } else {
+    let avg_ltp_gain = if importance_gains.is_empty() {
+        0.0
+    } else {
         importance_gains.iter().sum::<f32>() / importance_gains.len() as f32
     };
     let max_ltp_gain = importance_gains.iter().cloned().fold(0.0_f32, f32::max);
@@ -411,7 +514,10 @@ fn test_cognitive_layer_at_scale() {
     let spreading_start = Instant::now();
 
     for (domain, start, hop1, hop2, hop3) in &activation_chains {
-        println!("  Chain [{}]: {} → {} → {} → {}", domain, start, hop1, hop2, hop3);
+        println!(
+            "  Chain [{}]: {} → {} → {} → {}",
+            domain, start, hop1, hop2, hop3
+        );
 
         // Query with starting concept - use higher max_results to see full activation spread
         // Spreading activation should surface related concepts even if they're distant
@@ -437,7 +543,10 @@ fn test_cognitive_layer_at_scale() {
 
         let chain_depth = chain_found.iter().filter(|&&x| x).count();
         let result_count = results.len();
-        println!("    Depth reached: {}/4 concepts found (from {} results)", chain_depth, result_count);
+        println!(
+            "    Depth reached: {}/4 concepts found (from {} results)",
+            chain_depth, result_count
+        );
     }
 
     println!("  Time: {:?}", spreading_start.elapsed());
@@ -464,7 +573,9 @@ fn test_cognitive_layer_at_scale() {
 
     for content in &stress_memories {
         let exp = create_experience(content, &ner, ExperienceType::Observation);
-        stress_memory.remember(exp, None).expect("Failed to remember");
+        stress_memory
+            .remember(exp, None)
+            .expect("Failed to remember");
     }
 
     // Check distribution via search
@@ -482,7 +593,10 @@ fn test_cognitive_layer_at_scale() {
     }
 
     println!("  Migration complete in {:?}", migration_start.elapsed());
-    println!("  Tier distribution (sample of {} memories):", check_results.len());
+    println!(
+        "  Tier distribution (sample of {} memories):",
+        check_results.len()
+    );
     for (tier, count) in &tier_dist {
         println!("    {}: {}", tier, count);
     }
@@ -503,7 +617,11 @@ fn test_cognitive_layer_at_scale() {
     println!("    • Ingestion rate: {:.1} memories/sec", memories_per_sec);
     println!();
     println!("  Search Quality:");
-    println!("    • Average: {:.1}% (threshold: {:.0}%)", avg_quality * 100.0, SEARCH_QUALITY_THRESHOLD * 100.0);
+    println!(
+        "    • Average: {:.1}% (threshold: {:.0}%)",
+        avg_quality * 100.0,
+        SEARCH_QUALITY_THRESHOLD * 100.0
+    );
     println!("    • Avg latency: {:.2}ms", avg_latency);
     println!("    • P99 latency: {:.2}ms", p99_latency);
     println!();
@@ -580,7 +698,10 @@ fn test_cross_domain_retrieval() {
     println!("  Query: 'Rust ML transformer performance'");
     println!("  Results: {}", results.len());
     for r in &results {
-        println!("    • {}", &r.experience.content[..60.min(r.experience.content.len())]);
+        println!(
+            "    • {}",
+            &r.experience.content[..60.min(r.experience.content.len())]
+        );
     }
 
     assert!(results.len() >= 2, "Should find cross-domain memories");
@@ -623,7 +744,10 @@ fn test_importance_decay_resistance() {
 
     println!("  Initial importance: {:.3}", initial_importance);
     println!("  Final importance: {:.3}", final_importance);
-    println!("  Gain: {:.1}%", (final_importance - initial_importance) / initial_importance * 100.0);
+    println!(
+        "  Gain: {:.1}%",
+        (final_importance - initial_importance) / initial_importance * 100.0
+    );
 
     assert!(
         final_importance > initial_importance,

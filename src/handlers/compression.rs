@@ -2,10 +2,7 @@
 //!
 //! Handlers for memory compression and decompression operations.
 
-use axum::{
-    extract::State,
-    response::Json,
-};
+use axum::{extract::State, response::Json};
 use serde::Deserialize;
 
 use super::state::MultiUserMemoryManager;

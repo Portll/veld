@@ -2,15 +2,14 @@
 //!
 //! Handlers for tracing decision lineage and causal relationships between memories.
 
-use axum::{
-    extract::State,
-    response::Json,
-};
+use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{CausalRelation, LineageBranch, LineageEdge, LineageStats, MemoryId, TraceDirection};
+use crate::memory::{
+    CausalRelation, LineageBranch, LineageEdge, LineageStats, MemoryId, TraceDirection,
+};
 use crate::validation;
 use std::sync::Arc;
 
