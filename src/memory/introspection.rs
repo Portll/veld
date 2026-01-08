@@ -770,6 +770,325 @@ impl ConsolidationEventBuffer {
 
         report
     }
+
+    /// Generate a report from a slice of events (static method)
+    ///
+    /// This enables generating reports from events that come from multiple sources
+    /// (e.g., persisted learning history + ephemeral buffer).
+    pub fn generate_report_from_events(
+        events: &[ConsolidationEvent],
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> ConsolidationReport {
+        let mut report = ConsolidationReport {
+            period: ReportPeriod {
+                start: since,
+                end: until,
+            },
+            strengthened_memories: Vec::new(),
+            decayed_memories: Vec::new(),
+            formed_associations: Vec::new(),
+            strengthened_associations: Vec::new(),
+            potentiated_associations: Vec::new(),
+            pruned_associations: Vec::new(),
+            extracted_facts: Vec::new(),
+            reinforced_facts: Vec::new(),
+            decayed_facts: Vec::new(),
+            deleted_facts: Vec::new(),
+            replayed_memories: Vec::new(),
+            interference_events: Vec::new(),
+            weakened_memories: Vec::new(),
+            statistics: ConsolidationStats::default(),
+        };
+
+        for event in events {
+            match event {
+                ConsolidationEvent::MemoryStrengthened {
+                    memory_id,
+                    content_preview,
+                    activation_before,
+                    activation_after,
+                    reason,
+                    timestamp,
+                } => {
+                    report.strengthened_memories.push(MemoryChange {
+                        memory_id: memory_id.clone(),
+                        content_preview: content_preview.clone(),
+                        activation_before: *activation_before,
+                        activation_after: *activation_after,
+                        change_reason: format!("{:?}", reason),
+                        at_risk: false,
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.memories_strengthened += 1;
+                }
+
+                ConsolidationEvent::MemoryDecayed {
+                    memory_id,
+                    content_preview,
+                    activation_before,
+                    activation_after,
+                    at_risk,
+                    timestamp,
+                } => {
+                    report.decayed_memories.push(MemoryChange {
+                        memory_id: memory_id.clone(),
+                        content_preview: content_preview.clone(),
+                        activation_before: *activation_before,
+                        activation_after: *activation_after,
+                        change_reason: "decay".to_string(),
+                        at_risk: *at_risk,
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.memories_decayed += 1;
+                    if *at_risk {
+                        report.statistics.memories_at_risk += 1;
+                    }
+                }
+
+                ConsolidationEvent::EdgeFormed {
+                    from_memory_id,
+                    to_memory_id,
+                    initial_strength,
+                    reason,
+                    timestamp,
+                } => {
+                    report.formed_associations.push(AssociationChange {
+                        from_memory_id: from_memory_id.clone(),
+                        to_memory_id: to_memory_id.clone(),
+                        strength_before: None,
+                        strength_after: *initial_strength,
+                        co_activations: Some(1),
+                        reason: format!("{:?}", reason),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.edges_formed += 1;
+                }
+
+                ConsolidationEvent::EdgeStrengthened {
+                    from_memory_id,
+                    to_memory_id,
+                    strength_before,
+                    strength_after,
+                    co_activations,
+                    timestamp,
+                } => {
+                    report.strengthened_associations.push(AssociationChange {
+                        from_memory_id: from_memory_id.clone(),
+                        to_memory_id: to_memory_id.clone(),
+                        strength_before: Some(*strength_before),
+                        strength_after: *strength_after,
+                        co_activations: Some(*co_activations),
+                        reason: "co_activation".to_string(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.edges_strengthened += 1;
+                }
+
+                ConsolidationEvent::EdgePotentiated {
+                    from_memory_id,
+                    to_memory_id,
+                    final_strength,
+                    total_co_activations,
+                    timestamp,
+                } => {
+                    report.potentiated_associations.push(AssociationChange {
+                        from_memory_id: from_memory_id.clone(),
+                        to_memory_id: to_memory_id.clone(),
+                        strength_before: None,
+                        strength_after: *final_strength,
+                        co_activations: Some(*total_co_activations),
+                        reason: "long_term_potentiation".to_string(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.edges_potentiated += 1;
+                }
+
+                ConsolidationEvent::EdgePruned {
+                    from_memory_id,
+                    to_memory_id,
+                    final_strength,
+                    reason,
+                    timestamp,
+                } => {
+                    report.pruned_associations.push(AssociationChange {
+                        from_memory_id: from_memory_id.clone(),
+                        to_memory_id: to_memory_id.clone(),
+                        strength_before: Some(*final_strength),
+                        strength_after: 0.0,
+                        co_activations: None,
+                        reason: format!("{:?}", reason),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.edges_pruned += 1;
+                }
+
+                ConsolidationEvent::FactExtracted {
+                    fact_id,
+                    fact_content,
+                    confidence,
+                    source_memory_count,
+                    fact_type,
+                    timestamp,
+                } => {
+                    report.extracted_facts.push(FactChange {
+                        fact_id: fact_id.clone(),
+                        fact_content: fact_content.clone(),
+                        confidence: *confidence,
+                        support_count: *source_memory_count,
+                        fact_type: fact_type.clone(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.facts_extracted += 1;
+                }
+
+                ConsolidationEvent::FactReinforced {
+                    fact_id,
+                    fact_content,
+                    confidence_after,
+                    new_support_count,
+                    timestamp,
+                    ..
+                } => {
+                    report.reinforced_facts.push(FactChange {
+                        fact_id: fact_id.clone(),
+                        fact_content: fact_content.clone(),
+                        confidence: *confidence_after,
+                        support_count: *new_support_count,
+                        fact_type: "reinforced".to_string(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.facts_reinforced += 1;
+                }
+
+                ConsolidationEvent::FactDecayed {
+                    fact_id,
+                    fact_content,
+                    confidence_after,
+                    days_since_reinforcement,
+                    timestamp,
+                    ..
+                } => {
+                    report.decayed_facts.push(FactChange {
+                        fact_id: fact_id.clone(),
+                        fact_content: fact_content.clone(),
+                        confidence: *confidence_after,
+                        support_count: *days_since_reinforcement as usize,
+                        fact_type: "decayed".to_string(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.facts_decayed += 1;
+                }
+
+                ConsolidationEvent::FactDeleted {
+                    fact_id,
+                    fact_content,
+                    final_confidence,
+                    support_count,
+                    reason,
+                    timestamp,
+                } => {
+                    report.deleted_facts.push(FactChange {
+                        fact_id: fact_id.clone(),
+                        fact_content: fact_content.clone(),
+                        confidence: *final_confidence,
+                        support_count: *support_count,
+                        fact_type: reason.clone(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.facts_deleted += 1;
+                }
+
+                ConsolidationEvent::MemoryPromoted { .. } => {
+                    // Track promotions if needed
+                }
+
+                ConsolidationEvent::MaintenanceCycleCompleted { duration_ms, .. } => {
+                    report.statistics.maintenance_cycles += 1;
+                    report.statistics.total_maintenance_duration_ms += duration_ms;
+                }
+
+                ConsolidationEvent::MemoryReplayed {
+                    memory_id,
+                    content_preview,
+                    activation_before,
+                    activation_after,
+                    replay_priority,
+                    connected_memories_replayed,
+                    timestamp,
+                } => {
+                    report.replayed_memories.push(ReplayEvent {
+                        memory_id: memory_id.clone(),
+                        content_preview: content_preview.clone(),
+                        activation_before: *activation_before,
+                        activation_after: *activation_after,
+                        replay_priority: *replay_priority,
+                        connected_memories: *connected_memories_replayed,
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.memories_replayed += 1;
+                    report.statistics.total_replay_priority += replay_priority;
+                }
+
+                ConsolidationEvent::ReplayCycleCompleted {
+                    memories_replayed,
+                    total_priority_score,
+                    ..
+                } => {
+                    report.statistics.replay_cycles += 1;
+                    report.statistics.memories_replayed += memories_replayed;
+                    report.statistics.total_replay_priority += total_priority_score;
+                }
+
+                ConsolidationEvent::InterferenceDetected {
+                    new_memory_id,
+                    old_memory_id,
+                    similarity,
+                    interference_type,
+                    timestamp,
+                } => {
+                    report.interference_events.push(InterferenceEvent {
+                        new_memory_id: new_memory_id.clone(),
+                        old_memory_id: old_memory_id.clone(),
+                        similarity: *similarity,
+                        interference_type: interference_type.clone(),
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.interference_events += 1;
+                }
+
+                ConsolidationEvent::MemoryWeakened {
+                    memory_id,
+                    content_preview,
+                    activation_before,
+                    activation_after,
+                    interfering_memory_id,
+                    interference_type,
+                    timestamp,
+                } => {
+                    report.weakened_memories.push(MemoryChange {
+                        memory_id: memory_id.clone(),
+                        content_preview: content_preview.clone(),
+                        activation_before: *activation_before,
+                        activation_after: *activation_after,
+                        change_reason: format!(
+                            "{:?} interference from {}",
+                            interference_type, interfering_memory_id
+                        ),
+                        at_risk: *activation_after < 0.1,
+                        timestamp: *timestamp,
+                    });
+                    report.statistics.memories_weakened += 1;
+                }
+
+                ConsolidationEvent::RetrievalCompetition { .. } => {
+                    report.statistics.retrieval_competitions += 1;
+                }
+            }
+        }
+
+        report
+    }
 }
 
 impl ConsolidationEvent {
@@ -796,6 +1115,43 @@ impl ConsolidationEvent {
             ConsolidationEvent::MemoryWeakened { timestamp, .. } => *timestamp,
             ConsolidationEvent::RetrievalCompetition { timestamp, .. } => *timestamp,
         }
+    }
+
+    /// Check if this event is significant enough to persist to learning history
+    ///
+    /// Significant events represent actual learning/state changes:
+    /// - EdgePotentiated: Permanent association formed (LTP)
+    /// - FactExtracted: New semantic knowledge created
+    /// - FactDeleted: Knowledge was lost
+    /// - FactReinforced: Fact got stronger evidence
+    /// - InterferenceDetected: Memory conflict occurred
+    /// - MemoryReplayed: Consolidation strengthened this memory
+    /// - MemoryPromoted: Memory moved to higher tier
+    /// - ReplayCycleCompleted: Batch consolidation summary
+    /// - MaintenanceCycleCompleted: Maintenance summary
+    ///
+    /// Non-significant (routine housekeeping):
+    /// - MemoryDecayed: Happens every cycle to every memory
+    /// - MemoryStrengthened: High frequency access events
+    /// - EdgeStrengthened: Incremental co-activation
+    /// - EdgeFormed: Initial edge creation (may not survive)
+    /// - EdgePruned: Cleanup of weak edges
+    /// - FactDecayed: Minor confidence changes
+    /// - MemoryWeakened: Consequence of interference (tracked via InterferenceDetected)
+    /// - RetrievalCompetition: Transient retrieval-time event
+    pub fn is_significant(&self) -> bool {
+        matches!(
+            self,
+            ConsolidationEvent::EdgePotentiated { .. }
+                | ConsolidationEvent::FactExtracted { .. }
+                | ConsolidationEvent::FactDeleted { .. }
+                | ConsolidationEvent::FactReinforced { .. }
+                | ConsolidationEvent::InterferenceDetected { .. }
+                | ConsolidationEvent::MemoryReplayed { .. }
+                | ConsolidationEvent::MemoryPromoted { .. }
+                | ConsolidationEvent::ReplayCycleCompleted { .. }
+                | ConsolidationEvent::MaintenanceCycleCompleted { .. }
+        )
     }
 }
 

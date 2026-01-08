@@ -15,6 +15,7 @@ pub mod graph_retrieval;
 pub mod hybrid_search;
 pub mod injection;
 pub mod introspection;
+pub mod learning_history;
 pub mod lineage;
 pub mod prospective;
 pub mod query_parser;
@@ -79,6 +80,9 @@ pub use crate::memory::introspection::{
     AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
     ConsolidationStats, EdgeFormationReason, FactChange, InterferenceEvent, InterferenceType,
     MemoryChange, PruningReason, ReplayEvent, ReportPeriod, StrengtheningReason,
+};
+pub use crate::memory::learning_history::{
+    LearningEventType, LearningHistoryStore, LearningStats, LearningVelocity, StoredLearningEvent,
 };
 pub use crate::memory::lineage::{
     CausalRelation, InferenceConfig, LineageBranch, LineageEdge, LineageGraph, LineageSource,
@@ -207,6 +211,10 @@ pub struct MemorySystem {
     /// When set, entities are extracted and added to the knowledge graph on remember()
     /// This enables spreading activation retrieval and Hebbian co-activation learning
     graph_memory: Option<Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>>,
+
+    /// Persistent learning history for significant events
+    /// Enables recency-weighted retrieval and learning velocity tracking
+    learning_history: Arc<learning_history::LearningHistoryStore>,
 }
 
 impl MemorySystem {
@@ -394,6 +402,10 @@ impl MemorySystem {
             }
         }
 
+        // Initialize learning history store for persistent significant events
+        // Uses the same DB as long-term memory with "learning:" prefix
+        let learning_history = Arc::new(learning_history::LearningHistoryStore::new(storage.db()));
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -421,6 +433,8 @@ impl MemorySystem {
             hybrid_search: Arc::new(hybrid_search_engine),
             // Graph memory is optional - wire up with set_graph_memory() for entity relationships
             graph_memory: None,
+            // Persistent learning history for retrieval boosting
+            learning_history,
         })
     }
 
@@ -541,7 +555,11 @@ impl MemorySystem {
                     attributes: std::collections::HashMap::new(),
                     name_embedding: None,
                     salience: 0.5, // Default salience
-                    is_proper_noun: entity_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false),
+                    is_proper_noun: entity_name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false),
                 };
                 if let Err(e) = graph_guard.add_entity(entity) {
                     tracing::debug!("Failed to add entity '{}' to graph: {}", entity_name, e);
@@ -742,7 +760,11 @@ impl MemorySystem {
                     attributes: std::collections::HashMap::new(),
                     name_embedding: None,
                     salience: 0.5,
-                    is_proper_noun: entity_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false),
+                    is_proper_noun: entity_name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false),
                 };
                 if let Err(e) = graph_guard.add_entity(entity) {
                     tracing::debug!("Failed to add entity '{}' to graph: {}", entity_name, e);
@@ -989,19 +1011,28 @@ impl MemorySystem {
             embedding
         };
 
-
         // ===========================================================================
         // LAYER 1: TEMPORAL PRE-FILTER (Episode Coherence)
         // ===========================================================================
-        let episode_candidates: Option<HashSet<MemoryId>> = if let Some(episode_id) = &query.episode_id {
-            match self.long_term_memory.search(SearchCriteria::ByEpisode(episode_id.clone())) {
+        let episode_candidates: Option<HashSet<MemoryId>> = if let Some(episode_id) =
+            &query.episode_id
+        {
+            match self
+                .long_term_memory
+                .search(SearchCriteria::ByEpisode(episode_id.clone()))
+            {
                 Ok(ep) if !ep.is_empty() => {
                     tracing::debug!("Layer 1: {} candidates in episode {}", ep.len(), episode_id);
                     Some(ep.into_iter().map(|m| m.id).collect())
                 }
-                _ => { tracing::debug!("Layer 1: global search"); None }
+                _ => {
+                    tracing::debug!("Layer 1: global search");
+                    None
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
 
         // ===========================================================================
         // LAYER 2: GRAPH EXPANSION (Knowledge Graph Traversal)
@@ -1010,17 +1041,35 @@ impl MemorySystem {
             if let Some(graph) = &self.graph_memory {
                 let g = graph.read();
                 let a = query_parser::analyze_query(query_text);
-                let d = g.get_stats().ok().and_then(|s| if s.entity_count > 0 { Some(s.relationship_count as f32 / s.entity_count as f32) } else { None });
+                let d = g.get_stats().ok().and_then(|s| {
+                    if s.entity_count > 0 {
+                        Some(s.relationship_count as f32 / s.entity_count as f32)
+                    } else {
+                        None
+                    }
+                });
                 let mut ids = Vec::new();
-                for e in a.focal_entities.iter().map(|e| e.text.as_str()).chain(a.discriminative_modifiers.iter().map(|m| m.text.as_str())) {
+                for e in a
+                    .focal_entities
+                    .iter()
+                    .map(|e| e.text.as_str())
+                    .chain(a.discriminative_modifiers.iter().map(|m| m.text.as_str()))
+                {
                     if let Ok(Some(ent)) = g.find_entity_by_name(e) {
                         if let Ok(t) = g.traverse_from_entity(&ent.uuid, 2) {
                             for tr in &t.entities {
                                 if let Ok(eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
                                     for ep in eps {
                                         let mid = MemoryId(ep.uuid);
-                                        if episode_candidates.as_ref().map_or(true, |c| c.contains(&mid)) {
-                                            ids.push((mid, tr.entity.salience * tr.decay_factor, tr.decay_factor));
+                                        if episode_candidates
+                                            .as_ref()
+                                            .map_or(true, |c| c.contains(&mid))
+                                        {
+                                            ids.push((
+                                                mid,
+                                                tr.entity.salience * tr.decay_factor,
+                                                tr.decay_factor,
+                                            ));
                                         }
                                     }
                                 }
@@ -1028,12 +1077,24 @@ impl MemorySystem {
                         }
                     }
                 }
-                let mut seen: std::collections::HashMap<MemoryId, (f32, f32)> = std::collections::HashMap::new();
-                for (id, act, heb) in ids { seen.entry(id).and_modify(|(a,h)| { *a = a.max(act); *h = h.max(heb); }).or_insert((act, heb)); }
+                let mut seen: std::collections::HashMap<MemoryId, (f32, f32)> =
+                    std::collections::HashMap::new();
+                for (id, act, heb) in ids {
+                    seen.entry(id)
+                        .and_modify(|(a, h)| {
+                            *a = a.max(act);
+                            *h = h.max(heb);
+                        })
+                        .or_insert((act, heb));
+                }
                 let r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
-                if !r.is_empty() { tracing::debug!("Layer 2: {} graph results", r.len()); }
+                if !r.is_empty() {
+                    tracing::debug!("Layer 2: {} graph results", r.len());
+                }
                 (r, d)
-            } else { (Vec::new(), None) }
+            } else {
+                (Vec::new(), None)
+            }
         };
 
         // Create a modified query with the embedding for vector search
@@ -1068,28 +1129,56 @@ impl MemorySystem {
         // ===========================================================================
         // LAYER 3: VECTOR SEARCH (Vamana Index)
         // ===========================================================================
-        let vr = self.retriever.search_ids(&vector_query, query.max_results * 3)?;
+        let vr = self
+            .retriever
+            .search_ids(&vector_query, query.max_results * 3)?;
         let vector_results: Vec<(MemoryId, f32)> = if let Some(ref c) = episode_candidates {
             vr.into_iter().filter(|(id, _)| c.contains(id)).collect()
-        } else { vr };
+        } else {
+            vr
+        };
         tracing::debug!("Layer 3: {} vector results", vector_results.len());
 
         // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
         // ===========================================================================
-        let (memory_ids, hebbian_scores): (Vec<(MemoryId, f32)>, std::collections::HashMap<MemoryId, f32>) = {
+        let (memory_ids, hebbian_scores): (
+            Vec<(MemoryId, f32)>,
+            std::collections::HashMap<MemoryId, f32>,
+        ) = {
             let get_content = |id: &MemoryId| -> Option<String> {
-                self.working_memory.read().get(id).map(|m| m.experience.content.clone())
-                    .or_else(|| self.session_memory.read().get(id).map(|m| m.experience.content.clone()))
-                    .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.experience.content.clone()))
+                self.working_memory
+                    .read()
+                    .get(id)
+                    .map(|m| m.experience.content.clone())
+                    .or_else(|| {
+                        self.session_memory
+                            .read()
+                            .get(id)
+                            .map(|m| m.experience.content.clone())
+                    })
+                    .or_else(|| {
+                        self.long_term_memory
+                            .get(id)
+                            .ok()
+                            .map(|m| m.experience.content.clone())
+                    })
             };
-            let hybrid_ids = self.hybrid_search.search(query_text, vector_results.clone(), get_content)
-                .map(|r| r.into_iter().map(|x| (x.memory_id, x.score)).collect::<Vec<_>>())
+            let hybrid_ids = self
+                .hybrid_search
+                .search(query_text, vector_results.clone(), get_content)
+                .map(|r| {
+                    r.into_iter()
+                        .map(|x| (x.memory_id, x.score))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or(vector_results);
 
             const K: f32 = 60.0;
-            let mut fused: std::collections::HashMap<MemoryId, f32> = std::collections::HashMap::new();
-            let mut heb: std::collections::HashMap<MemoryId, f32> = std::collections::HashMap::new();
+            let mut fused: std::collections::HashMap<MemoryId, f32> =
+                std::collections::HashMap::new();
+            let mut heb: std::collections::HashMap<MemoryId, f32> =
+                std::collections::HashMap::new();
             let boost = graph_density.map(|d| 1.1 + d.min(2.0) * 0.7).unwrap_or(1.5);
             for (r, (id, _, h)) in graph_results.iter().enumerate() {
                 *fused.entry(id.clone()).or_insert(0.0) += boost / (K + r as f32);
@@ -1117,7 +1206,7 @@ impl MemorySystem {
             // Layer 5: Apply hebbian boost from learned graph weights
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
             let final_score = score + hebbian_boost * 0.1; // 10% hebbian contribution
-            // Helper to clone memory with score set (Arc<Memory> is immutable)
+                                                           // Helper to clone memory with score set (Arc<Memory> is immutable)
             let with_score = |mem: &SharedMemory, s: f32| -> SharedMemory {
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(s);
@@ -1269,6 +1358,106 @@ impl MemorySystem {
         }
 
         Ok(memories)
+    }
+
+    /// Apply learning velocity boost to retrieved memories
+    ///
+    /// This method should be called after `recall()` when user_id is known.
+    /// It boosts memories that have been recently learned/reinforced, implementing
+    /// the principle that "learning should improve retrieval over time".
+    ///
+    /// Boost factors:
+    /// - Base boost for any learning activity (5%)
+    /// - Velocity boost for rapid learning (up to 15%)
+    /// - Potentiation bonus for LTP'd edges (10%)
+    /// - Total max boost: 30%
+    ///
+    /// The memories are re-sorted by adjusted score after boosting.
+    pub fn apply_learning_boost(
+        &self,
+        user_id: &str,
+        mut memories: Vec<SharedMemory>,
+    ) -> Vec<SharedMemory> {
+        if memories.is_empty() {
+            return memories;
+        }
+
+        // Calculate boosts for all memories
+        let mut boosted: Vec<(SharedMemory, f32)> = memories
+            .drain(..)
+            .map(|mem| {
+                let base_score = mem.score.unwrap_or(0.5);
+                let boost = self
+                    .learning_history
+                    .recency_boost(user_id, &mem.id.0.to_string())
+                    .unwrap_or(1.0);
+                let adjusted_score = base_score * boost;
+                (mem, adjusted_score)
+            })
+            .collect();
+
+        // Log if any memories got significant boosts
+        let boosted_count = boosted.iter().filter(|(_, s)| *s > 0.5).count();
+        if boosted_count > 0 {
+            tracing::debug!(
+                user_id = %user_id,
+                boosted_count = boosted_count,
+                "Applied learning velocity boost to retrieved memories"
+            );
+        }
+
+        // Sort by adjusted score (descending)
+        boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Rebuild memories with updated scores
+        boosted
+            .into_iter()
+            .map(|(mem, score)| {
+                let mut cloned: Memory = mem.as_ref().clone();
+                cloned.set_score(score);
+                Arc::new(cloned)
+            })
+            .collect()
+    }
+
+    /// Recall with learning boost applied
+    ///
+    /// Convenience method that combines `recall()` with `apply_learning_boost()`.
+    /// Use this when you have the user_id available at recall time.
+    pub fn recall_for_user(&self, user_id: &str, query: &Query) -> Result<Vec<SharedMemory>> {
+        let memories = self.recall(query)?;
+        Ok(self.apply_learning_boost(user_id, memories))
+    }
+
+    /// Get learning velocity statistics for a memory
+    ///
+    /// Returns information about recent learning activity for this memory,
+    /// useful for debugging/introspection.
+    pub fn get_learning_velocity(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        hours: i64,
+    ) -> Result<learning_history::LearningVelocity> {
+        self.learning_history
+            .memory_learning_velocity(user_id, memory_id, hours)
+    }
+
+    /// Get learning history statistics for a user
+    pub fn get_learning_stats(&self, user_id: &str) -> Result<learning_history::LearningStats> {
+        self.learning_history.stats(user_id)
+    }
+
+    /// Get recent learning events for a user
+    pub fn get_learning_events(
+        &self,
+        user_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<learning_history::StoredLearningEvent>> {
+        let mut events = self.learning_history.events_since(user_id, since)?;
+        events.truncate(limit);
+        Ok(events)
     }
 
     /// Calculate linguistic boost based on focal entity matches
@@ -2999,7 +3188,11 @@ impl MemorySystem {
                         attributes: std::collections::HashMap::new(),
                         name_embedding: None,
                         salience: 0.5,
-                        is_proper_noun: entity_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false),
+                        is_proper_noun: entity_name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false),
                     };
                     if let Err(e) = graph_guard.add_entity(entity) {
                         tracing::debug!("Failed to add entity '{}' to graph: {}", entity_name, e);
@@ -3200,7 +3393,8 @@ impl MemorySystem {
             let should_replay = self.replay_manager.read().should_replay();
             if should_replay {
                 // Collect replay candidates from working + session memory
-                // Graph connections are managed by GraphMemory at the API layer
+                // Fetch actual connections from GraphMemory for replay eligibility
+                let graph_ref = self.graph_memory.clone();
                 let candidates_data: Vec<_> = {
                     let working = self.working_memory.read();
                     let session = self.session_memory.read();
@@ -3210,8 +3404,18 @@ impl MemorySystem {
                         .iter()
                         .chain(session.all_memories().iter())
                         .map(|m| {
-                            // Connections provided by GraphMemory at API layer
-                            let connections: Vec<String> = Vec::new();
+                            // Fetch actual connections from GraphMemory
+                            let connections: Vec<String> = if let Some(ref graph) = graph_ref {
+                                let graph_guard = graph.read();
+                                graph_guard
+                                    .find_memory_associations(&m.id.0, 10)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|(uuid, _)| uuid.to_string())
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                             let arousal = m
                                 .experience
                                 .context
@@ -3343,6 +3547,65 @@ impl MemorySystem {
         events.generate_report(since, until)
     }
 
+    /// Get a consolidation report for a user using persisted history
+    ///
+    /// Unlike `get_consolidation_report`, this method uses persisted learning history
+    /// and can generate reports spanning across restarts. It combines:
+    /// - Persisted significant events from learning_history (survives restarts)
+    /// - Ephemeral events from the event buffer (current session)
+    ///
+    /// Use this when you need historical reports beyond the current session.
+    pub fn get_consolidation_report_for_user(
+        &self,
+        user_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+        until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ConsolidationReport> {
+        let until = until.unwrap_or_else(chrono::Utc::now);
+
+        // Get persisted significant events from learning history
+        let persisted_events = self
+            .learning_history
+            .events_in_range(user_id, since, until)?;
+
+        // Get ephemeral events from the buffer
+        let ephemeral_events = {
+            let events = self.consolidation_events.read();
+            events.events_since(since)
+        };
+
+        // Combine events, deduplicating by timestamp (persisted events may also be in buffer)
+        let mut all_events: Vec<ConsolidationEvent> = Vec::new();
+        let mut seen_timestamps: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+        // Add persisted events first (these are significant events that survived restart)
+        for stored in &persisted_events {
+            let ts = stored.event.timestamp().timestamp_nanos_opt().unwrap_or(0);
+            if !seen_timestamps.contains(&ts) {
+                seen_timestamps.insert(ts);
+                all_events.push(stored.event.clone());
+            }
+        }
+
+        // Add ephemeral events that aren't already included
+        for event in ephemeral_events {
+            let ts = event.timestamp().timestamp_nanos_opt().unwrap_or(0);
+            if ts <= until.timestamp_nanos_opt().unwrap_or(0) && !seen_timestamps.contains(&ts) {
+                seen_timestamps.insert(ts);
+                all_events.push(event);
+            }
+        }
+
+        // Sort by timestamp
+        all_events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
+
+        // Generate report from combined events
+        let report =
+            ConsolidationEventBuffer::generate_report_from_events(&all_events, since, until);
+
+        Ok(report)
+    }
+
     /// Get all consolidation events since a timestamp
     ///
     /// Returns raw events for detailed analysis
@@ -3367,6 +3630,33 @@ impl MemorySystem {
     pub fn record_consolidation_event(&self, event: ConsolidationEvent) {
         let mut events = self.consolidation_events.write();
         events.push(event);
+    }
+
+    /// Record a consolidation event for a specific user
+    ///
+    /// This method both:
+    /// 1. Pushes to the ephemeral event buffer (for real-time introspection)
+    /// 2. Persists significant events to learning_history (for retrieval boosting)
+    ///
+    /// Use this instead of `record_consolidation_event` when you have a user_id.
+    pub fn record_consolidation_event_for_user(&self, user_id: &str, event: ConsolidationEvent) {
+        // Always push to ephemeral buffer
+        {
+            let mut events = self.consolidation_events.write();
+            events.push(event.clone());
+        }
+
+        // Persist significant events to learning history
+        if event.is_significant() {
+            if let Err(e) = self.learning_history.record(user_id, &event) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    event_type = ?std::mem::discriminant(&event),
+                    error = %e,
+                    "Failed to persist learning event"
+                );
+            }
+        }
     }
 
     /// Clear all consolidation events
@@ -3432,16 +3722,19 @@ impl MemorySystem {
                 "Semantic distillation complete"
             );
 
-            // Record consolidation event for each fact
+            // Record consolidation event for each fact (persists significant events)
             for fact in &result.new_facts {
-                self.record_consolidation_event(ConsolidationEvent::FactExtracted {
-                    fact_id: fact.id.clone(),
-                    fact_content: fact.fact.clone(),
-                    confidence: fact.confidence,
-                    fact_type: format!("{:?}", fact.fact_type),
-                    source_memory_count: fact.source_memories.len(),
-                    timestamp: chrono::Utc::now(),
-                });
+                self.record_consolidation_event_for_user(
+                    user_id,
+                    ConsolidationEvent::FactExtracted {
+                        fact_id: fact.id.clone(),
+                        fact_content: fact.fact.clone(),
+                        confidence: fact.confidence,
+                        fact_type: format!("{:?}", fact.fact_type),
+                        source_memory_count: fact.source_memories.len(),
+                        timestamp: chrono::Utc::now(),
+                    },
+                );
             }
         }
 
@@ -3537,15 +3830,18 @@ impl MemorySystem {
             // Update in store
             self.fact_store.update(user_id, &fact)?;
 
-            // Record reinforcement event
-            self.record_consolidation_event(ConsolidationEvent::FactReinforced {
-                fact_id: fact.id.clone(),
-                fact_content: fact.fact.clone(),
-                confidence_before,
-                confidence_after: fact.confidence,
-                new_support_count: fact.support_count,
-                timestamp: chrono::Utc::now(),
-            });
+            // Record reinforcement event (persists significant events)
+            self.record_consolidation_event_for_user(
+                user_id,
+                ConsolidationEvent::FactReinforced {
+                    fact_id: fact.id.clone(),
+                    fact_content: fact.fact.clone(),
+                    confidence_before,
+                    confidence_after: fact.confidence,
+                    new_support_count: fact.support_count,
+                    timestamp: chrono::Utc::now(),
+                },
+            );
 
             Ok(true)
         } else {
@@ -3680,20 +3976,23 @@ impl MemorySystem {
 
                 // Delete if below threshold
                 if fact.confidence < DELETE_CONFIDENCE {
-                    // Record deletion event
-                    self.record_consolidation_event(ConsolidationEvent::FactDeleted {
-                        fact_id: fact.id.clone(),
-                        fact_content: fact.fact.clone(),
-                        final_confidence: fact.confidence,
-                        support_count: fact.support_count,
-                        reason: format!("confidence_below_{}", DELETE_CONFIDENCE),
-                        timestamp: now,
-                    });
+                    // Record deletion event (persists significant events)
+                    self.record_consolidation_event_for_user(
+                        user_id,
+                        ConsolidationEvent::FactDeleted {
+                            fact_id: fact.id.clone(),
+                            fact_content: fact.fact.clone(),
+                            final_confidence: fact.confidence,
+                            support_count: fact.support_count,
+                            reason: format!("confidence_below_{}", DELETE_CONFIDENCE),
+                            timestamp: now,
+                        },
+                    );
 
                     self.fact_store.delete(user_id, &fact.id)?;
                     total_deleted += 1;
                 } else if fact.confidence < confidence_before {
-                    // Record decay event (only if actually decayed)
+                    // Record decay event (not significant - routine maintenance)
                     self.record_consolidation_event(ConsolidationEvent::FactDecayed {
                         fact_id: fact.id.clone(),
                         fact_content: fact.fact.clone(),
