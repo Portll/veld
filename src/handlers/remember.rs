@@ -351,6 +351,11 @@ pub async fn remember(
         .map_err(AppError::Internal)?
     };
 
+    // Build episodic graph: entities + episode + relationships for multi-hop retrieval
+    if let Err(e) = state.process_experience_into_graph(&req.user_id, &experience, &memory_id) {
+        tracing::debug!("Graph processing failed (non-fatal): {}", e);
+    }
+
     // Record metrics
     let duration = op_start.elapsed().as_secs_f64();
     metrics::MEMORY_STORE_DURATION.observe(duration);
@@ -528,6 +533,17 @@ pub async fn batch_remember(
     all_errors.sort_by_key(|e| e.index);
     let failed = all_errors.len();
 
+    // Build episodic graph for each stored memory (enables multi-hop retrieval)
+    for (_, id_str, experience) in &memory_results {
+        if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+            let memory_id = crate::memory::MemoryId(uuid);
+            if let Err(e) = state.process_experience_into_graph(&req.user_id, experience, &memory_id)
+            {
+                tracing::debug!("Graph processing failed for {} (non-fatal): {}", id_str, e);
+            }
+        }
+    }
+
     // Record metrics
     let duration = op_start.elapsed().as_secs_f64();
     metrics::BATCH_STORE_DURATION.observe(duration);
@@ -639,6 +655,11 @@ pub async fn upsert_memory(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
+
+    // Build episodic graph for multi-hop retrieval
+    if let Err(e) = state.process_experience_into_graph(&req.user_id, &experience, &memory_id) {
+        tracing::debug!("Graph processing failed (non-fatal): {}", e);
+    }
 
     // Record metrics
     let duration = op_start.elapsed().as_secs_f64();

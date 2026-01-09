@@ -32,7 +32,7 @@ use crate::constants::{
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EpisodicNode, GraphMemory};
-use crate::memory::injection::{compute_relevance, InjectionConfig, RelevanceInput};
+// Note: compute_relevance removed - using unified density-weighted scoring directly
 use crate::memory::query_parser::{analyze_query, QueryAnalysis};
 use crate::memory::types::{Memory, Query, RetrievalStats, SharedMemory};
 use crate::similarity::cosine_similarity;
@@ -392,22 +392,7 @@ pub fn spreading_activation_retrieve_with_stats(
     let query_embedding = embedder.encode(query_text)?;
     stats.embedding_time_us = embedding_start.elapsed().as_micros() as u64;
 
-    // Unified scoring config - ensures consistency with semantic_retrieve path
-    let injection_config = InjectionConfig::default();
     let now = chrono::Utc::now();
-
-    // Extract context entities from query analysis for entity overlap calculation
-    let context_entities: Vec<String> = analysis
-        .focal_entities
-        .iter()
-        .map(|e| e.text.clone())
-        .chain(
-            analysis
-                .discriminative_modifiers
-                .iter()
-                .map(|m| m.text.clone()),
-        )
-        .collect();
 
     for (_episode_uuid, (graph_activation, episode)) in activated_memories {
         // Convert episode to memory
@@ -423,38 +408,35 @@ pub fn spreading_activation_retrieve_with_stats(
             let linguistic_raw = calculate_linguistic_match(&memory, &analysis);
             let linguistic_score = linguistic_raw; // Already normalized in calculate_linguistic_match
 
-            // Extract episode context for episode coherence scoring
-            let episode_id = memory
+            // Unified scoring using density-dependent weights (calculated at function start)
+            // Weights are: semantic_weight, graph_weight, linguistic_weight
+            let hybrid_score = semantic_score * semantic_weight
+                + graph_activation * graph_weight
+                + linguistic_score * linguistic_weight;
+
+            // Recency decay (10% contribution) - recent memories get boost
+            // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
+            const RECENCY_DECAY_RATE: f32 = 0.01;
+            let hours_old = (now - memory.created_at).num_hours().max(0) as f32;
+            let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * 0.1;
+
+            // Emotional arousal boost: high arousal = more salient (5% contribution)
+            let arousal_boost = memory
                 .experience
                 .context
                 .as_ref()
-                .and_then(|ctx| ctx.episode.episode_id.clone());
-            let sequence_number = memory
+                .map(|c| c.emotional.arousal * 0.05)
+                .unwrap_or(0.0);
+
+            // Source credibility boost (5% contribution)
+            let credibility_boost = memory
                 .experience
                 .context
                 .as_ref()
-                .and_then(|ctx| ctx.episode.sequence_number);
+                .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
+                .unwrap_or(0.0);
 
-            // UNIFIED SCORING via compute_relevance - single source of truth
-            let memory_embedding = memory.experience.embeddings.clone().unwrap_or_default();
-            let input = RelevanceInput {
-                memory_embedding,
-                created_at: memory.created_at,
-                hebbian_strength: graph_activation, // Use graph activation as Hebbian proxy
-                memory_entities: memory.experience.entities.clone(),
-                context_entities: context_entities.clone(),
-                memory_type: Some(memory.experience.experience_type.clone()),
-                memory_files: Vec::new(),
-                context_files: Vec::new(),
-                feedback_momentum: 0.0,
-                episode_id,
-                query_episode_id: query.episode_id.clone(),
-                sequence_number,
-                graph_activation, // Spreading activation score
-                linguistic_score, // IC-weighted entity matches
-            };
-
-            let final_score = compute_relevance(&input, &query_embedding, now, &injection_config);
+            let final_score = hybrid_score + recency_boost + arousal_boost + credibility_boost;
 
             scored_memories.push(ActivatedMemory {
                 memory,

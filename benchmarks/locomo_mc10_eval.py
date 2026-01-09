@@ -48,11 +48,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
-try:
-    from datasets import load_dataset
-except ImportError:
-    print("Install datasets: pip install datasets")
-    exit(1)
+# Dataset loaded from local cache (no need for datasets library)
 
 try:
     from tqdm import tqdm
@@ -60,12 +56,35 @@ except ImportError:
     print("Install tqdm: pip install tqdm")
     exit(1)
 
-try:
-    from shodh_memory import Memory
-except ImportError:
-    print("Install shodh-memory: pip install shodh-memory")
-    print("Or build locally: maturin develop --release")
-    exit(1)
+import requests
+
+# HTTP API Client for shodh-memory server
+class ShodhMemoryClient:
+    """HTTP client for shodh-memory server API."""
+
+    def __init__(self, base_url: str = "http://127.0.0.1:3030", api_key: str = "sk-shodh-dev-local-testing-key", user_id: str = "locomo-eval"):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.user_id = user_id
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "X-API-Key": api_key
+        })
+
+    def remember(self, content: str, memory_type: str = "Observation", tags: list = None):
+        payload = {"user_id": self.user_id, "content": content, "memory_type": memory_type}
+        if tags:
+            payload["tags"] = tags
+        resp = self.session.post(f"{self.base_url}/api/remember", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def recall(self, query: str, limit: int = 5, mode: str = "hybrid"):
+        payload = {"user_id": self.user_id, "query": query, "limit": limit, "mode": mode}
+        resp = self.session.post(f"{self.base_url}/api/recall", json=payload)
+        resp.raise_for_status()
+        return resp.json().get("memories", [])
 
 
 # ============================================================================
@@ -231,28 +250,79 @@ class EvalResult:
     num_memories_stored: int
 
 
-def store_conversations(memory: Memory, sessions: list[str], summaries: list[str]) -> tuple[int, float]:
-    """Store conversation sessions into Shodh-Memory."""
+def store_conversations(
+    client: ShodhMemoryClient,
+    sessions: list,
+    summaries: list[str],
+    datetimes: list[str] = None
+) -> tuple[int, float]:
+    """Store conversation sessions into Shodh-Memory via HTTP API.
+
+    Uses semantic chunking: keeps dialogue turns together instead of arbitrary splits.
+    Includes session datetime for temporal reasoning (resolving "last Saturday" etc).
+    """
     start = time.perf_counter()
     count = 0
+    datetimes = datetimes or []
 
-    for i, (session, summary) in enumerate(zip(sessions, summaries)):
-        # Store the summary as a high-level memory
-        if summary and summary.strip():
-            memory.remember(
-                content=f"Session {i+1} Summary: {summary[:2000]}",  # Truncate long summaries
+    for i, summary in enumerate(summaries):
+        session = sessions[i] if i < len(sessions) else []
+        session_dt = datetimes[i] if i < len(datetimes) else None
+
+        # Format datetime for context (e.g., "2023-05-25T13:14:00" -> "May 25, 2023")
+        dt_prefix = ""
+        if session_dt:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(session_dt.replace('Z', '+00:00'))
+                dt_prefix = f"[Conversation on {dt.strftime('%B %d, %Y at %I:%M %p')}] "
+            except:
+                dt_prefix = f"[{session_dt}] "
+
+        # Store the summary with datetime context
+        if summary and isinstance(summary, str) and summary.strip():
+            client.remember(
+                content=f"{dt_prefix}Session {i+1} Summary: {summary[:2000]}",
                 memory_type="Context",
                 tags=[f"session_{i+1}", "summary"]
             )
             count += 1
 
-        # Store conversation chunks (split long sessions)
-        if session and session.strip():
-            # Split into chunks of ~500 chars to avoid memory bloat
-            chunks = [session[j:j+500] for j in range(0, len(session), 500)]
-            for chunk_idx, chunk in enumerate(chunks[:10]):  # Max 10 chunks per session
-                memory.remember(
-                    content=f"Session {i+1}: {chunk}",
+        # SEMANTIC CHUNKING: Keep dialogue turns together, don't split mid-sentence
+        if session and isinstance(session, list):
+            # Group turns into semantic chunks (~800 chars target, but don't break turns)
+            current_chunk = []
+            current_len = 0
+            TARGET_CHUNK_SIZE = 800
+
+            for turn in session:
+                if isinstance(turn, dict):
+                    content = turn.get("content", "").strip()
+                    if not content:
+                        continue
+
+                    turn_len = len(content)
+
+                    # If adding this turn exceeds target and we have content, flush chunk
+                    if current_len > 0 and current_len + turn_len > TARGET_CHUNK_SIZE:
+                        chunk_text = "\n".join(current_chunk)
+                        client.remember(
+                            content=f"{dt_prefix}Session {i+1}:\n{chunk_text}",
+                            memory_type="Conversation",
+                            tags=[f"session_{i+1}", "dialogue"]
+                        )
+                        count += 1
+                        current_chunk = []
+                        current_len = 0
+
+                    current_chunk.append(content)
+                    current_len += turn_len
+
+            # Don't forget the last chunk
+            if current_chunk:
+                chunk_text = "\n".join(current_chunk)
+                client.remember(
+                    content=f"{dt_prefix}Session {i+1}:\n{chunk_text}",
                     memory_type="Conversation",
                     tags=[f"session_{i+1}", "dialogue"]
                 )
@@ -262,16 +332,17 @@ def store_conversations(memory: Memory, sessions: list[str], summaries: list[str
     return count, elapsed_ms
 
 
-def recall_context(memory: Memory, question: str, limit: int = 5) -> tuple[str, float]:
-    """Retrieve relevant context for a question."""
+def recall_context(client: ShodhMemoryClient, question: str, limit: int = 5) -> tuple[str, float]:
+    """Retrieve relevant context for a question via HTTP API."""
     start = time.perf_counter()
 
-    results = memory.recall(query=question, limit=limit)
+    results = client.recall(query=question, limit=limit)
 
     elapsed_ms = (time.perf_counter() - start) * 1000
 
     if results:
-        context = "\n\n".join([f"[Memory {i+1}]: {r.content}" for i, r in enumerate(results)])
+        # API returns JSON with experience.content
+        context = "\n\n".join([f"[Memory {i+1}]: {r.get('experience', {}).get('content', '')}" for i, r in enumerate(results)])
     else:
         context = "(No relevant memories found)"
 
@@ -324,23 +395,21 @@ Your answer (single digit 0-9):"""
 def evaluate_single_item(
     item: dict,
     provider: LLMProvider,
-    db_path: str
+    client: ShodhMemoryClient
 ) -> EvalResult:
     """Evaluate a single LoCoMo-MC10 item."""
 
-    # Create fresh memory instance for this conversation
-    memory = Memory(
-        user_id=f"locomo_{item['question_id']}",
-        db_path=db_path
-    )
+    # Set user_id for this conversation (isolation)
+    client.user_id = f"locomo_{item['question_id']}"
 
-    # Store conversation sessions
+    # Store conversation sessions with timestamps for temporal reasoning
     sessions = item.get("haystack_sessions", [])
     summaries = item.get("haystack_session_summaries", [])
-    num_stored, store_latency = store_conversations(memory, sessions, summaries)
+    datetimes = item.get("haystack_session_datetimes", [])
+    num_stored, store_latency = store_conversations(client, sessions, summaries, datetimes)
 
     # Recall relevant context
-    context, recall_latency = recall_context(memory, item["question"], limit=5)
+    context, recall_latency = recall_context(client, item["question"], limit=5)
 
     # Select answer using LLM
     predicted_idx = select_answer_with_llm(
@@ -371,7 +440,8 @@ def run_evaluation(
     api_base: Optional[str] = None,
     api_key: Optional[str] = None,
     limit: Optional[int] = None,
-    db_path: str = "./locomo_eval_db",
+    shodh_url: str = "http://127.0.0.1:3030",
+    shodh_api_key: str = "sk-shodh-dev-local-testing-key",
     output_file: str = "locomo_results.json"
 ):
     """Run the full LoCoMo-MC10 evaluation."""
@@ -380,22 +450,45 @@ def run_evaluation(
     print("LoCoMo-MC10 Benchmark for Shodh-Memory")
     print("=" * 60)
 
+    # Create HTTP client for shodh-memory
+    print(f"\nConnecting to Shodh-Memory at {shodh_url}")
+    client = ShodhMemoryClient(base_url=shodh_url, api_key=shodh_api_key)
+
+    # Test connection
+    try:
+        resp = requests.get(f"{shodh_url}/health")
+        if resp.status_code != 200:
+            print(f"ERROR: Shodh-Memory server not responding at {shodh_url}")
+            exit(1)
+        print("[OK] Connected to Shodh-Memory server")
+    except Exception as e:
+        print(f"ERROR: Cannot connect to Shodh-Memory server: {e}")
+        exit(1)
+
     # Create LLM provider
-    print(f"\nInitializing {provider_name} provider with model: {model}")
+    print(f"Initializing {provider_name} provider with model: {model}")
     provider = create_provider(provider_name, model, api_base, api_key)
 
-    # Load dataset
+    # Load dataset from local cache
     print("Loading LoCoMo-MC10 dataset...")
-    dataset = load_dataset("Percena/locomo-mc10", split="train")
+    mc10_path = os.path.expanduser('~/.cache/huggingface/hub/datasets--Percena--locomo-mc10/snapshots/7d59a0463d83f97b042684310c0b3d17553004cd/data/locomo_mc10.json')
+
+    if not os.path.exists(mc10_path):
+        print(f"Dataset not found at {mc10_path}")
+        print("Please download: from datasets import load_dataset; load_dataset('Percena/locomo-mc10')")
+        exit(1)
+
+    with open(mc10_path, 'r', encoding='utf-8') as f:
+        dataset = [json.loads(line) for line in f]
 
     total_items = len(dataset)
     if limit:
-        dataset = dataset.select(range(min(limit, total_items)))
+        dataset = dataset[:min(limit, total_items)]
 
     print(f"Evaluating {len(dataset)} / {total_items} items")
     print(f"Provider: {provider_name}")
     print(f"Model: {model}")
-    print(f"DB Path: {db_path}")
+    print(f"Shodh URL: {shodh_url}")
     print()
 
     # Run evaluation
@@ -405,7 +498,7 @@ def run_evaluation(
         result = evaluate_single_item(
             item=item,
             provider=provider,
-            db_path=db_path
+            client=client
         )
         results.append(result)
 
@@ -509,7 +602,8 @@ Examples:
     parser.add_argument("--api-base", default=None, help="API base URL (required for openai-compatible)")
     parser.add_argument("--api-key", default=None, help="API key (or use env vars: OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of items (for testing)")
-    parser.add_argument("--db-path", default="./locomo_eval_db", help="Path for Shodh-Memory database")
+    parser.add_argument("--shodh-url", default="http://127.0.0.1:3030", help="Shodh-Memory server URL")
+    parser.add_argument("--shodh-api-key", default="sk-shodh-dev-local-testing-key", help="Shodh-Memory API key")
     parser.add_argument("--output", default="locomo_results.json", help="Output file for results")
     parser.add_argument("--full", action="store_true", help="Run full evaluation (all 1986 items)")
 
@@ -523,6 +617,7 @@ Examples:
         api_base=args.api_base,
         api_key=args.api_key,
         limit=limit,
-        db_path=args.db_path,
+        shodh_url=args.shodh_url,
+        shodh_api_key=args.shodh_api_key,
         output_file=args.output
     )

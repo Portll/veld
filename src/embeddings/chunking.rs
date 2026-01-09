@@ -3,23 +3,46 @@
 //! MiniLM has a 256 token limit. Content beyond this is silently dropped,
 //! making long memories unsearchable by their later content.
 //!
-//! This module implements overlapping chunking to ensure ALL content is embedded:
+//! This module implements two chunking strategies:
+//!
+//! ## 1. Fixed-Size Overlapping Chunking (`chunk_text`)
 //! - Split text into ~200 token chunks (leaving room for special tokens)
 //! - 50 token overlap between chunks for context continuity
-//! - Each chunk gets its own embedding in the vector index
-//! - Search matches against ANY chunk, returns the full memory
+//! - Good for general prose and documents
 //!
-//! # Example
+//! ## 2. Semantic Chunking (`semantic_chunk_text`)
+//! - Splits on natural boundaries (paragraphs, dialogue turns, sections)
+//! - Preserves conversational context - never splits mid-turn
+//! - Better for dialogue, structured text, logs, and multi-speaker content
+//!
+//! # Example (Fixed-Size)
 //!
 //! A 1000-token memory becomes ~6 chunks:
 //! ```text
 //! [0-200] [150-350] [300-500] [450-650] [600-800] [750-1000]
-//!         ↑ overlap  ↑ overlap  ↑ overlap  ↑ overlap
 //! ```
 //!
-//! If a search query matches chunk 4, the full memory is returned.
+//! # Example (Semantic)
+//!
+//! A dialogue becomes natural chunks preserving speaker turns:
+//! ```text
+//! [Alice: Hi / Bob: Hello] [Alice: How are you? / Bob: Great!]
+//! ```
 
-/// Chunk configuration
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// Pattern to detect dialogue turns (e.g., "Alice:", "User:", "Speaker 1:")
+static DIALOGUE_TURN_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^([A-Z][a-zA-Z0-9_\- ]{0,30})\s*:").unwrap()
+});
+
+/// Pattern to detect section headers or timestamps
+static SECTION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(?:\[.*?\]|#{1,3}\s+\w|Session \d+|---+)").unwrap()
+});
+
+/// Chunk configuration for fixed-size chunking
 pub struct ChunkConfig {
     /// Target chunk size in characters (approximate tokens * 4)
     pub chunk_size: usize,
@@ -211,6 +234,273 @@ pub fn estimate_tokens(text: &str) -> usize {
     // Average ~4 characters per token for English
     // This is a rough estimate; actual tokenization varies
     (text.len() + 3) / 4
+}
+
+/// Configuration for semantic chunking
+pub struct SemanticChunkConfig {
+    /// Target chunk size in characters
+    pub target_size: usize,
+    /// Maximum chunk size (hard limit)
+    pub max_size: usize,
+    /// Minimum chunk size (merge smaller segments)
+    pub min_size: usize,
+    /// Whether to preserve dialogue turns intact
+    pub preserve_dialogue_turns: bool,
+    /// Whether to split on paragraph boundaries
+    pub split_on_paragraphs: bool,
+}
+
+impl Default for SemanticChunkConfig {
+    fn default() -> Self {
+        Self {
+            target_size: 800,
+            max_size: 1200,
+            min_size: 100,
+            preserve_dialogue_turns: true,
+            split_on_paragraphs: true,
+        }
+    }
+}
+
+/// A semantic segment with metadata
+#[derive(Debug, Clone)]
+struct SemanticSegment {
+    text: String,
+    #[allow(dead_code)]
+    segment_type: SegmentType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SegmentType {
+    DialogueTurn,
+    Paragraph,
+    Section,
+    Text,
+}
+
+/// Semantic chunking: splits text on natural boundaries (dialogue turns, paragraphs, sections)
+/// and groups related content together.
+///
+/// This is better for conversational content, logs, and structured text than fixed-size chunking.
+pub fn semantic_chunk_text(text: &str, config: &SemanticChunkConfig) -> ChunkResult {
+    let text = text.trim();
+    let original_length = text.len();
+
+    // If text fits in a single chunk, no need to split
+    if original_length <= config.target_size {
+        return ChunkResult {
+            chunks: vec![text.to_string()],
+            original_length,
+            was_chunked: false,
+        };
+    }
+
+    // Step 1: Split into semantic segments
+    let segments = split_into_segments(text, config);
+
+    // Step 2: Group segments into chunks respecting size constraints
+    let chunks = group_segments_into_chunks(segments, config);
+
+    ChunkResult {
+        chunks,
+        original_length,
+        was_chunked: true,
+    }
+}
+
+/// Split text into semantic segments based on structure
+fn split_into_segments(text: &str, config: &SemanticChunkConfig) -> Vec<SemanticSegment> {
+    let mut segments = Vec::new();
+
+    // Check if this looks like dialogue (has speaker patterns)
+    let is_dialogue = config.preserve_dialogue_turns && DIALOGUE_TURN_PATTERN.is_match(text);
+
+    if is_dialogue {
+        // Split by dialogue turns
+        let turn_starts: Vec<usize> = DIALOGUE_TURN_PATTERN
+            .find_iter(text)
+            .map(|m| m.start())
+            .collect();
+
+        // Add any text before the first turn
+        if !turn_starts.is_empty() && turn_starts[0] > 0 {
+            let pre_text = text[..turn_starts[0]].trim();
+            if !pre_text.is_empty() {
+                segments.push(SemanticSegment {
+                    text: pre_text.to_string(),
+                    segment_type: SegmentType::Text,
+                });
+            }
+        }
+
+        for (i, &start) in turn_starts.iter().enumerate() {
+            let end = if i + 1 < turn_starts.len() {
+                turn_starts[i + 1]
+            } else {
+                text.len()
+            };
+
+            let turn_text = text[start..end].trim();
+            if !turn_text.is_empty() {
+                segments.push(SemanticSegment {
+                    text: turn_text.to_string(),
+                    segment_type: SegmentType::DialogueTurn,
+                });
+            }
+        }
+    } else if config.split_on_paragraphs {
+        // Split by paragraphs (double newlines) or section markers
+        let paragraph_pattern = Regex::new(r"\n\s*\n").unwrap();
+        let mut last_end = 0;
+
+        for mat in paragraph_pattern.find_iter(text) {
+            if mat.start() > last_end {
+                let para_text = text[last_end..mat.start()].trim();
+                if !para_text.is_empty() {
+                    let seg_type = if SECTION_PATTERN.is_match(para_text) {
+                        SegmentType::Section
+                    } else {
+                        SegmentType::Paragraph
+                    };
+                    segments.push(SemanticSegment {
+                        text: para_text.to_string(),
+                        segment_type: seg_type,
+                    });
+                }
+            }
+            last_end = mat.end();
+        }
+
+        // Add remaining text
+        if last_end < text.len() {
+            let remaining = text[last_end..].trim();
+            if !remaining.is_empty() {
+                segments.push(SemanticSegment {
+                    text: remaining.to_string(),
+                    segment_type: SegmentType::Paragraph,
+                });
+            }
+        }
+    } else {
+        // Fall back to sentence-based splitting
+        segments = split_by_sentences(text);
+    }
+
+    // If no segments found, treat entire text as one segment
+    if segments.is_empty() {
+        segments.push(SemanticSegment {
+            text: text.to_string(),
+            segment_type: SegmentType::Text,
+        });
+    }
+
+    segments
+}
+
+/// Split text by sentences for fallback
+fn split_by_sentences(text: &str) -> Vec<SemanticSegment> {
+    let sentence_pattern = Regex::new(r"[.!?]+\s+").unwrap();
+    let mut segments = Vec::new();
+    let mut last_end = 0;
+
+    for mat in sentence_pattern.find_iter(text) {
+        let sentence = text[last_end..mat.end()].trim();
+        if !sentence.is_empty() {
+            segments.push(SemanticSegment {
+                text: sentence.to_string(),
+                segment_type: SegmentType::Text,
+            });
+        }
+        last_end = mat.end();
+    }
+
+    // Add remaining text
+    if last_end < text.len() {
+        let remaining = text[last_end..].trim();
+        if !remaining.is_empty() {
+            segments.push(SemanticSegment {
+                text: remaining.to_string(),
+                segment_type: SegmentType::Text,
+            });
+        }
+    }
+
+    segments
+}
+
+/// Group segments into chunks respecting size constraints
+fn group_segments_into_chunks(
+    segments: Vec<SemanticSegment>,
+    config: &SemanticChunkConfig,
+) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+
+    for segment in segments {
+        let segment_len = segment.text.len();
+
+        // If segment alone exceeds max size, we need to split it
+        if segment_len > config.max_size {
+            // Flush current chunk first
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk.trim().to_string());
+                current_chunk = String::new();
+            }
+
+            // Split the large segment using fixed-size chunking
+            let fixed_config = ChunkConfig {
+                chunk_size: config.target_size,
+                overlap: config.min_size / 2,
+                min_chunk_size: config.min_size,
+            };
+            let sub_chunks = chunk_text(&segment.text, &fixed_config);
+            chunks.extend(sub_chunks.chunks);
+            continue;
+        }
+
+        // Check if adding this segment would exceed target
+        let new_len = current_chunk.len() + segment_len + 1; // +1 for newline
+
+        if new_len > config.target_size && !current_chunk.is_empty() {
+            // Flush current chunk
+            chunks.push(current_chunk.trim().to_string());
+            current_chunk = String::new();
+        }
+
+        // Add segment to current chunk
+        if !current_chunk.is_empty() {
+            current_chunk.push('\n');
+        }
+        current_chunk.push_str(&segment.text);
+    }
+
+    // Flush remaining chunk
+    if !current_chunk.is_empty() {
+        let trimmed = current_chunk.trim().to_string();
+        // Merge tiny trailing chunk with previous if too small
+        if trimmed.len() < config.min_size && !chunks.is_empty() {
+            let last = chunks.pop().unwrap();
+            chunks.push(format!("{}\n{}", last, trimmed));
+        } else {
+            chunks.push(trimmed);
+        }
+    }
+
+    chunks
+}
+
+/// Detect if text appears to be dialogue/conversation format
+pub fn is_dialogue_format(text: &str) -> bool {
+    DIALOGUE_TURN_PATTERN.is_match(text)
+}
+
+/// Auto-select the best chunking strategy based on content
+pub fn auto_chunk_text(text: &str) -> ChunkResult {
+    if is_dialogue_format(text) {
+        semantic_chunk_text(text, &SemanticChunkConfig::default())
+    } else {
+        chunk_text(text, &ChunkConfig::default())
+    }
 }
 
 #[cfg(test)]

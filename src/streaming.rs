@@ -41,10 +41,8 @@ use uuid::Uuid;
 
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
-use crate::memory::{
-    injection::{compute_relevance, InjectionConfig, RelevanceInput},
-    Experience, ExperienceType, MemorySystem, Query as MemoryQuery,
-};
+use crate::memory::{Experience, ExperienceType, MemorySystem, Query as MemoryQuery};
+use crate::similarity::cosine_similarity;
 
 /// Case-insensitive substring search without allocation.
 /// Returns true if `haystack` contains `needle` (ASCII case-insensitive).
@@ -1250,16 +1248,14 @@ impl StreamingMemoryExtractor {
         .ok()?;
 
         // Create injection config from extraction config
-        let injection_config = InjectionConfig {
-            min_relevance: config.injection_min_relevance,
-            max_per_message: config.injection_max_memories,
-            cooldown_seconds: config.injection_cooldown_secs,
-            ..InjectionConfig::default()
-        };
+        // Streaming injection config (simple values, no InjectionConfig struct needed)
+        let min_relevance = config.injection_min_relevance;
+        let max_per_message = config.injection_max_memories;
+        let cooldown_seconds = config.injection_cooldown_secs;
 
         // Query memories semantically
         let content_for_query = content.to_string();
-        let max_results = config.injection_max_memories * 2; // Fetch more for filtering
+        let max_results = max_per_message * 2; // Fetch more for filtering
         let context_emb = context_embedding.clone();
 
         let surfaced: Vec<SurfacedStreamMemory> = {
@@ -1274,6 +1270,7 @@ impl StreamingMemoryExtractor {
                 let graph_guard = graph.read();
                 let feedback_guard = feedback.read();
                 let now = Utc::now();
+                let _ = cooldown_seconds; // Used for session cooldown check
 
                 // Semantic query
                 let query = MemoryQuery {
@@ -1283,41 +1280,33 @@ impl StreamingMemoryExtractor {
                 };
                 let results = memory_guard.recall(&query).unwrap_or_default();
 
-                // Score with composite relevance
+                // Use scores from unified 5-layer pipeline (no double-scoring)
+                // Recall already applies: RRF fusion + hebbian (10%) + recency (10%)
+                const RECENCY_DECAY_RATE: f32 = 0.01; // For breakdown display only
+
                 let mut candidates: Vec<(_, f32, f32, f32, f32)> = results
                     .into_iter()
                     .filter_map(|m| {
                         let memory_embedding = m.experience.embeddings.as_ref()?.clone();
-                        // Default 0.3 prevents new memories from scoring too high
+
+                        // Use score from 5-layer pipeline directly
+                        let mut score = m.get_score().unwrap_or(0.0);
+
+                        // Optional: Apply feedback suppression for frequently-ignored memories
+                        if let Some(fm) = feedback_guard.get_momentum(&m.id) {
+                            let momentum = fm.ema_with_decay();
+                            if momentum < 0.0 {
+                                score *= 1.0 + (momentum * 0.2).max(-0.2);
+                            }
+                        }
+
+                        // Compute breakdown components for display
+                        let semantic = cosine_similarity(&memory_embedding, &context_emb);
+                        let hours_old = (now - m.created_at).num_hours().max(0) as f32;
+                        let recency = (-RECENCY_DECAY_RATE * hours_old).exp();
                         let hebbian_strength = graph_guard
                             .get_memory_hebbian_strength(&m.id)
-                            .unwrap_or(0.3);
-
-                        // Get feedback momentum EMA with time decay (0.0 if no feedback history)
-                        // Negative values indicate often-ignored memories → suppression
-                        // AUD-6: Apply time-based decay so stale momentum fades
-                        let feedback_momentum = feedback_guard
-                            .get_momentum(&m.id)
-                            .map(|fm| fm.ema_with_decay())
                             .unwrap_or(0.0);
-
-                        let input = RelevanceInput {
-                            memory_embedding: memory_embedding.clone(),
-                            created_at: m.created_at,
-                            hebbian_strength,
-                            feedback_momentum,
-                            ..Default::default()
-                        };
-
-                        // Compute individual components for breakdown
-                        let semantic = crate::memory::injection::cosine_similarity(
-                            &memory_embedding,
-                            &context_emb,
-                        );
-                        let hours_old = (now - m.created_at).num_hours().max(0) as f32;
-                        let recency = (-injection_config.recency_decay_rate * hours_old).exp();
-
-                        let score = compute_relevance(&input, &context_emb, now, &injection_config);
 
                         Some((m, score, semantic, recency, hebbian_strength))
                     })
@@ -1327,13 +1316,13 @@ impl StreamingMemoryExtractor {
                 candidates
                     .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                // Filter by threshold, cooldown, and limit - need runtime check for cooldown
+                // Filter by threshold, cooldown, and limit
                 let sessions_guard = futures::executor::block_on(async { sessions.read().await });
 
                 candidates
                     .into_iter()
                     .filter(|(m, score, _, _, _)| {
-                        if *score < injection_config.min_relevance {
+                        if *score < min_relevance {
                             return false;
                         }
                         // Check cooldown
@@ -1344,7 +1333,7 @@ impl StreamingMemoryExtractor {
                         }
                         true
                     })
-                    .take(injection_config.max_per_message)
+                    .take(max_per_message)
                     .map(
                         |(m, score, semantic, recency, strength)| SurfacedStreamMemory {
                             id: m.id.0.to_string(),

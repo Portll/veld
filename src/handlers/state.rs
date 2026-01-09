@@ -1030,6 +1030,11 @@ impl MultiUserMemoryManager {
         // Use pre-extracted entities from experience.entities if available
         // Only run NER if no entities were pre-extracted
         let extracted_entities = if !experience.entities.is_empty() {
+            tracing::debug!(
+                "Using {} pre-extracted entities: {:?}",
+                experience.entities.len(),
+                experience.entities
+            );
             experience
                 .entities
                 .iter()
@@ -1043,7 +1048,14 @@ impl MultiUserMemoryManager {
                 .collect()
         } else {
             match self.neural_ner.extract(&experience.content) {
-                Ok(entities) => entities,
+                Ok(entities) => {
+                    tracing::debug!(
+                        "NER extracted {} entities: {:?}",
+                        entities.len(),
+                        entities.iter().map(|e| e.text.as_str()).collect::<Vec<_>>()
+                    );
+                    entities
+                }
                 Err(e) => {
                     tracing::debug!("NER extraction failed: {}. Continuing without entities.", e);
                     Vec::new()
@@ -1067,7 +1079,9 @@ impl MultiUserMemoryManager {
                 if name.len() < 3 {
                     return false;
                 }
-                if !name.chars().any(|c| c.is_uppercase()) {
+                // Relaxed: Allow entities without uppercase if NER confidence is high
+                // This enables capturing "sarah", "lgbtq" etc. when NER is confident
+                if !name.chars().any(|c| c.is_uppercase()) && e.confidence < 0.7 {
                     return false;
                 }
                 if stop_words.contains(name.to_lowercase().as_str()) {
@@ -1079,6 +1093,12 @@ impl MultiUserMemoryManager {
                 true
             })
             .collect();
+
+        tracing::debug!(
+            "After filtering: {} entities: {:?}",
+            filtered_entities.len(),
+            filtered_entities.iter().map(|e| e.text.as_str()).collect::<Vec<_>>()
+        );
 
         let mut entity_uuids = Vec::new();
 
@@ -1199,6 +1219,13 @@ impl MultiUserMemoryManager {
         }
 
         // Create an episodic node for this experience
+        tracing::debug!(
+            "Creating episode for memory {} with {} entities: {:?}",
+            &memory_id.0.to_string()[..8],
+            entity_uuids.len(),
+            entity_uuids.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>()
+        );
+
         let episode = EpisodicNode {
             uuid: memory_id.0,
             name: format!("Memory {}", &memory_id.0.to_string()[..8]),
@@ -1210,8 +1237,13 @@ impl MultiUserMemoryManager {
             metadata: experience.metadata.clone(),
         };
 
-        if let Err(e) = graph_guard.add_episode(episode) {
-            tracing::debug!("Failed to add episode: {}", e);
+        match graph_guard.add_episode(episode) {
+            Ok(uuid) => {
+                tracing::debug!("Episode {} added with {} entity refs", &uuid.to_string()[..8], entity_uuids.len());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to add episode: {}", e);
+            }
         }
 
         // Create relationships between co-occurring entities

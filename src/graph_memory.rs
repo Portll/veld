@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use rocksdb::{Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cmp::Ordering as CmpOrdering;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1015,11 +1016,19 @@ impl GraphMemory {
     /// Add an episodic node
     pub fn add_episode(&self, episode: EpisodicNode) -> Result<Uuid> {
         let key = episode.uuid.as_bytes();
+        let entity_count = episode.entity_refs.len();
+        tracing::debug!(
+            "add_episode: {} with {} entity_refs",
+            &episode.uuid.to_string()[..8],
+            entity_count
+        );
+
         let value = bincode::serde::encode_to_vec(&episode, bincode::config::standard())?;
         self.episodes_db.put(key, value)?;
 
         // Increment episode counter
-        self.episode_count.fetch_add(1, Ordering::Relaxed);
+        let prev = self.episode_count.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("add_episode: count {} -> {}", prev, prev + 1);
 
         // Update inverted index: entity_uuid -> episode_uuid
         for entity_uuid in &episode.entity_refs {
@@ -1056,6 +1065,7 @@ impl GraphMemory {
     pub fn get_episodes_by_entity(&self, entity_uuid: &Uuid) -> Result<Vec<EpisodicNode>> {
         let mut episodes = Vec::new();
         let prefix = format!("{entity_uuid}:");
+        tracing::debug!("get_episodes_by_entity: prefix {}", &prefix[..12]);
 
         // Use inverted index: entity_uuid -> episode_uuids
         let iter = self.entity_episodes_db.prefix_iterator(prefix.as_bytes());
@@ -1076,6 +1086,7 @@ impl GraphMemory {
             }
         }
 
+        tracing::debug!("get_episodes_by_entity: found {} episodes", episodes.len());
         Ok(episodes)
     }
 
@@ -1192,6 +1203,558 @@ impl GraphMemory {
             entities: all_entities,
             relationships: all_edges,
         })
+    }
+
+    /// Weighted graph traversal with filtering (Dijkstra-style best-first)
+    ///
+    /// Unlike BFS traverse_from_entity, this uses edge weights to prioritize
+    /// stronger connections. Enables Cypher-like pattern matching:
+    /// - Filter by relationship types
+    /// - Filter by minimum edge strength
+    /// - Score paths by cumulative weight
+    ///
+    /// Returns entities sorted by path score (strongest connections first).
+    pub fn traverse_weighted(
+        &self,
+        start_uuid: &Uuid,
+        max_depth: usize,
+        relation_types: Option<&[RelationType]>,
+        min_strength: f32,
+    ) -> Result<GraphTraversal> {
+        // Priority queue entry: (negative score for max-heap, uuid, depth, path_score)
+        #[derive(Clone)]
+        struct PQEntry {
+            score: f32,
+            uuid: Uuid,
+            depth: usize,
+        }
+        impl PartialEq for PQEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.score == other.score
+            }
+        }
+        impl Eq for PQEntry {}
+        impl PartialOrd for PQEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for PQEntry {
+            fn cmp(&self, other: &Self) -> CmpOrdering {
+                // Reverse for max-heap (higher score = higher priority)
+                self.score.partial_cmp(&other.score).unwrap_or(CmpOrdering::Equal).reverse()
+            }
+        }
+
+        let mut visited: HashMap<Uuid, f32> = HashMap::new(); // uuid -> best path score
+        let mut heap: BinaryHeap<PQEntry> = BinaryHeap::new();
+        let mut all_entities: Vec<TraversedEntity> = Vec::new();
+        let mut all_edges: Vec<RelationshipEdge> = Vec::new();
+        let mut edges_to_strengthen: Vec<Uuid> = Vec::new();
+
+        // Start node
+        heap.push(PQEntry {
+            score: 1.0,
+            uuid: *start_uuid,
+            depth: 0,
+        });
+        visited.insert(*start_uuid, 1.0);
+
+        if let Some(entity) = self.get_entity(start_uuid)? {
+            all_entities.push(TraversedEntity {
+                entity,
+                hop_distance: 0,
+                decay_factor: 1.0,
+            });
+        }
+
+        while let Some(PQEntry { score, uuid, depth }) = heap.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            // Skip if we've found a better path to this node
+            if let Some(&best) = visited.get(&uuid) {
+                if score < best * 0.99 {
+                    continue;
+                }
+            }
+
+            let edges = self.get_entity_relationships(&uuid)?;
+
+            for edge in edges {
+                // Skip invalidated edges
+                if edge.invalidated_at.is_some() {
+                    continue;
+                }
+
+                // Filter by relationship type if specified
+                if let Some(types) = relation_types {
+                    if !types.contains(&edge.relation_type) {
+                        continue;
+                    }
+                }
+
+                // Filter by minimum strength
+                let effective = edge.effective_strength();
+                if effective < min_strength {
+                    continue;
+                }
+
+                // Track edge for Hebbian strengthening
+                edges_to_strengthen.push(edge.uuid);
+
+                let connected_uuid = if edge.from_entity == uuid {
+                    edge.to_entity
+                } else {
+                    edge.from_entity
+                };
+
+                // Path score = parent_score * edge_strength (multiplicative decay)
+                let new_score = score * effective;
+
+                // Only visit if this is a better path
+                let dominated = visited.get(&connected_uuid).map_or(false, |&best| new_score <= best);
+                if dominated {
+                    continue;
+                }
+
+                visited.insert(connected_uuid, new_score);
+
+                // Add edge to results
+                let mut edge_with_strength = edge.clone();
+                edge_with_strength.strength = effective;
+                all_edges.push(edge_with_strength);
+
+                // Add entity to results
+                if let Some(entity) = self.get_entity(&connected_uuid)? {
+                    all_entities.push(TraversedEntity {
+                        entity,
+                        hop_distance: depth + 1,
+                        decay_factor: new_score,
+                    });
+                }
+
+                heap.push(PQEntry {
+                    score: new_score,
+                    uuid: connected_uuid,
+                    depth: depth + 1,
+                });
+            }
+        }
+
+        // Sort entities by path score (decay_factor) descending
+        all_entities.sort_by(|a, b| {
+            b.decay_factor.partial_cmp(&a.decay_factor).unwrap_or(CmpOrdering::Equal)
+        });
+
+        // Hebbian strengthening
+        if !edges_to_strengthen.is_empty() {
+            if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
+                tracing::debug!("Failed to strengthen synapses: {}", e);
+            }
+        }
+
+        tracing::debug!(
+            "traverse_weighted: {} entities, {} edges (min_strength={:.2})",
+            all_entities.len(),
+            all_edges.len(),
+            min_strength
+        );
+
+        Ok(GraphTraversal {
+            entities: all_entities,
+            relationships: all_edges,
+        })
+    }
+
+    /// Bidirectional search between two entities (meet-in-middle)
+    ///
+    /// Complexity: O(b^(d/2)) instead of O(b^d) for unidirectional search.
+    /// Finds the shortest weighted path between start and goal.
+    /// Returns entities along the path with their path scores.
+    pub fn traverse_bidirectional(
+        &self,
+        start_uuid: &Uuid,
+        goal_uuid: &Uuid,
+        max_depth: usize,
+        min_strength: f32,
+    ) -> Result<GraphTraversal> {
+        // Track forward search from start
+        let mut forward_visited: HashMap<Uuid, (f32, usize)> = HashMap::new(); // uuid -> (score, depth)
+        let mut forward_parents: HashMap<Uuid, (Uuid, Uuid)> = HashMap::new(); // child -> (parent, edge_uuid)
+        let mut forward_frontier: Vec<(Uuid, f32, usize)> = vec![(*start_uuid, 1.0, 0)];
+        forward_visited.insert(*start_uuid, (1.0, 0));
+
+        // Track backward search from goal
+        let mut backward_visited: HashMap<Uuid, (f32, usize)> = HashMap::new();
+        let mut backward_parents: HashMap<Uuid, (Uuid, Uuid)> = HashMap::new();
+        let mut backward_frontier: Vec<(Uuid, f32, usize)> = vec![(*goal_uuid, 1.0, 0)];
+        backward_visited.insert(*goal_uuid, (1.0, 0));
+
+        let mut meeting_node: Option<Uuid> = None;
+        let mut best_path_score: f32 = 0.0;
+        let half_depth = max_depth / 2 + 1;
+
+        // Alternate forward and backward expansion
+        for _round in 0..half_depth {
+            // Expand forward frontier
+            let mut new_forward: Vec<(Uuid, f32, usize)> = Vec::new();
+            for (uuid, score, depth) in forward_frontier.drain(..) {
+                if depth >= half_depth {
+                    continue;
+                }
+
+                let edges = self.get_entity_relationships(&uuid)?;
+                for edge in edges {
+                    if edge.invalidated_at.is_some() {
+                        continue;
+                    }
+                    let effective = edge.effective_strength();
+                    if effective < min_strength {
+                        continue;
+                    }
+
+                    let connected = if edge.from_entity == uuid {
+                        edge.to_entity
+                    } else {
+                        edge.from_entity
+                    };
+                    let new_score = score * effective;
+
+                    // Check if we meet backward search
+                    if let Some(&(back_score, _)) = backward_visited.get(&connected) {
+                        let combined = new_score * back_score;
+                        if combined > best_path_score {
+                            best_path_score = combined;
+                            meeting_node = Some(connected);
+                        }
+                    }
+
+                    // Update forward frontier
+                    let dominated = forward_visited
+                        .get(&connected)
+                        .map_or(false, |&(best, _)| new_score <= best);
+                    if !dominated {
+                        forward_visited.insert(connected, (new_score, depth + 1));
+                        forward_parents.insert(connected, (uuid, edge.uuid));
+                        new_forward.push((connected, new_score, depth + 1));
+                    }
+                }
+            }
+            forward_frontier = new_forward;
+
+            // Expand backward frontier
+            let mut new_backward: Vec<(Uuid, f32, usize)> = Vec::new();
+            for (uuid, score, depth) in backward_frontier.drain(..) {
+                if depth >= half_depth {
+                    continue;
+                }
+
+                let edges = self.get_entity_relationships(&uuid)?;
+                for edge in edges {
+                    if edge.invalidated_at.is_some() {
+                        continue;
+                    }
+                    let effective = edge.effective_strength();
+                    if effective < min_strength {
+                        continue;
+                    }
+
+                    let connected = if edge.from_entity == uuid {
+                        edge.to_entity
+                    } else {
+                        edge.from_entity
+                    };
+                    let new_score = score * effective;
+
+                    // Check if we meet forward search
+                    if let Some(&(fwd_score, _)) = forward_visited.get(&connected) {
+                        let combined = fwd_score * new_score;
+                        if combined > best_path_score {
+                            best_path_score = combined;
+                            meeting_node = Some(connected);
+                        }
+                    }
+
+                    // Update backward frontier
+                    let dominated = backward_visited
+                        .get(&connected)
+                        .map_or(false, |&(best, _)| new_score <= best);
+                    if !dominated {
+                        backward_visited.insert(connected, (new_score, depth + 1));
+                        backward_parents.insert(connected, (uuid, edge.uuid));
+                        new_backward.push((connected, new_score, depth + 1));
+                    }
+                }
+            }
+            backward_frontier = new_backward;
+
+            // Early termination if we found a meeting point
+            if meeting_node.is_some() {
+                break;
+            }
+        }
+
+        // Reconstruct path from meeting node
+        let mut all_entities: Vec<TraversedEntity> = Vec::new();
+        let mut all_edges: Vec<RelationshipEdge> = Vec::new();
+        let mut edges_to_strengthen: Vec<Uuid> = Vec::new();
+
+        if let Some(meeting) = meeting_node {
+            // Forward path: start -> meeting
+            let mut path_forward: Vec<Uuid> = vec![meeting];
+            let mut current = meeting;
+            while let Some(&(parent, edge_uuid)) = forward_parents.get(&current) {
+                path_forward.push(parent);
+                edges_to_strengthen.push(edge_uuid);
+                if let Some(edge) = self.get_relationship(&edge_uuid)? {
+                    all_edges.push(edge);
+                }
+                current = parent;
+            }
+            path_forward.reverse();
+
+            // Backward path: meeting -> goal
+            let mut path_backward: Vec<Uuid> = Vec::new();
+            current = meeting;
+            while let Some(&(parent, edge_uuid)) = backward_parents.get(&current) {
+                path_backward.push(parent);
+                edges_to_strengthen.push(edge_uuid);
+                if let Some(edge) = self.get_relationship(&edge_uuid)? {
+                    all_edges.push(edge);
+                }
+                current = parent;
+            }
+
+            // Combine paths
+            let full_path: Vec<Uuid> = path_forward
+                .into_iter()
+                .chain(path_backward.into_iter())
+                .collect();
+
+            // Build entities with scores
+            for (i, uuid) in full_path.iter().enumerate() {
+                if let Some(entity) = self.get_entity(uuid)? {
+                    let score = forward_visited
+                        .get(uuid)
+                        .map(|&(s, _)| s)
+                        .or_else(|| backward_visited.get(uuid).map(|&(s, _)| s))
+                        .unwrap_or(0.5);
+                    all_entities.push(TraversedEntity {
+                        entity,
+                        hop_distance: i,
+                        decay_factor: score,
+                    });
+                }
+            }
+        } else {
+            // No path found - return empty traversal
+            tracing::debug!(
+                "traverse_bidirectional: no path between {:?} and {:?}",
+                start_uuid,
+                goal_uuid
+            );
+        }
+
+        // Hebbian strengthening for traversed edges
+        if !edges_to_strengthen.is_empty() {
+            if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
+                tracing::debug!("Failed to strengthen synapses: {}", e);
+            }
+        }
+
+        tracing::debug!(
+            "traverse_bidirectional: {} entities, {} edges, path_score={:.4}",
+            all_entities.len(),
+            all_edges.len(),
+            best_path_score
+        );
+
+        Ok(GraphTraversal {
+            entities: all_entities,
+            relationships: all_edges,
+        })
+    }
+
+    /// Subgraph pattern matching (Cypher-like MATCH patterns)
+    ///
+    /// Pattern format: Vec of (relation_type, direction) tuples
+    /// Direction: true = outgoing (a->b), false = incoming (a<-b)
+    ///
+    /// Example: MATCH (a)-[:WORKS_AT]->(b)-[:LOCATED_IN]->(c)
+    /// Pattern: vec![(WorksAt, true), (LocatedIn, true)]
+    ///
+    /// Returns all entities that match the pattern starting from start_uuid.
+    pub fn match_pattern(
+        &self,
+        start_uuid: &Uuid,
+        pattern: &[(RelationType, bool)], // (relation_type, is_outgoing)
+        min_strength: f32,
+    ) -> Result<Vec<Vec<TraversedEntity>>> {
+        let mut matches: Vec<Vec<TraversedEntity>> = Vec::new();
+
+        // Start entity
+        let start_entity = match self.get_entity(start_uuid)? {
+            Some(e) => e,
+            None => return Ok(matches),
+        };
+
+        // DFS backtracking search
+        let mut path: Vec<TraversedEntity> = vec![TraversedEntity {
+            entity: start_entity,
+            hop_distance: 0,
+            decay_factor: 1.0,
+        }];
+
+        self.match_pattern_recursive(
+            *start_uuid,
+            pattern,
+            0,
+            min_strength,
+            1.0,
+            &mut path,
+            &mut matches,
+        )?;
+
+        tracing::debug!(
+            "match_pattern: found {} matches for {}-step pattern",
+            matches.len(),
+            pattern.len()
+        );
+
+        Ok(matches)
+    }
+
+    fn match_pattern_recursive(
+        &self,
+        current_uuid: Uuid,
+        pattern: &[(RelationType, bool)],
+        pattern_idx: usize,
+        min_strength: f32,
+        path_score: f32,
+        path: &mut Vec<TraversedEntity>,
+        matches: &mut Vec<Vec<TraversedEntity>>,
+    ) -> Result<()> {
+        // Base case: completed the pattern
+        if pattern_idx >= pattern.len() {
+            matches.push(path.clone());
+            return Ok(());
+        }
+
+        let (required_type, is_outgoing) = &pattern[pattern_idx];
+        let edges = self.get_entity_relationships(&current_uuid)?;
+
+        for edge in edges {
+            if edge.invalidated_at.is_some() {
+                continue;
+            }
+
+            // Check relationship type
+            if edge.relation_type != *required_type {
+                continue;
+            }
+
+            // Check direction
+            let (next_uuid, direction_matches) = if *is_outgoing {
+                // Looking for current -> next
+                if edge.from_entity == current_uuid {
+                    (edge.to_entity, true)
+                } else {
+                    (edge.from_entity, false) // Wrong direction
+                }
+            } else {
+                // Looking for current <- next (incoming)
+                if edge.to_entity == current_uuid {
+                    (edge.from_entity, true)
+                } else {
+                    (edge.to_entity, false) // Wrong direction
+                }
+            };
+
+            if !direction_matches {
+                continue;
+            }
+
+            // Check strength
+            let effective = edge.effective_strength();
+            if effective < min_strength {
+                continue;
+            }
+
+            // Avoid cycles in pattern
+            if path.iter().any(|te| te.entity.uuid == next_uuid) {
+                continue;
+            }
+
+            // Add to path and recurse
+            if let Some(entity) = self.get_entity(&next_uuid)? {
+                let new_score = path_score * effective;
+                path.push(TraversedEntity {
+                    entity,
+                    hop_distance: pattern_idx + 1,
+                    decay_factor: new_score,
+                });
+
+                self.match_pattern_recursive(
+                    next_uuid,
+                    pattern,
+                    pattern_idx + 1,
+                    min_strength,
+                    new_score,
+                    path,
+                    matches,
+                )?;
+
+                path.pop();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find entities matching a pattern from any starting point
+    ///
+    /// Scans all entities and finds those that match the given pattern.
+    /// More expensive than match_pattern but doesn't require a known start.
+    ///
+    /// Pattern: Vec of (relation_type, is_outgoing) tuples
+    /// Returns: All complete pattern matches with their paths.
+    pub fn find_pattern_matches(
+        &self,
+        pattern: &[(RelationType, bool)],
+        min_strength: f32,
+        limit: usize,
+    ) -> Result<Vec<Vec<TraversedEntity>>> {
+        let mut all_matches: Vec<Vec<TraversedEntity>> = Vec::new();
+
+        // Iterate through all entities as potential starting points
+        let iter = self.entities_db.iterator(rocksdb::IteratorMode::Start);
+        for result in iter {
+            if all_matches.len() >= limit {
+                break;
+            }
+
+            let (_, value) = result?;
+            let (entity, _): (EntityNode, _) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+
+            let entity_matches = self.match_pattern(&entity.uuid, pattern, min_strength)?;
+            for m in entity_matches {
+                if all_matches.len() >= limit {
+                    break;
+                }
+                all_matches.push(m);
+            }
+        }
+
+        tracing::debug!(
+            "find_pattern_matches: {} total matches (limit={})",
+            all_matches.len(),
+            limit
+        );
+
+        Ok(all_matches)
     }
 
     /// Invalidate a relationship (temporal edge invalidation)

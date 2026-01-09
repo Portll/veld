@@ -1350,9 +1350,9 @@ impl RelevanceEngine {
                 }
 
                 if let Ok(Some(entity_node)) = graph.find_entity_by_name(&entity.name) {
-                    // GRAPH TRAVERSAL: Traverse to connected entities (2 hops)
-                    // This finds memories connected via entity relationships
-                    if let Ok(traversal) = graph.traverse_from_entity(&entity_node.uuid, 2) {
+                    // GRAPH TRAVERSAL: Traverse to connected entities (5 hops for deep multi-hop reasoning)
+                    // Decay factor (0.86^hop) naturally down-weights distant connections
+                    if let Ok(traversal) = graph.traverse_from_entity(&entity_node.uuid, 5) {
                         for traversed in &traversal.entities {
                             // Get episodes (memories) connected to this entity
                             if let Ok(episodes) =

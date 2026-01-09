@@ -55,10 +55,13 @@ export async function listTodos(includeCompleted = false): Promise<ShodhTodo[]> 
 }
 
 export async function listProjects(): Promise<ShodhProject[]> {
-  const data = await apiCall<{ projects: ShodhProject[] }>("/api/projects/list", "POST", {
+  const data = await apiCall<{ projects: [ShodhProject, unknown][] | ShodhProject[] }>("/api/projects/list", "POST", {
     user_id: config.shodh.userId,
   });
-  return data.projects || [];
+
+  // Handle both tuple format [project, stats] and flat format
+  const projects = data.projects || [];
+  return projects.map((p: any) => Array.isArray(p) ? p[0] : p);
 }
 
 export async function createProject(name: string, prefix?: string): Promise<ShodhProject> {

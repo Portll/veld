@@ -1037,10 +1037,12 @@ impl MemorySystem {
         // ===========================================================================
         // LAYER 2: GRAPH EXPANSION (Knowledge Graph Traversal)
         // ===========================================================================
-        let (graph_results, graph_density): (Vec<(MemoryId, f32, f32)>, Option<f32>) = {
+        let (graph_results, graph_density, query_entity_count): (Vec<(MemoryId, f32, f32)>, Option<f32>, usize) = {
             if let Some(graph) = &self.graph_memory {
                 let g = graph.read();
                 let a = query_parser::analyze_query(query_text);
+                // Count entities in query for adaptive boost (multi-hop detection)
+                let entity_count = a.focal_entities.len() + a.discriminative_modifiers.len();
                 let d = g.get_stats().ok().and_then(|s| {
                     if s.entity_count > 0 {
                         Some(s.relationship_count as f32 / s.entity_count as f32)
@@ -1048,7 +1050,9 @@ impl MemorySystem {
                         None
                     }
                 });
-                let mut ids = Vec::new();
+
+                // First, collect all query entity UUIDs
+                let mut query_entities: Vec<uuid::Uuid> = Vec::new();
                 for e in a
                     .focal_entities
                     .iter()
@@ -1056,20 +1060,40 @@ impl MemorySystem {
                     .chain(a.discriminative_modifiers.iter().map(|m| m.text.as_str()))
                 {
                     if let Ok(Some(ent)) = g.find_entity_by_name(e) {
-                        if let Ok(t) = g.traverse_from_entity(&ent.uuid, 2) {
-                            for tr in &t.entities {
-                                if let Ok(eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                    for ep in eps {
-                                        let mid = MemoryId(ep.uuid);
-                                        if episode_candidates
-                                            .as_ref()
-                                            .map_or(true, |c| c.contains(&mid))
-                                        {
-                                            ids.push((
-                                                mid,
-                                                tr.entity.salience * tr.decay_factor,
-                                                tr.decay_factor,
-                                            ));
+                        query_entities.push(ent.uuid);
+                    }
+                }
+
+                let mut ids = Vec::new();
+
+                // Multi-hop: Use bidirectional search between entity pairs
+                if query_entities.len() >= 2 {
+                    // Find paths between all pairs of query entities
+                    for i in 0..query_entities.len() {
+                        for j in (i + 1)..query_entities.len() {
+                            if let Ok(path) = g.traverse_bidirectional(
+                                &query_entities[i],
+                                &query_entities[j],
+                                6, // max_depth for bidirectional
+                                0.05, // lower min_strength for multi-hop
+                            ) {
+                                // Path entities are highly relevant for multi-hop
+                                for tr in &path.entities {
+                                    if let Ok(eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
+                                        for ep in eps {
+                                            let mid = MemoryId(ep.uuid);
+                                            if episode_candidates
+                                                .as_ref()
+                                                .map_or(true, |c| c.contains(&mid))
+                                            {
+                                                // Boost path entities (connecting entities)
+                                                let path_boost = 1.5;
+                                                ids.push((
+                                                    mid,
+                                                    tr.entity.salience * tr.decay_factor * path_boost,
+                                                    tr.decay_factor,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -1077,6 +1101,30 @@ impl MemorySystem {
                         }
                     }
                 }
+
+                // Single-hop or supplement multi-hop: Weighted traversal from each entity
+                for entity_uuid in &query_entities {
+                    if let Ok(t) = g.traverse_weighted(entity_uuid, 5, None, 0.1) {
+                        for tr in &t.entities {
+                            if let Ok(eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
+                                for ep in eps {
+                                    let mid = MemoryId(ep.uuid);
+                                    if episode_candidates
+                                        .as_ref()
+                                        .map_or(true, |c| c.contains(&mid))
+                                    {
+                                        ids.push((
+                                            mid,
+                                            tr.entity.salience * tr.decay_factor,
+                                            tr.decay_factor,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut seen: std::collections::HashMap<MemoryId, (f32, f32)> =
                     std::collections::HashMap::new();
                 for (id, act, heb) in ids {
@@ -1087,13 +1135,16 @@ impl MemorySystem {
                         })
                         .or_insert((act, heb));
                 }
-                let r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
+                let mut r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
+                // CRITICAL: Sort by activation score so RRF rank is meaningful
+                r.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 if !r.is_empty() {
-                    tracing::debug!("Layer 2: {} graph results", r.len());
+                    tracing::debug!("Layer 2: {} graph results, {} query entities, bidirectional={}, top_activation={:.3}",
+                        r.len(), entity_count, query_entities.len() >= 2, r.first().map(|x| x.1).unwrap_or(0.0));
                 }
-                (r, d)
+                (r, d, entity_count)
             } else {
-                (Vec::new(), None)
+                (Vec::new(), None, 0)
             }
         };
 
@@ -1174,16 +1225,37 @@ impl MemorySystem {
                 })
                 .unwrap_or(vector_results);
 
-            const K: f32 = 60.0;
+            // RRF K=30 (lower = sharper rank differentiation, higher emphasis on top results)
+            const K: f32 = 30.0;
             let mut fused: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
             let mut heb: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
-            let boost = graph_density.map(|d| 1.1 + d.min(2.0) * 0.7).unwrap_or(1.5);
-            for (r, (id, _, h)) in graph_results.iter().enumerate() {
-                *fused.entry(id.clone()).or_insert(0.0) += boost / (K + r as f32);
+
+            // ADAPTIVE BOOST based on query complexity (multi-hop detection)
+            // More entities = more complex query = need more graph traversal
+            // Scale: 0-1 → single-hop, 2 → simple multi-hop, 3+ → complex multi-hop
+            let entity_multiplier = match query_entity_count {
+                0 | 1 => 1.2,   // Single-hop: slight graph boost (entities still matter)
+                2 => 2.0,       // Simple multi-hop: strong graph boost
+                3 => 2.5,       // Complex multi-hop: very strong graph boost
+                4 => 3.0,       // Very complex: maximum graph boost
+                _ => 3.5,       // 5+: dominant graph for chain reasoning
+            };
+            // Combine entity multiplier with density scaling (0.8 to 1.2x)
+            let density_scale = graph_density.map(|d| 0.8 + d.min(2.0) * 0.2).unwrap_or(1.0);
+            let base_boost = entity_multiplier * density_scale;
+            tracing::debug!("Layer 4: query_entities={}, entity_mult={:.1}, density_scale={:.2}, boost={:.2}",
+                query_entity_count, entity_multiplier, density_scale, base_boost);
+
+            // Graph results: use activation score to weight contribution
+            for (r, (id, activation, h)) in graph_results.iter().enumerate() {
+                // RRF score weighted by activation (salience * decay)
+                let graph_score = base_boost * activation / (K + r as f32);
+                *fused.entry(id.clone()).or_insert(0.0) += graph_score;
                 heb.insert(id.clone(), *h);
             }
+            // Hybrid (BM25+vector) results
             for (r, (id, _)) in hybrid_ids.iter().enumerate() {
                 *fused.entry(id.clone()).or_insert(0.0) += 1.0 / (K + r as f32);
             }
@@ -1202,7 +1274,7 @@ impl MemorySystem {
         let mut storage_fetches = 0;
         let mut filtered_out = 0;
 
-        // Layer 5: Unified scoring with hebbian + recency
+        // Layer 5: Unified scoring with hebbian + recency + emotional signals
         // Recency decay: recent memories get boost, old memories decay
         // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
         const RECENCY_DECAY_RATE: f32 = 0.01;
@@ -1213,12 +1285,31 @@ impl MemorySystem {
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
             let base_score = score + hebbian_boost * 0.1;
 
-            // Helper to apply recency decay and set final score
+            // Helper to apply unified scoring (recency + arousal + credibility)
             let with_unified_score = |mem: &SharedMemory, base: f32| -> SharedMemory {
                 // Recency decay: exponential decay based on age (10% contribution)
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
                 let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * 0.1;
-                let final_score = base + recency_boost;
+
+                // Emotional arousal boost: high arousal = more salient (5% contribution)
+                // Research: LaBar & Cabeza (2006) - emotionally arousing events better remembered
+                let arousal_boost = mem
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| c.emotional.arousal * 0.05)
+                    .unwrap_or(0.0);
+
+                // Source credibility boost: credible sources weighted higher (5% contribution)
+                // Research: Source monitoring affects memory reliability
+                let credibility_boost = mem
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
+                    .unwrap_or(0.0);
+
+                let final_score = base + recency_boost + arousal_boost + credibility_boost;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);
@@ -1260,10 +1351,28 @@ impl MemorySystem {
                 Ok(memory) => {
                     // CRITICAL FIX: Apply filters before adding to results
                     if self.retriever.matches_filters(&memory, &vector_query) {
-                        // Apply unified scoring (hebbian + recency) for long-term memories
+                        // Apply unified scoring (hebbian + recency + arousal + credibility)
                         let hours_old = (now - memory.created_at).num_hours().max(0) as f32;
                         let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * 0.1;
-                        let final_score = base_score + recency_boost;
+
+                        // Emotional arousal boost (5% contribution)
+                        let arousal_boost = memory
+                            .experience
+                            .context
+                            .as_ref()
+                            .map(|c| c.emotional.arousal * 0.05)
+                            .unwrap_or(0.0);
+
+                        // Source credibility boost (5% contribution)
+                        let credibility_boost = memory
+                            .experience
+                            .context
+                            .as_ref()
+                            .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
+                            .unwrap_or(0.0);
+
+                        let final_score =
+                            base_score + recency_boost + arousal_boost + credibility_boost;
 
                         let mut scored_memory = memory;
                         scored_memory.set_score(final_score);
