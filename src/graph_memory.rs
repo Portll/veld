@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use rocksdb::{Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1192,7 +1192,8 @@ impl GraphMemory {
 
             for (entity_uuid, _hop) in &current_level {
                 // Use limited edge reading
-                let edges = self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_NODE))?;
+                let edges =
+                    self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_NODE))?;
 
                 for edge in edges {
                     if visited_edges.contains(&edge.uuid) {
@@ -1287,9 +1288,9 @@ impl GraphMemory {
         min_strength: f32,
     ) -> Result<GraphTraversal> {
         // Performance limits - prevents exponential blowup on dense graphs
-        const MAX_ENTITIES: usize = 200;       // Stop after finding this many entities
+        const MAX_ENTITIES: usize = 200; // Stop after finding this many entities
         const MAX_EDGES_PER_NODE: usize = 100; // Limit edges loaded per node
-        const MAX_ITERATIONS: usize = 500;     // Prevent infinite loops
+        const MAX_ITERATIONS: usize = 500; // Prevent infinite loops
 
         // Priority queue entry: (negative score for max-heap, uuid, depth, path_score)
         #[derive(Clone)]
@@ -1312,7 +1313,10 @@ impl GraphMemory {
         impl Ord for PQEntry {
             fn cmp(&self, other: &Self) -> CmpOrdering {
                 // Reverse for max-heap (higher score = higher priority)
-                self.score.partial_cmp(&other.score).unwrap_or(CmpOrdering::Equal).reverse()
+                self.score
+                    .partial_cmp(&other.score)
+                    .unwrap_or(CmpOrdering::Equal)
+                    .reverse()
             }
         }
 
@@ -1392,7 +1396,9 @@ impl GraphMemory {
                 let new_score = score * effective;
 
                 // Only visit if this is a better path
-                let dominated = visited.get(&connected_uuid).map_or(false, |&best| new_score <= best);
+                let dominated = visited
+                    .get(&connected_uuid)
+                    .map_or(false, |&best| new_score <= best);
                 if dominated {
                     continue;
                 }
@@ -1423,7 +1429,9 @@ impl GraphMemory {
 
         // Sort entities by path score (decay_factor) descending
         all_entities.sort_by(|a, b| {
-            b.decay_factor.partial_cmp(&a.decay_factor).unwrap_or(CmpOrdering::Equal)
+            b.decay_factor
+                .partial_cmp(&a.decay_factor)
+                .unwrap_or(CmpOrdering::Equal)
         });
 
         // Hebbian strengthening
@@ -1487,7 +1495,8 @@ impl GraphMemory {
                     continue;
                 }
 
-                let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
+                let edges =
+                    self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
                 for edge in edges {
                     if edge.invalidated_at.is_some() {
                         continue;
@@ -1533,7 +1542,8 @@ impl GraphMemory {
                     continue;
                 }
 
-                let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
+                let edges =
+                    self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
                 for edge in edges {
                     if edge.invalidated_at.is_some() {
                         continue;
@@ -1726,7 +1736,8 @@ impl GraphMemory {
 
         const MAX_EDGES_PER_NODE: usize = 100;
         let (required_type, is_outgoing) = &pattern[pattern_idx];
-        let edges = self.get_entity_relationships_limited(&current_uuid, Some(MAX_EDGES_PER_NODE))?;
+        let edges =
+            self.get_entity_relationships_limited(&current_uuid, Some(MAX_EDGES_PER_NODE))?;
 
         for edge in edges {
             if edge.invalidated_at.is_some() {
@@ -2205,7 +2216,9 @@ impl GraphMemory {
 
         const MAX_EDGES_PER_ENTITY: usize = 50; // Limit per entity for Hebbian lookup
         for entity_uuid in &episode.entity_refs {
-            if let Ok(edges) = self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_ENTITY)) {
+            if let Ok(edges) =
+                self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_ENTITY))
+            {
                 for edge in edges {
                     // Skip if already processed (edges are bidirectional in lookup)
                     if seen_edges.contains(&edge.uuid) {

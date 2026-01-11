@@ -837,6 +837,7 @@ impl NeuralNer {
                     | EntityLabel::Date
                     | EntityLabel::Product
                     | EntityLabel::Skill
+                    | EntityLabel::Keyword
                     | EntityLabel::Other(_) => NerEntityType::Misc,
                 };
 

@@ -634,7 +634,13 @@ impl HybridSearchEngine {
     where
         F: Fn(&MemoryId) -> Option<String>,
     {
-        self.search_with_ic_weights_and_phrases(query, vector_results, get_content, term_weights, None)
+        self.search_with_ic_weights_and_phrases(
+            query,
+            vector_results,
+            get_content,
+            term_weights,
+            None,
+        )
     }
 
     /// Perform hybrid search with IC-weighted BM25 term boosting AND phrase matching
@@ -743,10 +749,7 @@ impl HybridSearchEngine {
         }
 
         // 2. RRF Fusion with dynamic weights
-        let rrf = RRFusion::new(
-            self.config.rrf_k,
-            vec![bm25_weight, vector_weight],
-        );
+        let rrf = RRFusion::new(self.config.rrf_k, vec![bm25_weight, vector_weight]);
 
         let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone()]);
 

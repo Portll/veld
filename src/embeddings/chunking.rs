@@ -33,14 +33,12 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Pattern to detect dialogue turns (e.g., "Alice:", "User:", "Speaker 1:")
-static DIALOGUE_TURN_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^([A-Z][a-zA-Z0-9_\- ]{0,30})\s*:").unwrap()
-});
+static DIALOGUE_TURN_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^([A-Z][a-zA-Z0-9_\- ]{0,30})\s*:").unwrap());
 
 /// Pattern to detect section headers or timestamps
-static SECTION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^(?:\[.*?\]|#{1,3}\s+\w|Session \d+|---+)").unwrap()
-});
+static SECTION_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^(?:\[.*?\]|#{1,3}\s+\w|Session \d+|---+)").unwrap());
 
 /// Chunk configuration for fixed-size chunking
 pub struct ChunkConfig {

@@ -248,6 +248,12 @@ class EvalResult:
     latency_store_ms: float
     latency_recall_ms: float
     num_memories_stored: int
+    # Debug fields for failure analysis
+    question_text: str = ""
+    retrieved_context: str = ""
+    correct_answer: str = ""
+    predicted_answer: str = ""
+    all_choices: list = None
 
 
 def store_conversations(
@@ -430,7 +436,12 @@ def evaluate_single_item(
         correct_idx=correct_idx,
         latency_store_ms=store_latency,
         latency_recall_ms=recall_latency,
-        num_memories_stored=num_stored
+        num_memories_stored=num_stored,
+        question_text=item["question"],
+        retrieved_context=context,
+        correct_answer=item["choices"][correct_idx],
+        predicted_answer=item["choices"][predicted_idx],
+        all_choices=item["choices"]
     )
 
 
@@ -554,11 +565,31 @@ def run_evaluation(
                 "predicted_idx": r.predicted_idx,
                 "correct_idx": r.correct_idx,
                 "latency_store_ms": r.latency_store_ms,
-                "latency_recall_ms": r.latency_recall_ms
+                "latency_recall_ms": r.latency_recall_ms,
+                "question_text": r.question_text,
+                "retrieved_context": r.retrieved_context,
+                "correct_answer": r.correct_answer,
+                "predicted_answer": r.predicted_answer,
+                "all_choices": r.all_choices
             }
             for r in results
         ]
     }
+
+    # Print detailed failure analysis
+    failures = [r for r in results if not r.correct]
+    if failures:
+        print(f"\n{'='*60}")
+        print(f"FAILURE ANALYSIS ({len(failures)} failures)")
+        print('='*60)
+        for i, f in enumerate(failures[:10]):  # Show first 10 failures
+            print(f"\n--- Failure {i+1}: {f.question_id} ({f.question_type}) ---")
+            print(f"QUESTION: {f.question_text}")
+            print(f"\nRETRIEVED CONTEXT:")
+            print(f"{f.retrieved_context[:1500]}..." if len(f.retrieved_context) > 1500 else f.retrieved_context)
+            print(f"\nCORRECT ANSWER [{f.correct_idx}]: {f.correct_answer}")
+            print(f"PREDICTED [{f.predicted_idx}]: {f.predicted_answer}")
+            print("-" * 40)
 
     with open(output_file, "w") as f:
         json.dump(output_data, f, indent=2)

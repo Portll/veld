@@ -1,0 +1,46 @@
+--- a/src/memory/storage.rs
++++ b/src/memory/storage.rs
+@@ -55,6 +55,65 @@ impl Default for WriteMode {
+     }
+ }
+ 
++// BACKWARD-COMPATIBLE DESERIALIZATION
++// Handles both versioned format (SHO magic) and legacy bincode
++
++const STORAGE_MAGIC: &[u8; 3] = b"SHO";
++
++fn deserialize_memory(data: &[u8]) -> Result<Memory> {
++    if data.len() >= 8 && &data[0..3] == STORAGE_MAGIC {
++        let version = data[3];
++        let payload_end = data.len() - 4;
++        let stored_checksum = u32::from_le_bytes([
++            data[payload_end], data[payload_end + 1],
++            data[payload_end + 2], data[payload_end + 3],
++        ]);
++        let computed_checksum = crc32_simple(&data[..payload_end]);
++        if stored_checksum != computed_checksum {
++            tracing::warn!("Checksum mismatch: {:08x} vs {:08x}", stored_checksum, computed_checksum);
++        }
++        let payload = &data[4..payload_end];
++        bincode::serde::decode_from_slice::<Memory, _>(payload, bincode::config::standard())
++            .map(|(m, _)| m)
++            .map_err(|e| anyhow!("v{} decode failed: {}", version, e))
++    } else {
++        bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard())
++            .map(|(m, _)| m)
++            .map_err(|e| anyhow!("legacy decode failed: {}", e))
++    }
++}
++
++fn crc32_simple(data: &[u8]) -> u32 {
++    let mut crc: u32 = 0xFFFFFFFF;
++    for byte in data {
++        crc ^= *byte as u32;
++        for _ in 0..8 {
++            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB88320 } else { crc >> 1 };
++        }
++    }
++    !crc
++}
++
+ /// Storage engine for long-term memory persistence

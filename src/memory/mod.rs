@@ -584,7 +584,8 @@ impl MemorySystem {
             // This creates edges between entities that appear in the same sentence
             // Critical for multi-hop retrieval: "Melanie" <-> "sunrise" <-> "painted"
             let entity_extractor = crate::graph_memory::EntityExtractor::new();
-            let cooccurrence_pairs = entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
+            let cooccurrence_pairs =
+                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
 
             for (entity1, entity2) in cooccurrence_pairs {
                 // Find or create both entities
@@ -611,7 +612,12 @@ impl MemorySystem {
 
                     // add_relationship handles deduplication via Hebbian strengthening
                     if let Err(e) = graph_guard.add_relationship(edge) {
-                        tracing::trace!("Failed to add co-occurrence edge {}<->{}: {}", entity1, entity2, e);
+                        tracing::trace!(
+                            "Failed to add co-occurrence edge {}<->{}: {}",
+                            entity1,
+                            entity2,
+                            e
+                        );
                     }
                 }
             }
@@ -833,7 +839,8 @@ impl MemorySystem {
 
             // Add co-occurrence edges for multi-hop retrieval
             let entity_extractor = crate::graph_memory::EntityExtractor::new();
-            let cooccurrence_pairs = entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
+            let cooccurrence_pairs =
+                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
 
             for (entity1, entity2) in cooccurrence_pairs {
                 if let (Ok(Some(e1)), Ok(Some(e2))) = (
@@ -857,7 +864,12 @@ impl MemorySystem {
                     };
 
                     if let Err(e) = graph_guard.add_relationship(edge) {
-                        tracing::trace!("Failed to add co-occurrence edge {}<->{}: {}", entity1, entity2, e);
+                        tracing::trace!(
+                            "Failed to add co-occurrence edge {}<->{}: {}",
+                            entity1,
+                            entity2,
+                            e
+                        );
                     }
                 }
             }
@@ -1087,7 +1099,11 @@ impl MemorySystem {
             tracing::debug!(
                 "Temporal query detected: intent={:?}, refs={:?}",
                 temporal_intent,
-                query_temporal.refs.iter().map(|r| r.date.to_string()).collect::<Vec<_>>()
+                query_temporal
+                    .refs
+                    .iter()
+                    .map(|r| r.date.to_string())
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -1145,7 +1161,14 @@ impl MemorySystem {
         // ===========================================================================
         // LAYER 2: GRAPH EXPANSION (Knowledge Graph Traversal)
         // ===========================================================================
-        let (graph_results, graph_density, query_entity_count, ic_weights, phrase_boosts, keyword_disc): (
+        let (
+            graph_results,
+            graph_density,
+            query_entity_count,
+            ic_weights,
+            phrase_boosts,
+            keyword_disc,
+        ): (
             Vec<(MemoryId, f32, f32)>,
             Option<f32>,
             usize,
@@ -1166,7 +1189,8 @@ impl MemorySystem {
                 if disc > 0.5 && !disc_keywords.is_empty() {
                     tracing::debug!(
                         "Layer 2: YAKE discriminative keywords: {:?} (disc={:.2})",
-                        disc_keywords, disc
+                        disc_keywords,
+                        disc
                     );
                 }
                 // Count entities in query for adaptive boost (multi-hop detection)
@@ -1205,7 +1229,7 @@ impl MemorySystem {
                             if let Ok(path) = g.traverse_bidirectional(
                                 &query_entities[i],
                                 &query_entities[j],
-                                6, // max_depth for bidirectional
+                                6,    // max_depth for bidirectional
                                 0.05, // lower min_strength for multi-hop
                             ) {
                                 // Path entities are highly relevant for multi-hop
@@ -1221,7 +1245,9 @@ impl MemorySystem {
                                                 let path_boost = 1.5;
                                                 ids.push((
                                                     mid,
-                                                    tr.entity.salience * tr.decay_factor * path_boost,
+                                                    tr.entity.salience
+                                                        * tr.decay_factor
+                                                        * path_boost,
                                                     tr.decay_factor,
                                                 ));
                                             }
@@ -1278,7 +1304,14 @@ impl MemorySystem {
                 // No graph memory - still analyze query for IC weights and phrase boosts
                 let a = query_parser::analyze_query(query_text);
                 let (disc, _) = a.keyword_discriminativeness();
-                (Vec::new(), None, 0, a.to_ic_weights(), a.to_phrase_boosts(), disc)
+                (
+                    Vec::new(),
+                    None,
+                    0,
+                    a.to_ic_weights(),
+                    a.to_phrase_boosts(),
+                    disc,
+                )
             }
         };
 
@@ -1395,11 +1428,11 @@ impl MemorySystem {
             // More entities = more complex query = need more graph traversal
             // Scale: 0-1 → single-hop, 2 → simple multi-hop, 3+ → complex multi-hop
             let entity_multiplier = match query_entity_count {
-                0 | 1 => 1.2,   // Single-hop: slight graph boost (entities still matter)
-                2 => 2.0,       // Simple multi-hop: strong graph boost
-                3 => 2.5,       // Complex multi-hop: very strong graph boost
-                4 => 3.0,       // Very complex: maximum graph boost
-                _ => 3.5,       // 5+: dominant graph for chain reasoning
+                0 | 1 => 1.2, // Single-hop: slight graph boost (entities still matter)
+                2 => 2.0,     // Simple multi-hop: strong graph boost
+                3 => 2.5,     // Complex multi-hop: very strong graph boost
+                4 => 3.0,     // Very complex: maximum graph boost
+                _ => 3.5,     // 5+: dominant graph for chain reasoning
             };
             // Use research-based density weighting (SHO-26)
             // High density graphs (>2 edges/memory) → stronger graph signal (0.5 weight)
@@ -1408,8 +1441,8 @@ impl MemorySystem {
             let (_semantic_w, graph_w, _linguistic_w) = graph_density
                 .map(calculate_density_weights)
                 .unwrap_or((0.6, 0.3, 0.1)); // Default: balanced weights if no density info
-            // Convert graph_weight (0.1-0.5) to a multiplier (1.0-2.0)
-            // This ensures graph results are boosted proportionally to graph density
+                                             // Convert graph_weight (0.1-0.5) to a multiplier (1.0-2.0)
+                                             // This ensures graph results are boosted proportionally to graph density
             let density_multiplier = 1.0 + graph_w * 2.0; // 0.1 → 1.2, 0.5 → 2.0
             let base_boost = entity_multiplier * density_multiplier;
             tracing::debug!(
@@ -1481,7 +1514,9 @@ impl MemorySystem {
                 // TEMPORAL BOOST (TEMPR approach - key for multi-hop retrieval)
                 // If query has temporal intent and memory has matching temporal references,
                 // significantly boost the memory's score (25% contribution when matched)
-                let temporal_boost = if has_temporal_query && !mem.experience.temporal_refs.is_empty() {
+                let temporal_boost = if has_temporal_query
+                    && !mem.experience.temporal_refs.is_empty()
+                {
                     // Check if any memory temporal ref matches query temporal refs
                     let mut best_match = 0.0_f32;
                     for mem_ref in &mem.experience.temporal_refs {
@@ -1489,7 +1524,9 @@ impl MemorySystem {
                             // Exact date match: strong boost
                             if mem_ref == &query_ref.date.to_string() {
                                 best_match = best_match.max(0.25);
-                            } else if let Ok(mem_date) = chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d") {
+                            } else if let Ok(mem_date) =
+                                chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
+                            {
                                 // Approximate match: within 7 days gets partial boost
                                 let days_diff = (mem_date - query_ref.date).num_days().abs();
                                 if days_diff <= 7 {
@@ -1508,7 +1545,8 @@ impl MemorySystem {
                     0.0
                 };
 
-                let final_score = base + recency_boost + arousal_boost + credibility_boost + temporal_boost;
+                let final_score =
+                    base + recency_boost + arousal_boost + credibility_boost + temporal_boost;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);
@@ -1571,31 +1609,40 @@ impl MemorySystem {
                             .unwrap_or(0.0);
 
                         // TEMPORAL BOOST (TEMPR approach - key for multi-hop retrieval)
-                        let temporal_boost = if has_temporal_query && !memory.experience.temporal_refs.is_empty() {
-                            let mut best_match = 0.0_f32;
-                            for mem_ref in &memory.experience.temporal_refs {
-                                for query_ref in &query_temporal.refs {
-                                    if mem_ref == &query_ref.date.to_string() {
-                                        best_match = best_match.max(0.25);
-                                    } else if let Ok(mem_date) = chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d") {
-                                        let days_diff = (mem_date - query_ref.date).num_days().abs();
-                                        if days_diff <= 7 {
-                                            let proximity_boost = 0.15 * (1.0 - days_diff as f32 / 7.0);
-                                            best_match = best_match.max(proximity_boost);
-                                        } else if days_diff <= 30 {
-                                            let proximity_boost = 0.05 * (1.0 - days_diff as f32 / 30.0);
-                                            best_match = best_match.max(proximity_boost);
+                        let temporal_boost =
+                            if has_temporal_query && !memory.experience.temporal_refs.is_empty() {
+                                let mut best_match = 0.0_f32;
+                                for mem_ref in &memory.experience.temporal_refs {
+                                    for query_ref in &query_temporal.refs {
+                                        if mem_ref == &query_ref.date.to_string() {
+                                            best_match = best_match.max(0.25);
+                                        } else if let Ok(mem_date) =
+                                            chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
+                                        {
+                                            let days_diff =
+                                                (mem_date - query_ref.date).num_days().abs();
+                                            if days_diff <= 7 {
+                                                let proximity_boost =
+                                                    0.15 * (1.0 - days_diff as f32 / 7.0);
+                                                best_match = best_match.max(proximity_boost);
+                                            } else if days_diff <= 30 {
+                                                let proximity_boost =
+                                                    0.05 * (1.0 - days_diff as f32 / 30.0);
+                                                best_match = best_match.max(proximity_boost);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            best_match
-                        } else {
-                            0.0
-                        };
+                                best_match
+                            } else {
+                                0.0
+                            };
 
-                        let final_score =
-                            base_score + recency_boost + arousal_boost + credibility_boost + temporal_boost;
+                        let final_score = base_score
+                            + recency_boost
+                            + arousal_boost
+                            + credibility_boost
+                            + temporal_boost;
 
                         let mut scored_memory = memory;
                         scored_memory.set_score(final_score);
@@ -3424,10 +3471,14 @@ impl MemorySystem {
             }
 
             // TEMPORAL EXTRACTION: Re-extract dates when content changes
-            let temporal = crate::memory::query_parser::extract_temporal_refs(&existing.experience.content);
+            let temporal =
+                crate::memory::query_parser::extract_temporal_refs(&existing.experience.content);
             existing.experience.temporal_refs.clear();
             for temp_ref in temporal.refs {
-                existing.experience.temporal_refs.push(temp_ref.date.to_string());
+                existing
+                    .experience
+                    .temporal_refs
+                    .push(temp_ref.date.to_string());
             }
 
             // Persist updated memory
@@ -3504,7 +3555,8 @@ impl MemorySystem {
 
             // TEMPORAL EXTRACTION: Extract dates from content for temporal filtering
             if experience.temporal_refs.is_empty() {
-                let temporal = crate::memory::query_parser::extract_temporal_refs(&experience.content);
+                let temporal =
+                    crate::memory::query_parser::extract_temporal_refs(&experience.content);
                 for temp_ref in temporal.refs {
                     experience.temporal_refs.push(temp_ref.date.to_string());
                 }
@@ -3568,7 +3620,8 @@ impl MemorySystem {
 
                 // Add co-occurrence edges for multi-hop retrieval
                 let entity_extractor = crate::graph_memory::EntityExtractor::new();
-                let cooccurrence_pairs = entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
+                let cooccurrence_pairs =
+                    entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
 
                 for (entity1, entity2) in cooccurrence_pairs {
                     if let (Ok(Some(e1)), Ok(Some(e2))) = (
@@ -3592,7 +3645,12 @@ impl MemorySystem {
                         };
 
                         if let Err(e) = graph_guard.add_relationship(edge) {
-                            tracing::trace!("Failed to add co-occurrence edge {}<->{}: {}", entity1, entity2, e);
+                            tracing::trace!(
+                                "Failed to add co-occurrence edge {}<->{}: {}",
+                                entity1,
+                                entity2,
+                                e
+                            );
                         }
                     }
                 }

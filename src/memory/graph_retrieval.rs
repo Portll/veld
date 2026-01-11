@@ -259,8 +259,10 @@ pub fn spreading_activation_retrieve_with_stats(
                 continue;
             }
 
-            // Get relationships from this entity
-            let edges = graph.get_entity_relationships(&entity_uuid)?;
+            // Get relationships from this entity (limited to prevent blowup)
+            const MAX_EDGES_PER_SPREAD: usize = 100;
+            let edges =
+                graph.get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
 
             for edge in edges {
                 // Spread activation to connected entity

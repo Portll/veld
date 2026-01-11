@@ -15,15 +15,15 @@ use crate::backup;
 use crate::config::ServerConfig;
 use crate::embeddings::{
     are_ner_models_downloaded, download_ner_models, get_ner_models_dir, ner::NerEntityType,
-    NerConfig, NeuralNer,
+    KeywordExtractor, NerConfig, NeuralNer,
 };
 use crate::graph_memory::{
     EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats, RelationType,
     RelationshipEdge,
 };
 use crate::memory::{
-    facts::SemanticFactStore, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId,
-    MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
+    facts::SemanticFactStore, query_parser, Experience, FeedbackStore, FileMemoryStore,
+    MemoryConfig, MemoryId, MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::streaming;
 
@@ -136,6 +136,9 @@ pub struct MultiUserMemoryManager {
 
     /// Neural NER for automatic entity extraction
     pub neural_ner: Arc<NeuralNer>,
+
+    /// Statistical keyword extraction for graph population
+    pub keyword_extractor: Arc<KeywordExtractor>,
 
     /// User eviction counter for metrics
     pub user_evictions: Arc<std::sync::atomic::AtomicUsize>,
@@ -302,6 +305,9 @@ impl MultiUserMemoryManager {
         ));
         info!("Streaming memory extractor initialized");
 
+        let keyword_extractor = Arc::new(KeywordExtractor::new());
+        info!("Keyword extractor initialized (YAKE)");
+
         let backup_path = base_path.join("backups");
         let backup_engine = Arc::new(backup::ShodhBackupEngine::new(backup_path)?);
         if server_config.backup_enabled {
@@ -331,6 +337,7 @@ impl MultiUserMemoryManager {
             audit_log_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             graph_memories,
             neural_ner,
+            keyword_extractor,
             user_evictions,
             server_config,
             event_broadcaster,
@@ -770,6 +777,11 @@ impl MultiUserMemoryManager {
         self.neural_ner.clone()
     }
 
+    /// Get keyword extractor for statistical term extraction
+    pub fn get_keyword_extractor(&self) -> Arc<KeywordExtractor> {
+        self.keyword_extractor.clone()
+    }
+
     /// Get or create graph memory for a user
     pub fn get_user_graph(&self, user_id: &str) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
         if let Some(graph) = self.graph_memories.get(user_id) {
@@ -1097,7 +1109,10 @@ impl MultiUserMemoryManager {
         tracing::debug!(
             "After filtering: {} entities: {:?}",
             filtered_entities.len(),
-            filtered_entities.iter().map(|e| e.text.as_str()).collect::<Vec<_>>()
+            filtered_entities
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>()
         );
 
         let mut entity_uuids = Vec::new();
@@ -1218,12 +1233,69 @@ impl MultiUserMemoryManager {
             }
         }
 
+        // Extract verbs from content for multi-hop reasoning
+        // Verbs like "painted", "bought", "visited" connect entities across memories
+        let analysis = query_parser::analyze_query(&experience.content);
+        for verb in &analysis.relational_context {
+            let verb_text = verb.text.as_str();
+            let verb_stem = verb.stem.as_str();
+
+            // Skip if already added (as noun or other entity)
+            if entity_uuids
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(verb_text))
+            {
+                continue;
+            }
+            if stop_words.contains(verb_text.to_lowercase().as_str()) {
+                continue;
+            }
+            if verb_text.len() < 3 {
+                continue;
+            }
+
+            // Add verb as entity (both text form and stem for matching)
+            for name in [verb_text, verb_stem] {
+                if name.len() < 3 {
+                    continue;
+                }
+                if entity_uuids
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+
+                let entity = EntityNode {
+                    uuid: uuid::Uuid::new_v4(),
+                    name: name.to_string(),
+                    labels: vec![EntityLabel::Other("Verb".to_string())],
+                    created_at: chrono::Utc::now(),
+                    last_seen_at: chrono::Utc::now(),
+                    mention_count: 1,
+                    summary: String::new(),
+                    attributes: HashMap::new(),
+                    name_embedding: None,
+                    salience: 0.4, // Lower salience for verbs
+                    is_proper_noun: false,
+                };
+
+                match graph_guard.add_entity(entity) {
+                    Ok(uuid) => entity_uuids.push((name.to_string(), uuid)),
+                    Err(e) => tracing::debug!("Failed to add verb entity {}: {}", name, e),
+                }
+            }
+        }
+
         // Create an episodic node for this experience
         tracing::debug!(
             "Creating episode for memory {} with {} entities: {:?}",
             &memory_id.0.to_string()[..8],
             entity_uuids.len(),
-            entity_uuids.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>()
+            entity_uuids
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
         );
 
         let episode = EpisodicNode {
@@ -1239,7 +1311,11 @@ impl MultiUserMemoryManager {
 
         match graph_guard.add_episode(episode) {
             Ok(uuid) => {
-                tracing::debug!("Episode {} added with {} entity refs", &uuid.to_string()[..8], entity_uuids.len());
+                tracing::debug!(
+                    "Episode {} added with {} entity refs",
+                    &uuid.to_string()[..8],
+                    entity_uuids.len()
+                );
             }
             Err(e) => {
                 tracing::warn!("Failed to add episode: {}", e);

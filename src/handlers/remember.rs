@@ -295,6 +295,11 @@ pub async fn remember(
         }
     };
 
+    // Extract keywords via YAKE for common nouns, verbs, etc.
+    // NER only extracts named entities (Person, Org, Location, Misc)
+    // YAKE captures important terms like "sunrise", "painting", "lake"
+    let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
+
     let mut merged_entities: Vec<String> = req.tags.clone();
     for entity_name in extracted_names {
         if !merged_entities
@@ -302,6 +307,14 @@ pub async fn remember(
             .any(|t| t.eq_ignore_ascii_case(&entity_name))
         {
             merged_entities.push(entity_name);
+        }
+    }
+    for keyword in extracted_keywords {
+        if !merged_entities
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&keyword))
+        {
+            merged_entities.push(keyword);
         }
     }
 
@@ -321,8 +334,8 @@ pub async fn remember(
     let experience = Experience {
         content: req.content.clone(),
         experience_type,
-        entities: merged_entities,
-        tags: req.tags.clone(),
+        entities: merged_entities.clone(),
+        tags: merged_entities, // Include NER + YAKE keywords in tags for retrieval
         context,
         ..Default::default()
     };
@@ -442,6 +455,7 @@ pub async fn batch_remember(
 
     let extract_entities = req.options.extract_entities;
     let neural_ner = state.get_neural_ner();
+    let keyword_extractor = state.get_keyword_extractor();
 
     // Build experiences
     let mut experiences_with_index: Vec<(
@@ -454,6 +468,7 @@ pub async fn batch_remember(
         let experience_type = parse_experience_type(item.memory_type.as_ref());
 
         let merged_entities = if extract_entities {
+            // NER for named entities (Person, Org, Location, Misc)
             let extracted_names: Vec<String> = match neural_ner.extract(&item.content) {
                 Ok(entities) => entities.into_iter().map(|e| e.text).collect(),
                 Err(e) => {
@@ -462,10 +477,18 @@ pub async fn batch_remember(
                 }
             };
 
+            // YAKE for common nouns, verbs, concepts
+            let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
+
             let mut merged: Vec<String> = item.tags.clone();
             for entity_name in extracted_names {
                 if !merged.iter().any(|t| t.eq_ignore_ascii_case(&entity_name)) {
                     merged.push(entity_name);
+                }
+            }
+            for keyword in extracted_keywords {
+                if !merged.iter().any(|t| t.eq_ignore_ascii_case(&keyword)) {
+                    merged.push(keyword);
                 }
             }
             merged
@@ -487,8 +510,8 @@ pub async fn batch_remember(
         let experience = Experience {
             content: item.content,
             experience_type,
-            entities: merged_entities,
-            tags: item.tags,
+            entities: merged_entities.clone(),
+            tags: merged_entities, // Include NER + YAKE keywords in tags for retrieval
             context,
             ..Default::default()
         };
@@ -537,7 +560,8 @@ pub async fn batch_remember(
     for (_, id_str, experience) in &memory_results {
         if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
             let memory_id = crate::memory::MemoryId(uuid);
-            if let Err(e) = state.process_experience_into_graph(&req.user_id, experience, &memory_id)
+            if let Err(e) =
+                state.process_experience_into_graph(&req.user_id, experience, &memory_id)
             {
                 tracing::debug!("Graph processing failed for {} (non-fatal): {}", id_str, e);
             }
@@ -605,6 +629,9 @@ pub async fn upsert_memory(
         }
     };
 
+    // Extract keywords via YAKE for common nouns, verbs, concepts
+    let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
+
     let mut merged_entities: Vec<String> = req.tags.clone();
     for entity_name in extracted_names {
         if !merged_entities
@@ -614,11 +641,20 @@ pub async fn upsert_memory(
             merged_entities.push(entity_name);
         }
     }
+    for keyword in extracted_keywords {
+        if !merged_entities
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&keyword))
+        {
+            merged_entities.push(keyword);
+        }
+    }
 
     let experience = Experience {
         content: req.content.clone(),
         experience_type,
-        entities: merged_entities,
+        entities: merged_entities.clone(),
+        tags: merged_entities, // Include NER + YAKE keywords in tags for retrieval
         ..Default::default()
     };
 

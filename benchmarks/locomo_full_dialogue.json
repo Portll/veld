@@ -1,0 +1,60 @@
+{
+  "provider": "openai-compatible",
+  "model": "llama-3.1-8b-instant",
+  "total_items": 5,
+  "overall_accuracy": 20.0,
+  "accuracy_by_type": {
+    "multi_hop": 0.0,
+    "temporal_reasoning": 0.0,
+    "single_hop": 50.0
+  },
+  "latency_store_ms_avg": 24835.620780056342,
+  "latency_recall_ms_avg": 207.40851992741227,
+  "results": [
+    {
+      "question_id": "conv-26_q0",
+      "question_type": "multi_hop",
+      "correct": false,
+      "predicted_idx": 0,
+      "correct_idx": 5,
+      "latency_store_ms": 25236.76609992981,
+      "latency_recall_ms": 240.56349997408688
+    },
+    {
+      "question_id": "conv-26_q1",
+      "question_type": "multi_hop",
+      "correct": false,
+      "predicted_idx": 0,
+      "correct_idx": 8,
+      "latency_store_ms": 26200.3497001715,
+      "latency_recall_ms": 218.36689999327064
+    },
+    {
+      "question_id": "conv-26_q2",
+      "question_type": "temporal_reasoning",
+      "correct": false,
+      "predicted_idx": 0,
+      "correct_idx": 8,
+      "latency_store_ms": 24200.243999948725,
+      "latency_recall_ms": 232.17779980041087
+    },
+    {
+      "question_id": "conv-26_q3",
+      "question_type": "single_hop",
+      "correct": false,
+      "predicted_idx": 0,
+      "correct_idx": 7,
+      "latency_store_ms": 24063.41510009952,
+      "latency_recall_ms": 229.67049991711974
+    },
+    {
+      "question_id": "conv-26_q4",
+      "question_type": "single_hop",
+      "correct": true,
+      "predicted_idx": 0,
+      "correct_idx": 0,
+      "latency_store_ms": 24477.32900013216,
+      "latency_recall_ms": 116.26389995217323
+    }
+  ]
+}

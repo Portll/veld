@@ -157,7 +157,6 @@ impl InjectionConfig {
 
 // Note: RelevanceInput and compute_relevance removed - using unified 5-layer pipeline
 
-
 // =============================================================================
 // INJECTION ENGINE
 // =============================================================================
