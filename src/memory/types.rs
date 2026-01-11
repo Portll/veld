@@ -754,6 +754,15 @@ pub struct Experience {
     /// Tags for quick filtering: ["obstacle", "battery", "navigation", "emergency"]
     #[serde(default)]
     pub tags: Vec<String>,
+
+    // =========================================================================
+    // TEMPORAL EXTRACTION (v4 - TEMPR approach for LoCoMo)
+    // =========================================================================
+    /// Extracted temporal references from content (dates mentioned in text)
+    /// Used for temporal filtering in retrieval (key for multi-hop accuracy)
+    /// E.g., ["2023-05-07", "2023-06-15"] for memories mentioning specific dates
+    #[serde(default)]
+    pub temporal_refs: Vec<String>,
 }
 
 impl Default for Experience {
@@ -799,6 +808,7 @@ impl Default for Experience {
             predicted_outcome: None,
             prediction_accurate: None,
             tags: Vec::new(),
+            temporal_refs: Vec::new(),
         }
     }
 }

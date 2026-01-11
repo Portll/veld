@@ -64,16 +64,16 @@ pub struct HybridSearchConfig {
 }
 
 fn default_bm25_weight() -> f32 {
-    0.7 // Prioritize keyword matching for better recall accuracy
+    0.4 // Reduced: BM25 over-matches common terms (names), diluting rare discriminative terms
 }
 fn default_vector_weight() -> f32 {
-    0.3 // Semantic similarity as secondary signal
+    0.6 // Increased: Vector similarity better handles semantic relationships
 }
 fn default_rrf_k() -> f32 {
     45.0 // Lower k = more emphasis on top-ranked results
 }
 fn default_candidate_count() -> usize {
-    50 // Reduced from 100 for faster search; still sufficient for recall
+    100 // Increased for better recall; slight latency tradeoff acceptable
 }
 fn default_rerank_count() -> usize {
     20
@@ -256,6 +256,21 @@ impl BM25Index {
         limit: usize,
         term_weights: Option<&HashMap<String, f32>>,
     ) -> Result<Vec<(MemoryId, f32)>> {
+        self.search_with_term_and_phrase_weights(query, limit, term_weights, None)
+    }
+
+    /// Search with IC-weighted term boosting AND phrase matching
+    ///
+    /// Phrase boosts significantly improve retrieval for multi-word concepts:
+    /// - "support group" matches exact phrase, not just "support" OR "group"
+    /// - Reduces false positives from partial term matches
+    pub fn search_with_term_and_phrase_weights(
+        &self,
+        query: &str,
+        limit: usize,
+        term_weights: Option<&HashMap<String, f32>>,
+        phrase_boosts: Option<&[(String, f32)]>,
+    ) -> Result<Vec<(MemoryId, f32)>> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -268,9 +283,11 @@ impl BM25Index {
             vec![self.content_field, self.tags_field, self.entities_field],
         );
 
-        // Build boosted query if term weights provided
-        let boosted_query = if let Some(weights) = term_weights {
-            let mut boosted_terms: Vec<String> = Vec::new();
+        // Build boosted query with term weights
+        let mut query_parts: Vec<String> = Vec::new();
+
+        // Add individual terms with IC weights
+        if let Some(weights) = term_weights {
             for word in query.split_whitespace() {
                 let clean_word = word
                     .trim_matches(|c: char| !c.is_alphanumeric())
@@ -280,15 +297,36 @@ impl BM25Index {
                 }
                 if let Some(&weight) = weights.get(&clean_word) {
                     // Apply boost (Tantivy uses ^ for boost, like Lucene)
-                    boosted_terms.push(format!("{}^{:.1}", clean_word, weight));
+                    query_parts.push(format!("{}^{:.1}", clean_word, weight));
                 } else {
-                    boosted_terms.push(clean_word);
+                    query_parts.push(clean_word);
                 }
             }
-            boosted_terms.join(" ")
         } else {
-            query.to_string()
-        };
+            // No term weights - add words as-is
+            for word in query.split_whitespace() {
+                let clean_word = word
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase();
+                if !clean_word.is_empty() {
+                    query_parts.push(clean_word);
+                }
+            }
+        }
+
+        // Add phrase queries with boosts (e.g., "support group"^2.0)
+        // Phrase queries provide significant boost when exact phrase is found
+        if let Some(phrases) = phrase_boosts {
+            for (phrase, boost) in phrases {
+                // Tantivy phrase query syntax: "word1 word2"^boost
+                // Only add if phrase has multiple words and doesn't contain special chars
+                if phrase.contains(' ') && !phrase.contains('"') {
+                    query_parts.push(format!("\"{}\"^{:.1}", phrase, boost));
+                }
+            }
+        }
+
+        let boosted_query = query_parts.join(" ");
 
         // Handle query parsing errors gracefully
         let parsed_query = match query_parser.parse_query(&boosted_query) {
@@ -596,11 +634,68 @@ impl HybridSearchEngine {
     where
         F: Fn(&MemoryId) -> Option<String>,
     {
-        // 1. BM25 search with IC-weighted term boosting
-        let bm25_results = self.bm25_index.search_with_term_weights(
+        self.search_with_ic_weights_and_phrases(query, vector_results, get_content, term_weights, None)
+    }
+
+    /// Perform hybrid search with IC-weighted BM25 term boosting AND phrase matching
+    ///
+    /// IC weights from linguistic analysis boost important terms.
+    /// Phrase boosts enable exact multi-word phrase matching:
+    /// - "support group" matches the exact phrase, not just "support" OR "group"
+    /// - Compound nouns get 2.0x boost, adjacent nouns get 1.5x boost
+    pub fn search_with_ic_weights_and_phrases<F>(
+        &self,
+        query: &str,
+        vector_results: Vec<(MemoryId, f32)>,
+        get_content: F,
+        term_weights: Option<&HashMap<String, f32>>,
+        phrase_boosts: Option<&[(String, f32)]>,
+    ) -> Result<Vec<HybridSearchResult>>
+    where
+        F: Fn(&MemoryId) -> Option<String>,
+    {
+        // Use default discriminativeness (no dynamic weight adjustment)
+        self.search_with_dynamic_weights(
+            query,
+            vector_results,
+            get_content,
+            term_weights,
+            phrase_boosts,
+            None,
+        )
+    }
+
+    /// Perform hybrid search with dynamic BM25/vector weight adjustment
+    ///
+    /// When `keyword_discriminativeness` is provided and high (>0.5), BM25 weight
+    /// is boosted to ensure discriminative keywords are properly matched.
+    ///
+    /// This solves the multi-hop retrieval problem where queries like
+    /// "When did Melanie paint a sunrise?" fail because common terms ("Melanie", "paint")
+    /// dominate, while the discriminative term ("sunrise") gets diluted in vector search.
+    ///
+    /// Dynamic weight adjustment:
+    /// - discriminativeness 0.0-0.4: use default weights (BM25=0.4, Vector=0.6)
+    /// - discriminativeness 0.5-0.7: boost BM25 (BM25=0.55, Vector=0.45)
+    /// - discriminativeness 0.8-1.0: strong BM25 (BM25=0.7, Vector=0.3)
+    pub fn search_with_dynamic_weights<F>(
+        &self,
+        query: &str,
+        vector_results: Vec<(MemoryId, f32)>,
+        get_content: F,
+        term_weights: Option<&HashMap<String, f32>>,
+        phrase_boosts: Option<&[(String, f32)]>,
+        keyword_discriminativeness: Option<f32>,
+    ) -> Result<Vec<HybridSearchResult>>
+    where
+        F: Fn(&MemoryId) -> Option<String>,
+    {
+        // 1. BM25 search with IC-weighted term boosting AND phrase matching
+        let bm25_results = self.bm25_index.search_with_term_and_phrase_weights(
             query,
             self.config.candidate_count,
             term_weights,
+            phrase_boosts,
         )?;
 
         // Filter low BM25 scores
@@ -609,7 +704,25 @@ impl HybridSearchEngine {
             .filter(|(_, score)| *score >= self.config.min_bm25_score)
             .collect();
 
-        // Log counts at info level for debugging search quality
+        // Calculate dynamic weights based on keyword discriminativeness
+        // When YAKE identifies discriminative keywords, trust BM25 more
+        // YAKE importance = 1/(1+score), so 0.9+ means very discriminative keywords
+        let (bm25_weight, vector_weight) = if let Some(disc) = keyword_discriminativeness {
+            if disc >= 0.8 {
+                // Highly discriminative keywords - strong BM25 preference
+                (0.75, 0.25)
+            } else if disc >= 0.5 {
+                // Moderately discriminative - BM25 dominant
+                (0.6, 0.4)
+            } else {
+                // Low discriminativeness - use default weights
+                (self.config.bm25_weight, self.config.vector_weight)
+            }
+        } else {
+            (self.config.bm25_weight, self.config.vector_weight)
+        };
+
+        // Log counts and weights for debugging
         if bm25_results.is_empty() {
             tracing::warn!(
                 "Hybrid search: BM25 returned 0 results for query '{}', using {} vector results only",
@@ -618,18 +731,21 @@ impl HybridSearchEngine {
             );
         } else {
             debug!(
-                "Hybrid search: {} BM25 results (top score: {:.3}), {} vector results for '{}'",
+                "Hybrid search: {} BM25 (top: {:.3}), {} vector, weights: BM25={:.2}/Vec={:.2}, disc={:?} for '{}'",
                 bm25_results.len(),
                 bm25_results.first().map(|(_, s)| *s).unwrap_or(0.0),
                 vector_results.len(),
+                bm25_weight,
+                vector_weight,
+                keyword_discriminativeness,
                 &query[..query.len().min(50)]
             );
         }
 
-        // 2. RRF Fusion
+        // 2. RRF Fusion with dynamic weights
         let rrf = RRFusion::new(
             self.config.rrf_k,
-            vec![self.config.bm25_weight, self.config.vector_weight],
+            vec![bm25_weight, vector_weight],
         );
 
         let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone()]);
@@ -878,10 +994,10 @@ mod tests {
     #[test]
     fn test_hybrid_config_defaults() {
         let config = HybridSearchConfig::default();
-        assert_eq!(config.bm25_weight, 0.7); // BM25 prioritized for recall accuracy
-        assert_eq!(config.vector_weight, 0.3); // Semantic as secondary signal
+        assert_eq!(config.bm25_weight, 0.4); // BM25 reduced to avoid common term over-matching
+        assert_eq!(config.vector_weight, 0.6); // Vector increased for semantic relationships
         assert_eq!(config.rrf_k, 45.0); // Lower k for top-rank emphasis
-        assert_eq!(config.candidate_count, 50); // Reduced for speed
+        assert_eq!(config.candidate_count, 100); // Increased for better recall
         assert_eq!(config.rerank_count, 20);
         assert!(!config.use_reranking); // Disabled: bi-encoder, not cross-encoder
     }

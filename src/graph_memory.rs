@@ -76,6 +76,9 @@ pub enum EntityLabel {
     Date,
     Product,
     Skill,
+    /// YAKE-extracted discriminative keyword (not a named entity)
+    /// Used for graph-based retrieval of rare/important terms like "sunrise"
+    Keyword,
     Other(String),
 }
 
@@ -93,6 +96,7 @@ impl EntityLabel {
             Self::Date => "Date",
             Self::Product => "Product",
             Self::Skill => "Skill",
+            Self::Keyword => "Keyword",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -291,6 +295,10 @@ pub enum RelationType {
     /// Memory co-retrieval (Hebbian association between memories)
     CoRetrieved,
 
+    /// Sentence co-occurrence (entities appearing in same sentence)
+    /// Key for multi-hop: "Melanie" <-> "sunrise" when "Melanie painted a sunrise"
+    CoOccurs,
+
     /// Custom relationship
     Custom(String),
 }
@@ -319,6 +327,7 @@ impl RelationType {
             Self::RelatedTo => "RelatedTo",
             Self::AssociatedWith => "AssociatedWith",
             Self::CoRetrieved => "CoRetrieved",
+            Self::CoOccurs => "CoOccurs",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -928,25 +937,66 @@ impl GraphMemory {
         Ok(())
     }
 
-    /// Get all relationships for an entity
+    /// Get relationships for an entity with optional limit
+    ///
+    /// Uses batch reading (multi_get) to eliminate N+1 query pattern.
+    /// If limit is None, returns all edges (use sparingly for large graphs).
     pub fn get_entity_relationships(&self, entity_uuid: &Uuid) -> Result<Vec<RelationshipEdge>> {
-        let mut edges = Vec::new();
-        let prefix = format!("{entity_uuid}:");
+        self.get_entity_relationships_limited(entity_uuid, None)
+    }
 
+    /// Get relationships for an entity with limit
+    ///
+    /// Collects edge UUIDs first, then batch-reads them using multi_get.
+    /// This eliminates the N+1 query pattern that was causing 60s+ delays.
+    pub fn get_entity_relationships_limited(
+        &self,
+        entity_uuid: &Uuid,
+        limit: Option<usize>,
+    ) -> Result<Vec<RelationshipEdge>> {
+        let prefix = format!("{entity_uuid}:");
+        let max_edges = limit.unwrap_or(usize::MAX);
+
+        // Phase 1: Collect edge UUIDs from index (fast prefix scan)
+        let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(max_edges.min(256));
         let iter = self.entity_edges_db.prefix_iterator(prefix.as_bytes());
+
         for (key, _) in iter.flatten() {
+            if edge_uuids.len() >= max_edges {
+                break;
+            }
+
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
                     break;
                 }
 
-                // Extract edge UUID
                 if let Some(edge_uuid_str) = key_str.split(':').nth(1) {
                     if let Ok(edge_uuid) = Uuid::parse_str(edge_uuid_str) {
-                        if let Some(edge) = self.get_relationship(&edge_uuid)? {
-                            edges.push(edge);
-                        }
+                        edge_uuids.push(edge_uuid);
                     }
+                }
+            }
+        }
+
+        if edge_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: Batch read all edges using multi_get (single RocksDB call)
+        let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+
+        let results = self.relationships_db.multi_get(&key_refs);
+
+        let mut edges = Vec::with_capacity(edge_uuids.len());
+        for result in results.into_iter().flatten() {
+            if let Some(value) = result {
+                if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
+                    edges.push(edge);
                 }
             }
         }
@@ -1100,11 +1150,17 @@ impl GraphMemory {
     /// - hop 1: decay = 0.7
     /// - hop 2: decay = 0.49
     /// - etc.
+    ///
+    /// Performance: Uses batch edge reading and limits to handle large graphs.
     pub fn traverse_from_entity(
         &self,
         start_uuid: &Uuid,
         max_depth: usize,
     ) -> Result<GraphTraversal> {
+        // Performance limits
+        const MAX_ENTITIES: usize = 200;
+        const MAX_EDGES_PER_NODE: usize = 100;
+
         // Use tuned decay from constants (0.15 max decay → ~86% retention per hop)
         // This enables deeper traversal than the old 0.7 factor
         use crate::constants::IMPORTANCE_DECAY_MAX;
@@ -1127,10 +1183,16 @@ impl GraphMemory {
         }
 
         for depth in 0..max_depth {
+            // Early termination if we have enough entities
+            if all_entities.len() >= MAX_ENTITIES {
+                break;
+            }
+
             let mut next_level = Vec::new();
 
             for (entity_uuid, _hop) in &current_level {
-                let edges = self.get_entity_relationships(entity_uuid)?;
+                // Use limited edge reading
+                let edges = self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_NODE))?;
 
                 for edge in edges {
                     if visited_edges.contains(&edge.uuid) {
@@ -1214,6 +1276,9 @@ impl GraphMemory {
     /// - Score paths by cumulative weight
     ///
     /// Returns entities sorted by path score (strongest connections first).
+    ///
+    /// Performance: Uses batch edge reading and early termination to handle
+    /// large graphs (10000+ edges) efficiently.
     pub fn traverse_weighted(
         &self,
         start_uuid: &Uuid,
@@ -1221,6 +1286,11 @@ impl GraphMemory {
         relation_types: Option<&[RelationType]>,
         min_strength: f32,
     ) -> Result<GraphTraversal> {
+        // Performance limits - prevents exponential blowup on dense graphs
+        const MAX_ENTITIES: usize = 200;       // Stop after finding this many entities
+        const MAX_EDGES_PER_NODE: usize = 100; // Limit edges loaded per node
+        const MAX_ITERATIONS: usize = 500;     // Prevent infinite loops
+
         // Priority queue entry: (negative score for max-heap, uuid, depth, path_score)
         #[derive(Clone)]
         struct PQEntry {
@@ -1251,6 +1321,7 @@ impl GraphMemory {
         let mut all_entities: Vec<TraversedEntity> = Vec::new();
         let mut all_edges: Vec<RelationshipEdge> = Vec::new();
         let mut edges_to_strengthen: Vec<Uuid> = Vec::new();
+        let mut iterations = 0;
 
         // Start node
         heap.push(PQEntry {
@@ -1269,7 +1340,13 @@ impl GraphMemory {
         }
 
         while let Some(PQEntry { score, uuid, depth }) = heap.pop() {
-            if depth >= max_depth {
+            iterations += 1;
+
+            // Early termination checks
+            if depth >= max_depth
+                || all_entities.len() >= MAX_ENTITIES
+                || iterations >= MAX_ITERATIONS
+            {
                 continue;
             }
 
@@ -1280,7 +1357,8 @@ impl GraphMemory {
                 }
             }
 
-            let edges = self.get_entity_relationships(&uuid)?;
+            // Use limited edge reading to avoid loading 10000+ edges
+            let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
 
             for edge in edges {
                 // Skip invalidated edges
@@ -1373,6 +1451,8 @@ impl GraphMemory {
     /// Complexity: O(b^(d/2)) instead of O(b^d) for unidirectional search.
     /// Finds the shortest weighted path between start and goal.
     /// Returns entities along the path with their path scores.
+    ///
+    /// Performance: Uses batch edge reading with limits.
     pub fn traverse_bidirectional(
         &self,
         start_uuid: &Uuid,
@@ -1380,6 +1460,8 @@ impl GraphMemory {
         max_depth: usize,
         min_strength: f32,
     ) -> Result<GraphTraversal> {
+        const MAX_EDGES_PER_NODE: usize = 100;
+
         // Track forward search from start
         let mut forward_visited: HashMap<Uuid, (f32, usize)> = HashMap::new(); // uuid -> (score, depth)
         let mut forward_parents: HashMap<Uuid, (Uuid, Uuid)> = HashMap::new(); // child -> (parent, edge_uuid)
@@ -1405,7 +1487,7 @@ impl GraphMemory {
                     continue;
                 }
 
-                let edges = self.get_entity_relationships(&uuid)?;
+                let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
                 for edge in edges {
                     if edge.invalidated_at.is_some() {
                         continue;
@@ -1451,7 +1533,7 @@ impl GraphMemory {
                     continue;
                 }
 
-                let edges = self.get_entity_relationships(&uuid)?;
+                let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
                 for edge in edges {
                     if edge.invalidated_at.is_some() {
                         continue;
@@ -1642,8 +1724,9 @@ impl GraphMemory {
             return Ok(());
         }
 
+        const MAX_EDGES_PER_NODE: usize = 100;
         let (required_type, is_outgoing) = &pattern[pattern_idx];
-        let edges = self.get_entity_relationships(&current_uuid)?;
+        let edges = self.get_entity_relationships_limited(&current_uuid, Some(MAX_EDGES_PER_NODE))?;
 
         for edge in edges {
             if edge.invalidated_at.is_some() {
@@ -2120,8 +2203,9 @@ impl GraphMemory {
         let mut strengths: Vec<f32> = Vec::new();
         let mut seen_edges: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
+        const MAX_EDGES_PER_ENTITY: usize = 50; // Limit per entity for Hebbian lookup
         for entity_uuid in &episode.entity_refs {
-            if let Ok(edges) = self.get_entity_relationships(entity_uuid) {
+            if let Ok(edges) = self.get_entity_relationships_limited(entity_uuid, Some(MAX_EDGES_PER_ENTITY)) {
                 for edge in edges {
                     // Skip if already processed (edges are bidirectional in lookup)
                     if seen_edges.contains(&edge.uuid) {
@@ -2563,6 +2647,7 @@ fn entity_type_color(label: Option<&EntityLabel>) -> String {
         Some(EntityLabel::Skill) => "#98D8C8".to_string(),  // Mint
         Some(EntityLabel::Concept) => "#F7DC6F".to_string(), // Gold
         Some(EntityLabel::Date) => "#BB8FCE".to_string(),   // Light purple
+        Some(EntityLabel::Keyword) => "#FF9F43".to_string(), // Orange for YAKE keywords
         Some(EntityLabel::Other(_)) => "#AEB6BF".to_string(), // Gray
         None => "#AEB6BF".to_string(),                      // Gray default
     }
@@ -3483,6 +3568,7 @@ impl EntityExtractor {
             EntityLabel::Product => 0.7,      // Products are specific entities
             EntityLabel::Event => 0.6,        // Events are temporal anchors
             EntityLabel::Skill => 0.5,        // Skills are somewhat important
+            EntityLabel::Keyword => 0.55,     // YAKE keywords - discriminative terms
             EntityLabel::Concept => 0.4,      // Concepts are more generic
             EntityLabel::Date => 0.3,         // Dates are structural, not salient
             EntityLabel::Other(_) => 0.3,     // Unknown types get low salience
@@ -3682,7 +3768,137 @@ impl EntityExtractor {
             }
         }
 
+        // HYBRID APPROACH: POS-based extraction + YAKE importance scoring
+        //
+        // 1. POS extraction ensures ALL content words are captured (no frequency bias)
+        // 2. YAKE provides discriminativeness scores for boosting rare/important terms
+        //
+        // This solves the "sunrise problem": YAKE alone buries rare words at position 41,
+        // but POS ensures "sunrise" is extracted, and YAKE boosts its salience.
+        use crate::embeddings::keywords::{KeywordConfig, KeywordExtractor};
+        use crate::memory::query_parser::{extract_chunks, PosTag};
+
+        // Get YAKE importance scores for discriminative weighting
+        let kw_config = KeywordConfig {
+            max_keywords: 100, // Get many keywords for lookup
+            ngrams: 1,
+            min_length: 3,
+            ..Default::default()
+        };
+        let kw_extractor = KeywordExtractor::with_config(kw_config);
+        let keywords = kw_extractor.extract(text);
+
+        // Build a lookup map: term -> importance (0.0-1.0)
+        let yake_importance: std::collections::HashMap<String, f32> = keywords
+            .into_iter()
+            .map(|kw| (kw.text.to_lowercase(), kw.importance))
+            .collect();
+
+        // POS-based extraction for comprehensive coverage
+        let chunk_extraction = extract_chunks(text);
+
+        // Add all proper nouns (these are likely named entities we might have missed)
+        for proper_noun in &chunk_extraction.proper_nouns {
+            let term_lower = proper_noun.to_lowercase();
+            if !seen.contains(&term_lower) && term_lower.len() >= 3 {
+                // Boost salience if YAKE identified this as discriminative
+                let yake_boost = yake_importance.get(&term_lower).copied().unwrap_or(0.0);
+                let entity = ExtractedEntity {
+                    name: proper_noun.clone(),
+                    label: EntityLabel::Person,
+                    base_salience: 0.7 + (yake_boost * 0.2), // 0.7-0.9
+                };
+                entities.push(entity);
+                seen.insert(term_lower);
+            }
+        }
+
+        // Add all content words as Keyword entities
+        // POS ensures comprehensive extraction, YAKE boosts discriminative terms
+        for chunk in &chunk_extraction.chunks {
+            for word in &chunk.words {
+                let term_lower = word.text.to_lowercase();
+
+                // Skip if already extracted or too short
+                if seen.contains(&term_lower) || term_lower.len() < 4 {
+                    continue;
+                }
+
+                // Skip stop words
+                if self.stop_words.contains(&term_lower) {
+                    continue;
+                }
+
+                // Base salience by POS, boosted by YAKE importance
+                let yake_boost = yake_importance.get(&term_lower).copied().unwrap_or(0.0);
+
+                let (label, base_salience) = match word.pos {
+                    PosTag::Noun | PosTag::ProperNoun => {
+                        // Nouns are most important, start at 0.5
+                        (EntityLabel::Keyword, 0.5)
+                    }
+                    PosTag::Verb => {
+                        // Verbs connect entities, start at 0.4
+                        (EntityLabel::Keyword, 0.4)
+                    }
+                    PosTag::Adjective => {
+                        // Adjectives are modifiers, start at 0.35
+                        (EntityLabel::Keyword, 0.35)
+                    }
+                    _ => continue,
+                };
+
+                // Boost by YAKE importance (0.0-0.3 boost based on discriminativeness)
+                let final_salience = base_salience + (yake_boost * 0.3);
+
+                let entity = ExtractedEntity {
+                    name: word.text.clone(),
+                    label,
+                    base_salience: final_salience,
+                };
+                entities.push(entity);
+                seen.insert(term_lower);
+            }
+        }
+
         entities
+    }
+
+    /// Extract co-occurrence pairs from text for graph edge creation
+    ///
+    /// Returns pairs of (entity1, entity2) that appear in the same sentence.
+    /// This enables creating edges between words that co-occur, which is critical
+    /// for multi-hop retrieval (e.g., connecting "Melanie" to "sunrise" when
+    /// they appear in the same sentence about painting).
+    pub fn extract_cooccurrence_pairs(&self, text: &str) -> Vec<(String, String)> {
+        use crate::memory::query_parser::extract_chunks;
+
+        let chunk_extraction = extract_chunks(text);
+        let mut pairs = Vec::new();
+
+        // Get all co-occurrence pairs from chunks (same sentence)
+        for chunk in &chunk_extraction.chunks {
+            let content_words = chunk.content_words();
+
+            // Create pairs between all content words in the same sentence
+            for i in 0..content_words.len() {
+                for j in (i + 1)..content_words.len() {
+                    let w1 = content_words[i].text.to_lowercase();
+                    let w2 = content_words[j].text.to_lowercase();
+
+                    // Skip very short words and stop words
+                    if w1.len() >= 3
+                        && w2.len() >= 3
+                        && !self.stop_words.contains(&w1)
+                        && !self.stop_words.contains(&w2)
+                    {
+                        pairs.push((w1, w2));
+                    }
+                }
+            }
+        }
+
+        pairs
     }
 }
 

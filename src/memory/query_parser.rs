@@ -14,10 +14,901 @@
 //! - Context-aware POS disambiguation
 //! - Negation scope tracking
 //! - IDF-inspired term rarity weighting
+//!
+//! # Shallow Parsing / Chunking (v3)
+//! - Sentence-level chunking for co-occurrence detection
+//! - POS-based entity extraction (all nouns, verbs, adjectives - not just top-N)
+//! - Designed for both query analysis AND memory storage
+//!
+//! # Temporal Extraction (v4)
+//! - Extract dates from natural language text ("May 7, 2023", "yesterday", "last week")
+//! - Detect temporal queries ("when did", "what date", "how long ago")
+//! - Based on TEMPR approach (Hindsight paper achieving 89.6% on LoCoMo)
 
 use crate::constants::{IC_ADJECTIVE, IC_NOUN, IC_VERB};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_stemmers::{Algorithm, Stemmer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+// ============================================================================
+// SHALLOW PARSING / CHUNKING MODULE
+// ============================================================================
+// This section provides sentence-level chunking and POS-based entity extraction.
+// Unlike YAKE (which ranks by frequency and misses rare discriminative terms),
+// this extracts ALL content words (nouns, verbs, adjectives) for graph building.
+
+/// Part of speech tag
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PosTag {
+    Noun,
+    Verb,
+    Adjective,
+    ProperNoun,
+    StopWord,
+    Other,
+}
+
+/// A word with its POS annotation
+#[derive(Debug, Clone)]
+pub struct TaggedWord {
+    pub text: String,
+    pub stem: String,
+    pub pos: PosTag,
+    /// Position within the sentence (0-indexed)
+    pub position: usize,
+}
+
+/// A sentence chunk containing tagged words
+#[derive(Debug, Clone)]
+pub struct SentenceChunk {
+    /// Original sentence text
+    pub text: String,
+    /// Sentence index in document (0-indexed)
+    pub sentence_idx: usize,
+    /// All tagged words in this sentence
+    pub words: Vec<TaggedWord>,
+}
+
+impl SentenceChunk {
+    /// Get all nouns in this chunk
+    pub fn nouns(&self) -> Vec<&TaggedWord> {
+        self.words
+            .iter()
+            .filter(|w| matches!(w.pos, PosTag::Noun | PosTag::ProperNoun))
+            .collect()
+    }
+
+    /// Get all verbs in this chunk
+    pub fn verbs(&self) -> Vec<&TaggedWord> {
+        self.words
+            .iter()
+            .filter(|w| w.pos == PosTag::Verb)
+            .collect()
+    }
+
+    /// Get all adjectives in this chunk
+    pub fn adjectives(&self) -> Vec<&TaggedWord> {
+        self.words
+            .iter()
+            .filter(|w| w.pos == PosTag::Adjective)
+            .collect()
+    }
+
+    /// Get all content words (nouns, verbs, adjectives)
+    pub fn content_words(&self) -> Vec<&TaggedWord> {
+        self.words
+            .iter()
+            .filter(|w| {
+                matches!(
+                    w.pos,
+                    PosTag::Noun | PosTag::ProperNoun | PosTag::Verb | PosTag::Adjective
+                )
+            })
+            .collect()
+    }
+
+    /// Generate co-occurrence pairs (words in same sentence get edges)
+    /// Returns pairs of (word1_stem, word2_stem) for graph edge creation
+    pub fn cooccurrence_pairs(&self) -> Vec<(&str, &str)> {
+        let content = self.content_words();
+        let mut pairs = Vec::new();
+
+        for i in 0..content.len() {
+            for j in (i + 1)..content.len() {
+                pairs.push((content[i].stem.as_str(), content[j].stem.as_str()));
+            }
+        }
+
+        pairs
+    }
+}
+
+/// Result of chunking a document
+#[derive(Debug, Clone)]
+pub struct ChunkExtraction {
+    /// All sentence chunks
+    pub chunks: Vec<SentenceChunk>,
+    /// Unique nouns found (stems)
+    pub unique_nouns: HashSet<String>,
+    /// Unique verbs found (stems)
+    pub unique_verbs: HashSet<String>,
+    /// Unique adjectives found (stems)
+    pub unique_adjectives: HashSet<String>,
+    /// Proper nouns (likely named entities)
+    pub proper_nouns: HashSet<String>,
+}
+
+impl ChunkExtraction {
+    /// Get all unique content word stems
+    pub fn all_content_stems(&self) -> HashSet<String> {
+        let mut all = self.unique_nouns.clone();
+        all.extend(self.unique_verbs.clone());
+        all.extend(self.unique_adjectives.clone());
+        all.extend(self.proper_nouns.clone());
+        all
+    }
+
+    /// Get all co-occurrence pairs across all chunks
+    pub fn all_cooccurrence_pairs(&self) -> Vec<(String, String)> {
+        let mut all_pairs = Vec::new();
+        for chunk in &self.chunks {
+            for (w1, w2) in chunk.cooccurrence_pairs() {
+                all_pairs.push((w1.to_string(), w2.to_string()));
+            }
+        }
+        all_pairs
+    }
+}
+
+// ============================================================================
+// TEMPORAL EXTRACTION MODULE
+// ============================================================================
+// Extracts temporal references from natural language text.
+// Based on TEMPR approach from Hindsight paper (89.6% accuracy on LoCoMo).
+// Key insight: Temporal filtering is critical for multi-hop retrieval.
+
+/// A temporal reference extracted from text
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalRef {
+    /// The extracted date (normalized to NaiveDate)
+    pub date: NaiveDate,
+    /// Original text that was parsed (e.g., "May 7, 2023", "yesterday")
+    pub original_text: String,
+    /// Confidence in the extraction (0.0-1.0)
+    pub confidence: f32,
+    /// Position in original text (character offset)
+    pub position: usize,
+    /// Type of temporal reference
+    pub ref_type: TemporalRefType,
+}
+
+/// Type of temporal reference
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TemporalRefType {
+    /// Absolute date (May 7, 2023)
+    Absolute,
+    /// Relative date (yesterday, last week)
+    Relative,
+    /// Day of week (on Monday, last Tuesday)
+    DayOfWeek,
+    /// Month reference (in May, last March)
+    Month,
+    /// Year reference (in 2023, last year)
+    Year,
+}
+
+/// Result of temporal extraction from text
+#[derive(Debug, Clone, Default)]
+pub struct TemporalExtraction {
+    /// All temporal references found
+    pub refs: Vec<TemporalRef>,
+    /// Earliest date mentioned
+    pub earliest: Option<NaiveDate>,
+    /// Latest date mentioned
+    pub latest: Option<NaiveDate>,
+}
+
+impl TemporalExtraction {
+    /// Check if any temporal references were found
+    pub fn has_temporal_refs(&self) -> bool {
+        !self.refs.is_empty()
+    }
+
+    /// Get date range (earliest, latest) if temporal refs exist
+    pub fn date_range(&self) -> Option<(NaiveDate, NaiveDate)> {
+        match (self.earliest, self.latest) {
+            (Some(e), Some(l)) => Some((e, l)),
+            (Some(e), None) => Some((e, e)),
+            (None, Some(l)) => Some((l, l)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Extract temporal references from text
+///
+/// Uses date_time_parser crate for natural language date parsing.
+/// Handles:
+/// - Absolute dates: "May 7, 2023", "2023-05-07", "07/05/2023"
+/// - Relative dates: "yesterday", "last week", "3 days ago"
+/// - Day of week: "on Monday", "last Tuesday"
+/// - Month/year: "in May", "last year", "2023"
+pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
+    use date_time_parser::DateParser;
+
+    let now = Utc::now();
+    let mut refs = Vec::new();
+    let mut earliest: Option<NaiveDate> = None;
+    let mut latest: Option<NaiveDate> = None;
+
+    // Try parsing the entire text first for context
+    // date_time_parser::DateParser::parse returns Option<NaiveDate> directly
+    if let Some(date) = DateParser::parse(text) {
+        refs.push(TemporalRef {
+            date,
+            original_text: text.to_string(),
+            confidence: 0.8,
+            position: 0,
+            ref_type: classify_temporal_ref(text, &date, &now),
+        });
+        update_bounds(&mut earliest, &mut latest, date);
+    }
+
+    // Also try parsing individual sentences/phrases
+    for (pos, sentence) in split_temporal_phrases(text).iter().enumerate() {
+        if let Some(date) = DateParser::parse(sentence) {
+            // Skip if we already found this date
+            if refs.iter().any(|r| r.date == date) {
+                continue;
+            }
+            refs.push(TemporalRef {
+                date,
+                original_text: sentence.to_string(),
+                confidence: 0.7,
+                position: pos,
+                ref_type: classify_temporal_ref(sentence, &date, &now),
+            });
+            update_bounds(&mut earliest, &mut latest, date);
+        }
+    }
+
+    // Try explicit date patterns that date_time_parser might miss
+    let explicit_dates = extract_explicit_dates(text);
+    for (date, original, pos) in explicit_dates {
+        if refs.iter().any(|r| r.date == date) {
+            continue;
+        }
+        refs.push(TemporalRef {
+            date,
+            original_text: original,
+            confidence: 0.9,
+            position: pos,
+            ref_type: TemporalRefType::Absolute,
+        });
+        update_bounds(&mut earliest, &mut latest, date);
+    }
+
+    // Sort by position in text
+    refs.sort_by_key(|r| r.position);
+
+    TemporalExtraction {
+        refs,
+        earliest,
+        latest,
+    }
+}
+
+/// Classify the type of temporal reference
+fn classify_temporal_ref(text: &str, date: &NaiveDate, now: &DateTime<Utc>) -> TemporalRefType {
+    let text_lower = text.to_lowercase();
+    let today = now.date_naive();
+
+    // Check for relative indicators
+    if text_lower.contains("yesterday")
+        || text_lower.contains("ago")
+        || text_lower.contains("last")
+        || text_lower.contains("previous")
+        || text_lower.contains("before")
+        || text_lower.contains("earlier")
+    {
+        return TemporalRefType::Relative;
+    }
+
+    // Check for day of week
+    let days = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    if days.iter().any(|d| text_lower.contains(d)) {
+        return TemporalRefType::DayOfWeek;
+    }
+
+    // Check for month names without day
+    let months = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let has_month = months.iter().any(|m| text_lower.contains(m));
+    let has_day = text.chars().any(|c| c.is_ascii_digit());
+
+    if has_month && !has_day {
+        return TemporalRefType::Month;
+    }
+
+    // Check for year-only reference
+    if text.len() == 4 && text.chars().all(|c| c.is_ascii_digit()) {
+        return TemporalRefType::Year;
+    }
+
+    // If date is today or very close, might be relative
+    let diff = (today - *date).num_days().abs();
+    if diff <= 7 && text_lower.contains("this") {
+        return TemporalRefType::Relative;
+    }
+
+    TemporalRefType::Absolute
+}
+
+/// Split text into temporal-relevant phrases
+fn split_temporal_phrases(text: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+
+    // Split by common temporal markers and punctuation
+    let markers = [
+        " on ", " in ", " at ", " during ", " since ", " until ", " before ", " after ", " around ",
+        ", ", ". ", "! ", "? ",
+    ];
+
+    let mut current = text.to_string();
+    for marker in markers {
+        let parts: Vec<&str> = current.split(marker).collect();
+        if parts.len() > 1 {
+            for part in parts {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() && trimmed.len() > 3 {
+                    phrases.push(trimmed.to_string());
+                }
+            }
+            break;
+        }
+    }
+
+    // If no splitting happened, try sentence boundaries
+    if phrases.is_empty() {
+        for sentence in text.split('.') {
+            let trimmed = sentence.trim();
+            if !trimmed.is_empty() && trimmed.len() > 3 {
+                phrases.push(trimmed.to_string());
+            }
+        }
+    }
+
+    phrases
+}
+
+/// Extract explicit date patterns that date_time_parser might miss
+fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
+    use regex::Regex;
+
+    let mut results = Vec::new();
+
+    // Pattern: "Month Day, Year" (e.g., "May 7, 2023")
+    let month_day_year =
+        Regex::new(r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})")
+            .unwrap();
+
+    for cap in month_day_year.captures_iter(text) {
+        let month_str = &cap[1];
+        let day: u32 = cap[2].parse().unwrap_or(1);
+        let year: i32 = cap[3].parse().unwrap_or(2000);
+        let month = month_to_num(month_str);
+
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            results.push((date, cap[0].to_string(), pos));
+        }
+    }
+
+    // Pattern: "YYYY-MM-DD"
+    let iso_date = Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap();
+    for cap in iso_date.captures_iter(text) {
+        let year: i32 = cap[1].parse().unwrap_or(2000);
+        let month: u32 = cap[2].parse().unwrap_or(1);
+        let day: u32 = cap[3].parse().unwrap_or(1);
+
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            results.push((date, cap[0].to_string(), pos));
+        }
+    }
+
+    // Pattern: "MM/DD/YYYY" or "DD/MM/YYYY" (assume US format MM/DD)
+    let slash_date = Regex::new(r"(\d{1,2})/(\d{1,2})/(\d{4})").unwrap();
+    for cap in slash_date.captures_iter(text) {
+        let month: u32 = cap[1].parse().unwrap_or(1);
+        let day: u32 = cap[2].parse().unwrap_or(1);
+        let year: i32 = cap[3].parse().unwrap_or(2000);
+
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+            let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            results.push((date, cap[0].to_string(), pos));
+        }
+    }
+
+    results
+}
+
+/// Convert month name to number
+fn month_to_num(month: &str) -> u32 {
+    match month.to_lowercase().as_str() {
+        "january" | "jan" => 1,
+        "february" | "feb" => 2,
+        "march" | "mar" => 3,
+        "april" | "apr" => 4,
+        "may" => 5,
+        "june" | "jun" => 6,
+        "july" | "jul" => 7,
+        "august" | "aug" => 8,
+        "september" | "sep" | "sept" => 9,
+        "october" | "oct" => 10,
+        "november" | "nov" => 11,
+        "december" | "dec" => 12,
+        _ => 1,
+    }
+}
+
+/// Update earliest/latest bounds
+fn update_bounds(earliest: &mut Option<NaiveDate>, latest: &mut Option<NaiveDate>, date: NaiveDate) {
+    match earliest {
+        Some(e) if date < *e => *earliest = Some(date),
+        None => *earliest = Some(date),
+        _ => {}
+    }
+    match latest {
+        Some(l) if date > *l => *latest = Some(date),
+        None => *latest = Some(date),
+        _ => {}
+    }
+}
+
+// ============================================================================
+// TEMPORAL QUERY DETECTION
+// ============================================================================
+// Detect when a query is asking about time/dates.
+
+/// Query temporal intent
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalIntent {
+    /// Query is asking "when" something happened
+    WhenQuestion,
+    /// Query references a specific time period
+    SpecificTime,
+    /// Query asks about temporal ordering (before/after)
+    Ordering,
+    /// Query asks about duration (how long)
+    Duration,
+    /// No temporal intent detected
+    None,
+}
+
+/// Detect temporal intent in a query
+pub fn detect_temporal_intent(query: &str) -> TemporalIntent {
+    let query_lower = query.to_lowercase();
+
+    // "When" questions are highest priority
+    if query_lower.starts_with("when")
+        || query_lower.contains(" when ")
+        || query_lower.contains("what date")
+        || query_lower.contains("what day")
+        || query_lower.contains("what time")
+    {
+        return TemporalIntent::WhenQuestion;
+    }
+
+    // Duration questions
+    if query_lower.contains("how long")
+        || query_lower.contains("how many days")
+        || query_lower.contains("how many weeks")
+        || query_lower.contains("how many months")
+        || query_lower.contains("how many years")
+    {
+        return TemporalIntent::Duration;
+    }
+
+    // Ordering questions
+    if query_lower.contains("before or after")
+        || query_lower.contains("first or")
+        || query_lower.contains("earlier or later")
+        || query_lower.contains("which came first")
+        || query_lower.contains("in what order")
+    {
+        return TemporalIntent::Ordering;
+    }
+
+    // Specific time references
+    let time_indicators = [
+        "yesterday",
+        "today",
+        "last week",
+        "last month",
+        "last year",
+        "this week",
+        "this month",
+        "this year",
+        "in january",
+        "in february",
+        "in march",
+        "in april",
+        "in may",
+        "in june",
+        "in july",
+        "in august",
+        "in september",
+        "in october",
+        "in november",
+        "in december",
+        "on monday",
+        "on tuesday",
+        "on wednesday",
+        "on thursday",
+        "on friday",
+        "on saturday",
+        "on sunday",
+        " ago",
+        " days ago",
+        " weeks ago",
+        " months ago",
+        " years ago",
+    ];
+
+    if time_indicators.iter().any(|t| query_lower.contains(t)) {
+        return TemporalIntent::SpecificTime;
+    }
+
+    // Check for date patterns
+    let extraction = extract_temporal_refs(query);
+    if extraction.has_temporal_refs() {
+        return TemporalIntent::SpecificTime;
+    }
+
+    TemporalIntent::None
+}
+
+/// Check if a query requires temporal filtering for accurate retrieval
+///
+/// Returns true if the query has a temporal component that should be used
+/// to filter/rank memories by their temporal references.
+pub fn requires_temporal_filtering(query: &str) -> bool {
+    let intent = detect_temporal_intent(query);
+    matches!(
+        intent,
+        TemporalIntent::WhenQuestion
+            | TemporalIntent::SpecificTime
+            | TemporalIntent::Duration
+            | TemporalIntent::Ordering
+    )
+}
+
+/// Extract chunks from text using shallow parsing
+///
+/// This function:
+/// 1. Splits text into sentences
+/// 2. Tags each word with its POS (noun, verb, adjective, etc.)
+/// 3. Returns chunks that can be used for:
+///    - Entity extraction (all nouns, not just YAKE top-N)
+///    - Co-occurrence edge creation (words in same sentence)
+///
+/// Unlike YAKE, this doesn't rank by frequency - ALL content words are extracted.
+pub fn extract_chunks(text: &str) -> ChunkExtraction {
+    let stemmer = Stemmer::create(Algorithm::English);
+    let sentences = split_sentences(text);
+
+    let mut chunks = Vec::with_capacity(sentences.len());
+    let mut unique_nouns = HashSet::new();
+    let mut unique_verbs = HashSet::new();
+    let mut unique_adjectives = HashSet::new();
+    let mut proper_nouns = HashSet::new();
+
+    for (sentence_idx, sentence) in sentences.iter().enumerate() {
+        let words = tokenize_with_case(sentence);
+        let mut tagged_words = Vec::with_capacity(words.len());
+
+        for (position, (word, is_capitalized)) in words.iter().enumerate() {
+            let word_lower = word.to_lowercase();
+
+            // Skip very short words
+            if word_lower.len() < 2 {
+                continue;
+            }
+
+            let stem = stemmer.stem(&word_lower).to_string();
+            let pos = classify_pos_for_chunking(&word_lower, *is_capitalized, position, &words);
+
+            match pos {
+                PosTag::Noun => {
+                    unique_nouns.insert(stem.clone());
+                }
+                PosTag::Verb => {
+                    unique_verbs.insert(stem.clone());
+                }
+                PosTag::Adjective => {
+                    unique_adjectives.insert(stem.clone());
+                }
+                PosTag::ProperNoun => {
+                    proper_nouns.insert(word.clone());
+                    unique_nouns.insert(stem.clone()); // Also add to nouns
+                }
+                _ => {}
+            }
+
+            if pos != PosTag::StopWord {
+                tagged_words.push(TaggedWord {
+                    text: word.clone(),
+                    stem,
+                    pos,
+                    position,
+                });
+            }
+        }
+
+        if !tagged_words.is_empty() {
+            chunks.push(SentenceChunk {
+                text: sentence.clone(),
+                sentence_idx,
+                words: tagged_words,
+            });
+        }
+    }
+
+    ChunkExtraction {
+        chunks,
+        unique_nouns,
+        unique_verbs,
+        unique_adjectives,
+        proper_nouns,
+    }
+}
+
+/// Split text into sentences using punctuation and common patterns
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+
+    // Simple sentence splitting on . ! ? and newlines
+    // More sophisticated than just split('.') because we handle abbreviations
+    for ch in text.chars() {
+        current.push(ch);
+
+        if ch == '.' || ch == '!' || ch == '?' || ch == '\n' {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() && trimmed.len() > 3 {
+                // Avoid splitting on abbreviations like "Dr." or "Mr."
+                let last_word: String = trimmed
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| c.is_alphabetic())
+                    .collect();
+
+                // Common abbreviations that shouldn't split
+                let is_abbrev = matches!(
+                    last_word.to_lowercase().as_str(),
+                    "mr" | "mrs" | "ms" | "dr" | "prof" | "sr" | "jr" | "vs" | "etc" | "eg" | "ie"
+                        | "st" | "ave" | "rd" | "blvd"
+                );
+
+                if !is_abbrev || ch == '\n' {
+                    sentences.push(trimmed.to_string());
+                    current.clear();
+                }
+            }
+        }
+    }
+
+    // Don't forget the last sentence
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        sentences.push(trimmed.to_string());
+    }
+
+    sentences
+}
+
+/// Tokenize preserving case information for proper noun detection
+fn tokenize_with_case(text: &str) -> Vec<(String, bool)> {
+    text.split_whitespace()
+        .map(|w| {
+            let clean: String = w
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                .to_string();
+            let is_capitalized = clean.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+            (clean, is_capitalized)
+        })
+        .filter(|(w, _)| !w.is_empty())
+        .collect()
+}
+
+/// Classify POS for chunking purposes
+fn classify_pos_for_chunking(
+    word: &str,
+    is_capitalized: bool,
+    position: usize,
+    _context: &[(String, bool)],
+) -> PosTag {
+    // Check stop words first
+    if is_stop_word(word) {
+        return PosTag::StopWord;
+    }
+
+    // Capitalized words not at sentence start are likely proper nouns
+    if is_capitalized && position > 0 {
+        return PosTag::ProperNoun;
+    }
+
+    // Check verb indicators
+    if is_verb(word) {
+        return PosTag::Verb;
+    }
+
+    // Check adjective indicators
+    if is_adjective(word) {
+        return PosTag::Adjective;
+    }
+
+    // Check noun indicators
+    if is_noun_for_chunking(word) {
+        return PosTag::Noun;
+    }
+
+    // Default: if it's a content word (not too short, not a stop word), treat as noun
+    // This is the "80% rule" - unknown words are usually nouns in English
+    if word.len() >= 4 {
+        return PosTag::Noun;
+    }
+
+    PosTag::Other
+}
+
+/// Noun detection for chunking (more aggressive than query parsing)
+fn is_noun_for_chunking(word: &str) -> bool {
+    // All the noun indicators from the original is_noun function
+    // Plus additional heuristics for storage
+
+    // Domain-specific nouns
+    const NOUN_INDICATORS: &[&str] = &[
+        // Keep all original indicators
+        "memory", "graph", "node", "edge", "entity", "embedding", "vector", "index", "query",
+        "retrieval", "activation", "potentiation", "consolidation", "decay", "strength", "weight",
+        "threshold", "importance", "robot", "drone", "sensor", "lidar", "camera", "motor",
+        "actuator", "obstacle", "path", "waypoint", "location", "coordinates", "position",
+        "battery", "power", "energy", "voltage", "current", "system", "module", "component",
+        "unit", "device", "temperature", "pressure", "humidity", "speed", "velocity", "signal",
+        "communication", "network", "link", "connection", "navigation", "guidance", "control",
+        "steering", "data", "information", "message", "command", "response", "function", "method",
+        "class", "struct", "interface", "package", "library", "framework", "api", "endpoint",
+        "request", "error", "exception", "bug", "fix", "feature", "test", "benchmark",
+        "performance", "latency", "throughput", "cache", "buffer", "queue", "stack", "heap",
+        "thread", "process", "server", "client", "database", "table", "column", "row", "schema",
+        "migration", "deployment", "container", "cluster", "replica", "person", "people", "user",
+        "agent", "operator", "time", "date", "day", "hour", "minute", "second", "area", "zone",
+        "region", "sector", "space", "task", "mission", "goal", "objective", "target", "warning",
+        "alert", "notification", "level", "status", "state", "condition", "mode", "type", "kind",
+        "version", "release", "update", "change", "result", "output", "input", "value", "key",
+        "name", "id", "identifier",
+        // Additional nouns common in conversational text
+        "sunrise", "sunset", "lake", "mountain", "beach", "forest", "garden", "park", "city",
+        "town", "village", "country", "house", "home", "room", "building", "street", "road",
+        "car", "bus", "train", "plane", "boat", "bicycle", "food", "drink", "water", "coffee",
+        "tea", "breakfast", "lunch", "dinner", "meal", "book", "movie", "music", "song", "art",
+        "painting", "photo", "picture", "video", "game", "sport", "team", "player", "match",
+        "race", "trip", "vacation", "holiday", "weekend", "morning", "evening", "night", "week",
+        "month", "year", "birthday", "wedding", "party", "event", "meeting", "class", "lesson",
+        "course", "school", "college", "university", "job", "work", "office", "company",
+        "business", "project", "plan", "idea", "thought", "feeling", "emotion", "love", "friend",
+        "family", "parent", "child", "kid", "baby", "mother", "father", "sister", "brother",
+        "wife", "husband", "partner", "group", "community", "society", "culture", "tradition",
+        "story", "history", "news", "article", "blog", "post", "comment", "email", "letter",
+        "phone", "call", "text", "chat", "conversation", "discussion", "talk", "speech",
+        "presentation", "question", "answer", "problem", "solution", "issue", "challenge",
+        "opportunity", "success", "failure", "experience", "skill", "knowledge", "wisdom",
+        "truth", "fact", "opinion", "belief", "value", "principle", "rule", "law", "policy",
+        "decision", "choice", "option", "alternative", "reason", "cause", "effect", "impact",
+        "influence", "power", "authority", "responsibility", "duty", "right", "freedom",
+        "justice", "peace", "war", "conflict", "agreement", "contract", "deal", "price", "cost",
+        "money", "dollar", "euro", "pound", "budget", "investment", "profit", "loss", "risk",
+        "reward", "benefit", "advantage", "disadvantage", "strength", "weakness", "opportunity",
+        "threat", "strategy", "tactic", "method", "approach", "technique", "tool", "resource",
+        "material", "product", "service", "quality", "quantity", "size", "shape", "color",
+        "sound", "smell", "taste", "touch", "sight", "sense", "mind", "body", "heart", "soul",
+        "spirit", "health", "illness", "disease", "medicine", "doctor", "nurse", "hospital",
+        "clinic", "therapy", "treatment", "care", "support", "help", "advice", "guidance",
+        "counseling", "coaching", "mentoring", "training", "education", "learning", "teaching",
+        "research", "study", "experiment", "discovery", "invention", "innovation", "technology",
+        "science", "math", "physics", "chemistry", "biology", "psychology", "sociology",
+        "philosophy", "religion", "spirituality", "meditation", "yoga", "exercise", "fitness",
+        "diet", "nutrition", "sleep", "rest", "relaxation", "stress", "anxiety", "depression",
+        "happiness", "joy", "sadness", "anger", "fear", "surprise", "disgust", "trust", "hope",
+        "faith", "courage", "confidence", "pride", "shame", "guilt", "regret", "gratitude",
+        "empathy", "compassion", "kindness", "generosity", "honesty", "integrity", "loyalty",
+        "respect", "tolerance", "patience", "persistence", "determination", "motivation",
+        "inspiration", "creativity", "imagination", "curiosity", "wonder", "beauty", "art",
+        "music", "dance", "theater", "film", "literature", "poetry", "writing", "reading",
+        "speaking", "listening", "communication", "expression", "interpretation", "understanding",
+        "meaning", "purpose", "goal", "dream", "vision", "mission", "passion", "interest",
+        "hobby", "activity", "adventure", "journey", "path", "way", "direction", "destination",
+        "origin", "beginning", "end", "start", "finish", "progress", "growth", "development",
+        "evolution", "transformation", "change", "transition", "shift", "movement", "action",
+        "reaction", "response", "behavior", "habit", "pattern", "routine", "schedule", "plan",
+        "strategy", "tactic", "approach", "method", "process", "procedure", "step", "stage",
+        "phase", "cycle", "circle", "loop", "sequence", "order", "arrangement", "organization",
+        "structure", "system", "network", "connection", "relationship", "bond", "link", "tie",
+        "association", "affiliation", "membership", "participation", "involvement", "engagement",
+        "commitment", "dedication", "devotion", "loyalty", "allegiance", "support", "backing",
+        "endorsement", "approval", "acceptance", "recognition", "acknowledgment", "appreciation",
+        "gratitude", "thanks", "praise", "compliment", "criticism", "feedback", "evaluation",
+        "assessment", "judgment", "opinion", "view", "perspective", "angle", "aspect", "dimension",
+        "element", "component", "part", "piece", "section", "segment", "portion", "share",
+        "fraction", "percentage", "ratio", "proportion", "balance", "equilibrium", "harmony",
+        "unity", "diversity", "variety", "difference", "similarity", "comparison", "contrast",
+        "distinction", "separation", "division", "classification", "category", "class", "type",
+        "kind", "sort", "species", "variety", "version", "edition", "model", "design", "style",
+        "format", "layout", "arrangement", "configuration", "setup", "installation", "deployment",
+    ];
+
+    if NOUN_INDICATORS.contains(&word) {
+        return true;
+    }
+
+    // Noun suffixes
+    if word.ends_with("tion")
+        || word.ends_with("sion")
+        || word.ends_with("ment")
+        || word.ends_with("ness")
+        || word.ends_with("ity")
+        || word.ends_with("ance")
+        || word.ends_with("ence")
+        || word.ends_with("age")
+        || word.ends_with("ure")
+        || word.ends_with("dom")
+        || word.ends_with("ship")
+        || word.ends_with("hood")
+        || word.ends_with("ism")
+        || word.ends_with("ist")
+    {
+        return true;
+    }
+
+    // -er/-or suffixes (but not comparative adjectives)
+    if (word.ends_with("er") || word.ends_with("or")) && word.len() > 4 {
+        // Exclude likely comparatives
+        let without_suffix = &word[..word.len() - 2];
+        if !without_suffix.ends_with("t")
+            && !without_suffix.ends_with("g")
+            && !without_suffix.ends_with("d")
+        {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// Focal entity extracted from query (noun)
 #[derive(Debug, Clone)]
@@ -128,6 +1019,193 @@ impl QueryAnalysis {
             .filter(|e| e.negated)
             .map(|e| e.stem.as_str())
             .collect()
+    }
+
+    /// Convert analysis to IC weights HashMap for BM25 term boosting
+    ///
+    /// Returns a mapping of lowercase terms to their IC weights:
+    /// - Nouns (focal entities): IC_NOUN = 1.5
+    /// - Adjectives (modifiers): IC_ADJECTIVE = 0.9
+    /// - Verbs (relations): IC_VERB = 0.7
+    ///
+    /// Based on Lioma & Ounis (2006) - nouns carry more information content.
+    pub fn to_ic_weights(&self) -> std::collections::HashMap<String, f32> {
+        self.to_ic_weights_with_yake(true)
+    }
+
+    /// Convert analysis to IC weights with optional YAKE boosting
+    ///
+    /// When use_yake=true, extracts discriminative keywords using YAKE algorithm
+    /// and boosts their weights. This is critical for multi-hop queries where
+    /// discriminative terms like "sunrise" must outweigh common terms like "Melanie".
+    pub fn to_ic_weights_with_yake(&self, use_yake: bool) -> std::collections::HashMap<String, f32> {
+        use crate::embeddings::keywords::{KeywordConfig, KeywordExtractor};
+
+        let mut weights = std::collections::HashMap::new();
+
+        // YAKE keyword extraction for discriminative term boosting
+        // YAKE identifies statistically rare/important terms in the query
+        if use_yake {
+            let config = KeywordConfig {
+                max_keywords: 5,
+                ngrams: 2,
+                min_length: 3,
+                ..Default::default()
+            };
+            let extractor = KeywordExtractor::with_config(config);
+            let keywords = extractor.extract(&self.original_query);
+
+            // Boost YAKE-identified keywords with high weights
+            // YAKE importance is 0.0-1.0 where higher = more discriminative
+            // Key insight: Only boost SINGLE words, not bigrams
+            // Bigrams like "Melanie paint" match too broadly - we need specific terms
+            for kw in keywords {
+                let term = kw.text.to_lowercase();
+
+                // Skip bigrams/trigrams - they match documents with either word
+                // which defeats the purpose of discriminative keyword boosting
+                if term.contains(' ') {
+                    continue;
+                }
+
+                // Aggressive boost for single discriminative words
+                // Scale: importance 0.5 → boost 3.5, importance 1.0 → boost 6.0
+                // This ensures rare words like "sunrise" dominate over common words
+                let yake_boost = 1.0 + (kw.importance * 5.0);
+                weights
+                    .entry(term)
+                    .and_modify(|w: &mut f32| *w = w.max(yake_boost))
+                    .or_insert(yake_boost);
+            }
+        }
+
+        // Add focal entities (nouns) with highest IC weight
+        for entity in &self.focal_entities {
+            let term = entity.text.to_lowercase();
+            weights
+                .entry(term)
+                .and_modify(|w: &mut f32| *w = w.max(entity.ic_weight))
+                .or_insert(entity.ic_weight);
+            // Also add stem for fuzzy matching
+            if entity.stem != entity.text.to_lowercase() {
+                weights
+                    .entry(entity.stem.clone())
+                    .and_modify(|w: &mut f32| *w = w.max(entity.ic_weight))
+                    .or_insert(entity.ic_weight);
+            }
+        }
+
+        // Add discriminative modifiers (adjectives)
+        for modifier in &self.discriminative_modifiers {
+            let term = modifier.text.to_lowercase();
+            weights
+                .entry(term)
+                .and_modify(|w: &mut f32| *w = w.max(modifier.ic_weight))
+                .or_insert(modifier.ic_weight);
+            if modifier.stem != modifier.text.to_lowercase() {
+                weights
+                    .entry(modifier.stem.clone())
+                    .and_modify(|w: &mut f32| *w = w.max(modifier.ic_weight))
+                    .or_insert(modifier.ic_weight);
+            }
+        }
+
+        // Add relational context (verbs)
+        for relation in &self.relational_context {
+            let term = relation.text.to_lowercase();
+            weights
+                .entry(term)
+                .and_modify(|w: &mut f32| *w = w.max(relation.ic_weight))
+                .or_insert(relation.ic_weight);
+            if relation.stem != relation.text.to_lowercase() {
+                weights
+                    .entry(relation.stem.clone())
+                    .and_modify(|w: &mut f32| *w = w.max(relation.ic_weight))
+                    .or_insert(relation.ic_weight);
+            }
+        }
+
+        // Boost compound nouns (they carry more specific meaning)
+        for compound in &self.compound_nouns {
+            // Each word in compound gets a small boost
+            for word in compound.split_whitespace() {
+                let term = word.to_lowercase();
+                weights.entry(term).and_modify(|w: &mut f32| *w *= 1.2);
+            }
+        }
+
+        weights
+    }
+
+    /// Get maximum YAKE keyword discriminativeness score for dynamic weight adjustment
+    ///
+    /// Returns (max_importance, discriminative_keywords) where:
+    /// - max_importance: 0.0-1.0, higher means more discriminative keywords found
+    /// - discriminative_keywords: keywords with importance > 0.5 (for logging)
+    ///
+    /// Use this to dynamically adjust BM25/vector weights in hybrid search:
+    /// - High discriminativeness (>0.6) → boost BM25 weight (keyword matching critical)
+    /// - Low discriminativeness (<0.3) → trust vector more (semantic similarity better)
+    pub fn keyword_discriminativeness(&self) -> (f32, Vec<String>) {
+        use crate::embeddings::keywords::{KeywordConfig, KeywordExtractor};
+
+        let config = KeywordConfig {
+            max_keywords: 5,
+            ngrams: 2,
+            min_length: 3,
+            ..Default::default()
+        };
+        let extractor = KeywordExtractor::with_config(config);
+        let keywords = extractor.extract(&self.original_query);
+
+        let mut max_importance = 0.0f32;
+        let mut discriminative = Vec::new();
+
+        for kw in keywords {
+            if kw.importance > max_importance {
+                max_importance = kw.importance;
+            }
+            // Keywords with importance > 0.5 are considered discriminative
+            if kw.importance > 0.5 {
+                discriminative.push(kw.text.to_lowercase());
+            }
+        }
+
+        (max_importance, discriminative)
+    }
+
+    /// Get phrase boosts for BM25 exact phrase matching
+    ///
+    /// Returns compound nouns and adjacent noun pairs as phrases with boost weights.
+    /// Phrase matching significantly improves retrieval for multi-word concepts
+    /// like "support group", "machine learning", "LGBTQ community".
+    pub fn to_phrase_boosts(&self) -> Vec<(String, f32)> {
+        let mut phrases = Vec::new();
+
+        // Add compound nouns with high boost (they are specific concepts)
+        for compound in &self.compound_nouns {
+            // Compound nouns get 2.0x boost for exact phrase match
+            phrases.push((compound.to_lowercase(), 2.0));
+        }
+
+        // Also detect adjacent nouns that might form natural phrases
+        // Even if not in compound_nouns, adjacent entities may form useful phrases
+        if self.focal_entities.len() >= 2 {
+            for i in 0..self.focal_entities.len() - 1 {
+                let e1 = &self.focal_entities[i];
+                let e2 = &self.focal_entities[i + 1];
+                // Only if not negated and not already a compound
+                if !e1.negated && !e2.negated {
+                    let phrase = format!("{} {}", e1.text.to_lowercase(), e2.text.to_lowercase());
+                    if !self.compound_nouns.iter().any(|c| c.to_lowercase() == phrase) {
+                        // Adjacent nouns get 1.5x boost (lower than explicit compounds)
+                        phrases.push((phrase, 1.5));
+                    }
+                }
+            }
+        }
+
+        phrases
     }
 }
 
@@ -367,6 +1445,18 @@ fn detect_compound_nouns(tokens: &[AnnotatedToken]) -> Vec<String> {
         ("graph", "traversal"),
         ("edge", "device"),
         ("air", "gapped"),
+        // Social/community
+        ("support", "group"),
+        ("pride", "parade"),
+        ("poetry", "reading"),
+        ("civil", "rights"),
+        ("human", "rights"),
+        ("social", "media"),
+        ("community", "center"),
+        ("discussion", "group"),
+        ("therapy", "session"),
+        ("art", "therapy"),
+        ("group", "therapy"),
     ];
 
     // Check for known compound patterns
@@ -1460,5 +2550,72 @@ mod tests {
 
         let weight = analysis.total_weight();
         assert!(weight > 0.0);
+    }
+
+    #[test]
+    fn test_to_ic_weights() {
+        use crate::constants::{IC_ADJECTIVE, IC_NOUN, IC_VERB};
+
+        let query = "fast robot detecting obstacles";
+        let analysis = analyze_query(query);
+        let weights = analysis.to_ic_weights();
+
+        // Should have weights for terms
+        assert!(!weights.is_empty(), "Weights should not be empty");
+
+        // Check that weights were generated
+        // Nouns get IC_NOUN (1.5), adjectives IC_ADJECTIVE (0.9), verbs IC_VERB (0.7)
+        // The actual terms depend on POS tagging which may vary
+
+        // At minimum, check that we have some weights with expected IC values
+        let has_noun_weight = weights.values().any(|&w| (w - IC_NOUN).abs() < 0.01);
+        let has_adj_weight = weights.values().any(|&w| (w - IC_ADJECTIVE).abs() < 0.01);
+        let has_verb_weight = weights.values().any(|&w| (w - IC_VERB).abs() < 0.01);
+
+        // At least one type should be present
+        assert!(
+            has_noun_weight || has_adj_weight || has_verb_weight,
+            "Should have at least one IC weight type. Weights: {:?}",
+            weights
+        );
+    }
+
+    #[test]
+    fn test_to_phrase_boosts() {
+        // Test with a query containing known compound noun
+        let query = "machine learning model for semantic search";
+        let analysis = analyze_query(query);
+        let phrases = analysis.to_phrase_boosts();
+
+        // "machine learning" is a known compound pattern
+        let has_ml = phrases.iter().any(|(p, _)| p == "machine learning");
+        let has_ss = phrases.iter().any(|(p, _)| p == "semantic search");
+
+        assert!(
+            has_ml || has_ss,
+            "Should detect 'machine learning' or 'semantic search' as phrase. Found: {:?}",
+            phrases
+        );
+
+        // Compound nouns should have higher boost (2.0)
+        for (phrase, boost) in &phrases {
+            assert!(*boost >= 1.0, "Phrase '{}' should have boost >= 1.0, got {}", phrase, boost);
+        }
+    }
+
+    #[test]
+    fn test_to_phrase_boosts_support_group() {
+        // Test with LoCoMo-style query
+        let query = "when did she go to the support group";
+        let analysis = analyze_query(query);
+        let phrases = analysis.to_phrase_boosts();
+
+        // "support group" should be detected as a compound
+        let has_support_group = phrases.iter().any(|(p, _)| p == "support group");
+        assert!(
+            has_support_group,
+            "Should detect 'support group' as phrase. Found: {:?}",
+            phrases
+        );
     }
 }
