@@ -24,14 +24,18 @@ use uuid::Uuid;
 
 use crate::constants::{
     DENSITY_GRAPH_WEIGHT_MAX, DENSITY_GRAPH_WEIGHT_MIN, DENSITY_LINGUISTIC_WEIGHT,
-    DENSITY_THRESHOLD_MAX, DENSITY_THRESHOLD_MIN, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT,
+    DENSITY_THRESHOLD_MAX, DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2,
+    EDGE_TIER_TRUST_L3, EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT,
     HYBRID_SEMANTIC_WEIGHT, IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN,
+    MEMORY_TIER_GRAPH_MULT_ARCHIVE, MEMORY_TIER_GRAPH_MULT_LONGTERM,
+    MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING,
     SPREADING_ACTIVATION_THRESHOLD, SPREADING_EARLY_TERMINATION_CANDIDATES,
     SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES,
     SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
-use crate::graph_memory::{EpisodicNode, GraphMemory};
+use crate::graph_memory::{EdgeTier, EpisodicNode, GraphMemory};
+use crate::memory::types::MemoryTier;
 // Note: compute_relevance removed - using unified density-weighted scoring directly
 use crate::memory::query_parser::{analyze_query, QueryAnalysis};
 use crate::memory::types::{Memory, Query, RetrievalStats, SharedMemory};
@@ -50,26 +54,28 @@ pub struct ActivatedMemory {
     pub final_score: f32,
 }
 
-/// Calculate density-dependent graph weight (SHO-26)
+/// Calculate density-dependent graph weight (SHO-26, corrected)
 ///
-/// Graph weight scales linearly with density from MIN to MAX:
-/// - density < 0.5: weight = 0.1 (sparse graph, don't trust associations)
-/// - density > 2.0: weight = 0.5 (dense graph, trust learned associations)
+/// SPARSE = TRUST GRAPH (edges that survived Hebbian decay are high-quality)
+/// DENSE = TRUST VECTOR (too many noisy edges, use semantic similarity)
+///
+/// Graph weight scales INVERSELY with density:
+/// - density < 0.5: weight = 0.5 (sparse graph, trust high-signal associations)
+/// - density > 2.0: weight = 0.1 (dense graph, noisy, trust vector search)
 /// - in between: linear interpolation
 ///
-/// Formula: weight = MIN + (density - THRESHOLD_MIN) / (THRESHOLD_MAX - THRESHOLD_MIN) * (MAX - MIN)
-///
-/// Reference: GraphRAG Survey (arXiv 2408.08921)
+/// Reference: GraphRAG Survey (arXiv 2408.08921) + Hebbian learning insight
 pub fn calculate_density_weights(graph_density: f32) -> (f32, f32, f32) {
+    // INVERTED logic: sparse graphs have higher graph weight
     let graph_weight = if graph_density <= DENSITY_THRESHOLD_MIN {
-        DENSITY_GRAPH_WEIGHT_MIN
+        DENSITY_GRAPH_WEIGHT_MAX // Sparse = trust graph more
     } else if graph_density >= DENSITY_THRESHOLD_MAX {
-        DENSITY_GRAPH_WEIGHT_MAX
+        DENSITY_GRAPH_WEIGHT_MIN // Dense = trust vector more
     } else {
-        // Linear interpolation between MIN and MAX
+        // Linear interpolation: higher density = lower graph weight
         let ratio = (graph_density - DENSITY_THRESHOLD_MIN)
             / (DENSITY_THRESHOLD_MAX - DENSITY_THRESHOLD_MIN);
-        DENSITY_GRAPH_WEIGHT_MIN + ratio * (DENSITY_GRAPH_WEIGHT_MAX - DENSITY_GRAPH_WEIGHT_MIN)
+        DENSITY_GRAPH_WEIGHT_MAX - ratio * (DENSITY_GRAPH_WEIGHT_MAX - DENSITY_GRAPH_WEIGHT_MIN)
     };
 
     let linguistic_weight = DENSITY_LINGUISTIC_WEIGHT;
@@ -268,13 +274,28 @@ pub fn spreading_activation_retrieve_with_stats(
                 // Spread activation to connected entity
                 let target_uuid = edge.to_entity;
 
+                // Edge-tier trust weight (SHO-D1)
+                // LTP edges are gold (survived many activations)
+                // L3 edges have proven value (survived decay to semantic tier)
+                // L1 edges are noisy (new, untested) - graph search not optimal
+                let tier_trust = if edge.potentiated {
+                    EDGE_TIER_TRUST_LTP // 0.95 - highest trust
+                } else {
+                    match edge.tier {
+                        EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3, // 0.80
+                        EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2, // 0.50
+                        EdgeTier::L1Working => EDGE_TIER_TRUST_L1,  // 0.20
+                    }
+                };
+
                 // SHO-26: Importance-weighted decay
                 // Use edge strength as proxy for importance (stronger edges = more important)
                 let importance = edge.strength;
                 let decay_rate = calculate_importance_weighted_decay(importance);
                 let decay = (-decay_rate * hop as f32).exp();
 
-                let spread_amount = source_activation * decay * edge.strength;
+                // Include tier_trust in propagation: high-trust edges propagate more activation
+                let spread_amount = source_activation * decay * edge.strength * tier_trust;
 
                 // Accumulate activation
                 let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
@@ -410,11 +431,29 @@ pub fn spreading_activation_retrieve_with_stats(
             let linguistic_raw = calculate_linguistic_match(&memory, &analysis);
             let linguistic_score = linguistic_raw; // Already normalized in calculate_linguistic_match
 
+            // Memory-tier graph weight multiplier (SHO-D2)
+            // Working memories are dense/noisy → lower graph trust
+            // LongTerm memories are sparse/proven → full graph trust
+            let tier_graph_mult = match memory.tier {
+                MemoryTier::Working => MEMORY_TIER_GRAPH_MULT_WORKING,   // 0.3
+                MemoryTier::Session => MEMORY_TIER_GRAPH_MULT_SESSION,   // 0.6
+                MemoryTier::LongTerm => MEMORY_TIER_GRAPH_MULT_LONGTERM, // 1.0
+                MemoryTier::Archive => MEMORY_TIER_GRAPH_MULT_ARCHIVE,   // 1.2
+            };
+
             // Unified scoring using density-dependent weights (calculated at function start)
-            // Weights are: semantic_weight, graph_weight, linguistic_weight
-            let hybrid_score = semantic_score * semantic_weight
-                + graph_activation * graph_weight
-                + linguistic_score * linguistic_weight;
+            // Graph weight is further adjusted by memory tier
+            // Weights are: semantic_weight, graph_weight * tier_mult, linguistic_weight
+            let tier_adjusted_graph_weight = graph_weight * tier_graph_mult;
+            // Renormalize weights to sum to 1.0
+            let weight_sum = semantic_weight + tier_adjusted_graph_weight + linguistic_weight;
+            let norm_semantic = semantic_weight / weight_sum;
+            let norm_graph = tier_adjusted_graph_weight / weight_sum;
+            let norm_linguistic = linguistic_weight / weight_sum;
+
+            let hybrid_score = semantic_score * norm_semantic
+                + graph_activation * norm_graph
+                + linguistic_score * norm_linguistic;
 
             // Recency decay (10% contribution) - recent memories get boost
             // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
@@ -545,18 +584,18 @@ mod tests {
 
     #[test]
     fn test_density_weights_sparse() {
-        // Sparse graph: density < 0.5 -> min graph weight
+        // Sparse graph: density < 0.5 -> MAX graph weight (trust graph)
         let (semantic, graph, linguistic) = calculate_density_weights(0.3);
-        assert!((graph - DENSITY_GRAPH_WEIGHT_MIN).abs() < 0.001);
+        assert!((graph - DENSITY_GRAPH_WEIGHT_MAX).abs() < 0.001);
         assert!((linguistic - DENSITY_LINGUISTIC_WEIGHT).abs() < 0.001);
         assert!((semantic + graph + linguistic - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn test_density_weights_dense() {
-        // Dense graph: density > 2.0 -> max graph weight
+        // Dense graph: density > 2.0 -> MIN graph weight (trust vector)
         let (semantic, graph, linguistic) = calculate_density_weights(2.5);
-        assert!((graph - DENSITY_GRAPH_WEIGHT_MAX).abs() < 0.001);
+        assert!((graph - DENSITY_GRAPH_WEIGHT_MIN).abs() < 0.001);
         assert!((linguistic - DENSITY_LINGUISTIC_WEIGHT).abs() < 0.001);
         assert!((semantic + graph + linguistic - 1.0).abs() < 0.001);
     }

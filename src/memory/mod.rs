@@ -1238,7 +1238,9 @@ impl MemorySystem {
         // 2. Extract entity (Melanie) and event keywords (paint, sunrise, camping)
         // 3. Look up temporal facts matching these
         // 4. Boost the source memories of matching facts
-        let temporal_fact_boost_ids: HashSet<MemoryId> = if has_temporal_query {
+        // Temporal fact lookup - IDs collected for future use in unified boost
+        // Currently Layer 5 handles temporal boost via temporal_refs matching
+        let _temporal_fact_boost_ids: HashSet<MemoryId> = if has_temporal_query {
             if let Some(user_id) = &query.user_id {
                 // Parse query for entity and event keywords
                 let analysis = query_parser::analyze_query(query_text);
@@ -1413,13 +1415,6 @@ impl MemorySystem {
                 }
                 // Count entities in query for adaptive boost (multi-hop detection)
                 let entity_count = a.focal_entities.len() + a.discriminative_modifiers.len();
-                let d = g.get_stats().ok().and_then(|s| {
-                    if s.entity_count > 0 {
-                        Some(s.relationship_count as f32 / s.entity_count as f32)
-                    } else {
-                        None
-                    }
-                });
 
                 // First, collect all query entity UUIDs
                 // Include nouns, adjectives, AND verbs for multi-hop reasoning
@@ -1436,6 +1431,21 @@ impl MemorySystem {
                         query_entities.push(ent.uuid);
                     }
                 }
+
+                // Calculate PER-ENTITY density (not global graph density)
+                // Sparse entities = trust graph, Dense entities = trust vector
+                let d = if !query_entities.is_empty() {
+                    g.entities_average_density(&query_entities).ok().flatten()
+                } else {
+                    // Fallback to global density when no entities found
+                    g.get_stats().ok().and_then(|s| {
+                        if s.entity_count > 0 {
+                            Some(s.relationship_count as f32 / s.entity_count as f32)
+                        } else {
+                            None
+                        }
+                    })
+                };
 
                 let mut ids = Vec::new();
 
@@ -1708,32 +1718,6 @@ impl MemorySystem {
                 }
             }
 
-            // ===========================================================================
-            // LAYER 4.6: TEMPORAL FACT BOOST
-            // ===========================================================================
-            // For temporal queries like "When did Melanie paint a sunrise?", boost memories
-            // that are source memories for matching temporal facts. This ensures the specific
-            // memory containing the answer (e.g., "painted a sunrise in 2022") ranks high.
-            if !temporal_fact_boost_ids.is_empty() {
-                const TEMPORAL_FACT_BOOST: f32 = 0.6; // Strong boost for temporal fact matches
-                let mut boosted_count = 0;
-                for id in &temporal_fact_boost_ids {
-                    if fused.contains_key(id) {
-                        *fused.get_mut(id).unwrap() += TEMPORAL_FACT_BOOST;
-                        boosted_count += 1;
-                    } else {
-                        // Also add memories that weren't in the fusion but match temporal facts
-                        fused.insert(id.clone(), TEMPORAL_FACT_BOOST);
-                        boosted_count += 1;
-                    }
-                }
-                if boosted_count > 0 {
-                    tracing::info!(
-                        "Layer 4.6: Boosted {} memories for temporal fact match",
-                        boosted_count
-                    );
-                }
-            }
 
 
 
