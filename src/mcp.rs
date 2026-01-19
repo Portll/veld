@@ -174,16 +174,14 @@ struct BlockingApiClient {
     client: reqwest::blocking::Client,
     base_url: String,
     api_key: String,
-    user_id: String,
 }
 
 impl BlockingApiClient {
-    fn new(base_url: String, api_key: String, user_id: String) -> Self {
+    fn new(base_url: String, api_key: String) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             base_url,
             api_key,
-            user_id,
         }
     }
 
@@ -249,6 +247,7 @@ struct ListTodosResponse {
 
 #[derive(Deserialize)]
 struct Todo {
+    #[allow(dead_code)]
     id: String,
     content: String,
     status: String,
@@ -327,11 +326,7 @@ fn output_hook(event_name: &str, context: &str) {
 // =============================================================================
 
 fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir: Option<&str>) {
-    let client = BlockingApiClient::new(
-        api_url.to_string(),
-        api_key.to_string(),
-        user_id.to_string(),
-    );
+    let client = BlockingApiClient::new(api_url.to_string(), api_key.to_string());
 
     let dir_name = project_dir
         .and_then(|p| std::path::Path::new(p).file_name())
@@ -414,11 +409,7 @@ fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir
 }
 
 fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message: &str) {
-    let client = BlockingApiClient::new(
-        api_url.to_string(),
-        api_key.to_string(),
-        user_id.to_string(),
-    );
+    let client = BlockingApiClient::new(api_url.to_string(), api_key.to_string());
 
     // Get proactive context based on user message
     let context_result: Result<ProactiveContextResponse> = client.post(
@@ -575,6 +566,7 @@ struct LineageTraceResponse {
 
 #[derive(Deserialize)]
 struct LineageEdgeInfo {
+    #[allow(dead_code)]
     id: String,
     from: String,
     to: String,
@@ -592,6 +584,7 @@ struct LineageConfirmResponse {
 #[derive(Deserialize)]
 struct LineageRejectResponse {
     message: String,
+    #[allow(dead_code)]
     deleted: bool,
 }
 
