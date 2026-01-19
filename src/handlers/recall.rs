@@ -922,6 +922,22 @@ pub async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
+    // 2.5. Record coactivation - strengthen associations between surfaced memories
+    // When memories are retrieved together, their graph edges get stronger (Hebbian learning)
+    if memories.len() >= 2 {
+        let graph = graph_memory.clone();
+        let memory_ids: Vec<uuid::Uuid> = memories
+            .iter()
+            .filter_map(|m| uuid::Uuid::parse_str(&m.id).ok())
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let graph_guard = graph.write();
+            let _ = graph_guard.record_memory_coactivation(&memory_ids);
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Coactivation task panicked: {e}")))?;
+    }
+
     // 3. Check due reminders
     let user_id = req.user_id.clone();
     let due_reminders: Vec<ReminderItem> = {
