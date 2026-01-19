@@ -266,11 +266,32 @@ impl RelationshipEdge {
         let boost = (LTP_LEARNING_RATE + tier_boost) * (1.0 - self.strength);
         self.strength = (self.strength + boost).min(1.0);
 
-        // Check for Long-Term Potentiation threshold
-        if !self.potentiated && self.activation_count >= LTP_THRESHOLD {
-            self.potentiated = true;
-            // LTP bonus: immediate strength boost
-            self.strength = (self.strength + 0.2).min(1.0);
+        // Check for Long-Term Potentiation threshold (SHO-D3: time-aware LTP)
+        // Two paths to LTP:
+        // 1. Standard: 10+ activations (regardless of time)
+        // 2. Time-aware: 5+ activations over 30+ days (sustained value)
+        if !self.potentiated {
+            let standard_ltp = self.activation_count >= LTP_THRESHOLD;
+
+            // Time-aware LTP: fewer activations required for long-lived edges
+            let edge_age_days = (Utc::now() - self.created_at).num_days();
+            let time_aware_ltp = edge_age_days >= LTP_TIME_AWARE_DAYS
+                && self.activation_count >= LTP_TIME_AWARE_THRESHOLD;
+
+            if standard_ltp || time_aware_ltp {
+                self.potentiated = true;
+                // LTP bonus: immediate strength boost
+                self.strength = (self.strength + 0.2).min(1.0);
+
+                if time_aware_ltp && !standard_ltp {
+                    tracing::debug!(
+                        "Edge {} achieved time-aware LTP ({} activations over {} days)",
+                        self.uuid,
+                        self.activation_count,
+                        edge_age_days
+                    );
+                }
+            }
         }
 
         // Tier promotion: check if strength exceeds current tier's promotion threshold
@@ -1123,6 +1144,97 @@ impl GraphMemory {
         }
 
         Ok(edges)
+    }
+
+    /// Calculate edge density for a specific entity (SHO-D5)
+    ///
+    /// Returns the number of edges connected to this entity.
+    /// Used for per-entity density calculation: dense entities use vector search,
+    /// sparse entities use graph search.
+    ///
+    /// This is an O(1) prefix count operation.
+    pub fn entity_edge_count(&self, entity_uuid: &Uuid) -> Result<usize> {
+        let prefix = format!("{entity_uuid}:");
+        let iter = self.entity_edges_db.prefix_iterator(prefix.as_bytes());
+
+        let mut count = 0;
+        for (key, _) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Calculate average edge density for a set of entities (SHO-D5)
+    ///
+    /// Returns the mean number of edges per entity for the given UUIDs.
+    /// Used to determine optimal retrieval strategy:
+    /// - Low density (<5 edges): Trust graph search (sparse, high-signal)
+    /// - High density (>20 edges): Trust vector search (dense, noisy)
+    ///
+    /// Returns None if no entities provided.
+    pub fn entities_average_density(&self, entity_uuids: &[Uuid]) -> Result<Option<f32>> {
+        if entity_uuids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut total_edges = 0usize;
+        for uuid in entity_uuids {
+            total_edges += self.entity_edge_count(uuid)?;
+        }
+
+        Ok(Some(total_edges as f32 / entity_uuids.len() as f32))
+    }
+
+    /// Calculate edge density per tier for a specific entity (SHO-D5)
+    ///
+    /// Returns counts of edges by tier: (L1_count, L2_count, L3_count, LTP_count)
+    /// Useful for understanding if an entity's graph is consolidated (mostly L3/LTP)
+    /// or still noisy (mostly L1).
+    pub fn entity_density_by_tier(&self, entity_uuid: &Uuid) -> Result<(usize, usize, usize, usize)> {
+        let edges = self.get_entity_relationships(entity_uuid)?;
+
+        let mut l1_count = 0;
+        let mut l2_count = 0;
+        let mut l3_count = 0;
+        let mut ltp_count = 0;
+
+        for edge in edges {
+            if edge.potentiated {
+                ltp_count += 1;
+            } else {
+                match edge.tier {
+                    EdgeTier::L1Working => l1_count += 1,
+                    EdgeTier::L2Episodic => l2_count += 1,
+                    EdgeTier::L3Semantic => l3_count += 1,
+                }
+            }
+        }
+
+        Ok((l1_count, l2_count, l3_count, ltp_count))
+    }
+
+    /// Calculate consolidated ratio for an entity (SHO-D5)
+    ///
+    /// Returns the ratio of consolidated edges (L2 + L3 + LTP) to total edges.
+    /// High ratio (>0.7) = trust graph search, Low ratio (<0.3) = trust vector search.
+    ///
+    /// Returns None if entity has no edges.
+    pub fn entity_consolidation_ratio(&self, entity_uuid: &Uuid) -> Result<Option<f32>> {
+        let (l1, l2, l3, ltp) = self.entity_density_by_tier(entity_uuid)?;
+        let total = l1 + l2 + l3 + ltp;
+
+        if total == 0 {
+            return Ok(None);
+        }
+
+        let consolidated = l2 + l3 + ltp;
+        Ok(Some(consolidated as f32 / total as f32))
     }
 
     /// Get relationship by UUID (raw, without decay applied)
