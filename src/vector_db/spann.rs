@@ -65,7 +65,7 @@ use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::info;
@@ -328,8 +328,6 @@ pub struct SpannIndex {
     partitions: Arc<RwLock<Vec<Partition>>>,
     /// Memory-mapped file for disk access
     mmap: Arc<RwLock<Option<Mmap>>>,
-    /// Path to persisted index
-    storage_path: Option<PathBuf>,
     /// Number of vectors indexed
     num_vectors: AtomicUsize,
     /// Number of partitions
@@ -349,7 +347,6 @@ impl SpannIndex {
             quantizer: Arc::new(RwLock::new(None)),
             partitions: Arc::new(RwLock::new(Vec::new())),
             mmap: Arc::new(RwLock::new(None)),
-            storage_path: None,
             num_vectors: AtomicUsize::new(0),
             num_partitions: AtomicUsize::new(0),
             posting_index_offset: AtomicUsize::new(0),
@@ -956,7 +953,6 @@ impl SpannIndex {
             quantizer: Arc::new(RwLock::new(quantizer)),
             partitions: Arc::new(RwLock::new(Vec::new())), // Not loaded - use mmap
             mmap: Arc::new(RwLock::new(Some(mmap))),
-            storage_path: Some(path.to_path_buf()),
             num_vectors: AtomicUsize::new(num_vectors),
             num_partitions: AtomicUsize::new(num_partitions),
             posting_index_offset: AtomicUsize::new(header.posting_index_offset as usize),
