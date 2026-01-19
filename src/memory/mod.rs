@@ -566,7 +566,7 @@ impl MemorySystem {
 
         // Add entities to knowledge graph for associative/causal retrieval
         if let Some(graph) = &self.graph_memory {
-            let mut graph_guard = graph.write();
+            let graph_guard = graph.write();
 
             // First, add all entities from the merged list (NER + tags)
             for entity_name in &memory.experience.entities {
@@ -849,7 +849,7 @@ impl MemorySystem {
 
         // Add entities to knowledge graph with co-occurrence edges
         if let Some(graph) = &self.graph_memory {
-            let mut graph_guard = graph.write();
+            let graph_guard = graph.write();
 
             // Add all entities
             for entity_name in &memory.experience.entities {
@@ -1036,8 +1036,11 @@ impl MemorySystem {
         // Hebbian learning: co-activation strengthens associations between memories
         // When memories are retrieved together, they form/strengthen edges in the memory graph
         if memories.len() >= 2 {
-            let memory_ids: Vec<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
-            self.retriever.record_coactivation(&memory_ids);
+            if let Some(graph) = &self.graph_memory {
+                let memory_uuids: Vec<uuid::Uuid> =
+                    memories.iter().map(|m| m.id.0).collect();
+                let _ = graph.write().record_memory_coactivation(&memory_uuids);
+            }
         }
 
         // Increment and persist retrieval counter
@@ -1968,8 +1971,11 @@ impl MemorySystem {
         // Hebbian learning: co-activation strengthens associations between memories
         // When memories are retrieved together, they form/strengthen edges in the memory graph
         if memories.len() >= 2 {
-            let memory_ids: Vec<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
-            self.retriever.record_coactivation(&memory_ids);
+            if let Some(graph) = &self.graph_memory {
+                let memory_uuids: Vec<uuid::Uuid> =
+                    memories.iter().map(|m| m.id.0).collect();
+                let _ = graph.write().record_memory_coactivation(&memory_uuids);
+            }
         }
 
         // SHO-106: Apply retrieval competition between similar memories
@@ -2809,6 +2815,8 @@ impl MemorySystem {
     }
 
     /// Update access count for a memory (handles concurrency properly)
+    /// Note: Prefer update_access_count_instrumented() for consolidation tracking
+    #[allow(dead_code)]
     fn update_access_count(&self, memory_id: &MemoryId) -> Result<()> {
         // Try updating in working memory first (most common case)
         // Use write lock directly to avoid TOCTOU race condition
@@ -3718,12 +3726,46 @@ impl MemorySystem {
     /// Call this periodically (e.g., every hour or on user logout)
     /// to let unused associations naturally fade.
     pub fn graph_maintenance(&self) {
-        self.retriever.graph_maintenance();
+        if let Some(graph) = &self.graph_memory {
+            let _ = graph.write().apply_decay();
+        }
     }
 
     /// Get memory graph statistics
     pub fn graph_stats(&self) -> MemoryGraphStats {
-        self.retriever.graph_stats()
+        if let Some(graph) = &self.graph_memory {
+            let g = graph.read();
+            if let Ok(stats) = g.get_stats() {
+                // Calculate avg_strength and potentiated_count from relationships
+                let (avg_strength, potentiated_count) =
+                    if let Ok(relationships) = g.get_all_relationships() {
+                        if relationships.is_empty() {
+                            (0.0, 0)
+                        } else {
+                            let total_strength: f32 =
+                                relationships.iter().map(|r| r.strength).sum();
+                            let potentiated = relationships.iter().filter(|r| r.potentiated).count();
+                            (total_strength / relationships.len() as f32, potentiated)
+                        }
+                    } else {
+                        (0.0, 0)
+                    };
+
+                return MemoryGraphStats {
+                    node_count: stats.entity_count,
+                    edge_count: stats.relationship_count,
+                    avg_strength,
+                    potentiated_count,
+                };
+            }
+        }
+        // Return empty stats if no graph
+        MemoryGraphStats {
+            node_count: 0,
+            edge_count: 0,
+            avg_strength: 0.0,
+            potentiated_count: 0,
+        }
     }
 
     // =========================================================================
@@ -3920,7 +3962,7 @@ impl MemorySystem {
 
             // Add entities to knowledge graph with co-occurrence edges
             if let Some(graph) = &self.graph_memory {
-                let mut graph_guard = graph.write();
+                let graph_guard = graph.write();
 
                 // Add all entities
                 for entity_name in &memory.experience.entities {
@@ -4170,6 +4212,17 @@ impl MemorySystem {
         // Note: Graph maintenance doesn't currently report pruned edges,
         // but the retriever could be modified to return pruning stats
         self.graph_maintenance();
+
+        // 3.5. Temporal fact decay: decay/delete stale facts
+        // Facts that haven't been reinforced lose confidence over time
+        let (facts_decayed, facts_deleted) = self.decay_facts_for_all_users().unwrap_or((0, 0));
+        if facts_decayed > 0 || facts_deleted > 0 {
+            tracing::debug!(
+                "Temporal fact maintenance: {} decayed, {} deleted",
+                facts_decayed,
+                facts_deleted
+            );
+        }
 
         // 4. SHO-105: Memory replay cycle (sleep-like consolidation)
         // Replays high-value memories to strengthen them and their associations
