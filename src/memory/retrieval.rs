@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use super::introspection::{ConsolidationEvent, ConsolidationEventBuffer};
+use super::introspection::ConsolidationEventBuffer;
 use super::storage::{MemoryStorage, SearchCriteria};
 use super::types::*;
 use crate::constants::{
     PREFETCH_RECENCY_FULL_BOOST, PREFETCH_RECENCY_FULL_HOURS, PREFETCH_RECENCY_PARTIAL_BOOST,
-    PREFETCH_RECENCY_PARTIAL_HOURS, VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
+    PREFETCH_RECENCY_PARTIAL_HOURS, PREFETCH_TEMPORAL_WINDOW_HOURS,
+    VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
 };
 use crate::embeddings::{minilm::MiniLMEmbedder, Embedder};
 use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
@@ -105,30 +106,6 @@ impl IdMapping {
         self.vector_to_memory.get(&vector_id)
     }
 
-    /// Get the first/primary vector ID for a memory (backwards compatibility)
-    fn get_vector_id(&self, memory_id: &MemoryId) -> Option<u32> {
-        self.memory_to_vectors
-            .get(memory_id)
-            .and_then(|v| v.first().copied())
-    }
-
-    /// Get ALL vector IDs for a memory (chunked case)
-    fn get_vector_ids(&self, memory_id: &MemoryId) -> Option<&Vec<u32>> {
-        self.memory_to_vectors.get(memory_id)
-    }
-
-    /// Remove a memory from the mapping, returns all vector_ids if it existed
-    fn remove(&mut self, memory_id: &MemoryId) -> Option<u32> {
-        if let Some(vector_ids) = self.memory_to_vectors.remove(memory_id) {
-            for vid in &vector_ids {
-                self.vector_to_memory.remove(vid);
-            }
-            vector_ids.first().copied()
-        } else {
-            None
-        }
-    }
-
     /// Remove a memory and return ALL its vector IDs
     fn remove_all(&mut self, memory_id: &MemoryId) -> Vec<u32> {
         if let Some(vector_ids) = self.memory_to_vectors.remove(memory_id) {
@@ -144,11 +121,6 @@ impl IdMapping {
     /// Number of unique memories in the mapping
     fn len(&self) -> usize {
         self.memory_to_vectors.len()
-    }
-
-    /// Total number of vectors (may be > len() due to chunking)
-    fn vector_count(&self) -> usize {
-        self.vector_to_memory.len()
     }
 
     fn clear(&mut self) {
@@ -183,7 +155,6 @@ impl RetrievalEngine {
         consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
     ) -> Result<Self> {
         let storage_path = storage.path().to_path_buf();
-        let index_path = storage_path.join("vector_index");
 
         // Initialize Vamana index optimized for 10M+ memories per user
         let vamana_config = VamanaConfig {
@@ -473,13 +444,6 @@ impl RetrievalEngine {
     /// Set the consolidation event buffer (for late binding after construction)
     pub fn set_consolidation_events(&mut self, events: Arc<RwLock<ConsolidationEventBuffer>>) {
         self.consolidation_events = Some(events);
-    }
-
-    /// Record a consolidation event (helper method)
-    fn record_event(&self, event: ConsolidationEvent) {
-        if let Some(ref buffer) = self.consolidation_events {
-            buffer.write().push(event);
-        }
     }
 
     /// Save Vamana index to disk for instant startup
@@ -1370,7 +1334,7 @@ impl RetrievalEngine {
     ///
     /// Returns true if rebuild was performed
     pub fn auto_rebuild_index_if_needed(&self) -> Result<bool> {
-        let mut index = self.vector_index.write();
+        let index = self.vector_index.write();
         index.auto_rebuild_if_needed()
     }
 
@@ -1758,10 +1722,6 @@ pub enum PrefetchReason {
 pub struct AnticipatoryPrefetch {
     /// Maximum memories to prefetch at once
     max_prefetch: usize,
-    /// Minimum association strength for association-based prefetch
-    min_association_strength: f32,
-    /// Temporal window for pattern matching (hours)
-    temporal_window_hours: i64,
 }
 
 impl Default for AnticipatoryPrefetch {
@@ -1772,20 +1732,12 @@ impl Default for AnticipatoryPrefetch {
 
 impl AnticipatoryPrefetch {
     pub fn new() -> Self {
-        Self {
-            max_prefetch: 20,
-            min_association_strength: 0.3,
-            temporal_window_hours: 2,
-        }
+        Self { max_prefetch: 20 }
     }
 
-    /// Create with custom limits
-    pub fn with_limits(max_prefetch: usize, min_strength: f32, temporal_hours: i64) -> Self {
-        Self {
-            max_prefetch,
-            min_association_strength: min_strength,
-            temporal_window_hours: temporal_hours,
-        }
+    /// Create with custom prefetch limit
+    pub fn with_limit(max_prefetch: usize) -> Self {
+        Self { max_prefetch }
     }
 
     /// Generate prefetch query based on context
@@ -1858,12 +1810,12 @@ impl AnticipatoryPrefetch {
         let now = chrono::Utc::now();
 
         // Find similar time window
-        let start_hour = if hour >= self.temporal_window_hours as u32 {
-            hour - self.temporal_window_hours as u32
+        let start_hour = if hour >= PREFETCH_TEMPORAL_WINDOW_HOURS as u32 {
+            hour - PREFETCH_TEMPORAL_WINDOW_HOURS as u32
         } else {
             0
         };
-        let end_hour = (hour + self.temporal_window_hours as u32).min(23);
+        let end_hour = (hour + PREFETCH_TEMPORAL_WINDOW_HOURS as u32).min(23);
 
         // Calculate time range for today at similar hours
         let start = now
@@ -1928,7 +1880,7 @@ impl AnticipatoryPrefetch {
         // Temporal relevance (same hour of day)
         if let Some(hour) = context.hour_of_day {
             let memory_hour = memory.created_at.hour();
-            if (memory_hour as i32 - hour as i32).abs() <= self.temporal_window_hours as i32 {
+            if (memory_hour as i32 - hour as i32).abs() <= PREFETCH_TEMPORAL_WINDOW_HOURS as i32 {
                 score += 0.1;
             }
         }
