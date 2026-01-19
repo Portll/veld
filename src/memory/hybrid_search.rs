@@ -42,6 +42,11 @@ pub struct HybridSearchConfig {
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f32,
 
+    /// Weight for graph (spreading activation) scores in RRF (0.0-1.0) (SHO-D4)
+    /// Graph weight is dynamic based on graph density and memory tier
+    #[serde(default = "default_graph_weight")]
+    pub graph_weight: f32,
+
     /// RRF constant k (higher = more equal weighting)
     #[serde(default = "default_rrf_k")]
     pub rrf_k: f32,
@@ -61,13 +66,20 @@ pub struct HybridSearchConfig {
     /// Minimum BM25 score to consider (filters noise)
     #[serde(default = "default_min_bm25_score")]
     pub min_bm25_score: f32,
+
+    /// Minimum graph activation score to consider (SHO-D4)
+    #[serde(default = "default_min_graph_score")]
+    pub min_graph_score: f32,
 }
 
 fn default_bm25_weight() -> f32 {
-    0.4 // Reduced: BM25 over-matches common terms (names), diluting rare discriminative terms
+    0.35 // Reduced: BM25 over-matches common terms (names), diluting rare discriminative terms
 }
 fn default_vector_weight() -> f32 {
-    0.6 // Increased: Vector similarity better handles semantic relationships
+    0.40 // Vector similarity handles semantic relationships
+}
+fn default_graph_weight() -> f32 {
+    0.25 // Graph spreading activation for associative retrieval (SHO-D4)
 }
 fn default_rrf_k() -> f32 {
     45.0 // Lower k = more emphasis on top-ranked results
@@ -84,17 +96,22 @@ fn default_use_reranking() -> bool {
 fn default_min_bm25_score() -> f32 {
     0.01 // Lower threshold to capture more keyword matches
 }
+fn default_min_graph_score() -> f32 {
+    0.01 // Lower threshold to capture graph-based associations (SHO-D4)
+}
 
 impl Default for HybridSearchConfig {
     fn default() -> Self {
         Self {
             bm25_weight: default_bm25_weight(),
             vector_weight: default_vector_weight(),
+            graph_weight: default_graph_weight(),
             rrf_k: default_rrf_k(),
             candidate_count: default_candidate_count(),
             rerank_count: default_rerank_count(),
             use_reranking: default_use_reranking(),
             min_bm25_score: default_min_bm25_score(),
+            min_graph_score: default_min_graph_score(),
         }
     }
 }
@@ -114,6 +131,9 @@ pub struct HybridSearchResult {
     /// Vector similarity score (if matched)
     pub vector_score: Option<f32>,
 
+    /// Graph activation score from spreading activation (if matched) (SHO-D4)
+    pub graph_score: Option<f32>,
+
     /// RRF score before reranking
     pub rrf_score: f32,
 
@@ -125,6 +145,9 @@ pub struct HybridSearchResult {
 
     /// Rank from vector search (if matched)
     pub vector_rank: Option<usize>,
+
+    /// Rank from graph spreading activation (if matched) (SHO-D4)
+    pub graph_rank: Option<usize>,
 }
 
 /// BM25 Index using Tantivy
@@ -132,7 +155,6 @@ pub struct BM25Index {
     index: Index,
     reader: IndexReader,
     writer: Arc<RwLock<IndexWriter>>,
-    schema: Schema,
     id_field: Field,
     content_field: Field,
     tags_field: Field,
@@ -186,7 +208,6 @@ impl BM25Index {
             index,
             reader,
             writer: Arc::new(RwLock::new(writer)),
-            schema,
             id_field,
             content_field,
             tags_field,
@@ -799,10 +820,12 @@ impl HybridSearchEngine {
                         score: final_score,
                         bm25_score: bm25_info.map(|(s, _)| *s),
                         vector_score: vector_info.map(|(s, _)| *s),
+                        graph_score: None,
                         rrf_score,
                         rerank_score,
                         bm25_rank: bm25_info.map(|(_, r)| *r),
                         vector_rank: vector_info.map(|(_, r)| *r),
+                        graph_rank: None,
                     });
                 }
 
@@ -827,10 +850,12 @@ impl HybridSearchEngine {
                             score: rrf_score,
                             bm25_score: bm25_info.map(|(s, _)| *s),
                             vector_score: vector_info.map(|(s, _)| *s),
+                            graph_score: None,
                             rrf_score,
                             rerank_score: None,
                             bm25_rank: bm25_info.map(|(_, r)| *r),
                             vector_rank: vector_info.map(|(_, r)| *r),
+                            graph_rank: None,
                         }
                     })
                     .collect()
@@ -848,14 +873,165 @@ impl HybridSearchEngine {
                         score: rrf_score,
                         bm25_score: bm25_info.map(|(s, _)| *s),
                         vector_score: vector_info.map(|(s, _)| *s),
+                        graph_score: None,
                         rrf_score,
                         rerank_score: None,
                         bm25_rank: bm25_info.map(|(_, r)| *r),
                         vector_rank: vector_info.map(|(_, r)| *r),
+                        graph_rank: None,
                     }
                 })
                 .collect()
         };
+
+        Ok(final_results)
+    }
+
+    /// Unified search combining BM25 + Vector + Graph in single RRF fusion (SHO-D4)
+    ///
+    /// This is the recommended search method for optimal retrieval.
+    /// It combines three retrieval signals:
+    /// - BM25: Keyword/term matching (handles exact matches, rare terms)
+    /// - Vector: Semantic similarity (handles meaning, paraphrasing)
+    /// - Graph: Spreading activation (handles associations, related concepts)
+    ///
+    /// The three signals are fused using Reciprocal Rank Fusion (RRF) with
+    /// configurable weights. Graph weight can be dynamically adjusted based
+    /// on graph density (sparse graph = higher graph trust).
+    ///
+    /// # Arguments
+    /// * `query` - Search query text
+    /// * `vector_results` - Pre-computed vector search results (memory_id, similarity)
+    /// * `graph_results` - Pre-computed graph spreading activation results (memory_id, activation)
+    /// * `get_content` - Closure to fetch content for reranking
+    /// * `term_weights` - Optional IC-weighted term boosts for BM25
+    /// * `graph_density` - Optional graph density for dynamic weight adjustment
+    ///
+    /// # Returns
+    /// Unified search results with all component scores
+    pub fn unified_search<F>(
+        &self,
+        query: &str,
+        vector_results: Vec<(MemoryId, f32)>,
+        graph_results: Option<Vec<(MemoryId, f32)>>,
+        _get_content: F,
+        term_weights: Option<&HashMap<String, f32>>,
+        graph_density: Option<f32>,
+    ) -> Result<Vec<HybridSearchResult>>
+    where
+        F: Fn(&MemoryId) -> Option<String>,
+    {
+        // 1. BM25 search with IC-weighted term boosting
+        let bm25_results = self.bm25_index.search_with_term_weights(
+            query,
+            self.config.candidate_count,
+            term_weights,
+        )?;
+
+        // Filter low BM25 scores
+        let bm25_results: Vec<_> = bm25_results
+            .into_iter()
+            .filter(|(_, score)| *score >= self.config.min_bm25_score)
+            .collect();
+
+        // Filter low graph scores if provided
+        let graph_results: Option<Vec<_>> = graph_results.map(|results| {
+            results
+                .into_iter()
+                .filter(|(_, score)| *score >= self.config.min_graph_score)
+                .collect()
+        });
+
+        // Calculate dynamic weights based on graph density (SHO-D4)
+        // Sparse graph = high signal, trust graph more
+        // Dense graph = noisy, trust graph less
+        let (bm25_weight, vector_weight, graph_weight) = if let Some(density) = graph_density {
+            if density < 0.5 {
+                // Sparse graph: boost graph weight (high signal paths)
+                (self.config.bm25_weight * 0.8, self.config.vector_weight * 0.7, self.config.graph_weight * 1.5)
+            } else if density > 2.0 {
+                // Dense graph: reduce graph weight (noisy)
+                (self.config.bm25_weight * 1.1, self.config.vector_weight * 1.1, self.config.graph_weight * 0.5)
+            } else {
+                // Medium density: use configured weights
+                (self.config.bm25_weight, self.config.vector_weight, self.config.graph_weight)
+            }
+        } else {
+            (self.config.bm25_weight, self.config.vector_weight, self.config.graph_weight)
+        };
+
+        // Normalize weights to sum to 1.0
+        let weight_sum = bm25_weight + vector_weight + graph_weight;
+        let norm_bm25 = bm25_weight / weight_sum;
+        let norm_vector = vector_weight / weight_sum;
+        let norm_graph = graph_weight / weight_sum;
+
+        // Log search details
+        debug!(
+            "Unified search: {} BM25, {} vector, {} graph, weights: BM25={:.2}/Vec={:.2}/Graph={:.2}, density={:?}",
+            bm25_results.len(),
+            vector_results.len(),
+            graph_results.as_ref().map(|r| r.len()).unwrap_or(0),
+            norm_bm25,
+            norm_vector,
+            norm_graph,
+            graph_density
+        );
+
+        // 2. RRF Fusion with three retrievers
+        let (fused, graph_map) = if let Some(ref graph) = graph_results {
+            let rrf = RRFusion::new(self.config.rrf_k, vec![norm_bm25, norm_vector, norm_graph]);
+            let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone(), graph.clone()]);
+
+            let graph_map: HashMap<MemoryId, (f32, usize)> = graph
+                .iter()
+                .enumerate()
+                .map(|(rank, (id, score))| (id.clone(), (*score, rank)))
+                .collect();
+
+            (fused, Some(graph_map))
+        } else {
+            // No graph results, fall back to BM25 + Vector only
+            let rrf = RRFusion::new(self.config.rrf_k, vec![norm_bm25, norm_vector]);
+            let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone()]);
+            (fused, None)
+        };
+
+        // Build lookup maps for component scores
+        let bm25_map: HashMap<MemoryId, (f32, usize)> = bm25_results
+            .iter()
+            .enumerate()
+            .map(|(rank, (id, score))| (id.clone(), (*score, rank)))
+            .collect();
+
+        let vector_map: HashMap<MemoryId, (f32, usize)> = vector_results
+            .iter()
+            .enumerate()
+            .map(|(rank, (id, score))| (id.clone(), (*score, rank)))
+            .collect();
+
+        // 3. Build final results (no reranking for unified search)
+        let final_results: Vec<HybridSearchResult> = fused
+            .into_iter()
+            .map(|(memory_id, rrf_score)| {
+                let bm25_info = bm25_map.get(&memory_id);
+                let vector_info = vector_map.get(&memory_id);
+                let graph_info = graph_map.as_ref().and_then(|m| m.get(&memory_id));
+
+                HybridSearchResult {
+                    memory_id,
+                    score: rrf_score,
+                    bm25_score: bm25_info.map(|(s, _)| *s),
+                    vector_score: vector_info.map(|(s, _)| *s),
+                    graph_score: graph_info.map(|(s, _)| *s),
+                    rrf_score,
+                    rerank_score: None,
+                    bm25_rank: bm25_info.map(|(_, r)| *r),
+                    vector_rank: vector_info.map(|(_, r)| *r),
+                    graph_rank: graph_info.map(|(_, r)| *r),
+                }
+            })
+            .collect();
 
         Ok(final_results)
     }
@@ -997,12 +1173,14 @@ mod tests {
     #[test]
     fn test_hybrid_config_defaults() {
         let config = HybridSearchConfig::default();
-        assert_eq!(config.bm25_weight, 0.4); // BM25 reduced to avoid common term over-matching
-        assert_eq!(config.vector_weight, 0.6); // Vector increased for semantic relationships
+        assert_eq!(config.bm25_weight, 0.35); // BM25 for keyword matching
+        assert_eq!(config.vector_weight, 0.40); // Vector for semantic relationships
+        assert_eq!(config.graph_weight, 0.25); // Graph for associative retrieval (SHO-D4)
         assert_eq!(config.rrf_k, 45.0); // Lower k for top-rank emphasis
         assert_eq!(config.candidate_count, 100); // Increased for better recall
         assert_eq!(config.rerank_count, 20);
         assert!(!config.use_reranking); // Disabled: bi-encoder, not cross-encoder
+        assert_eq!(config.min_graph_score, 0.01); // Graph score threshold (SHO-D4)
     }
 
     #[test]
