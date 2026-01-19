@@ -77,9 +77,6 @@ const SRM_THRESHOLD: f64 = 0.05;
 /// Minimum effect size (Cohen's h) for practical significance
 const MIN_PRACTICAL_EFFECT_SIZE: f64 = 0.1;
 
-/// O'Brien-Fleming alpha spending function bounds
-const OBRIEN_FLEMING_ALPHA_SPENT: [f64; 5] = [0.0001, 0.001, 0.01, 0.025, 0.05];
-
 // =============================================================================
 // ADVANCED STATISTICAL TYPES
 // =============================================================================
