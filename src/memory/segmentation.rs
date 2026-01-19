@@ -474,10 +474,6 @@ pub enum DeduplicationResult {
 pub struct DeduplicationEngine {
     /// Content hash -> memory ID index
     content_hashes: HashSet<u64>,
-    /// Semantic similarity threshold for near-duplicates
-    semantic_threshold: f32,
-    /// Entity overlap threshold for related memories
-    entity_overlap_threshold: f32,
 }
 
 impl Default for DeduplicationEngine {
@@ -490,8 +486,6 @@ impl DeduplicationEngine {
     pub fn new() -> Self {
         Self {
             content_hashes: HashSet::new(),
-            semantic_threshold: 0.95,
-            entity_overlap_threshold: 0.80,
         }
     }
 
