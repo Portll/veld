@@ -387,7 +387,7 @@ fn split_temporal_phrases(text: &str) -> Vec<String> {
         " around ", ", ", ". ", "! ", "? ",
     ];
 
-    let mut current = text.to_string();
+    let current = text.to_string();
     for marker in markers {
         let parts: Vec<&str> = current.split(marker).collect();
         if parts.len() > 1 {
@@ -1830,6 +1830,36 @@ pub struct Relation {
     pub negated: bool,
 }
 
+/// Query intent type for retrieval strategy selection (SHO-D6)
+///
+/// Determines the optimal retrieval approach based on query structure:
+/// - Needle: Looking for specific facts → favor BM25/Vector (high precision)
+/// - Exploratory: Seeking related concepts → favor Graph (high recall)
+/// - Hybrid: Balanced query → use all retrieval methods equally
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryIntent {
+    /// Needle query: Seeking specific information
+    /// Examples: "What is John's email?", "When did we deploy v2.0?"
+    /// Strategy: High BM25/Vector weight, low Graph weight
+    Needle,
+
+    /// Exploratory query: Seeking related concepts and associations
+    /// Examples: "Tell me about the project", "What do we know about security?"
+    /// Strategy: Low BM25/Vector weight, high Graph weight
+    Exploratory,
+
+    /// Hybrid query: Balanced between specific and exploratory
+    /// Examples: "How does authentication work?", "What are the deployment options?"
+    /// Strategy: Balanced weights for all retrieval methods
+    Hybrid,
+}
+
+impl Default for QueryIntent {
+    fn default() -> Self {
+        QueryIntent::Hybrid
+    }
+}
+
 /// Complete linguistic analysis of a query
 #[derive(Debug, Clone)]
 pub struct QueryAnalysis {
@@ -1850,6 +1880,9 @@ pub struct QueryAnalysis {
 
     /// True if query contains negation
     pub has_negation: bool,
+
+    /// Detected query intent for retrieval strategy selection (SHO-D6)
+    pub intent: QueryIntent,
 }
 
 impl QueryAnalysis {
@@ -2132,6 +2165,7 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
             compound_nouns: Vec::new(),
             original_query: query_text.to_string(),
             has_negation: false,
+            intent: QueryIntent::Hybrid,
         };
     }
 
@@ -2207,6 +2241,9 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
         });
     }
 
+    // Detect query intent for retrieval strategy (SHO-D6)
+    let intent = detect_query_intent(query_text, &focal_entities, &relational_context);
+
     QueryAnalysis {
         focal_entities,
         discriminative_modifiers,
@@ -2214,6 +2251,89 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
         compound_nouns,
         original_query: query_text.to_string(),
         has_negation,
+        intent,
+    }
+}
+
+/// Detect query intent for retrieval strategy selection (SHO-D6)
+///
+/// Analyzes query structure to determine optimal retrieval approach:
+/// - Needle: Specific fact-seeking queries → favor BM25/Vector
+/// - Exploratory: Association-seeking queries → favor Graph
+/// - Hybrid: Balanced queries → use all methods equally
+fn detect_query_intent(
+    query_text: &str,
+    focal_entities: &[FocalEntity],
+    relational_context: &[Relation],
+) -> QueryIntent {
+    let lower = query_text.to_lowercase();
+
+    // Needle indicators: seeking specific facts
+    let needle_starters = [
+        "what is", "what's", "who is", "who's", "where is", "where's",
+        "when did", "when was", "which", "how much", "how many",
+        "find", "get me", "show me", "list", "give me",
+    ];
+
+    let needle_patterns = [
+        "'s email", "'s phone", "'s address", "'s name",
+        "email of", "phone of", "address of", "name of",
+        "id of", "password", "api key", "token",
+    ];
+
+    // Exploratory indicators: seeking associations and context
+    let exploratory_starters = [
+        "tell me about", "explain", "describe", "what do we know about",
+        "summarize", "overview", "recap", "context",
+        "related to", "associated with", "connected to",
+        "how does", "how do", "why does", "why do",
+    ];
+
+    let exploratory_patterns = [
+        "all about", "everything about", "more about",
+        "history of", "background", "related",
+    ];
+
+    // Check for needle patterns
+    for starter in needle_starters.iter() {
+        if lower.starts_with(starter) {
+            return QueryIntent::Needle;
+        }
+    }
+
+    for pattern in needle_patterns.iter() {
+        if lower.contains(pattern) {
+            return QueryIntent::Needle;
+        }
+    }
+
+    // Check for exploratory patterns
+    for starter in exploratory_starters.iter() {
+        if lower.starts_with(starter) || lower.contains(starter) {
+            return QueryIntent::Exploratory;
+        }
+    }
+
+    for pattern in exploratory_patterns.iter() {
+        if lower.contains(pattern) {
+            return QueryIntent::Exploratory;
+        }
+    }
+
+    // Heuristic: If query has many entities and few relations → Needle
+    // If query has few entities and many relations → Exploratory
+    let entity_count = focal_entities.len();
+    let relation_count = relational_context.len();
+
+    if entity_count > 0 && relation_count == 0 {
+        // Pure entity query (e.g., "John's project") → Needle
+        QueryIntent::Needle
+    } else if relation_count > entity_count {
+        // More relations than entities → Exploratory
+        QueryIntent::Exploratory
+    } else {
+        // Balanced → Hybrid
+        QueryIntent::Hybrid
     }
 }
 
