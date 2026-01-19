@@ -1037,8 +1037,7 @@ impl MemorySystem {
         // When memories are retrieved together, they form/strengthen edges in the memory graph
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
-                let memory_uuids: Vec<uuid::Uuid> =
-                    memories.iter().map(|m| m.id.0).collect();
+                let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 let _ = graph.write().record_memory_coactivation(&memory_uuids);
             }
         }
@@ -1721,14 +1720,6 @@ impl MemorySystem {
                 }
             }
 
-
-
-
-
-
-
-
-
             let mut res: Vec<_> = fused.into_iter().collect();
             res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             res.truncate(query.max_results);
@@ -1972,8 +1963,7 @@ impl MemorySystem {
         // When memories are retrieved together, they form/strengthen edges in the memory graph
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
-                let memory_uuids: Vec<uuid::Uuid> =
-                    memories.iter().map(|m| m.id.0).collect();
+                let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 let _ = graph.write().record_memory_coactivation(&memory_uuids);
             }
         }
@@ -3737,19 +3727,19 @@ impl MemorySystem {
             let g = graph.read();
             if let Ok(stats) = g.get_stats() {
                 // Calculate avg_strength and potentiated_count from relationships
-                let (avg_strength, potentiated_count) =
-                    if let Ok(relationships) = g.get_all_relationships() {
-                        if relationships.is_empty() {
-                            (0.0, 0)
-                        } else {
-                            let total_strength: f32 =
-                                relationships.iter().map(|r| r.strength).sum();
-                            let potentiated = relationships.iter().filter(|r| r.potentiated).count();
-                            (total_strength / relationships.len() as f32, potentiated)
-                        }
-                    } else {
+                let (avg_strength, potentiated_count) = if let Ok(relationships) =
+                    g.get_all_relationships()
+                {
+                    if relationships.is_empty() {
                         (0.0, 0)
-                    };
+                    } else {
+                        let total_strength: f32 = relationships.iter().map(|r| r.strength).sum();
+                        let potentiated = relationships.iter().filter(|r| r.potentiated).count();
+                        (total_strength / relationships.len() as f32, potentiated)
+                    }
+                } else {
+                    (0.0, 0)
+                };
 
                 return MemoryGraphStats {
                     node_count: stats.entity_count,

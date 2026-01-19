@@ -40,20 +40,13 @@ impl QueryParser for RuleBasedParser {
 
         // Resolve relative dates if context provided
         let resolved_dates = if context_date.is_some() {
-            relative_refs
-                .iter()
-                .filter_map(|r| r.resolved)
-                .collect()
+            relative_refs.iter().filter_map(|r| r.resolved).collect()
         } else {
             Vec::new()
         };
 
         // Extract absolute dates from temporal refs
-        let absolute_dates: Vec<NaiveDate> = temporal_refs
-            .refs
-            .iter()
-            .map(|r| r.date)
-            .collect();
+        let absolute_dates: Vec<NaiveDate> = temporal_refs.refs.iter().map(|r| r.date).collect();
 
         // Convert focal entities
         let entities: Vec<Entity> = analysis
@@ -143,7 +136,11 @@ fn detect_entity_type(text: &str) -> EntityType {
     let text_lower = text.to_lowercase();
 
     // Check if it starts with capital (likely proper noun / person)
-    if text.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+    if text
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
         && !text.chars().all(|c| c.is_uppercase())
     {
         // Common person name patterns
@@ -154,17 +151,28 @@ fn detect_entity_type(text: &str) -> EntityType {
     }
 
     // Time-related words
-    if ["morning", "evening", "afternoon", "night", "day", "week", "month", "year"]
-        .iter()
-        .any(|t| text_lower.contains(t))
+    if [
+        "morning",
+        "evening",
+        "afternoon",
+        "night",
+        "day",
+        "week",
+        "month",
+        "year",
+    ]
+    .iter()
+    .any(|t| text_lower.contains(t))
     {
         return EntityType::Time;
     }
 
     // Event-related words
-    if ["meeting", "party", "wedding", "concert", "race", "trip", "vacation"]
-        .iter()
-        .any(|e| text_lower.contains(e))
+    if [
+        "meeting", "party", "wedding", "concert", "race", "trip", "vacation",
+    ]
+    .iter()
+    .any(|e| text_lower.contains(e))
     {
         return EntityType::Event;
     }
@@ -186,10 +194,34 @@ fn is_likely_person_name(word: &str) -> bool {
 
     // Common non-person capitalized words
     let non_names = [
-        "The", "This", "That", "What", "When", "Where", "Who", "How", "Why",
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-        "January", "February", "March", "April", "May", "June", "July",
-        "August", "September", "October", "November", "December",
+        "The",
+        "This",
+        "That",
+        "What",
+        "When",
+        "Where",
+        "Who",
+        "How",
+        "Why",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
 
     !non_names.iter().any(|n| n.eq_ignore_ascii_case(word))
@@ -223,9 +255,8 @@ fn extract_relative_refs(query: &str, context_date: Option<DateTime<Utc>>) -> Ve
 
     for (pattern, direction, unit, offset) in patterns {
         if query_lower.contains(pattern) {
-            let resolved = context_date.and_then(|ctx| {
-                resolve_relative_date(ctx, direction, unit, offset, pattern)
-            });
+            let resolved = context_date
+                .and_then(|ctx| resolve_relative_date(ctx, direction, unit, offset, pattern));
 
             refs.push(RelativeTimeRef {
                 text: pattern.to_string(),
@@ -260,7 +291,8 @@ fn resolve_relative_date(
             let current_weekday = base_date.weekday();
             let days_back = (current_weekday.num_days_from_monday() as i32
                 - target_weekday.num_days_from_monday() as i32
-                + 7) % 7;
+                + 7)
+                % 7;
             let days_back = if days_back == 0 { 7 } else { days_back };
             return Some(base_date - Duration::days(days_back as i64));
         }
@@ -280,9 +312,11 @@ fn resolve_relative_date(
                 base_date.day().min(28),
             )?
         }
-        (TimeDirection::Past, TimeUnit::Year) => {
-            NaiveDate::from_ymd_opt(base_date.year() - offset, base_date.month(), base_date.day())?
-        }
+        (TimeDirection::Past, TimeUnit::Year) => NaiveDate::from_ymd_opt(
+            base_date.year() - offset,
+            base_date.month(),
+            base_date.day(),
+        )?,
         (TimeDirection::Future, TimeUnit::Day) => base_date + Duration::days(offset as i64),
         (TimeDirection::Future, TimeUnit::Week) => base_date + Duration::weeks(offset as i64),
         (TimeDirection::Future, TimeUnit::Month) => {
@@ -295,9 +329,11 @@ fn resolve_relative_date(
                 base_date.day().min(28),
             )?
         }
-        (TimeDirection::Future, TimeUnit::Year) => {
-            NaiveDate::from_ymd_opt(base_date.year() + offset, base_date.month(), base_date.day())?
-        }
+        (TimeDirection::Future, TimeUnit::Year) => NaiveDate::from_ymd_opt(
+            base_date.year() + offset,
+            base_date.month(),
+            base_date.day(),
+        )?,
         _ => return None,
     };
 
@@ -351,6 +387,9 @@ mod tests {
         assert!(!parsed.temporal.relative_refs.is_empty());
         let ref_ = &parsed.temporal.relative_refs[0];
         assert_eq!(ref_.text, "last year");
-        assert_eq!(ref_.resolved, Some(NaiveDate::from_ymd_opt(2022, 5, 8).unwrap()));
+        assert_eq!(
+            ref_.resolved,
+            Some(NaiveDate::from_ymd_opt(2022, 5, 8).unwrap())
+        );
     }
 }

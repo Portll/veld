@@ -28,10 +28,10 @@ use crate::constants::{
     EDGE_TIER_TRUST_L3, EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT,
     HYBRID_SEMANTIC_WEIGHT, IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN,
     MEMORY_TIER_GRAPH_MULT_ARCHIVE, MEMORY_TIER_GRAPH_MULT_LONGTERM,
-    MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING,
-    SPREADING_ACTIVATION_THRESHOLD, SPREADING_EARLY_TERMINATION_CANDIDATES,
-    SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES,
-    SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
+    MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING, SPREADING_ACTIVATION_THRESHOLD,
+    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
+    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
+    SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EpisodicNode, GraphMemory};
@@ -435,10 +435,10 @@ pub fn spreading_activation_retrieve_with_stats(
             // Working memories are dense/noisy → lower graph trust
             // LongTerm memories are sparse/proven → full graph trust
             let tier_graph_mult = match memory.tier {
-                MemoryTier::Working => MEMORY_TIER_GRAPH_MULT_WORKING,   // 0.3
-                MemoryTier::Session => MEMORY_TIER_GRAPH_MULT_SESSION,   // 0.6
+                MemoryTier::Working => MEMORY_TIER_GRAPH_MULT_WORKING, // 0.3
+                MemoryTier::Session => MEMORY_TIER_GRAPH_MULT_SESSION, // 0.6
                 MemoryTier::LongTerm => MEMORY_TIER_GRAPH_MULT_LONGTERM, // 1.0
-                MemoryTier::Archive => MEMORY_TIER_GRAPH_MULT_ARCHIVE,   // 1.2
+                MemoryTier::Archive => MEMORY_TIER_GRAPH_MULT_ARCHIVE, // 1.2
             };
 
             // Unified scoring using density-dependent weights (calculated at function start)

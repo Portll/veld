@@ -409,7 +409,9 @@ pub fn print_env_help() {
     println!("Shodh-Memory Configuration Environment Variables:");
     println!();
     println!("  SHODH_ENV              - Set to 'production' or 'prod' for production mode");
-    println!("  SHODH_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)");
+    println!(
+        "  SHODH_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)"
+    );
     println!("  SHODH_PORT             - Server port (default: 3030)");
     println!("  SHODH_MEMORY_PATH      - Storage directory (default: ./shodh_memory_data)");
     println!("  SHODH_API_KEYS         - Comma-separated API keys (required in production)");

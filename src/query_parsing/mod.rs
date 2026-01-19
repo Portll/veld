@@ -19,13 +19,13 @@
 //! let parsed = parser.parse("When did Melanie paint a sunrise?", Some(conv_date))?;
 //! ```
 
+mod llm_parser;
 mod parser_trait;
 mod rule_based;
-mod llm_parser;
 
+pub use llm_parser::{ApiType, LlmParser};
 pub use parser_trait::*;
 pub use rule_based::RuleBasedParser;
-pub use llm_parser::{ApiType, LlmParser};
 
 use std::sync::Arc;
 

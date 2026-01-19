@@ -948,16 +948,32 @@ impl HybridSearchEngine {
         let (bm25_weight, vector_weight, graph_weight) = if let Some(density) = graph_density {
             if density < 0.5 {
                 // Sparse graph: boost graph weight (high signal paths)
-                (self.config.bm25_weight * 0.8, self.config.vector_weight * 0.7, self.config.graph_weight * 1.5)
+                (
+                    self.config.bm25_weight * 0.8,
+                    self.config.vector_weight * 0.7,
+                    self.config.graph_weight * 1.5,
+                )
             } else if density > 2.0 {
                 // Dense graph: reduce graph weight (noisy)
-                (self.config.bm25_weight * 1.1, self.config.vector_weight * 1.1, self.config.graph_weight * 0.5)
+                (
+                    self.config.bm25_weight * 1.1,
+                    self.config.vector_weight * 1.1,
+                    self.config.graph_weight * 0.5,
+                )
             } else {
                 // Medium density: use configured weights
-                (self.config.bm25_weight, self.config.vector_weight, self.config.graph_weight)
+                (
+                    self.config.bm25_weight,
+                    self.config.vector_weight,
+                    self.config.graph_weight,
+                )
             }
         } else {
-            (self.config.bm25_weight, self.config.vector_weight, self.config.graph_weight)
+            (
+                self.config.bm25_weight,
+                self.config.vector_weight,
+                self.config.graph_weight,
+            )
         };
 
         // Normalize weights to sum to 1.0
@@ -981,7 +997,11 @@ impl HybridSearchEngine {
         // 2. RRF Fusion with three retrievers
         let (fused, graph_map) = if let Some(ref graph) = graph_results {
             let rrf = RRFusion::new(self.config.rrf_k, vec![norm_bm25, norm_vector, norm_graph]);
-            let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone(), graph.clone()]);
+            let fused = rrf.fuse(vec![
+                bm25_results.clone(),
+                vector_results.clone(),
+                graph.clone(),
+            ]);
 
             let graph_map: HashMap<MemoryId, (f32, usize)> = graph
                 .iter()

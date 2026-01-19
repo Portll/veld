@@ -2270,28 +2270,51 @@ fn detect_query_intent(
 
     // Needle indicators: seeking specific facts
     let needle_starters = [
-        "what is", "what's", "who is", "who's", "where is", "where's",
-        "when did", "when was", "which", "how much", "how many",
-        "find", "get me", "show me", "list", "give me",
+        "what is", "what's", "who is", "who's", "where is", "where's", "when did", "when was",
+        "which", "how much", "how many", "find", "get me", "show me", "list", "give me",
     ];
 
     let needle_patterns = [
-        "'s email", "'s phone", "'s address", "'s name",
-        "email of", "phone of", "address of", "name of",
-        "id of", "password", "api key", "token",
+        "'s email",
+        "'s phone",
+        "'s address",
+        "'s name",
+        "email of",
+        "phone of",
+        "address of",
+        "name of",
+        "id of",
+        "password",
+        "api key",
+        "token",
     ];
 
     // Exploratory indicators: seeking associations and context
     let exploratory_starters = [
-        "tell me about", "explain", "describe", "what do we know about",
-        "summarize", "overview", "recap", "context",
-        "related to", "associated with", "connected to",
-        "how does", "how do", "why does", "why do",
+        "tell me about",
+        "explain",
+        "describe",
+        "what do we know about",
+        "summarize",
+        "overview",
+        "recap",
+        "context",
+        "related to",
+        "associated with",
+        "connected to",
+        "how does",
+        "how do",
+        "why does",
+        "why do",
     ];
 
     let exploratory_patterns = [
-        "all about", "everything about", "more about",
-        "history of", "background", "related",
+        "all about",
+        "everything about",
+        "more about",
+        "history of",
+        "background",
+        "related",
     ];
 
     // Check for needle patterns

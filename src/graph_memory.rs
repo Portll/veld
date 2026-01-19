@@ -1196,7 +1196,10 @@ impl GraphMemory {
     /// Returns counts of edges by tier: (L1_count, L2_count, L3_count, LTP_count)
     /// Useful for understanding if an entity's graph is consolidated (mostly L3/LTP)
     /// or still noisy (mostly L1).
-    pub fn entity_density_by_tier(&self, entity_uuid: &Uuid) -> Result<(usize, usize, usize, usize)> {
+    pub fn entity_density_by_tier(
+        &self,
+        entity_uuid: &Uuid,
+    ) -> Result<(usize, usize, usize, usize)> {
         let edges = self.get_entity_relationships(entity_uuid)?;
 
         let mut l1_count = 0;
