@@ -559,6 +559,90 @@ pub const SPREADING_EARLY_TERMINATION_CANDIDATES: usize = 50;
 pub const SPREADING_NORMALIZATION_FACTOR: f32 = 2.0;
 
 // =============================================================================
+// EDGE-TIER TRUST WEIGHTS FOR SPREADING ACTIVATION
+// Based on hippocampal-cortical consolidation: edges that survive decay are
+// more reliable for graph traversal. Dense graphs (L1) are noisy for search,
+// sparse consolidated graphs (L3) have high-signal paths.
+//
+// Key insight: Graph search optimality depends on edge tier:
+// - L1 (Working): Dense, noisy - graph search doesn't discriminate well
+// - L2 (Episodic): Moderate - balanced trust
+// - L3 (Semantic): Sparse, proven - graph search follows meaningful paths
+// - LTP: Gold standard - survived many activations
+// =============================================================================
+
+/// Trust weight for L1 (Working) tier edges in spreading activation
+///
+/// Justification:
+/// - 0.20 (20%) - low trust because L1 is dense and noisy
+/// - New edges haven't proven their value yet
+/// - Graph search not optimal for dense regions
+pub const EDGE_TIER_TRUST_L1: f32 = 0.20;
+
+/// Trust weight for L2 (Episodic) tier edges in spreading activation
+///
+/// Justification:
+/// - 0.50 (50%) - moderate trust, edges have survived initial decay
+/// - In transition between working and semantic memory
+/// - Some signal, some noise
+pub const EDGE_TIER_TRUST_L2: f32 = 0.50;
+
+/// Trust weight for L3 (Semantic) tier edges in spreading activation
+///
+/// Justification:
+/// - 0.80 (80%) - high trust, edges consolidated to long-term storage
+/// - Sparse graph = high-signal paths
+/// - Graph search is optimal for these edges
+pub const EDGE_TIER_TRUST_L3: f32 = 0.80;
+
+/// Trust weight for LTP (potentiated) edges in spreading activation
+///
+/// Justification:
+/// - 0.95 (95%) - highest trust, survived 10+ co-activations
+/// - These are gold-standard learned associations
+/// - Graph search strongly follows these paths
+pub const EDGE_TIER_TRUST_LTP: f32 = 0.95;
+
+// =============================================================================
+// MEMORY-TIER GRAPH WEIGHT MULTIPLIERS (SHO-D2)
+// Based on Cowan's model: memories in different tiers have different graph trust.
+// Working memories are dense/noisy, LongTerm memories are sparse/proven.
+// These multiply the base graph_weight in hybrid scoring.
+// =============================================================================
+
+/// Graph weight multiplier for Working tier memories
+///
+/// Justification:
+/// - 0.3 (30% of base graph weight) - working memory is dense, noisy
+/// - Vector search dominates for recent/working memories
+/// - Graph associations haven't been tested yet
+pub const MEMORY_TIER_GRAPH_MULT_WORKING: f32 = 0.3;
+
+/// Graph weight multiplier for Session tier memories
+///
+/// Justification:
+/// - 0.6 (60% of base graph weight) - session memory is transitional
+/// - Some associations have proven useful within the session
+/// - Balanced between vector and graph
+pub const MEMORY_TIER_GRAPH_MULT_SESSION: f32 = 0.6;
+
+/// Graph weight multiplier for LongTerm tier memories
+///
+/// Justification:
+/// - 1.0 (100% of base graph weight) - long-term memories are proven
+/// - Associations survived decay, graph search is optimal
+/// - Full trust in graph-based retrieval
+pub const MEMORY_TIER_GRAPH_MULT_LONGTERM: f32 = 1.0;
+
+/// Graph weight multiplier for Archive tier memories
+///
+/// Justification:
+/// - 1.2 (120% of base graph weight) - archived memories are gold
+/// - Only accessed via strong associations
+/// - Boost graph weight to surface archived knowledge
+pub const MEMORY_TIER_GRAPH_MULT_ARCHIVE: f32 = 1.2;
+
+// =============================================================================
 // LONG-TERM POTENTIATION (LTP) CONSTANTS
 // Based on synaptic plasticity and Hebbian learning theory
 // =============================================================================
@@ -591,6 +675,27 @@ pub const LTP_DECAY_HALF_LIFE_DAYS: f64 = 14.0;
 /// - 10 activations indicates consistent pattern, not coincidence
 /// - Matches biological LTP threshold (~10-100 activations)
 pub const LTP_THRESHOLD: u32 = 10;
+
+/// Time-aware LTP: activation threshold for long-lived edges (SHO-D3)
+///
+/// Edges older than LTP_TIME_AWARE_DAYS can potentiate with fewer activations.
+/// An edge that persists for 30+ days with 5 activations shows sustained value.
+///
+/// Justification:
+/// - 5 activations over 30+ days = sustained, not coincidental
+/// - Rewards edges that survive despite decay pressure
+/// - Mimics biological late-phase LTP (protein synthesis dependent)
+pub const LTP_TIME_AWARE_THRESHOLD: u32 = 5;
+
+/// Time-aware LTP: minimum edge age in days (SHO-D3)
+///
+/// Edges must be at least this old to qualify for time-aware LTP.
+///
+/// Justification:
+/// - 30 days = ~1 month of sustained relevance
+/// - Matches memory consolidation timeline (hippocampal → cortical)
+/// - Combined with 5 activations, prevents false positives
+pub const LTP_TIME_AWARE_DAYS: i64 = 30;
 
 /// Decay factor for potentiated synapses
 ///
@@ -781,6 +886,13 @@ pub const PREFETCH_RECENCY_FULL_BOOST: f32 = 0.1;
 
 /// Recency boost for recent memories (24h - 1 week)
 pub const PREFETCH_RECENCY_PARTIAL_BOOST: f32 = 0.05;
+
+/// Temporal window (hours) for time-of-day pattern matching in prefetch
+///
+/// Justification:
+/// - 2 hour window captures "similar time of day" patterns
+/// - E.g., if it's 10am, consider memories from 8am-12pm
+pub const PREFETCH_TEMPORAL_WINDOW_HOURS: i32 = 2;
 
 // =============================================================================
 // MEMORY REPLAY CONSTANTS (SHO-105)
