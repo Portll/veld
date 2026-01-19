@@ -1210,8 +1210,8 @@ impl PyMemorySystem {
             dict.insert("edge_count".to_string(), stats.edge_count.into_py(py));
             dict.insert("avg_strength".to_string(), stats.avg_strength.into_py(py));
             dict.insert(
-                "potentiated_edges".to_string(),
-                stats.potentiated_edges.into_py(py),
+                "potentiated_count".to_string(),
+                stats.potentiated_count.into_py(py),
             );
             Ok(dict)
         })
