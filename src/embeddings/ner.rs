@@ -1206,7 +1206,11 @@ mod tests {
         let entities = ner.extract("the quick brown fox jumps").unwrap();
 
         // All lowercase, no entities expected
-        assert!(entities.is_empty());
+        assert!(
+            entities.is_empty(),
+            "Expected no entities but got: {:?}",
+            entities
+        );
     }
 
     #[test]
