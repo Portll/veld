@@ -1213,7 +1213,7 @@ impl StreamingMemoryExtractor {
         let start = std::time::Instant::now();
 
         // Get session config and check if injection is enabled
-        let (config, user_id) = {
+        let (config, _user_id) = {
             let sessions = self.sessions.read().await;
             let session = sessions.get(session_id)?;
             if !session.config.enable_context_injection {
