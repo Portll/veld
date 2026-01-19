@@ -496,9 +496,9 @@ fn bench_prefetch_creation(c: &mut Criterion) {
     });
 }
 
-fn bench_prefetch_with_limits(c: &mut Criterion) {
-    c.bench_function("adaptive_prefetch_with_limits", |b| {
-        b.iter(|| AnticipatoryPrefetch::with_limits(50, 0.5, 4));
+fn bench_prefetch_with_limit(c: &mut Criterion) {
+    c.bench_function("adaptive_prefetch_with_limit", |b| {
+        b.iter(|| AnticipatoryPrefetch::with_limit(50));
     });
 }
 
@@ -855,7 +855,7 @@ criterion_group!(
         .measurement_time(std::time::Duration::from_secs(3));
     targets =
         bench_prefetch_creation,
-        bench_prefetch_with_limits,
+        bench_prefetch_with_limit,
         bench_prefetch_context_creation,
         bench_prefetch_context_from_time,
         bench_generate_prefetch_query_project,
