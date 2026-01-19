@@ -907,7 +907,7 @@ fn test_ltp_persists_across_restart() {
 
         let stats = memory.graph_stats();
         assert!(
-            stats.potentiated_edges > 0 || stats.avg_strength > 0.8,
+            stats.potentiated_count > 0 || stats.avg_strength > 0.8,
             "Should have potentiated edges or high strength after many reinforcements"
         );
     }
@@ -919,9 +919,9 @@ fn test_ltp_persists_across_restart() {
         let stats = memory.graph_stats();
         // Either potentiated edges persist, or strength is high
         assert!(
-            stats.potentiated_edges > 0 || stats.avg_strength > 0.7,
+            stats.potentiated_count > 0 || stats.avg_strength > 0.7,
             "LTP should persist: potentiated={}, avg_strength={}",
-            stats.potentiated_edges,
+            stats.potentiated_count,
             stats.avg_strength
         );
     }

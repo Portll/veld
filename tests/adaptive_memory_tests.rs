@@ -668,8 +668,8 @@ fn test_anticipatory_prefetch_creation() {
 }
 
 #[test]
-fn test_anticipatory_prefetch_with_limits() {
-    let _prefetch = AnticipatoryPrefetch::with_limits(50, 0.5, 4);
+fn test_anticipatory_prefetch_with_limit() {
+    let _prefetch = AnticipatoryPrefetch::with_limit(50);
 }
 
 #[test]

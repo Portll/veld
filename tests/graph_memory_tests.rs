@@ -11,7 +11,7 @@
 use chrono::{DateTime, Duration, Utc};
 use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 use shodh_memory::graph_memory::{
-    EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, RelationType,
+    EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, RelationType,
     RelationshipEdge,
 };
 use shodh_memory::uuid::Uuid;
@@ -106,6 +106,7 @@ fn create_relationship(
         last_activated: Utc::now(),
         activation_count: 0,
         potentiated: false,
+        tier: EdgeTier::L1Working,
     }
 }
 
@@ -133,6 +134,7 @@ fn create_relationship_with_plasticity(
         last_activated,
         activation_count,
         potentiated,
+        tier: EdgeTier::L2Episodic,
     }
 }
 

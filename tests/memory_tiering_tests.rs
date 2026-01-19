@@ -206,10 +206,11 @@ fn test_longterm_persistence() {
             None, // created_at
         );
 
-        let serialized =
-            bincode::serialize(&test_memory).expect("Failed to serialize Memory struct");
-        let deserialized: Memory = bincode::deserialize(&serialized)
-            .expect("Bincode roundtrip failed - serialization format is broken");
+        let serialized = bincode::serde::encode_to_vec(&test_memory, bincode::config::standard())
+            .expect("Failed to serialize Memory struct");
+        let (deserialized, _): (Memory, _) =
+            bincode::serde::decode_from_slice(&serialized, bincode::config::standard())
+                .expect("Bincode roundtrip failed - serialization format is broken");
 
         assert_eq!(
             test_memory.id.0, deserialized.id.0,

@@ -10,7 +10,7 @@
 use chrono::Utc;
 use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
 use shodh_memory::graph_memory::{
-    EntityLabel, EntityNode, GraphMemory, RelationType, RelationshipEdge,
+    EdgeTier, EntityLabel, EntityNode, GraphMemory, RelationType, RelationshipEdge,
 };
 use shodh_memory::uuid::Uuid;
 use std::collections::HashMap;
@@ -105,6 +105,7 @@ fn create_relationship(
         last_activated: Utc::now(),
         activation_count: 0,
         potentiated: false,
+        tier: EdgeTier::L1Working,
     }
 }
 

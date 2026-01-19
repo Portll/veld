@@ -613,13 +613,13 @@ fn test_sla_maintenance_latency() {
     assert!(
         duration <= 1000,
         "SLA VIOLATION: Maintenance of {} memories took {}ms, threshold 1000ms",
-        processed,
+        processed.decayed_count,
         duration
     );
 
     println!(
         "Maintenance: {} memories processed in {}ms",
-        processed, duration
+        processed.decayed_count, duration
     );
 }
 
