@@ -99,6 +99,39 @@ Working Memory ──overflow──▶ Session Memory ──importance──▶ 
 
 ## Claude / Cursor (MCP)
 
+### Quick Start: Full Setup
+
+The MCP client connects to a shodh-memory server. Follow these steps:
+
+**Step 1: Start the server**
+
+Download from [GitHub Releases](https://github.com/varun29ankuS/shodh-memory/releases) or use Docker:
+
+```bash
+# Option A: Direct download (Linux/macOS)
+curl -L https://github.com/varun29ankuS/shodh-memory/releases/latest/download/shodh-memory-linux-x64.tar.gz | tar -xz
+./shodh-memory
+
+# Option B: Docker
+docker run -d -p 3030:3030 -e SHODH_HOST=0.0.0.0 -v shodh-data:/data roshera/shodh-memory
+```
+
+Wait for "Server ready!" message before proceeding.
+
+**Step 2: Generate an API key**
+
+The API key is **locally generated** — you create your own. This is for local client-server authentication, not a cloud service credential:
+
+```bash
+# Generate a random key
+openssl rand -hex 32
+# Example output: a1b2c3d4e5f6...
+```
+
+Set this key on your server via `SHODH_DEV_API_KEY` environment variable.
+
+**Step 3: Configure the MCP client**
+
 **Claude Code (CLI):**
 ```bash
 claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
@@ -112,11 +145,18 @@ claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
       "command": "npx",
       "args": ["-y", "@shodh/memory-mcp"],
       "env": {
-        "SHODH_API_KEY": "your-api-key"
+        "SHODH_API_KEY": "your-generated-key-from-step-2"
       }
     }
   }
 }
+```
+
+**Step 4: Verify connection**
+
+```bash
+curl http://localhost:3030/health
+# Should return: {"status":"ok"}
 ```
 
 **Key MCP Tools:**
@@ -191,10 +231,10 @@ let results = memory.recall("user-1", "user preferences", 5)?;
 | Platform | Status |
 |----------|--------|
 | Linux x86_64 | Supported |
+| Linux ARM64 | Supported |
 | macOS ARM64 (Apple Silicon) | Supported |
 | macOS x86_64 (Intel) | Supported |
 | Windows x86_64 | Supported |
-| Linux ARM64 | Coming soon |
 
 ## Community Implementations
 

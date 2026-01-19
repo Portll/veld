@@ -22,6 +22,8 @@ function getPlatformInfo() {
 
   if (platform === 'linux' && arch === 'x64') {
     return { name: 'shodh-memory-linux-x64', ext: '.tar.gz', binary: 'shodh-memory-server' };
+  } else if (platform === 'linux' && arch === 'arm64') {
+    return { name: 'shodh-memory-linux-arm64', ext: '.tar.gz', binary: 'shodh-memory-server' };
   } else if (platform === 'darwin' && arch === 'x64') {
     return { name: 'shodh-memory-macos-x64', ext: '.tar.gz', binary: 'shodh-memory-server' };
   } else if (platform === 'darwin' && arch === 'arm64') {

@@ -169,6 +169,10 @@ impl CorsConfig {
 /// Server configuration loaded from environment with defaults
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Server host address (default: 127.0.0.1)
+    /// Set to 0.0.0.0 for Docker or network-accessible deployments
+    pub host: String,
+
     /// Server port (default: 3030)
     pub port: u16,
 
@@ -187,10 +191,10 @@ pub struct ServerConfig {
     /// Audit log retention days (default: 30)
     pub audit_retention_days: u64,
 
-    /// Rate limit: requests per second (default: 1000 - LLM-friendly)
+    /// Rate limit: requests per second (default: 4000 - LLM-friendly)
     pub rate_limit_per_second: u64,
 
-    /// Rate limit: burst size (default: 2000 - allows rapid agent bursts)
+    /// Rate limit: burst size (default: 8000 - allows rapid agent bursts)
     pub rate_limit_burst: u32,
 
     /// Maximum concurrent requests (default: 200)
@@ -226,6 +230,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            host: "127.0.0.1".to_string(),
             port: 3030,
             storage_path: PathBuf::from("./shodh_memory_data"),
             max_users_in_memory: 1000,
@@ -259,6 +264,11 @@ impl ServerConfig {
                 v == "production" || v == "prod"
             })
             .unwrap_or(false);
+
+        // Host (bind address)
+        if let Ok(val) = env::var("SHODH_HOST") {
+            config.host = val;
+        }
 
         // Port
         if let Ok(val) = env::var("SHODH_PORT") {
@@ -399,13 +409,14 @@ pub fn print_env_help() {
     println!("Shodh-Memory Configuration Environment Variables:");
     println!();
     println!("  SHODH_ENV              - Set to 'production' or 'prod' for production mode");
+    println!("  SHODH_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)");
     println!("  SHODH_PORT             - Server port (default: 3030)");
     println!("  SHODH_MEMORY_PATH      - Storage directory (default: ./shodh_memory_data)");
     println!("  SHODH_API_KEYS         - Comma-separated API keys (required in production)");
     println!("  SHODH_DEV_API_KEY      - Development API key (required in dev if SHODH_API_KEYS not set)");
     println!("  SHODH_MAX_USERS        - Max users in memory LRU (default: 1000)");
-    println!("  SHODH_RATE_LIMIT       - Requests per second (default: 1000)");
-    println!("  SHODH_RATE_BURST       - Burst size (default: 2000)");
+    println!("  SHODH_RATE_LIMIT       - Requests per second (default: 4000)");
+    println!("  SHODH_RATE_BURST       - Burst size (default: 8000)");
     println!("  SHODH_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
     println!("  SHODH_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
     println!("  SHODH_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");

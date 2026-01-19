@@ -649,82 +649,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "recall_by_tags",
-        description: "Search memories by tags. Returns memories matching ANY of the provided tags.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            tags: {
-              type: "array",
-              items: { type: "string" },
-              description: "Tags to search for (returns memories matching ANY tag)",
-            },
-            limit: {
-              type: "number",
-              description: "Maximum number of results (default: 20)",
-              default: 20,
-            },
-          },
-          required: ["tags"],
-        },
-      },
-      {
-        name: "recall_by_date",
-        description: "Search memories within a date range.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            start: {
-              type: "string",
-              description: "Start date (ISO 8601 format, e.g., '2024-01-01T00:00:00Z')",
-            },
-            end: {
-              type: "string",
-              description: "End date (ISO 8601 format, e.g., '2024-12-31T23:59:59Z')",
-            },
-            limit: {
-              type: "number",
-              description: "Maximum number of results (default: 20)",
-              default: 20,
-            },
-          },
-          required: ["start", "end"],
-        },
-      },
-      {
-        name: "forget_by_tags",
-        description: "Delete memories matching ANY of the provided tags.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            tags: {
-              type: "array",
-              items: { type: "string" },
-              description: "Tags to match for deletion",
-            },
-          },
-          required: ["tags"],
-        },
-      },
-      {
-        name: "forget_by_date",
-        description: "Delete memories within a date range.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            start: {
-              type: "string",
-              description: "Start date (ISO 8601 format)",
-            },
-            end: {
-              type: "string",
-              description: "End date (ISO 8601 format)",
-            },
-          },
-          required: ["start", "end"],
-        },
-      },
-      {
         name: "consolidation_report",
         description: "Get a report of what the memory system has been learning. Shows memory strengthening/decay events, edge formation, fact extraction, and maintenance cycles. Use this to understand how your memories are evolving.",
         inputSchema: {
@@ -783,14 +707,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["context"],
-        },
-      },
-      {
-        name: "streaming_status",
-        description: "Check the status of WebSocket streaming connection. Use this to diagnose if streaming memory ingestion is working.",
-        inputSchema: {
-          type: "object",
-          properties: {},
         },
       },
       {
@@ -1997,128 +1913,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case "recall_by_tags": {
-        const { tags, limit = 20 } = args as { tags: string[]; limit?: number };
-
-        const result = await apiCall<{ memories: Memory[]; count: number }>("/api/recall/tags", "POST", {
-          user_id: USER_ID,
-          tags,
-          limit,
-        });
-
-        const memories = result.memories || [];
-
-        if (memories.length === 0) {
-          let response = `🐘 Recall by Tags\n`;
-          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-          response += `Tags: ${tags.map(t => `#${t}`).join(' ')}\n`;
-          response += `No memories found.`;
-          return {
-            content: [{ type: "text", text: response }],
-          };
-        }
-
-        let response = `🐘 Recall by Tags\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Tags: ${tags.map(t => `#${t}`).join(' ')} │ Found: ${memories.length}\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-        for (let i = 0; i < memories.length; i++) {
-          const m = memories[i];
-          const content = getContent(m);
-          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
-          response += `    ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
-        }
-
-        return {
-          content: [{ type: "text", text: response.trimEnd() }],
-        };
-      }
-
-      case "recall_by_date": {
-        const { start, end, limit = 20 } = args as { start: string; end: string; limit?: number };
-
-        const result = await apiCall<{ memories: Memory[]; count: number }>("/api/recall/date", "POST", {
-          user_id: USER_ID,
-          start,
-          end,
-          limit,
-        });
-
-        const memories = result.memories || [];
-
-        // Format date range for display
-        const startDate = new Date(start).toLocaleDateString();
-        const endDate = new Date(end).toLocaleDateString();
-
-        if (memories.length === 0) {
-          let response = `🐘 Recall by Date\n`;
-          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-          response += `Range: ${startDate} → ${endDate}\n`;
-          response += `No memories found.`;
-          return {
-            content: [{ type: "text", text: response }],
-          };
-        }
-
-        let response = `🐘 Recall by Date\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Range: ${startDate} → ${endDate} │ Found: ${memories.length}\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-        for (let i = 0; i < memories.length; i++) {
-          const m = memories[i];
-          const content = getContent(m);
-          const created = m.created_at ? new Date(m.created_at).toLocaleString() : 'unknown';
-          response += `${String(i + 1).padStart(2)}. ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
-          response += `    ┗━ ${getType(m)} │ ${created}\n`;
-        }
-
-        return {
-          content: [{ type: "text", text: response.trimEnd() }],
-        };
-      }
-
-      case "forget_by_tags": {
-        const { tags } = args as { tags: string[] };
-
-        const result = await apiCall<{ deleted_count: number }>("/api/forget/tags", "POST", {
-          user_id: USER_ID,
-          tags,
-        });
-
-        let response = `🐘 Forget by Tags\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Tags: ${tags.map(t => `#${t}`).join(' ')}\n`;
-        response += `✓ Deleted: ${result.deleted_count} memories`;
-
-        return {
-          content: [{ type: "text", text: response }],
-        };
-      }
-
-      case "forget_by_date": {
-        const { start, end } = args as { start: string; end: string };
-
-        const result = await apiCall<{ deleted_count: number }>("/api/forget/date", "POST", {
-          user_id: USER_ID,
-          start,
-          end,
-        });
-
-        const startDate = new Date(start).toLocaleDateString();
-        const endDate = new Date(end).toLocaleDateString();
-
-        let response = `🐘 Forget by Date\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Range: ${startDate} → ${endDate}\n`;
-        response += `✓ Deleted: ${result.deleted_count} memories`;
-
-        return {
-          content: [{ type: "text", text: response }],
-        };
-      }
-
       case "proactive_context": {
         const {
           context,
@@ -2368,45 +2162,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-
-      case "streaming_status": {
-        const wsState = streamSocket?.readyState;
-        const stateNames = ["CONNECTING", "OPEN", "CLOSING", "CLOSED"];
-        const stateName = wsState !== undefined ? stateNames[wsState] || "UNKNOWN" : "NULL";
-
-        const status = {
-          enabled: STREAM_ENABLED,
-          ws_url: WS_URL,
-          socket_state: stateName,
-          handshake_complete: streamHandshakeComplete,
-          buffer_size: streamBuffer.length,
-          connecting: streamConnecting,
-          reconnect_pending: streamReconnectTimer !== null,
-        };
-
-        // Try to reconnect if not connected
-        if (!streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
-          connectStream().catch(() => {});
-        }
-
-        const statusIcon = status.handshake_complete ? '✓' : '✗';
-        const statusText = status.handshake_complete ? 'ACTIVE' : 'INACTIVE';
-
-        let response = `🐘 Streaming Status\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `${statusIcon} ${statusText}\n`;
-        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Enabled: ${status.enabled ? 'Yes' : 'No'}\n`;
-        response += `Socket: ${status.socket_state}\n`;
-        response += `Handshake: ${status.handshake_complete ? 'Complete' : 'Pending'}\n`;
-        response += `Buffer: ${status.buffer_size} messages\n`;
-        if (status.connecting) response += `Connecting...\n`;
-        if (status.reconnect_pending) response += `Reconnect pending\n`;
-
-        return {
-          content: [{ type: "text", text: response.trimEnd() }],
-        };
-      }
 
       case "token_status": {
         const status = getTokenStatus();

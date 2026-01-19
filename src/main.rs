@@ -133,8 +133,14 @@ async fn main() -> Result<()> {
     ));
 
     // Start server
+    let host = &server_config.host;
     let port = server_config.port;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .unwrap_or_else(|_| {
+            tracing::warn!("Invalid SHODH_HOST '{}', falling back to 127.0.0.1", host);
+            SocketAddr::from(([127, 0, 0, 1], port))
+        });
 
     // Small delay for log flush
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -350,6 +356,7 @@ fn print_config(config: &ServerConfig) {
             "Development"
         }
     );
+    eprintln!("     Host:    {}", config.host);
     eprintln!("     Port:    {}", config.port);
     eprintln!("     Storage: {}", config.storage_path.display());
     eprintln!();

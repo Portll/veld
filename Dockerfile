@@ -51,8 +51,9 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Set environment variables
 ENV RUST_LOG=info \
-    PORT=3030 \
-    STORAGE_PATH=/data
+    SHODH_HOST=0.0.0.0 \
+    SHODH_PORT=3030 \
+    SHODH_MEMORY_PATH=/data
 
 # Run the binary
 CMD ["shodh-memory"]
