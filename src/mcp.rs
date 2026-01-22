@@ -148,7 +148,7 @@ impl AsyncApiClient {
         endpoint: &str,
         body: &T,
     ) -> Result<R> {
-        let url = format!("{}{}", self.base_url, endpoint);
+        let url = format!("{}{endpoint}", self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -161,7 +161,7 @@ impl AsyncApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("API error {}: {}", status, text);
+            anyhow::bail!("API error {status}: {text}");
         }
 
         Ok(resp.json().await?)
@@ -190,7 +190,7 @@ impl BlockingApiClient {
         endpoint: &str,
         body: &T,
     ) -> Result<R> {
-        let url = format!("{}{}", self.base_url, endpoint);
+        let url = format!("{}{endpoint}", self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -202,7 +202,7 @@ impl BlockingApiClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
-            anyhow::bail!("API error {}: {}", status, text);
+            anyhow::bail!("API error {status}: {text}");
         }
 
         Ok(resp.json()?)
@@ -338,7 +338,7 @@ fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir
         "/api/proactive_context",
         &ProactiveContextRequest {
             user_id: user_id.to_string(),
-            context: format!("Starting session in {}", dir_name),
+            context: format!("Starting session in {dir_name}"),
             max_results: 3,
             auto_ingest: false,
         },
