@@ -1508,7 +1508,7 @@ const GEOHASH_CHARS: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
 /// - 10 chars: 1.2m x 60cm (shelf location)
 /// - 11 chars: 15cm x 15cm (sub-meter)
 /// - 12 chars: 4cm x 2cm (high precision)
-
+///
 /// Encode latitude/longitude to geohash string
 pub fn geohash_encode(lat: f64, lon: f64, precision: usize) -> String {
     let mut lat_range = (-90.0, 90.0);
