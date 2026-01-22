@@ -508,7 +508,7 @@ async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
                 let graph_guard = graph_memory.read();
                 engine.surface_relevant(
                     &context,
-                    &*memory_guard,
+                    &memory_guard,
                     Some(&*graph_guard),
                     &effective_config,
                 )

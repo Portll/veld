@@ -1337,7 +1337,7 @@ pub async fn surface_relevant(
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_sys.read();
             let graph_guard = graph_memory.read();
-            engine.surface_relevant(&context, &*memory_guard, Some(&*graph_guard), &config)
+            engine.surface_relevant(&context, &memory_guard, Some(&*graph_guard), &config)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
