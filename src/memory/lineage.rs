@@ -985,7 +985,7 @@ impl PostMortem {
             for learning in &self.learnings {
                 md.push_str(&format!("- {}\n", learning));
             }
-            md.push_str("\n");
+            md.push('\n');
         }
 
         if !self.decisions.is_empty() {
@@ -993,7 +993,7 @@ impl PostMortem {
             for decision in &self.decisions {
                 md.push_str(&format!("- {}\n", decision));
             }
-            md.push_str("\n");
+            md.push('\n');
         }
 
         if !self.errors_resolved.is_empty() {
@@ -1001,7 +1001,7 @@ impl PostMortem {
             for error in &self.errors_resolved {
                 md.push_str(&format!("- {}\n", error));
             }
-            md.push_str("\n");
+            md.push('\n');
         }
 
         if !self.patterns.is_empty() {
@@ -1009,7 +1009,7 @@ impl PostMortem {
             for pattern in &self.patterns {
                 md.push_str(&format!("- {}\n", pattern));
             }
-            md.push_str("\n");
+            md.push('\n');
         }
 
         md.push_str(&format!(
