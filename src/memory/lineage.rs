@@ -973,7 +973,7 @@ impl PostMortem {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
 
-        md.push_str(&format!("# Project Growth Summary\n\n"));
+        md.push_str("# Project Growth Summary\n\n");
         md.push_str(&format!("**{}**\n\n", self.summary));
         md.push_str(&format!(
             "Generated: {}\n\n",
