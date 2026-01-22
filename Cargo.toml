@@ -117,10 +117,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.14"
 
 # Distributed Tracing (P1.6) - OPTIONAL (heavy, ~200 packages, not needed for edge)
+# NOTE: tracing-opentelemetry 0.28 requires opentelemetry 0.27
 tracing-opentelemetry = { version = "0.28", optional = true }
-opentelemetry = { version = "0.28", features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.28", features = ["trace"], optional = true }
-opentelemetry_sdk = { version = "0.28", features = ["trace", "rt-tokio"], optional = true }
+opentelemetry = { version = "0.27", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"], optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"], optional = true }
 
 # Vector operations (lightweight)
 ordered-float = "5.0"

@@ -11,16 +11,20 @@
 //! - Disabled by default for edge devices (saves ~200 packages)
 
 #[cfg(feature = "telemetry")]
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 #[cfg(feature = "telemetry")]
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 #[cfg(feature = "telemetry")]
 use opentelemetry_sdk::{
-    trace::{self, RandomIdGenerator, Sampler},
+    trace::{RandomIdGenerator, Sampler, TracerProvider},
     Resource,
 };
 #[cfg(feature = "telemetry")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Global tracer provider for shutdown
+#[cfg(feature = "telemetry")]
+static TRACER_PROVIDER: std::sync::OnceLock<TracerProvider> = std::sync::OnceLock::new();
 
 /// Initialize distributed tracing with OpenTelemetry
 ///
@@ -38,24 +42,34 @@ pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "shodh-memory".to_string());
 
-    // Configure OpenTelemetry tracer
-    let tracer = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(&otlp_endpoint),
-        )
-        .with_trace_config(
-            trace::config()
-                .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
-                .with_id_generator(RandomIdGenerator::default())
-                .with_resource(Resource::new(vec![
-                    KeyValue::new("service.name", service_name.clone()),
-                    KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-                ])),
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+    // Build span exporter using the new builder API (opentelemetry 0.27+)
+    let exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&otlp_endpoint)
+        .build()?;
+
+    // Build resource with service metadata
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", service_name.clone()),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+    ]);
+
+    // Build tracer provider using the new builder API
+    let tracer_provider = TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource)
+        .build();
+
+    // Get tracer from provider
+    let tracer = tracer_provider.tracer("shodh-memory");
+
+    // Store provider for shutdown
+    let _ = TRACER_PROVIDER.set(tracer_provider.clone());
+
+    // Set as global provider
+    global::set_tracer_provider(tracer_provider);
 
     // Create OpenTelemetry tracing layer
     let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -85,7 +99,11 @@ pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "telemetry")]
 pub fn shutdown_tracing() {
     tracing::info!("Shutting down OpenTelemetry tracing");
-    global::shutdown_tracer_provider();
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            tracing::error!("Error shutting down tracer provider: {:?}", e);
+        }
+    }
 }
 
 /// Middleware for propagating trace context through HTTP headers
