@@ -1858,7 +1858,7 @@ impl GraphMemory {
             // Combine paths
             let full_path: Vec<Uuid> = path_forward
                 .into_iter()
-                .chain(path_backward.into_iter())
+                .chain(path_backward)
                 .collect();
 
             // Build entities with scores
