@@ -1028,18 +1028,18 @@ async fn main() -> Result<()> {
 
 /// Launch Claude Code with Shodh Cortex proxy
 async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
-    let server_url = format!("http://127.0.0.1:{}", port);
+    let server_url = format!("http://127.0.0.1:{port}");
 
     // Check if server is running
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
 
-    let health_url = format!("{}/health", server_url);
+    let health_url = format!("{server_url}/health");
     let server_running = client.get(&health_url).send().await.is_ok();
 
     if !server_running {
-        eprintln!("🧠 Starting shodh-memory server on port {}...", port);
+        eprintln!("🧠 Starting shodh-memory server on port {port}...");
 
         // Start server in background
         let server_binary = std::env::current_exe()?
