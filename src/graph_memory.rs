@@ -4166,8 +4166,17 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
-    /// Create a test relationship edge with specified strength and last_activated
+    /// Create a test relationship edge with specified strength and last_activated (L1 tier)
     fn create_test_edge(strength: f32, days_since_activated: i64) -> RelationshipEdge {
+        create_test_edge_with_tier(strength, days_since_activated, EdgeTier::L1Working)
+    }
+
+    /// Create a test relationship edge with specified strength, last_activated, and tier
+    fn create_test_edge_with_tier(
+        strength: f32,
+        days_since_activated: i64,
+        tier: EdgeTier,
+    ) -> RelationshipEdge {
         RelationshipEdge {
             uuid: Uuid::new_v4(),
             from_entity: Uuid::new_v4(),
@@ -4182,44 +4191,64 @@ mod tests {
             last_activated: Utc::now() - Duration::days(days_since_activated),
             activation_count: 0,
             potentiated: false,
-            tier: EdgeTier::L1Working,
+            tier,
         }
     }
 
     #[test]
     fn test_hebbian_strengthen_increases_strength() {
-        let mut edge = create_test_edge(0.5, 0);
+        use crate::constants::*;
+        // Use L2 tier to avoid L1 promotion resetting strength
+        let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
         let initial_strength = edge.strength;
 
         edge.strengthen();
 
+        // With tier boost (L2 gets 80% of TIER_CO_ACCESS_BOOST), strength should increase
+        let tier_boost = TIER_CO_ACCESS_BOOST * 0.8;
+        let expected_boost = (LTP_LEARNING_RATE + tier_boost) * (1.0 - initial_strength);
         assert!(
             edge.strength > initial_strength,
-            "Strengthen should increase strength"
+            "Strengthen should increase strength (expected boost {})",
+            expected_boost
         );
         assert_eq!(edge.activation_count, 1);
     }
 
     #[test]
     fn test_hebbian_strengthen_asymptotic() {
-        let mut edge = create_test_edge(0.95, 0);
+        use crate::constants::*;
+        // Use L3 tier (no promotion) with high initial strength
+        let mut edge = create_test_edge_with_tier(0.95, 0, EdgeTier::L3Semantic);
 
         edge.strengthen();
 
         // High strength should still increase but slowly (asymptotic to 1.0)
-        assert!(edge.strength > 0.95);
+        // L3 tier boost = TIER_CO_ACCESS_BOOST * 0.5 = 0.075
+        let tier_boost = TIER_CO_ACCESS_BOOST * 0.5;
+        let expected_min = 0.95 + (LTP_LEARNING_RATE + tier_boost) * 0.05 - 0.01;
+        assert!(
+            edge.strength > expected_min,
+            "Expected > {}, got {}",
+            expected_min,
+            edge.strength
+        );
         assert!(edge.strength <= 1.0);
     }
 
     #[test]
     fn test_hebbian_strengthen_formula() {
-        // Test: w_new = w_old + η × (1 - w_old) where η = 0.1
-        let mut edge = create_test_edge(0.5, 0);
+        use crate::constants::*;
+        // Test: w_new = w_old + (η + tier_boost) × (1 - w_old)
+        // Use L2 tier (tier_boost = TIER_CO_ACCESS_BOOST * 0.8) at 0.3 to avoid promotion
+        let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
 
         edge.strengthen();
 
-        // Expected: 0.5 + 0.1 * (1 - 0.5) = 0.5 + 0.05 = 0.55
-        let expected = 0.5 + 0.1 * 0.5;
+        // L2 tier boost = 0.15 * 0.8 = 0.12
+        // Expected: 0.3 + (0.1 + 0.12) * (1 - 0.3) = 0.3 + 0.22 * 0.7 = 0.454
+        let tier_boost = TIER_CO_ACCESS_BOOST * 0.8;
+        let expected = 0.3 + (LTP_LEARNING_RATE + tier_boost) * 0.7;
         assert!(
             (edge.strength - expected).abs() < 0.001,
             "Expected {}, got {}",
@@ -4250,36 +4279,37 @@ mod tests {
 
     #[test]
     fn test_decay_reduces_strength() {
-        let mut edge = create_test_edge(0.5, 7); // 7 days elapsed
+        // Use L2 tier for multi-day decay testing (L1 max age is only 4 hours)
+        let mut edge = create_test_edge_with_tier(0.5, 7, EdgeTier::L2Episodic);
 
         let initial_strength = edge.strength;
         edge.decay();
 
         assert!(
             edge.strength < initial_strength,
-            "Decay should reduce strength"
+            "Decay should reduce strength (initial: {}, after: {})",
+            initial_strength,
+            edge.strength
         );
     }
 
     #[test]
-    fn test_decay_hybrid_model() {
-        // Test hybrid decay: exponential (< 3 days) → power-law (≥ 3 days)
-        // At 14 days with β=0.5:
-        // - Crossover value at 3 days: e^(-0.693 * 3) ≈ 0.125
-        // - Power-law from crossover: 0.125 * (14/3)^(-0.5) ≈ 0.058
-        let mut edge = create_test_edge(1.0, 14);
+    fn test_decay_tier_aware() {
+        // Test tier-aware decay: L2 episodic with 10%/day decay over 7 days
+        // Use L2 tier (max 14 days, 10%/day decay)
+        let mut edge = create_test_edge_with_tier(1.0, 7, EdgeTier::L2Episodic);
 
         edge.decay();
 
-        // Hybrid decay at 14 days should be much less than old exponential 0.5
-        // Expected ~0.058 for normal, allowing some tolerance
+        // After 7 days with ~10%/day linear decay, expect significant reduction
+        // but still above floor since within max age
         assert!(
-            edge.strength < 0.15,
-            "After 14 days with hybrid decay, strength should be < 0.15, got {}",
+            edge.strength < 0.5,
+            "After 7 days with L2 decay, strength should be reduced significantly, got {}",
             edge.strength
         );
         assert!(
-            edge.strength > 0.01,
+            edge.strength > LTP_MIN_STRENGTH,
             "Strength should still be above floor, got {}",
             edge.strength
         );
@@ -4287,7 +4317,8 @@ mod tests {
 
     #[test]
     fn test_decay_minimum_floor() {
-        let mut edge = create_test_edge(0.02, 100); // Very old, very weak
+        // Use L3 tier for very old edge testing (L3 has 10 year max age)
+        let mut edge = create_test_edge_with_tier(0.02, 100, EdgeTier::L3Semantic);
 
         edge.decay();
 
@@ -4299,8 +4330,9 @@ mod tests {
 
     #[test]
     fn test_potentiated_decay_slower() {
-        let mut edge1 = create_test_edge(0.8, 14);
-        let mut edge2 = create_test_edge(0.8, 14);
+        // Use L2 tier for multi-day decay comparison
+        let mut edge1 = create_test_edge_with_tier(0.8, 7, EdgeTier::L2Episodic);
+        let mut edge2 = create_test_edge_with_tier(0.8, 7, EdgeTier::L2Episodic);
         edge2.potentiated = true;
 
         edge1.decay();
@@ -4308,13 +4340,16 @@ mod tests {
 
         assert!(
             edge2.strength > edge1.strength,
-            "Potentiated edge should decay slower"
+            "Potentiated edge should decay slower (normal: {}, potentiated: {})",
+            edge1.strength,
+            edge2.strength
         );
     }
 
     #[test]
     fn test_effective_strength_read_only() {
-        let edge = create_test_edge(0.5, 7);
+        // Use L2 tier for multi-day testing
+        let edge = create_test_edge_with_tier(0.5, 7, EdgeTier::L2Episodic);
         let initial_strength = edge.strength;
 
         let effective = edge.effective_strength();
@@ -4326,21 +4361,23 @@ mod tests {
 
     #[test]
     fn test_decay_prune_threshold() {
-        let mut weak_edge = create_test_edge(LTP_MIN_STRENGTH, 30);
+        // Use L2 tier for decay testing beyond its max age (14 days)
+        let mut weak_edge = create_test_edge_with_tier(LTP_MIN_STRENGTH, 30, EdgeTier::L2Episodic);
         weak_edge.potentiated = false;
 
         let should_prune = weak_edge.decay();
 
-        // Non-potentiated edge at minimum strength after decay should be prunable
+        // Non-potentiated edge at minimum strength past max age should be prunable
         assert!(
             should_prune,
-            "Weak non-potentiated edge should be marked for pruning"
+            "Weak non-potentiated edge past max age should be marked for pruning"
         );
     }
 
     #[test]
     fn test_potentiated_never_pruned() {
-        let mut edge = create_test_edge(LTP_MIN_STRENGTH, 100);
+        // Use L2 tier for testing
+        let mut edge = create_test_edge_with_tier(LTP_MIN_STRENGTH, 30, EdgeTier::L2Episodic);
         edge.potentiated = true;
 
         let should_prune = edge.decay();

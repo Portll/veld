@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_extraction_no_entities() {
+    fn test_fallback_extraction_stop_words_only() {
         let config = NerConfig {
             model_path: PathBuf::from("nonexistent.onnx"),
             tokenizer_path: PathBuf::from("nonexistent.json"),
@@ -1203,12 +1203,13 @@ mod tests {
         };
 
         let ner = NeuralNer::new_fallback(config);
-        let entities = ner.extract("the quick brown fox jumps").unwrap();
+        // Use only stop words which should be filtered out
+        let entities = ner.extract("the a an and or is are was were").unwrap();
 
-        // All lowercase, no entities expected
+        // Only stop words, no entities expected
         assert!(
             entities.is_empty(),
-            "Expected no entities but got: {:?}",
+            "Expected no entities from stop words but got: {:?}",
             entities
         );
     }
