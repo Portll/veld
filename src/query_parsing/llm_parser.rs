@@ -341,7 +341,7 @@ Output this exact JSON structure:
         // Try Ollama health check
         if self
             .client
-            .get(&format!("{}/api/tags", self.endpoint))
+            .get(format!("{}/api/tags", self.endpoint))
             .send()
             .map(|r| r.status().is_success())
             .unwrap_or(false)
@@ -351,7 +351,7 @@ Output this exact JSON structure:
 
         // Try OpenAI-compatible models endpoint
         self.client
-            .get(&format!("{}/v1/models", self.endpoint))
+            .get(format!("{}/v1/models", self.endpoint))
             .send()
             .map(|r| r.status().is_success())
             .unwrap_or(false)

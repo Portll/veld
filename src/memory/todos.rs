@@ -225,7 +225,7 @@ impl TodoStore {
             None => 0,
         };
         let next = current + 1;
-        self.index_db.put(key.as_bytes(), &next.to_le_bytes())?;
+        self.index_db.put(key.as_bytes(), next.to_le_bytes())?;
         Ok(next)
     }
 

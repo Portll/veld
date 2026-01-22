@@ -231,10 +231,10 @@ impl BM25Index {
 
         // Create new document
         let mut doc = TantivyDocument::new();
-        doc.add_text(self.id_field, &memory_id.0.to_string());
+        doc.add_text(self.id_field, memory_id.0.to_string());
         doc.add_text(self.content_field, content);
-        doc.add_text(self.tags_field, &tags.join(" "));
-        doc.add_text(self.entities_field, &entities.join(" "));
+        doc.add_text(self.tags_field, tags.join(" "));
+        doc.add_text(self.entities_field, entities.join(" "));
 
         writer.add_document(doc)?;
 
