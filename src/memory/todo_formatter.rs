@@ -276,7 +276,7 @@ pub fn format_due_todos(todos: &[Todo]) -> String {
         let due_text = todo
             .due_date
             .as_ref()
-            .map(|d| format_due_date(d))
+            .map(format_due_date)
             .unwrap_or_default();
 
         output.push_str(&format!(

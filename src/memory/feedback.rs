@@ -435,7 +435,7 @@ impl FeedbackMomentum {
         let time_since_last = self
             .last_signal_at
             .map(|last| signal_time - last)
-            .unwrap_or_else(|| Duration::zero());
+            .unwrap_or_else(Duration::zero);
 
         if time_since_last < Duration::hours(1) {
             1.0
