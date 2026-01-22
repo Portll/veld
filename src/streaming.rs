@@ -220,7 +220,7 @@ fn default_injection_cooldown() -> u64 {
 
 // Validation bounds to prevent DoS via malformed configs
 const MIN_CHECKPOINT_INTERVAL_MS: u64 = 100; // Minimum 100ms to prevent tight loops
-const MAX_CHECKPOINT_INTERVAL_MS: u64 = 3600_000; // Maximum 1 hour
+const MAX_CHECKPOINT_INTERVAL_MS: u64 = 3_600_000; // Maximum 1 hour
 const MAX_BUFFER_SIZE: usize = 10_000; // Maximum 10k messages to prevent memory exhaustion
 const MAX_TRIGGER_EVENTS: usize = 100; // Maximum trigger event types
 
