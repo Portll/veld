@@ -114,6 +114,11 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      - name: Install LLVM (for RocksDB)
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+
       - name: Download models and ONNX Runtime
         run: |
           mkdir -p bundled/lib bundled/models/minilm-l6 bundled/models/bert-tiny-ner
@@ -195,6 +200,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
+
+      - name: Install LLVM (for RocksDB)
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
 
       - name: Download models and ONNX Runtime
         run: |
