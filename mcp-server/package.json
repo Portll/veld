@@ -1,12 +1,12 @@
 {
   "name": "@shodh/memory-mcp",
-  "version": "0.1.61",
+  "version": "0.1.70",
   "mcpName": "io.github.varun29ankuS/shodh-memory",
   "description": "MCP server for persistent AI memory - store and recall context across sessions",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "shodh-memory-mcp": "./dist/index.js"
+    "shodh-memory-mcp": "dist/index.js"
   },
   "scripts": {
     "start": "bun run index.ts",
@@ -36,7 +36,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/varun29ankuS/shodh-memory"
+    "url": "git+https://github.com/varun29ankuS/shodh-memory.git"
   },
   "homepage": "https://github.com/varun29ankuS/shodh-memory#readme",
   "bugs": {
