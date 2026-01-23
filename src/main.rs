@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
     std::env::set_var("SHODH_PORT", cli.port.to_string());
     std::env::set_var(
         "SHODH_MEMORY_PATH",
-        cli.storage_path.to_string_lossy().as_ref(),
+        cli.storage_path.to_string_lossy().to_string(),
     );
     if cli.production {
         std::env::set_var("SHODH_ENV", "production");
