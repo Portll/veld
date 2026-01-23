@@ -12,7 +12,8 @@ env:
   ORT_VERSION: "1.22.0"
 
 jobs:
-  build:
+  # Native builds for Linux x64, macOS, and Windows
+  build-native:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -25,13 +26,6 @@ jobs:
             ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
             ort_lib: libonnxruntime.so.1.22.0
             ort_lib_name: libonnxruntime.so
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: shodh-memory-linux-arm64
-            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-aarch64-1.22.0.tgz
-            ort_lib: libonnxruntime.so.1.22.0
-            ort_lib_name: libonnxruntime.so
-            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             name: shodh-memory-macos-x64
@@ -60,13 +54,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.cross == true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          cargo install cross --git https://github.com/cross-rs/cross
-
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -92,13 +79,8 @@ jobs:
           Copy-Item "$($ortDir.FullName)\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
           echo "ORT_DYLIB_PATH=$PWD\onnxruntime.dll" >> $env:GITHUB_ENV
 
-      - name: Build (native)
-        if: matrix.cross != true
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross-compile)
-        if: matrix.cross == true
-        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package (Linux x64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -106,24 +88,6 @@ jobs:
           mkdir -p package
           cp target/${{ matrix.target }}/release/shodh-memory-server package/
           cp ${{ matrix.ort_lib_name }} package/
-          # Create wrapper script
-          cat > package/shodh-memory << 'EOF'
-          #!/bin/bash
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
-          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
-          EOF
-          chmod +x package/shodh-memory
-          chmod +x package/shodh-memory-server
-          tar -czvf ${{ matrix.name }}.tar.gz -C package .
-
-      - name: Package (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p package
-          cp target/${{ matrix.target }}/release/shodh-memory-server package/
-          cp ${{ matrix.ort_lib_name }} package/
-          # Create wrapper script
           cat > package/shodh-memory << 'EOF'
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -140,7 +104,6 @@ jobs:
           mkdir -p package
           cp target/${{ matrix.target }}/release/shodh-memory-server package/
           cp ${{ matrix.ort_lib_name }} package/
-          # Create wrapper script
           cat > package/shodh-memory << 'EOF'
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -158,7 +121,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path package
           Copy-Item "target\${{ matrix.target }}\release\shodh-memory-server.exe" -Destination "package\"
           Copy-Item "onnxruntime.dll" -Destination "package\"
-          # Create batch wrapper
           @"
           @echo off
           set "SCRIPT_DIR=%~dp0"
@@ -173,9 +135,60 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.*
 
+  # Cross-compile for Linux ARM64 using custom Docker image
+  build-linux-arm64:
+    name: Build (aarch64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t shodh-cross-arm64 -f docker/cross-aarch64.Dockerfile .
+
+      - name: Download ONNX Runtime
+        run: |
+          curl -L -o ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-aarch64-1.22.0.tgz"
+          tar -xzf ort.tgz
+          ORT_DIR=$(find . -maxdepth 1 -type d -name "onnxruntime-*" | head -1)
+          cp "$ORT_DIR/lib/libonnxruntime.so.1.22.0" ./libonnxruntime.so
+
+      - name: Build in Docker
+        run: |
+          docker run --rm \
+            -v "$PWD:/project" \
+            -w /project \
+            -e ORT_DYLIB_PATH=/project/libonnxruntime.so \
+            shodh-cross-arm64 \
+            cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          mkdir -p package
+          cp target/aarch64-unknown-linux-gnu/release/shodh-memory-server package/
+          cp libonnxruntime.so package/
+          cat > package/shodh-memory << 'EOF'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
+          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
+          EOF
+          chmod +x package/shodh-memory
+          chmod +x package/shodh-memory-server
+          tar -czvf shodh-memory-linux-arm64.tar.gz -C package .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shodh-memory-linux-arm64
+          path: shodh-memory-linux-arm64.tar.gz
+
   release:
     name: Create Release
-    needs: build
+    needs: [build-native, build-linux-arm64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

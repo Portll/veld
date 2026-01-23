@@ -49,7 +49,6 @@ exclude = [
     "STPI_PITCH_DECK.md",
     ".github/",
     "pyproject.toml",
-    "Cross.toml",
 ]
 
 [lib]
