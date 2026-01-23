@@ -13,6 +13,7 @@ categories = ["science", "database", "embedded"]
 exclude = [
     "mcp-server/",
     "python/",
+    "docker/",
     "test_memory_db/",
     "shodh_memory_data/",
     "*.exe",
@@ -48,6 +49,7 @@ exclude = [
     "STPI_PITCH_DECK.md",
     ".github/",
     "pyproject.toml",
+    "Cross.toml",
 ]
 
 [lib]

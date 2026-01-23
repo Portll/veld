@@ -1,0 +1,8 @@
+# Cross-compilation configuration for cross-rs
+# https://github.com/cross-rs/cross
+
+[target.aarch64-unknown-linux-gnu]
+# Use custom Dockerfile with newer LLVM/clang for bindgen compatibility
+# The default cross image has clang-10, but librocksdb-sys needs clang-14+
+# for the clang_Type_getValueType symbol
+dockerfile = "docker/cross-aarch64.Dockerfile"

@@ -98,8 +98,6 @@ jobs:
 
       - name: Build (cross-compile)
         if: matrix.cross == true
-        env:
-          CROSS_REMOTE: "1"
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Package (Linux x64)
