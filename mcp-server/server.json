@@ -1,5 +1,5 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.varun29ankuS/shodh-memory",
   "description": "Persistent AI memory with semantic search. Store and recall context across sessions.",
   "icons": [
@@ -19,12 +19,12 @@
     "source": "github",
     "subfolder": "mcp-server"
   },
-  "version": "0.1.4",
+  "version": "0.1.70",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@shodh/memory-mcp",
-      "version": "0.1.4",
+      "version": "0.1.70",
       "transport": {
         "type": "stdio"
       },
