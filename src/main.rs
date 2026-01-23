@@ -2,14 +2,25 @@
 //!
 //! Clean entry point using modular handlers architecture.
 //! All HTTP handlers are in src/handlers/ modules.
+//!
+//! Usage:
+//!   shodh-memory-server [OPTIONS]
+//!
+//! Options:
+//!   -H, --host <HOST>         Bind address [env: SHODH_HOST] [default: 127.0.0.1]
+//!   -p, --port <PORT>         Port number [env: SHODH_PORT] [default: 3030]
+//!   -s, --storage <PATH>      Storage directory [env: SHODH_MEMORY_PATH] [default: ./shodh_memory_data]
+//!   -h, --help                Print help
+//!   -V, --version             Print version
 
 use anyhow::Result;
+use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 use tower::ServiceBuilder;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
-use tower_http::services::ServeDir;
 use tracing::info;
 
 use shodh_memory::{
@@ -22,6 +33,87 @@ use shodh_memory::{
 #[cfg(feature = "telemetry")]
 use shodh_memory::tracing_setup;
 
+// =============================================================================
+// CLI Arguments
+// =============================================================================
+
+const LONG_ABOUT: &str = r#"
+Shodh-Memory is a cognitive memory system for AI agents, featuring:
+
+  • 3-tier memory (Working → Session → LongTerm) with automatic promotion
+  • Hebbian learning - memories that help get stronger, misleading ones decay
+  • Knowledge graph with spreading activation for associative retrieval
+  • Vector search (MiniLM embeddings + Vamana/DiskANN index)
+  • 100% offline - no cloud, no API keys needed for core functionality
+
+The server exposes a REST API for memory operations. After starting:
+
+  Health check:  curl http://localhost:3030/health
+  Store memory:  curl -X POST http://localhost:3030/api/remember \
+                   -H "Content-Type: application/json" \
+                   -H "X-API-Key: sk-shodh-dev-local-testing-key" \
+                   -d '{"user_id":"test","content":"Hello world"}'
+  Search:        curl -X POST http://localhost:3030/api/recall \
+                   -H "Content-Type: application/json" \
+                   -H "X-API-Key: sk-shodh-dev-local-testing-key" \
+                   -d '{"user_id":"test","query":"hello"}'
+  API docs:      curl http://localhost:3030/health (returns server info)
+"#;
+
+const AFTER_HELP: &str = r#"
+INTEGRATION:
+  Claude Code:   Install hooks from ./hooks/ directory
+  MCP Server:    Run `shodh serve` for Model Context Protocol
+  Python:        pip install shodh-memory
+  TUI:           Run `cargo run -p shodh-memory-tui`
+
+EXAMPLES:
+  # Start with defaults (localhost:3030)
+  shodh-memory-server
+
+  # Custom port, accessible from network
+  shodh-memory-server -H 0.0.0.0 -p 8080
+
+  # Production mode with custom storage
+  shodh-memory-server --production -s /var/lib/shodh
+
+  # Using environment variables
+  SHODH_PORT=9000 SHODH_HOST=0.0.0.0 shodh-memory-server
+
+DOCUMENTATION:
+  GitHub:  https://github.com/varun29ankuS/shodh-memory
+"#;
+
+/// Shodh-Memory Server - Cognitive Memory for AI Agents
+#[derive(Parser)]
+#[command(name = "shodh-memory-server")]
+#[command(version, about, long_about = LONG_ABOUT, after_help = AFTER_HELP)]
+struct Cli {
+    /// Bind address (use 0.0.0.0 for network access)
+    #[arg(short = 'H', long, env = "SHODH_HOST", default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port number to listen on
+    #[arg(short, long, env = "SHODH_PORT", default_value_t = 3030)]
+    port: u16,
+
+    /// Storage directory for RocksDB data
+    #[arg(short, long = "storage", env = "SHODH_MEMORY_PATH", default_value = "./shodh_memory_data")]
+    storage_path: PathBuf,
+
+    /// Production mode: stricter CORS, automatic backups enabled
+    #[arg(long, env = "SHODH_ENV")]
+    production: bool,
+
+    /// Rate limit: max requests per second per client
+    #[arg(long, env = "SHODH_RATE_LIMIT", default_value_t = 4000)]
+    rate_limit: u64,
+
+    /// Maximum concurrent requests before load shedding
+    #[arg(long, env = "SHODH_MAX_CONCURRENT", default_value_t = 200)]
+    max_concurrent: usize,
+}
+
 // Timeout constants for graceful shutdown
 const DATABASE_FLUSH_TIMEOUT_SECS: u64 = 30;
 const VECTOR_INDEX_SAVE_TIMEOUT_SECS: u64 = 60;
@@ -29,7 +121,21 @@ const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file if present
+    // Parse CLI arguments FIRST (enables --help without initializing storage)
+    let cli = Cli::parse();
+
+    // Set environment variables from CLI args so ServerConfig::from_env() picks them up
+    // CLI args take precedence over existing env vars (clap already handles this)
+    std::env::set_var("SHODH_HOST", &cli.host);
+    std::env::set_var("SHODH_PORT", cli.port.to_string());
+    std::env::set_var("SHODH_MEMORY_PATH", cli.storage_path.to_string_lossy().as_ref());
+    if cli.production {
+        std::env::set_var("SHODH_ENV", "production");
+    }
+    std::env::set_var("SHODH_RATE_LIMIT", cli.rate_limit.to_string());
+    std::env::set_var("SHODH_MAX_CONCURRENT", cli.max_concurrent.to_string());
+
+    // Load .env file if present (won't override CLI-set vars)
     let _ = dotenvy::dotenv();
 
     // Initialize tracing
@@ -100,11 +206,23 @@ async fn main() -> Result<()> {
 
     // Build routes using handlers module
     let public_routes = handlers::build_public_routes(Arc::clone(&manager))
-        .nest_service("/static", ServeDir::new("static"))
         .route(
             "/",
             axum::routing::get(|| async {
-                axum::response::Redirect::permanent("/static/live.html")
+                axum::Json(serde_json::json!({
+                    "name": "shodh-memory",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "description": "Cognitive Memory for AI Agents",
+                    "health": "/health",
+                    "api": {
+                        "remember": "POST /api/remember",
+                        "recall": "POST /api/recall",
+                        "forget": "POST /api/forget",
+                        "todos": "GET /api/todos",
+                        "graph": "GET /api/graph/stats"
+                    },
+                    "docs": "https://github.com/varun29ankuS/shodh-memory"
+                }))
             }),
         );
 
@@ -386,9 +504,8 @@ fn print_ready_message(addr: SocketAddr) {
     let _ = std::io::stderr().flush();
     eprintln!();
     eprintln!("  🚀 Server ready!");
-    eprintln!("     HTTP:      http://{}", addr);
+    eprintln!("     API:       http://{}", addr);
     eprintln!("     Health:    http://{}/health", addr);
-    eprintln!("     Dashboard: http://{}/static/live.html", addr);
     eprintln!("     Stream:    ws://{}/api/stream", addr);
     eprintln!();
     eprintln!("  Press Ctrl+C to stop");
