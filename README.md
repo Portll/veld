@@ -207,6 +207,103 @@ let results = memory.recall("user-1", "user preferences", 5)?;
 
 [Full Rust documentation →](https://crates.io/crates/shodh-memory)
 
+## REST API
+
+The server exposes a REST API on `http://localhost:3030`. All `/api/*` endpoints require the `X-API-Key` header.
+
+### Core Memory
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/remember` | Store a memory |
+| POST | `/api/remember/batch` | Store multiple memories |
+| POST | `/api/recall` | Semantic search |
+| POST | `/api/recall/tags` | Search by tags |
+| POST | `/api/proactive_context` | Context-aware retrieval |
+| POST | `/api/context_summary` | Get condensed summary |
+| GET | `/api/memory/{id}` | Get memory by ID |
+| DELETE | `/api/memory/{id}` | Delete memory |
+| POST | `/api/memories` | List with filters |
+| POST | `/api/reinforce` | Hebbian feedback |
+
+### Todos
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/todos` | List todos |
+| POST | `/api/todos/add` | Create todo |
+| POST | `/api/todos/update` | Update todo |
+| POST | `/api/todos/complete` | Mark complete |
+| POST | `/api/todos/delete` | Delete todo |
+| GET | `/api/todos/{id}` | Get todo by ID |
+| GET | `/api/todos/{id}/subtasks` | List subtasks |
+| POST | `/api/todos/stats` | Get statistics |
+
+### Projects
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/projects` | List projects |
+| POST | `/api/projects/add` | Create project |
+| GET | `/api/projects/{id}` | Get project by ID |
+| POST | `/api/projects/delete` | Delete project |
+
+### Health
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Health check |
+| GET | `/metrics` | Prometheus metrics |
+| GET | `/api/context/status` | Context window status |
+
+<details>
+<summary>Example: Store a memory</summary>
+
+```bash
+curl -X POST http://localhost:3030/api/remember \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "user_id": "user-1",
+    "content": "User prefers dark mode",
+    "memory_type": "Decision",
+    "tags": ["preferences", "ui"]
+  }'
+```
+</details>
+
+<details>
+<summary>Example: Semantic search</summary>
+
+```bash
+curl -X POST http://localhost:3030/api/recall \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "user_id": "user-1",
+    "query": "user preferences",
+    "limit": 5
+  }'
+```
+</details>
+
+<details>
+<summary>Example: Create todo</summary>
+
+```bash
+curl -X POST http://localhost:3030/api/todos/add \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{
+    "user_id": "user-1",
+    "content": "Fix authentication bug",
+    "project": "Backend",
+    "priority": "high",
+    "contexts": ["@computer"]
+  }'
+```
+</details>
+
 ## Performance
 
 | Operation | Latency |
