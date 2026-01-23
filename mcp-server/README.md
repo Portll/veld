@@ -30,7 +30,7 @@
 - **Knowledge Graph**: Entity extraction and relationship tracking
 - **Memory Consolidation**: Automatic decay, replay, and strengthening
 - **1-Click Install**: Auto-downloads native server binary for your platform
-- **Offline-First**: All models bundled (~15MB), no internet required after install
+- **Offline-First**: All models auto-downloaded on first run (~38MB total), no internet required after
 - **Fast**: Sub-millisecond graph lookup, 30-50ms semantic search
 
 ## Installation
@@ -56,6 +56,17 @@ Config file locations:
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 - Linux: `~/.config/Claude/claude_desktop_config.json`
+
+**Codex CLI** (`.codex/config.toml`):
+```toml
+[mcp_servers.shodh-memory]
+startup_timeout_sec = 60
+command = "npx"
+args = ["-y", "@shodh/memory-mcp"]
+env = { SHODH_API_KEY = "your-api-key-here" }
+```
+
+> **Note**: First run downloads the server binary (~15MB) plus embedding model (~23MB). The `startup_timeout_sec = 60` ensures enough time for initial setup.
 
 **For Cursor/other MCP clients**: Similar configuration with the npx command.
 
@@ -169,7 +180,7 @@ Based on Cowan's working memory model:
 ## How It Works
 
 1. **Install**: `npx -y @shodh/memory-mcp` downloads the package
-2. **Auto-spawn**: On first run, downloads the native server binary (~15MB)
+2. **Auto-spawn**: On first run, downloads the native server binary (~15MB) and embedding model (~23MB)
 3. **Connect**: MCP client connects to the server via stdio
 4. **Ready**: Start using `remember` and `recall` tools
 
