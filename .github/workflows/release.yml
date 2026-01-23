@@ -67,6 +67,12 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+
       - name: Download ONNX Runtime (Unix)
         if: runner.os != 'Windows'
         run: |
