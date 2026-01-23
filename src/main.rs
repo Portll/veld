@@ -98,7 +98,12 @@ struct Cli {
     port: u16,
 
     /// Storage directory for RocksDB data
-    #[arg(short, long = "storage", env = "SHODH_MEMORY_PATH", default_value = "./shodh_memory_data")]
+    #[arg(
+        short,
+        long = "storage",
+        env = "SHODH_MEMORY_PATH",
+        default_value = "./shodh_memory_data"
+    )]
     storage_path: PathBuf,
 
     /// Production mode: stricter CORS, automatic backups enabled
@@ -128,7 +133,10 @@ async fn main() -> Result<()> {
     // CLI args take precedence over existing env vars (clap already handles this)
     std::env::set_var("SHODH_HOST", &cli.host);
     std::env::set_var("SHODH_PORT", cli.port.to_string());
-    std::env::set_var("SHODH_MEMORY_PATH", cli.storage_path.to_string_lossy().as_ref());
+    std::env::set_var(
+        "SHODH_MEMORY_PATH",
+        cli.storage_path.to_string_lossy().as_ref(),
+    );
     if cli.production {
         std::env::set_var("SHODH_ENV", "production");
     }
@@ -205,26 +213,25 @@ async fn main() -> Result<()> {
     let cors = server_config.cors.to_layer();
 
     // Build routes using handlers module
-    let public_routes = handlers::build_public_routes(Arc::clone(&manager))
-        .route(
-            "/",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({
-                    "name": "shodh-memory",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "description": "Cognitive Memory for AI Agents",
-                    "health": "/health",
-                    "api": {
-                        "remember": "POST /api/remember",
-                        "recall": "POST /api/recall",
-                        "forget": "POST /api/forget",
-                        "todos": "GET /api/todos",
-                        "graph": "GET /api/graph/stats"
-                    },
-                    "docs": "https://github.com/varun29ankuS/shodh-memory"
-                }))
-            }),
-        );
+    let public_routes = handlers::build_public_routes(Arc::clone(&manager)).route(
+        "/",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "name": "shodh-memory",
+                "version": env!("CARGO_PKG_VERSION"),
+                "description": "Cognitive Memory for AI Agents",
+                "health": "/health",
+                "api": {
+                    "remember": "POST /api/remember",
+                    "recall": "POST /api/recall",
+                    "forget": "POST /api/forget",
+                    "todos": "GET /api/todos",
+                    "graph": "GET /api/graph/stats"
+                },
+                "docs": "https://github.com/varun29ankuS/shodh-memory"
+            }))
+        }),
+    );
 
     let protected_routes = handlers::build_protected_routes(Arc::clone(&manager))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
