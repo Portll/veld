@@ -54,6 +54,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-14 libclang-14-dev clang-14
+          echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
       - name: Install LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
