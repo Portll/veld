@@ -395,7 +395,15 @@ async function apiCall<T>(
     }
   }
 
-  throw new Error(`Failed after ${RETRY_ATTEMPTS} attempts: ${lastError?.message || 'Unknown error'}`);
+  // Provide helpful error message
+  const errMsg = lastError?.message || 'Unknown error';
+  if (errMsg.includes('ECONNREFUSED') || errMsg.includes('fetch failed')) {
+    throw new Error(
+      `Cannot connect to shodh-memory server at ${API_URL}. ` +
+      `Start the server with: shodh-memory-server`
+    );
+  }
+  throw new Error(`Failed after ${RETRY_ATTEMPTS} attempts: ${errMsg}`);
 }
 
 // Check if server is available
@@ -3749,7 +3757,12 @@ async function ensureServerRunning(): Promise<void> {
   }
 
   if (!AUTO_SPAWN_ENABLED) {
-    console.error("[shodh-memory] Auto-spawn disabled. Please start the server manually.");
+    console.error("[shodh-memory] Server not running at", API_URL);
+    console.error("[shodh-memory] Auto-spawn disabled (SHODH_AUTO_SPAWN=false).");
+    console.error("[shodh-memory] Start the server manually:");
+    console.error("[shodh-memory]   shodh-memory-server");
+    console.error("[shodh-memory] Or with Docker:");
+    console.error("[shodh-memory]   docker run -d -p 3030:3030 roshera/shodh-memory");
     return;
   }
 

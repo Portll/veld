@@ -95,7 +95,19 @@ async fn fetch_users(base_url: &str, api_key: &str) -> Result<Vec<String>, Strin
                 .await
                 .map_err(|e| format!("Parse error: {}", e))
         }
-        Err(e) => Err(format!("Connection failed: {}", e)),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("Connection refused") || err_str.contains("connection refused") {
+                Err(format!(
+                    "Server not running at {}. Start with: shodh-memory-server",
+                    base_url
+                ))
+            } else if err_str.contains("timed out") || err_str.contains("timeout") {
+                Err(format!("Server at {} not responding (timeout)", base_url))
+            } else {
+                Err(format!("Cannot connect to {}: {}", base_url, err_str))
+            }
+        }
     }
 }
 
