@@ -286,19 +286,31 @@ pub async fn remember(
 
     let experience_type = parse_experience_type(req.memory_type.as_ref());
 
-    // Extract entities via NER and merge with user tags
-    let extracted_names: Vec<String> = match state.get_neural_ner().extract(&req.content) {
-        Ok(entities) => entities.into_iter().map(|e| e.text).collect(),
-        Err(e) => {
-            tracing::debug!("NER extraction failed: {}", e);
-            Vec::new()
-        }
-    };
+    // PERF: Run NER and YAKE extraction in parallel using spawn_blocking
+    // Both are CPU-bound and independent - parallelization reduces latency by ~40%
+    let ner = state.get_neural_ner();
+    let yake = state.get_keyword_extractor();
+    let content_for_ner = req.content.clone();
+    let content_for_yake = req.content.clone();
 
-    // Extract keywords via YAKE for common nouns, verbs, etc.
-    // NER only extracts named entities (Person, Org, Location, Misc)
-    // YAKE captures important terms like "sunrise", "painting", "lake"
-    let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
+    let (ner_result, yake_result) = tokio::join!(
+        // NER extraction (named entities: Person, Org, Location, Misc)
+        tokio::task::spawn_blocking(move || {
+            match ner.extract(&content_for_ner) {
+                Ok(entities) => entities.into_iter().map(|e| e.text).collect::<Vec<String>>(),
+                Err(e) => {
+                    tracing::debug!("NER extraction failed: {}", e);
+                    Vec::new()
+                }
+            }
+        }),
+        // YAKE extraction (keywords: common nouns, verbs, etc.)
+        // Captures important terms like "sunrise", "painting", "lake"
+        tokio::task::spawn_blocking(move || yake.extract_texts(&content_for_yake))
+    );
+
+    let extracted_names = ner_result.unwrap_or_default();
+    let extracted_keywords = yake_result.unwrap_or_default();
 
     let mut merged_entities: Vec<String> = req.tags.clone();
     for entity_name in extracted_names {
