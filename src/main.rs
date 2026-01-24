@@ -275,22 +275,20 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Run server until shutdown signal
-    tokio::select! {
-        result = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        ) => {
-            if let Err(e) = result {
-                tracing::error!("Server error: {}", e);
-            }
-        }
-        _ = shutdown_signal() => {
-            info!("Shutdown signal received");
-        }
+    // Run server with graceful shutdown support
+    // This allows axum to finish in-flight requests before stopping
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
+
+    if let Err(e) = serve_result {
+        tracing::error!("Server error: {}", e);
     }
 
-    // Graceful shutdown with cleanup
+    // Graceful shutdown with cleanup (flush databases, save indices)
     run_shutdown_cleanup(manager_for_shutdown).await;
 
     Ok(())
