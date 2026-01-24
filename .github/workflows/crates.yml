@@ -24,6 +24,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install LLVM (for RocksDB/clang-sys)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-14 clang-14 libclang-14-dev
+          echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> $GITHUB_ENV
+
       - name: Verify package (dry-run)
         run: cargo publish --dry-run
 
