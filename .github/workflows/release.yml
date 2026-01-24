@@ -86,14 +86,20 @@ jobs:
           Copy-Item "$($ortDir.FullName)\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
           echo "ORT_DYLIB_PATH=$PWD\onnxruntime.dll" >> $env:GITHUB_ENV
 
-      - name: Build
+      - name: Build Server
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build TUI
+        run: |
+          cd tui
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Linux x64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           mkdir -p package
           cp target/${{ matrix.target }}/release/shodh-memory-server package/
+          cp tui/target/${{ matrix.target }}/release/shodh-tui package/
           cp ${{ matrix.ort_lib_name }} package/
           cat > package/shodh-memory << 'EOF'
           #!/bin/bash
@@ -103,6 +109,7 @@ jobs:
           EOF
           chmod +x package/shodh-memory
           chmod +x package/shodh-memory-server
+          chmod +x package/shodh-tui
           tar -czvf ${{ matrix.name }}.tar.gz -C package .
 
       - name: Package (macOS)
@@ -110,6 +117,7 @@ jobs:
         run: |
           mkdir -p package
           cp target/${{ matrix.target }}/release/shodh-memory-server package/
+          cp tui/target/${{ matrix.target }}/release/shodh-tui package/
           cp ${{ matrix.ort_lib_name }} package/
           cat > package/shodh-memory << 'EOF'
           #!/bin/bash
@@ -119,6 +127,7 @@ jobs:
           EOF
           chmod +x package/shodh-memory
           chmod +x package/shodh-memory-server
+          chmod +x package/shodh-tui
           tar -czvf ${{ matrix.name }}.tar.gz -C package .
 
       - name: Package (Windows)
@@ -127,6 +136,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path package
           Copy-Item "target\${{ matrix.target }}\release\shodh-memory-server.exe" -Destination "package\"
+          Copy-Item "tui\target\${{ matrix.target }}\release\shodh-tui.exe" -Destination "package\"
           Copy-Item "onnxruntime.dll" -Destination "package\"
           @"
           @echo off
@@ -163,7 +173,7 @@ jobs:
           ORT_DIR=$(find . -maxdepth 1 -type d -name "onnxruntime-*" | head -1)
           cp "$ORT_DIR/lib/libonnxruntime.so.1.22.0" ./libonnxruntime.so
 
-      - name: Build in Docker
+      - name: Build Server in Docker
         run: |
           docker run --rm \
             -v "$PWD:/project" \
@@ -172,10 +182,19 @@ jobs:
             shodh-cross-arm64 \
             cargo build --release --target aarch64-unknown-linux-gnu
 
+      - name: Build TUI in Docker
+        run: |
+          docker run --rm \
+            -v "$PWD:/project" \
+            -w /project/tui \
+            shodh-cross-arm64 \
+            cargo build --release --target aarch64-unknown-linux-gnu
+
       - name: Package
         run: |
           mkdir -p package
           cp target/aarch64-unknown-linux-gnu/release/shodh-memory-server package/
+          cp tui/target/aarch64-unknown-linux-gnu/release/shodh-tui package/
           cp libonnxruntime.so package/
           cat > package/shodh-memory << 'EOF'
           #!/bin/bash
@@ -185,6 +204,7 @@ jobs:
           EOF
           chmod +x package/shodh-memory
           chmod +x package/shodh-memory-server
+          chmod +x package/shodh-tui
           tar -czvf shodh-memory-linux-arm64.tar.gz -C package .
 
       - name: Upload artifact
