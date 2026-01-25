@@ -19,7 +19,7 @@ use crate::embeddings::{
 };
 use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
-    RelationType, RelationshipEdge,
+    LtpStatus, RelationType, RelationshipEdge,
 };
 use crate::memory::{
     facts::SemanticFactStore, query_parser, Experience, FeedbackStore, FileMemoryStore,
@@ -1338,8 +1338,9 @@ impl MultiUserMemoryManager {
                     context: experience.content.clone(),
                     last_activated: chrono::Utc::now(),
                     activation_count: 1,
-                    potentiated: false,
+                    ltp_status: LtpStatus::None,
                     tier: EdgeTier::L1Working,
+                    activation_timestamps: None,
                 };
 
                 if let Err(e) = graph_guard.add_relationship(edge) {

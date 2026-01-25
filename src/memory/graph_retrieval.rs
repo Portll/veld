@@ -309,12 +309,12 @@ pub fn spreading_activation_retrieve_with_stats(
                 // Spread activation to connected entity
                 let target_uuid = edge.to_entity;
 
-                // Edge-tier trust weight (SHO-D1)
+                // Edge-tier trust weight (SHO-D1, PIPE-4)
                 // LTP edges are gold (survived many activations)
                 // L3 edges have proven value (survived decay to semantic tier)
                 // L1 edges are noisy (new, untested) - graph search not optimal
-                let tier_trust = if edge.potentiated {
-                    EDGE_TIER_TRUST_LTP // 0.95 - highest trust
+                let tier_trust = if edge.is_potentiated() {
+                    EDGE_TIER_TRUST_LTP // 0.95 - highest trust (any LTP level)
                 } else {
                     match edge.tier {
                         EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3, // 0.80

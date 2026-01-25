@@ -173,13 +173,22 @@ pub fn retention_curve_debug(potentiated: bool) -> String {
 ///
 /// * `hours_elapsed` - Time since last activation in hours
 /// * `tier` - Memory tier (0=L1, 1=L2, 2=L3)
-/// * `potentiated` - Whether edge has LTP (further reduces decay)
+/// * `ltp_decay_factor` - LTP decay protection factor (1.0=none, 0.5=2x slower, 0.1=10x slower)
 ///
 /// # Returns
 ///
 /// Decay factor (0.0-1.0) and whether edge should be pruned
+///
+/// # PIPE-4 Update
+///
+/// Changed from `potentiated: bool` to `ltp_decay_factor: f32` to support
+/// multi-scale LTP with graduated protection levels:
+/// - LtpStatus::None → 1.0 (no protection)
+/// - LtpStatus::Burst → 0.5 (2x slower decay, temporary)
+/// - LtpStatus::Weekly → 0.3 (3x slower decay, moderate)
+/// - LtpStatus::Full → 0.1 (10x slower decay, maximum)
 #[inline]
-pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, potentiated: bool) -> (f32, bool) {
+pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, ltp_decay_factor: f32) -> (f32, bool) {
     use crate::constants::*;
 
     if hours_elapsed <= 0.0 {
@@ -212,18 +221,21 @@ pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, potentiated: bool) -> (f3
         }
     };
 
-    // Potentiated edges decay 5x slower
-    let effective_rate = if potentiated {
-        decay_rate * 0.2
-    } else {
-        decay_rate
-    };
+    // PIPE-4: Apply graduated LTP protection
+    // ltp_decay_factor of 0.5 = 2x slower, 0.1 = 10x slower, 1.0 = no protection
+    let effective_rate = decay_rate * ltp_decay_factor as f64;
 
     // Exponential decay: w(t) = w₀ × e^(-λt)
     let decay_factor = (-effective_rate * hours_elapsed).exp() as f32;
 
     // Check if edge exceeded max age (should prune)
-    let should_prune = hours_elapsed > max_age_hours && decay_factor < prune_threshold;
+    // PIPE-4: Potentiated edges (ltp_decay_factor < 1.0) extend max age proportionally
+    let effective_max_age = if ltp_decay_factor < 1.0 {
+        max_age_hours / ltp_decay_factor as f64
+    } else {
+        max_age_hours
+    };
+    let should_prune = hours_elapsed > effective_max_age && decay_factor < prune_threshold;
 
     (decay_factor.max(0.001), should_prune)
 }

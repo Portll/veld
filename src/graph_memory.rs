@@ -9,7 +9,7 @@ use rocksdb::{Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -169,6 +169,87 @@ impl EdgeTier {
     }
 }
 
+/// Long-Term Potentiation status for edges (PIPE-4)
+///
+/// Multi-scale LTP based on neuroscience research:
+/// - Burst: Temporary protection from high-frequency activation (E-LTP)
+/// - Weekly: Moderate protection from consistent routine use (L-LTP)
+/// - Full: Maximum protection from sustained long-term use (systems consolidation)
+///
+/// Reference: Frey & Morris (1997) "Synaptic tagging and long-term potentiation"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LtpStatus {
+    /// Not potentiated - normal decay applies
+    #[default]
+    None,
+
+    /// Burst potentiated: 5+ activations in 24 hours
+    /// Temporary protection (2x slower decay) that expires after 48h
+    /// Represents early-phase LTP (protein synthesis independent)
+    Burst {
+        /// When burst was detected (for expiration check)
+        #[serde(with = "chrono::serde::ts_seconds")]
+        detected_at: DateTime<Utc>,
+    },
+
+    /// Weekly potentiated: 3+/week for 2+ weeks
+    /// Moderate protection (3x slower decay)
+    /// Represents late-phase LTP (habit formation)
+    Weekly,
+
+    /// Fully potentiated: 10+ activations OR 5+ over 30 days
+    /// Maximum protection (10x slower decay)
+    /// Represents systems consolidation (semantic memory)
+    Full,
+}
+
+impl LtpStatus {
+    /// Get the decay factor for this LTP status
+    pub fn decay_factor(&self) -> f32 {
+        use crate::constants::*;
+        match self {
+            Self::None => 1.0,
+            Self::Burst { detected_at } => {
+                // Check if burst has expired
+                let hours_since = (Utc::now() - *detected_at).num_hours();
+                if hours_since > LTP_BURST_DURATION_HOURS {
+                    1.0 // Expired, normal decay
+                } else {
+                    LTP_BURST_DECAY_FACTOR
+                }
+            }
+            Self::Weekly => LTP_WEEKLY_DECAY_FACTOR,
+            Self::Full => LTP_DECAY_FACTOR,
+        }
+    }
+
+    /// Check if this status provides any protection
+    pub fn is_potentiated(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Check if burst protection has expired
+    pub fn is_burst_expired(&self) -> bool {
+        use crate::constants::LTP_BURST_DURATION_HOURS;
+        match self {
+            Self::Burst { detected_at } => {
+                (Utc::now() - *detected_at).num_hours() > LTP_BURST_DURATION_HOURS
+            }
+            _ => false,
+        }
+    }
+
+    /// Get priority for LTP upgrades (higher = stronger protection)
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Burst { .. } => 1,
+            Self::Weekly => 2,
+            Self::Full => 3,
+        }
+    }
+}
+
 /// Relationship edge between entities
 ///
 /// Implements Hebbian synaptic plasticity: "Neurons that fire together, wire together"
@@ -219,15 +300,26 @@ pub struct RelationshipEdge {
     #[serde(default)]
     pub activation_count: u32,
 
-    /// Long-Term Potentiation flag: synapse becomes permanent after threshold
-    /// Once potentiated, decay is dramatically reduced (like biological LTP)
+    /// Long-Term Potentiation status (PIPE-4: multi-scale LTP)
+    /// Replaces simple bool with tiered protection levels:
+    /// - None: Normal decay
+    /// - Burst: Temporary 2x protection (5+ activations in 24h)
+    /// - Weekly: Moderate 3x protection (3+/week for 2 weeks)
+    /// - Full: Maximum 10x protection (10+ activations or 5+ over 30 days)
     #[serde(default)]
-    pub potentiated: bool,
+    pub ltp_status: LtpStatus,
 
     /// Memory tier for consolidation (L1→L2→L3)
     /// Edges start in L1 (working memory) and promote based on Hebbian strength
     #[serde(default)]
     pub tier: EdgeTier,
+
+    /// Activation timestamp history for temporal pattern detection (PIPE-4)
+    /// Only populated for L2+ edges (L1 edges die too quickly to need history)
+    /// Capacity: L2 = 20 timestamps, L3 = 50 timestamps
+    /// Enables: burst detection, weekly patterns, temporal query relevance
+    #[serde(default)]
+    pub activation_timestamps: Option<VecDeque<DateTime<Utc>>>,
 }
 
 fn default_last_activated() -> DateTime<Utc> {
@@ -237,9 +329,14 @@ fn default_last_activated() -> DateTime<Utc> {
 // Hebbian learning constants now imported from crate::constants:
 // - LTP_LEARNING_RATE (0.1): η for strength increase per co-activation
 // - LTP_DECAY_HALF_LIFE_DAYS (14.0): λ for time-based decay
-// - LTP_THRESHOLD (10): Activations needed for Long-Term Potentiation
-// - LTP_DECAY_FACTOR (0.1): Potentiated synapses decay 10x slower
+// - LTP_THRESHOLD (10): Activations needed for Full LTP
+// - LTP_DECAY_FACTOR (0.1): Fully potentiated synapses decay 10x slower
 // - LTP_MIN_STRENGTH (0.01): Floor to prevent complete forgetting
+// PIPE-4 additions:
+// - LTP_BURST_THRESHOLD (5): Activations in 24h for burst LTP
+// - LTP_BURST_WINDOW_HOURS (24): Window for burst detection
+// - LTP_WEEKLY_THRESHOLD (3): Activations per week for weekly LTP
+// - LTP_WEEKLY_MIN_WEEKS (2): Minimum weeks of consistent activation
 
 impl RelationshipEdge {
     /// Strengthen this synapse (Hebbian learning)
@@ -247,50 +344,65 @@ impl RelationshipEdge {
     /// Called when both connected entities are accessed together.
     /// Formula: w_new = w_old + η × (1 - w_old) × co_activation_boost
     ///
-    /// The (1 - w_old) term ensures asymptotic approach to 1.0,
-    /// preventing unbounded growth while allowing strong associations.
+    /// PIPE-4: Multi-scale LTP detection
+    /// - Records activation timestamps for L2+ edges
+    /// - Detects burst patterns (5+ in 24h) → temporary protection
+    /// - Detects weekly patterns (3+/week for 2 weeks) → moderate protection
+    /// - Detects sustained patterns (10+ total or 5+ over 30 days) → full protection
     ///
     /// Also handles tier promotion (L1→L2→L3) when strength exceeds tier threshold.
     pub fn strengthen(&mut self) {
         use crate::constants::*;
 
+        let now = Utc::now();
         self.activation_count += 1;
-        self.last_activated = Utc::now();
+        self.last_activated = now;
+
+        // PIPE-4: Record activation timestamp for L2+ edges
+        self.record_activation_timestamp(now);
 
         // Hebbian strengthening with tier-specific boost
         let tier_boost = match self.tier {
             EdgeTier::L1Working => TIER_CO_ACCESS_BOOST,
-            EdgeTier::L2Episodic => TIER_CO_ACCESS_BOOST * 0.8, // Slower growth in higher tiers
+            EdgeTier::L2Episodic => TIER_CO_ACCESS_BOOST * 0.8,
             EdgeTier::L3Semantic => TIER_CO_ACCESS_BOOST * 0.5,
         };
         let boost = (LTP_LEARNING_RATE + tier_boost) * (1.0 - self.strength);
         self.strength = (self.strength + boost).min(1.0);
 
-        // Check for Long-Term Potentiation threshold (SHO-D3: time-aware LTP)
-        // Two paths to LTP:
-        // 1. Standard: 10+ activations (regardless of time)
-        // 2. Time-aware: 5+ activations over 30+ days (sustained value)
-        if !self.potentiated {
-            let standard_ltp = self.activation_count >= LTP_THRESHOLD;
+        // PIPE-4: Multi-scale LTP detection (only upgrade, never downgrade)
+        let new_ltp_status = self.detect_ltp_status(now);
+        if new_ltp_status.priority() > self.ltp_status.priority() {
+            let old_status = self.ltp_status;
+            self.ltp_status = new_ltp_status;
 
-            // Time-aware LTP: fewer activations required for long-lived edges
-            let edge_age_days = (Utc::now() - self.created_at).num_days();
-            let time_aware_ltp = edge_age_days >= LTP_TIME_AWARE_DAYS
-                && self.activation_count >= LTP_TIME_AWARE_THRESHOLD;
+            // LTP bonus: immediate strength boost on upgrade
+            let bonus = match new_ltp_status {
+                LtpStatus::Burst { .. } => 0.05,
+                LtpStatus::Weekly => 0.1,
+                LtpStatus::Full => 0.2,
+                LtpStatus::None => 0.0,
+            };
+            self.strength = (self.strength + bonus).min(1.0);
 
-            if standard_ltp || time_aware_ltp {
-                self.potentiated = true;
-                // LTP bonus: immediate strength boost
-                self.strength = (self.strength + 0.2).min(1.0);
+            tracing::debug!(
+                "Edge {} LTP upgrade: {:?} → {:?} (activations: {}, age: {} days)",
+                self.uuid,
+                old_status,
+                self.ltp_status,
+                self.activation_count,
+                (now - self.created_at).num_days()
+            );
+        }
 
-                if time_aware_ltp && !standard_ltp {
-                    tracing::debug!(
-                        "Edge {} achieved time-aware LTP ({} activations over {} days)",
-                        self.uuid,
-                        self.activation_count,
-                        edge_age_days
-                    );
-                }
+        // Check for burst expiration and potential downgrade
+        if self.ltp_status.is_burst_expired() {
+            // Burst expired - check if weekly pattern has emerged
+            let weekly_check = self.detect_weekly_pattern();
+            if weekly_check {
+                self.ltp_status = LtpStatus::Weekly;
+            } else {
+                self.ltp_status = LtpStatus::None;
             }
         }
 
@@ -302,6 +414,24 @@ impl RelationshipEdge {
                     self.tier = next_tier;
                     // Reset strength to next tier's initial weight (consolidation)
                     self.strength = next_tier.initial_weight();
+
+                    // PIPE-4: Initialize activation_timestamps on L1→L2 promotion
+                    if old_tier == EdgeTier::L1Working {
+                        self.activation_timestamps =
+                            Some(VecDeque::with_capacity(ACTIVATION_HISTORY_L2_CAPACITY));
+                        // Seed with current timestamp
+                        if let Some(ref mut ts) = self.activation_timestamps {
+                            ts.push_back(now);
+                        }
+                    }
+
+                    // Expand capacity on L2→L3 promotion
+                    if old_tier == EdgeTier::L2Episodic {
+                        if let Some(ref mut ts) = self.activation_timestamps {
+                            ts.reserve(ACTIVATION_HISTORY_L3_CAPACITY - ts.capacity());
+                        }
+                    }
+
                     tracing::debug!(
                         "Edge {} promoted: {:?} → {:?}",
                         self.uuid,
@@ -312,9 +442,160 @@ impl RelationshipEdge {
             }
         }
 
-        // L3 semantic edges with high strength get LTP automatically
-        if matches!(self.tier, EdgeTier::L3Semantic) && self.strength >= TIER_LTP_THRESHOLD {
-            self.potentiated = true;
+        // L3 semantic edges with high strength get Full LTP automatically
+        // PIPE-4: Only auto-potentiate if no existing LTP status (don't override Burst/Weekly)
+        // This allows multi-scale LTP progression: Burst → Weekly → Full via activation patterns
+        if matches!(self.tier, EdgeTier::L3Semantic)
+            && self.strength >= TIER_LTP_THRESHOLD
+            && matches!(self.ltp_status, LtpStatus::None)
+        {
+            self.ltp_status = LtpStatus::Full;
+        }
+    }
+
+    /// Record an activation timestamp (PIPE-4)
+    ///
+    /// Only records for L2+ edges. Maintains capacity limits.
+    fn record_activation_timestamp(&mut self, timestamp: DateTime<Utc>) {
+        use crate::constants::*;
+
+        // L1 edges don't track history (too transient)
+        if matches!(self.tier, EdgeTier::L1Working) {
+            return;
+        }
+
+        // Initialize if needed
+        if self.activation_timestamps.is_none() {
+            let capacity = match self.tier {
+                EdgeTier::L1Working => return,
+                EdgeTier::L2Episodic => ACTIVATION_HISTORY_L2_CAPACITY,
+                EdgeTier::L3Semantic => ACTIVATION_HISTORY_L3_CAPACITY,
+            };
+            self.activation_timestamps = Some(VecDeque::with_capacity(capacity));
+        }
+
+        if let Some(ref mut timestamps) = self.activation_timestamps {
+            let capacity = match self.tier {
+                EdgeTier::L1Working => return,
+                EdgeTier::L2Episodic => ACTIVATION_HISTORY_L2_CAPACITY,
+                EdgeTier::L3Semantic => ACTIVATION_HISTORY_L3_CAPACITY,
+            };
+
+            // Maintain capacity limit (ring buffer behavior)
+            while timestamps.len() >= capacity {
+                timestamps.pop_front();
+            }
+            timestamps.push_back(timestamp);
+        }
+    }
+
+    /// Detect LTP status based on multi-scale patterns (PIPE-4)
+    fn detect_ltp_status(&self, now: DateTime<Utc>) -> LtpStatus {
+        use crate::constants::*;
+
+        // Check for Full LTP first (highest priority)
+        // Path 1: 10+ total activations
+        if self.activation_count >= LTP_THRESHOLD {
+            return LtpStatus::Full;
+        }
+
+        // Path 2: 5+ activations over 30+ days (time-aware)
+        let edge_age_days = (now - self.created_at).num_days();
+        if edge_age_days >= LTP_TIME_AWARE_DAYS && self.activation_count >= LTP_TIME_AWARE_THRESHOLD
+        {
+            return LtpStatus::Full;
+        }
+
+        // Check for Weekly LTP (requires timestamp history)
+        if self.detect_weekly_pattern() {
+            return LtpStatus::Weekly;
+        }
+
+        // Check for Burst LTP (requires timestamp history)
+        if self.detect_burst_pattern(now) {
+            return LtpStatus::Burst { detected_at: now };
+        }
+
+        LtpStatus::None
+    }
+
+    /// Detect burst pattern: 5+ activations in 24 hours (PIPE-4)
+    fn detect_burst_pattern(&self, now: DateTime<Utc>) -> bool {
+        use crate::constants::*;
+        use chrono::Duration;
+
+        let timestamps = match &self.activation_timestamps {
+            Some(ts) => ts,
+            None => return false,
+        };
+
+        let window_start = now - Duration::hours(LTP_BURST_WINDOW_HOURS);
+        let count_in_window = timestamps.iter().filter(|&&ts| ts >= window_start).count();
+
+        count_in_window >= LTP_BURST_THRESHOLD as usize
+    }
+
+    /// Detect weekly pattern: 3+/week for 2+ weeks (PIPE-4)
+    fn detect_weekly_pattern(&self) -> bool {
+        use crate::constants::*;
+        use chrono::Duration;
+
+        let timestamps = match &self.activation_timestamps {
+            Some(ts) => ts,
+            None => return false,
+        };
+
+        if timestamps.is_empty() {
+            return false;
+        }
+
+        let now = Utc::now();
+        let mut weeks_meeting_threshold = 0u32;
+
+        // Check each of the last LTP_WEEKLY_MIN_WEEKS weeks
+        for week_offset in 0..LTP_WEEKLY_MIN_WEEKS {
+            let week_end = now - Duration::weeks(week_offset as i64);
+            let week_start = week_end - Duration::weeks(1);
+
+            let count_in_week = timestamps
+                .iter()
+                .filter(|&&ts| ts >= week_start && ts < week_end)
+                .count();
+
+            if count_in_week >= LTP_WEEKLY_THRESHOLD as usize {
+                weeks_meeting_threshold += 1;
+            }
+        }
+
+        weeks_meeting_threshold >= LTP_WEEKLY_MIN_WEEKS
+    }
+
+    /// Get activation count within a time window (for temporal retrieval scoring)
+    pub fn activations_in_window(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> usize {
+        match &self.activation_timestamps {
+            Some(ts) => ts.iter().filter(|&&t| t >= start && t <= end).count(),
+            None => 0,
+        }
+    }
+
+    /// Check if edge was active at similar time of day (for temporal retrieval)
+    pub fn time_of_day_match(&self, target_hour: u32, window_hours: u32) -> usize {
+        use chrono::Timelike;
+
+        match &self.activation_timestamps {
+            Some(ts) => ts
+                .iter()
+                .filter(|t| {
+                    let hour = t.hour();
+                    let diff = if hour > target_hour {
+                        (hour - target_hour).min(24 + target_hour - hour)
+                    } else {
+                        (target_hour - hour).min(24 + hour - target_hour)
+                    };
+                    diff <= window_hours
+                })
+                .count(),
+            None => 0,
         }
     }
 
@@ -325,7 +606,10 @@ impl RelationshipEdge {
     /// - L2 (Episodic): 10%/day decay, max 14 days before prune
     /// - L3 (Semantic): 2%/month decay, near-permanent
     ///
-    /// Potentiated synapses decay 5x slower.
+    /// PIPE-4: Multi-scale LTP protection
+    /// - Burst: 2x slower decay (temporary, 48h)
+    /// - Weekly: 3x slower decay (habit protection)
+    /// - Full: 10x slower decay (permanent protection)
     ///
     /// **Important:** Updates `last_activated` to prevent double-decay on
     /// repeated calls.
@@ -345,14 +629,15 @@ impl RelationshipEdge {
         // Cap max decay to protect against clock jumps (max 1 year = 8760 hours)
         let hours_elapsed = hours_elapsed.min(8760.0);
 
-        // Tier-aware decay
+        // Tier-aware decay with PIPE-4 multi-scale LTP
         let tier_num = match self.tier {
             EdgeTier::L1Working => 0,
             EdgeTier::L2Episodic => 1,
             EdgeTier::L3Semantic => 2,
         };
+        let ltp_factor = self.ltp_status.decay_factor();
         let (decay_factor, exceeded_max_age) =
-            tier_decay_factor(hours_elapsed, tier_num, self.potentiated);
+            tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
         self.strength *= decay_factor;
 
         // Update last_activated to prevent double-decay on repeated calls
@@ -365,9 +650,9 @@ impl RelationshipEdge {
         }
 
         // Return whether this synapse should be pruned
-        // Prune if: exceeded max age OR below prune threshold (unless potentiated)
-        if self.potentiated {
-            false // Never prune potentiated edges
+        // Prune if: exceeded max age OR below prune threshold (unless any LTP protection)
+        if self.ltp_status.is_potentiated() {
+            false // Never prune potentiated edges (any level)
         } else {
             exceeded_max_age || self.strength <= prune_threshold
         }
@@ -394,8 +679,14 @@ impl RelationshipEdge {
             EdgeTier::L2Episodic => 1,
             EdgeTier::L3Semantic => 2,
         };
-        let (decay_factor, _) = tier_decay_factor(hours_elapsed, tier_num, self.potentiated);
+        let ltp_factor = self.ltp_status.decay_factor();
+        let (decay_factor, _) = tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
         (self.strength * decay_factor).max(LTP_MIN_STRENGTH)
+    }
+
+    /// Check if this edge has any LTP protection (for backward compatibility)
+    pub fn is_potentiated(&self) -> bool {
+        self.ltp_status.is_potentiated()
     }
 }
 
@@ -1208,7 +1499,7 @@ impl GraphMemory {
         let mut ltp_count = 0;
 
         for edge in edges {
-            if edge.potentiated {
+            if edge.is_potentiated() {
                 ltp_count += 1;
             } else {
                 match edge.tier {
@@ -2220,7 +2511,8 @@ impl GraphMemory {
                         context: String::new(),
                         last_activated: Utc::now(),
                         activation_count: 1,
-                        potentiated: false,
+                        ltp_status: LtpStatus::None,
+                        activation_timestamps: None,
                         tier: EdgeTier::L1Working,
                     };
 
@@ -2335,7 +2627,8 @@ impl GraphMemory {
                     context: "replay_strengthened".to_string(),
                     last_activated: Utc::now(),
                     activation_count: 1,
-                    potentiated: false,
+                    ltp_status: LtpStatus::None,
+                    activation_timestamps: None,
                     tier: EdgeTier::L2Episodic,
                 };
 
@@ -4187,7 +4480,8 @@ mod tests {
             context: String::new(),
             last_activated: Utc::now() - Duration::days(days_since_activated),
             activation_count: 0,
-            potentiated: false,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
             tier,
         }
     }
@@ -4257,7 +4551,7 @@ mod tests {
     #[test]
     fn test_ltp_threshold_potentiation() {
         let mut edge = create_test_edge(0.5, 0);
-        assert!(!edge.potentiated);
+        assert!(!edge.is_potentiated());
 
         // Strengthen 10 times (LTP_THRESHOLD = 10)
         for _ in 0..10 {
@@ -4265,13 +4559,155 @@ mod tests {
         }
 
         assert!(
-            edge.potentiated,
+            edge.is_potentiated(),
             "Should be potentiated after 10 activations"
+        );
+        assert!(
+            matches!(edge.ltp_status, LtpStatus::Full),
+            "Should have Full LTP status after 10 activations"
         );
         assert!(
             edge.strength > 0.7,
             "Potentiated edge should have bonus strength"
         );
+    }
+
+    #[test]
+    fn test_pipe4_burst_ltp_detection() {
+        // Create an L2 edge with low strength to avoid early tier promotion
+        let mut edge = create_test_edge_with_tier(0.22, 0, EdgeTier::L2Episodic);
+
+        // Strengthen 5 times (LTP_BURST_THRESHOLD = 5) within 24 hours
+        for _ in 0..5 {
+            edge.strengthen();
+        }
+
+        // Should have burst LTP (5+ activations in 24h)
+        // Edge may promote to L3 during strengthening, but should keep Burst status
+        assert!(
+            matches!(edge.ltp_status, LtpStatus::Burst { .. }),
+            "Should have Burst LTP after 5 rapid activations, got {:?}",
+            edge.ltp_status
+        );
+    }
+
+    #[test]
+    fn test_pipe4_activation_timestamps_recorded() {
+        // L2 edges should record activation timestamps
+        let mut edge = create_test_edge_with_tier(0.22, 0, EdgeTier::L2Episodic);
+
+        // Strengthen a few times
+        for _ in 0..3 {
+            edge.strengthen();
+        }
+
+        // Should have recorded timestamps (edge may have promoted to L3, but still tracks)
+        assert!(
+            edge.activation_timestamps.is_some(),
+            "L2+ edge should have activation timestamps"
+        );
+        assert_eq!(
+            edge.activation_timestamps.as_ref().unwrap().len(),
+            3,
+            "Should have 3 recorded timestamps"
+        );
+    }
+
+    #[test]
+    fn test_pipe4_fresh_l1_no_timestamps() {
+        // Fresh L1 edges should NOT have activation timestamps
+        let edge = create_test_edge(0.3, 0);
+        assert!(matches!(edge.tier, EdgeTier::L1Working));
+        assert!(
+            edge.activation_timestamps.is_none(),
+            "Fresh L1 edges should not have timestamps"
+        );
+    }
+
+    #[test]
+    fn test_pipe4_l1_promotes_and_tracks() {
+        // L1 edges that promote to L2 should start tracking timestamps
+        let mut edge = create_test_edge(0.3, 0);
+        assert!(matches!(edge.tier, EdgeTier::L1Working));
+
+        // Strengthen until it promotes to L2 (L1_PROMOTION_THRESHOLD = 0.5)
+        while matches!(edge.tier, EdgeTier::L1Working) {
+            edge.strengthen();
+        }
+
+        // After promotion to L2, should start tracking
+        assert!(
+            matches!(edge.tier, EdgeTier::L2Episodic),
+            "Should have promoted to L2"
+        );
+        // Timestamps are initialized on promotion
+        assert!(
+            edge.activation_timestamps.is_some(),
+            "L2 edges should track timestamps after promotion"
+        );
+    }
+
+    #[test]
+    fn test_pipe4_ltp_status_decay_factors() {
+        // Test that each LTP status has correct decay factor
+        use crate::constants::*;
+
+        assert_eq!(LtpStatus::None.decay_factor(), 1.0);
+        assert_eq!(LtpStatus::Weekly.decay_factor(), LTP_WEEKLY_DECAY_FACTOR);
+        assert_eq!(LtpStatus::Full.decay_factor(), LTP_DECAY_FACTOR);
+
+        // Burst factor depends on expiration
+        let burst = LtpStatus::Burst {
+            detected_at: Utc::now(),
+        };
+        assert_eq!(burst.decay_factor(), LTP_BURST_DECAY_FACTOR);
+    }
+
+    #[test]
+    fn test_pipe4_burst_to_full_upgrade() {
+        // LTP should upgrade from Burst to Full after 10 activations
+        let mut edge = create_test_edge_with_tier(0.22, 0, EdgeTier::L2Episodic);
+
+        // Get to burst LTP (5 activations)
+        for _ in 0..5 {
+            edge.strengthen();
+        }
+        assert!(
+            matches!(edge.ltp_status, LtpStatus::Burst { .. }),
+            "Should have Burst after 5 activations, got {:?}",
+            edge.ltp_status
+        );
+
+        // Continue strengthening to Full LTP (10 total)
+        for _ in 0..5 {
+            edge.strengthen();
+        }
+
+        // Should now be Full (upgraded from Burst via 10 activations)
+        assert!(
+            matches!(edge.ltp_status, LtpStatus::Full),
+            "Should have upgraded to Full LTP after 10 activations"
+        );
+    }
+
+    #[test]
+    fn test_pipe4_activations_in_window() {
+        let mut edge = create_test_edge_with_tier(0.22, 0, EdgeTier::L2Episodic);
+
+        // Record some activations
+        for _ in 0..5 {
+            edge.strengthen();
+        }
+
+        let now = Utc::now();
+        let hour_ago = now - chrono::Duration::hours(1);
+        let day_ago = now - chrono::Duration::days(1);
+
+        // All activations are recent (within last second really)
+        let in_hour = edge.activations_in_window(hour_ago, now);
+        let in_day = edge.activations_in_window(day_ago, now);
+        assert!(in_hour >= 5, "Expected 5+ in hour window, got {}", in_hour);
+        assert!(in_day >= 5, "Expected 5+ in day window, got {}", in_day);
     }
 
     #[test]
@@ -4330,7 +4766,7 @@ mod tests {
         // Use L2 tier for multi-day decay comparison
         let mut edge1 = create_test_edge_with_tier(0.8, 7, EdgeTier::L2Episodic);
         let mut edge2 = create_test_edge_with_tier(0.8, 7, EdgeTier::L2Episodic);
-        edge2.potentiated = true;
+        edge2.ltp_status = LtpStatus::Full; // Full LTP = 10x slower decay
 
         edge1.decay();
         edge2.decay();
@@ -4360,7 +4796,8 @@ mod tests {
     fn test_decay_prune_threshold() {
         // Use L2 tier for decay testing beyond its max age (14 days)
         let mut weak_edge = create_test_edge_with_tier(LTP_MIN_STRENGTH, 30, EdgeTier::L2Episodic);
-        weak_edge.potentiated = false;
+        // No LTP status = normal decay
+        assert!(matches!(weak_edge.ltp_status, LtpStatus::None));
 
         let should_prune = weak_edge.decay();
 
@@ -4375,7 +4812,7 @@ mod tests {
     fn test_potentiated_never_pruned() {
         // Use L2 tier for testing
         let mut edge = create_test_edge_with_tier(LTP_MIN_STRENGTH, 30, EdgeTier::L2Episodic);
-        edge.potentiated = true;
+        edge.ltp_status = LtpStatus::Full;
 
         let should_prune = edge.decay();
 
@@ -4540,7 +4977,8 @@ mod tests {
             context: "Test context".to_string(),
             last_activated: Utc::now(), // Just activated - no decay
             activation_count: 5,
-            potentiated: false,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
             tier: EdgeTier::L2Episodic, // Use L2 since it has activation count
         };
         graph.add_relationship(edge).unwrap();

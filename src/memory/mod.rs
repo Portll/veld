@@ -646,8 +646,9 @@ impl MemorySystem {
                         context: edge_context.clone(),
                         last_activated: now,
                         activation_count: 1,
-                        potentiated: false,
+                        ltp_status: crate::graph_memory::LtpStatus::None,
                         tier: crate::graph_memory::EdgeTier::L1Working,
+                        activation_timestamps: None,
                     };
 
                     // add_relationship handles deduplication via Hebbian strengthening
@@ -976,8 +977,9 @@ impl MemorySystem {
                         context: format!("Co-occurred in memory {}", memory.id.0),
                         last_activated: chrono::Utc::now(),
                         activation_count: 1,
-                        potentiated: false,
+                        ltp_status: crate::graph_memory::LtpStatus::None,
                         tier: crate::graph_memory::EdgeTier::L1Working,
+                        activation_timestamps: None,
                     };
 
                     if let Err(e) = graph_guard.add_relationship(edge) {
@@ -3863,7 +3865,8 @@ impl MemorySystem {
                         (0.0, 0)
                     } else {
                         let total_strength: f32 = relationships.iter().map(|r| r.strength).sum();
-                        let potentiated = relationships.iter().filter(|r| r.potentiated).count();
+                        let potentiated =
+                            relationships.iter().filter(|r| r.is_potentiated()).count();
                         (total_strength / relationships.len() as f32, potentiated)
                     }
                 } else {
@@ -4130,8 +4133,9 @@ impl MemorySystem {
                             context: format!("Co-occurred in memory {}", memory.id.0),
                             last_activated: chrono::Utc::now(),
                             activation_count: 1,
-                            potentiated: false,
+                            ltp_status: crate::graph_memory::LtpStatus::None,
                             tier: crate::graph_memory::EdgeTier::L1Working,
+                            activation_timestamps: None,
                         };
 
                         if let Err(e) = graph_guard.add_relationship(edge) {

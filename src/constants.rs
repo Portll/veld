@@ -730,6 +730,101 @@ pub const LTP_DECAY_FACTOR: f32 = 0.1;
 pub const LTP_MIN_STRENGTH: f32 = 0.01;
 
 // =============================================================================
+// MULTI-SCALE LTP CONSTANTS (PIPE-4)
+// Based on multi-timescale memory consolidation research
+// Different activation patterns indicate different types of learning:
+// - Burst: High immediate interest (working memory consolidation)
+// - Weekly: Routine/habit (procedural knowledge)
+// - Monthly: Sustained low-frequency (semantic knowledge)
+// =============================================================================
+
+/// Burst LTP: minimum activations within 24 hours
+///
+/// High-frequency activation indicates immediate high interest.
+///
+/// Justification:
+/// - 5 activations in 24h is significant engagement
+/// - Matches early-phase LTP (E-LTP) in neuroscience
+/// - Triggers temporary protection to allow pattern to prove sustained value
+///
+/// Reference: Frey & Morris (1997) "Synaptic tagging and LTP"
+pub const LTP_BURST_THRESHOLD: u32 = 5;
+
+/// Burst LTP: time window in hours
+///
+/// Activations must occur within this window for burst detection.
+pub const LTP_BURST_WINDOW_HOURS: i64 = 24;
+
+/// Burst LTP: decay protection factor
+///
+/// Burst-potentiated edges decay at this fraction of normal rate.
+/// Less protection than full LTP - must prove sustained value.
+///
+/// Justification:
+/// - 0.5 = 2x slower decay (temporary protection)
+/// - Allows burst patterns time to consolidate or fade
+pub const LTP_BURST_DECAY_FACTOR: f32 = 0.5;
+
+/// Burst LTP: protection duration in hours
+///
+/// Burst potentiation expires after this duration without upgrade.
+///
+/// Justification:
+/// - 48 hours gives pattern time to recur or consolidate
+/// - Matches E-LTP duration in biological systems
+pub const LTP_BURST_DURATION_HOURS: i64 = 48;
+
+/// Weekly LTP: minimum activations per week
+///
+/// Regular weekly activation indicates habit/routine.
+///
+/// Justification:
+/// - 3 activations per week = consistent but not excessive use
+/// - Matches habit formation research (~3 repetitions to form habit)
+pub const LTP_WEEKLY_THRESHOLD: u32 = 3;
+
+/// Weekly LTP: minimum weeks of consistent activation
+///
+/// Pattern must persist for this many weeks to qualify.
+///
+/// Justification:
+/// - 2 weeks ensures pattern is not a one-off busy period
+/// - Matches habit consolidation timeline (14-21 days)
+///
+/// Reference: Lally et al. (2010) "How habits are formed"
+pub const LTP_WEEKLY_MIN_WEEKS: u32 = 2;
+
+/// Weekly LTP: decay protection factor
+///
+/// Weekly-potentiated edges decay at this fraction of normal rate.
+/// More protection than burst, less than full LTP.
+///
+/// Justification:
+/// - 0.3 = ~3x slower decay (moderate protection)
+/// - Proven weekly value deserves more protection than burst
+pub const LTP_WEEKLY_DECAY_FACTOR: f32 = 0.3;
+
+/// Activation history capacity for L2 (Episodic) tier edges
+///
+/// L2 edges store this many recent activation timestamps.
+///
+/// Justification:
+/// - 20 timestamps covers ~2 weeks of daily use
+/// - Sufficient for weekly pattern detection
+/// - Memory: 20 × 8 bytes = 160 bytes per L2 edge
+pub const ACTIVATION_HISTORY_L2_CAPACITY: usize = 20;
+
+/// Activation history capacity for L3 (Semantic) tier edges
+///
+/// L3 edges store this many recent activation timestamps.
+///
+/// Justification:
+/// - 50 timestamps covers ~2 months of regular use
+/// - Sufficient for monthly pattern detection and temporal queries
+/// - Memory: 50 × 8 bytes = 400 bytes per L3 edge
+pub const ACTIVATION_HISTORY_L3_CAPACITY: usize = 50;
+
+// =============================================================================
 // HYBRID DECAY MODEL CONSTANTS (SHO-103)
 // Based on Wixted & Ebbesen (1991) - power-law forgetting matches human memory
 // Hybrid model: exponential for consolidation, power-law for long-term retention
