@@ -1788,7 +1788,10 @@ impl MemorySystem {
 
             tracing::debug!(
                 "Layer 4 RRF: density={:?}, graph_w={:.2}, hybrid_w={:.2}, query_entities={}",
-                graph_density, graph_w, hybrid_w, query_entity_count
+                graph_density,
+                graph_w,
+                hybrid_w,
+                query_entity_count
             );
 
             // Graph results: pure RRF with density weight
