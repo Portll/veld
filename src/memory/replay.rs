@@ -483,7 +483,7 @@ impl InterferenceDetector {
     }
 
     /// Record an interference event
-    fn record_interference(
+    pub(crate) fn record_interference(
         &mut self,
         affected_memory_id: &str,
         interfering_memory_id: &str,
@@ -528,6 +528,109 @@ impl InterferenceDetector {
     /// Clear history for a deleted memory
     pub fn clear_memory(&mut self, memory_id: &str) {
         self.interference_history.remove(memory_id);
+    }
+
+    // =========================================================================
+    // PIPE-3: INTERFERENCE-AWARE RETRIEVAL SCORING
+    // =========================================================================
+    //
+    // Research basis:
+    // - Anderson & Neely (1996): "Interference and inhibition in memory retrieval"
+    // - Anderson et al. (1994): Retrieval-induced forgetting (RIF)
+    // - Postman & Underwood (1973): "Critical issues in interference theory"
+    //
+    // Key insight: Retrieval is a competitive process where:
+    // 1. Memories that frequently "lose" competitions become harder to retrieve
+    // 2. Memories that survive despite competition become STRONGER (robust encoding)
+    //
+    // The "fan effect" (Anderson 1974): Memories with many competing associations
+    // are harder to retrieve, BUT memories that maintain strength despite fans
+    // are extra-reliable.
+    // =========================================================================
+
+    /// Calculate retrieval score adjustment based on interference history
+    ///
+    /// This implements Anderson's retrieval-induced forgetting (RIF) theory:
+    /// - Memories with high interference that maintained activation → BOOST (survivors)
+    /// - Memories with high interference and low activation → SUPPRESS (chronic losers)
+    ///
+    /// # Arguments
+    /// * `memory_id` - The memory to score
+    /// * `current_activation` - Current importance/activation level (0.0-1.0)
+    ///
+    /// # Returns
+    /// Score adjustment factor:
+    /// - > 1.0: boost (multiply score)
+    /// - < 1.0: suppress (multiply score)
+    /// - 1.0: no adjustment
+    ///
+    /// # Research Reference
+    /// Anderson, M.C. & Neely, J.H. (1996). Interference and inhibition in
+    /// memory retrieval. In E.L. Bjork & R.A. Bjork (Eds.), Memory (pp. 237-313).
+    pub fn calculate_retrieval_adjustment(&self, memory_id: &str, current_activation: f32) -> f32 {
+        let history = match self.interference_history.get(memory_id) {
+            Some(h) if !h.is_empty() => h,
+            _ => return 1.0, // No interference history → no adjustment
+        };
+
+        // Calculate interference metrics
+        let interference_count = history.len();
+        let total_strength_lost: f32 = history.iter().map(|r| r.strength_change.abs()).sum();
+        let avg_similarity: f32 =
+            history.iter().map(|r| r.similarity).sum::<f32>() / interference_count as f32;
+
+        // Normalize interference intensity (0-1 scale)
+        // Combines: event count + similarity + cumulative damage
+        // More events + higher similarity + more damage = more intense competition history
+        let count_factor = (interference_count as f32 / INTERFERENCE_MAX_TRACKED as f32).min(1.0);
+        let damage_factor = (total_strength_lost / 0.5).min(1.0); // 0.5 total loss = max damage
+        let interference_intensity = (count_factor * 0.5 + damage_factor * 0.5) * avg_similarity;
+
+        // The key insight from Anderson's RIF research:
+        // - High interference + high activation = SURVIVOR (boost)
+        // - High interference + low activation = CHRONIC LOSER (suppress)
+        //
+        // Formula: adjustment = 1.0 + intensity * (2 * activation - 1)
+        // - When activation = 1.0: adjustment = 1.0 + intensity (boost up to 2x)
+        // - When activation = 0.5: adjustment = 1.0 (neutral)
+        // - When activation = 0.0: adjustment = 1.0 - intensity (suppress down to 0x)
+
+        let activation_factor = 2.0 * current_activation - 1.0; // Maps [0,1] to [-1,1]
+        let adjustment = 1.0 + interference_intensity * activation_factor * 0.5;
+
+        // Clamp to reasonable bounds (0.5x to 1.5x)
+        adjustment.clamp(0.5, 1.5)
+    }
+
+    /// Batch calculate retrieval adjustments for multiple memories
+    ///
+    /// Efficient for scoring entire result sets.
+    ///
+    /// # Arguments
+    /// * `memories` - Vec of (memory_id, current_activation)
+    ///
+    /// # Returns
+    /// HashMap of memory_id → adjustment factor
+    pub fn batch_retrieval_adjustments(&self, memories: &[(String, f32)]) -> HashMap<String, f32> {
+        memories
+            .iter()
+            .map(|(id, activation)| {
+                (
+                    id.clone(),
+                    self.calculate_retrieval_adjustment(id, *activation),
+                )
+            })
+            .collect()
+    }
+
+    /// Check if a memory has significant interference history
+    ///
+    /// Useful for deciding whether to apply interference adjustments.
+    pub fn has_significant_interference(&self, memory_id: &str) -> bool {
+        self.interference_history
+            .get(memory_id)
+            .map(|h| h.len() >= 2) // At least 2 interference events
+            .unwrap_or(false)
     }
 }
 
@@ -672,5 +775,133 @@ mod tests {
         assert_eq!(result.winners[0].0, "mem-1");
         // Close competitor may be suppressed depending on competition factor
         assert!(!result.winners.is_empty());
+    }
+
+    // =========================================================================
+    // PIPE-3: Interference-Aware Retrieval Tests
+    // =========================================================================
+
+    #[test]
+    fn test_retrieval_adjustment_no_history() {
+        let detector = InterferenceDetector::new();
+
+        // Memory with no interference history should get neutral adjustment
+        let adjustment = detector.calculate_retrieval_adjustment("unknown-mem", 0.8);
+        assert_eq!(
+            adjustment, 1.0,
+            "No history should return neutral adjustment"
+        );
+    }
+
+    #[test]
+    fn test_retrieval_adjustment_survivor_boost() {
+        let mut detector = InterferenceDetector::new();
+        let now = Utc::now();
+
+        // Simulate interference history for a "survivor" memory
+        // (high interference but maintained high activation)
+        let similar_memories = vec![(
+            "survivor-mem".to_string(),
+            0.90,
+            0.85, // High importance maintained despite interference
+            now - Duration::hours(12),
+            "Survivor content".to_string(),
+        )];
+
+        // Record multiple interference events
+        for i in 0..5 {
+            detector.record_interference(
+                "survivor-mem",
+                &format!("interferer-{}", i),
+                0.88,
+                InterferenceType::Retroactive,
+                0.05,
+            );
+        }
+
+        // High activation (0.9) + interference history = BOOST
+        let adjustment = detector.calculate_retrieval_adjustment("survivor-mem", 0.9);
+        assert!(
+            adjustment > 1.0,
+            "Survivor (high activation despite interference) should be boosted: {}",
+            adjustment
+        );
+    }
+
+    #[test]
+    fn test_retrieval_adjustment_chronic_loser_suppress() {
+        let mut detector = InterferenceDetector::new();
+
+        // Simulate interference history for a "chronic loser" memory
+        // (high interference and low activation = weak memory)
+        for i in 0..5 {
+            detector.record_interference(
+                "loser-mem",
+                &format!("winner-{}", i),
+                0.88,
+                InterferenceType::Retroactive,
+                0.1,
+            );
+        }
+
+        // Low activation (0.2) + interference history = SUPPRESS
+        let adjustment = detector.calculate_retrieval_adjustment("loser-mem", 0.2);
+        assert!(
+            adjustment < 1.0,
+            "Chronic loser (low activation with interference) should be suppressed: {}",
+            adjustment
+        );
+    }
+
+    #[test]
+    fn test_retrieval_adjustment_neutral_midpoint() {
+        let mut detector = InterferenceDetector::new();
+
+        // Record some interference
+        for i in 0..3 {
+            detector.record_interference(
+                "neutral-mem",
+                &format!("other-{}", i),
+                0.87,
+                InterferenceType::Retroactive,
+                0.05,
+            );
+        }
+
+        // Medium activation (0.5) should be near neutral
+        let adjustment = detector.calculate_retrieval_adjustment("neutral-mem", 0.5);
+        assert!(
+            (adjustment - 1.0).abs() < 0.1,
+            "Medium activation should be near neutral: {}",
+            adjustment
+        );
+    }
+
+    #[test]
+    fn test_batch_retrieval_adjustments() {
+        let mut detector = InterferenceDetector::new();
+
+        // Set up different interference histories
+        for i in 0..3 {
+            detector.record_interference(
+                "mem-with-history",
+                &format!("interferer-{}", i),
+                0.88,
+                InterferenceType::Retroactive,
+                0.05,
+            );
+        }
+
+        let memories = vec![
+            ("mem-with-history".to_string(), 0.9), // Has history, high activation
+            ("mem-no-history".to_string(), 0.9),   // No history
+        ];
+
+        let adjustments = detector.batch_retrieval_adjustments(&memories);
+
+        // Memory with history and high activation should be boosted
+        assert!(adjustments.get("mem-with-history").unwrap() > &1.0);
+        // Memory without history should be neutral
+        assert_eq!(adjustments.get("mem-no-history").unwrap(), &1.0);
     }
 }

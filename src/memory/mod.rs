@@ -1798,6 +1798,57 @@ impl MemorySystem {
                 }
             }
 
+            // ===========================================================================
+            // LAYER 4.6: INTERFERENCE-AWARE SCORING (PIPE-3)
+            // ===========================================================================
+            // Research basis: Anderson & Neely (1996) - Retrieval-induced forgetting
+            //
+            // Retrieval is a competitive process:
+            // - Memories that frequently "lose" competitions → harder to retrieve (suppress)
+            // - Memories that survive despite competition → stronger/reliable (boost)
+            //
+            // The adjustment is based on interference history + current activation:
+            // - High interference + high activation = "survivor" → boost (1.0-1.5x)
+            // - High interference + low activation = "chronic loser" → suppress (0.5-1.0x)
+            // - No interference history → neutral (1.0x)
+            {
+                let detector = self.interference_detector.read();
+
+                // Compute max score once for normalization
+                let max_score = fused
+                    .values()
+                    .copied()
+                    .fold(0.0_f32, |a, b| a.max(b))
+                    .max(0.01);
+
+                // Collect adjustments first to avoid borrow issues
+                let adjustments: Vec<_> = fused
+                    .iter()
+                    .map(|(id, &score)| {
+                        let current_activation = (score / max_score).clamp(0.0, 1.0);
+                        let adjustment = detector
+                            .calculate_retrieval_adjustment(&id.0.to_string(), current_activation);
+                        (id.clone(), adjustment)
+                    })
+                    .filter(|(_, adj)| (*adj - 1.0).abs() > 0.01)
+                    .collect();
+
+                // Apply adjustments
+                let adjusted_count = adjustments.len();
+                for (id, adjustment) in adjustments {
+                    if let Some(score) = fused.get_mut(&id) {
+                        *score *= adjustment;
+                    }
+                }
+
+                if adjusted_count > 0 {
+                    tracing::debug!(
+                        "Layer 4.6 (PIPE-3): Applied interference adjustments to {} memories",
+                        adjusted_count
+                    );
+                }
+            }
+
             let mut res: Vec<_> = fused.into_iter().collect();
             res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             res.truncate(query.max_results);
