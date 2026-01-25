@@ -31,8 +31,9 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::constants::{
-    BIDIRECTIONAL_INTERSECTION_BOOST, BIDIRECTIONAL_INTERSECTION_MIN,
-    BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION, BIDIRECTIONAL_MIN_ENTITIES, DENSITY_GRAPH_WEIGHT_MAX,
+    BIDIRECTIONAL_DENSITY_DENSE, BIDIRECTIONAL_DENSITY_SPARSE, BIDIRECTIONAL_HOPS_DENSE,
+    BIDIRECTIONAL_HOPS_MEDIUM, BIDIRECTIONAL_HOPS_SPARSE, BIDIRECTIONAL_INTERSECTION_BOOST,
+    BIDIRECTIONAL_INTERSECTION_MIN, BIDIRECTIONAL_MIN_ENTITIES, DENSITY_GRAPH_WEIGHT_MAX,
     DENSITY_GRAPH_WEIGHT_MIN, DENSITY_LINGUISTIC_WEIGHT, DENSITY_THRESHOLD_MAX,
     DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
     EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
@@ -121,6 +122,38 @@ pub fn calculate_importance_weighted_decay(importance: f32) -> f32 {
 // Key insight: When query has multiple focal entities (e.g., "Rust" and "database"),
 // spreading from both ends and boosting intersection entities finds the "bridge"
 // concepts that connect the query terms - these are often the most relevant.
+//
+// Density-adaptive hop count:
+// - Dense (fresh) graphs: fewer hops to avoid noise from L1 edges
+// - Sparse (mature) graphs: more hops to find connections through curated L2/L3 edges
+
+/// Calculate density-adaptive hop count for bidirectional spreading
+///
+/// Graph lifecycle: Dense → Sparse as decay prunes weak edges over time.
+/// - Fresh system (dense): many noisy L1 edges → fewer hops (2)
+/// - Mature system (sparse): curated L2/L3 edges → more hops (4)
+///
+/// Returns: number of hops per direction
+pub fn calculate_adaptive_hops(graph_density: Option<f32>) -> usize {
+    match graph_density {
+        Some(density) if density > BIDIRECTIONAL_DENSITY_DENSE => {
+            // Dense graph: limit exploration to avoid noise
+            BIDIRECTIONAL_HOPS_DENSE
+        }
+        Some(density) if density < BIDIRECTIONAL_DENSITY_SPARSE => {
+            // Sparse graph: explore deeper through quality edges
+            BIDIRECTIONAL_HOPS_SPARSE
+        }
+        Some(_) => {
+            // Medium density: balanced exploration
+            BIDIRECTIONAL_HOPS_MEDIUM
+        }
+        None => {
+            // No density info: use medium as safe default
+            BIDIRECTIONAL_HOPS_MEDIUM
+        }
+    }
+}
 
 /// Spread activation from a set of seed entities for a fixed number of hops
 ///
@@ -204,11 +237,18 @@ fn spread_single_direction(
 /// Splits focal entities into forward/backward sets, spreads from each,
 /// and boosts entities found at the intersection.
 ///
+/// # Arguments
+/// - `entity_data`: Focal entities with (uuid, name, ic_weight, salience)
+/// - `graph`: The knowledge graph
+/// - `total_salience`: Sum of entity saliences for normalization
+/// - `hops_per_direction`: Density-adaptive hop count (2-4)
+///
 /// Returns: (combined_activation_map, traversed_edges, intersection_count)
 fn bidirectional_spread(
     entity_data: &[(Uuid, String, f32, f32)], // (uuid, name, ic_weight, salience)
     graph: &GraphMemory,
     total_salience: f32,
+    hops_per_direction: usize,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, usize)> {
     // Split entities into forward/backward sets (alternating assignment)
     // This distributes entities evenly regardless of count
@@ -238,19 +278,19 @@ fn bidirectional_spread(
         backward_seeds.len()
     );
 
-    // Spread from both directions
+    // Spread from both directions with density-adaptive hops
     let threshold = SPREADING_ACTIVATION_THRESHOLD;
     let (forward_map, forward_edges) = spread_single_direction(
         &forward_seeds,
         graph,
-        BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION,
+        hops_per_direction,
         threshold,
     )?;
 
     let (backward_map, backward_edges) = spread_single_direction(
         &backward_seeds,
         graph,
-        BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION,
+        hops_per_direction,
         threshold,
     )?;
 
@@ -476,18 +516,23 @@ pub fn spreading_activation_retrieve_with_stats(
     if entity_data.len() >= BIDIRECTIONAL_MIN_ENTITIES {
         // PIPE-7: Bidirectional spreading activation
         // Split entities into forward/backward sets, spread from each, boost intersections
+        // Density-adaptive hops: dense (fresh) graphs use fewer hops, sparse (mature) use more
+        let adaptive_hops = calculate_adaptive_hops(graph_density);
+
         tracing::info!(
-            "🔀 Using bidirectional spreading ({} focal entities)",
-            entity_data.len()
+            "🔀 Using bidirectional spreading ({} focal entities, {} hops/direction, density={:.2})",
+            entity_data.len(),
+            adaptive_hops,
+            graph_density.unwrap_or(0.0)
         );
 
         let (bidirectional_map, edges, intersection_count) =
-            bidirectional_spread(&entity_data, graph, total_salience)?;
+            bidirectional_spread(&entity_data, graph, total_salience, adaptive_hops)?;
 
         activation_map = bidirectional_map;
         traversed_edges = edges;
         stats.entities_activated = activation_map.len();
-        stats.graph_hops = BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION * 2; // Effective depth
+        stats.graph_hops = adaptive_hops * 2; // Effective depth (forward + backward)
 
         tracing::info!(
             "🔀 Bidirectional complete: {} entities, {} intersections",
@@ -1002,8 +1047,63 @@ mod tests {
         // Intersection minimum must be below activation threshold
         assert!(BIDIRECTIONAL_INTERSECTION_MIN < SPREADING_ACTIVATION_THRESHOLD);
 
-        // Max hops per direction × 2 should approximate max hops for unidirectional
-        assert!(BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION * 2 >= SPREADING_MAX_HOPS);
+        // Density thresholds must be ordered correctly
+        assert!(BIDIRECTIONAL_DENSITY_SPARSE < BIDIRECTIONAL_DENSITY_DENSE);
+
+        // Hop counts must be ordered: dense < medium < sparse
+        assert!(BIDIRECTIONAL_HOPS_DENSE < BIDIRECTIONAL_HOPS_MEDIUM);
+        assert!(BIDIRECTIONAL_HOPS_MEDIUM < BIDIRECTIONAL_HOPS_SPARSE);
+
+        // Medium hops × 2 should approximate max hops for unidirectional
+        assert!(BIDIRECTIONAL_HOPS_MEDIUM * 2 >= SPREADING_MAX_HOPS);
+    }
+
+    #[test]
+    fn test_adaptive_hops_dense_graph() {
+        // Dense graph (fresh system): fewer hops to avoid noise
+        let hops = calculate_adaptive_hops(Some(3.0)); // Above DENSE threshold
+        assert_eq!(hops, BIDIRECTIONAL_HOPS_DENSE);
+        assert_eq!(hops, 2);
+    }
+
+    #[test]
+    fn test_adaptive_hops_sparse_graph() {
+        // Sparse graph (mature system): more hops for quality edges
+        let hops = calculate_adaptive_hops(Some(0.3)); // Below SPARSE threshold
+        assert_eq!(hops, BIDIRECTIONAL_HOPS_SPARSE);
+        assert_eq!(hops, 4);
+    }
+
+    #[test]
+    fn test_adaptive_hops_medium_graph() {
+        // Medium density: balanced exploration
+        let hops = calculate_adaptive_hops(Some(1.0)); // Between thresholds
+        assert_eq!(hops, BIDIRECTIONAL_HOPS_MEDIUM);
+        assert_eq!(hops, 3);
+    }
+
+    #[test]
+    fn test_adaptive_hops_no_density() {
+        // No density info: use medium as safe default
+        let hops = calculate_adaptive_hops(None);
+        assert_eq!(hops, BIDIRECTIONAL_HOPS_MEDIUM);
+    }
+
+    #[test]
+    fn test_adaptive_hops_lifecycle() {
+        // Simulate graph lifecycle: dense → medium → sparse
+        let fresh_hops = calculate_adaptive_hops(Some(2.5)); // Fresh system
+        let mid_hops = calculate_adaptive_hops(Some(1.0)); // 6 months in
+        let mature_hops = calculate_adaptive_hops(Some(0.3)); // Mature system
+
+        // Hops should increase as graph matures (gets sparser)
+        assert!(fresh_hops <= mid_hops);
+        assert!(mid_hops <= mature_hops);
+
+        // Verify actual values
+        assert_eq!(fresh_hops, 2);
+        assert_eq!(mid_hops, 3);
+        assert_eq!(mature_hops, 4);
     }
 
     #[test]

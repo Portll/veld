@@ -946,16 +946,63 @@ pub const BIDIRECTIONAL_INTERSECTION_BOOST: f32 = 1.5;
 /// - Entity must receive meaningful activation from both sides
 pub const BIDIRECTIONAL_INTERSECTION_MIN: f32 = 0.0025;
 
-/// Maximum hops per direction in bidirectional mode
+// -----------------------------------------------------------------------------
+// Density-Adaptive Hop Count
+// Graph lifecycle: Dense (fresh) → Sparse (mature) as decay prunes weak edges
+// Fresh system: many noisy L1 edges → fewer hops to avoid noise
+// Mature system: curated L2/L3 edges → more hops to find valuable connections
+// -----------------------------------------------------------------------------
+
+/// Hops per direction for dense graphs (density > DENSE_THRESHOLD)
 ///
-/// Total depth = 2 × this value (forward + backward meet in middle).
-/// Complexity: O(b^d) → O(2 × b^(d/2)) where d = this value.
+/// Dense graphs have many paths, risk of noise overwhelming signal.
+/// Fewer hops prevents over-exploration of noisy connections.
 ///
 /// Justification:
-/// - 3 hops per direction = 6 hop effective depth (matches SPREADING_MAX_HOPS)
-/// - Meet-in-middle reduces branching factor exponentially
-/// - 3 hops is enough for most semantic connections (friend-of-friend-of-friend)
-pub const BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION: usize = 3;
+/// - Fresh systems have many L1 working memory edges (high noise)
+/// - 2 hops sufficient to find direct and 1-hop-away connections
+/// - Effective depth = 4 (2 forward + 2 backward)
+pub const BIDIRECTIONAL_HOPS_DENSE: usize = 2;
+
+/// Hops per direction for medium-density graphs
+///
+/// Balanced exploration for graphs in transition from dense to sparse.
+///
+/// Justification:
+/// - 3 hops is the "Goldilocks" zone for most graphs
+/// - Effective depth = 6 (matches SPREADING_MAX_HOPS)
+pub const BIDIRECTIONAL_HOPS_MEDIUM: usize = 3;
+
+/// Hops per direction for sparse graphs (density < SPARSE_THRESHOLD)
+///
+/// Sparse graphs have fewer but higher-quality edges (survived decay).
+/// More hops needed to find connections through curated paths.
+///
+/// Justification:
+/// - Mature systems have mostly L2/L3 edges (high signal)
+/// - 4 hops allows finding connections through longer semantic chains
+/// - Effective depth = 8 (deeper exploration is safe with quality edges)
+pub const BIDIRECTIONAL_HOPS_SPARSE: usize = 4;
+
+/// Density threshold below which graph is considered sparse
+///
+/// Sparse = fewer edges per memory, higher quality, needs more exploration.
+///
+/// Justification:
+/// - 0.5 edges/memory means most memories have 0-1 graph connections
+/// - Indicates mature, pruned graph where surviving edges are valuable
+/// - Aligns with DENSITY_THRESHOLD_MIN used in density-weighted scoring
+pub const BIDIRECTIONAL_DENSITY_SPARSE: f32 = 0.5;
+
+/// Density threshold above which graph is considered dense
+///
+/// Dense = many edges per memory, potentially noisy, limit exploration.
+///
+/// Justification:
+/// - 2.0 edges/memory means active graph with many connections
+/// - Fresh systems or highly interconnected domains
+/// - Aligns with DENSITY_THRESHOLD_MAX used in density-weighted scoring
+pub const BIDIRECTIONAL_DENSITY_DENSE: f32 = 2.0;
 
 // =============================================================================
 // HYBRID DECAY MODEL CONSTANTS (SHO-103)
