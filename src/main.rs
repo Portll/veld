@@ -123,6 +123,7 @@ struct Cli {
 }
 
 // Timeout constants for graceful shutdown
+const SERVER_DRAIN_TIMEOUT_SECS: u64 = 5; // Time to wait for in-flight requests
 const DATABASE_FLUSH_TIMEOUT_SECS: u64 = 30;
 const VECTOR_INDEX_SAVE_TIMEOUT_SECS: u64 = 60;
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
@@ -275,17 +276,40 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Run server with graceful shutdown support
-    // This allows axum to finish in-flight requests before stopping
-    let serve_result = axum::serve(
+    // Spawn server in a task so we can abort it after timeout
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    );
 
-    if let Err(e) = serve_result {
-        tracing::error!("Server error: {}", e);
+    let server_handle = tokio::spawn(async move {
+        server.await
+    });
+
+    // Wait for shutdown signal
+    shutdown_signal_with_drain().await;
+
+    // Give the server a brief moment to finish in-flight requests
+    info!(
+        "Waiting up to {}s for in-flight requests...",
+        SERVER_DRAIN_TIMEOUT_SECS
+    );
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(SERVER_DRAIN_TIMEOUT_SECS),
+        server_handle,
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => info!("Server stopped gracefully"),
+        Ok(Ok(Err(e))) => tracing::error!("Server error: {}", e),
+        Ok(Err(e)) => tracing::error!("Server task panicked: {}", e),
+        Err(_) => {
+            info!(
+                "Server drain timed out after {}s, proceeding with cleanup",
+                SERVER_DRAIN_TIMEOUT_SECS
+            );
+            // Server handle will be dropped, aborting the task
+        }
     }
 
     // Graceful shutdown with cleanup (flush databases, save indices)
@@ -370,7 +394,8 @@ fn start_backup_scheduler(manager: AppState, interval_secs: u64, max_backups: us
 // Shutdown Handling
 // =============================================================================
 
-async fn shutdown_signal() {
+/// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix).
+async fn shutdown_signal_with_drain() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -400,33 +425,43 @@ async fn run_shutdown_cleanup(manager: AppState) {
     info!("Proceeding with database flush...");
 
     let cleanup_future = async {
-        // Flush databases
-        let flush_future = async { manager.flush_all_databases() };
+        // Flush databases (blocking operation, must use spawn_blocking)
+        let manager_for_flush = Arc::clone(&manager);
+        let flush_handle = tokio::task::spawn_blocking(move || {
+            manager_for_flush.flush_all_databases()
+        });
+
         match tokio::time::timeout(
             std::time::Duration::from_secs(DATABASE_FLUSH_TIMEOUT_SECS),
-            flush_future,
+            flush_handle,
         )
         .await
         {
-            Ok(Ok(())) => info!("Databases flushed successfully"),
-            Ok(Err(e)) => tracing::error!("Failed to flush databases: {}", e),
+            Ok(Ok(Ok(()))) => info!("Databases flushed successfully"),
+            Ok(Ok(Err(e))) => tracing::error!("Failed to flush databases: {}", e),
+            Ok(Err(e)) => tracing::error!("Flush task panicked: {}", e),
             Err(_) => tracing::error!(
                 "Database flush timed out after {}s",
                 DATABASE_FLUSH_TIMEOUT_SECS
             ),
         }
 
-        // Save vector indices
+        // Save vector indices (blocking operation, must use spawn_blocking)
         info!("Persisting vector indices...");
-        let save_future = async { manager.save_all_vector_indices() };
+        let manager_for_save = Arc::clone(&manager);
+        let save_handle = tokio::task::spawn_blocking(move || {
+            manager_for_save.save_all_vector_indices()
+        });
+
         match tokio::time::timeout(
             std::time::Duration::from_secs(VECTOR_INDEX_SAVE_TIMEOUT_SECS),
-            save_future,
+            save_handle,
         )
         .await
         {
-            Ok(Ok(())) => info!("Vector indices saved successfully"),
-            Ok(Err(e)) => tracing::error!("Failed to save vector indices: {}", e),
+            Ok(Ok(Ok(()))) => info!("Vector indices saved successfully"),
+            Ok(Ok(Err(e))) => tracing::error!("Failed to save vector indices: {}", e),
+            Ok(Err(e)) => tracing::error!("Save task panicked: {}", e),
             Err(_) => tracing::error!(
                 "Vector index save timed out after {}s",
                 VECTOR_INDEX_SAVE_TIMEOUT_SECS

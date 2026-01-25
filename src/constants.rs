@@ -558,6 +558,20 @@ pub const SPREADING_EARLY_TERMINATION_CANDIDATES: usize = 50;
 /// Tuning (2026-01): Increased from 1.5 to 2.0 for more signal preservation
 pub const SPREADING_NORMALIZATION_FACTOR: f32 = 2.0;
 
+/// Salience boost factor for initial entity activation (ACT-R inspired)
+///
+/// Formula: activation = IC_weight × (1 + SALIENCE_BOOST_FACTOR × normalized_salience)
+///
+/// Justification:
+/// - ACT-R uses salience weights (wj) to reflect "attentional weighting"
+/// - Normalized salience ensures entities compete for attention budget
+/// - Value of 1.0 means high-salience entity (1.0) gets 2x boost vs zero-salience
+/// - The fan effect naturally dilutes high-connectivity entities
+///
+/// Reference: Anderson (1983) "A spreading activation theory of memory"
+/// Tuning (2026-01): Initial value 1.0 for full salience effect
+pub const SALIENCE_BOOST_FACTOR: f32 = 1.0;
+
 // =============================================================================
 // EDGE-TIER TRUST WEIGHTS FOR SPREADING ACTIVATION
 // Based on hippocampal-cortical consolidation: edges that survive decay are

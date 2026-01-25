@@ -8,7 +8,7 @@
 //!
 //! Implements spreading activation algorithm for memory retrieval:
 //! 1. Extract entities from query (using linguistic analysis)
-//! 2. Activate entities in knowledge graph
+//! 2. Activate entities in knowledge graph (salience-weighted, ACT-R inspired)
 //! 3. Spread activation through graph relationships (importance-weighted decay)
 //! 4. Retrieve episodic memories connected to activated entities
 //! 5. Score using hybrid method (density-dependent graph + semantic + linguistic)
@@ -28,10 +28,10 @@ use crate::constants::{
     EDGE_TIER_TRUST_L3, EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT,
     HYBRID_SEMANTIC_WEIGHT, IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN,
     MEMORY_TIER_GRAPH_MULT_ARCHIVE, MEMORY_TIER_GRAPH_MULT_LONGTERM,
-    MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING, SPREADING_ACTIVATION_THRESHOLD,
-    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
-    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
-    SPREADING_RELAXED_THRESHOLD,
+    MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING, SALIENCE_BOOST_FACTOR,
+    SPREADING_ACTIVATION_THRESHOLD, SPREADING_EARLY_TERMINATION_CANDIDATES,
+    SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES,
+    SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EpisodicNode, GraphMemory};
@@ -208,25 +208,60 @@ pub fn spreading_activation_retrieve_with_stats(
     );
 
     // Step 2: Initialize activation map from focal entities (nouns)
+    // ACT-R inspired: weight initial activation by entity salience (attention budget)
     let mut activation_map: HashMap<Uuid, f32> = HashMap::new();
 
-    for entity in &analysis.focal_entities {
-        // Find entity in graph by name
-        if let Some(entity_node) = graph.find_entity_by_name(&entity.text)? {
-            // Initial activation = IC weight (2.3 for nouns)
-            activation_map.insert(entity_node.uuid, entity.ic_weight);
-            stats.entities_activated += 1;
+    // First pass: collect entities with their salience values
+    let mut entity_data: Vec<(Uuid, String, f32, f32)> = Vec::new(); // (uuid, name, ic_weight, salience)
 
-            tracing::debug!(
-                "  ✓ Activated entity '{}' (UUID: {}, IC: {})",
-                entity.text,
+    for entity in &analysis.focal_entities {
+        if let Some(entity_node) = graph.find_entity_by_name(&entity.text)? {
+            entity_data.push((
                 entity_node.uuid,
-                entity.ic_weight
-            );
+                entity.text.clone(),
+                entity.ic_weight,
+                entity_node.salience,
+            ));
         } else {
             tracing::debug!("  ✗ Entity '{}' not found in graph", entity.text);
         }
     }
+
+    // Calculate total salience for normalization (attention budget)
+    let total_salience: f32 = entity_data.iter().map(|(_, _, _, s)| s).sum();
+    let total_salience = total_salience.max(0.1); // Prevent division by zero
+
+    // Second pass: apply salience-weighted activation
+    let mut total_boost = 0.0_f32;
+    for (uuid, name, ic_weight, salience) in &entity_data {
+        // Normalize salience across query entities (ACT-R attention budget)
+        let normalized_salience = salience / total_salience;
+
+        // ACT-R inspired: activation = IC_weight × (1 + boost_factor × normalized_salience)
+        let salience_boost = SALIENCE_BOOST_FACTOR * normalized_salience;
+        let initial_activation = ic_weight * (1.0 + salience_boost);
+
+        activation_map.insert(*uuid, initial_activation);
+        stats.entities_activated += 1;
+        total_boost += salience_boost;
+
+        tracing::debug!(
+            "  ✓ Activated '{}' (IC={:.2}, salience={:.2}, norm={:.2}, boost={:.2}, activation={:.2})",
+            name,
+            ic_weight,
+            salience,
+            normalized_salience,
+            salience_boost,
+            initial_activation
+        );
+    }
+
+    // Track average salience boost for observability
+    stats.avg_salience_boost = if !entity_data.is_empty() {
+        total_boost / entity_data.len() as f32
+    } else {
+        0.0
+    };
 
     if activation_map.is_empty() {
         tracing::warn!("No entities found in graph, falling back to semantic search");

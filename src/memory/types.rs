@@ -2599,6 +2599,10 @@ pub struct RetrievalStats {
     /// Number of unique entities activated during graph traversal
     pub entities_activated: usize,
 
+    /// Average salience boost applied to initial activations (0.0 if no entities)
+    /// Tracks ACT-R inspired salience weighting effectiveness
+    pub avg_salience_boost: f32,
+
     /// Total time spent on retrieval (microseconds)
     pub retrieval_time_us: u64,
 
