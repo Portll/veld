@@ -225,23 +225,26 @@ pub const HYBRID_LINGUISTIC_WEIGHT: f32 = 0.15;
 // =============================================================================
 // DENSITY-DEPENDENT RETRIEVAL WEIGHTS (SHO-26)
 // Based on GraphRAG Survey (arXiv 2408.08921) - hybrid KG-Vector improves 13.1%
-// Graph weight scales with density: sparse graphs get less trust, dense graphs more
+// Biological model: Dense graphs = noisy (fresh L1 edges), Sparse = curated (pruned)
+// Graph weight INVERSELY scales with density: sparse graphs get MORE trust
 // =============================================================================
 
-/// Minimum graph weight for sparse graphs (few associations)
+/// Minimum graph weight (used for DENSE graphs)
 ///
 /// Justification:
-/// - 0.1 (10%) for graphs with < 0.5 edges per memory
-/// - Sparse graphs have low-confidence associations
-/// - Semantic similarity dominates when graph is underdeveloped
+/// - 0.1 (10%) when graph has > 2.0 edges per memory
+/// - Dense graphs have many untested L1 edges (noisy)
+/// - Semantic/BM25 dominates when graph is fresh/noisy
+/// - Biological basis: new synapses need pruning before trust
 pub const DENSITY_GRAPH_WEIGHT_MIN: f32 = 0.1;
 
-/// Maximum graph weight for dense graphs (rich associations)
+/// Maximum graph weight (used for SPARSE graphs)
 ///
 /// Justification:
-/// - 0.5 (50%) for graphs with > 2.0 edges per memory
-/// - Dense graphs have high-confidence Hebbian associations
-/// - Graph traversal becomes primary retrieval signal
+/// - 0.5 (50%) when graph has < 0.5 edges per memory
+/// - Sparse graphs have survived Hebbian pruning (curated)
+/// - Graph traversal is high-signal when edges are mature
+/// - Biological basis: long-term potentiation = trusted paths
 ///
 /// Reference: GraphRAG Survey (arXiv 2408.08921)
 pub const DENSITY_GRAPH_WEIGHT_MAX: f32 = 0.5;
@@ -253,14 +256,18 @@ pub const DENSITY_GRAPH_WEIGHT_MAX: f32 = 0.5;
 /// - Semantic weight = 1.0 - graph_weight - linguistic_weight
 pub const DENSITY_LINGUISTIC_WEIGHT: f32 = 0.15;
 
-/// Density threshold for minimum graph weight
+/// Density threshold for sparse graphs (high graph weight)
 ///
-/// Below this edges-per-memory ratio, use DENSITY_GRAPH_WEIGHT_MIN
+/// Below this edges-per-memory ratio, graph is considered sparse/mature.
+/// Sparse graphs use DENSITY_GRAPH_WEIGHT_MAX (trust graph more).
+/// Biological basis: pruned graphs have curated, high-value edges.
 pub const DENSITY_THRESHOLD_MIN: f32 = 0.5;
 
-/// Density threshold for maximum graph weight
+/// Density threshold for dense graphs (low graph weight)
 ///
-/// Above this edges-per-memory ratio, use DENSITY_GRAPH_WEIGHT_MAX
+/// Above this edges-per-memory ratio, graph is considered dense/noisy.
+/// Dense graphs use DENSITY_GRAPH_WEIGHT_MIN (trust vector/BM25 more).
+/// Biological basis: fresh graphs have many untested L1 edges.
 pub const DENSITY_THRESHOLD_MAX: f32 = 2.0;
 
 // =============================================================================

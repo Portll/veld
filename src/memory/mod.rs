@@ -1759,56 +1759,54 @@ impl MemorySystem {
                 })
                 .unwrap_or(vector_results);
 
-            // RRF K=30 (lower = sharper rank differentiation, higher emphasis on top results)
+            // ===========================================================================
+            // LAYER 4: RRF FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
+            // ===========================================================================
+            // Biological model: Memory graphs start dense (noisy L1 edges) and become
+            // sparse over time through pruning (Hebbian "use it or lose it").
+            //
+            // Sparse graphs = mature, curated connections = trust graph more
+            // Dense graphs = fresh, noisy connections = trust semantic/BM25 more
+            //
+            // The density weights directly control the balance - no extra multipliers.
+            // This follows ACT-R's additive activation model.
             const K: f32 = 30.0;
             let mut fused: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
             let mut heb: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
 
-            // ADAPTIVE BOOST based on query complexity (multi-hop detection)
-            // More entities = more complex query = need more graph traversal
-            // Scale: 0-1 → single-hop, 2 → simple multi-hop, 3+ → complex multi-hop
-            let entity_multiplier = match query_entity_count {
-                0 | 1 => 1.2, // Single-hop: slight graph boost (entities still matter)
-                2 => 2.0,     // Simple multi-hop: strong graph boost
-                3 => 2.5,     // Complex multi-hop: very strong graph boost
-                4 => 3.0,     // Very complex: maximum graph boost
-                _ => 3.5,     // 5+: dominant graph for chain reasoning
-            };
-            // Use research-based density weighting (SHO-26, PIPE-8)
-            // Sparse graphs (<0.5 edges/memory) → stronger graph signal (0.5 weight)
-            //   Mature systems have curated L2/L3 edges, trust the graph
-            // Dense graphs (>2 edges/memory) → weaker graph signal (0.1 weight)
-            //   Fresh systems have noisy L1 edges, trust semantic/hybrid
-            // Reference: GraphRAG Survey (arXiv 2408.08921)
-            let (_semantic_w, graph_w, _linguistic_w) = graph_density
+            // Density-based weights (already tuned in calculate_density_weights)
+            // Sparse (≤0.5): graph_w=0.5, semantic_w=0.4, linguistic_w=0.1
+            // Dense (≥2.0):  graph_w=0.1, semantic_w=0.7, linguistic_w=0.2
+            let (semantic_w, graph_w, linguistic_w) = graph_density
                 .map(calculate_density_weights)
-                .unwrap_or((0.6, 0.3, 0.1)); // Default: balanced weights if no density info
+                .unwrap_or((0.6, 0.3, 0.1));
 
-            // Convert graph_weight (0.1-0.5) to multipliers
-            // Graph multiplier: higher when sparse (trust graph)
-            let density_multiplier = 1.0 + graph_w * 2.0; // 0.1 → 1.2, 0.5 → 2.0
-                                                          // Hybrid multiplier: inverse relationship (trust hybrid when dense)
-                                                          // Dense (graph_w=0.1) → 1.4, Medium (0.3) → 1.0, Sparse (0.5) → 0.6
-            let hybrid_multiplier = 1.0 + (0.3 - graph_w) * 2.0;
+            // Hybrid weight = semantic + linguistic (BM25 + vector combined)
+            let hybrid_w = semantic_w + linguistic_w;
 
-            let base_boost = entity_multiplier * density_multiplier;
             tracing::debug!(
-                "Layer 4: query_entities={}, entity_mult={:.1}, graph_w={:.2}, density_mult={:.2}, hybrid_mult={:.2}, boost={:.2}",
-                query_entity_count, entity_multiplier, graph_w, density_multiplier, hybrid_multiplier, base_boost
+                "Layer 4 RRF: density={:?}, graph_w={:.2}, hybrid_w={:.2}, query_entities={}",
+                graph_density, graph_w, hybrid_w, query_entity_count
             );
 
-            // Graph results: use activation score to weight contribution
+            // Graph results: pure RRF with density weight
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
-                // RRF score weighted by activation (salience * decay)
-                let graph_score = base_boost * activation / (K + r as f32);
-                *fused.entry(id.clone()).or_insert(0.0) += graph_score;
+                // Standard RRF: weight / (K + rank), rank is 1-indexed
+                let rrf_score = graph_w / (K + (r + 1) as f32);
+                *fused.entry(id.clone()).or_insert(0.0) += rrf_score;
                 heb.insert(id.clone(), *h);
+
+                // Additive activation bonus (ACT-R style spreading activation)
+                // Scaled by graph_w: trust activation more when graph is sparse/mature
+                let activation_bonus = graph_w * 0.2 * activation.clamp(0.0, 1.0);
+                *fused.get_mut(id).unwrap() += activation_bonus;
             }
-            // Hybrid (BM25+vector) results: density-adjusted (PIPE-8)
+
+            // Hybrid (BM25+vector) results: pure RRF with density weight
             for (r, (id, _)) in hybrid_ids.iter().enumerate() {
-                *fused.entry(id.clone()).or_insert(0.0) += hybrid_multiplier / (K + r as f32);
+                *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (K + (r + 1) as f32);
             }
 
             // ===========================================================================
