@@ -299,10 +299,10 @@ impl MultiUserMemoryManager {
         ));
         info!("Feedback store initialized");
 
-        let streaming_extractor = Arc::new(streaming::StreamingMemoryExtractor::new(
-            neural_ner.clone(),
-            feedback_store.clone(),
-        ));
+        // PIPE-9: StreamingMemoryExtractor no longer needs FeedbackStore
+        // Feedback momentum is now applied in the MemorySystem pipeline
+        let streaming_extractor =
+            Arc::new(streaming::StreamingMemoryExtractor::new(neural_ner.clone()));
         info!("Streaming memory extractor initialized");
 
         let keyword_extractor = Arc::new(KeywordExtractor::new());
@@ -506,6 +506,8 @@ impl MultiUserMemoryManager {
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
         let graph = self.get_user_graph(user_id)?;
         memory_system.set_graph_memory(graph);
+        // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
+        memory_system.set_feedback_store(self.feedback_store.clone());
 
         let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
 

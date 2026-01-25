@@ -854,27 +854,25 @@ pub async fn proactive_context(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?;
 
     // 2. Retrieve memories using unified 5-layer pipeline
-    // The pipeline already applies: hebbian boost (10%) + recency decay (10%) + RRF fusion
+    // The pipeline already applies: RRF fusion + hebbian + recency + feedback (PIPE-9)
     // No double-scoring needed - just use the scores from recall() directly
     let context_clone = req.context.clone();
     let max_results = req.max_results;
     let user_id_for_query = req.user_id.clone();
-    let feedback_store_for_scoring = state.feedback_store.clone();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            let feedback_guard = feedback_store_for_scoring.read();
 
             let query = MemoryQuery {
                 user_id: Some(user_id_for_query),
                 query_text: Some(context_clone),
-                max_results: max_results * 2, // Fetch extra for feedback filtering
+                max_results,
                 ..Default::default()
             };
             let results = memory_guard.recall(&query).unwrap_or_default();
 
-            // Use scores from 5-layer pipeline, apply optional feedback suppression
+            // Use scores from 5-layer pipeline (PIPE-9: feedback momentum now applied in pipeline)
             let mut candidates: Vec<(SharedMemory, f32)> = results
                 .into_iter()
                 .filter_map(|m| {
@@ -883,19 +881,9 @@ pub async fn proactive_context(
                         return None;
                     }
 
-                    // Base score from unified 5-layer pipeline (hebbian + recency + RRF)
-                    let mut score = m.get_score().unwrap_or(0.0);
-
-                    // Optional: Apply feedback suppression for frequently-ignored memories
-                    // Negative momentum = often ignored → penalize
-                    if let Some(fm) = feedback_guard.get_momentum(&m.id) {
-                        let momentum = fm.ema_with_decay();
-                        if momentum < 0.0 {
-                            // Suppress by up to 20% for highly negative momentum
-                            score *= 1.0 + (momentum * 0.2).max(-0.2);
-                        }
-                    }
-
+                    // Score from unified 5-layer pipeline includes:
+                    // RRF fusion + hebbian + recency + arousal + credibility + temporal + feedback
+                    let score = m.get_score().unwrap_or(0.0);
                     Some((m, score))
                 })
                 .collect();

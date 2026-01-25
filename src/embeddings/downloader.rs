@@ -60,13 +60,13 @@ impl ModelChecksums {
         Some("be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037");
 }
 
-/// ONNX Runtime download URLs by platform (v1.22.0 required by ort 2.0.0-rc.10)
+/// ONNX Runtime download URLs by platform (v1.23.2 required by ort 2.0.0-rc.11)
 #[cfg(target_os = "windows")]
-const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip";
+const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip";
 #[cfg(target_os = "linux")]
-const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz";
+const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz";
 #[cfg(target_os = "macos")]
-const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-osx-arm64-1.22.0.tgz";
+const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz";
 
 /// Get the cache directory for shodh-memory
 pub fn get_cache_dir() -> PathBuf {

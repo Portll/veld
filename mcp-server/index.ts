@@ -3798,11 +3798,38 @@ async function ensureServerRunning(): Promise<void> {
   }
 }
 
-// Cleanup on exit
-process.on("exit", () => {
+// Graceful shutdown helper
+function cleanupServer() {
   if (serverProcess && !serverProcess.killed) {
-    serverProcess.kill();
+    // For detached processes, we need to kill the process group on Unix
+    if (process.platform !== "win32" && serverProcess.pid) {
+      try {
+        // Kill the process group (negative PID)
+        process.kill(-serverProcess.pid, "SIGTERM");
+      } catch {
+        // Fallback to direct kill if process group kill fails
+        serverProcess.kill("SIGTERM");
+      }
+    } else {
+      serverProcess.kill();
+    }
   }
+}
+
+// Cleanup on exit
+process.on("exit", cleanupServer);
+
+// Handle signals for clean shutdown
+process.on("SIGINT", () => {
+  console.error("[shodh-memory] Received SIGINT, shutting down...");
+  cleanupServer();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.error("[shodh-memory] Received SIGTERM, shutting down...");
+  cleanupServer();
+  process.exit(0);
 });
 
 // Start server

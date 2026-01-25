@@ -222,6 +222,11 @@ pub struct MemorySystem {
     /// This enables spreading activation retrieval and Hebbian co-activation learning
     graph_memory: Option<Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>>,
 
+    /// Optional feedback store for momentum-based scoring (PIPE-9)
+    /// When set, retrieval applies feedback momentum to boost proven-helpful memories
+    /// and suppress frequently-ignored memories (up to 20% penalty for negative momentum)
+    feedback_store: Option<Arc<parking_lot::RwLock<FeedbackStore>>>,
+
     /// Persistent learning history for significant events
     /// Enables recency-weighted retrieval and learning velocity tracking
     learning_history: Arc<learning_history::LearningHistoryStore>,
@@ -456,6 +461,8 @@ impl MemorySystem {
             hybrid_search: Arc::new(hybrid_search_engine),
             // Graph memory is optional - wire up with set_graph_memory() for entity relationships
             graph_memory: None,
+            // Feedback store is optional - wire up with set_feedback_store() for momentum scoring (PIPE-9)
+            feedback_store: None,
             // Persistent learning history for retrieval boosting
             learning_history,
             // Temporal fact store for multi-hop temporal reasoning
@@ -483,6 +490,22 @@ impl MemorySystem {
         &self,
     ) -> Option<&Arc<parking_lot::RwLock<crate::graph_memory::GraphMemory>>> {
         self.graph_memory.as_ref()
+    }
+
+    /// Set the feedback store for momentum-based scoring (PIPE-9)
+    ///
+    /// When set, retrieval automatically applies feedback momentum:
+    /// - Positive momentum (frequently helpful) → boost score
+    /// - Negative momentum (frequently ignored) → suppress score (up to 20%)
+    ///
+    /// This provides consistent feedback integration across all retrieval paths.
+    pub fn set_feedback_store(&mut self, feedback: Arc<parking_lot::RwLock<FeedbackStore>>) {
+        self.feedback_store = Some(feedback);
+    }
+
+    /// Get reference to the optional feedback store
+    pub fn feedback_store(&self) -> Option<&Arc<parking_lot::RwLock<FeedbackStore>>> {
+        self.feedback_store.as_ref()
     }
 
     /// Store a new memory (takes ownership to avoid clones)
@@ -1753,20 +1776,27 @@ impl MemorySystem {
                 4 => 3.0,     // Very complex: maximum graph boost
                 _ => 3.5,     // 5+: dominant graph for chain reasoning
             };
-            // Use research-based density weighting (SHO-26)
-            // High density graphs (>2 edges/memory) → stronger graph signal (0.5 weight)
-            // Low density graphs (<0.5 edges/memory) → weaker graph signal (0.1 weight)
+            // Use research-based density weighting (SHO-26, PIPE-8)
+            // Sparse graphs (<0.5 edges/memory) → stronger graph signal (0.5 weight)
+            //   Mature systems have curated L2/L3 edges, trust the graph
+            // Dense graphs (>2 edges/memory) → weaker graph signal (0.1 weight)
+            //   Fresh systems have noisy L1 edges, trust semantic/hybrid
             // Reference: GraphRAG Survey (arXiv 2408.08921)
             let (_semantic_w, graph_w, _linguistic_w) = graph_density
                 .map(calculate_density_weights)
                 .unwrap_or((0.6, 0.3, 0.1)); // Default: balanced weights if no density info
-                                             // Convert graph_weight (0.1-0.5) to a multiplier (1.0-2.0)
-                                             // This ensures graph results are boosted proportionally to graph density
+
+            // Convert graph_weight (0.1-0.5) to multipliers
+            // Graph multiplier: higher when sparse (trust graph)
             let density_multiplier = 1.0 + graph_w * 2.0; // 0.1 → 1.2, 0.5 → 2.0
+                                                          // Hybrid multiplier: inverse relationship (trust hybrid when dense)
+                                                          // Dense (graph_w=0.1) → 1.4, Medium (0.3) → 1.0, Sparse (0.5) → 0.6
+            let hybrid_multiplier = 1.0 + (0.3 - graph_w) * 2.0;
+
             let base_boost = entity_multiplier * density_multiplier;
             tracing::debug!(
-                "Layer 4: query_entities={}, entity_mult={:.1}, graph_w={:.2}, density_mult={:.2}, boost={:.2}",
-                query_entity_count, entity_multiplier, graph_w, density_multiplier, base_boost
+                "Layer 4: query_entities={}, entity_mult={:.1}, graph_w={:.2}, density_mult={:.2}, hybrid_mult={:.2}, boost={:.2}",
+                query_entity_count, entity_multiplier, graph_w, density_multiplier, hybrid_multiplier, base_boost
             );
 
             // Graph results: use activation score to weight contribution
@@ -1776,9 +1806,9 @@ impl MemorySystem {
                 *fused.entry(id.clone()).or_insert(0.0) += graph_score;
                 heb.insert(id.clone(), *h);
             }
-            // Hybrid (BM25+vector) results
+            // Hybrid (BM25+vector) results: density-adjusted (PIPE-8)
             for (r, (id, _)) in hybrid_ids.iter().enumerate() {
-                *fused.entry(id.clone()).or_insert(0.0) += 1.0 / (K + r as f32);
+                *fused.entry(id.clone()).or_insert(0.0) += hybrid_multiplier / (K + r as f32);
             }
 
             // ===========================================================================
@@ -1874,11 +1904,15 @@ impl MemorySystem {
         let mut storage_fetches = 0;
         let mut filtered_out = 0;
 
-        // Layer 5: Unified scoring with hebbian + recency + emotional signals
+        // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // Recency decay: recent memories get boost, old memories decay
         // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
         const RECENCY_DECAY_RATE: f32 = 0.01;
         let now = chrono::Utc::now();
+
+        // PIPE-9: Get feedback store guard for momentum-based scoring
+        // Acquire once outside the loop to avoid repeated locking
+        let feedback_guard = self.feedback_store.as_ref().map(|fs| fs.read());
 
         for (memory_id, score) in memory_ids {
             // Hebbian boost from learned graph weights (10% contribution)
@@ -1943,8 +1977,31 @@ impl MemorySystem {
                     0.0
                 };
 
+                // FEEDBACK MOMENTUM (PIPE-9)
+                // Apply momentum from past feedback to consistently boost/suppress memories
+                // - Positive momentum (proven helpful) → boost score
+                // - Negative momentum (frequently ignored) → suppress up to 20%
+                // This ensures consistent feedback integration across ALL retrieval paths
+                let feedback_multiplier = if let Some(ref guard) = feedback_guard {
+                    if let Some(fm) = guard.get_momentum(&mem.id) {
+                        let momentum = fm.ema_with_decay();
+                        if momentum < 0.0 {
+                            // Suppress: up to 20% penalty for highly negative momentum
+                            1.0 + (momentum * 0.2).max(-0.2)
+                        } else {
+                            // Boost: up to 10% bonus for positive momentum
+                            1.0 + (momentum * 0.1).min(0.1)
+                        }
+                    } else {
+                        1.0 // No feedback history
+                    }
+                } else {
+                    1.0 // No feedback store configured
+                };
+
                 let final_score =
-                    base + recency_boost + arousal_boost + credibility_boost + temporal_boost;
+                    (base + recency_boost + arousal_boost + credibility_boost + temporal_boost)
+                        * feedback_multiplier;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);

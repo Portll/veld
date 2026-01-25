@@ -717,20 +717,14 @@ pub struct StreamingMemoryExtractor {
 
     /// Active sessions
     sessions: Arc<RwLock<HashMap<String, StreamSession>>>,
-
-    /// Feedback store for memory relevance scoring
-    feedback_store: Arc<parking_lot::RwLock<crate::memory::FeedbackStore>>,
+    // PIPE-9: feedback_store removed - feedback momentum now applied in MemorySystem pipeline
 }
 
 impl StreamingMemoryExtractor {
-    pub fn new(
-        neural_ner: Arc<NeuralNer>,
-        feedback_store: Arc<parking_lot::RwLock<crate::memory::FeedbackStore>>,
-    ) -> Self {
+    pub fn new(neural_ner: Arc<NeuralNer>) -> Self {
         Self {
             neural_ner,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            feedback_store,
         }
     }
 
@@ -1261,14 +1255,13 @@ impl StreamingMemoryExtractor {
         let surfaced: Vec<SurfacedStreamMemory> = {
             let memory = memory_system.clone();
             let graph = graph_memory.clone();
-            let feedback = self.feedback_store.clone();
             let sessions = self.sessions.clone();
             let session_id_owned = session_id.to_string();
 
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory.read();
                 let graph_guard = graph.read();
-                let feedback_guard = feedback.read();
+                // PIPE-9: feedback momentum now applied in pipeline, no post-hoc adjustment needed
                 let now = Utc::now();
                 let _ = cooldown_seconds; // Used for session cooldown check
 
@@ -1280,8 +1273,8 @@ impl StreamingMemoryExtractor {
                 };
                 let results = memory_guard.recall(&query).unwrap_or_default();
 
-                // Use scores from unified 5-layer pipeline (no double-scoring)
-                // Recall already applies: RRF fusion + hebbian (10%) + recency (10%)
+                // Use scores from unified 5-layer pipeline (PIPE-9: feedback now in pipeline)
+                // Recall already applies: RRF fusion + hebbian + recency + feedback
                 const RECENCY_DECAY_RATE: f32 = 0.01; // For breakdown display only
 
                 let mut candidates: Vec<(_, f32, f32, f32, f32)> = results
@@ -1289,16 +1282,8 @@ impl StreamingMemoryExtractor {
                     .filter_map(|m| {
                         let memory_embedding = m.experience.embeddings.as_ref()?.clone();
 
-                        // Use score from 5-layer pipeline directly
-                        let mut score = m.get_score().unwrap_or(0.0);
-
-                        // Optional: Apply feedback suppression for frequently-ignored memories
-                        if let Some(fm) = feedback_guard.get_momentum(&m.id) {
-                            let momentum = fm.ema_with_decay();
-                            if momentum < 0.0 {
-                                score *= 1.0 + (momentum * 0.2).max(-0.2);
-                            }
-                        }
+                        // Use score from 5-layer pipeline directly (includes feedback momentum)
+                        let score = m.get_score().unwrap_or(0.0);
 
                         // Compute breakdown components for display
                         let semantic = cosine_similarity(&memory_embedding, &context_emb);

@@ -891,7 +891,7 @@ fn test_long_term_potentiation_threshold() {
 
     let mut edge = create_relationship(entity_a, entity_b, RelationType::Knows, 0.5);
     assert!(
-        !edge.potentiated,
+        !edge.is_potentiated(),
         "Edge should not be potentiated initially"
     );
 
@@ -900,7 +900,7 @@ fn test_long_term_potentiation_threshold() {
         edge.strengthen();
     }
     assert!(
-        !edge.potentiated,
+        !edge.is_potentiated(),
         "Edge should not be potentiated at 9 activations"
     );
 
@@ -909,7 +909,7 @@ fn test_long_term_potentiation_threshold() {
     edge.strengthen();
 
     assert!(
-        edge.potentiated,
+        edge.is_potentiated(),
         "Edge should be potentiated at 10 activations"
     );
     assert!(

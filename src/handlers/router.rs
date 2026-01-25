@@ -43,7 +43,8 @@ pub fn build_public_routes(state: AppState) -> Router {
         // =================================================================
         .route("/api/context/status", post(health::update_context_status))
         .route("/api/context/status", get(health::get_context_status))
-        .route("/api/context_status", get(health::get_context_status)) // TUI alias
+        .route("/api/context_status", get(health::get_context_status)) // TUI GET alias
+        .route("/api/context_status", post(health::update_context_status)) // TUI POST alias
         .route("/api/context/sse", get(webhooks::context_status_sse))
         // =================================================================
         // EXTERNAL WEBHOOKS (SIGNATURE VERIFIED INTERNALLY)
