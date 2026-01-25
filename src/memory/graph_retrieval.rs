@@ -2,20 +2,28 @@
 //!
 //! Based on:
 //! - Anderson & Pirolli (1984): "Spread of Activation"
+//! - Collins & Loftus (1975): "Spreading-activation theory of semantic processing"
 //! - Xiong et al. (2017): "Explicit Semantic Ranking via Knowledge Graph Embedding"
 //! - GraphRAG Survey (arXiv 2408.08921): Hybrid KG-Vector improves 13.1%
 //! - spreadr R package (Siew, 2019): Importance-weighted decay
+//! - ACT-R cognitive architecture: Multi-source activation with intersection boost
 //!
 //! Implements spreading activation algorithm for memory retrieval:
 //! 1. Extract entities from query (using linguistic analysis)
 //! 2. Activate entities in knowledge graph (salience-weighted, ACT-R inspired)
 //! 3. Spread activation through graph relationships (importance-weighted decay)
+//!    - PIPE-7: Bidirectional spreading for 2+ entities (meet-in-middle)
 //! 4. Retrieve episodic memories connected to activated entities
 //! 5. Score using hybrid method (density-dependent graph + semantic + linguistic)
 //!
 //! SHO-26 Enhancements:
 //! - Density-dependent hybrid weights: Graph trust scales with learned associations
 //! - Importance-weighted decay: Important memories decay slower, preserve signal
+//!
+//! PIPE-7 Enhancements:
+//! - Bidirectional spreading: When 2+ focal entities, split and spread from both ends
+//! - Intersection boost: Entities reached from both directions get 1.5× activation
+//! - Complexity reduction: O(b^d) → O(2 × b^(d/2)) for multi-entity queries
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -23,13 +31,14 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::constants::{
-    DENSITY_GRAPH_WEIGHT_MAX, DENSITY_GRAPH_WEIGHT_MIN, DENSITY_LINGUISTIC_WEIGHT,
-    DENSITY_THRESHOLD_MAX, DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2,
-    EDGE_TIER_TRUST_L3, EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT,
-    HYBRID_SEMANTIC_WEIGHT, IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN,
-    MEMORY_TIER_GRAPH_MULT_ARCHIVE, MEMORY_TIER_GRAPH_MULT_LONGTERM,
-    MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING, SALIENCE_BOOST_FACTOR,
-    SPREADING_ACTIVATION_THRESHOLD, SPREADING_EARLY_TERMINATION_CANDIDATES,
+    BIDIRECTIONAL_INTERSECTION_BOOST, BIDIRECTIONAL_INTERSECTION_MIN,
+    BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION, BIDIRECTIONAL_MIN_ENTITIES, DENSITY_GRAPH_WEIGHT_MAX,
+    DENSITY_GRAPH_WEIGHT_MIN, DENSITY_LINGUISTIC_WEIGHT, DENSITY_THRESHOLD_MAX,
+    DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
+    EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
+    IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
+    MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING,
+    SALIENCE_BOOST_FACTOR, SPREADING_ACTIVATION_THRESHOLD, SPREADING_EARLY_TERMINATION_CANDIDATES,
     SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES,
     SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
 };
@@ -98,6 +107,196 @@ pub fn calculate_importance_weighted_decay(importance: f32) -> f32 {
     let clamped_importance = importance.clamp(0.0, 1.0);
     IMPORTANCE_DECAY_MIN
         + (1.0 - clamped_importance) * (IMPORTANCE_DECAY_MAX - IMPORTANCE_DECAY_MIN)
+}
+
+// =============================================================================
+// PIPE-7: BIDIRECTIONAL SPREADING ACTIVATION
+// =============================================================================
+//
+// Based on:
+// - Collins & Loftus (1975): Spreading activation in semantic memory
+// - ACT-R cognitive architecture: Multi-source activation with intersection boost
+// - Meet-in-middle search: O(b^d) → O(2 × b^(d/2)) complexity reduction
+//
+// Key insight: When query has multiple focal entities (e.g., "Rust" and "database"),
+// spreading from both ends and boosting intersection entities finds the "bridge"
+// concepts that connect the query terms - these are often the most relevant.
+
+/// Spread activation from a set of seed entities for a fixed number of hops
+///
+/// This is a single-direction spread used by bidirectional algorithm.
+/// Returns the activation map after spreading.
+fn spread_single_direction(
+    seeds: &[(Uuid, f32)],
+    graph: &GraphMemory,
+    max_hops: usize,
+    threshold: f32,
+) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>)> {
+    let mut activation_map: HashMap<Uuid, f32> = seeds.iter().cloned().collect();
+    let mut traversed_edges: Vec<Uuid> = Vec::new();
+
+    for hop in 1..=max_hops {
+        let current_activated: Vec<(Uuid, f32)> =
+            activation_map.iter().map(|(id, act)| (*id, *act)).collect();
+
+        for (entity_uuid, source_activation) in current_activated {
+            if source_activation < threshold {
+                continue;
+            }
+
+            const MAX_EDGES_PER_SPREAD: usize = 100;
+            let edges =
+                graph.get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
+
+            for edge in edges {
+                let target_uuid = edge.to_entity;
+
+                // Edge-tier trust weight
+                let tier_trust = if edge.is_potentiated() {
+                    EDGE_TIER_TRUST_LTP
+                } else {
+                    match edge.tier {
+                        EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3,
+                        EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2,
+                        EdgeTier::L1Working => EDGE_TIER_TRUST_L1,
+                    }
+                };
+
+                // Importance-weighted decay
+                let importance = edge.strength;
+                let decay_rate = calculate_importance_weighted_decay(importance);
+                let decay = (-decay_rate * hop as f32).exp();
+
+                let spread_amount = source_activation * decay * edge.strength * tier_trust;
+
+                let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
+                *new_activation += spread_amount;
+
+                if spread_amount > 0.01 {
+                    traversed_edges.push(edge.uuid);
+                }
+            }
+        }
+
+        // Normalize to prevent unbounded growth
+        let max_activation = activation_map
+            .values()
+            .cloned()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(1.0);
+
+        if max_activation > SPREADING_NORMALIZATION_FACTOR {
+            let scale = SPREADING_NORMALIZATION_FACTOR / max_activation;
+            for activation in activation_map.values_mut() {
+                *activation *= scale;
+            }
+        }
+
+        // Prune weak activations
+        activation_map.retain(|_, activation| *activation > threshold);
+    }
+
+    Ok((activation_map, traversed_edges))
+}
+
+/// Bidirectional spreading activation with intersection boost (PIPE-7)
+///
+/// Splits focal entities into forward/backward sets, spreads from each,
+/// and boosts entities found at the intersection.
+///
+/// Returns: (combined_activation_map, traversed_edges, intersection_count)
+fn bidirectional_spread(
+    entity_data: &[(Uuid, String, f32, f32)], // (uuid, name, ic_weight, salience)
+    graph: &GraphMemory,
+    total_salience: f32,
+) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, usize)> {
+    // Split entities into forward/backward sets (alternating assignment)
+    // This distributes entities evenly regardless of count
+    let mut forward_seeds: Vec<(Uuid, f32)> = Vec::new();
+    let mut backward_seeds: Vec<(Uuid, f32)> = Vec::new();
+
+    for (i, (uuid, _name, ic_weight, salience)) in entity_data.iter().enumerate() {
+        let normalized_salience = salience / total_salience;
+        let salience_boost = SALIENCE_BOOST_FACTOR * normalized_salience;
+        let initial_activation = ic_weight * (1.0 + salience_boost);
+
+        if i % 2 == 0 {
+            forward_seeds.push((*uuid, initial_activation));
+        } else {
+            backward_seeds.push((*uuid, initial_activation));
+        }
+    }
+
+    // If odd number of entities, backward might be empty - add last entity to both
+    if backward_seeds.is_empty() && !forward_seeds.is_empty() {
+        backward_seeds.push(forward_seeds[forward_seeds.len() - 1]);
+    }
+
+    tracing::debug!(
+        "🔀 Bidirectional spread: {} forward seeds, {} backward seeds",
+        forward_seeds.len(),
+        backward_seeds.len()
+    );
+
+    // Spread from both directions
+    let threshold = SPREADING_ACTIVATION_THRESHOLD;
+    let (forward_map, forward_edges) = spread_single_direction(
+        &forward_seeds,
+        graph,
+        BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION,
+        threshold,
+    )?;
+
+    let (backward_map, backward_edges) = spread_single_direction(
+        &backward_seeds,
+        graph,
+        BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION,
+        threshold,
+    )?;
+
+    // Combine maps with intersection boost
+    let mut combined_map: HashMap<Uuid, f32> = HashMap::new();
+    let mut intersection_count = 0;
+
+    // Collect all entities from both directions
+    let all_entities: std::collections::HashSet<Uuid> = forward_map
+        .keys()
+        .chain(backward_map.keys())
+        .cloned()
+        .collect();
+
+    for entity_uuid in all_entities {
+        let forward_activation = forward_map.get(&entity_uuid).cloned().unwrap_or(0.0);
+        let backward_activation = backward_map.get(&entity_uuid).cloned().unwrap_or(0.0);
+
+        // Check if this is an intersection entity (meaningful activation from both)
+        let is_intersection = forward_activation >= BIDIRECTIONAL_INTERSECTION_MIN
+            && backward_activation >= BIDIRECTIONAL_INTERSECTION_MIN;
+
+        let combined_activation = if is_intersection {
+            intersection_count += 1;
+            // Intersection boost: these are "bridge" concepts
+            (forward_activation + backward_activation) * BIDIRECTIONAL_INTERSECTION_BOOST
+        } else {
+            // Non-intersection: just sum the activations
+            forward_activation + backward_activation
+        };
+
+        combined_map.insert(entity_uuid, combined_activation);
+    }
+
+    // Combine traversed edges
+    let mut all_edges = forward_edges;
+    all_edges.extend(backward_edges);
+
+    tracing::debug!(
+        "🔀 Bidirectional result: {} entities ({} intersections), {} edges",
+        combined_map.len(),
+        intersection_count,
+        all_edges.len()
+    );
+
+    Ok((combined_map, all_edges, intersection_count))
 }
 
 /// Spreading activation retrieval (legacy - uses fixed weights)
@@ -269,152 +468,171 @@ pub fn spreading_activation_retrieve_with_stats(
         return Ok((Vec::new(), stats)); // Caller should fall back to semantic search
     }
 
-    // Step 3: Spread activation through graph (Anderson & Pirolli 1984)
-    // With importance-weighted decay (SHO-26) and adaptive limits
+    // Step 3: Spread activation through graph
+    // PIPE-7: Use bidirectional spreading when 2+ focal entities, else unidirectional
     let graph_start = Instant::now();
+    let mut traversed_edges: Vec<Uuid>;
 
-    // Track traversed edges for Hebbian strengthening (AUD-1)
-    let mut traversed_edges: Vec<Uuid> = Vec::new();
-
-    // Adaptive threshold: start strict, relax if too few candidates
-    let mut current_threshold = SPREADING_ACTIVATION_THRESHOLD;
-
-    for hop in 1..=SPREADING_MAX_HOPS {
-        stats.graph_hops = hop;
-        let count_before = activation_map.len();
-
-        tracing::debug!(
-            "📊 Spreading activation (hop {}/{}, threshold={:.4})",
-            hop,
-            SPREADING_MAX_HOPS,
-            current_threshold
+    if entity_data.len() >= BIDIRECTIONAL_MIN_ENTITIES {
+        // PIPE-7: Bidirectional spreading activation
+        // Split entities into forward/backward sets, spread from each, boost intersections
+        tracing::info!(
+            "🔀 Using bidirectional spreading ({} focal entities)",
+            entity_data.len()
         );
 
-        // Clone to avoid borrow issues
-        let current_activated: Vec<(Uuid, f32)> =
-            activation_map.iter().map(|(id, act)| (*id, *act)).collect();
+        let (bidirectional_map, edges, intersection_count) =
+            bidirectional_spread(&entity_data, graph, total_salience)?;
 
-        for (entity_uuid, source_activation) in current_activated {
-            // Only spread from entities with sufficient activation
-            if source_activation < current_threshold {
-                continue;
-            }
+        activation_map = bidirectional_map;
+        traversed_edges = edges;
+        stats.entities_activated = activation_map.len();
+        stats.graph_hops = BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION * 2; // Effective depth
 
-            // Get relationships from this entity (limited to prevent blowup)
-            const MAX_EDGES_PER_SPREAD: usize = 100;
-            let edges =
-                graph.get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
-
-            for edge in edges {
-                // Spread activation to connected entity
-                let target_uuid = edge.to_entity;
-
-                // Edge-tier trust weight (SHO-D1, PIPE-4)
-                // LTP edges are gold (survived many activations)
-                // L3 edges have proven value (survived decay to semantic tier)
-                // L1 edges are noisy (new, untested) - graph search not optimal
-                let tier_trust = if edge.is_potentiated() {
-                    EDGE_TIER_TRUST_LTP // 0.95 - highest trust (any LTP level)
-                } else {
-                    match edge.tier {
-                        EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3, // 0.80
-                        EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2, // 0.50
-                        EdgeTier::L1Working => EDGE_TIER_TRUST_L1,  // 0.20
-                    }
-                };
-
-                // SHO-26: Importance-weighted decay
-                // Use edge strength as proxy for importance (stronger edges = more important)
-                let importance = edge.strength;
-                let decay_rate = calculate_importance_weighted_decay(importance);
-                let decay = (-decay_rate * hop as f32).exp();
-
-                // Include tier_trust in propagation: high-trust edges propagate more activation
-                let spread_amount = source_activation * decay * edge.strength * tier_trust;
-
-                // Accumulate activation
-                let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
-                *new_activation += spread_amount;
-
-                // Track traversed edges for Hebbian strengthening (AUD-1)
-                // Only track edges that contributed meaningful activation
-                if spread_amount > 0.01 {
-                    traversed_edges.push(edge.uuid);
-                }
-
-                // Track newly activated entities
-                if *new_activation >= current_threshold
-                    && *new_activation - spread_amount < current_threshold
-                {
-                    stats.entities_activated += 1;
-                }
-            }
-        }
-
-        // Normalize activations to prevent unbounded growth
-        // Scale so max activation = NORMALIZATION_FACTOR (allows some accumulation)
-        let max_activation = activation_map
-            .values()
-            .cloned()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(1.0);
-
-        if max_activation > SPREADING_NORMALIZATION_FACTOR {
-            let scale = SPREADING_NORMALIZATION_FACTOR / max_activation;
-            for activation in activation_map.values_mut() {
-                *activation *= scale;
-            }
-        }
-
-        // Prune weak activations (ACT-R model)
-        activation_map.retain(|_, activation| *activation > current_threshold);
-
-        let count_after = activation_map.len();
-        let new_activations = count_after.saturating_sub(count_before);
-
-        tracing::debug!(
-            "  Activated entities: {} (+{} new)",
-            count_after,
-            new_activations
+        tracing::info!(
+            "🔀 Bidirectional complete: {} entities, {} intersections",
+            activation_map.len(),
+            intersection_count
+        );
+    } else {
+        // Standard unidirectional spreading (Anderson & Pirolli 1984)
+        // With importance-weighted decay (SHO-26) and adaptive limits
+        tracing::info!(
+            "📊 Using unidirectional spreading ({} focal entity)",
+            entity_data.len()
         );
 
-        // Adaptive threshold relaxation: if too few candidates, lower threshold
-        if count_after < SPREADING_MIN_CANDIDATES && current_threshold > SPREADING_RELAXED_THRESHOLD
-        {
-            current_threshold = SPREADING_RELAXED_THRESHOLD;
+        let mut edges_collected: Vec<Uuid> = Vec::new();
+        let mut current_threshold = SPREADING_ACTIVATION_THRESHOLD;
+
+        for hop in 1..=SPREADING_MAX_HOPS {
+            stats.graph_hops = hop;
+            let count_before = activation_map.len();
+
             tracing::debug!(
-                "  Relaxing threshold to {:.4} (only {} candidates)",
-                current_threshold,
-                count_after
+                "📊 Spreading activation (hop {}/{}, threshold={:.4})",
+                hop,
+                SPREADING_MAX_HOPS,
+                current_threshold
             );
-        }
 
-        // Early termination checks (only after minimum hops)
-        if hop >= SPREADING_MIN_HOPS {
-            // Check 1: Saturation - very few new activations relative to total
-            let new_ratio = if count_after > 0 {
-                new_activations as f32 / count_after as f32
-            } else {
-                0.0
-            };
+            // Clone to avoid borrow issues
+            let current_activated: Vec<(Uuid, f32)> =
+                activation_map.iter().map(|(id, act)| (*id, *act)).collect();
 
-            if new_ratio < SPREADING_EARLY_TERMINATION_RATIO && count_after > 0 {
-                tracing::debug!(
-                    "  Early termination: activation saturated ({:.1}% new)",
-                    new_ratio * 100.0
-                );
-                break;
+            for (entity_uuid, source_activation) in current_activated {
+                // Only spread from entities with sufficient activation
+                if source_activation < current_threshold {
+                    continue;
+                }
+
+                // Get relationships from this entity (limited to prevent blowup)
+                const MAX_EDGES_PER_SPREAD: usize = 100;
+                let edges = graph
+                    .get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
+
+                for edge in edges {
+                    // Spread activation to connected entity
+                    let target_uuid = edge.to_entity;
+
+                    // Edge-tier trust weight (SHO-D1, PIPE-4)
+                    let tier_trust = if edge.is_potentiated() {
+                        EDGE_TIER_TRUST_LTP
+                    } else {
+                        match edge.tier {
+                            EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3,
+                            EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2,
+                            EdgeTier::L1Working => EDGE_TIER_TRUST_L1,
+                        }
+                    };
+
+                    // SHO-26: Importance-weighted decay
+                    let importance = edge.strength;
+                    let decay_rate = calculate_importance_weighted_decay(importance);
+                    let decay = (-decay_rate * hop as f32).exp();
+
+                    let spread_amount = source_activation * decay * edge.strength * tier_trust;
+
+                    let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
+                    *new_activation += spread_amount;
+
+                    if spread_amount > 0.01 {
+                        edges_collected.push(edge.uuid);
+                    }
+
+                    if *new_activation >= current_threshold
+                        && *new_activation - spread_amount < current_threshold
+                    {
+                        stats.entities_activated += 1;
+                    }
+                }
             }
 
-            // Check 2: Sufficient coverage - we have enough candidates
-            if count_after >= SPREADING_EARLY_TERMINATION_CANDIDATES {
+            // Normalize activations to prevent unbounded growth
+            let max_activation = activation_map
+                .values()
+                .cloned()
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(1.0);
+
+            if max_activation > SPREADING_NORMALIZATION_FACTOR {
+                let scale = SPREADING_NORMALIZATION_FACTOR / max_activation;
+                for activation in activation_map.values_mut() {
+                    *activation *= scale;
+                }
+            }
+
+            // Prune weak activations (ACT-R model)
+            activation_map.retain(|_, activation| *activation > current_threshold);
+
+            let count_after = activation_map.len();
+            let new_activations = count_after.saturating_sub(count_before);
+
+            tracing::debug!(
+                "  Activated entities: {} (+{} new)",
+                count_after,
+                new_activations
+            );
+
+            // Adaptive threshold relaxation
+            if count_after < SPREADING_MIN_CANDIDATES
+                && current_threshold > SPREADING_RELAXED_THRESHOLD
+            {
+                current_threshold = SPREADING_RELAXED_THRESHOLD;
                 tracing::debug!(
-                    "  Early termination: sufficient coverage ({} candidates)",
+                    "  Relaxing threshold to {:.4} (only {} candidates)",
+                    current_threshold,
                     count_after
                 );
-                break;
+            }
+
+            // Early termination checks (only after minimum hops)
+            if hop >= SPREADING_MIN_HOPS {
+                let new_ratio = if count_after > 0 {
+                    new_activations as f32 / count_after as f32
+                } else {
+                    0.0
+                };
+
+                if new_ratio < SPREADING_EARLY_TERMINATION_RATIO && count_after > 0 {
+                    tracing::debug!(
+                        "  Early termination: activation saturated ({:.1}% new)",
+                        new_ratio * 100.0
+                    );
+                    break;
+                }
+
+                if count_after >= SPREADING_EARLY_TERMINATION_CANDIDATES {
+                    tracing::debug!(
+                        "  Early termination: sufficient coverage ({} candidates)",
+                        count_after
+                    );
+                    break;
+                }
             }
         }
+
+        traversed_edges = edges_collected;
     }
 
     stats.graph_time_us = graph_start.elapsed().as_micros() as u64;
@@ -767,5 +985,187 @@ mod tests {
 
         // Should NOT trigger early termination (60% new)
         assert!(growing_ratio >= SPREADING_EARLY_TERMINATION_RATIO);
+    }
+
+    // =========================================================================
+    // PIPE-7: Bidirectional Spreading Activation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_bidirectional_constants_valid() {
+        // Minimum entities must be at least 2 for bidirectional to make sense
+        assert!(BIDIRECTIONAL_MIN_ENTITIES >= 2);
+
+        // Intersection boost must be positive
+        assert!(BIDIRECTIONAL_INTERSECTION_BOOST > 1.0);
+
+        // Intersection minimum must be below activation threshold
+        assert!(BIDIRECTIONAL_INTERSECTION_MIN < SPREADING_ACTIVATION_THRESHOLD);
+
+        // Max hops per direction × 2 should approximate max hops for unidirectional
+        assert!(BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION * 2 >= SPREADING_MAX_HOPS);
+    }
+
+    #[test]
+    fn test_intersection_boost_calculation() {
+        // Test that intersection entities get boosted
+        let forward_activation = 0.5;
+        let backward_activation = 0.3;
+
+        // Both exceed minimum threshold
+        assert!(forward_activation >= BIDIRECTIONAL_INTERSECTION_MIN);
+        assert!(backward_activation >= BIDIRECTIONAL_INTERSECTION_MIN);
+
+        // Intersection boost calculation
+        let boosted = (forward_activation + backward_activation) * BIDIRECTIONAL_INTERSECTION_BOOST;
+        let unboosted = forward_activation + backward_activation;
+
+        // Boosted should be higher
+        assert!(boosted > unboosted);
+
+        // Boosted should be exactly 1.5× unboosted (with default constants)
+        let expected_ratio = BIDIRECTIONAL_INTERSECTION_BOOST;
+        assert!((boosted / unboosted - expected_ratio).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_non_intersection_no_boost() {
+        // Test that non-intersection entities don't get boosted
+        let forward_activation = 0.5;
+        let backward_activation = 0.0; // Below threshold
+
+        // Backward doesn't meet threshold
+        assert!(backward_activation < BIDIRECTIONAL_INTERSECTION_MIN);
+
+        // Non-intersection: just sum
+        let combined = forward_activation + backward_activation;
+
+        // Should equal just forward activation
+        assert!((combined - forward_activation).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_bidirectional_entity_split() {
+        // Test alternating assignment distributes evenly
+        let entities = vec![
+            (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity3".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity4".to_string(), 1.0, 0.5),
+        ];
+
+        // With 4 entities, split should be 2-2
+        let mut forward_count = 0;
+        let mut backward_count = 0;
+
+        for (i, _) in entities.iter().enumerate() {
+            if i % 2 == 0 {
+                forward_count += 1;
+            } else {
+                backward_count += 1;
+            }
+        }
+
+        assert_eq!(forward_count, 2);
+        assert_eq!(backward_count, 2);
+    }
+
+    #[test]
+    fn test_bidirectional_odd_entities() {
+        // Test odd number of entities doesn't leave backward empty
+        let entities = vec![
+            (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity3".to_string(), 1.0, 0.5),
+        ];
+
+        // With 3 entities: indices 0,2 go forward, index 1 goes backward
+        let mut forward_seeds = Vec::new();
+        let mut backward_seeds = Vec::new();
+
+        for (i, entity) in entities.iter().enumerate() {
+            if i % 2 == 0 {
+                forward_seeds.push(entity.0);
+            } else {
+                backward_seeds.push(entity.0);
+            }
+        }
+
+        // 2 forward, 1 backward
+        assert_eq!(forward_seeds.len(), 2);
+        assert_eq!(backward_seeds.len(), 1);
+
+        // Both sets are non-empty (the actual function duplicates if backward would be empty)
+        assert!(!forward_seeds.is_empty());
+        assert!(!backward_seeds.is_empty());
+    }
+
+    #[test]
+    fn test_bidirectional_threshold_triggers() {
+        // Test when bidirectional is triggered vs unidirectional
+
+        // 1 entity: unidirectional
+        let single_entity = vec![(Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5)];
+        assert!(single_entity.len() < BIDIRECTIONAL_MIN_ENTITIES);
+
+        // 2 entities: bidirectional
+        let two_entities = vec![
+            (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
+        ];
+        assert!(two_entities.len() >= BIDIRECTIONAL_MIN_ENTITIES);
+
+        // 5 entities: bidirectional
+        let many_entities = vec![
+            (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity3".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity4".to_string(), 1.0, 0.5),
+            (Uuid::new_v4(), "entity5".to_string(), 1.0, 0.5),
+        ];
+        assert!(many_entities.len() >= BIDIRECTIONAL_MIN_ENTITIES);
+    }
+
+    #[test]
+    fn test_complexity_improvement() {
+        // Theoretical complexity comparison
+        // Let b = branching factor, d = depth
+
+        // Unidirectional: O(b^d)
+        // Bidirectional: O(2 × b^(d/2))
+
+        // For b=10, d=6:
+        // Unidirectional: 10^6 = 1,000,000
+        // Bidirectional: 2 × 10^3 = 2,000
+
+        let b: f64 = 10.0;
+        let d: f64 = 6.0;
+
+        let unidirectional = b.powf(d);
+        let bidirectional = 2.0 * b.powf(d / 2.0);
+
+        // Bidirectional should be significantly smaller
+        assert!(bidirectional < unidirectional);
+
+        // Ratio should be ~500× improvement
+        let improvement = unidirectional / bidirectional;
+        assert!(improvement > 100.0);
+    }
+
+    #[test]
+    fn test_intersection_detection_threshold() {
+        // Test the minimum threshold for intersection detection
+        let min_threshold = BIDIRECTIONAL_INTERSECTION_MIN;
+
+        // Should be half of activation threshold
+        let expected = SPREADING_ACTIVATION_THRESHOLD / 2.0;
+        assert!((min_threshold - expected).abs() < 0.001);
+
+        // Should be positive
+        assert!(min_threshold > 0.0);
+
+        // Should be less than typical initial activation
+        // (IC_NOUN * (1 + SALIENCE_BOOST_FACTOR) = 2.3 * 2 = 4.6 max)
+        assert!(min_threshold < 1.0);
     }
 }

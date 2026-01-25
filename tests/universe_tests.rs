@@ -10,7 +10,7 @@
 use chrono::Utc;
 use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
 use shodh_memory::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, GraphMemory, RelationType, RelationshipEdge,
+    EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
 };
 use shodh_memory::uuid::Uuid;
 use std::collections::HashMap;
@@ -104,8 +104,10 @@ fn create_relationship(
         // Hebbian plasticity fields
         last_activated: Utc::now(),
         activation_count: 0,
-        potentiated: false,
+        ltp_status: LtpStatus::None,
         tier: EdgeTier::L1Working,
+        activation_timestamps: None,
+        entity_confidence: None,
     }
 }
 

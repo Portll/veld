@@ -909,6 +909,55 @@ pub const LTP_STRENGTH_FLOOR_L3: f32 = 0.80;
 pub const LTP_READINESS_THRESHOLD: f32 = 1.0;
 
 // =============================================================================
+// BIDIRECTIONAL SPREADING ACTIVATION (PIPE-7)
+// Based on ACT-R spreading activation and meet-in-middle search optimization
+// Reference: Collins & Loftus (1975) "A spreading-activation theory of semantic processing"
+// =============================================================================
+
+/// Minimum focal entities to enable bidirectional spreading
+///
+/// With fewer entities, unidirectional spreading is sufficient.
+/// Bidirectional only helps when we can split query entities into two groups.
+///
+/// Justification:
+/// - 2 entities minimum allows forward/backward split
+/// - Single entity queries use standard spreading (no intersection possible)
+pub const BIDIRECTIONAL_MIN_ENTITIES: usize = 2;
+
+/// Activation boost for intersection entities (found by both directions)
+///
+/// Entities activated from both forward and backward directions are
+/// "bridge" concepts connecting the query entities - highly relevant.
+///
+/// Justification:
+/// - 1.5x boost prioritizes intersection entities without overwhelming
+/// - ACT-R: activation spreads from multiple sources, intersection = high relevance
+/// - Higher values (2.0+) might over-emphasize bridges vs directly connected
+pub const BIDIRECTIONAL_INTERSECTION_BOOST: f32 = 1.5;
+
+/// Minimum activation from each direction to qualify as intersection
+///
+/// Both forward and backward activations must exceed this threshold
+/// for an entity to receive the intersection boost.
+///
+/// Justification:
+/// - Uses half of SPREADING_ACTIVATION_THRESHOLD (0.0025)
+/// - Prevents noise from counting as intersection
+/// - Entity must receive meaningful activation from both sides
+pub const BIDIRECTIONAL_INTERSECTION_MIN: f32 = 0.0025;
+
+/// Maximum hops per direction in bidirectional mode
+///
+/// Total depth = 2 × this value (forward + backward meet in middle).
+/// Complexity: O(b^d) → O(2 × b^(d/2)) where d = this value.
+///
+/// Justification:
+/// - 3 hops per direction = 6 hop effective depth (matches SPREADING_MAX_HOPS)
+/// - Meet-in-middle reduces branching factor exponentially
+/// - 3 hops is enough for most semantic connections (friend-of-friend-of-friend)
+pub const BIDIRECTIONAL_MAX_HOPS_PER_DIRECTION: usize = 3;
+
+// =============================================================================
 // HYBRID DECAY MODEL CONSTANTS (SHO-103)
 // Based on Wixted & Ebbesen (1991) - power-law forgetting matches human memory
 // Hybrid model: exponential for consolidation, power-law for long-term retention
