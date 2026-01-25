@@ -38,10 +38,11 @@ use crate::constants::{
     DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
     EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
     IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
-    MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION, MEMORY_TIER_GRAPH_MULT_WORKING,
-    SALIENCE_BOOST_FACTOR, SPREADING_ACTIVATION_THRESHOLD, SPREADING_EARLY_TERMINATION_CANDIDATES,
-    SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES,
-    SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
+    MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION,
+    MEMORY_TIER_GRAPH_MULT_WORKING, SALIENCE_BOOST_FACTOR, SPREADING_ACTIVATION_THRESHOLD,
+    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
+    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
+    SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EpisodicNode, GraphMemory};
@@ -280,19 +281,11 @@ fn bidirectional_spread(
 
     // Spread from both directions with density-adaptive hops
     let threshold = SPREADING_ACTIVATION_THRESHOLD;
-    let (forward_map, forward_edges) = spread_single_direction(
-        &forward_seeds,
-        graph,
-        hops_per_direction,
-        threshold,
-    )?;
+    let (forward_map, forward_edges) =
+        spread_single_direction(&forward_seeds, graph, hops_per_direction, threshold)?;
 
-    let (backward_map, backward_edges) = spread_single_direction(
-        &backward_seeds,
-        graph,
-        hops_per_direction,
-        threshold,
-    )?;
+    let (backward_map, backward_edges) =
+        spread_single_direction(&backward_seeds, graph, hops_per_direction, threshold)?;
 
     // Combine maps with intersection boost
     let mut combined_map: HashMap<Uuid, f32> = HashMap::new();
