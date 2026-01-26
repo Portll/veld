@@ -1962,21 +1962,21 @@ mod tests {
     fn test_storage_stats_default() {
         let stats = StorageStats::default();
 
-        assert_eq!(stats.total_memories, 0);
-        assert_eq!(stats.total_bytes, 0);
-        assert_eq!(stats.average_size_bytes, 0);
-        assert!(stats.by_type.is_empty());
+        assert_eq!(stats.total_count, 0);
+        assert_eq!(stats.compressed_count, 0);
+        assert_eq!(stats.total_size_bytes, 0);
+        assert_eq!(stats.total_retrievals, 0);
     }
 
     #[test]
     fn test_search_criteria_variants() {
         let criteria1 = SearchCriteria::ByEntity("test".to_string());
         let criteria2 = SearchCriteria::ByImportance { min: 0.5, max: 1.0 };
-        let criteria3 = SearchCriteria::ByTag("tag".to_string());
+        let criteria3 = SearchCriteria::ByType(ExperienceType::Observation);
 
         assert!(matches!(criteria1, SearchCriteria::ByEntity(_)));
         assert!(matches!(criteria2, SearchCriteria::ByImportance { .. }));
-        assert!(matches!(criteria3, SearchCriteria::ByTag(_)));
+        assert!(matches!(criteria3, SearchCriteria::ByType(_)));
     }
 
     #[test]
@@ -2009,13 +2009,13 @@ mod tests {
     #[test]
     fn test_modality_vectors_struct() {
         let mv = ModalityVectors {
-            modality: Modality::Text,
             vector_ids: vec![1, 2, 3],
             dimension: 384,
+            chunk_ranges: None,
         };
 
-        assert_eq!(mv.modality, Modality::Text);
         assert_eq!(mv.vector_ids.len(), 3);
         assert_eq!(mv.dimension, 384);
+        assert!(mv.chunk_ranges.is_none());
     }
 }
