@@ -253,22 +253,19 @@ pub async fn list_memories(
     // Filter by text query if specified (search in content and tags)
     if let Some(ref text_query) = query.query {
         let query_lower = text_query.to_lowercase();
-        filtered = filtered
-            .into_iter()
-            .filter(|m| {
-                // Check content
-                if m.experience.content.to_lowercase().contains(&query_lower) {
+        filtered.retain(|m| {
+            // Check content
+            if m.experience.content.to_lowercase().contains(&query_lower) {
+                return true;
+            }
+            // Check tags/entities
+            for tag in &m.experience.entities {
+                if tag.to_lowercase().contains(&query_lower) {
                     return true;
                 }
-                // Check tags/entities
-                for tag in &m.experience.entities {
-                    if tag.to_lowercase().contains(&query_lower) {
-                        return true;
-                    }
-                }
-                false
-            })
-            .collect();
+            }
+            false
+        });
     }
 
     let total = filtered.len();
@@ -328,22 +325,19 @@ pub async fn list_memories_post(
     // Filter by text query if specified (search in content and tags)
     if let Some(ref text_query) = req.query {
         let query_lower = text_query.to_lowercase();
-        filtered = filtered
-            .into_iter()
-            .filter(|m| {
-                // Check content
-                if m.experience.content.to_lowercase().contains(&query_lower) {
+        filtered.retain(|m| {
+            // Check content
+            if m.experience.content.to_lowercase().contains(&query_lower) {
+                return true;
+            }
+            // Check tags/entities
+            for tag in &m.experience.entities {
+                if tag.to_lowercase().contains(&query_lower) {
                     return true;
                 }
-                // Check tags/entities
-                for tag in &m.experience.entities {
-                    if tag.to_lowercase().contains(&query_lower) {
-                        return true;
-                    }
-                }
-                false
-            })
-            .collect();
+            }
+            false
+        });
     }
 
     let total = filtered.len();

@@ -249,10 +249,8 @@ pub fn is_bare_question(content: &str) -> bool {
     let ends_with_question = trimmed.ends_with('?');
 
     // Short content - apply looser filter
-    if trimmed.len() < 100 {
-        if starts_with_question || ends_with_question {
-            return true;
-        }
+    if trimmed.len() < 100 && (starts_with_question || ends_with_question) {
+        return true;
     }
 
     // Medium content (100-300 chars) - check if it's purely a question without context
