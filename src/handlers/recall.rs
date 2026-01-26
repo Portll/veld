@@ -877,9 +877,7 @@ pub async fn proactive_context(
                 .into_iter()
                 .filter_map(|m| {
                     // Skip memories without embeddings (can't be meaningfully ranked)
-                    if m.experience.embeddings.is_none() {
-                        return None;
-                    }
+                    m.experience.embeddings.as_ref()?;
 
                     // Score from unified 5-layer pipeline includes:
                     // RRF fusion + hebbian + recency + arousal + credibility + temporal + feedback
@@ -1017,7 +1015,7 @@ pub async fn proactive_context(
                     ReminderItem {
                         id: t.id.0.to_string(),
                         content: t.content,
-                        trigger_type: format!("context (score: {:.2})", score),
+                        trigger_type: format!("context (score: {score:.2})"),
                         status: format!("{:?}", t.status).to_lowercase(),
                         due_at: t.trigger.due_at(),
                         created_at: t.created_at,
@@ -1471,7 +1469,7 @@ pub async fn reinforce_feedback(
     let outcome = match outcome_label.as_str() {
         "helpful" => crate::memory::RetrievalOutcome::Helpful,
         "misleading" => crate::memory::RetrievalOutcome::Misleading,
-        "neutral" | _ => crate::memory::RetrievalOutcome::Neutral,
+        _ => crate::memory::RetrievalOutcome::Neutral,
     };
 
     // Convert string IDs to MemoryId
