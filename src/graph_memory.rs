@@ -2658,7 +2658,7 @@ impl GraphMemory {
         }
 
         // Check reverse index
-        let idx_key_rev = format!("mem_edge:{}:{}", entity_b, entity_a);
+        let idx_key_rev = format!("mem_edge:{entity_b}:{entity_a}");
         if let Some(edge_uuid_bytes) = self.relationships_db.get(idx_key_rev.as_bytes())? {
             if edge_uuid_bytes.len() == 16 {
                 let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;

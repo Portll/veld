@@ -2173,6 +2173,7 @@ mod tests {
         // Each tuple: (semantic, entity, tag, importance, momentum_ema, access_count, graph_strength, is_truly_relevant)
         // The key insight: some memories LOOK good (high semantic/entity) but have poor track record
         // Treatment should deprioritize these based on momentum/access/graph signals
+        #[allow(clippy::type_complexity)]
         let memory_corpus: Vec<(f32, f32, f32, f32, f32, u32, f32, bool)> = vec![
             // === HIGH-VALUE: Good signals + good track record ===
             (0.8, 0.7, 0.5, 0.8, 0.9, 15, 0.9, true), // Consistently helpful, frequently accessed
@@ -2276,18 +2277,14 @@ mod tests {
         let control_trap_ratio = control_trap_count as f32 / memories_surfaced as f32;
         let treatment_trap_ratio = treatment_trap_count as f32 / memories_surfaced as f32;
 
-        println!("📈 CONTEXT QUALITY (top {}):", memories_surfaced);
+        println!("📈 CONTEXT QUALITY (top {memories_surfaced}):");
+        let control_trap_pct = control_trap_ratio * 100.0;
+        let treatment_trap_pct = treatment_trap_ratio * 100.0;
         println!(
-            "   Control:   {} relevant, {} traps ({:.0}% trap ratio)",
-            control_relevant_count,
-            control_trap_count,
-            control_trap_ratio * 100.0
+            "   Control:   {control_relevant_count} relevant, {control_trap_count} traps ({control_trap_pct:.0}% trap ratio)"
         );
         println!(
-            "   Treatment: {} relevant, {} traps ({:.0}% trap ratio)\n",
-            treatment_relevant_count,
-            treatment_trap_count,
-            treatment_trap_ratio * 100.0
+            "   Treatment: {treatment_relevant_count} relevant, {treatment_trap_count} traps ({treatment_trap_pct:.0}% trap ratio)\n"
         );
 
         // Deterministic seeding for reproducibility (LCG PRNG)
@@ -2337,13 +2334,13 @@ mod tests {
             .with_traffic_split(0.5)
             .build();
 
-        test.control_metrics.impressions = num_impressions as u64;
+        test.control_metrics.impressions = num_impressions;
         test.control_metrics.clicks = control_clicks;
         test.control_metrics.unique_users = (num_impressions as f64 * 0.85) as u64;
         test.control_metrics.positive_feedback = control_positive;
         test.control_metrics.negative_feedback = control_negative;
 
-        test.treatment_metrics.impressions = num_impressions as u64;
+        test.treatment_metrics.impressions = num_impressions;
         test.treatment_metrics.clicks = treatment_clicks;
         test.treatment_metrics.unique_users = (num_impressions as f64 * 0.85) as u64;
         test.treatment_metrics.positive_feedback = treatment_positive;
@@ -2356,154 +2353,117 @@ mod tests {
 
         println!("📊 DYNAMIC SIMULATION RESULTS:");
         println!(
-            "   ├─ Control:   {} impressions, {} clicks ({:.1}% CTR)",
-            num_impressions, control_clicks, control_ctr
+            "   ├─ Control:   {num_impressions} impressions, {control_clicks} clicks ({control_ctr:.1}% CTR)"
         );
+        println!("   │            positive={control_positive}, negative={control_negative}");
         println!(
-            "   │            positive={}, negative={}",
-            control_positive, control_negative
+            "   └─ Treatment: {num_impressions} impressions, {treatment_clicks} clicks ({treatment_ctr:.1}% CTR)"
         );
-        println!(
-            "   └─ Treatment: {} impressions, {} clicks ({:.1}% CTR)",
-            num_impressions, treatment_clicks, treatment_ctr
-        );
-        println!(
-            "                 positive={}, negative={}\n",
-            treatment_positive, treatment_negative
-        );
+        println!("                 positive={treatment_positive}, negative={treatment_negative}\n");
 
         println!("🔬 FREQUENTIST ANALYSIS:");
-        println!("   ├─ Chi-squared: {:.4}", analysis.frequentist.chi_squared);
-        println!("   ├─ P-value: {:.6}", analysis.frequentist.p_value);
-        println!(
-            "   ├─ Significant: {}",
-            if analysis.frequentist.is_significant {
-                "YES ✓"
-            } else {
-                "NO ✗"
-            }
-        );
-        println!("   └─ Winner: {:?}\n", analysis.frequentist.winner);
+        let chi_sq = analysis.frequentist.chi_squared;
+        let p_val = analysis.frequentist.p_value;
+        println!("   ├─ Chi-squared: {chi_sq:.4}");
+        println!("   ├─ P-value: {p_val:.6}");
+        let significant = if analysis.frequentist.is_significant {
+            "YES ✓"
+        } else {
+            "NO ✗"
+        };
+        println!("   ├─ Significant: {significant}");
+        let winner = &analysis.frequentist.winner;
+        println!("   └─ Winner: {winner:?}\n");
 
         println!("🎲 BAYESIAN ANALYSIS:");
-        println!(
-            "   ├─ P(Treatment better): {:.2}%",
-            analysis.bayesian.prob_treatment_better * 100.0
-        );
-        println!(
-            "   ├─ Expected lift: {:.2}%",
-            analysis.bayesian.expected_lift * 100.0
-        );
-        println!(
-            "   ├─ 95% Credible Interval: ({:.2}%, {:.2}%)",
-            analysis.bayesian.credible_interval.0 * 100.0,
-            analysis.bayesian.credible_interval.1 * 100.0
-        );
-        println!(
-            "   ├─ Risk if shipping treatment: {:.3}%",
-            analysis.bayesian.risk_treatment * 100.0
-        );
-        println!(
-            "   └─ Risk if keeping control: {:.3}%\n",
-            analysis.bayesian.risk_control * 100.0
-        );
+        let prob_treat = analysis.bayesian.prob_treatment_better * 100.0;
+        let exp_lift = analysis.bayesian.expected_lift * 100.0;
+        let ci_lo = analysis.bayesian.credible_interval.0 * 100.0;
+        let ci_hi = analysis.bayesian.credible_interval.1 * 100.0;
+        let risk_treat = analysis.bayesian.risk_treatment * 100.0;
+        let risk_ctrl = analysis.bayesian.risk_control * 100.0;
+        println!("   ├─ P(Treatment better): {prob_treat:.2}%");
+        println!("   ├─ Expected lift: {exp_lift:.2}%");
+        println!("   ├─ 95% Credible Interval: ({ci_lo:.2}%, {ci_hi:.2}%)");
+        println!("   ├─ Risk if shipping treatment: {risk_treat:.3}%");
+        println!("   └─ Risk if keeping control: {risk_ctrl:.3}%\n");
 
         println!("📏 EFFECT SIZE:");
-        println!("   ├─ Cohen's h: {:.4}", analysis.effect_size.cohens_h);
-        println!(
-            "   ├─ Interpretation: {}",
-            analysis.effect_size.interpretation
-        );
-        println!(
-            "   ├─ Relative Risk: {:.2}x",
-            analysis.effect_size.relative_risk
-        );
-        println!("   ├─ Odds Ratio: {:.2}", analysis.effect_size.odds_ratio);
-        if analysis.effect_size.nnt.is_finite() {
-            println!(
-                "   └─ NNT (Number Needed to Treat): {:.0}\n",
-                analysis.effect_size.nnt
-            );
+        let cohens_h = analysis.effect_size.cohens_h;
+        let interpretation = &analysis.effect_size.interpretation;
+        let rel_risk = analysis.effect_size.relative_risk;
+        let odds_ratio = analysis.effect_size.odds_ratio;
+        let nnt = analysis.effect_size.nnt;
+        println!("   ├─ Cohen's h: {cohens_h:.4}");
+        println!("   ├─ Interpretation: {interpretation}");
+        println!("   ├─ Relative Risk: {rel_risk:.2}x");
+        println!("   ├─ Odds Ratio: {odds_ratio:.2}");
+        if nnt.is_finite() {
+            println!("   └─ NNT (Number Needed to Treat): {nnt:.0}\n");
         } else {
             println!("   └─ NNT: N/A (no effect)\n");
         }
 
         println!("⚖️ DATA QUALITY (SRM Check):");
-        println!(
-            "   ├─ Expected ratio: {:.1}%",
-            analysis.srm.expected_ratio * 100.0
-        );
-        println!(
-            "   ├─ Observed ratio: {:.1}%",
-            analysis.srm.observed_ratio * 100.0
-        );
-        println!(
-            "   ├─ SRM Detected: {}",
-            if analysis.srm.srm_detected {
-                "YES ⚠️"
-            } else {
-                "NO ✓"
-            }
-        );
-        println!("   └─ Severity: {:?}\n", analysis.srm.severity);
+        let expected_ratio = analysis.srm.expected_ratio * 100.0;
+        let observed_ratio = analysis.srm.observed_ratio * 100.0;
+        println!("   ├─ Expected ratio: {expected_ratio:.1}%");
+        println!("   ├─ Observed ratio: {observed_ratio:.1}%");
+        let srm_detected = if analysis.srm.srm_detected {
+            "YES ⚠️"
+        } else {
+            "NO ✓"
+        };
+        println!("   ├─ SRM Detected: {srm_detected}");
+        let severity = &analysis.srm.severity;
+        println!("   └─ Severity: {severity:?}\n");
 
         println!("📈 SEQUENTIAL TESTING:");
-        println!(
-            "   ├─ Analysis #{} of {}",
-            analysis.sequential.analysis_number, analysis.sequential.planned_analyses
-        );
-        println!("   ├─ Alpha spent: {:.4}", analysis.sequential.alpha_spent);
-        println!(
-            "   ├─ Current threshold: {:.4}",
-            analysis.sequential.current_alpha
-        );
-        println!(
-            "   └─ Can stop early: {}\n",
-            if analysis.sequential.can_stop_early {
-                "YES ✓"
-            } else {
-                "NO - Continue testing"
-            }
-        );
+        let analysis_num = analysis.sequential.analysis_number;
+        let planned = analysis.sequential.planned_analyses;
+        let alpha_spent = analysis.sequential.alpha_spent;
+        println!("   ├─ Analysis #{analysis_num} of {planned}");
+        println!("   ├─ Alpha spent: {alpha_spent:.4}");
+        let current_alpha = analysis.sequential.current_alpha;
+        println!("   ├─ Current threshold: {current_alpha:.4}");
+        let can_stop = if analysis.sequential.can_stop_early {
+            "YES ✓"
+        } else {
+            "NO - Continue testing"
+        };
+        println!("   └─ Can stop early: {can_stop}\n");
 
         println!("═══════════════════════════════════════");
         println!("🎯 FINAL DECISION:");
         println!("═══════════════════════════════════════");
-        println!(
-            "   Should ship: {}",
-            if analysis.should_ship {
-                "YES ✅"
-            } else {
-                "NO ❌"
-            }
-        );
-        println!(
-            "   Practically significant: {}",
-            if analysis.is_practically_significant {
-                "YES"
-            } else {
-                "NO"
-            }
-        );
+        let should_ship = if analysis.should_ship {
+            "YES ✅"
+        } else {
+            "NO ❌"
+        };
+        println!("   Should ship: {should_ship}");
+        let practically_sig = if analysis.is_practically_significant {
+            "YES"
+        } else {
+            "NO"
+        };
+        println!("   Practically significant: {practically_sig}");
         println!("\n📋 USER-FOCUSED INSIGHTS:");
         for insight in &analysis.insights {
-            println!("   • {}", insight);
+            println!("   • {insight}");
         }
 
         // Calculate and display NNT
         let ard = (treatment_ctr - control_ctr) / 100.0; // Absolute Risk Difference
         let nnt = if ard > 0.0 { 1.0 / ard } else { f64::INFINITY };
+        let ctr_diff = treatment_ctr - control_ctr;
         println!("\n🎯 KEY METRIC:");
-        println!(
-            "   ├─ CTR Improvement: {:.1}% → {:.1}% (+{:.1}%)",
-            control_ctr,
-            treatment_ctr,
-            treatment_ctr - control_ctr
-        );
-        println!("   ├─ ARD (Absolute Risk Difference): {:.2}%", ard * 100.0);
+        println!("   ├─ CTR Improvement: {control_ctr:.1}% → {treatment_ctr:.1}% (+{ctr_diff:.1}%)");
+        let ard_pct = ard * 100.0;
+        println!("   ├─ ARD (Absolute Risk Difference): {ard_pct:.2}%");
         if nnt.is_finite() && nnt < 100.0 {
-            println!("   └─ NNT (Number Needed to Treat): {:.0}", nnt);
-            println!("      (1 in {:.0} users benefit from treatment)", nnt);
+            println!("   └─ NNT (Number Needed to Treat): {nnt:.0}");
+            println!("      (1 in {nnt:.0} users benefit from treatment)");
         } else {
             println!("   └─ NNT: N/A (no significant improvement)");
         }
