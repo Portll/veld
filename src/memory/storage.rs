@@ -378,7 +378,7 @@ fn deserialize_memory(data: &[u8]) -> Result<Memory> {
 }
 
 /// Try deserializing with multiple format fallbacks
-/// Supports both bincode 2.x (current) and bincode 1.x (legacy) wire formats
+/// Supports bincode 2.x (current), MessagePack, and bincode 1.x (legacy) wire formats
 fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     // Try current format first (bincode 2.x)
     if let Ok((memory, _)) =
@@ -387,10 +387,26 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
         return Ok(memory);
     }
 
-    // Try bincode 1.x format with original Experience (no multimodal fields)
-    if let Ok(legacy) = bincode1::deserialize::<LegacyMemoryV1Full>(data) {
-        tracing::debug!("Migrated memory from bincode 1.x v1 full format");
+    // Try MessagePack format (rmp-serde) - self-describing format
+    // This was used in some intermediate versions before the current bincode 2.x
+    if let Ok(legacy) = rmp_serde::from_slice::<LegacyMemoryV1Full>(data) {
+        tracing::debug!("Migrated memory from MessagePack v1 format");
         return Ok(legacy.into_memory());
+    }
+
+    // Try bincode 1.x format with original Experience (no multimodal fields)
+    match bincode1::deserialize::<LegacyMemoryV1Full>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x v1 full format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => {
+            static BINCODE1_ERR_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !BINCODE1_ERR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("bincode1 LegacyMemoryV1Full error: {}", e);
+            }
+        }
     }
 
     // Try bincode 1.x format (used in versions prior to bincode 2.0 migration)
