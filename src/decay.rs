@@ -213,8 +213,8 @@ pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, ltp_decay_factor: f32) ->
                 L2_PRUNE_THRESHOLD,
             )
         }
-        2 | _ => {
-            // L3 Semantic: 2%/month decay, near-permanent
+        _ => {
+            // L3 Semantic (tier 2+): 2%/month decay, near-permanent
             let decay_per_hour = L3_DECAY_PER_MONTH as f64 / (30.0 * 24.0);
             // Max age: effectively unlimited (10 years)
             (decay_per_hour, 87600.0, L3_PRUNE_THRESHOLD)

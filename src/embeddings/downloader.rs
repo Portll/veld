@@ -272,16 +272,13 @@ fn download_file_with_checksum(
         if actual_checksum != expected.to_lowercase() {
             // Delete the corrupted file - log if deletion fails
             if let Err(e) = fs::remove_file(path) {
-                tracing::error!("Failed to delete corrupted file {:?}: {}", path, e);
+                tracing::error!("Failed to delete corrupted file {path:?}: {e}");
             }
             anyhow::bail!(
-                "Checksum verification failed for {:?}. Expected: {}, Got: {}. File deleted for security.",
-                path,
-                expected,
-                actual_checksum
+                "Checksum verification failed for {path:?}. Expected: {expected}, Got: {actual_checksum}. File deleted for security."
             );
         }
-        tracing::info!("Checksum verified for {:?}", path);
+        tracing::info!("Checksum verified for {path:?}");
     } else {
         // Log warning that no checksum was provided
         tracing::warn!(
