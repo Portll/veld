@@ -223,6 +223,7 @@ const MIN_CHECKPOINT_INTERVAL_MS: u64 = 100; // Minimum 100ms to prevent tight l
 const MAX_CHECKPOINT_INTERVAL_MS: u64 = 3_600_000; // Maximum 1 hour
 const MAX_BUFFER_SIZE: usize = 10_000; // Maximum 10k messages to prevent memory exhaustion
 const MAX_TRIGGER_EVENTS: usize = 100; // Maximum trigger event types
+const MAX_SEEN_HASHES: usize = 10_000; // Maximum dedup hashes per session
 
 impl ExtractionConfig {
     /// Validate and clamp config values to sane ranges
@@ -658,7 +659,12 @@ impl StreamSession {
     }
 
     /// Add content hash to seen set
+    /// Clears when at capacity to prevent unbounded growth
     fn mark_seen(&mut self, content: &str) {
+        // Prevent unbounded growth - clear when full
+        if self.seen_hashes.len() >= MAX_SEEN_HASHES {
+            self.seen_hashes.clear();
+        }
         let hash = Self::hash_content(content);
         self.seen_hashes.insert(hash);
     }
