@@ -191,7 +191,7 @@ impl MiniLMEmbedder {
 
         match result {
             Ok(_) => Ok(()),
-            Err(e) => anyhow::bail!("{}", e),
+            Err(e) => anyhow::bail!("{e}"),
         }
     }
 
