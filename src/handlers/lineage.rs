@@ -117,7 +117,7 @@ pub async fn lineage_trace(
         let memory_guard = memory.read();
         let memory_id = MemoryId(
             uuid::Uuid::parse_str(&memory_id_str)
-                .map_err(|e| anyhow::anyhow!("Invalid memory_id: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid memory_id: {e}"))?,
         );
         let dir = match direction.as_str() {
             "forward" => TraceDirection::Forward,
@@ -241,11 +241,11 @@ pub async fn lineage_add_edge(
         let memory_guard = memory.read();
         let from = MemoryId(
             uuid::Uuid::parse_str(&from_str)
-                .map_err(|e| anyhow::anyhow!("Invalid from_memory_id: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid from_memory_id: {e}"))?,
         );
         let to = MemoryId(
             uuid::Uuid::parse_str(&to_str)
-                .map_err(|e| anyhow::anyhow!("Invalid to_memory_id: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid to_memory_id: {e}"))?,
         );
         let relation = match relation_str.as_str() {
             "Caused" => CausalRelation::Caused,
@@ -340,7 +340,7 @@ pub async fn lineage_create_branch(
         let memory_guard = memory.read();
         let branch_point = MemoryId(
             uuid::Uuid::parse_str(&branch_point_str)
-                .map_err(|e| anyhow::anyhow!("Invalid branch_point_memory_id: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid branch_point_memory_id: {e}"))?,
         );
         memory_guard.lineage_graph().create_branch(
             &user_id,
