@@ -1797,7 +1797,7 @@ mod tests {
 
         // Assign many users
         for i in 0..1000 {
-            let user = format!("user_{}", i);
+            let user = format!("user_{i}");
             match test.get_variant(&user) {
                 ABTestVariant::Control => _control_count += 1,
                 ABTestVariant::Treatment => treatment_count += 1,
@@ -1806,7 +1806,7 @@ mod tests {
 
         // Should be roughly 50/50 (within 10% tolerance)
         let ratio = treatment_count as f64 / 1000.0;
-        assert!(ratio > 0.4 && ratio < 0.6, "Ratio was {}", ratio);
+        assert!(ratio > 0.4 && ratio < 0.6, "Ratio was {ratio}");
     }
 
     #[test]
@@ -1906,9 +1906,11 @@ mod tests {
     #[test]
     fn test_learned_weights_integration() {
         let control = LearnedWeights::default();
-        let mut treatment = LearnedWeights::default();
-        treatment.semantic = 0.6;
-        treatment.entity = 0.2;
+        let mut treatment = LearnedWeights {
+            semantic: 0.6,
+            entity: 0.2,
+            ..Default::default()
+        };
         treatment.normalize();
 
         let test = ABTest::builder("weights_test")
@@ -1956,7 +1958,7 @@ mod tests {
 
         // Add significant data
         for i in 0..500 {
-            let user = format!("control_{}", i);
+            let user = format!("control_{i}");
             test.user_assignments
                 .insert(user.clone(), ABTestVariant::Control);
             test.control_metrics.impressions += 1;
@@ -1968,7 +1970,7 @@ mod tests {
         }
 
         for i in 0..500 {
-            let user = format!("treatment_{}", i);
+            let user = format!("treatment_{i}");
             test.user_assignments
                 .insert(user.clone(), ABTestVariant::Treatment);
             test.treatment_metrics.impressions += 1;
@@ -1980,7 +1982,7 @@ mod tests {
         }
 
         let power = ABTestAnalyzer::estimate_power(&test);
-        assert!(power > 0.5, "Power was {}", power); // Should have decent power with this effect size
+        assert!(power > 0.5, "Power was {power}"); // Should have decent power with this effect size
     }
 
     #[test]
@@ -2039,20 +2041,13 @@ mod tests {
         let (ci_low, ci_high) = ABTestAnalyzer::calculate_confidence_interval(1000, 100, 1000, 200);
 
         println!("\n   RESULTS:");
-        println!("   ├─ Chi-squared statistic: {:.4}", chi_sq);
-        println!("   ├─ P-value: {:.6}", p_value);
-        println!(
-            "   ├─ Significant (p < 0.05): {}",
-            if p_value < 0.05 { "YES ✓" } else { "NO ✗" }
-        );
-        println!(
-            "   ├─ 95% Confidence Interval: ({:.4}, {:.4})",
-            ci_low, ci_high
-        );
-        println!(
-            "   └─ Relative improvement: {:.1}%",
-            ((0.20 - 0.10) / 0.10) * 100.0
-        );
+        println!("   ├─ Chi-squared statistic: {chi_sq:.4}");
+        println!("   ├─ P-value: {p_value:.6}");
+        let significant = if p_value < 0.05 { "YES ✓" } else { "NO ✗" };
+        println!("   ├─ Significant (p < 0.05): {significant}");
+        println!("   ├─ 95% Confidence Interval: ({ci_low:.4}, {ci_high:.4})");
+        let improvement = ((0.20 - 0.10) / 0.10) * 100.0;
+        println!("   └─ Relative improvement: {improvement:.1}%");
 
         // Scenario 2: No significant difference
         println!("\n📊 SCENARIO 2: No Significant Difference (Sample too small)");
@@ -2063,23 +2058,18 @@ mod tests {
         let (ci_low2, ci_high2) = ABTestAnalyzer::calculate_confidence_interval(50, 5, 50, 6);
 
         println!("\n   RESULTS:");
-        println!("   ├─ Chi-squared statistic: {:.4}", chi_sq2);
-        println!("   ├─ P-value: {:.6}", p_value2);
+        println!("   ├─ Chi-squared statistic: {chi_sq2:.4}");
+        println!("   ├─ P-value: {p_value2:.6}");
+        let significant2 = if p_value2 < 0.05 { "YES ✓" } else { "NO ✗" };
+        println!("   ├─ Significant (p < 0.05): {significant2}");
+        println!("   ├─ 95% Confidence Interval: ({ci_low2:.4}, {ci_high2:.4})");
+        let ci_includes_zero = if ci_low2 < 0.0 && ci_high2 > 0.0 {
+            "YES"
+        } else {
+            "NO"
+        };
         println!(
-            "   ├─ Significant (p < 0.05): {}",
-            if p_value2 < 0.05 { "YES ✓" } else { "NO ✗" }
-        );
-        println!(
-            "   ├─ 95% Confidence Interval: ({:.4}, {:.4})",
-            ci_low2, ci_high2
-        );
-        println!(
-            "   └─ CI includes 0: {} (effect may be due to chance)",
-            if ci_low2 < 0.0 && ci_high2 > 0.0 {
-                "YES"
-            } else {
-                "NO"
-            }
+            "   └─ CI includes 0: {ci_includes_zero} (effect may be due to chance)"
         );
 
         // Scenario 3: Full analysis with recommendations
