@@ -820,14 +820,18 @@ impl MemorySystem {
                                 .get(&MemoryId(uuid::Uuid::parse_str(old_id).unwrap_or_default()))
                             {
                                 old_memory.decay_importance(*decay_amount);
-                                let _ = self.long_term_memory.update(&old_memory);
+                                if let Err(e) = self.long_term_memory.update(&old_memory) {
+                                    tracing::debug!("Failed to persist retroactive decay: {e}");
+                                }
                             }
                         }
 
                         // Apply proactive interference (reduce new memory importance)
                         if interference_result.proactive_decay > 0.0 {
                             memory.decay_importance(interference_result.proactive_decay);
-                            let _ = self.long_term_memory.update(&memory);
+                            if let Err(e) = self.long_term_memory.update(&memory) {
+                                tracing::debug!("Failed to persist proactive decay: {e}");
+                            }
                         }
 
                         // Record interference events
@@ -1149,7 +1153,9 @@ impl MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                let _ = graph.write().record_memory_coactivation(&memory_uuids);
+                if let Err(e) = graph.write().record_memory_coactivation(&memory_uuids) {
+                    tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                }
             }
         }
 
@@ -2210,7 +2216,9 @@ impl MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                let _ = graph.write().record_memory_coactivation(&memory_uuids);
+                if let Err(e) = graph.write().record_memory_coactivation(&memory_uuids) {
+                    tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                }
             }
         }
 
@@ -3921,7 +3929,9 @@ impl MemorySystem {
     /// to let unused associations naturally fade.
     pub fn graph_maintenance(&self) {
         if let Some(graph) = &self.graph_memory {
-            let _ = graph.write().apply_decay();
+            if let Err(e) = graph.write().apply_decay() {
+                tracing::debug!("Graph decay maintenance failed: {e}");
+            }
         }
     }
 
@@ -4543,7 +4553,9 @@ impl MemorySystem {
                         if let Ok(mem_id) = uuid::Uuid::parse_str(mem_id_str) {
                             if let Ok(memory) = self.long_term_memory.get(&MemoryId(mem_id)) {
                                 memory.boost_importance(*boost);
-                                let _ = self.long_term_memory.update(&memory);
+                                if let Err(e) = self.long_term_memory.update(&memory) {
+                                    tracing::debug!("Failed to persist replay boost: {e}");
+                                }
                             }
                         }
                     }

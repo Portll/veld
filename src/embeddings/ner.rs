@@ -534,11 +534,14 @@ impl NeuralNer {
                 let token_logits = &logits[start_idx..start_idx + num_labels];
                 let probs = softmax(token_logits);
 
-                let (best_idx, best_prob) = probs
+                // Find highest probability label (safe: partial_cmp handles NaN, empty probs skipped)
+                let Some((best_idx, best_prob)) = probs
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                    .unwrap();
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                else {
+                    continue; // Empty probs (shouldn't happen, but defensive)
+                };
 
                 let tag = NerTag::from_index(best_idx);
 
@@ -669,12 +672,14 @@ impl NeuralNer {
             // Softmax to get probabilities
             let probs = softmax(token_logits);
 
-            // Find best label
-            let (best_idx, best_prob) = probs
+            // Find best label (safe: partial_cmp handles NaN, empty probs skipped)
+            let Some((best_idx, best_prob)) = probs
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap();
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            else {
+                continue; // Empty probs (shouldn't happen, but defensive)
+            };
 
             let tag = NerTag::from_index(best_idx);
 

@@ -1042,9 +1042,10 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         eprintln!("🧠 Starting shodh-memory server on port {port}...");
 
         // Start server in background
-        let server_binary = std::env::current_exe()?
+        let exe_path = std::env::current_exe()?;
+        let server_binary = exe_path
             .parent()
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("Cannot find executable directory"))?
             .join("shodh-memory-server");
 
         #[cfg(windows)]

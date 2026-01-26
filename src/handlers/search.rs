@@ -78,11 +78,10 @@ pub async fn advanced_search(
         });
     }
 
+    // Combine criteria or use single criterion directly
+    let mut criterias = criterias;
     let criteria = if criterias.len() == 1 {
-        criterias
-            .into_iter()
-            .next()
-            .expect("Criteria list has exactly one element")
+        criterias.pop().unwrap() // Safe: just verified len() == 1
     } else {
         memory::storage::SearchCriteria::Combined(criterias)
     };

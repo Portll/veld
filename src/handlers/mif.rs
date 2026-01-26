@@ -428,7 +428,7 @@ pub struct PiiPatterns {
     ssn: regex::Regex,
     api_key: regex::Regex,
     credit_card: regex::Regex,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Reserved for future PII detection expansion
     ip_address: regex::Regex,
 }
 
@@ -556,6 +556,7 @@ pub struct MifEncryptionMeta {
 }
 
 /// Encrypt MIF export data using AES-256-GCM
+/// Prepared for encrypted MIF export feature (requires key management integration)
 #[allow(dead_code)]
 pub fn encrypt_mif_data(
     data: &[u8],
@@ -585,6 +586,7 @@ pub fn encrypt_mif_data(
 }
 
 /// Decrypt MIF export data using AES-256-GCM
+/// Prepared for encrypted MIF import feature (requires key management integration)
 #[allow(dead_code)]
 pub fn decrypt_mif_data(
     ciphertext: &[u8],

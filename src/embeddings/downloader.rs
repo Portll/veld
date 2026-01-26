@@ -177,7 +177,8 @@ fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
     }
 }
 
-/// Compute SHA-256 checksum of a file (for logging/verification)
+/// Compute SHA-256 checksum of a file
+/// Reserved for model integrity verification (currently logged during download)
 #[allow(dead_code)]
 fn compute_checksum(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).context("Failed to open file for checksum")?;
