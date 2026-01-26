@@ -576,8 +576,7 @@ mod tests {
                         || last_char == '!'
                         || last_char == '?'
                         || chunk == result.chunks.last().unwrap(),
-                    "Chunk '{}' doesn't end at sentence boundary",
-                    chunk
+                    "Chunk '{chunk}' doesn't end at sentence boundary"
                 );
             }
         }
@@ -657,10 +656,7 @@ mod tests {
         let end_padding = "More filler content for separation between sections. ".repeat(30);
         let end = "GAMMA_END_MARKER signifies the conclusion of this memory content.";
 
-        let full_text = format!(
-            "{} {} {} {} {}",
-            beginning, middle_padding, middle, end_padding, end
-        );
+        let full_text = format!("{beginning} {middle_padding} {middle} {end_padding} {end}");
 
         let result = chunk_text(&full_text, &config);
 
@@ -712,7 +708,7 @@ mod tests {
 
         // Create text with numbered sentences for easy tracking
         let sentences: Vec<String> = (1..=20)
-            .map(|i| format!("Sentence number {} contains unique information. ", i))
+            .map(|i| format!("Sentence number {i} contains unique information. "))
             .collect();
         let text = sentences.join("");
 
@@ -720,13 +716,9 @@ mod tests {
 
         // Every sentence number should appear in at least one chunk
         for i in 1..=20 {
-            let marker = format!("number {}", i);
+            let marker = format!("number {i}");
             let found = result.chunks.iter().any(|c| c.contains(&marker));
-            assert!(
-                found,
-                "Sentence {} not found in any chunk! Coverage gap detected.",
-                i
-            );
+            assert!(found, "Sentence {i} not found in any chunk! Coverage gap detected.");
         }
     }
 }

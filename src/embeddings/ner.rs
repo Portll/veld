@@ -1087,16 +1087,12 @@ mod tests {
             let found = entities.iter().find(|e| e.text == expected_entity);
             assert!(
                 found.is_some(),
-                "Should find {} in '{}'",
-                expected_entity,
-                text
+                "Should find {expected_entity} in '{text}'"
             );
             assert_eq!(
                 found.unwrap().entity_type,
                 expected_type,
-                "Wrong type for {} in '{}'",
-                expected_entity,
-                text
+                "Wrong type for {expected_entity} in '{text}'"
             );
         }
     }
@@ -1134,16 +1130,12 @@ mod tests {
             let found = entities.iter().find(|e| e.text == expected_entity);
             assert!(
                 found.is_some(),
-                "Should find {} in '{}'",
-                expected_entity,
-                text
+                "Should find {expected_entity} in '{text}'"
             );
             assert_eq!(
                 found.unwrap().entity_type,
                 expected_type,
-                "Wrong type for {} in '{}'",
-                expected_entity,
-                text
+                "Wrong type for {expected_entity} in '{text}'"
             );
         }
     }
@@ -1216,8 +1208,7 @@ mod tests {
         // Only stop words, no entities expected
         assert!(
             entities.is_empty(),
-            "Expected no entities from stop words but got: {:?}",
-            entities
+            "Expected no entities from stop words but got: {entities:?}"
         );
     }
 
@@ -1333,9 +1324,9 @@ mod tests {
         let indian_companies = vec!["Flipkart", "Zomato", "Swiggy", "Paytm"];
 
         for company in indian_companies {
-            let entities = ner.extract(&format!("{} is growing", company)).unwrap();
+            let entities = ner.extract(&format!("{company} is growing")).unwrap();
             let found = entities.iter().find(|e| e.text == company);
-            assert!(found.is_some(), "Should find Indian company: {}", company);
+            assert!(found.is_some(), "Should find Indian company: {company}");
         }
     }
 
@@ -1354,14 +1345,13 @@ mod tests {
         let indian_cities = vec!["Mumbai", "Delhi", "Bangalore", "Chennai", "Hyderabad"];
 
         for city in indian_cities {
-            let entities = ner.extract(&format!("Office in {}", city)).unwrap();
+            let entities = ner.extract(&format!("Office in {city}")).unwrap();
             let found = entities.iter().find(|e| e.text == city);
-            assert!(found.is_some(), "Should find Indian city: {}", city);
+            assert!(found.is_some(), "Should find Indian city: {city}");
             assert_eq!(
                 found.unwrap().entity_type,
                 NerEntityType::Location,
-                "{} should be Location",
-                city
+                "{city} should be Location"
             );
         }
     }

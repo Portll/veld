@@ -171,8 +171,7 @@ mod tests {
         let texts: Vec<&str> = keywords.iter().map(|k| k.text.as_str()).collect();
         assert!(
             texts.contains(&"sunrise") || texts.contains(&"beautiful sunrise"),
-            "Should extract 'sunrise': {:?}",
-            texts
+            "Should extract 'sunrise': {texts:?}"
         );
     }
 
