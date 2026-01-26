@@ -4604,8 +4604,7 @@ mod tests {
         let expected_boost = (LTP_LEARNING_RATE + tier_boost) * (1.0 - initial_strength);
         assert!(
             edge.strength > initial_strength,
-            "Strengthen should increase strength (expected boost {})",
-            expected_boost
+            "Strengthen should increase strength (expected boost {expected_boost})"
         );
         assert_eq!(edge.activation_count, 1);
     }
@@ -4624,9 +4623,7 @@ mod tests {
         let expected_min = 0.95 + (LTP_LEARNING_RATE + tier_boost) * 0.05 - 0.01;
         assert!(
             edge.strength > expected_min,
-            "Expected > {}, got {}",
-            expected_min,
-            edge.strength
+            "Expected > {expected_min}, got {}", edge.strength
         );
         assert!(edge.strength <= 1.0);
     }
@@ -4646,9 +4643,7 @@ mod tests {
         let expected = 0.3 + (LTP_LEARNING_RATE + tier_boost) * 0.7;
         assert!(
             (edge.strength - expected).abs() < 0.001,
-            "Expected {}, got {}",
-            expected,
-            edge.strength
+            "Expected {expected}, got {}", edge.strength
         );
     }
 
@@ -4810,8 +4805,8 @@ mod tests {
         // All activations are recent (within last second really)
         let in_hour = edge.activations_in_window(hour_ago, now);
         let in_day = edge.activations_in_window(day_ago, now);
-        assert!(in_hour >= 5, "Expected 5+ in hour window, got {}", in_hour);
-        assert!(in_day >= 5, "Expected 5+ in day window, got {}", in_day);
+        assert!(in_hour >= 5, "Expected 5+ in hour window, got {in_hour}");
+        assert!(in_day >= 5, "Expected 5+ in day window, got {in_day}");
     }
 
     // =========================================================================
@@ -4839,8 +4834,7 @@ mod tests {
         // confidence 0.9 → threshold = 13 - (0.9 * 6) = 7.6 → 8
         assert!(
             threshold <= 8,
-            "High confidence should give threshold <= 8, got {}",
-            threshold
+            "High confidence should give threshold <= 8, got {threshold}"
         );
     }
 
@@ -4854,8 +4848,7 @@ mod tests {
         // confidence 0.2 → threshold = 13 - (0.2 * 6) = 11.8 → 12
         assert!(
             threshold >= 11,
-            "Low confidence should give threshold >= 11, got {}",
-            threshold
+            "Low confidence should give threshold >= 11, got {threshold}"
         );
     }
 
