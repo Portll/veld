@@ -1085,10 +1085,7 @@ mod tests {
         for (text, expected_entity, expected_type) in test_cases {
             let entities = ner.extract(text).unwrap();
             let found = entities.iter().find(|e| e.text == expected_entity);
-            assert!(
-                found.is_some(),
-                "Should find {expected_entity} in '{text}'"
-            );
+            assert!(found.is_some(), "Should find {expected_entity} in '{text}'");
             assert_eq!(
                 found.unwrap().entity_type,
                 expected_type,
@@ -1128,10 +1125,7 @@ mod tests {
         for (text, expected_entity, expected_type) in test_cases {
             let entities = ner.extract(text).unwrap();
             let found = entities.iter().find(|e| e.text == expected_entity);
-            assert!(
-                found.is_some(),
-                "Should find {expected_entity} in '{text}'"
-            );
+            assert!(found.is_some(), "Should find {expected_entity} in '{text}'");
             assert_eq!(
                 found.unwrap().entity_type,
                 expected_type,

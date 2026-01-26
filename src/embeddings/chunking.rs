@@ -718,7 +718,10 @@ mod tests {
         for i in 1..=20 {
             let marker = format!("number {i}");
             let found = result.chunks.iter().any(|c| c.contains(&marker));
-            assert!(found, "Sentence {i} not found in any chunk! Coverage gap detected.");
+            assert!(
+                found,
+                "Sentence {i} not found in any chunk! Coverage gap detected."
+            );
         }
     }
 }

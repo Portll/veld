@@ -62,6 +62,190 @@ impl Default for WriteMode {
 
 const STORAGE_MAGIC: &[u8; 3] = b"SHO";
 
+use std::collections::HashMap;
+
+/// Default experience type for legacy deserialization
+fn default_legacy_experience_type() -> ExperienceType {
+    ExperienceType::Observation
+}
+
+/// Legacy Experience type from v0.1.0 - EXACT match for bincode 1.x deserialization
+/// Includes all fields that were in the original Experience struct in EXACT ORDER.
+/// bincode 1.x serializes fields positionally, so order matters!
+#[derive(Deserialize)]
+struct LegacyExperienceV1 {
+    // Core fields (always present)
+    #[serde(default = "default_legacy_experience_type")]
+    experience_type: ExperienceType,
+    content: String,
+    #[serde(default)]
+    context: Option<RichContext>,
+    #[serde(default)]
+    entities: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+    #[serde(default)]
+    embeddings: Option<Vec<f32>>,
+    #[serde(default)]
+    related_memories: Vec<MemoryId>,
+    #[serde(default)]
+    causal_chain: Vec<MemoryId>,
+    #[serde(default)]
+    outcomes: Vec<String>,
+    // Robotics fields
+    #[serde(default)]
+    robot_id: Option<String>,
+    #[serde(default)]
+    mission_id: Option<String>,
+    #[serde(default)]
+    geo_location: Option<[f64; 3]>,
+    #[serde(default)]
+    local_position: Option<[f32; 3]>,
+    #[serde(default)]
+    heading: Option<f32>,
+    #[serde(default)]
+    action_type: Option<String>,
+    #[serde(default)]
+    reward: Option<f32>,
+    #[serde(default)]
+    sensor_data: HashMap<String, f64>,
+    // Decision & learning fields
+    #[serde(default)]
+    decision_context: Option<HashMap<String, String>>,
+    #[serde(default)]
+    action_params: Option<HashMap<String, String>>,
+    #[serde(default)]
+    outcome_type: Option<String>,
+    #[serde(default)]
+    outcome_details: Option<String>,
+    #[serde(default)]
+    confidence: Option<f32>,
+    #[serde(default)]
+    alternatives_considered: Vec<String>,
+    // Environmental context
+    #[serde(default)]
+    weather: Option<HashMap<String, String>>,
+    #[serde(default)]
+    terrain_type: Option<String>,
+    #[serde(default)]
+    lighting: Option<String>,
+    #[serde(default)]
+    nearby_agents: Vec<HashMap<String, String>>,
+    // Failure & anomaly tracking
+    #[serde(default)]
+    is_failure: bool,
+    #[serde(default)]
+    is_anomaly: bool,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    recovery_action: Option<String>,
+    #[serde(default)]
+    root_cause: Option<String>,
+    // Learned patterns & predictions
+    #[serde(default)]
+    pattern_id: Option<String>,
+    #[serde(default)]
+    predicted_outcome: Option<String>,
+    #[serde(default)]
+    prediction_accurate: Option<bool>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+impl LegacyExperienceV1 {
+    fn into_experience(self) -> Experience {
+        Experience {
+            experience_type: self.experience_type,
+            content: self.content,
+            context: self.context,
+            entities: self.entities,
+            metadata: self.metadata,
+            embeddings: self.embeddings,
+            image_embeddings: None,
+            audio_embeddings: None,
+            video_embeddings: None,
+            media_refs: Vec::new(),
+            related_memories: self.related_memories,
+            causal_chain: self.causal_chain,
+            outcomes: self.outcomes,
+            robot_id: self.robot_id,
+            mission_id: self.mission_id,
+            geo_location: self.geo_location,
+            local_position: self.local_position,
+            heading: self.heading,
+            action_type: self.action_type,
+            reward: self.reward,
+            sensor_data: self.sensor_data,
+            decision_context: self.decision_context,
+            action_params: self.action_params,
+            outcome_type: self.outcome_type,
+            outcome_details: self.outcome_details,
+            confidence: self.confidence,
+            alternatives_considered: self.alternatives_considered,
+            weather: self.weather,
+            terrain_type: self.terrain_type,
+            lighting: self.lighting,
+            nearby_agents: self.nearby_agents,
+            is_failure: self.is_failure,
+            is_anomaly: self.is_anomaly,
+            severity: self.severity,
+            recovery_action: self.recovery_action,
+            root_cause: self.root_cause,
+            pattern_id: self.pattern_id,
+            predicted_outcome: self.predicted_outcome,
+            prediction_accurate: self.prediction_accurate,
+            tags: self.tags,
+            temporal_refs: Vec::new(), // Not in v1
+        }
+    }
+}
+
+/// Legacy v0.1.0 Memory with full Experience - for bincode 1.x deserialization
+#[derive(Deserialize)]
+struct LegacyMemoryV1Full {
+    #[serde(rename = "memory_id")]
+    id: MemoryId,
+    experience: LegacyExperienceV1,
+    importance: f32,
+    access_count: u32,
+    created_at: DateTime<Utc>,
+    last_accessed: DateTime<Utc>,
+    compressed: bool,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    actor_id: Option<String>,
+    temporal_relevance: f32,
+    score: Option<f32>,
+}
+
+impl LegacyMemoryV1Full {
+    fn into_memory(self) -> Memory {
+        Memory::from_legacy(
+            self.id,
+            self.experience.into_experience(),
+            self.importance,
+            self.access_count,
+            self.created_at,
+            self.last_accessed,
+            self.compressed,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            self.agent_id,
+            self.run_id,
+            self.actor_id,
+            self.temporal_relevance,
+            self.score,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+}
+
 /// Legacy v0.1.0 format - matches the initial release serialization
 /// Uses named struct fields (memory_id instead of id, no tier/entity_refs/etc.)
 #[derive(Deserialize)]
@@ -186,12 +370,10 @@ fn deserialize_memory(data: &[u8]) -> Result<Memory> {
         }
         let payload = &data[4..payload_end];
         // Try current format first, then fallback to legacy formats
-        deserialize_with_fallback(payload)
-            .map_err(|e| anyhow!("v{version} decode failed: {e}"))
+        deserialize_with_fallback(payload).map_err(|e| anyhow!("v{version} decode failed: {e}"))
     } else {
         // Legacy format: raw bincode (no SHO header)
-        deserialize_with_fallback(data)
-            .map_err(|e| anyhow!("legacy decode failed: {e}"))
+        deserialize_with_fallback(data).map_err(|e| anyhow!("legacy decode failed: {e}"))
     }
 }
 
@@ -205,6 +387,12 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
         return Ok(memory);
     }
 
+    // Try bincode 1.x format with original Experience (no multimodal fields)
+    if let Ok(legacy) = bincode1::deserialize::<LegacyMemoryV1Full>(data) {
+        tracing::debug!("Migrated memory from bincode 1.x v1 full format");
+        return Ok(legacy.into_memory());
+    }
+
     // Try bincode 1.x format (used in versions prior to bincode 2.0 migration)
     // bincode 1.x has a completely different wire format than bincode 2.x
     if let Ok(legacy) = bincode1::deserialize::<LegacyMemoryV1>(data) {
@@ -216,6 +404,18 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     if let Ok(legacy) = bincode1::deserialize::<LegacyMemoryV2>(data) {
         tracing::debug!("Migrated memory from bincode 1.x v2 format");
         return Ok(legacy.into_memory());
+    }
+
+    // Log first 64 bytes for debugging (only on first failure to avoid log spam)
+    static DEBUG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !DEBUG_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let hex_preview: String = data
+            .iter()
+            .take(64)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::warn!("Legacy format debug - first 64 bytes: {}", hex_preview);
     }
 
     // All formats failed
@@ -1498,7 +1698,10 @@ impl MemoryStorage {
 
         // Re-save migrated memories in current format
         if !to_migrate.is_empty() {
-            tracing::info!("Migrating {} legacy memories to current format", to_migrate.len());
+            tracing::info!(
+                "Migrating {} legacy memories to current format",
+                to_migrate.len()
+            );
 
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(self.write_mode == WriteMode::Sync);
@@ -1651,8 +1854,6 @@ pub struct StorageStats {
 //
 // Key format: "vmapping:{memory_id}" -> bincode(VectorMappingEntry)
 // =============================================================================
-
-use std::collections::HashMap;
 
 /// Supported embedding modalities
 ///

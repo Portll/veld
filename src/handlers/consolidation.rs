@@ -249,9 +249,8 @@ pub async fn migrate_legacy(
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let (migrated, already_current, failed) = memory_guard
-        .migrate_legacy()
-        .map_err(AppError::Internal)?;
+    let (migrated, already_current, failed) =
+        memory_guard.migrate_legacy().map_err(AppError::Internal)?;
 
     // Broadcast event for real-time dashboard
     if migrated > 0 {

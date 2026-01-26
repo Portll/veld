@@ -4623,7 +4623,8 @@ mod tests {
         let expected_min = 0.95 + (LTP_LEARNING_RATE + tier_boost) * 0.05 - 0.01;
         assert!(
             edge.strength > expected_min,
-            "Expected > {expected_min}, got {}", edge.strength
+            "Expected > {expected_min}, got {}",
+            edge.strength
         );
         assert!(edge.strength <= 1.0);
     }
@@ -4643,7 +4644,8 @@ mod tests {
         let expected = 0.3 + (LTP_LEARNING_RATE + tier_boost) * 0.7;
         assert!(
             (edge.strength - expected).abs() < 0.001,
-            "Expected {expected}, got {}", edge.strength
+            "Expected {expected}, got {}",
+            edge.strength
         );
     }
 

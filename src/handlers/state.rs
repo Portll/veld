@@ -500,9 +500,8 @@ impl MultiUserMemoryManager {
             ..self.default_config.clone()
         };
 
-        let mut memory_system = MemorySystem::new(config).with_context(|| {
-            format!("Failed to initialize memory system for user '{user_id}'")
-        })?;
+        let mut memory_system = MemorySystem::new(config)
+            .with_context(|| format!("Failed to initialize memory system for user '{user_id}'"))?;
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
         let graph = self.get_user_graph(user_id)?;
         memory_system.set_graph_memory(graph);

@@ -2068,9 +2068,7 @@ mod tests {
         } else {
             "NO"
         };
-        println!(
-            "   └─ CI includes 0: {ci_includes_zero} (effect may be due to chance)"
-        );
+        println!("   └─ CI includes 0: {ci_includes_zero} (effect may be due to chance)");
 
         // Scenario 3: Full analysis with recommendations
         println!("\n📊 SCENARIO 3: Full Analysis with Recommendations");
@@ -2458,7 +2456,9 @@ mod tests {
         let nnt = if ard > 0.0 { 1.0 / ard } else { f64::INFINITY };
         let ctr_diff = treatment_ctr - control_ctr;
         println!("\n🎯 KEY METRIC:");
-        println!("   ├─ CTR Improvement: {control_ctr:.1}% → {treatment_ctr:.1}% (+{ctr_diff:.1}%)");
+        println!(
+            "   ├─ CTR Improvement: {control_ctr:.1}% → {treatment_ctr:.1}% (+{ctr_diff:.1}%)"
+        );
         let ard_pct = ard * 100.0;
         println!("   ├─ ARD (Absolute Risk Difference): {ard_pct:.2}%");
         if nnt.is_finite() && nnt < 100.0 {
