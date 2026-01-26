@@ -69,6 +69,288 @@ fn default_legacy_experience_type() -> ExperienceType {
     ExperienceType::Observation
 }
 
+/// Minimal memory format - EXACT match for hex pattern: UUID (16 bytes) + varint string length + string
+/// This is the simplest possible format with no extra fields. bincode doesn't support #[serde(default)]
+/// so we can't have optional fields - the struct must match the binary data exactly.
+#[derive(Deserialize)]
+struct MinimalMemory {
+    id: MemoryId,
+    content: String,
+}
+
+/// Memory with experience type prefix - format: UUID + u8 (unknown) + u8 (experience_type) + String
+/// Matches the failing entries that have 2 extra bytes before content:
+/// - Byte 16: u8 value (seen as 28/0x1c)
+/// - Byte 17: u8 experience type index (seen as 7 = Task)
+/// - Byte 18+: varint length + string content
+#[derive(Deserialize)]
+struct MemoryWithTypePrefix {
+    id: MemoryId,
+    _unknown_field: u8,  // byte 16 - purpose unclear, maybe version?
+    experience_type: u8, // byte 17 - experience type enum index
+    content: String,     // byte 18+
+}
+
+/// Memory with 3-byte header - format: UUID + 3 bytes + raw content
+/// Hex analysis shows: bytes 16-18 are header, byte 19+ is UTF-8 content starting with `[`
+/// - Byte 16: 0x1c (28) - unknown
+/// - Byte 17: 0x07 (7) - possibly experience type
+/// - Byte 18: 0xa4 (164) - unknown (NOT valid UTF-8 start)
+/// - Byte 19+: UTF-8 content
+#[derive(Deserialize)]
+struct MemoryWith3ByteHeader {
+    id: MemoryId,
+    _header1: u8, // byte 16
+    _header2: u8, // byte 17
+    _header3: u8, // byte 18
+    content: String, // byte 19+
+}
+
+impl MemoryWith3ByteHeader {
+    fn into_memory(self) -> Memory {
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: self.content,
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            self.id,
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+}
+
+/// Try to parse as raw bytes: UUID (16) + skip header bytes + raw UTF-8 string
+/// This is a last-resort fallback for entries that don't match any standard format
+fn try_raw_memory_parse(data: &[u8]) -> Option<Memory> {
+    if data.len() < 20 {
+        return None;
+    }
+
+    // Extract UUID from first 16 bytes
+    let uuid_bytes: [u8; 16] = data[0..16].try_into().ok()?;
+    let id = MemoryId(uuid::Uuid::from_bytes(uuid_bytes));
+
+    // Try different header sizes (2, 3, 4 bytes) and find valid UTF-8
+    for header_skip in [2, 3, 4, 5, 6] {
+        let content_start = 16 + header_skip;
+        if content_start >= data.len() {
+            continue;
+        }
+        if let Ok(content) = std::str::from_utf8(&data[content_start..]) {
+            if !content.is_empty()
+                && content
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_graphic())
+                    .unwrap_or(false)
+            {
+                let now = Utc::now();
+                let experience = Experience {
+                    experience_type: ExperienceType::Observation,
+                    content: content.to_string(),
+                    ..Default::default()
+                };
+                // Log only at debug level to avoid spam
+                tracing::debug!(
+                    "Recovered memory with raw parsing (header_skip={}, content_len={})",
+                    header_skip,
+                    content.len()
+                );
+                return Some(Memory::from_legacy(
+                    id,
+                    experience,
+                    0.5,
+                    0,
+                    now,
+                    now,
+                    false,
+                    MemoryTier::LongTerm,
+                    Vec::new(),
+                    1.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0.0,
+                    None,
+                    None,
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+impl MemoryWithTypePrefix {
+    fn into_memory(self) -> Memory {
+        let now = Utc::now();
+        let exp_type = match self.experience_type {
+            0 => ExperienceType::Observation,
+            1 => ExperienceType::Decision,
+            2 => ExperienceType::Learning,
+            3 => ExperienceType::Error,
+            4 => ExperienceType::Discovery,
+            5 => ExperienceType::Pattern,
+            6 => ExperienceType::Context,
+            7 => ExperienceType::Task,
+            8 => ExperienceType::CodeEdit,
+            9 => ExperienceType::FileAccess,
+            10 => ExperienceType::Search,
+            11 => ExperienceType::Command,
+            12 => ExperienceType::Conversation,
+            _ => ExperienceType::Observation,
+        };
+        let experience = Experience {
+            experience_type: exp_type,
+            content: self.content,
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            self.id,
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+}
+
+impl MinimalMemory {
+    fn into_memory(self) -> Memory {
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: self.content,
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            self.id,
+            experience,
+            0.5, // default importance
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+}
+
+/// Very simple legacy Memory - some early versions stored content directly without Experience wrapper
+/// This matches the hex pattern: UUID (16 bytes) + varint string length + string content
+#[derive(Deserialize)]
+struct SimpleLegacyMemory {
+    id: MemoryId,
+    content: String, // Direct content field, no Experience wrapper
+    #[serde(default)]
+    importance: f32,
+    #[serde(default)]
+    access_count: u32,
+    #[serde(default)]
+    created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_accessed: Option<DateTime<Utc>>,
+    #[serde(default)]
+    compressed: bool,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    actor_id: Option<String>,
+    #[serde(default)]
+    temporal_relevance: f32,
+    #[serde(default)]
+    score: Option<f32>,
+}
+
+impl SimpleLegacyMemory {
+    fn into_memory(self) -> Memory {
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: self.content,
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            self.id,
+            experience,
+            if self.importance > 0.0 {
+                self.importance
+            } else {
+                0.5
+            },
+            self.access_count,
+            self.created_at.unwrap_or(now),
+            self.last_accessed.unwrap_or(now),
+            self.compressed,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            self.agent_id,
+            self.run_id,
+            self.actor_id,
+            self.temporal_relevance,
+            self.score,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+}
+
 /// Legacy Experience type from v0.1.0 - EXACT match for bincode 1.x deserialization
 /// Includes all fields that were in the original Experience struct in EXACT ORDER.
 /// bincode 1.x serializes fields positionally, so order matters!
@@ -247,12 +529,12 @@ impl LegacyMemoryV1Full {
 }
 
 /// Legacy v0.1.0 format - matches the initial release serialization
-/// Uses named struct fields (memory_id instead of id, no tier/entity_refs/etc.)
+/// Uses LegacyExperienceV1 (no multimodal fields) because bincode is positional
 #[derive(Deserialize)]
 struct LegacyMemoryV1 {
     #[serde(rename = "memory_id")]
     id: MemoryId,
-    experience: Experience,
+    experience: LegacyExperienceV1, // Must use legacy Experience - bincode ignores #[serde(default)]
     importance: f32,
     access_count: u32,
     created_at: DateTime<Utc>,
@@ -270,25 +552,25 @@ impl LegacyMemoryV1 {
     fn into_memory(self) -> Memory {
         Memory::from_legacy(
             self.id,
-            self.experience,
+            self.experience.into_experience(),
             self.importance,
             self.access_count,
             self.created_at,
             self.last_accessed,
             self.compressed,
-            MemoryTier::LongTerm, // Already persisted = LongTerm
-            Vec::new(),           // entity_refs not in v1
-            1.0,                  // activation - default fully activated
-            None,                 // last_retrieval_id not in v1
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
             self.agent_id,
             self.run_id,
             self.actor_id,
             self.temporal_relevance,
             self.score,
-            None,       // external_id not in v1
-            1,          // version
-            Vec::new(), // history not in v1
-            Vec::new(), // related_todo_ids not in v1
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
         )
     }
 }
@@ -298,7 +580,7 @@ impl LegacyMemoryV1 {
 #[derive(Deserialize)]
 struct LegacyMemoryV2 {
     id: MemoryId,
-    experience: Experience,
+    experience: LegacyExperienceV1, // bincode is positional - must match original fields
     importance: f32,
     access_count: u32,
     created_at: DateTime<Utc>,
@@ -320,7 +602,7 @@ impl LegacyMemoryV2 {
     fn into_memory(self) -> Memory {
         Memory::from_legacy(
             self.id,
-            self.experience,
+            self.experience.into_experience(),
             self.importance,
             self.access_count,
             self.created_at,
@@ -377,21 +659,176 @@ fn deserialize_memory(data: &[u8]) -> Result<Memory> {
     }
 }
 
+/// Legacy MemoryFlat for bincode 2.x data written BEFORE multimodal Experience fields
+/// This matches the format at MIF commit (dee4b03) - has tier/entity_refs but Experience without multimodal
+#[derive(Deserialize)]
+struct LegacyMemoryFlatV2 {
+    id: MemoryId,
+    experience: LegacyExperienceV1, // No multimodal fields
+    importance: f32,
+    access_count: u32,
+    created_at: DateTime<Utc>,
+    last_accessed: DateTime<Utc>,
+    compressed: bool,
+    tier: MemoryTier,
+    entity_refs: Vec<EntityRef>,
+    activation: f32,
+    last_retrieval_id: Option<uuid::Uuid>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    actor_id: Option<String>,
+    temporal_relevance: f32,
+    score: Option<f32>,
+    external_id: Option<String>,
+    version: u32,
+    history: Vec<MemoryRevision>,
+    #[serde(default)]
+    related_todo_ids: Vec<TodoId>,
+}
+
+impl LegacyMemoryFlatV2 {
+    fn into_memory(self) -> Memory {
+        Memory::from_legacy(
+            self.id,
+            self.experience.into_experience(),
+            self.importance,
+            self.access_count,
+            self.created_at,
+            self.last_accessed,
+            self.compressed,
+            self.tier,
+            self.entity_refs,
+            self.activation,
+            self.last_retrieval_id,
+            self.agent_id,
+            self.run_id,
+            self.actor_id,
+            self.temporal_relevance,
+            self.score,
+            self.external_id,
+            self.version,
+            self.history,
+            self.related_todo_ids,
+        )
+    }
+}
+
 /// Try deserializing with multiple format fallbacks
 /// Supports bincode 2.x (current), MessagePack, and bincode 1.x (legacy) wire formats
 fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
-    // Try current format first (bincode 2.x)
-    if let Ok((memory, _)) =
-        bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard())
+    // Log detailed errors for first entry only to help debug format issues
+    static DEBUG_ENTRY_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let is_first_failure = !DEBUG_ENTRY_LOGGED.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Collect all errors for debugging
+    let mut errors: Vec<(&str, String)> = Vec::new();
+
+    // Try current format first (bincode 2.x with current Memory/Experience)
+    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
+        Ok((memory, _)) => return Ok(memory),
+        Err(e) => errors.push(("bincode2 Memory", e.to_string())),
+    }
+
+    // Try bincode 2.x MINIMAL format (just UUID + content string)
+    // This matches the hex pattern: 16-byte UUID + varint length + string bytes
+    match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard()) {
+        Ok((minimal, _)) => {
+            tracing::debug!("Migrated memory from bincode 2.x minimal format");
+            return Ok(minimal.into_memory());
+        }
+        Err(e) => errors.push(("bincode2 MinimalMemory", e.to_string())),
+    }
+
+    // Try bincode 2.x with type prefix: UUID + u8 + u8 (experience_type) + String
+    // Matches entries with 2 extra bytes before content (byte 16=unknown, byte 17=exp_type)
+    match bincode::serde::decode_from_slice::<MemoryWithTypePrefix, _>(
+        data,
+        bincode::config::standard(),
+    ) {
+        Ok((typed, _)) => {
+            tracing::debug!("Migrated memory from bincode 2.x with type prefix");
+            return Ok(typed.into_memory());
+        }
+        Err(e) => errors.push(("bincode2 MemoryWithTypePrefix", e.to_string())),
+    }
+
+    // Try bincode 2.x with OLD Experience (before multimodal fields were added)
+    match bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(data, bincode::config::standard())
     {
-        return Ok(memory);
+        Ok((legacy, _)) => {
+            tracing::debug!("Migrated memory from bincode 2.x pre-multimodal format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("bincode2 LegacyMemoryFlatV2", e.to_string())),
+    }
+
+    // Try bincode 1.x with LegacyMemoryV1 (v0.1.0 format)
+    match bincode1::deserialize::<LegacyMemoryV1>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x v0.1.0 format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("bincode1 LegacyMemoryV1", e.to_string())),
+    }
+
+    // Try bincode 1.x MINIMAL format (just UUID + content)
+    match bincode1::deserialize::<MinimalMemory>(data) {
+        Ok(minimal) => {
+            tracing::debug!("Migrated memory from bincode 1.x minimal format");
+            return Ok(minimal.into_memory());
+        }
+        Err(e) => errors.push(("bincode1 MinimalMemory", e.to_string())),
+    }
+
+    // Try bincode 1.x with SIMPLE legacy format (content as direct field, no Experience wrapper)
+    match bincode1::deserialize::<SimpleLegacyMemory>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x simple format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("bincode1 SimpleLegacyMemory", e.to_string())),
+    }
+
+    // Try bincode 1.x with fixint encoding (u64 lengths instead of varint)
+    use bincode1::Options;
+    let fixint_config = bincode1::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes();
+
+    // Try bincode 1.x fixint MinimalMemory
+    match fixint_config.deserialize::<MinimalMemory>(data) {
+        Ok(minimal) => {
+            tracing::debug!("Migrated memory from bincode 1.x fixint minimal format");
+            return Ok(minimal.into_memory());
+        }
+        Err(e) => errors.push(("bincode1 fixint MinimalMemory", e.to_string())),
+    }
+
+    match fixint_config.deserialize::<SimpleLegacyMemory>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x fixint simple format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("bincode1 fixint SimpleLegacyMemory", e.to_string())),
+    }
+
+    // Try MessagePack minimal format
+    match rmp_serde::from_slice::<MinimalMemory>(data) {
+        Ok(minimal) => {
+            tracing::debug!("Migrated memory from MessagePack minimal format");
+            return Ok(minimal.into_memory());
+        }
+        Err(e) => errors.push(("msgpack MinimalMemory", e.to_string())),
     }
 
     // Try MessagePack format (rmp-serde) - self-describing format
-    // This was used in some intermediate versions before the current bincode 2.x
-    if let Ok(legacy) = rmp_serde::from_slice::<LegacyMemoryV1Full>(data) {
-        tracing::debug!("Migrated memory from MessagePack v1 format");
-        return Ok(legacy.into_memory());
+    match rmp_serde::from_slice::<SimpleLegacyMemory>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from MessagePack simple format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("msgpack SimpleLegacyMemory", e.to_string())),
     }
 
     // Try bincode 1.x format with original Experience (no multimodal fields)
@@ -400,38 +837,80 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
             tracing::debug!("Migrated memory from bincode 1.x v1 full format");
             return Ok(legacy.into_memory());
         }
-        Err(e) => {
-            static BINCODE1_ERR_LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !BINCODE1_ERR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!("bincode1 LegacyMemoryV1Full error: {}", e);
-            }
+        Err(e) => errors.push(("bincode1 LegacyMemoryV1Full", e.to_string())),
+    }
+
+    // Try bincode 1.x with fixint encoding for full legacy format
+    match fixint_config.deserialize::<LegacyMemoryV1Full>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x fixint v1 full format");
+            return Ok(legacy.into_memory());
         }
+        Err(e) => errors.push(("bincode1 fixint LegacyMemoryV1Full", e.to_string())),
+    }
+
+    // Try MessagePack with full legacy format
+    match rmp_serde::from_slice::<LegacyMemoryV1Full>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from MessagePack v1 full format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("msgpack LegacyMemoryV1Full", e.to_string())),
     }
 
     // Try bincode 1.x format (used in versions prior to bincode 2.0 migration)
-    // bincode 1.x has a completely different wire format than bincode 2.x
-    if let Ok(legacy) = bincode1::deserialize::<LegacyMemoryV1>(data) {
-        tracing::debug!("Migrated memory from bincode 1.x format");
-        return Ok(legacy.into_memory());
+    match bincode1::deserialize::<LegacyMemoryV1>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x format");
+            return Ok(legacy.into_memory());
+        }
+        Err(_) => {} // Already tried above
     }
 
     // Try legacy v2 format with bincode 1.x (cognitive extensions era)
-    if let Ok(legacy) = bincode1::deserialize::<LegacyMemoryV2>(data) {
-        tracing::debug!("Migrated memory from bincode 1.x v2 format");
-        return Ok(legacy.into_memory());
+    match bincode1::deserialize::<LegacyMemoryV2>(data) {
+        Ok(legacy) => {
+            tracing::debug!("Migrated memory from bincode 1.x v2 format");
+            return Ok(legacy.into_memory());
+        }
+        Err(e) => errors.push(("bincode1 LegacyMemoryV2", e.to_string())),
     }
 
-    // Log first 64 bytes for debugging (only on first failure to avoid log spam)
-    static DEBUG_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !DEBUG_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // Try bincode 2.x with 3-byte header: UUID + 3 bytes + String
+    // Hex analysis shows content starts at byte 19 (byte 18 is 0xa4, not valid UTF-8 start)
+    match bincode::serde::decode_from_slice::<MemoryWith3ByteHeader, _>(
+        data,
+        bincode::config::standard(),
+    ) {
+        Ok((mem, _)) => {
+            tracing::debug!("Migrated memory from bincode 2.x with 3-byte header");
+            return Ok(mem.into_memory());
+        }
+        Err(e) => errors.push(("bincode2 MemoryWith3ByteHeader", e.to_string())),
+    }
+
+    // LAST RESORT: Try raw byte parsing with different header skip sizes
+    // This handles non-standard formats by finding where valid UTF-8 content starts
+    if let Some(memory) = try_raw_memory_parse(data) {
+        return Ok(memory);
+    }
+    errors.push(("raw parse", "no valid UTF-8 content found".to_string()));
+
+    // Log debug info on first failure only (at debug level to reduce noise)
+    if is_first_failure {
+        DEBUG_ENTRY_LOGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+
         let hex_preview: String = data
             .iter()
-            .take(64)
+            .take(32)
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        tracing::warn!("Legacy format debug - first 64 bytes: {}", hex_preview);
+        tracing::debug!(
+            "Unknown memory format ({} bytes): {}...",
+            data.len(),
+            hex_preview
+        );
     }
 
     // All formats failed
