@@ -1870,3 +1870,152 @@ impl MemoryStorage {
         Ok(stats)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_mode_default_async() {
+        std::env::remove_var("SHODH_WRITE_MODE");
+        let mode = WriteMode::default();
+        assert_eq!(mode, WriteMode::Async);
+    }
+
+    #[test]
+    fn test_crc32_simple() {
+        let data = b"test data for CRC32";
+        let crc1 = crc32_simple(data);
+        let crc2 = crc32_simple(data);
+
+        assert_eq!(crc1, crc2);
+        assert_ne!(crc1, 0);
+
+        let crc3 = crc32_simple(b"different data");
+        assert_ne!(crc1, crc3);
+    }
+
+    #[test]
+    fn test_crc32_empty() {
+        let crc = crc32_simple(b"");
+        assert_ne!(crc, 0);
+    }
+
+    #[test]
+    fn test_modality_dimension() {
+        assert_eq!(Modality::Text.dimension(), 384);
+        assert_eq!(Modality::Image.dimension(), 512);
+        assert_eq!(Modality::Audio.dimension(), 768);
+        assert_eq!(Modality::Video.dimension(), 1024);
+    }
+
+    #[test]
+    fn test_modality_as_str() {
+        assert_eq!(Modality::Text.as_str(), "text");
+        assert_eq!(Modality::Image.as_str(), "image");
+        assert_eq!(Modality::Audio.as_str(), "audio");
+        assert_eq!(Modality::Video.as_str(), "video");
+    }
+
+    #[test]
+    fn test_vector_mapping_entry_with_text() {
+        let entry = VectorMappingEntry::with_text(vec![1, 2, 3]);
+
+        assert_eq!(entry.text_vectors(), Some(&vec![1, 2, 3]));
+        assert!(!entry.is_empty());
+    }
+
+    #[test]
+    fn test_vector_mapping_entry_multimodal() {
+        let entry = VectorMappingEntry::with_text(vec![1])
+            .with_image(vec![2])
+            .with_audio(vec![3])
+            .with_video(vec![4]);
+
+        let all = entry.all_vector_ids();
+        assert_eq!(all.len(), 4);
+
+        assert!(all.contains(&(Modality::Text, 1)));
+        assert!(all.contains(&(Modality::Image, 2)));
+        assert!(all.contains(&(Modality::Audio, 3)));
+        assert!(all.contains(&(Modality::Video, 4)));
+    }
+
+    #[test]
+    fn test_vector_mapping_entry_empty() {
+        let entry = VectorMappingEntry::default();
+
+        assert!(entry.is_empty());
+        assert!(entry.text_vectors().is_none());
+        assert!(entry.all_vector_ids().is_empty());
+    }
+
+    #[test]
+    fn test_vector_mapping_entry_add_modality() {
+        let mut entry = VectorMappingEntry::default();
+        entry.add_modality(Modality::Text, vec![1, 2]);
+
+        assert_eq!(entry.text_vectors(), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn test_storage_stats_default() {
+        let stats = StorageStats::default();
+
+        assert_eq!(stats.total_memories, 0);
+        assert_eq!(stats.total_bytes, 0);
+        assert_eq!(stats.average_size_bytes, 0);
+        assert!(stats.by_type.is_empty());
+    }
+
+    #[test]
+    fn test_search_criteria_variants() {
+        let criteria1 = SearchCriteria::ByEntity("test".to_string());
+        let criteria2 = SearchCriteria::ByImportance { min: 0.5, max: 1.0 };
+        let criteria3 = SearchCriteria::ByTag("tag".to_string());
+
+        assert!(matches!(criteria1, SearchCriteria::ByEntity(_)));
+        assert!(matches!(criteria2, SearchCriteria::ByImportance { .. }));
+        assert!(matches!(criteria3, SearchCriteria::ByTag(_)));
+    }
+
+    #[test]
+    fn test_search_criteria_by_date() {
+        let now = Utc::now();
+        let start = now - chrono::Duration::days(7);
+        let criteria = SearchCriteria::ByDate { start, end: now };
+
+        if let SearchCriteria::ByDate { start: s, end: e } = criteria {
+            assert!(s < e);
+        } else {
+            panic!("Expected ByDate");
+        }
+    }
+
+    #[test]
+    fn test_search_criteria_combined() {
+        let criteria = SearchCriteria::Combined(vec![
+            SearchCriteria::ByEntity("test".to_string()),
+            SearchCriteria::ByImportance { min: 0.5, max: 1.0 },
+        ]);
+
+        if let SearchCriteria::Combined(inner) = criteria {
+            assert_eq!(inner.len(), 2);
+        } else {
+            panic!("Expected Combined");
+        }
+    }
+
+    #[test]
+    fn test_modality_vectors_struct() {
+        let mv = ModalityVectors {
+            modality: Modality::Text,
+            vector_ids: vec![1, 2, 3],
+            dimension: 384,
+        };
+
+        assert_eq!(mv.modality, Modality::Text);
+        assert_eq!(mv.vector_ids.len(), 3);
+        assert_eq!(mv.dimension, 384);
+    }
+}

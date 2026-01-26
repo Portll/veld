@@ -797,3 +797,262 @@ impl SemanticConsolidator {
         days_since_reinforcement > decay_threshold
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn create_test_memory(content: &str, importance: f32) -> Memory {
+        let experience = Experience {
+            content: content.to_string(),
+            experience_type: ExperienceType::Observation,
+            entities: vec!["test".to_string()],
+            ..Default::default()
+        };
+
+        let created_at = Some(chrono::Utc::now() - chrono::Duration::days(60));
+
+        Memory::new(
+            MemoryId(Uuid::new_v4()),
+            experience,
+            importance,
+            None, // agent_id
+            None, // run_id
+            None, // actor_id
+            created_at,
+        )
+    }
+
+    #[test]
+    fn test_compression_pipeline_default() {
+        let pipeline = CompressionPipeline::default();
+        assert!(pipeline.keyword_extractor.stop_words.contains("the"));
+    }
+
+    #[test]
+    fn test_lz4_compress_decompress() {
+        let pipeline = CompressionPipeline::new();
+        let memory = create_test_memory("This is a test memory content for compression", 0.9);
+
+        let compressed = pipeline.compress(&memory).unwrap();
+        assert!(compressed.compressed);
+        assert_eq!(
+            compressed
+                .experience
+                .metadata
+                .get("compression_strategy")
+                .unwrap(),
+            "lz4"
+        );
+
+        let decompressed = pipeline.decompress(&compressed).unwrap();
+        assert!(!decompressed.compressed);
+        assert_eq!(decompressed.experience.content, memory.experience.content);
+    }
+
+    #[test]
+    fn test_already_compressed_memory() {
+        let pipeline = CompressionPipeline::new();
+        let mut memory = create_test_memory("Test content", 0.9);
+        memory.compressed = true;
+
+        let result = pipeline.compress(&memory).unwrap();
+        assert!(result.compressed);
+    }
+
+    #[test]
+    fn test_semantic_compression_lossy() {
+        let pipeline = CompressionPipeline::new();
+        let mut memory = create_test_memory(
+            "This is a long test memory with many words for semantic compression testing purposes",
+            0.1,
+        );
+        memory.created_at = chrono::Utc::now() - chrono::Duration::days(100);
+
+        let compressed = pipeline.compress_semantic(&memory).unwrap();
+        assert!(compressed.compressed);
+        assert!(compressed.experience.metadata.contains_key("keywords"));
+
+        let result = pipeline.decompress(&compressed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("lossy"));
+    }
+
+    #[test]
+    fn test_is_lossless() {
+        let pipeline = CompressionPipeline::new();
+        let memory = create_test_memory("Test content", 0.9);
+
+        assert!(pipeline.is_lossless(&memory));
+
+        let compressed_lz4 = pipeline.compress_lz4(&memory).unwrap();
+        assert!(pipeline.is_lossless(&compressed_lz4));
+
+        let compressed_semantic = pipeline.compress_semantic(&memory).unwrap();
+        assert!(!pipeline.is_lossless(&compressed_semantic));
+    }
+
+    #[test]
+    fn test_get_strategy() {
+        let pipeline = CompressionPipeline::new();
+        let memory = create_test_memory("Test content", 0.9);
+
+        assert!(pipeline.get_strategy(&memory).is_none());
+
+        let compressed = pipeline.compress_lz4(&memory).unwrap();
+        assert_eq!(pipeline.get_strategy(&compressed), Some("lz4"));
+    }
+
+    #[test]
+    fn test_keyword_extraction() {
+        let extractor = KeywordExtractor::new();
+        let text = "Rust programming language memory management ownership borrowing";
+        let keywords = extractor.extract(text);
+
+        assert!(!keywords.is_empty());
+        assert!(keywords.contains(&"rust".to_string()));
+        assert!(keywords.contains(&"memory".to_string()));
+        assert!(!keywords.contains(&"the".to_string()));
+    }
+
+    #[test]
+    fn test_stop_words_filtered() {
+        let extractor = KeywordExtractor::new();
+        let text = "the is at which on and a an as are was were";
+        let keywords = extractor.extract(text);
+
+        assert!(keywords.is_empty());
+    }
+
+    #[test]
+    fn test_semantic_consolidator_empty() {
+        let consolidator = SemanticConsolidator::new();
+        let result = consolidator.consolidate(&[]);
+
+        assert_eq!(result.memories_processed, 0);
+        assert_eq!(result.facts_extracted, 0);
+    }
+
+    #[test]
+    fn test_semantic_consolidator_with_thresholds() {
+        let consolidator = SemanticConsolidator::with_thresholds(2, 7);
+        assert_eq!(consolidator.min_support, 2);
+        assert_eq!(consolidator.min_age_days, 7);
+    }
+
+    #[test]
+    fn test_fact_type_classification() {
+        let consolidator = SemanticConsolidator::new();
+
+        assert_eq!(
+            consolidator.classify_fact("preference: concise code"),
+            FactType::Preference
+        );
+        assert_eq!(
+            consolidator.classify_fact("system can handle 10k requests"),
+            FactType::Capability
+        );
+        assert_eq!(
+            consolidator.classify_fact("auth relates to jwt"),
+            FactType::Relationship
+        );
+        assert_eq!(
+            consolidator.classify_fact("to deploy, run cargo build"),
+            FactType::Procedure
+        );
+        assert_eq!(
+            consolidator.classify_fact("MemoryId is a UUID wrapper"),
+            FactType::Definition
+        );
+    }
+
+    #[test]
+    fn test_reinforce_fact() {
+        let consolidator = SemanticConsolidator::new();
+        let mut fact = SemanticFact {
+            id: "test-fact".to_string(),
+            fact: "test fact content".to_string(),
+            confidence: 0.5,
+            support_count: 1,
+            source_memories: vec![],
+            related_entities: vec![],
+            created_at: chrono::Utc::now(),
+            last_reinforced: chrono::Utc::now() - chrono::Duration::days(10),
+            fact_type: FactType::Pattern,
+        };
+        let memory = create_test_memory("reinforcing memory", 0.7);
+
+        let old_confidence = fact.confidence;
+        consolidator.reinforce_fact(&mut fact, &memory);
+
+        assert!(fact.confidence > old_confidence);
+        assert_eq!(fact.support_count, 2);
+        assert!(fact.source_memories.contains(&memory.id));
+    }
+
+    #[test]
+    fn test_fact_decay_threshold() {
+        let consolidator = SemanticConsolidator::new();
+
+        let recent_fact = SemanticFact {
+            id: "recent".to_string(),
+            fact: "recent fact".to_string(),
+            confidence: 0.8,
+            support_count: 5,
+            source_memories: vec![],
+            related_entities: vec![],
+            created_at: chrono::Utc::now(),
+            last_reinforced: chrono::Utc::now(),
+            fact_type: FactType::Pattern,
+        };
+        assert!(!consolidator.should_decay_fact(&recent_fact));
+
+        let old_fact = SemanticFact {
+            id: "old".to_string(),
+            fact: "old fact".to_string(),
+            confidence: 0.1,
+            support_count: 1,
+            source_memories: vec![],
+            related_entities: vec![],
+            created_at: chrono::Utc::now() - chrono::Duration::days(365),
+            last_reinforced: chrono::Utc::now() - chrono::Duration::days(100),
+            fact_type: FactType::Pattern,
+        };
+        assert!(consolidator.should_decay_fact(&old_fact));
+    }
+
+    #[test]
+    fn test_compression_stats_default() {
+        let stats = CompressionStats::default();
+
+        assert_eq!(stats.total_compressed, 0);
+        assert_eq!(stats.average_compression_ratio, 1.0);
+        assert!(stats.strategies_used.is_empty());
+    }
+
+    #[test]
+    fn test_create_summary() {
+        let pipeline = CompressionPipeline::new();
+        let content = "This is a long piece of content that should be summarized into fewer words";
+        let summary = pipeline.create_summary(content, 5);
+
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() < content.len());
+    }
+
+    #[test]
+    fn test_consolidation_result_default() {
+        let result = ConsolidationResult::default();
+
+        assert_eq!(result.memories_processed, 0);
+        assert_eq!(result.facts_extracted, 0);
+        assert!(result.new_facts.is_empty());
+    }
+
+    #[test]
+    fn test_fact_type_default() {
+        let fact_type = FactType::default();
+        assert_eq!(fact_type, FactType::Pattern);
+    }
+}

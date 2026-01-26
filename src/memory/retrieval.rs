@@ -1929,3 +1929,216 @@ impl AnticipatoryPrefetch {
 }
 
 use chrono::{Datelike, Timelike};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_id_mapping_basic() {
+        let mut mapping = IdMapping::new();
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+
+        mapping.insert(memory_id.clone(), 42);
+
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping.get_memory_id(42), Some(&memory_id));
+    }
+
+    #[test]
+    fn test_id_mapping_chunks() {
+        let mut mapping = IdMapping::new();
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+
+        mapping.insert_chunks(memory_id.clone(), vec![1, 2, 3]);
+
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping.get_memory_id(1), Some(&memory_id));
+        assert_eq!(mapping.get_memory_id(2), Some(&memory_id));
+        assert_eq!(mapping.get_memory_id(3), Some(&memory_id));
+    }
+
+    #[test]
+    fn test_id_mapping_remove_all() {
+        let mut mapping = IdMapping::new();
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+
+        mapping.insert_chunks(memory_id.clone(), vec![1, 2, 3]);
+        let removed = mapping.remove_all(&memory_id);
+
+        assert_eq!(removed.len(), 3);
+        assert_eq!(mapping.len(), 0);
+        assert!(mapping.get_memory_id(1).is_none());
+    }
+
+    #[test]
+    fn test_id_mapping_clear() {
+        let mut mapping = IdMapping::new();
+        mapping.insert(MemoryId(uuid::Uuid::new_v4()), 1);
+        mapping.insert(MemoryId(uuid::Uuid::new_v4()), 2);
+
+        mapping.clear();
+
+        assert_eq!(mapping.len(), 0);
+    }
+
+    #[test]
+    fn test_retrieval_outcome_default() {
+        let outcome = RetrievalOutcome::default();
+        assert_eq!(outcome, RetrievalOutcome::Neutral);
+    }
+
+    #[test]
+    fn test_reinforcement_stats_default() {
+        let stats = ReinforcementStats::default();
+
+        assert_eq!(stats.memories_processed, 0);
+        assert_eq!(stats.associations_strengthened, 0);
+        assert_eq!(stats.importance_boosts, 0);
+        assert_eq!(stats.importance_decays, 0);
+    }
+
+    #[test]
+    fn test_memory_graph_stats_default() {
+        let stats = MemoryGraphStats::default();
+
+        assert_eq!(stats.node_count, 0);
+        assert_eq!(stats.edge_count, 0);
+        assert_eq!(stats.avg_strength, 0.0);
+        assert_eq!(stats.potentiated_count, 0);
+    }
+
+    #[test]
+    fn test_prefetch_context_default() {
+        let ctx = PrefetchContext::default();
+
+        assert!(ctx.project_id.is_none());
+        assert!(ctx.current_file.is_none());
+        assert!(ctx.recent_entities.is_empty());
+    }
+
+    #[test]
+    fn test_prefetch_context_from_current_time() {
+        let ctx = PrefetchContext::from_current_time();
+
+        assert!(ctx.hour_of_day.is_some());
+        assert!(ctx.day_of_week.is_some());
+    }
+
+    #[test]
+    fn test_anticipatory_prefetch_new() {
+        let prefetch = AnticipatoryPrefetch::new();
+        assert_eq!(prefetch.max_prefetch, 20);
+    }
+
+    #[test]
+    fn test_anticipatory_prefetch_with_limit() {
+        let prefetch = AnticipatoryPrefetch::with_limit(50);
+        assert_eq!(prefetch.max_prefetch, 50);
+    }
+
+    #[test]
+    fn test_generate_prefetch_query_project() {
+        let prefetch = AnticipatoryPrefetch::new();
+        let ctx = PrefetchContext {
+            project_id: Some("my-project".to_string()),
+            ..Default::default()
+        };
+
+        let query = prefetch.generate_prefetch_query(&ctx);
+
+        assert!(query.is_some());
+        let query = query.unwrap();
+        assert!(query.query_text.unwrap().contains("my-project"));
+    }
+
+    #[test]
+    fn test_generate_prefetch_query_entities() {
+        let prefetch = AnticipatoryPrefetch::new();
+        let ctx = PrefetchContext {
+            recent_entities: vec!["Rust".to_string(), "memory".to_string()],
+            ..Default::default()
+        };
+
+        let query = prefetch.generate_prefetch_query(&ctx);
+
+        assert!(query.is_some());
+        let query = query.unwrap();
+        let text = query.query_text.unwrap();
+        assert!(text.contains("Rust"));
+        assert!(text.contains("memory"));
+    }
+
+    #[test]
+    fn test_generate_prefetch_query_file() {
+        let prefetch = AnticipatoryPrefetch::new();
+        let ctx = PrefetchContext {
+            current_file: Some("/src/memory/retrieval.rs".to_string()),
+            ..Default::default()
+        };
+
+        let query = prefetch.generate_prefetch_query(&ctx);
+
+        assert!(query.is_some());
+        let query = query.unwrap();
+        assert!(query.query_text.unwrap().contains("retrieval.rs"));
+    }
+
+    #[test]
+    fn test_generate_prefetch_query_temporal() {
+        let prefetch = AnticipatoryPrefetch::new();
+        let ctx = PrefetchContext {
+            hour_of_day: Some(14),
+            day_of_week: Some(1),
+            ..Default::default()
+        };
+
+        let query = prefetch.generate_prefetch_query(&ctx);
+
+        assert!(query.is_some());
+        let query = query.unwrap();
+        assert!(query.time_range.is_some());
+    }
+
+    #[test]
+    fn test_generate_prefetch_query_empty() {
+        let prefetch = AnticipatoryPrefetch::new();
+        let ctx = PrefetchContext::default();
+
+        let query = prefetch.generate_prefetch_query(&ctx);
+
+        assert!(query.is_none());
+    }
+
+    #[test]
+    fn test_prefetch_reason_default() {
+        let reason = PrefetchReason::default();
+        assert!(matches!(reason, PrefetchReason::Mixed));
+    }
+
+    #[test]
+    fn test_prefetch_result_default() {
+        let result = PrefetchResult::default();
+
+        assert!(result.prefetched_ids.is_empty());
+        assert_eq!(result.cache_hits, 0);
+        assert_eq!(result.fetches, 0);
+    }
+
+    #[test]
+    fn test_index_health_struct() {
+        let health = IndexHealth {
+            total_vectors: 1000,
+            incremental_inserts: 100,
+            deleted_count: 50,
+            deletion_ratio: 0.05,
+            needs_rebuild: false,
+            needs_compaction: false,
+            rebuild_threshold: 500,
+            deletion_ratio_threshold: 0.2,
+        };
+
+        assert_eq!(health.total_vectors, 1000);
+        assert!(!health.needs_rebuild);
+    }
+}
