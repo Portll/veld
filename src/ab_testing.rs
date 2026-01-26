@@ -1792,14 +1792,14 @@ mod tests {
     fn test_traffic_split() {
         let mut test = ABTest::builder("test").with_traffic_split(0.5).build();
 
-        let mut control_count = 0;
+        let mut _control_count = 0;
         let mut treatment_count = 0;
 
         // Assign many users
         for i in 0..1000 {
             let user = format!("user_{}", i);
             match test.get_variant(&user) {
-                ABTestVariant::Control => control_count += 1,
+                ABTestVariant::Control => _control_count += 1,
                 ABTestVariant::Treatment => treatment_count += 1,
             }
         }

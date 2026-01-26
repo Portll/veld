@@ -486,7 +486,7 @@ mod tests {
         index.save_to_file(&index_path).unwrap();
 
         // Corrupt the file
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&index_path)

@@ -1641,7 +1641,7 @@ mod tests {
         );
 
         // First memory should score higher with semantic (response embedding matches memory embedding)
-        let (id1, sig1_entity) = &signals_entity_only[0];
+        let (id1, _sig1_entity) = &signals_entity_only[0];
         let (_, sig1_semantic) = &signals_with_semantic[0];
         assert_eq!(id1, &memory_id1);
 

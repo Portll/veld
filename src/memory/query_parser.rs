@@ -3545,7 +3545,7 @@ mod tests {
         let analysis = analyze_query(query);
 
         let positive = analysis.positive_entity_stems();
-        let negated = analysis.negated_entity_stems();
+        let _negated = analysis.negated_entity_stems();
 
         // "memory" should be positive
         assert!(positive.iter().any(|s| s.contains("memori")));

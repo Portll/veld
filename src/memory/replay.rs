@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn test_replay_execution() {
         let mut manager = ReplayManager::new();
-        let now = Utc::now();
+        let _now = Utc::now();
 
         let candidates = vec![ReplayCandidate {
             memory_id: "mem-1".to_string(),
@@ -800,7 +800,7 @@ mod tests {
 
         // Simulate interference history for a "survivor" memory
         // (high interference but maintained high activation)
-        let similar_memories = vec![(
+        let _similar_memories = vec![(
             "survivor-mem".to_string(),
             0.90,
             0.85, // High importance maintained despite interference
