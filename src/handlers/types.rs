@@ -770,3 +770,233 @@ pub struct BrainStats {
 pub struct BuildVisualizationRequest {
     pub user_id: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_health_response_serialize() {
+        let resp = HealthResponse {
+            status: "ok".to_string(),
+            version: "0.1.0".to_string(),
+            uptime_seconds: 1000,
+            memory_mb: 256.5,
+            active_users: 10,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("ok"));
+        assert!(json.contains("0.1.0"));
+    }
+
+    #[test]
+    fn test_record_request_deserialize() {
+        let json = json!({
+            "user_id": "test-user",
+            "content": "test content"
+        });
+        let req: RecordRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.user_id, "test-user");
+        assert_eq!(req.content, "test content");
+        assert!(req.entities.is_empty());
+    }
+
+    #[test]
+    fn test_record_request_with_entities() {
+        let json = json!({
+            "user_id": "test-user",
+            "content": "test content",
+            "experience_type": "Decision",
+            "entities": ["entity1", "entity2"]
+        });
+        let req: RecordRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.entities.len(), 2);
+        assert_eq!(req.experience_type, Some("Decision".to_string()));
+    }
+
+    #[test]
+    fn test_remember_request_defaults() {
+        let json = json!({
+            "user_id": "test-user",
+            "content": "test content"
+        });
+        let req: RememberRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.user_id, "test-user");
+        assert!(req.memory_type.is_none());
+        assert!(req.tags.is_empty());
+        assert!(req.emotional_valence.is_none());
+    }
+
+    #[test]
+    fn test_remember_request_full() {
+        let json = json!({
+            "user_id": "test-user",
+            "content": "test content",
+            "memory_type": "Learning",
+            "tags": ["rust", "memory"],
+            "emotional_valence": 0.5,
+            "emotional_arousal": 0.7,
+            "emotion": "joy",
+            "source_type": "user",
+            "credibility": 0.9,
+            "episode_id": "ep-123",
+            "sequence_number": 5
+        });
+        let req: RememberRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.memory_type, Some("Learning".to_string()));
+        assert_eq!(req.tags.len(), 2);
+        assert_eq!(req.emotional_valence, Some(0.5));
+        assert_eq!(req.episode_id, Some("ep-123".to_string()));
+    }
+
+    #[test]
+    fn test_recall_request_defaults() {
+        let json = json!({
+            "user_id": "test-user",
+            "query": "search query"
+        });
+        let req: RecallRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.user_id, "test-user");
+        assert_eq!(req.query, "search query");
+        assert_eq!(req.limit, 5); // default
+        assert_eq!(req.mode, "hybrid"); // default
+    }
+
+    #[test]
+    fn test_recall_request_custom() {
+        let json = json!({
+            "user_id": "test-user",
+            "query": "search query",
+            "limit": 10,
+            "mode": "semantic"
+        });
+        let req: RecallRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.limit, 10);
+        assert_eq!(req.mode, "semantic");
+    }
+
+    #[test]
+    fn test_recall_response_serialize() {
+        let resp = RecallResponse {
+            memories: vec![],
+            count: 0,
+            retrieval_stats: None,
+            todos: vec![],
+            todo_count: None,
+            facts: vec![],
+            fact_count: None,
+            triggered_reminders: vec![],
+            reminder_count: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("memories"));
+        assert!(json.contains("count"));
+    }
+
+    #[test]
+    fn test_batch_remember_options_default() {
+        let opts = BatchRememberOptions::default();
+        assert!(opts.extract_entities);
+        assert!(opts.create_edges);
+    }
+
+    #[test]
+    fn test_batch_remember_request() {
+        let json = json!({
+            "user_id": "test-user",
+            "memories": [
+                {"content": "memory 1"},
+                {"content": "memory 2", "tags": ["tag1"]}
+            ]
+        });
+        let req: BatchRememberRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.user_id, "test-user");
+        assert_eq!(req.memories.len(), 2);
+    }
+
+    #[test]
+    fn test_upsert_request() {
+        let json = json!({
+            "user_id": "test-user",
+            "external_id": "linear:SHO-123",
+            "content": "issue content"
+        });
+        let req: UpsertRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.external_id, "linear:SHO-123");
+        assert_eq!(req.change_type, "update"); // default
+    }
+
+    #[test]
+    fn test_consolidate_request_defaults() {
+        let json = json!({
+            "user_id": "test-user"
+        });
+        let req: ConsolidateRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.min_support, 2); // default
+        assert_eq!(req.min_age_days, 1); // default
+    }
+
+    #[test]
+    fn test_multimodal_search_request() {
+        let json = json!({
+            "user_id": "test-user",
+            "query_text": "search query",
+            "mode": "hybrid"
+        });
+        let req: MultiModalSearchRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.user_id, "test-user");
+        assert_eq!(req.mode, "hybrid");
+    }
+
+    #[test]
+    fn test_robotics_search_request_defaults() {
+        let json = json!({
+            "user_id": "test-user",
+            "query_text": "search query"
+        });
+        let req: RoboticsSearchRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.limit, 10); // default
+        assert!(!req.include_spatial);
+    }
+
+    #[test]
+    fn test_audit_event_serialize() {
+        let event = AuditEvent {
+            timestamp: chrono::Utc::now(),
+            event_type: "remember".to_string(),
+            memory_id: "mem-123".to_string(),
+            details: "test details".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("remember"));
+    }
+
+    #[test]
+    fn test_memory_event_serialize() {
+        let event = MemoryEvent {
+            event_type: "created".to_string(),
+            timestamp: chrono::Utc::now(),
+            user_id: "user-123".to_string(),
+            memory_id: Some("mem-123".to_string()),
+            content_preview: Some("preview...".to_string()),
+            memory_type: Some("Observation".to_string()),
+            importance: Some(0.8),
+            count: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("created"));
+    }
+
+    #[test]
+    fn test_brain_stats_serialize() {
+        let stats = BrainStats {
+            total_neurons: 100,
+            total_connections: 500,
+            avg_importance: 0.65,
+            memory_by_type: std::collections::HashMap::new(),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains("total_neurons"));
+    }
+}
