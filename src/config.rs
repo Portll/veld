@@ -481,8 +481,10 @@ mod tests {
 
     #[test]
     fn test_cors_with_origins_is_restricted() {
-        let mut cors = CorsConfig::default();
-        cors.allowed_origins = vec!["https://example.com".to_string()];
+        let cors = CorsConfig {
+            allowed_origins: vec!["https://example.com".to_string()],
+            ..Default::default()
+        };
         assert!(cors.is_restricted());
     }
 
@@ -494,8 +496,10 @@ mod tests {
 
     #[test]
     fn test_cors_to_layer_restricted() {
-        let mut cors = CorsConfig::default();
-        cors.allowed_origins = vec!["https://example.com".to_string()];
+        let cors = CorsConfig {
+            allowed_origins: vec!["https://example.com".to_string()],
+            ..Default::default()
+        };
         let _layer = cors.to_layer(); // Should not panic
     }
 }

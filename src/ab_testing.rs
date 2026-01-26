@@ -2475,15 +2475,11 @@ mod tests {
         // Assertions - verify treatment outperforms control
         assert!(
             treatment_clicks >= control_clicks,
-            "Treatment ({} clicks) should outperform Control ({} clicks)",
-            treatment_clicks,
-            control_clicks
+            "Treatment ({treatment_clicks} clicks) should outperform Control ({control_clicks} clicks)"
         );
         assert!(
             treatment_ctr >= control_ctr,
-            "Treatment CTR ({:.1}%) should be >= Control CTR ({:.1}%)",
-            treatment_ctr,
-            control_ctr
+            "Treatment CTR ({treatment_ctr:.1}%) should be >= Control CTR ({control_ctr:.1}%)"
         );
         // Treatment should have better positive/negative ratio
         let control_quality = if control_negative > 0 {
@@ -2498,9 +2494,7 @@ mod tests {
         };
         assert!(
             treatment_quality >= control_quality * 0.9, // Allow 10% tolerance
-            "Treatment quality ratio ({:.2}) should be >= Control ({:.2})",
-            treatment_quality,
-            control_quality
+            "Treatment quality ratio ({treatment_quality:.2}) should be >= Control ({control_quality:.2})"
         );
         assert!(!analysis.insights.is_empty());
     }

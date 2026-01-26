@@ -2741,8 +2741,8 @@ impl GraphMemory {
                     batch.put(key, value);
 
                     // Index both directions
-                    let idx_key_fwd = format!("mem_edge:{}:{}", from_uuid, to_uuid);
-                    let idx_key_rev = format!("mem_edge:{}:{}", to_uuid, from_uuid);
+                    let idx_key_fwd = format!("mem_edge:{from_uuid}:{to_uuid}");
+                    let idx_key_rev = format!("mem_edge:{to_uuid}:{from_uuid}");
                     batch.put(idx_key_fwd.as_bytes(), edge.uuid.as_bytes());
                     batch.put(idx_key_rev.as_bytes(), edge.uuid.as_bytes());
 
@@ -2774,7 +2774,7 @@ impl GraphMemory {
         let mut associations: Vec<(Uuid, f32)> = Vec::new();
 
         // Scan for edges involving this memory
-        let prefix_fwd = format!("mem_edge:{}:", memory_id);
+        let prefix_fwd = format!("mem_edge:{memory_id}:");
 
         let iter = self.relationships_db.prefix_iterator(prefix_fwd.as_bytes());
         for item in iter {
