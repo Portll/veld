@@ -1523,14 +1523,12 @@ impl GraphMemory {
         let results = self.relationships_db.multi_get(&key_refs);
 
         let mut edges = Vec::with_capacity(edge_uuids.len());
-        for result in results.into_iter().flatten() {
-            if let Some(value) = result {
-                if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
-                    edges.push(edge);
-                }
+        for value in results.into_iter().flatten().flatten() {
+            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                edges.push(edge);
             }
         }
 

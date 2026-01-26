@@ -732,9 +732,10 @@ impl MiniLMEmbedder {
 
             for seq_idx in 0..max_length {
                 if attention_masks[attention_offset + seq_idx] == 1 {
-                    for dim_idx in 0..self.dimension {
+                    for (dim_idx, pooled_val) in pooled.iter_mut().enumerate().take(self.dimension)
+                    {
                         let idx = batch_offset + seq_idx * self.dimension + dim_idx;
-                        pooled[dim_idx] += output_data[idx];
+                        *pooled_val += output_data[idx];
                     }
                     mask_sum += 1.0;
                 }

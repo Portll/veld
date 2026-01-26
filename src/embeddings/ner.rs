@@ -525,6 +525,7 @@ impl NeuralNer {
             let mut entities = Vec::new();
             let mut current_entity: Option<(NerTag, Vec<usize>, f32)> = None;
 
+            #[allow(clippy::needless_range_loop)] // Index used for both array access and arithmetic
             for i in 0..seq_len {
                 if i == 0 || batch_attention[i] == 0 {
                     continue;
@@ -659,6 +660,7 @@ impl NeuralNer {
         let mut entities = Vec::new();
         let mut current_entity: Option<(NerTag, Vec<usize>, f32)> = None;
 
+        #[allow(clippy::needless_range_loop)] // Index used for both array access and arithmetic
         for i in 0..seq_len {
             // Skip [CLS] and [SEP] tokens
             if i == 0 || attention[i] == 0 {
