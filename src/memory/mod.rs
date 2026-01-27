@@ -3558,6 +3558,40 @@ impl MemorySystem {
         self.long_term_memory.store(memory)
     }
 
+    /// Set or update the parent of a memory for hierarchical organization
+    ///
+    /// This enables memory trees where memories can have parent-child relationships.
+    /// Example: "71-research" -> "algebraic" -> "21×27≡-1"
+    ///
+    /// Pass `None` as parent_id to remove the parent (make it a root memory).
+    pub fn set_memory_parent(
+        &self,
+        memory_id: &MemoryId,
+        parent_id: Option<MemoryId>,
+    ) -> Result<()> {
+        let mut memory = self.long_term_memory.get(memory_id)?;
+        memory.set_parent(parent_id);
+        self.long_term_memory.store(&memory)
+    }
+
+    /// Get children of a memory
+    pub fn get_memory_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
+        self.long_term_memory.get_children(parent_id)
+    }
+
+    /// Get ancestors (parent chain) of a memory
+    pub fn get_memory_ancestors(&self, memory_id: &MemoryId) -> Result<Vec<Memory>> {
+        self.long_term_memory.get_ancestors(memory_id)
+    }
+
+    /// Get full hierarchy context (ancestors, memory, children)
+    pub fn get_memory_hierarchy(
+        &self,
+        memory_id: &MemoryId,
+    ) -> Result<(Vec<Memory>, Memory, Vec<Memory>)> {
+        self.long_term_memory.get_hierarchy_context(memory_id)
+    }
+
     /// Decompress a memory
     pub fn decompress_memory(&self, memory: &Memory) -> Result<Memory> {
         self.compressor.decompress(memory)

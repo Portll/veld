@@ -56,6 +56,10 @@ pub struct RememberRequest {
     pub parent_agent_id: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Parent memory ID for hierarchical organization
+    /// Use this to create memory trees (e.g., "71-research" -> "algebraic" -> "21×27≡-1")
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// Remember response
@@ -113,6 +117,9 @@ pub struct BatchMemoryItem {
     pub sequence_number: Option<u32>,
     #[serde(default)]
     pub preceding_memory_id: Option<String>,
+    /// Parent memory ID for hierarchical organization
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// Error detail for batch item
@@ -382,6 +389,25 @@ pub async fn remember(
     // Build episodic graph: entities + episode + relationships for multi-hop retrieval
     if let Err(e) = state.process_experience_into_graph(&req.user_id, &experience, &memory_id) {
         tracing::debug!("Graph processing failed (non-fatal): {}", e);
+    }
+
+    // Set parent_id for hierarchical organization
+    if let Some(ref parent_id_str) = req.parent_id {
+        if let Ok(parent_uuid) = uuid::Uuid::parse_str(parent_id_str) {
+            let memory = memory.clone();
+            let memory_id_clone = memory_id.clone();
+            let parent_id = crate::memory::MemoryId(parent_uuid);
+            tokio::task::spawn_blocking(move || {
+                let memory_guard = memory.read();
+                if let Err(e) = memory_guard.set_memory_parent(&memory_id_clone, Some(parent_id)) {
+                    tracing::warn!("Failed to set parent_id: {}", e);
+                }
+            })
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("Parent set task panicked: {e}")))?;
+        } else {
+            tracing::warn!("Invalid parent_id format: {}", parent_id_str);
+        }
     }
 
     // Extract and store temporal facts for multi-hop temporal reasoning
