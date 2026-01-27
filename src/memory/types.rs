@@ -964,6 +964,14 @@ pub struct Memory {
     /// Related todo IDs for bidirectional linking with todo system
     /// Populated when a todo references this memory or vice versa
     pub related_todo_ids: Vec<TodoId>,
+
+    // ==========================================================================
+    // HIERARCHY - Memory trees for structured knowledge
+    // ==========================================================================
+    /// Parent memory ID for hierarchical organization
+    /// Enables tree structures: parent -> children
+    /// Example: "71-research" -> "algebraic relationships" -> "21 × 27 ≡ -1"
+    pub parent_id: Option<MemoryId>,
 }
 
 impl Clone for Memory {
@@ -988,6 +996,7 @@ impl Clone for Memory {
             version: self.version,
             history: self.history.clone(),
             related_todo_ids: self.related_todo_ids.clone(),
+            parent_id: self.parent_id.clone(),
         }
     }
 }
@@ -1032,6 +1041,8 @@ impl Memory {
             history: Vec::new(),
             // Todo system linking - empty by default
             related_todo_ids: Vec::new(),
+            // Hierarchy - no parent by default (root memory)
+            parent_id: None,
         }
     }
 
@@ -1101,6 +1112,8 @@ impl Memory {
             version,
             history,
             related_todo_ids,
+            // Legacy memories don't have hierarchy - default to root
+            parent_id: None,
         }
     }
 
@@ -1388,6 +1401,117 @@ impl Memory {
 
         (base_salience + access_boost).clamp(0.0, 1.0)
     }
+
+    // =========================================================================
+    // HIERARCHY METHODS - For memory trees
+    // =========================================================================
+
+    /// Set the parent memory ID
+    pub fn set_parent(&mut self, parent_id: Option<MemoryId>) {
+        self.parent_id = parent_id;
+    }
+
+    /// Get the parent memory ID
+    pub fn get_parent(&self) -> Option<&MemoryId> {
+        self.parent_id.as_ref()
+    }
+
+    /// Check if this memory has a parent
+    pub fn has_parent(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
+    /// Check if this is a root memory (no parent)
+    pub fn is_root(&self) -> bool {
+        self.parent_id.is_none()
+    }
+}
+
+/// Tree node for memory hierarchy traversal
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTreeNode {
+    /// The memory at this node
+    pub memory: Memory,
+    /// Child nodes
+    pub children: Vec<MemoryTreeNode>,
+    /// Depth in tree (0 = root)
+    pub depth: usize,
+}
+
+impl MemoryTreeNode {
+    /// Create a new tree node with no children
+    pub fn new(memory: Memory, depth: usize) -> Self {
+        Self {
+            memory,
+            children: Vec::new(),
+            depth,
+        }
+    }
+
+    /// Add a child node
+    pub fn add_child(&mut self, child: MemoryTreeNode) {
+        self.children.push(child);
+    }
+
+    /// Get total count of nodes in this subtree (including self)
+    pub fn total_count(&self) -> usize {
+        1 + self.children.iter().map(|c| c.total_count()).sum::<usize>()
+    }
+
+    /// Format as ASCII tree
+    pub fn format_tree(&self) -> String {
+        let mut output = String::new();
+        self.format_tree_recursive(&mut output, "", true);
+        output
+    }
+
+    fn format_tree_recursive(&self, output: &mut String, prefix: &str, is_last: bool) {
+        let connector = if self.depth == 0 {
+            ""
+        } else if is_last {
+            "└── "
+        } else {
+            "├── "
+        };
+
+        // Truncate content for display
+        let content = &self.memory.experience.content;
+        let display_content = if content.len() > 60 {
+            format!("{}...", &content[..57])
+        } else {
+            content.clone()
+        };
+
+        output.push_str(&format!("{}{}{}\n", prefix, connector, display_content));
+
+        let child_prefix = if self.depth == 0 {
+            String::new()
+        } else if is_last {
+            format!("{}    ", prefix)
+        } else {
+            format!("{}│   ", prefix)
+        };
+
+        for (i, child) in self.children.iter().enumerate() {
+            let is_last_child = i == self.children.len() - 1;
+            child.format_tree_recursive(output, &child_prefix, is_last_child);
+        }
+    }
+}
+
+/// Summary of a memory tree (for listing)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTreeSummary {
+    /// Root memory ID
+    pub root_id: MemoryId,
+    /// Root memory content preview
+    pub root_content: String,
+    /// Direct child count
+    pub child_count: usize,
+    /// Total descendant count (all levels)
+    pub total_count: usize,
+    /// Created timestamp of root
+    pub created_at: DateTime<Utc>,
 }
 
 // Custom serialization for Memory to flatten the Arc<Mutex<>> field
@@ -1420,6 +1544,9 @@ struct MemoryFlat {
     // Todo system linking
     #[serde(default)]
     related_todo_ids: Vec<TodoId>,
+    // Hierarchy
+    #[serde(default)]
+    parent_id: Option<MemoryId>,
 }
 
 impl Serialize for Memory {
@@ -1454,6 +1581,8 @@ impl Serialize for Memory {
             history: self.history.clone(),
             // Todo system linking
             related_todo_ids: self.related_todo_ids.clone(),
+            // Hierarchy
+            parent_id: self.parent_id.clone(),
         };
         flat.serialize(serializer)
     }
@@ -1493,6 +1622,8 @@ impl<'de> Deserialize<'de> for Memory {
             history: flat.history,
             // Todo system linking
             related_todo_ids: flat.related_todo_ids,
+            // Hierarchy
+            parent_id: flat.parent_id,
         })
     }
 }
