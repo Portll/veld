@@ -1161,6 +1161,15 @@ impl MemoryStorage {
             batch.put(external_key.as_bytes(), memory.id.0.as_bytes());
         }
 
+        // === Hierarchy Index ===
+        // Index by parent_id for tree queries (list children, build tree)
+        // Key format: parent:{parent_id}:{child_id} -> 1
+        // Enables O(1) lookup of all children for a parent
+        if let Some(ref parent_id) = memory.parent_id {
+            let parent_key = format!("parent:{}:{}", parent_id.0, memory.id.0);
+            batch.put(parent_key.as_bytes(), b"1");
+        }
+
         // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
@@ -1334,6 +1343,12 @@ impl MemoryStorage {
             batch.delete(external_key.as_bytes());
         }
 
+        // Parent index (hierarchy)
+        if let Some(ref parent_id) = memory.parent_id {
+            let parent_key = format!("parent:{}:{}", parent_id.0, id.0);
+            batch.delete(parent_key.as_bytes());
+        }
+
         // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
@@ -1419,6 +1434,14 @@ impl MemoryStorage {
                         .filter(|id| result_sets.iter().all(|set| set.contains(id)))
                         .collect();
                 }
+            }
+
+            // === Hierarchy Criteria ===
+            SearchCriteria::ByParent(parent_id) => {
+                memory_ids = self.search_by_parent(&parent_id)?;
+            }
+            SearchCriteria::RootsOnly => {
+                memory_ids = self.search_roots()?;
             }
         }
 
@@ -1814,6 +1837,126 @@ impl MemoryStorage {
         }
 
         Ok(ids)
+    }
+
+    // =========================================================================
+    // HIERARCHY SEARCH METHODS
+    // =========================================================================
+
+    /// Get all children of a parent memory
+    fn search_by_parent(&self, parent_id: &MemoryId) -> Result<Vec<MemoryId>> {
+        let mut ids = Vec::new();
+        let prefix = format!("parent:{}:", parent_id.0);
+
+        let iter = self.index_db.iterator(IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+
+        for (key, _) in iter.log_errors() {
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            // Key format: parent:{parent_uuid}:{child_uuid}
+            if let Some(child_id_str) = key_str.strip_prefix(&prefix) {
+                if let Ok(uuid) = uuid::Uuid::parse_str(child_id_str) {
+                    ids.push(MemoryId(uuid));
+                }
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// Get all root memories (memories with no parent)
+    fn search_roots(&self) -> Result<Vec<MemoryId>> {
+        let mut roots = Vec::new();
+
+        // Iterate all memories and check for parent_id = None
+        let iter = self.db.iterator(IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if key.len() != 16 {
+                    continue;
+                }
+                if let Ok(memory) = deserialize_memory(&value) {
+                    if memory.parent_id.is_none() {
+                        roots.push(memory.id);
+                    }
+                }
+            }
+        }
+
+        Ok(roots)
+    }
+
+    /// Get children of a memory (public API)
+    pub fn get_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
+        let child_ids = self.search_by_parent(parent_id)?;
+        let mut children = Vec::new();
+        for id in child_ids {
+            if let Ok(memory) = self.get(&id) {
+                children.push(memory);
+            }
+        }
+        Ok(children)
+    }
+
+    /// Get the parent chain (ancestors) of a memory
+    pub fn get_ancestors(&self, memory_id: &MemoryId) -> Result<Vec<Memory>> {
+        let mut ancestors = Vec::new();
+        let mut current_id = memory_id.clone();
+
+        // Walk up the parent chain (max 100 to prevent infinite loops)
+        for _ in 0..100 {
+            let memory = self.get(&current_id)?;
+            if let Some(parent_id) = &memory.parent_id {
+                let parent = self.get(parent_id)?;
+                ancestors.push(parent.clone());
+                current_id = parent_id.clone();
+            } else {
+                break; // Reached root
+            }
+        }
+
+        Ok(ancestors)
+    }
+
+    /// Get the full hierarchy context for a memory
+    /// Returns (ancestors, memory, children)
+    pub fn get_hierarchy_context(
+        &self,
+        memory_id: &MemoryId,
+    ) -> Result<(Vec<Memory>, Memory, Vec<Memory>)> {
+        let memory = self.get(memory_id)?;
+        let ancestors = self.get_ancestors(memory_id)?;
+        let children = self.get_children(memory_id)?;
+        Ok((ancestors, memory, children))
+    }
+
+    /// Get all memories in a subtree rooted at the given memory
+    pub fn get_subtree(&self, root_id: &MemoryId, max_depth: usize) -> Result<Vec<Memory>> {
+        let mut result = Vec::new();
+        let mut queue = vec![(root_id.clone(), 0usize)];
+
+        while let Some((id, depth)) = queue.pop() {
+            if depth > max_depth {
+                continue;
+            }
+            if let Ok(memory) = self.get(&id) {
+                result.push(memory);
+                // Add children to queue
+                if depth < max_depth {
+                    let child_ids = self.search_by_parent(&id)?;
+                    for child_id in child_ids {
+                        queue.push((child_id, depth + 1));
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get all memories from long-term storage
@@ -2314,6 +2457,12 @@ pub enum SearchCriteria {
 
     // === Compound Criteria ===
     Combined(Vec<SearchCriteria>),
+
+    // === Hierarchy Criteria ===
+    /// Filter by parent memory ID - returns all children of a memory
+    ByParent(MemoryId),
+    /// Filter for root memories (no parent)
+    RootsOnly,
 }
 
 /// Storage statistics
