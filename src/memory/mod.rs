@@ -1120,6 +1120,10 @@ impl MemorySystem {
             }
         }
 
+        // Expand with hierarchy context (parent chain + children)
+        // Related memories in hierarchy get a decayed score boost
+        self.expand_with_hierarchy(&mut memories, &mut seen_ids);
+
         // Rank by importance * temporal relevance
         let now = chrono::Utc::now();
         memories.sort_by(|a, b| {
@@ -2659,6 +2663,58 @@ impl MemorySystem {
             8..=30 => 0.7,  // Medium-term: 70% weight
             31..=90 => 0.4, // Old: 40% weight
             _ => 0.2,       // Ancient: 20% weight (never completely forgotten)
+        }
+    }
+
+    /// Expand retrieved memories with their hierarchy context
+    ///
+    /// When a memory is retrieved, its parent chain and children are also
+    /// contextually relevant. This method adds them to the result set with
+    /// slightly boosted importance (hierarchy context is valuable).
+    ///
+    /// Hierarchy expansion depth is limited to prevent explosion:
+    /// - Parents: Full chain up to root (usually shallow)
+    /// - Children: Direct children only (1 level)
+    fn expand_with_hierarchy(
+        &self,
+        memories: &mut Vec<SharedMemory>,
+        seen_ids: &mut HashSet<MemoryId>,
+    ) {
+        // Skip if no memories to expand
+        if memories.is_empty() {
+            return;
+        }
+
+        // Collect IDs to expand (copy to avoid borrow issues)
+        let ids_to_expand: Vec<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
+
+        // Expand each memory with its hierarchy
+        for memory_id in ids_to_expand {
+            // Get parent chain
+            if let Ok(ancestors) = self.long_term_memory.get_ancestors(&memory_id) {
+                for ancestor in ancestors {
+                    if seen_ids.insert(ancestor.id.clone()) {
+                        // Boost ancestor importance slightly (context is valuable)
+                        let new_importance = (ancestor.importance() * 1.1).min(1.0);
+                        let mut shared = Arc::new(ancestor);
+                        Arc::make_mut(&mut shared).set_importance(new_importance);
+                        memories.push(shared);
+                    }
+                }
+            }
+
+            // Get direct children
+            if let Ok(children) = self.long_term_memory.get_children(&memory_id) {
+                for child in children {
+                    if seen_ids.insert(child.id.clone()) {
+                        // Boost child importance slightly
+                        let new_importance = (child.importance() * 1.05).min(1.0);
+                        let mut shared = Arc::new(child);
+                        Arc::make_mut(&mut shared).set_importance(new_importance);
+                        memories.push(shared);
+                    }
+                }
+            }
         }
     }
 
