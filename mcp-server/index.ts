@@ -2942,47 +2942,99 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "read_memory": {
         const { memory_id } = args as { memory_id: string };
 
-        // Use recall with a query that matches the ID to find the memory
-        interface RecallResponse {
-          memories: Array<{
-            id: string;
-            experience: {
-              content: string;
-              memory_type: string;
-              tags?: string[];
-            };
-            importance: number;
-            created_at: string;
-          }>;
-          count: number;
+        // Response includes hierarchy: parent_id in memory, children_ids/children_count
+        interface MemoryWithHierarchy {
+          id: string;
+          experience: {
+            content: string;
+            experience_type: string;
+            entities?: string[];
+          };
+          importance: number;
+          created_at: string;
+          parent_id?: string;
+          children_ids: string[];
+          children_count: number;
         }
 
-        // First try to get memory by searching for its ID
-        const result = await apiCall<RecallResponse>("/api/recall", "POST", {
-          user_id: USER_ID,
-          query: memory_id,
-          limit: 20,
-        });
+        // First try direct lookup by full or partial ID
+        let memory: MemoryWithHierarchy | null = null;
 
-        // Find exact match by ID prefix
-        const memory = result.memories.find(m =>
-          m.id.toLowerCase().startsWith(memory_id.toLowerCase())
-        );
+        // Try direct endpoint first (works with full UUID)
+        try {
+          memory = await apiCall<MemoryWithHierarchy>(
+            `/api/memories/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
+            "GET"
+          );
+        } catch {
+          // If not a full UUID, search by prefix using recall
+          interface RecallResponse {
+            memories: Array<{
+              id: string;
+              experience: {
+                content: string;
+                experience_type: string;
+                entities?: string[];
+              };
+              importance: number;
+              created_at: string;
+              parent_id?: string;
+            }>;
+            count: number;
+          }
+
+          const result = await apiCall<RecallResponse>("/api/recall", "POST", {
+            user_id: USER_ID,
+            query: memory_id,
+            limit: 20,
+          });
+
+          // Find exact match by ID prefix
+          const found = result.memories.find(m =>
+            m.id.toLowerCase().startsWith(memory_id.toLowerCase())
+          );
+
+          if (found) {
+            // Now get full hierarchy info via direct endpoint
+            try {
+              memory = await apiCall<MemoryWithHierarchy>(
+                `/api/memories/${found.id}?user_id=${encodeURIComponent(USER_ID)}`,
+                "GET"
+              );
+            } catch {
+              // Fallback: use found memory without hierarchy
+              memory = {
+                ...found,
+                children_ids: [],
+                children_count: 0,
+              };
+            }
+          }
+        }
 
         if (!memory) {
           return {
-            content: [{ type: "text", text: `❌ Memory not found: ${memory_id}` }],
+            content: [{ type: "text", text: `Memory not found: ${memory_id}` }],
           };
         }
 
-        // Format full memory content
-        const tags = memory.experience.tags?.join(", ") || "none";
+        // Format full memory content with hierarchy info
+        const tags = memory.experience.entities?.join(", ") || "none";
         const created = new Date(memory.created_at).toLocaleString();
 
-        let response = `🐘 Memory: ${memory.id}\n`;
+        let response = `Memory: ${memory.id}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `Type: ${memory.experience.memory_type} │ Tags: ${tags}\n`;
-        response += `Created: ${created} │ Importance: ${(memory.importance * 100).toFixed(0)}%\n`;
+        response += `Type: ${memory.experience.experience_type} | Tags: ${tags}\n`;
+        response += `Created: ${created} | Importance: ${(memory.importance * 100).toFixed(0)}%\n`;
+
+        // Hierarchy info
+        if (memory.parent_id) {
+          response += `Parent: ${memory.parent_id.slice(0, 8)}...\n`;
+        }
+        if (memory.children_count > 0) {
+          response += `Children: ${memory.children_count} (${memory.children_ids.map(id => id.slice(0, 8)).join(", ")})\n`;
+        }
+
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
         response += memory.experience.content;
 

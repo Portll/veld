@@ -21,6 +21,22 @@ use crate::validation;
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 
 // =============================================================================
+// GET MEMORY RESPONSE (with hierarchy)
+// =============================================================================
+
+/// Response for GET /api/memories/{memory_id} - includes hierarchy context
+#[derive(Debug, Serialize)]
+pub struct MemoryWithHierarchy {
+    /// The memory itself (flattened)
+    #[serde(flatten)]
+    pub memory: Memory,
+    /// Children memory IDs (if any)
+    pub children_ids: Vec<String>,
+    /// Number of children
+    pub children_count: usize,
+}
+
+// =============================================================================
 // LIST MEMORIES TYPES
 // =============================================================================
 
@@ -171,12 +187,13 @@ pub struct PatchMemoryRequest {
 // =============================================================================
 
 /// GET /api/memories/{memory_id} - Get specific memory by ID
+/// Returns memory with hierarchy context (parent_id in memory, children_ids in response)
 #[tracing::instrument(skip(state))]
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(memory_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Memory>, AppError> {
+) -> Result<Json<MemoryWithHierarchy>, AppError> {
     let user_id = params
         .get("user_id")
         .ok_or_else(|| AppError::InvalidInput {
@@ -207,7 +224,22 @@ pub async fn get_memory(
         .find(|m| m.id.0 == mem_id)
         .ok_or_else(|| AppError::MemoryNotFound(memory_id.clone()))?;
 
-    Ok(Json((*shared_memory).clone()))
+    let memory_obj = (*shared_memory).clone();
+    let memory_id_obj = MemoryId(mem_id);
+
+    // Fetch children for hierarchy context
+    let children = memory_guard
+        .get_memory_children(&memory_id_obj)
+        .unwrap_or_default();
+
+    let children_ids: Vec<String> = children.iter().map(|c| c.id.0.to_string()).collect();
+    let children_count = children_ids.len();
+
+    Ok(Json(MemoryWithHierarchy {
+        memory: memory_obj,
+        children_ids,
+        children_count,
+    }))
 }
 
 // =============================================================================
