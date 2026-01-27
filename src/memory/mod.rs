@@ -2231,6 +2231,11 @@ impl MemorySystem {
             self.stats.write().total_retrievals = count;
         }
 
+        // Expand with hierarchy context (parent chain + children)
+        // This ensures semantic search also surfaces contextually related memories
+        let mut seen_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
+        self.expand_with_hierarchy(&mut memories, &mut seen_ids);
+
         Ok(memories)
     }
 
