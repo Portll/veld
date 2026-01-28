@@ -91,6 +91,9 @@ pub async fn request_id(mut req: Request, next: Next) -> Response {
     response
 }
 
+/// Slow request warning threshold (seconds)
+const SLOW_REQUEST_THRESHOLD_SECS: f64 = 30.0;
+
 /// P1.3: Middleware to track HTTP request latency and counts
 pub async fn track_metrics(req: Request, next: Next) -> Result<Response, StatusCode> {
     let start = Instant::now();
@@ -102,10 +105,31 @@ pub async fn track_metrics(req: Request, next: Next) -> Result<Response, StatusC
 
     // Record metrics
     let duration = start.elapsed().as_secs_f64();
-    let status = response.status().as_u16().to_string();
+    let status_code = response.status();
+    let status = status_code.as_u16().to_string();
 
     // Normalize path to avoid high cardinality (group dynamic IDs)
     let normalized_path = normalize_path(&path);
+
+    // Log timeouts (408) for observability - helps identify which endpoints need attention
+    if status_code == StatusCode::REQUEST_TIMEOUT {
+        tracing::error!(
+            method = %method,
+            path = %path,
+            normalized_path = %normalized_path,
+            duration_secs = %duration,
+            "Request timeout - endpoint exceeded configured timeout limit"
+        );
+    } else if duration > SLOW_REQUEST_THRESHOLD_SECS {
+        // Log slow requests that haven't timed out yet
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            normalized_path = %normalized_path,
+            duration_secs = %format!("{:.2}", duration),
+            "Slow request - approaching timeout threshold"
+        );
+    }
 
     crate::metrics::HTTP_REQUEST_DURATION
         .with_label_values(&[&method, &normalized_path, &status])

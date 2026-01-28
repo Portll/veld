@@ -6,6 +6,49 @@ use axum::{
 };
 use std::env;
 
+/// Check if running in production mode
+pub fn is_production_mode() -> bool {
+    env::var("SHODH_ENV")
+        .map(|v| v.to_lowercase() == "production" || v.to_lowercase() == "prod")
+        .unwrap_or(false)
+}
+
+/// Log security warnings at startup based on environment configuration
+pub fn log_security_status() {
+    let has_api_keys = env::var("SHODH_API_KEYS")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    let has_dev_key = env::var("SHODH_DEV_API_KEY")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    let is_prod = is_production_mode();
+
+    if is_prod {
+        if has_api_keys {
+            tracing::info!("Running in PRODUCTION mode with API key authentication");
+        } else {
+            tracing::error!(
+                "PRODUCTION mode but SHODH_API_KEYS not set! Server will reject all authenticated requests."
+            );
+        }
+    } else {
+        tracing::warn!("╔════════════════════════════════════════════════════════════════╗");
+        tracing::warn!("║  SECURITY WARNING: Running in DEVELOPMENT mode                 ║");
+        tracing::warn!("║                                                                ║");
+        if has_dev_key {
+            tracing::warn!("║  Using SHODH_DEV_API_KEY for authentication.                  ║");
+            tracing::warn!("║  DO NOT use this configuration in production!                 ║");
+        } else if !has_api_keys {
+            tracing::warn!("║  No API keys configured. Authentication will fail.            ║");
+        }
+        tracing::warn!("║                                                                ║");
+        tracing::warn!("║  For production, set:                                          ║");
+        tracing::warn!("║    SHODH_ENV=production                                        ║");
+        tracing::warn!("║    SHODH_API_KEYS=your-secure-key-1,your-secure-key-2          ║");
+        tracing::warn!("╚════════════════════════════════════════════════════════════════╝");
+    }
+}
+
 /// API Key authentication errors
 #[derive(Debug)]
 pub enum AuthError {

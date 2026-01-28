@@ -227,6 +227,10 @@ pub struct ServerConfig {
     /// Maximum concurrent requests (default: 200)
     pub max_concurrent_requests: usize,
 
+    /// Request timeout in seconds (default: 60)
+    /// Requests exceeding this duration are terminated with 408 status
+    pub request_timeout_secs: u64,
+
     /// Whether running in production mode
     pub is_production: bool,
 
@@ -267,6 +271,7 @@ impl Default for ServerConfig {
             rate_limit_per_second: 4000,
             rate_limit_burst: 8000,
             max_concurrent_requests: 200,
+            request_timeout_secs: 60,
             is_production: false,
             cors: CorsConfig::default(),
             maintenance_interval_secs: 300, // 5 minutes
@@ -349,6 +354,13 @@ impl ServerConfig {
             }
         }
 
+        // Request timeout
+        if let Ok(val) = env::var("SHODH_REQUEST_TIMEOUT") {
+            if let Ok(n) = val.parse() {
+                config.request_timeout_secs = n;
+            }
+        }
+
         // CORS configuration
         config.cors = CorsConfig::from_env();
 
@@ -408,6 +420,7 @@ impl ServerConfig {
             self.rate_limit_per_second, self.rate_limit_burst
         );
         info!("   Max concurrent: {}", self.max_concurrent_requests);
+        info!("   Request timeout: {}s", self.request_timeout_secs);
         info!("   Audit retention: {} days", self.audit_retention_days);
         if self.cors.is_restricted() {
             info!("   CORS origins: {:?}", self.cors.allowed_origins);
@@ -447,6 +460,7 @@ pub fn print_env_help() {
     println!("  SHODH_RATE_LIMIT       - Requests per second (default: 4000)");
     println!("  SHODH_RATE_BURST       - Burst size (default: 8000)");
     println!("  SHODH_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
+    println!("  SHODH_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
     println!("  SHODH_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
     println!("  SHODH_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");
     println!();

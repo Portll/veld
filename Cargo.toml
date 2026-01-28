@@ -81,7 +81,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }  # SSE event streaming (
 futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
 tower_governor = { version = "0.8", features = ["axum"] }
 
 # Serialization

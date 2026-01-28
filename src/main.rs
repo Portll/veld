@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tower::ServiceBuilder;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_http::timeout::TimeoutLayer;
 use tracing::info;
 
 use shodh_memory::{
@@ -166,6 +167,9 @@ async fn main() -> Result<()> {
     // Print startup banner
     print_banner();
 
+    // Log security/authentication status
+    auth::log_security_status();
+
     // Register Prometheus metrics
     metrics::register_metrics().expect("Failed to register metrics");
 
@@ -243,12 +247,17 @@ async fn main() -> Result<()> {
 
     // Combine routes with global middleware
     // Note: Routes already have state from build_public_routes/build_protected_routes
+    let request_timeout = std::time::Duration::from_secs(server_config.request_timeout_secs);
     let app = axum::Router::new()
         .merge(public_routes)
         .merge(protected_routes)
         .layer(
             ServiceBuilder::new()
                 .layer(axum::middleware::from_fn(middleware::track_metrics))
+                .layer(TimeoutLayer::with_status_code(
+                    axum::http::StatusCode::REQUEST_TIMEOUT,
+                    request_timeout,
+                ))
                 .layer(tower::limit::ConcurrencyLimitLayer::new(
                     server_config.max_concurrent_requests,
                 ))
