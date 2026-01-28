@@ -261,16 +261,38 @@ impl MultiUserMemoryManager {
         let user_evictions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let evictions_clone = user_evictions.clone();
         let max_cache = server_config.max_users_in_memory;
+        let eviction_base_path = base_path.clone();
 
         let user_memories = moka::sync::Cache::builder()
             .max_capacity(server_config.max_users_in_memory as u64)
-            .eviction_listener(move |key: Arc<String>, _value, cause| {
+            .eviction_listener(move |key: Arc<String>, value: Arc<parking_lot::RwLock<MemorySystem>>, cause| {
                 if cause == moka::notification::RemovalCause::Size {
                     evictions_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        "Evicted user '{}' from memory cache (LRU, cache_size={})",
-                        key, max_cache
-                    );
+
+                    // Persist vector index before eviction to prevent data loss
+                    let index_path = eviction_base_path.join(key.as_str()).join("vector_index");
+                    if let Some(guard) = value.try_read() {
+                        match guard.save_vector_index(&index_path) {
+                            Ok(()) => {
+                                info!(
+                                    "Evicted user '{}' from memory cache (LRU, cache_size={}) - vector index saved",
+                                    key, max_cache
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Evicted user '{}' from memory cache (LRU) - failed to save vector index: {}",
+                                    key, e
+                                );
+                            }
+                        }
+                    } else {
+                        // Lock contention during eviction - unusual but possible
+                        tracing::warn!(
+                            "Evicted user '{}' from memory cache (LRU) - could not acquire lock to save index",
+                            key
+                        );
+                    }
                 }
             })
             .build();
