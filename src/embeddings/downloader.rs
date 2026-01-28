@@ -148,6 +148,8 @@ pub fn get_onnx_runtime_path() -> Option<PathBuf> {
 pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Verify SHA-256 checksum of a file
+/// Used for model integrity verification when checksum values are provided
+#[allow(dead_code)]
 fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
     let mut file = fs::File::open(path).context("Failed to open file for checksum")?;
     let mut hasher = Sha256::new();

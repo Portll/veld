@@ -13,9 +13,6 @@
 //! - `SHODH_LAZY_LOAD=false` - Load model at startup
 //! - `SHODH_ONNX_THREADS=N` - Set ONNX thread count
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod downloader;

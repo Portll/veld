@@ -442,46 +442,6 @@ impl MiniLMEmbedder {
         })
     }
 
-    /// Tokenize text (simplified implementation)
-    fn tokenize(&self, text: &str) -> Result<Vec<i64>> {
-        // Simplified tokenization - split by whitespace and convert to IDs
-        // In production, this would use the HuggingFace tokenizer
-        let tokens: Vec<i64> = text
-            .split_whitespace()
-            .enumerate()
-            .map(|(i, _)| i as i64 + 1000) // Dummy token IDs
-            .take(self.config.max_length)
-            .collect();
-
-        Ok(tokens)
-    }
-
-    /// Mean pooling with attention mask
-    fn mean_pooling(&self, token_embeddings: &[Vec<f32>], attention_mask: &[i64]) -> Vec<f32> {
-        let _seq_len = token_embeddings.len();
-        let dim = self.dimension;
-        let mut pooled = vec![0.0; dim];
-        let mut mask_sum = 0.0;
-
-        for (i, embedding) in token_embeddings.iter().enumerate() {
-            if i < attention_mask.len() && attention_mask[i] == 1 {
-                for (j, &val) in embedding.iter().enumerate() {
-                    pooled[j] += val;
-                }
-                mask_sum += 1.0;
-            }
-        }
-
-        // Average
-        if mask_sum > 0.0 {
-            for val in &mut pooled {
-                *val /= mask_sum;
-            }
-        }
-
-        pooled
-    }
-
     /// L2 normalize embedding
     /// Returns false if normalization failed (zero norm or NaN detected)
     fn normalize(&self, embedding: &mut [f32]) -> bool {
