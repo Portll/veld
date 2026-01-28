@@ -41,46 +41,70 @@ struct MultiUserMemoryManagerRotationHelper {
 }
 
 impl MultiUserMemoryManagerRotationHelper {
+    /// Rotate audit logs for a user - delete old entries and enforce max count.
+    ///
+    /// Optimized: Keys are `{user_id}:{timestamp_nanos}` so RocksDB returns them
+    /// in timestamp-sorted order. No in-memory sort needed.
     fn rotate_user_audit_logs(&self, user_id: &str) -> Result<usize> {
         let cutoff_time = chrono::Utc::now() - chrono::Duration::days(self.audit_retention_days);
         let cutoff_nanos = cutoff_time.timestamp_nanos_opt().unwrap_or(0);
-
-        let mut events: Vec<(Vec<u8>, AuditEvent, i64)> = Vec::new();
         let prefix = format!("{user_id}:");
 
+        // Pass 1: Count total entries (no deserialization, just key counting)
+        let mut total_count = 0usize;
         let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
-        for (key, value) in iter.flatten() {
+        for (key, _) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with(&prefix) {
+                    break;
+                }
+                total_count += 1;
+            }
+        }
+
+        if total_count == 0 {
+            return Ok(0);
+        }
+
+        // Calculate how many excess entries to delete (beyond max_entries)
+        let excess_count = total_count.saturating_sub(self.audit_max_entries);
+
+        // Pass 2: Collect keys to delete (oldest first due to key ordering)
+        // Delete entries that are: too old OR part of excess count
+        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+        let mut position = 0usize;
+
+        let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
+        for (key, _) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
                     break;
                 }
 
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
-                    let timestamp_nanos = event.timestamp.timestamp_nanos_opt().unwrap_or(0);
-                    events.push((key.to_vec(), event, timestamp_nanos));
+                // Extract timestamp from key: "{user_id}:{timestamp_nanos}"
+                let should_delete = if let Some(ts_str) = key_str.strip_prefix(&prefix) {
+                    if let Ok(timestamp_nanos) = ts_str.parse::<i64>() {
+                        // Delete if: older than cutoff OR in the excess oldest entries
+                        timestamp_nanos < cutoff_nanos || position < excess_count
+                    } else {
+                        // Malformed key - delete it
+                        true
+                    }
+                } else {
+                    false
+                };
+
+                if should_delete {
+                    keys_to_remove.push(key.to_vec());
                 }
+
+                position += 1;
             }
         }
 
-        let initial_count = events.len();
-        let mut removed_count = 0;
+        let removed_count = keys_to_remove.len();
 
-        events.sort_by(|a, b| b.2.cmp(&a.2));
-
-        let mut keys_to_remove = Vec::new();
-
-        for (idx, (key, _event, timestamp_nanos)) in events.iter().enumerate() {
-            let should_remove = *timestamp_nanos < cutoff_nanos || idx >= self.audit_max_entries;
-
-            if should_remove {
-                keys_to_remove.push(key.clone());
-                removed_count += 1;
-            }
-        }
-
+        // Batch delete
         if !keys_to_remove.is_empty() {
             let mut batch = rocksdb::WriteBatch::default();
             for key in &keys_to_remove {
@@ -91,6 +115,7 @@ impl MultiUserMemoryManagerRotationHelper {
                 .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
         }
 
+        // Sync in-memory cache
         if removed_count > 0 {
             if let Some(log) = self.audit_logs.get(user_id) {
                 let mut log_guard = log.write();
@@ -98,7 +123,6 @@ impl MultiUserMemoryManagerRotationHelper {
                 log_guard.retain(|event| {
                     let event_nanos = event.timestamp.timestamp_nanos_opt().unwrap_or(0);
                     event_nanos >= cutoff_nanos
-                        && initial_count - removed_count <= self.audit_max_entries
                 });
 
                 while log_guard.len() > self.audit_max_entries {
