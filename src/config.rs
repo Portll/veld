@@ -116,17 +116,44 @@ impl CorsConfig {
 
         // Configure allowed origins
         if self.allowed_origins.is_empty() {
+            // Intentionally permissive - no origins configured
             layer = layer.allow_origin(Any);
         } else {
-            let origins: Vec<_> = self
-                .allowed_origins
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if origins.is_empty() {
-                layer = layer.allow_origin(Any);
+            // Parse configured origins, tracking failures
+            let mut valid_origins = Vec::new();
+            let mut invalid_origins = Vec::new();
+
+            for origin_str in &self.allowed_origins {
+                match origin_str.parse::<axum::http::HeaderValue>() {
+                    Ok(origin) => valid_origins.push(origin),
+                    Err(_) => invalid_origins.push(origin_str.clone()),
+                }
+            }
+
+            // Log any invalid origins
+            for invalid in &invalid_origins {
+                tracing::warn!("CORS: Invalid origin '{}' - skipping", invalid);
+            }
+
+            if valid_origins.is_empty() {
+                // All configured origins failed to parse - this is a config error
+                // Do NOT fall back to permissive - that would be a security hole
+                tracing::error!(
+                    "CORS: All {} configured origin(s) failed to parse. \
+                     Rejecting all cross-origin requests. Fix SHODH_CORS_ORIGINS.",
+                    self.allowed_origins.len()
+                );
+                // Use an impossible origin to effectively deny all CORS
+                layer = layer.allow_origin(AllowOrigin::list(Vec::<axum::http::HeaderValue>::new()));
             } else {
-                layer = layer.allow_origin(AllowOrigin::list(origins));
+                if !invalid_origins.is_empty() {
+                    tracing::info!(
+                        "CORS: Using {} valid origin(s), {} invalid skipped",
+                        valid_origins.len(),
+                        invalid_origins.len()
+                    );
+                }
+                layer = layer.allow_origin(AllowOrigin::list(valid_origins));
             }
         }
 
