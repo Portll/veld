@@ -339,6 +339,98 @@ curl -X POST http://localhost:3030/api/todos/add \
 | macOS x86_64 (Intel) | Supported |
 | Windows x86_64 | Supported |
 
+## Production Deployment
+
+Shodh-Memory is designed for single-machine deployments where multiple AI agents share a common memory store. For production use:
+
+### Security Model
+
+```
+Internet → Reverse Proxy (TLS + Auth) → Shodh-Memory (localhost:3030)
+```
+
+**TLS/HTTPS**: The server does not handle TLS directly. For network deployments, place it behind a reverse proxy (Nginx, Caddy, Traefik, Cloudflare Tunnel) that handles TLS termination.
+
+**Authentication**: All data endpoints require API key authentication via `X-API-Key` header. Health and metrics endpoints are public for monitoring.
+
+**Network Binding**: By default, the server binds to `127.0.0.1` (localhost only). Set `SHODH_HOST=0.0.0.0` only when behind an authenticated reverse proxy.
+
+### Environment Variables
+
+```bash
+# Required for production
+SHODH_ENV=production              # Enables production mode (stricter validation)
+SHODH_API_KEYS=key1,key2,key3     # Comma-separated API keys
+
+# Optional
+SHODH_HOST=127.0.0.1              # Bind address (default: localhost)
+SHODH_PORT=3030                   # Port (default: 3030)
+SHODH_MEMORY_PATH=/var/lib/shodh  # Data directory
+SHODH_REQUEST_TIMEOUT=60          # Request timeout in seconds
+SHODH_MAX_CONCURRENT=200          # Max concurrent requests
+SHODH_CORS_ORIGINS=https://app.example.com  # Allowed CORS origins
+```
+
+### Example: Nginx Reverse Proxy
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name memory.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/memory.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/memory.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3030;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+### Example: Caddy (Auto-TLS)
+
+```caddyfile
+memory.example.com {
+    reverse_proxy localhost:3030
+}
+```
+
+### Docker Compose (Production)
+
+```yaml
+version: '3.8'
+services:
+  shodh-memory:
+    image: roshera/shodh-memory:latest
+    environment:
+      - SHODH_ENV=production
+      - SHODH_HOST=0.0.0.0
+      - SHODH_API_KEYS=${SHODH_API_KEYS}
+    volumes:
+      - shodh-data:/data
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:latest
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+    networks:
+      - internal
+
+volumes:
+  shodh-data:
+
+networks:
+  internal:
+```
+
 ## Community Implementations
 
 | Project | Description | Author |
