@@ -631,7 +631,10 @@ impl LegacyMemoryV2 {
 /// 1. Current format (with external linking, todos)
 /// 2. Legacy v2 (cognitive extensions, no external linking)
 /// 3. Legacy v1 (original v0.1.0 format)
-fn deserialize_memory(data: &[u8]) -> Result<Memory> {
+///
+/// Returns (Memory, needs_migration) where needs_migration=true means the data
+/// was in a legacy format and should be re-written for future performance.
+fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
     // Check for versioned format: SHO + version byte + payload + 4-byte CRC32
     if data.len() >= 8 && &data[0..3] == STORAGE_MAGIC {
         let version = data[3];
@@ -715,7 +718,10 @@ impl LegacyMemoryFlatV2 {
 
 /// Try deserializing with multiple format fallbacks
 /// Supports bincode 2.x (current), MessagePack, and bincode 1.x (legacy) wire formats
-fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
+///
+/// Returns (Memory, is_legacy) where is_legacy=true means the data was in an old format
+/// and should be re-written to current format for future performance.
+fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     // Log detailed errors for first entry only to help debug format issues
     static DEBUG_ENTRY_LOGGED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -726,7 +732,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
 
     // Try current format first (bincode 2.x with current Memory/Experience)
     match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
-        Ok((memory, _)) => return Ok(memory),
+        Ok((memory, _)) => return Ok((memory, false)), // Current format, no migration needed
         Err(e) => errors.push(("bincode2 Memory", e.to_string())),
     }
 
@@ -735,7 +741,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard()) {
         Ok((minimal, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x minimal format");
-            return Ok(minimal.into_memory());
+            return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 MinimalMemory", e.to_string())),
     }
@@ -748,7 +754,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     ) {
         Ok((typed, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x with type prefix");
-            return Ok(typed.into_memory());
+            return Ok((typed.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 MemoryWithTypePrefix", e.to_string())),
     }
@@ -760,7 +766,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     ) {
         Ok((legacy, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x pre-multimodal format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV2", e.to_string())),
     }
@@ -769,7 +775,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode1::deserialize::<LegacyMemoryV1>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x v0.1.0 format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 LegacyMemoryV1", e.to_string())),
     }
@@ -778,7 +784,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode1::deserialize::<MinimalMemory>(data) {
         Ok(minimal) => {
             tracing::debug!("Migrated memory from bincode 1.x minimal format");
-            return Ok(minimal.into_memory());
+            return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 MinimalMemory", e.to_string())),
     }
@@ -787,7 +793,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode1::deserialize::<SimpleLegacyMemory>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x simple format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 SimpleLegacyMemory", e.to_string())),
     }
@@ -802,7 +808,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match fixint_config.deserialize::<MinimalMemory>(data) {
         Ok(minimal) => {
             tracing::debug!("Migrated memory from bincode 1.x fixint minimal format");
-            return Ok(minimal.into_memory());
+            return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 fixint MinimalMemory", e.to_string())),
     }
@@ -810,7 +816,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match fixint_config.deserialize::<SimpleLegacyMemory>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x fixint simple format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 fixint SimpleLegacyMemory", e.to_string())),
     }
@@ -819,7 +825,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match rmp_serde::from_slice::<MinimalMemory>(data) {
         Ok(minimal) => {
             tracing::debug!("Migrated memory from MessagePack minimal format");
-            return Ok(minimal.into_memory());
+            return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("msgpack MinimalMemory", e.to_string())),
     }
@@ -828,7 +834,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match rmp_serde::from_slice::<SimpleLegacyMemory>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from MessagePack simple format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("msgpack SimpleLegacyMemory", e.to_string())),
     }
@@ -837,7 +843,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode1::deserialize::<LegacyMemoryV1Full>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x v1 full format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 LegacyMemoryV1Full", e.to_string())),
     }
@@ -846,7 +852,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match fixint_config.deserialize::<LegacyMemoryV1Full>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x fixint v1 full format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 fixint LegacyMemoryV1Full", e.to_string())),
     }
@@ -855,7 +861,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match rmp_serde::from_slice::<LegacyMemoryV1Full>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from MessagePack v1 full format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("msgpack LegacyMemoryV1Full", e.to_string())),
     }
@@ -864,7 +870,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode1::deserialize::<LegacyMemoryV1>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(_) => {} // Already tried above
     }
@@ -873,7 +879,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     match bincode1::deserialize::<LegacyMemoryV2>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x v2 format");
-            return Ok(legacy.into_memory());
+            return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 LegacyMemoryV2", e.to_string())),
     }
@@ -886,7 +892,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     ) {
         Ok((mem, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x with 3-byte header");
-            return Ok(mem.into_memory());
+            return Ok((mem.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 MemoryWith3ByteHeader", e.to_string())),
     }
@@ -894,7 +900,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<Memory> {
     // LAST RESORT: Try raw byte parsing with different header skip sizes
     // This handles non-standard formats by finding where valid UTF-8 content starts
     if let Some(memory) = try_raw_memory_parse(data) {
-        return Ok(memory);
+        return Ok((memory, true));
     }
     errors.push(("raw parse", "no valid UTF-8 content found".to_string()));
 
@@ -1046,8 +1052,20 @@ impl MemoryStorage {
             .put_opt(key, &value, &write_opts)
             .context(format!("Failed to put memory {} in RocksDB", memory.id.0))?;
 
-        // Update indices
-        self.update_indices(memory)?;
+        // Update indices - rollback main write on failure for consistency
+        if let Err(e) = self.update_indices(memory) {
+            // Rollback: delete the memory we just wrote
+            if let Err(del_err) = self.db.delete(key) {
+                tracing::error!(
+                    "Index write failed AND rollback failed for memory {}: index_err={}, delete_err={}",
+                    memory.id.0, e, del_err
+                );
+            }
+            return Err(e.context(format!(
+                "Failed to update indices for memory {} (rolled back)",
+                memory.id.0
+            )));
+        }
 
         Ok(())
     }
@@ -1178,18 +1196,52 @@ impl MemoryStorage {
     }
 
     /// Retrieve a memory by ID
+    ///
+    /// Performs lazy migration: if memory is in legacy format, re-writes it
+    /// in current format for faster future reads.
     pub fn get(&self, id: &MemoryId) -> Result<Memory> {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
-            Some(value) => deserialize_memory(&value).with_context(|| {
-                format!(
-                    "Failed to deserialize memory {} ({} bytes)",
-                    id.0,
-                    value.len()
-                )
-            }),
+            Some(value) => {
+                let (memory, needs_migration) =
+                    deserialize_memory(&value).with_context(|| {
+                        format!(
+                            "Failed to deserialize memory {} ({} bytes)",
+                            id.0,
+                            value.len()
+                        )
+                    })?;
+
+                // Lazy migration: re-write legacy formats in current format
+                if needs_migration {
+                    if let Err(e) = self.migrate_memory_format(&memory) {
+                        // Migration failure is non-fatal - log and continue
+                        tracing::debug!(
+                            "Lazy migration skipped for memory {}: {}",
+                            memory.id.0,
+                            e
+                        );
+                    }
+                }
+
+                Ok(memory)
+            }
             None => Err(anyhow!("Memory not found: {id:?}")),
         }
+    }
+
+    /// Re-write a memory in current format (lazy migration helper)
+    fn migrate_memory_format(&self, memory: &Memory) -> Result<()> {
+        let key = memory.id.0.as_bytes();
+        let value = bincode::serde::encode_to_vec(memory, bincode::config::standard())
+            .context("Failed to serialize for migration")?;
+
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(false); // Async is fine for migration
+
+        self.db.put_opt(key, &value, &write_opts)?;
+        tracing::debug!("Migrated memory {} to current format", memory.id.0);
+        Ok(())
     }
 
     /// Find a memory by its external_id (e.g., "linear:SHO-39", "github:pr-123")
@@ -1880,7 +1932,7 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok(memory) = deserialize_memory(&value) {
+                if let Ok((memory, _)) = deserialize_memory(&value) {
                     if memory.parent_id.is_none() {
                         roots.push(memory.id);
                     }
@@ -1973,7 +2025,7 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok(memory) = deserialize_memory(&value) {
+                if let Ok((memory, _)) = deserialize_memory(&value) {
                     memories.push(memory);
                 }
             }
@@ -1993,7 +2045,7 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok(memory) = deserialize_memory(&value) {
+                if let Ok((memory, _)) = deserialize_memory(&value) {
                     if !memory.compressed && memory.created_at < cutoff {
                         memories.push(memory);
                     }
@@ -2019,7 +2071,7 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok(mut memory) = deserialize_memory(&value) {
+                if let Ok((mut memory, _)) = deserialize_memory(&value) {
                     if memory.created_at < cutoff {
                         // Add forgotten flag to metadata
                         memory
@@ -2058,7 +2110,7 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok(mut memory) = deserialize_memory(&value) {
+                if let Ok((mut memory, _)) = deserialize_memory(&value) {
                     if memory.importance() < threshold {
                         memory
                             .experience
@@ -2093,7 +2145,7 @@ impl MemoryStorage {
                 if key.len() != 16 {
                     continue;
                 }
-                if let Ok(memory) = deserialize_memory(&value) {
+                if let Ok((memory, _)) = deserialize_memory(&value) {
                     if regex.is_match(&memory.experience.content) {
                         to_delete.push(key.to_vec());
                         count += 1;
@@ -2152,7 +2204,7 @@ impl MemoryStorage {
                     }
 
                     match deserialize_memory(&value) {
-                        Ok(memory) => {
+                        Ok((memory, _)) => {
                             stats.total_count += 1;
                             stats.total_size_bytes += value.len();
                             if memory.compressed {
@@ -2325,7 +2377,7 @@ impl MemoryStorage {
 
                 // Not current format - try with fallback
                 match deserialize_memory(&value) {
-                    Ok(memory) => {
+                    Ok((memory, _)) => {
                         // Successfully deserialized legacy format - queue for migration
                         to_migrate.push((key.to_vec(), memory));
                     }
@@ -2889,7 +2941,7 @@ impl MemoryStorage {
                 }
 
                 // Try to deserialize as memory
-                if let Ok(memory) = deserialize_memory(&value) {
+                if let Ok((memory, _)) = deserialize_memory(&value) {
                     // Check if vector mapping exists and has text vectors
                     let has_mapping = match self.get_vector_mapping(&memory.id) {
                         Ok(Some(entry)) => entry.text_vectors().is_some_and(|v| !v.is_empty()),
