@@ -144,7 +144,8 @@ impl CorsConfig {
                     self.allowed_origins.len()
                 );
                 // Use an impossible origin to effectively deny all CORS
-                layer = layer.allow_origin(AllowOrigin::list(Vec::<axum::http::HeaderValue>::new()));
+                layer =
+                    layer.allow_origin(AllowOrigin::list(Vec::<axum::http::HeaderValue>::new()));
             } else {
                 if !invalid_origins.is_empty() {
                     tracing::info!(
