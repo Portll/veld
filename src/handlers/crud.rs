@@ -936,6 +936,40 @@ pub async fn clear_all_memories(
 // HELPER FUNCTIONS
 // =============================================================================
 
+/// Resolve a memory ID (full UUID or 8+ char hex prefix) to a concrete Memory.
+///
+/// Used by get/update/delete/patch handlers. Validates the input format,
+/// then searches across all memory tiers via prefix matching.
+fn resolve_memory(
+    memory_guard: &memory::MemorySystem,
+    memory_id_str: &str,
+) -> Result<memory::SharedMemory, AppError> {
+    validation::validate_memory_id_or_prefix(memory_id_str)
+        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
+
+    memory_guard
+        .find_memory_by_prefix(memory_id_str)
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("Ambiguous") {
+                // Parse count from error message "...matches N memories"
+                let count = msg
+                    .rsplit("matches ")
+                    .next()
+                    .and_then(|s| s.split(' ').next())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                AppError::AmbiguousMemoryId {
+                    prefix: memory_id_str.to_string(),
+                    count,
+                }
+            } else {
+                AppError::Internal(e)
+            }
+        })?
+        .ok_or_else(|| AppError::MemoryNotFound(memory_id_str.to_string()))
+}
+
 /// Parse experience type from string
 fn parse_experience_type(type_str: &str) -> Result<ExperienceType, AppError> {
     match type_str.to_lowercase().as_str() {
