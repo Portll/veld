@@ -2633,6 +2633,44 @@ impl MemorySystem {
         Ok(all_memories)
     }
 
+    /// Find a memory by UUID prefix across all tiers.
+    ///
+    /// Accepts both full UUIDs and 8+ char hex prefixes (as displayed by MCP tools).
+    /// Searches working → session → long-term memory with deduplication.
+    /// Returns `Err` for ambiguous prefixes (multiple matches).
+    pub fn find_memory_by_prefix(&self, id_prefix: &str) -> Result<Option<SharedMemory>> {
+        // Fast path: try full UUID first via direct lookup
+        if let Ok(uuid) = uuid::Uuid::parse_str(id_prefix) {
+            let target_id = MemoryId(uuid);
+            let all = self.get_all_memories()?;
+            return Ok(all.into_iter().find(|m| m.id == target_id));
+        }
+
+        // Prefix search across all tiers
+        let prefix_lower = id_prefix.to_lowercase();
+        let all_memories = self.get_all_memories()?;
+        let matches: Vec<SharedMemory> = all_memories
+            .into_iter()
+            .filter(|m| {
+                m.id.0
+                    .to_string()
+                    .replace('-', "")
+                    .to_lowercase()
+                    .starts_with(&prefix_lower)
+            })
+            .collect();
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches.into_iter().next().unwrap())),
+            n => Err(anyhow::anyhow!(
+                "Ambiguous memory ID prefix '{}': matches {} memories",
+                id_prefix,
+                n
+            )),
+        }
+    }
+
     /// Get memories from working memory tier (highest activation, most recent)
     pub fn get_working_memories(&self) -> Vec<SharedMemory> {
         let working = self.working_memory.read();
