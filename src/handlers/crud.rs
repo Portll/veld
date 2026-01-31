@@ -202,34 +202,17 @@ pub async fn get_memory(
         })?;
 
     validation::validate_user_id(user_id).map_validation_err("user_id")?;
-    validation::validate_memory_id(&memory_id)
-        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
 
     let memory = state.get_user_memory(user_id).map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
-    let mem_id =
-        uuid::Uuid::parse_str(&memory_id).map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
-
-    // Search for memory
-    let query = MemoryQuery {
-        max_results: 1000,
-        ..Default::default()
-    };
-
-    let all_memories = memory_guard.recall(&query).map_err(AppError::Internal)?;
-
-    let shared_memory = all_memories
-        .into_iter()
-        .find(|m| m.id.0 == mem_id)
-        .ok_or_else(|| AppError::MemoryNotFound(memory_id.clone()))?;
-
+    let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
     let memory_obj = (*shared_memory).clone();
-    let memory_id_obj = MemoryId(mem_id);
+    let resolved_id = shared_memory.id.clone();
 
     // Fetch children for hierarchy context
     let children = memory_guard
-        .get_memory_children(&memory_id_obj)
+        .get_memory_children(&resolved_id)
         .unwrap_or_default();
 
     let children_ids: Vec<String> = children.iter().map(|c| c.id.0.to_string()).collect();
