@@ -464,25 +464,25 @@ pub async fn delete_memory(
         })?;
 
     validation::validate_user_id(user_id).map_validation_err("user_id")?;
-    validation::validate_memory_id(&memory_id)
-        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
 
     let memory = state.get_user_memory(user_id).map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
-    let uuid =
-        uuid::Uuid::parse_str(&memory_id).map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
+    let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
+    let resolved_id = shared_memory.id.clone();
+    let resolved_id_str = resolved_id.0.to_string();
+
     memory_guard
-        .forget(memory::ForgetCriteria::ById(MemoryId(uuid)))
+        .forget(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
 
-    state.log_event(user_id, "DELETE", &memory_id, "Memory deleted");
+    state.log_event(user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
     state.emit_event(MemoryEvent {
         event_type: "DELETE".to_string(),
         timestamp: chrono::Utc::now(),
         user_id: user_id.to_string(),
-        memory_id: Some(memory_id.clone()),
+        memory_id: Some(resolved_id_str.clone()),
         content_preview: None,
         memory_type: None,
         importance: None,
@@ -491,7 +491,7 @@ pub async fn delete_memory(
 
     Ok(Json(DeleteMemoryResponse {
         success: true,
-        id: memory_id,
+        id: resolved_id_str,
         message: "Memory deleted successfully".to_string(),
     }))
 }
