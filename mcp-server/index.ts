@@ -2957,59 +2957,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           children_count: number;
         }
 
-        // First try direct lookup by full or partial ID
+        // Backend accepts both full UUIDs and 8+ char hex prefixes
         let memory: MemoryWithHierarchy | null = null;
 
-        // Try direct endpoint first (works with full UUID)
         try {
           memory = await apiCall<MemoryWithHierarchy>(
-            `/api/memories/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
+            `/api/memory/${memory_id}?user_id=${encodeURIComponent(USER_ID)}`,
             "GET"
           );
         } catch {
-          // If not a full UUID, search by prefix using recall
-          interface RecallResponse {
-            memories: Array<{
-              id: string;
-              experience: {
-                content: string;
-                experience_type: string;
-                entities?: string[];
-              };
-              importance: number;
-              created_at: string;
-              parent_id?: string;
-            }>;
-            count: number;
-          }
-
-          const result = await apiCall<RecallResponse>("/api/recall", "POST", {
-            user_id: USER_ID,
-            query: memory_id,
-            limit: 20,
-          });
-
-          // Find exact match by ID prefix
-          const found = result.memories.find(m =>
-            m.id.toLowerCase().startsWith(memory_id.toLowerCase())
-          );
-
-          if (found) {
-            // Now get full hierarchy info via direct endpoint
-            try {
-              memory = await apiCall<MemoryWithHierarchy>(
-                `/api/memories/${found.id}?user_id=${encodeURIComponent(USER_ID)}`,
-                "GET"
-              );
-            } catch {
-              // Fallback: use found memory without hierarchy
-              memory = {
-                ...found,
-                children_ids: [],
-                children_count: 0,
-              };
-            }
-          }
+          // Not found or invalid prefix
         }
 
         if (!memory) {
