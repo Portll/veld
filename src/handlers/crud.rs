@@ -14,7 +14,7 @@ use tracing::info;
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{self, ExperienceType, Memory, MemoryId, Query as MemoryQuery};
+use crate::memory::{self, ExperienceType, Memory};
 use crate::validation;
 
 /// Application state type alias
@@ -386,8 +386,6 @@ pub async fn update_memory(
     Json(req): Json<UpdateMemoryRequest>,
 ) -> Result<Json<UpdateMemoryResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    validation::validate_memory_id(&memory_id)
-        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
 
     if let Some(ref emb) = req.embeddings {
@@ -401,22 +399,7 @@ pub async fn update_memory(
 
     let memory_guard = memory.read();
 
-    let mem_id =
-        uuid::Uuid::parse_str(&memory_id).map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
-
-    // Get current memory to preserve metadata
-    let query = MemoryQuery {
-        max_results: 1000,
-        ..Default::default()
-    };
-
-    let all_memories = memory_guard.recall(&query).map_err(AppError::Internal)?;
-
-    let shared_memory = all_memories
-        .into_iter()
-        .find(|m| m.id.0 == mem_id)
-        .ok_or_else(|| AppError::MemoryNotFound(memory_id.clone()))?;
-
+    let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
     let mut current_memory = (*shared_memory).clone();
 
     let content_preview: String = req.content.chars().take(50).collect();
@@ -508,8 +491,6 @@ pub async fn patch_memory(
     Json(req): Json<PatchMemoryRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    validation::validate_memory_id(&memory_id)
-        .map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
 
     let memory = state
         .get_user_memory(&req.user_id)
@@ -517,21 +498,7 @@ pub async fn patch_memory(
 
     let memory_guard = memory.read();
 
-    let mem_id =
-        uuid::Uuid::parse_str(&memory_id).map_err(|e| AppError::InvalidMemoryId(e.to_string()))?;
-
-    let query = MemoryQuery {
-        max_results: 1000,
-        ..Default::default()
-    };
-
-    let all_memories = memory_guard.recall(&query).map_err(AppError::Internal)?;
-
-    let shared_memory = all_memories
-        .into_iter()
-        .find(|m| m.id.0 == mem_id)
-        .ok_or_else(|| AppError::MemoryNotFound(memory_id.clone()))?;
-
+    let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
     let mut current_memory = (*shared_memory).clone();
     let mut changes = Vec::new();
 
