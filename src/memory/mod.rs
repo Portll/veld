@@ -3672,7 +3672,12 @@ impl MemorySystem {
         if let Some(graph) = &self.graph_memory {
             match graph.write().clear_all() {
                 Ok((entities, relationships, episodes)) => {
-                    tracing::info!(entities, relationships, episodes, "Graph cleared during forget_all");
+                    tracing::info!(
+                        entities,
+                        relationships,
+                        episodes,
+                        "Graph cleared during forget_all"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to clear knowledge graph during forget_all");

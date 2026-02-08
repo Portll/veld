@@ -1785,7 +1785,12 @@ impl GraphMemory {
         self.relationship_count.store(0, Ordering::Relaxed);
         self.episode_count.store(0, Ordering::Relaxed);
 
-        tracing::info!("Graph data cleared (GDPR erasure): {} entities, {} relationships, {} episodes", entity_count, relationship_count, episode_count);
+        tracing::info!(
+            "Graph data cleared (GDPR erasure): {} entities, {} relationships, {} episodes",
+            entity_count,
+            relationship_count,
+            episode_count
+        );
         Ok((entity_count, relationship_count, episode_count))
     }
 
@@ -3094,7 +3099,6 @@ impl GraphMemory {
             episode_count: self.episode_count.load(Ordering::Relaxed),
         })
     }
-
 
     /// Get all entities in the graph
     pub fn get_all_entities(&self) -> Result<Vec<EntityNode>> {
