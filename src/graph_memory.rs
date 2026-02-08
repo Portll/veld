@@ -1691,6 +1691,61 @@ impl GraphMemory {
         Ok(true)
     }
 
+    /// Delete an episode and clean up associated indices and orphan edges
+    ///
+    /// When a memory is deleted, its corresponding episode should also be removed.
+    /// This method:
+    /// 1. Removes the episode from the episodes DB
+    /// 2. Removes entity_episodes index entries
+    /// 3. Deletes relationship edges that were sourced from this episode
+    pub fn delete_episode(&self, episode_uuid: &Uuid) -> Result<bool> {
+        // Fetch episode to get entity_refs for index cleanup
+        let episode = match self.get_episode(episode_uuid)? {
+            Some(ep) => ep,
+            None => return Ok(false),
+        };
+
+        // Delete episode from main storage
+        self.episodes_db.delete(episode_uuid.as_bytes())?;
+        self.episode_count.fetch_sub(1, Ordering::Relaxed);
+
+        // Remove from entity_episodes inverted index
+        for entity_uuid in &episode.entity_refs {
+            let key = format!("{entity_uuid}:{episode_uuid}");
+            let _ = self.entity_episodes_db.delete(key.as_bytes());
+        }
+
+        // Delete edges sourced from this episode
+        // Scan all relationships for matching source_episode_id
+        let iter = self.relationships_db.iterator(rocksdb::IteratorMode::Start);
+        let mut edges_to_delete = Vec::new();
+        for (_, value) in iter.flatten() {
+            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                if edge.source_episode_id == Some(*episode_uuid) {
+                    edges_to_delete.push(edge.uuid);
+                }
+            }
+        }
+
+        for edge_uuid in &edges_to_delete {
+            if let Err(e) = self.delete_relationship(edge_uuid) {
+                tracing::debug!("Failed to delete orphan edge {}: {}", edge_uuid, e);
+            }
+        }
+
+        tracing::debug!(
+            "Deleted episode {} with {} entity_refs and {} sourced edges",
+            &episode_uuid.to_string()[..8],
+            episode.entity_refs.len(),
+            edges_to_delete.len()
+        );
+
+        Ok(true)
+    }
+
     /// Add an episodic node
     pub fn add_episode(&self, episode: EpisodicNode) -> Result<Uuid> {
         let key = episode.uuid.as_bytes();
