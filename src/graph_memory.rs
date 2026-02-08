@@ -1746,6 +1746,49 @@ impl GraphMemory {
         Ok(true)
     }
 
+    /// Clear all graph data (GDPR full erasure)
+    ///
+    /// Wipes all entities, relationships, episodes, and all indices.
+    /// Resets all counters to zero.
+    /// Returns (entity_count, relationship_count, episode_count) that were cleared.
+    pub fn clear_all(&self) -> Result<(usize, usize, usize)> {
+        let entity_count = self.entity_count.load(Ordering::Relaxed);
+        let relationship_count = self.relationship_count.load(Ordering::Relaxed);
+        let episode_count = self.episode_count.load(Ordering::Relaxed);
+
+        // Clear each DB by iterating and batch-deleting
+        for db in [
+            &self.entities_db,
+            &self.relationships_db,
+            &self.episodes_db,
+            &self.entity_edges_db,
+            &self.entity_episodes_db,
+            &self.entity_name_index_db,
+            &self.entity_lowercase_index_db,
+            &self.entity_stemmed_index_db,
+        ] {
+            let mut batch = rocksdb::WriteBatch::default();
+            let iter = db.iterator(rocksdb::IteratorMode::Start);
+            for (key, _) in iter.flatten() {
+                batch.delete(&key);
+            }
+            db.write(batch)?;
+        }
+
+        // Clear in-memory indices
+        self.entity_name_index.write().clear();
+        self.entity_lowercase_index.write().clear();
+        self.entity_stemmed_index.write().clear();
+
+        // Reset counters
+        self.entity_count.store(0, Ordering::Relaxed);
+        self.relationship_count.store(0, Ordering::Relaxed);
+        self.episode_count.store(0, Ordering::Relaxed);
+
+        tracing::info!("Graph data cleared (GDPR erasure): {} entities, {} relationships, {} episodes", entity_count, relationship_count, episode_count);
+        Ok((entity_count, relationship_count, episode_count))
+    }
+
     /// Add an episodic node
     pub fn add_episode(&self, episode: EpisodicNode) -> Result<Uuid> {
         let key = episode.uuid.as_bytes();
@@ -3052,114 +3095,6 @@ impl GraphMemory {
         })
     }
 
-    /// Clear all graph data (entities, relationships, episodes)
-    /// Returns the number of items cleared (entities, relationships, episodes)
-    pub fn clear_all(&self) -> Result<(usize, usize, usize)> {
-        let entity_count = self.entity_count.load(Ordering::Relaxed);
-        let relationship_count = self.relationship_count.load(Ordering::Relaxed);
-        let episode_count = self.episode_count.load(Ordering::Relaxed);
-
-        // Clear all databases by iterating and deleting
-        // Entities
-        let keys: Vec<_> = self
-            .entities_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.entities_db.delete(key)?;
-        }
-
-        // Relationships
-        let keys: Vec<_> = self
-            .relationships_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.relationships_db.delete(key)?;
-        }
-
-        // Episodes
-        let keys: Vec<_> = self
-            .episodes_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.episodes_db.delete(key)?;
-        }
-
-        // Entity edges index
-        let keys: Vec<_> = self
-            .entity_edges_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.entity_edges_db.delete(key)?;
-        }
-
-        // Entity episodes index
-        let keys: Vec<_> = self
-            .entity_episodes_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.entity_episodes_db.delete(key)?;
-        }
-
-        // Entity name index
-        let keys: Vec<_> = self
-            .entity_name_index_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.entity_name_index_db.delete(key)?;
-        }
-
-        // Entity lowercase index
-        let keys: Vec<_> = self
-            .entity_lowercase_index_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.entity_lowercase_index_db.delete(key)?;
-        }
-
-        // Entity stemmed index
-        let keys: Vec<_> = self
-            .entity_stemmed_index_db
-            .iterator(rocksdb::IteratorMode::Start)
-            .flatten()
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        for key in &keys {
-            self.entity_stemmed_index_db.delete(key)?;
-        }
-
-        // Reset in-memory indexes
-        self.entity_name_index.write().clear();
-        self.entity_lowercase_index.write().clear();
-        self.entity_stemmed_index.write().clear();
-
-        // Reset counters
-        self.entity_count.store(0, Ordering::Relaxed);
-        self.relationship_count.store(0, Ordering::Relaxed);
-        self.episode_count.store(0, Ordering::Relaxed);
-
-        Ok((entity_count, relationship_count, episode_count))
-    }
 
     /// Get all entities in the graph
     pub fn get_all_entities(&self) -> Result<Vec<EntityNode>> {

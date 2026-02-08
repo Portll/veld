@@ -668,7 +668,7 @@ impl MemorySystem {
                         created_at: now,
                         valid_at: now,
                         invalidated_at: None,
-                        source_episode_id: None,
+                        source_episode_id: Some(memory.id.0),
                         context: edge_context.clone(),
                         last_activated: now,
                         activation_count: 1,
@@ -1020,7 +1020,7 @@ impl MemorySystem {
                         created_at: now,
                         valid_at: now,
                         invalidated_at: None,
-                        source_episode_id: None,
+                        source_episode_id: Some(memory.id.0),
                         context: edge_context.clone(),
                         last_activated: now,
                         activation_count: 1,
@@ -3253,6 +3253,21 @@ impl MemorySystem {
         }
     }
 
+    /// Clean up graph episodes for a batch of deleted memory IDs (best-effort)
+    fn cleanup_graph_for_ids(&self, ids: &[MemoryId]) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(graph) = &self.graph_memory {
+            let graph_guard = graph.write();
+            for id in ids {
+                if let Err(e) = graph_guard.delete_episode(&id.0) {
+                    tracing::debug!("Graph cleanup failed for {}: {}", &id.0.to_string()[..8], e);
+                }
+            }
+        }
+    }
+
     /// Forget memories matching a pattern
     ///
     /// Uses validated regex compilation with ReDoS protection
@@ -3311,14 +3326,24 @@ impl MemorySystem {
 
         // Remove from long-term memory
         let all_lt = self.long_term_memory.get_all()?;
+        let mut lt_ids = Vec::new();
         for memory in all_lt {
             if regex.is_match(&memory.experience.content) {
+                lt_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
                 long_term_removed += 1;
                 count += 1;
             }
         }
+
+        // Clean up graph episodes for all deleted memories
+        let all_ids: Vec<MemoryId> = working_ids
+            .into_iter()
+            .chain(session_ids)
+            .chain(lt_ids)
+            .collect();
+        self.cleanup_graph_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3341,6 +3366,7 @@ impl MemorySystem {
         let mut working_removed = 0;
         let mut session_removed = 0;
         let mut long_term_removed = 0;
+        let mut all_deleted_ids = Vec::new();
 
         // Remove from working memory
         {
@@ -3358,6 +3384,7 @@ impl MemorySystem {
                     count += 1;
                 }
             }
+            all_deleted_ids.extend(ids_to_remove);
         }
 
         // Remove from session memory
@@ -3376,18 +3403,23 @@ impl MemorySystem {
                     count += 1;
                 }
             }
+            all_deleted_ids.extend(ids_to_remove);
         }
 
         // Remove from long-term memory (hard delete for tag-based)
         let all_lt = self.long_term_memory.get_all()?;
         for memory in all_lt {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
+                all_deleted_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
                 long_term_removed += 1;
                 count += 1;
             }
         }
+
+        // Clean up graph episodes for all deleted memories
+        self.cleanup_graph_for_ids(&all_deleted_ids);
 
         // Update stats
         {
@@ -3415,16 +3447,20 @@ impl MemorySystem {
         let mut session_removed = 0;
         let mut long_term_removed = 0;
 
-        // Remove from working memory
-        {
-            let mut working = self.working_memory.write();
-            let ids_to_remove: Vec<MemoryId> = working
+        // Collect IDs from working memory that match date range
+        let working_ids: Vec<MemoryId> = {
+            let working = self.working_memory.read();
+            working
                 .all_memories()
                 .iter()
                 .filter(|m| m.created_at >= start && m.created_at <= end)
                 .map(|m| m.id.clone())
-                .collect();
-            for id in &ids_to_remove {
+                .collect()
+        };
+        // Remove from working memory and vector index
+        {
+            let mut working = self.working_memory.write();
+            for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
                     working_removed += 1;
@@ -3433,16 +3469,20 @@ impl MemorySystem {
             }
         }
 
-        // Remove from session memory
-        {
-            let mut session = self.session_memory.write();
-            let ids_to_remove: Vec<MemoryId> = session
+        // Collect IDs from session memory that match date range
+        let session_ids: Vec<MemoryId> = {
+            let session = self.session_memory.read();
+            session
                 .all_memories()
                 .iter()
                 .filter(|m| m.created_at >= start && m.created_at <= end)
                 .map(|m| m.id.clone())
-                .collect();
-            for id in &ids_to_remove {
+                .collect()
+        };
+        // Remove from session memory and vector index
+        {
+            let mut session = self.session_memory.write();
+            for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
                     session_removed += 1;
@@ -3455,12 +3495,22 @@ impl MemorySystem {
         let memories = self
             .long_term_memory
             .search(storage::SearchCriteria::ByDate { start, end })?;
+        let mut lt_ids = Vec::new();
         for memory in memories {
+            lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
             long_term_removed += 1;
             count += 1;
         }
+
+        // Clean up graph episodes for all deleted memories
+        let all_ids: Vec<MemoryId> = working_ids
+            .into_iter()
+            .chain(session_ids)
+            .chain(lt_ids)
+            .collect();
+        self.cleanup_graph_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3484,16 +3534,20 @@ impl MemorySystem {
         let mut session_removed = 0;
         let mut long_term_removed = 0;
 
-        // Remove from working memory
-        {
-            let mut working = self.working_memory.write();
-            let ids_to_remove: Vec<MemoryId> = working
+        // Collect IDs from working memory that match type
+        let working_ids: Vec<MemoryId> = {
+            let working = self.working_memory.read();
+            working
                 .all_memories()
                 .iter()
                 .filter(|m| m.experience.experience_type == exp_type)
                 .map(|m| m.id.clone())
-                .collect();
-            for id in &ids_to_remove {
+                .collect()
+        };
+        // Remove from working memory and vector index
+        {
+            let mut working = self.working_memory.write();
+            for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
                     working_removed += 1;
@@ -3502,16 +3556,20 @@ impl MemorySystem {
             }
         }
 
-        // Remove from session memory
-        {
-            let mut session = self.session_memory.write();
-            let ids_to_remove: Vec<MemoryId> = session
+        // Collect IDs from session memory that match type
+        let session_ids: Vec<MemoryId> = {
+            let session = self.session_memory.read();
+            session
                 .all_memories()
                 .iter()
                 .filter(|m| m.experience.experience_type == exp_type)
                 .map(|m| m.id.clone())
-                .collect();
-            for id in &ids_to_remove {
+                .collect()
+        };
+        // Remove from session memory and vector index
+        {
+            let mut session = self.session_memory.write();
+            for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
                     session_removed += 1;
@@ -3524,12 +3582,22 @@ impl MemorySystem {
         let memories = self
             .long_term_memory
             .search(storage::SearchCriteria::ByType(exp_type))?;
+        let mut lt_ids = Vec::new();
         for memory in memories {
+            lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
             long_term_removed += 1;
             count += 1;
         }
+
+        // Clean up graph episodes for all deleted memories
+        let all_ids: Vec<MemoryId> = working_ids
+            .into_iter()
+            .chain(session_ids)
+            .chain(lt_ids)
+            .collect();
+        self.cleanup_graph_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3599,6 +3667,18 @@ impl MemorySystem {
             self.long_term_memory.delete(&memory.id)?;
         }
         count += long_term_count;
+
+        // Clear entire knowledge graph (GDPR - complete erasure)
+        if let Some(graph) = &self.graph_memory {
+            match graph.write().clear_all() {
+                Ok((entities, relationships, episodes)) => {
+                    tracing::info!(entities, relationships, episodes, "Graph cleared during forget_all");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to clear knowledge graph during forget_all");
+                }
+            }
+        }
 
         // Reset all stats to zero
         {
