@@ -1103,30 +1103,30 @@ pub const IC_VERB: f32 = 1.0;
 
 /// Graceful shutdown timeout in seconds
 ///
-/// Maximum time to wait for active requests to drain.
+/// Maximum time to wait for the full graceful shutdown sequence.
 ///
 /// Justification:
-/// - 30 seconds allows long-running requests to complete
-/// - Beyond this, force shutdown to avoid hanging
-pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+/// - 120 seconds accommodates drain (5s) + flush (30s) + vector save (60s)
+/// - Overall budget prevents indefinite hangs even if individual phases stall
+pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
 
 /// Database flush timeout in seconds
 ///
 /// Maximum time to wait for RocksDB flush on shutdown.
 ///
 /// Justification:
-/// - 10 seconds is sufficient for typical write buffers
+/// - 30 seconds accommodates large write buffers and multiple per-user DBs
 /// - Prevents data loss on clean shutdown
-pub const DATABASE_FLUSH_TIMEOUT_SECS: u64 = 10;
+pub const DATABASE_FLUSH_TIMEOUT_SECS: u64 = 30;
 
 /// Vector index save timeout in seconds
 ///
 /// Maximum time to wait for HNSW index persistence.
 ///
 /// Justification:
-/// - 10 seconds handles typical index sizes
-/// - Large indices may need longer, but startup rebuild is fallback
-pub const VECTOR_INDEX_SAVE_TIMEOUT_SECS: u64 = 10;
+/// - 60 seconds handles large indices (100K+ vectors)
+/// - Startup rebuild is fallback if save is interrupted
+pub const VECTOR_INDEX_SAVE_TIMEOUT_SECS: u64 = 60;
 
 // =============================================================================
 // COMPRESSION SAFETY LIMITS

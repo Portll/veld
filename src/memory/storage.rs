@@ -2057,24 +2057,20 @@ impl MemoryStorage {
         Ok(memories)
     }
 
-    /// Mark memories as forgotten (soft delete) with durable writes
+    /// Mark memories as forgotten (soft delete) with atomic batch write
     pub fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        let mut batch = rocksdb::WriteBatch::default();
         let mut count = 0;
-
-        // DURABILITY: Sync write for data integrity
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
+        let now = Utc::now().to_rfc3339();
 
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
             if let Ok((key, value)) = item {
-                // Only process valid 16-byte UUID keys
                 if key.len() != 16 {
                     continue;
                 }
                 if let Ok((mut memory, _)) = deserialize_memory(&value) {
                     if memory.created_at < cutoff {
-                        // Add forgotten flag to metadata
                         memory
                             .experience
                             .metadata
@@ -2082,32 +2078,35 @@ impl MemoryStorage {
                         memory
                             .experience
                             .metadata
-                            .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
+                            .insert("forgotten_at".to_string(), now.clone());
 
                         let updated_value =
                             bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
-                        self.db.put_opt(&key, updated_value, &write_opts)?;
+                        batch.put(&key, updated_value);
                         count += 1;
                     }
                 }
             }
         }
 
+        if count > 0 {
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(true);
+            self.db.write_opt(batch, &write_opts)?;
+        }
+
         Ok(count)
     }
 
-    /// Mark memories with low importance as forgotten with durable writes
+    /// Mark memories with low importance as forgotten with atomic batch write
     pub fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<usize> {
+        let mut batch = rocksdb::WriteBatch::default();
         let mut count = 0;
-
-        // DURABILITY: Sync write for data integrity
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
+        let now = Utc::now().to_rfc3339();
 
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
             if let Ok((key, value)) = item {
-                // Only process valid 16-byte UUID keys
                 if key.len() != 16 {
                     continue;
                 }
@@ -2120,15 +2119,21 @@ impl MemoryStorage {
                         memory
                             .experience
                             .metadata
-                            .insert("forgotten_at".to_string(), Utc::now().to_rfc3339());
+                            .insert("forgotten_at".to_string(), now.clone());
 
                         let updated_value =
                             bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
-                        self.db.put_opt(&key, updated_value, &write_opts)?;
+                        batch.put(&key, updated_value);
                         count += 1;
                     }
                 }
             }
+        }
+
+        if count > 0 {
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(true);
+            self.db.write_opt(batch, &write_opts)?;
         }
 
         Ok(count)

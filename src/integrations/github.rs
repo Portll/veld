@@ -240,8 +240,8 @@ impl GitHubWebhook {
         let secret = match &self.webhook_secret {
             Some(s) => s,
             None => {
-                tracing::warn!("No webhook secret configured, skipping signature verification");
-                return Ok(true);
+                tracing::warn!("No webhook secret configured, rejecting webhook");
+                return Ok(false);
             }
         };
 

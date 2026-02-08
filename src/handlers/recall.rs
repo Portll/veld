@@ -266,6 +266,7 @@ pub async fn recall(
 ) -> Result<Json<RecallResponse>, AppError> {
     let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_max_results(req.limit).map_validation_err("limit")?;
 
     let memory = state
         .get_user_memory(&req.user_id)
@@ -593,6 +594,7 @@ pub async fn context_summary(
     Json(req): Json<ContextSummaryRequest>,
 ) -> Result<Json<ContextSummaryResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_max_results(req.max_items).map_validation_err("max_items")?;
 
     let memory = state
         .get_user_memory(&req.user_id)
@@ -680,6 +682,7 @@ pub async fn proactive_context(
     Json(req): Json<ProactiveContextRequest>,
 ) -> Result<Json<ProactiveContextResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_max_results(req.max_results).map_validation_err("max_results")?;
 
     let memory_system = state
         .get_user_memory(&req.user_id)
@@ -1303,6 +1306,7 @@ pub async fn surface_relevant(
     Json(req): Json<relevance::RelevanceRequest>,
 ) -> Result<Json<relevance::RelevanceResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_max_results(req.config.max_results).map_validation_err("max_results")?;
 
     let memory_sys = state
         .get_user_memory(&req.user_id)
@@ -1360,6 +1364,7 @@ pub async fn recall_tracked(
 ) -> Result<Json<TrackedRetrieveResponse>, AppError> {
     let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_max_results(req.limit).map_validation_err("limit")?;
 
     let memory = state
         .get_user_memory(&req.user_id)
@@ -1543,6 +1548,10 @@ pub async fn recall_by_tags(
 ) -> Result<Json<RetrieveResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
+    if let Some(limit) = req.limit {
+        validation::validate_max_results(limit).map_validation_err("limit")?;
+    }
+
     if req.tags.is_empty() {
         return Err(AppError::InvalidInput {
             field: "tags".to_string(),
@@ -1602,6 +1611,10 @@ pub async fn recall_by_date(
     Json(req): Json<RecallByDateRequest>,
 ) -> Result<Json<RetrieveResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if let Some(limit) = req.limit {
+        validation::validate_max_results(limit).map_validation_err("limit")?;
+    }
 
     if req.end < req.start {
         return Err(AppError::InvalidInput {

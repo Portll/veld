@@ -202,8 +202,8 @@ impl LinearWebhook {
         let secret = match &self.signing_secret {
             Some(s) => s,
             None => {
-                tracing::warn!("No signing secret configured, skipping signature verification");
-                return Ok(true);
+                tracing::warn!("No signing secret configured, rejecting webhook");
+                return Ok(false);
             }
         };
 

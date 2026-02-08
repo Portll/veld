@@ -123,11 +123,13 @@ struct Cli {
     max_concurrent: usize,
 }
 
-// Timeout constants for graceful shutdown
-const SERVER_DRAIN_TIMEOUT_SECS: u64 = 5; // Time to wait for in-flight requests
-const DATABASE_FLUSH_TIMEOUT_SECS: u64 = 30;
-const VECTOR_INDEX_SAVE_TIMEOUT_SECS: u64 = 60;
-const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
+// Timeout for draining in-flight requests (not in constants.rs — server-specific)
+const SERVER_DRAIN_TIMEOUT_SECS: u64 = 5;
+
+// Re-export shutdown constants from the central constants module
+use shodh_memory::constants::{
+    DATABASE_FLUSH_TIMEOUT_SECS, GRACEFUL_SHUTDOWN_TIMEOUT_SECS, VECTOR_INDEX_SAVE_TIMEOUT_SECS,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {

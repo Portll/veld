@@ -23,21 +23,34 @@ pub async fn linear_webhook(
     use integrations::linear::LinearWebhook;
 
     let signing_secret = std::env::var("LINEAR_WEBHOOK_SECRET").ok();
+    let has_secret = signing_secret.is_some();
     let webhook = LinearWebhook::new(signing_secret);
 
-    // Verify signature if present
-    if let Some(signature) = headers
+    // Verify webhook signature
+    let signature = headers
         .get("linear-signature")
-        .and_then(|h| h.to_str().ok())
-    {
-        if !webhook
-            .verify_signature(&body, signature)
-            .map_err(AppError::Internal)?
-        {
+        .and_then(|h| h.to_str().ok());
+
+    match (has_secret, signature) {
+        (true, Some(sig)) => {
+            if !webhook
+                .verify_signature(&body, sig)
+                .map_err(AppError::Internal)?
+            {
+                return Err(AppError::InvalidInput {
+                    field: "signature".to_string(),
+                    reason: "Invalid webhook signature".to_string(),
+                });
+            }
+        }
+        (true, None) => {
             return Err(AppError::InvalidInput {
-                field: "signature".to_string(),
-                reason: "Invalid webhook signature".to_string(),
+                field: "linear-signature".to_string(),
+                reason: "Missing required webhook signature header".to_string(),
             });
+        }
+        (false, _) => {
+            tracing::warn!("No LINEAR_WEBHOOK_SECRET configured, skipping signature verification");
         }
     }
 
@@ -226,20 +239,34 @@ pub async fn github_webhook(
     use integrations::github::GitHubWebhook;
 
     let webhook_secret = std::env::var("GITHUB_WEBHOOK_SECRET").ok();
+    let has_secret = webhook_secret.is_some();
     let webhook = GitHubWebhook::new(webhook_secret);
 
-    if let Some(signature) = headers
+    // Verify webhook signature
+    let signature = headers
         .get("x-hub-signature-256")
-        .and_then(|h| h.to_str().ok())
-    {
-        if !webhook
-            .verify_signature(&body, signature)
-            .map_err(AppError::Internal)?
-        {
+        .and_then(|h| h.to_str().ok());
+
+    match (has_secret, signature) {
+        (true, Some(sig)) => {
+            if !webhook
+                .verify_signature(&body, sig)
+                .map_err(AppError::Internal)?
+            {
+                return Err(AppError::InvalidInput {
+                    field: "signature".to_string(),
+                    reason: "Invalid webhook signature".to_string(),
+                });
+            }
+        }
+        (true, None) => {
             return Err(AppError::InvalidInput {
-                field: "signature".to_string(),
-                reason: "Invalid webhook signature".to_string(),
+                field: "x-hub-signature-256".to_string(),
+                reason: "Missing required webhook signature header".to_string(),
             });
+        }
+        (false, _) => {
+            tracing::warn!("No GITHUB_WEBHOOK_SECRET configured, skipping signature verification");
         }
     }
 
