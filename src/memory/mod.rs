@@ -599,7 +599,7 @@ impl MemorySystem {
 
         // Add entities to knowledge graph for associative/causal retrieval
         // PERF: Build entity structs and extract co-occurrences OUTSIDE the lock
-        // to minimize write lock hold time (was 50-200ms, now ~5-10ms)
+        // GraphMemory is internally thread-safe; read lock allows concurrent graph access
         if let Some(graph) = &self.graph_memory {
             let now = chrono::Utc::now();
 
@@ -637,8 +637,8 @@ impl MemorySystem {
             // Pre-build edge context string outside lock
             let edge_context = format!("Co-occurred in memory {}", memory.id.0);
 
-            // Phase 3: Acquire write lock and perform batch insertions (fast I/O only)
-            let graph_guard = graph.write();
+            // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
+            let graph_guard = graph.read();
 
             // Insert all entities
             for entity in entities_to_add {
@@ -959,7 +959,7 @@ impl MemorySystem {
 
         // Add entities to knowledge graph with co-occurrence edges
         // PERF: Build entity structs and extract co-occurrences OUTSIDE the lock
-        // to minimize write lock hold time (was 50-200ms, now ~5-10ms)
+        // GraphMemory is internally thread-safe; read lock allows concurrent graph access
         if let Some(graph) = &self.graph_memory {
             let now = chrono::Utc::now();
 
@@ -995,8 +995,8 @@ impl MemorySystem {
             // Pre-build edge context string outside lock
             let edge_context = format!("Co-occurred in memory {}", memory.id.0);
 
-            // Phase 3: Acquire write lock and perform batch insertions (fast I/O only)
-            let graph_guard = graph.write();
+            // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
+            let graph_guard = graph.read();
 
             for entity in entities_to_add {
                 if let Err(e) = graph_guard.add_entity(entity.clone()) {
@@ -1171,7 +1171,7 @@ impl MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                if let Err(e) = graph.write().record_memory_coactivation(&memory_uuids) {
+                if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
                     tracing::trace!("Coactivation recording failed (non-critical): {e}");
                 }
             }
@@ -2234,7 +2234,7 @@ impl MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                if let Err(e) = graph.write().record_memory_coactivation(&memory_uuids) {
+                if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
                     tracing::trace!("Coactivation recording failed (non-critical): {e}");
                 }
             }
@@ -2485,7 +2485,7 @@ impl MemorySystem {
 
                 // Clean up knowledge graph episode and sourced edges
                 if let Some(graph) = &self.graph_memory {
-                    if let Err(e) = graph.write().delete_episode(&memory_id.0) {
+                    if let Err(e) = graph.read().delete_episode(&memory_id.0) {
                         tracing::warn!(
                             memory_id = %memory_id.0,
                             error = %e,
@@ -3259,7 +3259,7 @@ impl MemorySystem {
             return;
         }
         if let Some(graph) = &self.graph_memory {
-            let graph_guard = graph.write();
+            let graph_guard = graph.read();
             for id in ids {
                 if let Err(e) = graph_guard.delete_episode(&id.0) {
                     tracing::debug!("Graph cleanup failed for {}: {}", &id.0.to_string()[..8], e);
@@ -3670,7 +3670,7 @@ impl MemorySystem {
 
         // Clear entire knowledge graph (GDPR - complete erasure)
         if let Some(graph) = &self.graph_memory {
-            match graph.write().clear_all() {
+            match graph.read().clear_all() {
                 Ok((entities, relationships, episodes)) => {
                     tracing::info!(
                         entities,
@@ -4269,7 +4269,7 @@ impl MemorySystem {
     /// to let unused associations naturally fade.
     pub fn graph_maintenance(&self) {
         if let Some(graph) = &self.graph_memory {
-            if let Err(e) = graph.write().apply_decay() {
+            if let Err(e) = graph.read().apply_decay() {
                 tracing::debug!("Graph decay maintenance failed: {e}");
             }
         }
@@ -4541,8 +4541,8 @@ impl MemorySystem {
 
                 let edge_context = format!("Co-occurred in memory {}", memory.id.0);
 
-                // Phase 3: Acquire write lock and perform batch insertions (fast I/O only)
-                let graph_guard = graph.write();
+                // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
+                let graph_guard = graph.read();
 
                 for entity in entities_to_add {
                     if let Err(e) = graph_guard.add_entity(entity.clone()) {

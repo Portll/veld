@@ -887,7 +887,7 @@ impl MultiUserMemoryManager {
             if let Some(ref result) = maintenance_result {
                 if !result.edge_boosts.is_empty() {
                     if let Ok(graph) = self.get_user_graph(&user_id) {
-                        let graph_guard = graph.write();
+                        let graph_guard = graph.read();
                         match graph_guard.strengthen_memory_edges(&result.edge_boosts) {
                             Ok(count) => {
                                 edges_strengthened += count;
@@ -905,7 +905,7 @@ impl MultiUserMemoryManager {
             }
 
             if let Ok(graph) = self.get_user_graph(&user_id) {
-                let graph_guard = graph.write();
+                let graph_guard = graph.read();
                 match graph_guard.apply_decay() {
                     Ok(pruned) => {
                         edges_decayed += pruned;
@@ -1353,7 +1353,7 @@ impl MultiUserMemoryManager {
         // Only fast I/O operations happen here.
         // =====================================================================
 
-        let graph_guard = graph.write();
+        let graph_guard = graph.read();
 
         let mut entity_uuids = Vec::new();
 
