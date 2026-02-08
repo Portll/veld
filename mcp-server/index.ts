@@ -1794,6 +1794,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           checksum: string;
           memory_count: number;
           sequence_number: number;
+          secondary_stores?: string[];
+          secondary_size_bytes?: number;
         }
 
         interface BackupResponse {
@@ -1817,6 +1819,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           response += `Type: ${b.backup_type}\n`;
           response += `Memories: ${b.memory_count}\n`;
           response += `Size: ${sizeMB} MB\n`;
+          if (b.secondary_stores && b.secondary_stores.length > 0) {
+            const secSizeMB = ((b.secondary_size_bytes || 0) / (1024 * 1024)).toFixed(2);
+            response += `Secondary stores: ${b.secondary_stores.length} (${secSizeMB} MB)\n`;
+            response += `  Includes: ${b.secondary_stores.join(", ")}\n`;
+          }
           response += `Checksum: ${b.checksum.slice(0, 16)}...\n`;
           response += `Created: ${new Date(b.created_at).toLocaleString()}\n`;
         } else {

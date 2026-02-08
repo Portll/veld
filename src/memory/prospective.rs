@@ -82,6 +82,14 @@ impl ProspectiveStore {
         Ok(())
     }
 
+    /// Get references to all RocksDB databases for backup
+    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
+        vec![
+            ("prospective_tasks", &self.db),
+            ("prospective_index", &self.index_db),
+        ]
+    }
+
     /// Store a new prospective task
     pub fn store(&self, task: &ProspectiveTask) -> Result<()> {
         let key = format!("{}:{}", task.user_id, task.id);

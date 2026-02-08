@@ -1253,6 +1253,11 @@ impl FeedbackStore {
         Ok(flushed)
     }
 
+    /// Get reference to the RocksDB database for backup (if available)
+    pub fn database(&self) -> Option<&Arc<DB>> {
+        self.db.as_ref()
+    }
+
     /// Get statistics
     pub fn stats(&self) -> FeedbackStoreStats {
         FeedbackStoreStats {

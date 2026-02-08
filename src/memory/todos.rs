@@ -1152,6 +1152,15 @@ impl TodoStore {
         Ok(())
     }
 
+    /// Get references to all RocksDB databases for backup
+    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
+        vec![
+            ("todo_items", &self.todo_db),
+            ("todo_projects", &self.project_db),
+            ("todo_index", &self.index_db),
+        ]
+    }
+
     /// Get overall todo stats for a user
     pub fn get_user_stats(&self, user_id: &str) -> Result<UserTodoStats> {
         let todos = self.list_todos_for_user(user_id, None)?;

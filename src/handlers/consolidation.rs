@@ -304,7 +304,7 @@ pub async fn rebuild_index(
 // BACKUP & RESTORE
 // =============================================================================
 
-/// Create a backup for a user
+/// Create a comprehensive backup for a user (memories + secondary stores)
 pub async fn create_backup(
     State(state): State<AppState>,
     Json(req): Json<CreateBackupRequest>,
@@ -318,13 +318,32 @@ pub async fn create_backup(
     let memory_guard = memory_sys.read();
     let db = memory_guard.get_db();
 
-    match state.backup_engine().create_backup(&db, &req.user_id) {
+    // Collect secondary store DB references for comprehensive backup
+    let secondary_refs = state.collect_secondary_store_refs();
+    let store_refs: Vec<crate::backup::SecondaryStoreRef<'_>> = secondary_refs
+        .iter()
+        .map(|(name, db)| crate::backup::SecondaryStoreRef { name, db })
+        .collect();
+
+    let result = if store_refs.is_empty() {
+        state.backup_engine().create_backup(&db, &req.user_id)
+    } else {
+        state
+            .backup_engine()
+            .create_comprehensive_backup(&db, &req.user_id, &store_refs)
+    };
+
+    match result {
         Ok(metadata) => {
+            let secondary_count = metadata.secondary_stores.len();
             state.log_event(
                 &req.user_id,
                 "BACKUP_CREATED",
                 &metadata.backup_id.to_string(),
-                &format!("Backup created: {} bytes", metadata.size_bytes),
+                &format!(
+                    "Backup created: {} bytes + {} secondary stores ({} bytes)",
+                    metadata.size_bytes, secondary_count, metadata.secondary_size_bytes
+                ),
             );
             Ok(Json(BackupResponse {
                 success: true,

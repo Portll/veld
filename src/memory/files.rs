@@ -81,6 +81,14 @@ impl FileMemoryStore {
         Ok(())
     }
 
+    /// Get references to all RocksDB databases for backup
+    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
+        vec![
+            ("file_memories", &self.file_db),
+            ("file_index", &self.index_db),
+        ]
+    }
+
     // =========================================================================
     // CRUD OPERATIONS
     // =========================================================================

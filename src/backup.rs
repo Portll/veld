@@ -11,12 +11,14 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rocksdb::{
     backup::{BackupEngine, BackupEngineOptions},
+    checkpoint::Checkpoint,
     Env, DB,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Backup metadata for tracking and verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,18 @@ pub struct BackupMetadata {
     pub memory_count: usize,
     /// RocksDB sequence number (for PITR)
     pub sequence_number: u64,
+    /// Secondary stores included in this backup
+    #[serde(default)]
+    pub secondary_stores: Vec<String>,
+    /// Total size of secondary store backups in bytes
+    #[serde(default)]
+    pub secondary_size_bytes: u64,
+}
+
+/// Named reference to a RocksDB database for backup
+pub struct SecondaryStoreRef<'a> {
+    pub name: &'a str,
+    pub db: &'a Arc<DB>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,6 +128,8 @@ impl ShodhBackupEngine {
             checksum,
             memory_count,
             sequence_number,
+            secondary_stores: Vec::new(),
+            secondary_size_bytes: 0,
         };
 
         // Save metadata
@@ -124,6 +140,90 @@ impl ShodhBackupEngine {
             user_id = user_id,
             size_mb = size_bytes / 1024 / 1024,
             "Backup created successfully"
+        );
+
+        Ok(metadata)
+    }
+
+    /// Create a comprehensive backup of the main database and all secondary stores.
+    ///
+    /// Uses RocksDB BackupEngine for the main memories DB and Checkpoint API
+    /// for secondary stores (todos, reminders, facts, files, feedback, audit).
+    pub fn create_comprehensive_backup(
+        &self,
+        db: &DB,
+        user_id: &str,
+        secondary_stores: &[SecondaryStoreRef<'_>],
+    ) -> Result<BackupMetadata> {
+        // Step 1: Create main memories backup (existing logic)
+        let mut metadata = self.create_backup(db, user_id)?;
+
+        // Step 2: Checkpoint each secondary store alongside the backup
+        let secondary_dir = self
+            .backup_path
+            .join(user_id)
+            .join(format!("secondary_{}", metadata.backup_id));
+        fs::create_dir_all(&secondary_dir)?;
+
+        let mut backed_up_stores = Vec::new();
+        let mut total_secondary_bytes: u64 = 0;
+
+        for store_ref in secondary_stores {
+            let store_checkpoint_dir = secondary_dir.join(store_ref.name);
+
+            // Skip if checkpoint directory already exists (shouldn't happen, but be safe)
+            if store_checkpoint_dir.exists() {
+                tracing::warn!(
+                    store = store_ref.name,
+                    "Checkpoint directory already exists, skipping"
+                );
+                continue;
+            }
+
+            match Checkpoint::new(store_ref.db) {
+                Ok(checkpoint) => {
+                    if let Err(e) = checkpoint.create_checkpoint(&store_checkpoint_dir) {
+                        tracing::warn!(
+                            store = store_ref.name,
+                            error = %e,
+                            "Failed to checkpoint secondary store, skipping"
+                        );
+                        // Clean up partial checkpoint
+                        let _ = fs::remove_dir_all(&store_checkpoint_dir);
+                        continue;
+                    }
+
+                    let store_size = dir_size(&store_checkpoint_dir).unwrap_or(0);
+                    total_secondary_bytes += store_size;
+                    backed_up_stores.push(store_ref.name.to_string());
+
+                    tracing::debug!(
+                        store = store_ref.name,
+                        size_kb = store_size / 1024,
+                        "Secondary store checkpointed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        store = store_ref.name,
+                        error = %e,
+                        "Failed to create checkpoint handle for secondary store"
+                    );
+                }
+            }
+        }
+
+        // Step 3: Update metadata with secondary store info
+        metadata.secondary_stores = backed_up_stores;
+        metadata.secondary_size_bytes = total_secondary_bytes;
+        self.save_metadata(&metadata)?;
+
+        tracing::info!(
+            backup_id = metadata.backup_id,
+            user_id = user_id,
+            secondary_stores = metadata.secondary_stores.len(),
+            secondary_size_kb = total_secondary_bytes / 1024,
+            "Comprehensive backup created"
         );
 
         Ok(metadata)
@@ -205,6 +305,89 @@ impl ShodhBackupEngine {
         Ok(metadata_list)
     }
 
+    /// Restore from a comprehensive backup, including secondary stores.
+    ///
+    /// The `secondary_restore_paths` map store names to their target restore directories.
+    /// Secondary stores are restored by copying the checkpoint directory to the target path.
+    pub fn restore_comprehensive_backup(
+        &self,
+        user_id: &str,
+        backup_id: Option<u32>,
+        restore_path: &Path,
+        secondary_restore_paths: &[(&str, &Path)],
+    ) -> Result<Vec<String>> {
+        // Step 1: Restore main memories DB
+        self.restore_backup(user_id, backup_id, restore_path)?;
+
+        // Step 2: Determine which backup_id was restored
+        let resolved_backup_id = match backup_id {
+            Some(id) => id,
+            None => {
+                let backup_dir = self.backup_path.join(user_id);
+                let backup_opts = BackupEngineOptions::new(&backup_dir)?;
+                let env = Env::new()?;
+                let backup_engine = BackupEngine::open(&backup_opts, &env)?;
+                let info = backup_engine.get_backup_info();
+                info.last()
+                    .map(|i| i.backup_id)
+                    .ok_or_else(|| anyhow!("No backups available"))?
+            }
+        };
+
+        // Step 3: Restore secondary stores from checkpoints
+        let secondary_dir = self
+            .backup_path
+            .join(user_id)
+            .join(format!("secondary_{resolved_backup_id}"));
+
+        let mut restored_stores = Vec::new();
+
+        if secondary_dir.exists() {
+            for (store_name, target_path) in secondary_restore_paths {
+                let checkpoint_dir = secondary_dir.join(store_name);
+                if !checkpoint_dir.exists() {
+                    tracing::debug!(
+                        store = *store_name,
+                        "No checkpoint found in backup, skipping"
+                    );
+                    continue;
+                }
+
+                // Remove existing target and copy checkpoint
+                if target_path.exists() {
+                    fs::remove_dir_all(target_path).map_err(|e| {
+                        anyhow!(
+                            "Failed to remove existing {} directory at {:?}: {}",
+                            store_name,
+                            target_path,
+                            e
+                        )
+                    })?;
+                }
+
+                copy_dir_recursive(&checkpoint_dir, target_path).map_err(|e| {
+                    anyhow!("Failed to restore {} from checkpoint: {}", store_name, e)
+                })?;
+
+                restored_stores.push(store_name.to_string());
+                tracing::info!(
+                    store = *store_name,
+                    target = ?target_path,
+                    "Secondary store restored from checkpoint"
+                );
+            }
+        }
+
+        tracing::info!(
+            user_id = user_id,
+            backup_id = resolved_backup_id,
+            restored_secondary = restored_stores.len(),
+            "Comprehensive restore completed"
+        );
+
+        Ok(restored_stores)
+    }
+
     /// Delete old backups, keeping only the most recent N backups
     pub fn purge_old_backups(&self, user_id: &str, keep_count: usize) -> Result<usize> {
         let backup_dir = self.backup_path.join(user_id);
@@ -226,8 +409,30 @@ impl ShodhBackupEngine {
 
         let to_delete = total_backups - keep_count;
 
+        // Collect IDs of backups that will be purged (oldest ones)
+        let mut purge_ids: Vec<u32> = backup_info.iter().map(|b| b.backup_id).collect();
+        purge_ids.sort();
+        let purge_ids: Vec<u32> = purge_ids.into_iter().take(to_delete).collect();
+
         // Delete oldest backups (purge keeps the most recent N backups)
         backup_engine.purge_old_backups(keep_count)?;
+
+        // Clean up secondary store checkpoints for purged backups
+        for purged_id in &purge_ids {
+            let secondary_dir = backup_dir.join(format!("secondary_{purged_id}"));
+            if secondary_dir.exists() {
+                if let Err(e) = fs::remove_dir_all(&secondary_dir) {
+                    tracing::warn!(
+                        backup_id = purged_id,
+                        error = %e,
+                        "Failed to clean up secondary store checkpoint"
+                    );
+                }
+            }
+            // Clean up metadata file
+            let metadata_path = backup_dir.join(format!("backup_{purged_id}.json"));
+            let _ = fs::remove_file(metadata_path);
+        }
 
         tracing::info!(
             purged_count = to_delete,
@@ -308,6 +513,39 @@ impl ShodhBackupEngine {
     }
 }
 
+/// Calculate total size of a directory recursively
+fn dir_size(path: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                total += dir_size(&entry_path)?;
+            } else {
+                total += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Recursively copy a directory
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +569,8 @@ mod tests {
             checksum: "abc123".to_string(),
             memory_count: 100,
             sequence_number: 42,
+            secondary_stores: vec!["todo_items".to_string(), "prospective_tasks".to_string()],
+            secondary_size_bytes: 2048,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

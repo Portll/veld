@@ -42,6 +42,11 @@ impl SemanticFactStore {
         Self { db }
     }
 
+    /// Get references to all RocksDB databases for backup
+    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
+        vec![("semantic_facts", &self.db)]
+    }
+
     /// Store a semantic fact
     pub fn store(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
         // Primary storage
