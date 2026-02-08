@@ -603,36 +603,68 @@ impl MemorySystem {
         if let Some(graph) = &self.graph_memory {
             let now = chrono::Utc::now();
 
-            // Phase 1: Build entity structs (CPU work, no lock needed)
+            // Phase 1: Build entity structs with proper labels from NER (CPU work, no lock needed)
+            // Uses pre-extracted NER records for accurate labels (Person, Organization, Location)
+            // instead of defaulting everything to Concept
+            let ner_lookup: std::collections::HashMap<String, (&str, f32)> = memory
+                .experience
+                .ner_entities
+                .iter()
+                .map(|r| {
+                    (
+                        r.text.to_lowercase(),
+                        (r.entity_type.as_str(), r.confidence),
+                    )
+                })
+                .collect();
+
             let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
                 .experience
                 .entities
                 .iter()
-                .map(|entity_name| crate::graph_memory::EntityNode {
-                    uuid: Uuid::new_v4(),
-                    name: entity_name.clone(),
-                    labels: vec![crate::graph_memory::EntityLabel::Concept],
-                    created_at: now,
-                    last_seen_at: now,
-                    mention_count: 1,
-                    summary: String::new(),
-                    attributes: std::collections::HashMap::new(),
-                    name_embedding: None,
-                    salience: 0.5,
-                    is_proper_noun: entity_name
-                        .chars()
-                        .next()
-                        .map(|c| c.is_uppercase())
-                        .unwrap_or(false),
+                .map(|entity_name| {
+                    let (label, salience) = if let Some((ner_type, confidence)) =
+                        ner_lookup.get(&entity_name.to_lowercase())
+                    {
+                        let label = match *ner_type {
+                            "PER" => crate::graph_memory::EntityLabel::Person,
+                            "ORG" => crate::graph_memory::EntityLabel::Organization,
+                            "LOC" => crate::graph_memory::EntityLabel::Location,
+                            _ => crate::graph_memory::EntityLabel::Concept,
+                        };
+                        (label, *confidence)
+                    } else {
+                        (crate::graph_memory::EntityLabel::Concept, 0.5)
+                    };
+                    crate::graph_memory::EntityNode {
+                        uuid: Uuid::new_v4(),
+                        name: entity_name.clone(),
+                        labels: vec![label],
+                        created_at: now,
+                        last_seen_at: now,
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: std::collections::HashMap::new(),
+                        name_embedding: None,
+                        salience,
+                        is_proper_noun: entity_name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false),
+                    }
                 })
                 .collect();
 
             // Phase 2: Extract co-occurrence pairs (CPU-intensive, no lock needed)
             // This creates edges between entities that appear in the same sentence
             // Critical for multi-hop retrieval: "Melanie" <-> "sunrise" <-> "painted"
-            let entity_extractor = crate::graph_memory::EntityExtractor::new();
-            let cooccurrence_pairs =
-                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
+            let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
+                memory.experience.cooccurrence_pairs.clone()
+            } else {
+                let entity_extractor = crate::graph_memory::EntityExtractor::new();
+                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content)
+            };
 
             // Pre-build edge context string outside lock
             let edge_context = format!("Co-occurred in memory {}", memory.id.0);
@@ -649,14 +681,10 @@ impl MemorySystem {
 
             // Insert all relationships
             for (entity1, entity2) in cooccurrence_pairs {
-                // Find both entities (fast - uses in-memory index)
                 if let (Ok(Some(e1)), Ok(Some(e2))) = (
                     graph_guard.find_entity_by_name(&entity1),
                     graph_guard.find_entity_by_name(&entity2),
                 ) {
-                    // Create edge between co-occurring entities
-                    // Starts in L1 (working memory) with tier-specific initial weight
-                    // PIPE-5: Calculate entity confidence from connected entities' salience
                     let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
 
                     let edge = crate::graph_memory::RelationshipEdge {
@@ -678,7 +706,6 @@ impl MemorySystem {
                         entity_confidence,
                     };
 
-                    // add_relationship handles deduplication via Hebbian strengthening
                     if let Err(e) = graph_guard.add_relationship(edge) {
                         tracing::trace!(
                             "Failed to add co-occurrence edge {}<->{}: {}",
@@ -963,36 +990,65 @@ impl MemorySystem {
         if let Some(graph) = &self.graph_memory {
             let now = chrono::Utc::now();
 
-            // Phase 1: Build entity structs (CPU work, no lock needed)
+            // Phase 1: Build entity structs with proper labels from NER
+            let ner_lookup: std::collections::HashMap<String, (&str, f32)> = memory
+                .experience
+                .ner_entities
+                .iter()
+                .map(|r| {
+                    (
+                        r.text.to_lowercase(),
+                        (r.entity_type.as_str(), r.confidence),
+                    )
+                })
+                .collect();
+
             let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
                 .experience
                 .entities
                 .iter()
-                .map(|entity_name| crate::graph_memory::EntityNode {
-                    uuid: Uuid::new_v4(),
-                    name: entity_name.clone(),
-                    labels: vec![crate::graph_memory::EntityLabel::Concept],
-                    created_at: now,
-                    last_seen_at: now,
-                    mention_count: 1,
-                    summary: String::new(),
-                    attributes: std::collections::HashMap::new(),
-                    name_embedding: None,
-                    salience: 0.5,
-                    is_proper_noun: entity_name
-                        .chars()
-                        .next()
-                        .map(|c| c.is_uppercase())
-                        .unwrap_or(false),
+                .map(|entity_name| {
+                    let (label, salience) = if let Some((ner_type, confidence)) =
+                        ner_lookup.get(&entity_name.to_lowercase())
+                    {
+                        let label = match *ner_type {
+                            "PER" => crate::graph_memory::EntityLabel::Person,
+                            "ORG" => crate::graph_memory::EntityLabel::Organization,
+                            "LOC" => crate::graph_memory::EntityLabel::Location,
+                            _ => crate::graph_memory::EntityLabel::Concept,
+                        };
+                        (label, *confidence)
+                    } else {
+                        (crate::graph_memory::EntityLabel::Concept, 0.5)
+                    };
+                    crate::graph_memory::EntityNode {
+                        uuid: Uuid::new_v4(),
+                        name: entity_name.clone(),
+                        labels: vec![label],
+                        created_at: now,
+                        last_seen_at: now,
+                        mention_count: 1,
+                        summary: String::new(),
+                        attributes: std::collections::HashMap::new(),
+                        name_embedding: None,
+                        salience,
+                        is_proper_noun: entity_name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false),
+                    }
                 })
                 .collect();
 
-            // Phase 2: Extract co-occurrence pairs (CPU-intensive, no lock needed)
-            let entity_extractor = crate::graph_memory::EntityExtractor::new();
-            let cooccurrence_pairs =
-                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
+            // Phase 2: Use pre-extracted co-occurrence pairs or extract fresh
+            let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
+                memory.experience.cooccurrence_pairs.clone()
+            } else {
+                let entity_extractor = crate::graph_memory::EntityExtractor::new();
+                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content)
+            };
 
-            // Pre-build edge context string outside lock
             let edge_context = format!("Co-occurred in memory {}", memory.id.0);
 
             // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
@@ -1040,7 +1096,6 @@ impl MemorySystem {
                     }
                 }
             }
-            // Lock released here - held only for fast I/O operations
         }
 
         // Index in BM25 for hybrid search
@@ -4510,34 +4565,64 @@ impl MemorySystem {
             if let Some(graph) = &self.graph_memory {
                 let now = chrono::Utc::now();
 
-                // Phase 1: Build entity structs (CPU work, no lock needed)
+                // Phase 1: Build entity structs with proper labels from NER
+                let ner_lookup: std::collections::HashMap<String, (&str, f32)> = memory
+                    .experience
+                    .ner_entities
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.text.to_lowercase(),
+                            (r.entity_type.as_str(), r.confidence),
+                        )
+                    })
+                    .collect();
+
                 let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
                     .experience
                     .entities
                     .iter()
-                    .map(|entity_name| crate::graph_memory::EntityNode {
-                        uuid: Uuid::new_v4(),
-                        name: entity_name.clone(),
-                        labels: vec![crate::graph_memory::EntityLabel::Concept],
-                        created_at: now,
-                        last_seen_at: now,
-                        mention_count: 1,
-                        summary: String::new(),
-                        attributes: std::collections::HashMap::new(),
-                        name_embedding: None,
-                        salience: 0.5,
-                        is_proper_noun: entity_name
-                            .chars()
-                            .next()
-                            .map(|c| c.is_uppercase())
-                            .unwrap_or(false),
+                    .map(|entity_name| {
+                        let (label, salience) = if let Some((ner_type, confidence)) =
+                            ner_lookup.get(&entity_name.to_lowercase())
+                        {
+                            let label = match *ner_type {
+                                "PER" => crate::graph_memory::EntityLabel::Person,
+                                "ORG" => crate::graph_memory::EntityLabel::Organization,
+                                "LOC" => crate::graph_memory::EntityLabel::Location,
+                                _ => crate::graph_memory::EntityLabel::Concept,
+                            };
+                            (label, *confidence)
+                        } else {
+                            (crate::graph_memory::EntityLabel::Concept, 0.5)
+                        };
+                        crate::graph_memory::EntityNode {
+                            uuid: Uuid::new_v4(),
+                            name: entity_name.clone(),
+                            labels: vec![label],
+                            created_at: now,
+                            last_seen_at: now,
+                            mention_count: 1,
+                            summary: String::new(),
+                            attributes: std::collections::HashMap::new(),
+                            name_embedding: None,
+                            salience,
+                            is_proper_noun: entity_name
+                                .chars()
+                                .next()
+                                .map(|c| c.is_uppercase())
+                                .unwrap_or(false),
+                        }
                     })
                     .collect();
 
-                // Phase 2: Extract co-occurrence pairs (CPU-intensive, no lock needed)
-                let entity_extractor = crate::graph_memory::EntityExtractor::new();
-                let cooccurrence_pairs =
-                    entity_extractor.extract_cooccurrence_pairs(&memory.experience.content);
+                // Phase 2: Use pre-extracted co-occurrence pairs or extract fresh
+                let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
+                    memory.experience.cooccurrence_pairs.clone()
+                } else {
+                    let entity_extractor = crate::graph_memory::EntityExtractor::new();
+                    entity_extractor.extract_cooccurrence_pairs(&memory.experience.content)
+                };
 
                 let edge_context = format!("Co-occurred in memory {}", memory.id.0);
 
@@ -4566,7 +4651,7 @@ impl MemorySystem {
                             created_at: now,
                             valid_at: now,
                             invalidated_at: None,
-                            source_episode_id: None,
+                            source_episode_id: Some(memory.id.0),
                             context: edge_context.clone(),
                             last_activated: now,
                             activation_count: 1,
@@ -4586,7 +4671,6 @@ impl MemorySystem {
                         }
                     }
                 }
-                // Lock released here
             }
 
             // Index in BM25 for hybrid search

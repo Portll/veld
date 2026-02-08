@@ -1009,6 +1009,45 @@ impl MultiUserMemoryManager {
         self.user_memories.entry_count() as usize
     }
 
+    /// Collect references to all secondary store databases for comprehensive backup.
+    /// Returns (name, Arc<DB>) pairs for each available store.
+    pub fn collect_secondary_store_refs(&self) -> Vec<(String, std::sync::Arc<rocksdb::DB>)> {
+        let mut refs = Vec::new();
+
+        // TodoStore databases
+        for (name, db) in self.todo_store.databases() {
+            refs.push((name.to_string(), std::sync::Arc::clone(db)));
+        }
+
+        // ProspectiveStore (reminders) databases
+        for (name, db) in self.prospective_store.databases() {
+            refs.push((name.to_string(), std::sync::Arc::clone(db)));
+        }
+
+        // SemanticFactStore database
+        for (name, db) in self.fact_store.databases() {
+            refs.push((name.to_string(), std::sync::Arc::clone(db)));
+        }
+
+        // FileMemoryStore databases
+        for (name, db) in self.file_store.databases() {
+            refs.push((name.to_string(), std::sync::Arc::clone(db)));
+        }
+
+        // FeedbackStore database (if available)
+        if let Some(db) = self.feedback_store.read().database() {
+            refs.push(("feedback".to_string(), std::sync::Arc::clone(db)));
+        }
+
+        // Audit log database
+        refs.push((
+            "audit_logs".to_string(),
+            std::sync::Arc::clone(&self.audit_db),
+        ));
+
+        refs
+    }
+
     /// Run backups for all active users
     pub fn run_backup_all_users(&self, max_backups: usize) -> usize {
         let mut backed_up = 0;
@@ -1033,7 +1072,15 @@ impl MultiUserMemoryManager {
                 if let Ok(memory_lock) = self.get_user_memory(name) {
                     let memory = memory_lock.read();
                     let db = memory.get_db();
-                    match self.backup_engine.create_backup(&db, name) {
+                    let secondary_refs = self.collect_secondary_store_refs();
+                    let store_refs: Vec<crate::backup::SecondaryStoreRef<'_>> = secondary_refs
+                        .iter()
+                        .map(|(n, d)| crate::backup::SecondaryStoreRef { name: n, db: d })
+                        .collect();
+                    match self
+                        .backup_engine
+                        .create_comprehensive_backup(&db, name, &store_refs)
+                    {
                         Ok(metadata) => {
                             tracing::info!(
                                 user_id = name,
@@ -1100,12 +1147,33 @@ impl MultiUserMemoryManager {
         .cloned()
         .collect();
 
-        // NER extraction or pre-extracted entities
-        let extracted_entities = if !experience.entities.is_empty() {
+        // Use pre-extracted NER records for proper entity labels when available
+        // This avoids redundant NER inference — the handler already ran NER in Pass 1
+        let extracted_entities = if !experience.ner_entities.is_empty() {
             tracing::debug!(
-                "Using {} pre-extracted entities: {:?}",
-                experience.entities.len(),
-                experience.entities
+                "Using {} pre-extracted NER entities from handler",
+                experience.ner_entities.len()
+            );
+            experience
+                .ner_entities
+                .iter()
+                .map(|record| crate::embeddings::ner::NerEntity {
+                    text: record.text.clone(),
+                    entity_type: match record.entity_type.as_str() {
+                        "PER" => NerEntityType::Person,
+                        "ORG" => NerEntityType::Organization,
+                        "LOC" => NerEntityType::Location,
+                        _ => NerEntityType::Misc,
+                    },
+                    confidence: record.confidence,
+                    start: 0,
+                    end: record.text.len(),
+                })
+                .collect()
+        } else if !experience.entities.is_empty() {
+            tracing::debug!(
+                "Using {} pre-extracted entity names (no NER types available)",
+                experience.entities.len()
             );
             experience
                 .entities

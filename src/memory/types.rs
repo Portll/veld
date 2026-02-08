@@ -566,6 +566,17 @@ pub enum RelationshipType {
 /// - related_memories: Empty vector
 /// - causal_chain: Empty vector
 /// - outcomes: Empty vector
+/// Structured NER entity record preserving type classification and confidence.
+/// Used to carry NER results from handler through to graph insertion
+/// without losing type information (Person, Organization, Location, Misc).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NerEntityRecord {
+    pub text: String,
+    /// NER type: "PER", "ORG", "LOC", "MISC"
+    pub entity_type: String,
+    pub confidence: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experience {
     /// Type of experience (defaults to Observation)
@@ -763,6 +774,20 @@ pub struct Experience {
     /// E.g., ["2023-05-07", "2023-06-15"] for memories mentioning specific dates
     #[serde(default)]
     pub temporal_refs: Vec<String>,
+
+    // =========================================================================
+    // STRUCTURED NER & CO-OCCURRENCE (pre-extracted by handler)
+    // =========================================================================
+    /// Structured NER entities with type and confidence (preserves NER classification)
+    /// Populated by handler during remember/upsert. Consumed by graph insertion
+    /// to create entities with proper labels (Person, Organization, Location, etc.)
+    #[serde(default)]
+    pub ner_entities: Vec<NerEntityRecord>,
+
+    /// Co-occurrence pairs extracted from content (sentence-level proximity)
+    /// Pre-computed by handler to avoid redundant content parsing in downstream passes
+    #[serde(default)]
+    pub cooccurrence_pairs: Vec<(String, String)>,
 }
 
 impl Default for Experience {
@@ -809,6 +834,8 @@ impl Default for Experience {
             prediction_accurate: None,
             tags: Vec::new(),
             temporal_refs: Vec::new(),
+            ner_entities: Vec::new(),
+            cooccurrence_pairs: Vec::new(),
         }
     }
 }

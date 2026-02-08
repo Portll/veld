@@ -9,8 +9,8 @@ use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     types::{
-        ChangeType, ContextId, EmotionalContext, EpisodeContext, RichContext, SourceContext,
-        SourceType,
+        ChangeType, ContextId, EmotionalContext, EpisodeContext, NerEntityRecord, RichContext,
+        SourceContext, SourceType,
     },
     Experience, ExperienceType, SessionEvent,
 };
@@ -302,12 +302,17 @@ pub async fn remember(
 
     let (ner_result, yake_result) = tokio::join!(
         // NER extraction (named entities: Person, Org, Location, Misc)
+        // Preserve full entity records for downstream graph insertion with proper labels
         tokio::task::spawn_blocking(move || {
             match ner.extract(&content_for_ner) {
                 Ok(entities) => entities
                     .into_iter()
-                    .map(|e| e.text)
-                    .collect::<Vec<String>>(),
+                    .map(|e| NerEntityRecord {
+                        text: e.text,
+                        entity_type: e.entity_type.as_str().to_string(),
+                        confidence: e.confidence,
+                    })
+                    .collect::<Vec<NerEntityRecord>>(),
                 Err(e) => {
                     tracing::debug!("NER extraction failed: {}", e);
                     Vec::new()
@@ -319,16 +324,16 @@ pub async fn remember(
         tokio::task::spawn_blocking(move || yake.extract_texts(&content_for_yake))
     );
 
-    let extracted_names = ner_result.unwrap_or_default();
+    let ner_entities = ner_result.unwrap_or_default();
     let extracted_keywords = yake_result.unwrap_or_default();
 
     let mut merged_entities: Vec<String> = req.tags.clone();
-    for entity_name in extracted_names {
+    for record in &ner_entities {
         if !merged_entities
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(&entity_name))
+            .any(|t| t.eq_ignore_ascii_case(&record.text))
         {
-            merged_entities.push(entity_name);
+            merged_entities.push(record.text.clone());
         }
     }
     for keyword in extracted_keywords {
@@ -357,8 +362,9 @@ pub async fn remember(
         content: req.content.clone(),
         experience_type,
         entities: merged_entities.clone(),
-        tags: merged_entities, // Include NER + YAKE keywords in tags for retrieval
+        tags: merged_entities,
         context,
+        ner_entities,
         ..Default::default()
     };
 
@@ -536,10 +542,17 @@ pub async fn batch_remember(
     for (index, item) in valid_items {
         let experience_type = parse_experience_type(item.memory_type.as_ref());
 
-        let merged_entities = if extract_entities {
+        let (merged_entities, ner_records) = if extract_entities {
             // NER for named entities (Person, Org, Location, Misc)
-            let extracted_names: Vec<String> = match neural_ner.extract(&item.content) {
-                Ok(entities) => entities.into_iter().map(|e| e.text).collect(),
+            let ner_records: Vec<NerEntityRecord> = match neural_ner.extract(&item.content) {
+                Ok(entities) => entities
+                    .into_iter()
+                    .map(|e| NerEntityRecord {
+                        text: e.text,
+                        entity_type: e.entity_type.as_str().to_string(),
+                        confidence: e.confidence,
+                    })
+                    .collect(),
                 Err(e) => {
                     tracing::debug!("NER extraction failed for batch item {}: {}", index, e);
                     Vec::new()
@@ -550,9 +563,9 @@ pub async fn batch_remember(
             let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
 
             let mut merged: Vec<String> = item.tags.clone();
-            for entity_name in extracted_names {
-                if !merged.iter().any(|t| t.eq_ignore_ascii_case(&entity_name)) {
-                    merged.push(entity_name);
+            for record in &ner_records {
+                if !merged.iter().any(|t| t.eq_ignore_ascii_case(&record.text)) {
+                    merged.push(record.text.clone());
                 }
             }
             for keyword in extracted_keywords {
@@ -560,9 +573,9 @@ pub async fn batch_remember(
                     merged.push(keyword);
                 }
             }
-            merged
+            (merged, ner_records)
         } else {
-            item.tags.clone()
+            (item.tags.clone(), Vec::new())
         };
 
         let context = build_rich_context(
@@ -580,8 +593,9 @@ pub async fn batch_remember(
             content: item.content,
             experience_type,
             entities: merged_entities.clone(),
-            tags: merged_entities, // Include NER + YAKE keywords in tags for retrieval
+            tags: merged_entities,
             context,
+            ner_entities: ner_records,
             ..Default::default()
         };
 
@@ -689,9 +703,16 @@ pub async fn upsert_memory(
         _ => ChangeType::ContentUpdated,
     };
 
-    // Extract entities via NER
-    let extracted_names: Vec<String> = match state.get_neural_ner().extract(&req.content) {
-        Ok(entities) => entities.into_iter().map(|e| e.text).collect(),
+    // Extract entities via NER (preserve full records for graph label propagation)
+    let ner_entities: Vec<NerEntityRecord> = match state.get_neural_ner().extract(&req.content) {
+        Ok(entities) => entities
+            .into_iter()
+            .map(|e| NerEntityRecord {
+                text: e.text,
+                entity_type: e.entity_type.as_str().to_string(),
+                confidence: e.confidence,
+            })
+            .collect(),
         Err(e) => {
             tracing::debug!("NER extraction failed in upsert: {}", e);
             Vec::new()
@@ -702,12 +723,12 @@ pub async fn upsert_memory(
     let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
 
     let mut merged_entities: Vec<String> = req.tags.clone();
-    for entity_name in extracted_names {
+    for record in &ner_entities {
         if !merged_entities
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(&entity_name))
+            .any(|t| t.eq_ignore_ascii_case(&record.text))
         {
-            merged_entities.push(entity_name);
+            merged_entities.push(record.text.clone());
         }
     }
     for keyword in extracted_keywords {
@@ -723,7 +744,8 @@ pub async fn upsert_memory(
         content: req.content.clone(),
         experience_type,
         entities: merged_entities.clone(),
-        tags: merged_entities, // Include NER + YAKE keywords in tags for retrieval
+        tags: merged_entities,
+        ner_entities,
         ..Default::default()
     };
 

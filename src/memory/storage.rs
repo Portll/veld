@@ -478,7 +478,9 @@ impl LegacyExperienceV1 {
             predicted_outcome: self.predicted_outcome,
             prediction_accurate: self.prediction_accurate,
             tags: self.tags,
-            temporal_refs: Vec::new(), // Not in v1
+            temporal_refs: Vec::new(),
+            ner_entities: Vec::new(),
+            cooccurrence_pairs: Vec::new(),
         }
     }
 }
