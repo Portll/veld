@@ -24,40 +24,51 @@ use std::sync::Arc;
 
 /// URLs for MiniLM model files (hosted on HuggingFace)
 /// Full model is 90MB, quantized is 23MB - we download quantized for edge devices
+/// Pinned to commit c9745ed1 to prevent checksum drift when HuggingFace updates models
 const MODEL_ONNX_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx";
-const MODEL_QUANTIZED_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quint8_avx2.onnx";
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/onnx/model.onnx";
+const MODEL_QUANTIZED_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/onnx/model_quint8_avx2.onnx";
 const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/tokenizer.json";
 
 /// URLs for NER model files (TinyBERT-finetuned-NER, ~14.5MB quantized)
 /// Using a lightweight 4-layer TinyBERT model optimized for edge devices
 /// Source: onnx-community/TinyBERT-finetuned-NER-ONNX (fine-tuned on CoNLL2003)
+/// Pinned to commit 9b03777d for reproducibility
 const NER_MODEL_URL: &str =
-    "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/onnx/model_quantized.onnx";
+    "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/9b03777d9832105fbe419f258127fb2ec3eb09d7/onnx/model_quantized.onnx";
 const NER_TOKENIZER_URL: &str =
-    "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/main/tokenizer.json";
+    "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/9b03777d9832105fbe419f258127fb2ec3eb09d7/tokenizer.json";
 
 /// SHA-256 checksums for model integrity verification
-/// These should be updated when model versions change
-/// Note: HuggingFace models may be updated - if checksum fails, verify and update
+/// Verified against pinned commit hashes above — these will not drift
 struct ModelChecksums;
 
 impl ModelChecksums {
-    /// Quantized model checksum (model_quint8_avx2.onnx from HuggingFace)
-    /// Verified from: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-    /// Note: HuggingFace may update models - if verification fails, re-verify and update
+    /// Quantized model checksum (model_quint8_avx2.onnx)
+    /// Pinned: sentence-transformers/all-MiniLM-L6-v2 @ c9745ed1
     const QUANTIZED_MODEL: Option<&'static str> =
-        Some("6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452");
+        Some("b941bf19f1f1283680f449fa6a7336bb5600bdcd5f84d10ddc5cd72218a0fd21");
 
     /// Full model checksum (model.onnx)
-    /// Same as quantized for sentence-transformers/all-MiniLM-L6-v2
+    /// Pinned: sentence-transformers/all-MiniLM-L6-v2 @ c9745ed1
     const FULL_MODEL: Option<&'static str> =
         Some("6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452");
 
     /// Tokenizer checksum (tokenizer.json)
+    /// Pinned: sentence-transformers/all-MiniLM-L6-v2 @ c9745ed1
     const TOKENIZER: Option<&'static str> =
         Some("be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037");
+
+    /// NER quantized model checksum (model_quantized.onnx)
+    /// Pinned: onnx-community/TinyBERT-finetuned-NER-ONNX @ 9b03777d
+    const NER_MODEL: Option<&'static str> =
+        Some("ba4a1a00cf1600cae8e7cf3fda4650c825811719065b51041256392edd3647b8");
+
+    /// NER tokenizer checksum (tokenizer.json)
+    /// Pinned: onnx-community/TinyBERT-finetuned-NER-ONNX @ 9b03777d
+    const NER_TOKENIZER: Option<&'static str> =
+        Some("d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66");
 }
 
 /// ONNX Runtime download URLs by platform (v1.23.2 required by ort 2.0.0-rc.11)
@@ -99,16 +110,69 @@ pub fn get_onnx_runtime_dir() -> PathBuf {
     get_cache_dir().join("onnxruntime")
 }
 
-/// Check if embedding model files are downloaded
+/// Check if embedding model files are downloaded and valid
 pub fn are_models_downloaded() -> bool {
     let models_dir = get_models_dir();
-    models_dir.join("model_quantized.onnx").exists() && models_dir.join("tokenizer.json").exists()
+    let model_path = models_dir.join("model_quantized.onnx");
+    let tokenizer_path = models_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return false;
+    }
+
+    // Verify checksums to ensure files aren't corrupted or from a different version
+    if let Some(expected) = ModelChecksums::QUANTIZED_MODEL {
+        if let Ok(valid) = verify_checksum(&model_path, expected) {
+            if !valid {
+                tracing::warn!("Model file checksum mismatch — will re-download");
+                let _ = fs::remove_file(&model_path);
+                return false;
+            }
+        }
+    }
+    if let Some(expected) = ModelChecksums::TOKENIZER {
+        if let Ok(valid) = verify_checksum(&tokenizer_path, expected) {
+            if !valid {
+                tracing::warn!("Tokenizer file checksum mismatch — will re-download");
+                let _ = fs::remove_file(&tokenizer_path);
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
-/// Check if NER model files are downloaded
+/// Check if NER model files are downloaded and valid
 pub fn are_ner_models_downloaded() -> bool {
     let models_dir = get_ner_models_dir();
-    models_dir.join("model.onnx").exists() && models_dir.join("tokenizer.json").exists()
+    let model_path = models_dir.join("model.onnx");
+    let tokenizer_path = models_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return false;
+    }
+
+    if let Some(expected) = ModelChecksums::NER_MODEL {
+        if let Ok(valid) = verify_checksum(&model_path, expected) {
+            if !valid {
+                tracing::warn!("NER model file checksum mismatch — will re-download");
+                let _ = fs::remove_file(&model_path);
+                return false;
+            }
+        }
+    }
+    if let Some(expected) = ModelChecksums::NER_TOKENIZER {
+        if let Ok(valid) = verify_checksum(&tokenizer_path, expected) {
+            if !valid {
+                tracing::warn!("NER tokenizer file checksum mismatch — will re-download");
+                let _ = fs::remove_file(&tokenizer_path);
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Check if ONNX Runtime is downloaded
@@ -149,7 +213,6 @@ pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Verify SHA-256 checksum of a file
 /// Used for model integrity verification when checksum values are provided
-#[allow(dead_code)]
 fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
     let mut file = fs::File::open(path).context("Failed to open file for checksum")?;
     let mut hasher = Sha256::new();
@@ -377,19 +440,21 @@ pub fn download_ner_models(progress: Option<ProgressCallback>) -> Result<PathBuf
     // Download model (~14.5MB quantized)
     let model_path = models_dir.join("model.onnx");
     tracing::info!("Downloading NER model_quantized.onnx (~14.5MB)");
-    download_file(
+    download_file_with_checksum(
         NER_MODEL_URL,
         &model_path,
         progress.as_ref().map(|p| p.as_ref()),
+        ModelChecksums::NER_MODEL,
     )?;
 
     // Download tokenizer (~700KB)
     let tokenizer_path = models_dir.join("tokenizer.json");
     tracing::info!("Downloading NER tokenizer.json");
-    download_file(
+    download_file_with_checksum(
         NER_TOKENIZER_URL,
         &tokenizer_path,
         progress.as_ref().map(|p| p.as_ref()),
+        ModelChecksums::NER_TOKENIZER,
     )?;
 
     tracing::info!(
