@@ -1498,11 +1498,13 @@ impl MemoryStorage {
             }
         }
 
-        // Fetch full memories
+        // Fetch full memories, filtering out forgotten ones
         let mut memories = Vec::new();
         for id in memory_ids {
             if let Ok(memory) = self.get(&id) {
-                memories.push(memory);
+                if !memory.is_forgotten() {
+                    memories.push(memory);
+                }
             }
         }
 
@@ -2027,7 +2029,9 @@ impl MemoryStorage {
                     continue;
                 }
                 if let Ok((memory, _)) = deserialize_memory(&value) {
-                    memories.push(memory);
+                    if !memory.is_forgotten() {
+                        memories.push(memory);
+                    }
                 }
             }
         }
@@ -2070,6 +2074,9 @@ impl MemoryStorage {
                     continue;
                 }
                 if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                    if memory.is_forgotten() {
+                        continue;
+                    }
                     if memory.created_at < cutoff {
                         memory
                             .experience
@@ -2111,6 +2118,9 @@ impl MemoryStorage {
                     continue;
                 }
                 if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                    if memory.is_forgotten() {
+                        continue;
+                    }
                     if memory.importance() < threshold {
                         memory
                             .experience
@@ -2210,6 +2220,9 @@ impl MemoryStorage {
 
                     match deserialize_memory(&value) {
                         Ok((memory, _)) => {
+                            if memory.is_forgotten() {
+                                continue;
+                            }
                             stats.total_count += 1;
                             stats.total_size_bytes += value.len();
                             if memory.compressed {

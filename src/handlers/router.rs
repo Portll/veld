@@ -167,9 +167,11 @@ pub fn build_protected_routes(state: AppState) -> Router {
             get(consolidation::get_consolidation_events),
         )
         .route("/api/backup/create", post(consolidation::create_backup))
-        .route("/api/backup/list", get(consolidation::list_backups))
+        .route("/api/backup/list", post(consolidation::list_backups))
+        .route("/api/backups", post(consolidation::list_backups)) // MCP alias
         .route("/api/backup/verify", post(consolidation::verify_backup))
         .route("/api/backup/purge", post(consolidation::purge_backups))
+        .route("/api/backups/purge", post(consolidation::purge_backups)) // MCP alias
         // =================================================================
         // FACTS
         // =================================================================
@@ -266,6 +268,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
             put(todos::update_todo_comment),
         )
         .route(
+            "/api/todos/{todo_id}/comments/{comment_id}/update",
+            post(todos::update_todo_comment), // MCP alias
+        )
+        .route(
             "/api/todos/{todo_id}/comments/{comment_id}",
             delete(todos::delete_todo_comment),
         )
@@ -273,11 +279,18 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         // PROJECTS
         // =================================================================
-        .route("/api/projects", get(todos::list_projects))
-        .route("/api/projects/add", post(todos::create_project))
+        .route("/api/projects", post(todos::create_project)) // MCP: POST /api/projects
+        .route("/api/projects/list", post(todos::list_projects)) // MCP alias
+        .route("/api/projects/add", post(todos::create_project)) // Legacy alias
         .route("/api/projects/{project_id}", get(todos::get_project))
-        .route("/api/projects/update", post(todos::update_project))
-        .route("/api/projects/delete", post(todos::delete_project))
+        .route(
+            "/api/projects/{project_id}/update",
+            post(todos::update_project),
+        )
+        .route(
+            "/api/projects/{project_id}/delete",
+            post(todos::delete_project),
+        )
         // =================================================================
         // FILE MEMORY / CODEBASE INTEGRATION
         // =================================================================
@@ -301,11 +314,19 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         // REMINDERS
         // =================================================================
-        .route("/api/reminders", get(todos::list_reminders))
+        .route("/api/reminders", post(todos::list_reminders))
         .route("/api/reminders/set", post(todos::create_reminder))
-        .route("/api/reminders/due", get(todos::get_due_reminders))
+        .route("/api/remind", post(todos::create_reminder)) // MCP alias
+        .route("/api/reminders/due", post(todos::get_due_reminders))
         .route("/api/reminders/check", post(todos::check_context_reminders))
-        .route("/api/reminders/dismiss", post(todos::dismiss_reminder))
+        .route(
+            "/api/reminders/context",
+            post(todos::check_context_reminders),
+        ) // MCP alias
+        .route(
+            "/api/reminders/{reminder_id}/dismiss",
+            post(todos::dismiss_reminder),
+        )
         .route("/api/reminders/delete", post(todos::delete_reminder))
         // =================================================================
         // SESSIONS

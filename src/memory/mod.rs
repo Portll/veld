@@ -2503,16 +2503,19 @@ impl MemorySystem {
                 // Mark as forgotten in long-term (don't delete, just flag)
                 let lt_flagged = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
 
-                // Update stats for hard-deleted tiers
-                if working_removed > 0 || session_removed > 0 {
-                    let mut stats = self.stats.write();
-                    stats.working_memory_count =
-                        stats.working_memory_count.saturating_sub(working_removed);
-                    stats.session_memory_count =
-                        stats.session_memory_count.saturating_sub(session_removed);
-                    stats.total_memories = stats
-                        .total_memories
-                        .saturating_sub(working_removed + session_removed);
+                // Update stats for hard-deleted and soft-deleted tiers
+                {
+                    let removed = working_removed + session_removed + lt_flagged;
+                    if removed > 0 {
+                        let mut stats = self.stats.write();
+                        stats.working_memory_count =
+                            stats.working_memory_count.saturating_sub(working_removed);
+                        stats.session_memory_count =
+                            stats.session_memory_count.saturating_sub(session_removed);
+                        stats.long_term_memory_count =
+                            stats.long_term_memory_count.saturating_sub(lt_flagged);
+                        stats.total_memories = stats.total_memories.saturating_sub(removed);
+                    }
                 }
 
                 lt_flagged
@@ -2530,16 +2533,19 @@ impl MemorySystem {
                     .long_term_memory
                     .mark_forgotten_by_importance(threshold)?;
 
-                // Update stats for hard-deleted tiers
-                if working_removed > 0 || session_removed > 0 {
-                    let mut stats = self.stats.write();
-                    stats.working_memory_count =
-                        stats.working_memory_count.saturating_sub(working_removed);
-                    stats.session_memory_count =
-                        stats.session_memory_count.saturating_sub(session_removed);
-                    stats.total_memories = stats
-                        .total_memories
-                        .saturating_sub(working_removed + session_removed);
+                // Update stats for hard-deleted and soft-deleted tiers
+                {
+                    let removed = working_removed + session_removed + lt_flagged;
+                    if removed > 0 {
+                        let mut stats = self.stats.write();
+                        stats.working_memory_count =
+                            stats.working_memory_count.saturating_sub(working_removed);
+                        stats.session_memory_count =
+                            stats.session_memory_count.saturating_sub(session_removed);
+                        stats.long_term_memory_count =
+                            stats.long_term_memory_count.saturating_sub(lt_flagged);
+                        stats.total_memories = stats.total_memories.saturating_sub(removed);
+                    }
                 }
 
                 lt_flagged

@@ -1117,6 +1117,15 @@ impl Memory {
         }
     }
 
+    /// Check if this memory has been soft-deleted (marked as forgotten)
+    pub fn is_forgotten(&self) -> bool {
+        self.experience
+            .metadata
+            .get("forgotten")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
     /// Update this memory's content, pushing old content to history
     /// Returns the new version number
     pub fn update_content(
@@ -2039,6 +2048,11 @@ impl Query {
     /// # Returns
     /// * `true` if memory passes all filters, `false` otherwise
     pub fn matches(&self, memory: &Memory) -> bool {
+        // Skip soft-deleted (forgotten) memories
+        if memory.is_forgotten() {
+            return false;
+        }
+
         // Importance threshold
         if let Some(threshold) = self.importance_threshold {
             if memory.importance() < threshold {

@@ -420,7 +420,6 @@ pub async fn remember(
         let created_at = req.created_at.unwrap_or_else(chrono::Utc::now);
         let memory_id_clone = memory_id.clone(); // Clone before moving into closure
 
-        // Run temporal fact extraction in background (non-blocking)
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
             if let Err(e) = memory_guard.store_temporal_facts_for_memory(
@@ -432,7 +431,11 @@ pub async fn remember(
             ) {
                 tracing::debug!("Temporal fact extraction failed (non-fatal): {}", e);
             }
-        });
+        })
+        .await
+        .map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("Temporal fact extraction panicked: {e}"))
+        })?;
     }
 
     // Record metrics
