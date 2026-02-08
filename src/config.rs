@@ -416,10 +416,14 @@ impl ServerConfig {
         info!("   Port: {}", self.port);
         info!("   Storage: {:?}", self.storage_path);
         info!("   Max users in memory: {}", self.max_users_in_memory);
-        info!(
-            "   Rate limit: {} req/sec (burst: {})",
-            self.rate_limit_per_second, self.rate_limit_burst
-        );
+        if self.rate_limit_per_second > 0 {
+            info!(
+                "   Rate limit: {} req/sec (burst: {})",
+                self.rate_limit_per_second, self.rate_limit_burst
+            );
+        } else {
+            info!("   Rate limit: disabled");
+        }
         info!("   Max concurrent: {}", self.max_concurrent_requests);
         info!("   Request timeout: {}s", self.request_timeout_secs);
         info!("   Audit retention: {} days", self.audit_retention_days);

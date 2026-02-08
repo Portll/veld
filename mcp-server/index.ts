@@ -3793,14 +3793,40 @@ async function ensureServerRunning(): Promise<void> {
 
   console.error("[shodh-memory] Starting backend server...");
 
+  // Build a clean environment for the server process.
+  // Only pass through system env + server-relevant SHODH_ vars.
+  // MCP-client-specific vars (SHODH_RATE_LIMIT, SHODH_TOKEN_BUDGET, etc.)
+  // must NOT leak to the server — they have different semantics.
+  const serverEnv: Record<string, string> = {};
+  const SERVER_ENV_ALLOWLIST = new Set([
+    "SHODH_HOST", "SHODH_PORT", "SHODH_MEMORY_PATH", "SHODH_ENV",
+    "SHODH_API_KEYS", "SHODH_DEV_API_KEY", "SHODH_MAX_USERS",
+    "SHODH_RATE_LIMIT", "SHODH_RATE_BURST", "SHODH_MAX_CONCURRENT",
+    "SHODH_REQUEST_TIMEOUT", "SHODH_WRITE_MODE", "SHODH_OFFLINE",
+    "SHODH_LAZY_LOAD", "SHODH_ONNX_THREADS", "SHODH_VECTOR_BACKEND",
+    "SHODH_CORS_ORIGINS", "SHODH_CORS_MAX_AGE", "SHODH_CORS_CREDENTIALS",
+    "RUST_LOG",
+  ]);
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (key.startsWith("SHODH_")) {
+      // Only pass through env vars the server actually understands
+      if (SERVER_ENV_ALLOWLIST.has(key)) {
+        serverEnv[key] = value;
+      }
+    } else {
+      // Pass through all non-SHODH env vars (PATH, HOME, etc.)
+      serverEnv[key] = value;
+    }
+  }
+  // Always pass the API key for auth
+  serverEnv["SHODH_DEV_API_KEY"] = API_KEY;
+
   // Spawn the server process
   serverProcess = spawn(binaryPath, [], {
     detached: true,
     stdio: "ignore",
-    env: {
-      ...process.env,
-      SHODH_DEV_API_KEY: API_KEY, // Pass the API key to the server
-    },
+    env: serverEnv,
   });
 
   serverProcess.unref();

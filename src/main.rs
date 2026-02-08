@@ -204,18 +204,23 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Configure rate limiting
-    let governor_conf = GovernorConfigBuilder::default()
-        .per_second(server_config.rate_limit_per_second)
-        .burst_size(server_config.rate_limit_burst)
-        .finish()
-        .expect("Failed to build governor rate limiter configuration");
-    let governor_layer = GovernorLayer::new(governor_conf);
-
-    info!(
-        "Rate limiting: {} req/sec, burst of {}",
-        server_config.rate_limit_per_second, server_config.rate_limit_burst
-    );
+    // Configure rate limiting (0 = disabled, for localhost/embedded use)
+    let rate_limit_enabled = server_config.rate_limit_per_second > 0;
+    let governor_layer = if rate_limit_enabled {
+        let governor_conf = GovernorConfigBuilder::default()
+            .per_second(server_config.rate_limit_per_second)
+            .burst_size(server_config.rate_limit_burst)
+            .finish()
+            .expect("Failed to build governor rate limiter configuration");
+        info!(
+            "Rate limiting: {} req/sec, burst of {}",
+            server_config.rate_limit_per_second, server_config.rate_limit_burst
+        );
+        Some(GovernorLayer::new(governor_conf))
+    } else {
+        info!("Rate limiting: disabled (SHODH_RATE_LIMIT=0)");
+        None
+    };
 
     // Build CORS layer
     let cors = server_config.cors.to_layer();
@@ -241,9 +246,14 @@ async fn main() -> Result<()> {
         }),
     );
 
-    let protected_routes = handlers::build_protected_routes(Arc::clone(&manager))
-        .layer(axum::middleware::from_fn(auth::auth_middleware))
-        .layer(governor_layer);
+    let protected_routes = if let Some(governor) = governor_layer {
+        handlers::build_protected_routes(Arc::clone(&manager))
+            .layer(axum::middleware::from_fn(auth::auth_middleware))
+            .layer(governor)
+    } else {
+        handlers::build_protected_routes(Arc::clone(&manager))
+            .layer(axum::middleware::from_fn(auth::auth_middleware))
+    };
 
     // Combine routes with global middleware
     // Note: Routes already have state from build_public_routes/build_protected_routes
