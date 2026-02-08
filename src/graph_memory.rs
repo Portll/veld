@@ -1671,7 +1671,7 @@ impl GraphMemory {
     pub fn delete_relationship(&self, uuid: &Uuid) -> Result<bool> {
         let key = uuid.as_bytes();
 
-        // Get the edge first to find the from_entity for index cleanup
+        // Get the edge first to find both entities for index cleanup
         let edge = match self.get_relationship(uuid)? {
             Some(e) => e,
             None => return Ok(false),
@@ -1681,9 +1681,12 @@ impl GraphMemory {
         self.relationships_db.delete(key)?;
         self.relationship_count.fetch_sub(1, Ordering::Relaxed);
 
-        // Also remove from entity_edges index
-        let index_key = format!("{}:{}", edge.from_entity, uuid);
-        let _ = self.entity_edges_db.delete(index_key.as_bytes());
+        // Remove from entity_edges index for BOTH entities
+        // (add_relationship indexes both from_entity and to_entity)
+        let from_key = format!("{}:{}", edge.from_entity, uuid);
+        let _ = self.entity_edges_db.delete(from_key.as_bytes());
+        let to_key = format!("{}:{}", edge.to_entity, uuid);
+        let _ = self.entity_edges_db.delete(to_key.as_bytes());
 
         Ok(true)
     }

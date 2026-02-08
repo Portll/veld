@@ -600,9 +600,18 @@ impl RetrievalEngine {
         };
 
         if !existing_vector_ids.is_empty() {
-            // Remove old mappings (vectors stay in index but become orphaned - acceptable for Vamana)
-            // Note: Vamana doesn't support true deletion, but this is fine for upsert scenarios
-            // The old vectors will be ignored during search since ID mapping points to new vectors
+            // Soft-delete old vectors in Vamana so they're excluded from search results
+            // and counted toward the compaction threshold (30% deletion ratio triggers rebuild).
+            // Without this, reindexed vectors become invisible ghost entries that waste
+            // search candidate slots and never trigger compaction.
+            {
+                let index = self.vector_index.read();
+                for &vid in &existing_vector_ids {
+                    index.mark_deleted(vid);
+                }
+            }
+
+            // Remove old ID mappings
             let mut mapping = self.id_mapping.write();
             mapping.memory_to_vectors.remove(&memory.id);
             for vector_id in existing_vector_ids {

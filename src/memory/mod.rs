@@ -2495,23 +2495,54 @@ impl MemorySystem {
                 let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
 
                 // Remove from working memory
-                self.working_memory.write().remove_older_than(cutoff)?;
+                let working_removed = self.working_memory.write().remove_older_than(cutoff)?;
 
                 // Remove from session memory
-                self.session_memory.write().remove_older_than(cutoff)?;
+                let session_removed = self.session_memory.write().remove_older_than(cutoff)?;
 
                 // Mark as forgotten in long-term (don't delete, just flag)
-                self.long_term_memory.mark_forgotten_by_age(cutoff)?
+                let lt_flagged = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
+
+                // Update stats for hard-deleted tiers
+                if working_removed > 0 || session_removed > 0 {
+                    let mut stats = self.stats.write();
+                    stats.working_memory_count =
+                        stats.working_memory_count.saturating_sub(working_removed);
+                    stats.session_memory_count =
+                        stats.session_memory_count.saturating_sub(session_removed);
+                    stats.total_memories = stats
+                        .total_memories
+                        .saturating_sub(working_removed + session_removed);
+                }
+
+                lt_flagged
             }
             ForgetCriteria::LowImportance(threshold) => {
-                self.working_memory
+                let working_removed = self
+                    .working_memory
                     .write()
                     .remove_below_importance(threshold)?;
-                self.session_memory
+                let session_removed = self
+                    .session_memory
                     .write()
                     .remove_below_importance(threshold)?;
-                self.long_term_memory
-                    .mark_forgotten_by_importance(threshold)?
+                let lt_flagged = self
+                    .long_term_memory
+                    .mark_forgotten_by_importance(threshold)?;
+
+                // Update stats for hard-deleted tiers
+                if working_removed > 0 || session_removed > 0 {
+                    let mut stats = self.stats.write();
+                    stats.working_memory_count =
+                        stats.working_memory_count.saturating_sub(working_removed);
+                    stats.session_memory_count =
+                        stats.session_memory_count.saturating_sub(session_removed);
+                    stats.total_memories = stats
+                        .total_memories
+                        .saturating_sub(working_removed + session_removed);
+                }
+
+                lt_flagged
             }
             ForgetCriteria::Pattern(pattern) => {
                 // Remove memories matching pattern
@@ -3006,7 +3037,10 @@ impl MemorySystem {
         }
 
         if count > 0 {
-            self.stats.write().promotions_to_session += count;
+            let mut stats = self.stats.write();
+            stats.promotions_to_session += count;
+            stats.working_memory_count = stats.working_memory_count.saturating_sub(count);
+            stats.session_memory_count += count;
             tracing::debug!(
                 "Promoted {} memories from working to session (importance >= {}, age >= {}s)",
                 count,
@@ -3081,7 +3115,10 @@ impl MemorySystem {
         }
 
         if count > 0 {
-            self.stats.write().promotions_to_longterm += count;
+            let mut stats = self.stats.write();
+            stats.promotions_to_longterm += count;
+            stats.session_memory_count = stats.session_memory_count.saturating_sub(count);
+            stats.long_term_memory_count += count;
             tracing::debug!(
                 "Promoted {} memories from session to long-term (importance >= {}, age >= {}s)",
                 count,

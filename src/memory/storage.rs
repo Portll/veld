@@ -1203,24 +1203,19 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (memory, needs_migration) =
-                    deserialize_memory(&value).with_context(|| {
-                        format!(
-                            "Failed to deserialize memory {} ({} bytes)",
-                            id.0,
-                            value.len()
-                        )
-                    })?;
+                let (memory, needs_migration) = deserialize_memory(&value).with_context(|| {
+                    format!(
+                        "Failed to deserialize memory {} ({} bytes)",
+                        id.0,
+                        value.len()
+                    )
+                })?;
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
                     if let Err(e) = self.migrate_memory_format(&memory) {
                         // Migration failure is non-fatal - log and continue
-                        tracing::debug!(
-                            "Lazy migration skipped for memory {}: {}",
-                            memory.id.0,
-                            e
-                        );
+                        tracing::debug!("Lazy migration skipped for memory {}: {}", memory.id.0, e);
                     }
                 }
 
@@ -1288,15 +1283,19 @@ impl MemoryStorage {
     /// Delete a memory with configurable durability
     #[allow(unused)] // Public API - available for memory management
     pub fn delete(&self, id: &MemoryId) -> Result<()> {
-        let key = id.0.as_bytes();
+        // Clean up indices FIRST while the memory still exists in the main DB,
+        // since remove_from_indices() needs to read the memory to reconstruct index keys.
+        self.remove_from_indices(id)?;
 
-        // Use write mode based on configuration
+        // Then delete from main database
+        let key = id.0.as_bytes();
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.db.delete_opt(key, &write_opts)?;
 
-        // Clean up indices
-        self.remove_from_indices(id)?;
+        // Delete vector mapping if present
+        let mapping_key = format!("vmapping:{}", id.0);
+        let _ = self.db.delete_opt(mapping_key.as_bytes(), &write_opts);
 
         Ok(())
     }
@@ -1331,9 +1330,10 @@ impl MemoryStorage {
         let importance_key = format!("importance:{}:{}", importance_bucket, id.0);
         batch.delete(importance_key.as_bytes());
 
-        // Entity indices
+        // Entity indices (must match the to_lowercase() normalization in update_indices)
         for entity in &memory.experience.entities {
-            let entity_key = format!("entity:{}:{}", entity, id.0);
+            let normalized_entity = entity.to_lowercase();
+            let entity_key = format!("entity:{}:{}", normalized_entity, id.0);
             batch.delete(entity_key.as_bytes());
         }
 
@@ -1382,9 +1382,10 @@ impl MemoryStorage {
             batch.delete(action_key.as_bytes());
         }
 
-        // Reward index
+        // Reward index (must match the clamp in update_indices)
         if let Some(reward) = memory.experience.reward {
-            let reward_bucket = ((reward + 1.0) * 10.0) as i32;
+            let clamped_reward = reward.clamp(-1.0, 1.0);
+            let reward_bucket = ((clamped_reward + 1.0) * 10.0) as i32;
             let reward_key = format!("reward:{}:{}", reward_bucket, id.0);
             batch.delete(reward_key.as_bytes());
         }
@@ -2136,7 +2137,7 @@ impl MemoryStorage {
     /// Remove memories matching a pattern with durable writes
     pub fn remove_matching(&self, regex: &regex::Regex) -> Result<usize> {
         let mut count = 0;
-        let mut to_delete = Vec::new();
+        let mut to_delete: Vec<MemoryId> = Vec::new();
 
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
@@ -2147,19 +2148,18 @@ impl MemoryStorage {
                 }
                 if let Ok((memory, _)) = deserialize_memory(&value) {
                     if regex.is_match(&memory.experience.content) {
-                        to_delete.push(key.to_vec());
+                        to_delete.push(memory.id);
                         count += 1;
                     }
                 }
             }
         }
 
-        // DURABILITY: Sync write for delete operations
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
-
-        for key in to_delete {
-            self.db.delete_opt(&key, &write_opts)?;
+        // Delete each memory through the proper delete() path which cleans up indices first
+        for memory_id in to_delete {
+            if let Err(e) = self.delete(&memory_id) {
+                tracing::warn!("Failed to delete matching memory {}: {}", memory_id.0, e);
+            }
         }
 
         Ok(count)
@@ -3021,9 +3021,11 @@ mod tests {
     #[test]
     fn test_modality_dimension() {
         assert_eq!(Modality::Text.dimension(), 384);
-        assert_eq!(Modality::Image.dimension(), 512);
-        assert_eq!(Modality::Audio.dimension(), 768);
+        // ImageBind projects all non-text modalities to 1024-dim shared space
+        assert_eq!(Modality::Image.dimension(), 1024);
+        assert_eq!(Modality::Audio.dimension(), 1024);
         assert_eq!(Modality::Video.dimension(), 1024);
+        assert_eq!(Modality::Unified.dimension(), 1024);
     }
 
     #[test]

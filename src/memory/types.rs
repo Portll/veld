@@ -2450,7 +2450,7 @@ impl WorkingMemory {
         Ok(())
     }
 
-    pub fn remove_older_than(&mut self, cutoff: DateTime<Utc>) -> anyhow::Result<()> {
+    pub fn remove_older_than(&mut self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
         let to_remove: Vec<MemoryId> = self
             .memories
             .iter()
@@ -2458,13 +2458,14 @@ impl WorkingMemory {
             .map(|(id, _)| id.clone())
             .collect();
 
+        let count = to_remove.len();
         for id in to_remove {
             self.remove(&id)?;
         }
-        Ok(())
+        Ok(count)
     }
 
-    pub fn remove_below_importance(&mut self, threshold: f32) -> anyhow::Result<()> {
+    pub fn remove_below_importance(&mut self, threshold: f32) -> anyhow::Result<usize> {
         let to_remove: Vec<MemoryId> = self
             .memories
             .iter()
@@ -2472,10 +2473,11 @@ impl WorkingMemory {
             .map(|(id, _)| id.clone())
             .collect();
 
+        let count = to_remove.len();
         for id in to_remove {
             self.remove(&id)?;
         }
-        Ok(())
+        Ok(count)
     }
 
     pub fn remove_matching(&mut self, regex: &regex::Regex) -> anyhow::Result<usize> {
@@ -2652,7 +2654,7 @@ impl SessionMemory {
         Ok(())
     }
 
-    pub fn remove_older_than(&mut self, cutoff: DateTime<Utc>) -> anyhow::Result<()> {
+    pub fn remove_older_than(&mut self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
         let to_remove: Vec<MemoryId> = self
             .memories
             .iter()
@@ -2660,13 +2662,14 @@ impl SessionMemory {
             .map(|(id, _)| id.clone())
             .collect();
 
+        let count = to_remove.len();
         for id in to_remove {
             self.remove(&id)?;
         }
-        Ok(())
+        Ok(count)
     }
 
-    pub fn remove_below_importance(&mut self, threshold: f32) -> anyhow::Result<()> {
+    pub fn remove_below_importance(&mut self, threshold: f32) -> anyhow::Result<usize> {
         let to_remove: Vec<MemoryId> = self
             .memories
             .iter()
@@ -2674,10 +2677,11 @@ impl SessionMemory {
             .map(|(id, _)| id.clone())
             .collect();
 
+        let count = to_remove.len();
         for id in to_remove {
             self.remove(&id)?;
         }
-        Ok(())
+        Ok(count)
     }
 
     pub fn remove_matching(&mut self, regex: &regex::Regex) -> anyhow::Result<usize> {
