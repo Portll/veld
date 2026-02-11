@@ -513,8 +513,16 @@ impl NeuralNer {
             Value::from_array((vec![batch_size, max_length], token_type_ids))
                 .context("Failed to create batched token_type_ids tensor")?;
 
-        // Run batch inference
-        let mut session = model.session.lock();
+        // Run batch inference with timeout to prevent deadlock cascade
+        let lock_timeout = std::time::Duration::from_secs(30);
+        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+            tracing::error!(
+                "NER session lock timed out after {}s in batch extract — \
+                 a previous inference call is likely stuck.",
+                lock_timeout.as_secs()
+            );
+            anyhow::anyhow!("NER session lock timeout ({}s) in batch extract", lock_timeout.as_secs())
+        })?;
         let outputs = session
             .run(ort::inputs![
                 "input_ids" => &input_ids_value,
@@ -623,7 +631,15 @@ impl NeuralNer {
     /// Neural extraction using ONNX model
     fn extract_neural(&self, text: &str) -> Result<Vec<NerEntity>> {
         let model = self.ensure_model_loaded()?;
-        let mut session = model.session.lock();
+        let lock_timeout = std::time::Duration::from_secs(30);
+        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+            tracing::error!(
+                "NER session lock timed out after {}s in extract — \
+                 a previous inference call is likely stuck.",
+                lock_timeout.as_secs()
+            );
+            anyhow::anyhow!("NER session lock timeout ({}s) in extract", lock_timeout.as_secs())
+        })?;
 
         // Tokenize input
         let encoding = model
