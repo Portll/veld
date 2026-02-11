@@ -178,17 +178,23 @@ pub struct UpsertResponse {
 /// Parse memory type from string
 pub fn parse_experience_type(s: Option<&String>) -> ExperienceType {
     s.and_then(|s| match s.to_lowercase().as_str() {
-        "task" => Some(ExperienceType::Task),
-        "learning" => Some(ExperienceType::Learning),
+        "observation" => Some(ExperienceType::Observation),
         "decision" => Some(ExperienceType::Decision),
+        "learning" => Some(ExperienceType::Learning),
         "error" => Some(ExperienceType::Error),
-        "pattern" => Some(ExperienceType::Pattern),
-        "conversation" => Some(ExperienceType::Conversation),
         "discovery" => Some(ExperienceType::Discovery),
-        "observation" | "context" => Some(ExperienceType::Context),
+        "pattern" => Some(ExperienceType::Pattern),
+        "context" => Some(ExperienceType::Context),
+        "task" => Some(ExperienceType::Task),
+        "codeedit" | "code_edit" => Some(ExperienceType::CodeEdit),
+        "fileaccess" | "file_access" => Some(ExperienceType::FileAccess),
+        "search" => Some(ExperienceType::Search),
+        "command" => Some(ExperienceType::Command),
+        "conversation" => Some(ExperienceType::Conversation),
+        "intention" => Some(ExperienceType::Intention),
         _ => None,
     })
-    .unwrap_or(ExperienceType::Context)
+    .unwrap_or(ExperienceType::Observation)
 }
 
 /// Parse source type from string
