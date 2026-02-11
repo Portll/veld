@@ -504,7 +504,7 @@ fn group_segments_into_chunks(
         let trimmed = current_chunk.trim().to_string();
         // Merge tiny trailing chunk with previous if too small
         if trimmed.len() < config.min_size && !chunks.is_empty() {
-            let last = chunks.pop().unwrap();
+            let last = chunks.pop().unwrap_or_default();
             chunks.push(format!("{last}\n{trimmed}"));
         } else {
             chunks.push(trimmed);

@@ -1452,6 +1452,8 @@ impl VamanaIndex {
             vectors: Vec<Vec<f32>>,
             medoid: u32,
             num_vectors: usize,
+            #[serde(default)]
+            deleted_ids: HashSet<u32>,
         }
 
         // Collect vectors from storage
@@ -1500,6 +1502,7 @@ impl VamanaIndex {
             vectors,
             medoid: *self.medoid.read(),
             num_vectors: num_vecs,
+            deleted_ids: self.deleted_ids.read().clone(),
         };
 
         // Save as binary
@@ -1537,6 +1540,8 @@ impl VamanaIndex {
             vectors: Vec<Vec<f32>>,
             medoid: u32,
             num_vectors: usize,
+            #[serde(default)]
+            deleted_ids: HashSet<u32>,
         }
 
         let data: VamanaData =
@@ -1562,6 +1567,15 @@ impl VamanaIndex {
                 );
                 *self.vectors.write() = VectorStorage::Memory(data.vectors);
             }
+        }
+
+        // Restore soft-deleted IDs
+        if !data.deleted_ids.is_empty() {
+            info!(
+                "Restoring {} soft-deleted vector IDs from persisted index",
+                data.deleted_ids.len()
+            );
+            *self.deleted_ids.write() = data.deleted_ids;
         }
 
         info!("Loaded Vamana index with {} vectors", data.num_vectors);

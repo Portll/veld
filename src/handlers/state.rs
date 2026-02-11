@@ -7,8 +7,20 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::info;
+
+/// Static regex for extracting all-caps terms (API, TUI, NER, REST, etc.)
+fn allcaps_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b[A-Z]{2,}[A-Z0-9]*\b").unwrap())
+}
+
+/// Static regex for extracting issue IDs (SHO-XX, JIRA-123, etc.)
+fn issue_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap())
+}
 
 use crate::ab_testing;
 use crate::backup;
@@ -1297,8 +1309,7 @@ impl MultiUserMemoryManager {
             .collect();
 
         // Extract all-caps terms (API, TUI, NER, REST, etc.)
-        let allcaps_regex = regex::Regex::new(r"\b[A-Z]{2,}[A-Z0-9]*\b").unwrap();
-        let allcaps_entities: Vec<(String, EntityNode)> = allcaps_regex
+        let allcaps_entities: Vec<(String, EntityNode)> = allcaps_regex()
             .find_iter(&experience.content)
             .filter_map(|cap| {
                 let term = cap.as_str();
@@ -1332,8 +1343,7 @@ impl MultiUserMemoryManager {
             .collect();
 
         // Extract issue IDs (SHO-XX, JIRA-123, etc.)
-        let issue_regex = regex::Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap();
-        let issue_entities: Vec<(String, EntityNode)> = issue_regex
+        let issue_entities: Vec<(String, EntityNode)> = issue_regex()
             .find_iter(&experience.content)
             .filter_map(|issue| {
                 let issue_id = issue.as_str();

@@ -2212,8 +2212,8 @@ mod tests {
             .collect();
 
         // Sort by score descending
-        control_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        treatment_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        control_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        treatment_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         println!("🔍 RANKING COMPARISON (top 8):");
         println!("   Control ranking:");

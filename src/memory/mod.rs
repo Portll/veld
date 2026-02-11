@@ -258,7 +258,9 @@ fn resolve_entity_label(
 }
 
 /// Build a lookup table from NER entity records for label resolution.
-fn build_ner_lookup(ner_entities: &[NerEntityRecord]) -> std::collections::HashMap<String, (String, f32)> {
+fn build_ner_lookup(
+    ner_entities: &[NerEntityRecord],
+) -> std::collections::HashMap<String, (String, f32)> {
     ner_entities
         .iter()
         .map(|r| (r.text.to_lowercase(), (r.entity_type.clone(), r.confidence)))
@@ -1687,7 +1689,9 @@ impl MemorySystem {
 
                 // Single-hop or supplement multi-hop: Weighted traversal from each entity
                 for entity_uuid in &query_entities {
-                    if let Ok(t) = g.traverse_weighted(entity_uuid, weighted_depth, None, weighted_min_str) {
+                    if let Ok(t) =
+                        g.traverse_weighted(entity_uuid, weighted_depth, None, weighted_min_str)
+                    {
                         for tr in &t.entities {
                             if let Ok(eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
                                 for ep in eps {

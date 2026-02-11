@@ -50,6 +50,29 @@ pub fn validate_user_id(user_id: &str) -> Result<()> {
         return Err(anyhow!("user_id cannot start or end with a dot"));
     }
 
+    // Reject absolute paths — PathBuf::join with an absolute path ignores the base
+    if std::path::Path::new(user_id).is_absolute() {
+        return Err(anyhow!("user_id cannot be an absolute path"));
+    }
+
+    // Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    // These cause issues when used as directory names on Windows
+    {
+        let upper = user_id.to_uppercase();
+        // Strip any extension (e.g., "CON.txt" is still reserved on Windows)
+        let stem = upper.split('.').next().unwrap_or(&upper);
+        const DEVICE_NAMES: &[&str] = &[
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if DEVICE_NAMES.contains(&stem) {
+            return Err(anyhow!(
+                "user_id cannot be a Windows reserved device name: {}",
+                user_id
+            ));
+        }
+    }
+
     Ok(())
 }
 

@@ -511,8 +511,13 @@ impl MiniLMEmbedder {
             }
         }
 
-        // Normalize - if normalization fails (empty text), return zero vector
-        let _ = self.normalize(&mut embedding);
+        // Normalize - if normalization fails (empty text / NaN), return zero vector
+        if !self.normalize(&mut embedding) {
+            tracing::warn!(
+                "Embedding normalization failed (zero norm or NaN), returning zero vector"
+            );
+            embedding.iter_mut().for_each(|v| *v = 0.0);
+        }
 
         Ok(embedding)
     }

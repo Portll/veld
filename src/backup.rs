@@ -189,7 +189,13 @@ impl ShodhBackupEngine {
                             "Failed to checkpoint secondary store, skipping"
                         );
                         // Clean up partial checkpoint
-                        let _ = fs::remove_dir_all(&store_checkpoint_dir);
+                        if let Err(cleanup_err) = fs::remove_dir_all(&store_checkpoint_dir) {
+                            tracing::warn!(
+                                store = store_ref.name,
+                                error = %cleanup_err,
+                                "Failed to clean up partial checkpoint directory"
+                            );
+                        }
                         continue;
                     }
 
@@ -353,21 +359,57 @@ impl ShodhBackupEngine {
                     continue;
                 }
 
-                // Remove existing target and copy checkpoint
-                if target_path.exists() {
-                    fs::remove_dir_all(target_path).map_err(|e| {
+                // Safe restore: copy to temp dir first, then atomic swap.
+                // This prevents data loss if copy fails midway.
+                let temp_path = target_path.with_extension("restore_tmp");
+                if temp_path.exists() {
+                    fs::remove_dir_all(&temp_path).map_err(|e| {
                         anyhow!(
-                            "Failed to remove existing {} directory at {:?}: {}",
+                            "Failed to clean up stale temp dir for {}: {}",
                             store_name,
-                            target_path,
                             e
                         )
                     })?;
                 }
 
-                copy_dir_recursive(&checkpoint_dir, target_path).map_err(|e| {
-                    anyhow!("Failed to restore {} from checkpoint: {}", store_name, e)
-                })?;
+                if let Err(e) = copy_dir_recursive(&checkpoint_dir, &temp_path) {
+                    // Copy failed — clean up temp, leave original intact
+                    let _ = fs::remove_dir_all(&temp_path);
+                    tracing::warn!(
+                        store = *store_name,
+                        error = %e,
+                        "Failed to copy checkpoint for restore, skipping (original data preserved)"
+                    );
+                    continue;
+                }
+
+                // Copy succeeded — now swap: remove original, rename temp to target
+                if target_path.exists() {
+                    if let Err(e) = fs::remove_dir_all(target_path) {
+                        // Can't remove original — roll back by removing temp
+                        let _ = fs::remove_dir_all(&temp_path);
+                        return Err(anyhow!(
+                            "Failed to remove existing {} directory at {:?}: {}",
+                            store_name,
+                            target_path,
+                            e
+                        ));
+                    }
+                }
+
+                if let Err(e) = fs::rename(&temp_path, target_path) {
+                    // Rename failed (cross-device?), fall back to copy + remove temp
+                    if let Err(copy_err) = copy_dir_recursive(&temp_path, target_path) {
+                        let _ = fs::remove_dir_all(&temp_path);
+                        return Err(anyhow!(
+                            "Failed to finalize restore for {}: rename={}, copy={}",
+                            store_name,
+                            e,
+                            copy_err
+                        ));
+                    }
+                    let _ = fs::remove_dir_all(&temp_path);
+                }
 
                 restored_stores.push(store_name.to_string());
                 tracing::info!(
@@ -431,7 +473,13 @@ impl ShodhBackupEngine {
             }
             // Clean up metadata file
             let metadata_path = backup_dir.join(format!("backup_{purged_id}.json"));
-            let _ = fs::remove_file(metadata_path);
+            if let Err(e) = fs::remove_file(&metadata_path) {
+                tracing::warn!(
+                    backup_id = purged_id,
+                    error = %e,
+                    "Failed to remove backup metadata file"
+                );
+            }
         }
 
         tracing::info!(

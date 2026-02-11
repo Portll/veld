@@ -73,6 +73,7 @@ pub async fn consolidate_memories(
     };
 
     // AUD-7: Store extracted facts in the semantic fact store
+    let mut warnings = Vec::new();
     if !result.new_facts.is_empty() {
         match state
             .fact_store
@@ -91,6 +92,11 @@ pub async fn consolidate_memories(
                     error = %e,
                     "Failed to store extracted facts"
                 );
+                warnings.push(format!(
+                    "Failed to store {} extracted facts: {}",
+                    result.new_facts.len(),
+                    e
+                ));
             }
         }
     }
@@ -148,6 +154,7 @@ pub async fn consolidate_memories(
         memories_replayed,
         edges_strengthened,
         memories_decayed: maintenance_result.decayed_count,
+        warnings,
     }))
 }
 

@@ -166,6 +166,43 @@ async fn handle_streaming_socket(socket: WebSocket, state: AppState) {
             return;
         }
 
+        // Validate extraction config bounds
+        {
+            let config = &handshake.extraction_config;
+            if config.checkpoint_interval_ms > 0 && config.checkpoint_interval_ms < 1000 {
+                let error = streaming::ExtractionResult::Error {
+                    code: "INVALID_CONFIG".to_string(),
+                    message: "checkpoint_interval_ms must be 0 (disabled) or >= 1000ms".to_string(),
+                    fatal: true,
+                    timestamp: chrono::Utc::now(),
+                };
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
+                    .await;
+                return;
+            }
+            if config.max_buffer_size > 1000 {
+                let error = streaming::ExtractionResult::Error {
+                    code: "INVALID_CONFIG".to_string(),
+                    message: "max_buffer_size must be <= 1000".to_string(),
+                    fatal: true,
+                    timestamp: chrono::Utc::now(),
+                };
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::to_string(&error)
+                            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.to_string())
+                            .into(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+
         // Create session
         let id = match state
             .streaming_extractor

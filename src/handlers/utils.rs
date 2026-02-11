@@ -174,7 +174,11 @@ pub fn strip_system_noise(content: &str) -> String {
     while let Some(start) = result.find("<system-reminder>") {
         if let Some(end) = result.find("</system-reminder>") {
             let end_pos = end + "</system-reminder>".len();
-            result = format!("{}{}", &result[..start], &result[end_pos..]);
+            if end_pos <= result.len() && start < end_pos {
+                result = format!("{}{}", &result[..start], &result[end_pos..]);
+            } else {
+                break;
+            }
         } else {
             break;
         }
@@ -184,7 +188,11 @@ pub fn strip_system_noise(content: &str) -> String {
     while let Some(start) = result.find("<shodh-context") {
         if let Some(end) = result.find("</shodh-context>") {
             let end_pos = end + "</shodh-context>".len();
-            result = format!("{}{}", &result[..start], &result[end_pos..]);
+            if end_pos <= result.len() && start < end_pos {
+                result = format!("{}{}", &result[..start], &result[end_pos..]);
+            } else {
+                break;
+            }
         } else {
             break;
         }
@@ -197,7 +205,12 @@ pub fn strip_system_noise(content: &str) -> String {
             .find("\n\n")
             .or_else(|| search_area.find("\r\n\r\n"))
             .unwrap_or(search_area.len().min(2000));
-        result = format!("{}{}", &result[..start], &result[start + end_offset..]);
+        let cut_pos = start + end_offset;
+        if cut_pos <= result.len() {
+            result = format!("{}{}", &result[..start], &result[cut_pos..]);
+        } else {
+            break;
+        }
     }
 
     // Remove Claude Code file content blocks - Unix paths
@@ -207,14 +220,26 @@ pub fn strip_system_noise(content: &str) -> String {
             .find("\n\n")
             .or_else(|| search_area.find("\r\n\r\n"))
             .unwrap_or(search_area.len().min(2000));
-        result = format!("{}{}", &result[..start], &result[start + end_offset..]);
+        let cut_pos = start + end_offset;
+        if cut_pos <= result.len() {
+            result = format!("{}{}", &result[..start], &result[cut_pos..]);
+        } else {
+            break;
+        }
     }
 
     // Remove fenced code blocks (```...```) - these are often tool outputs, not memories
     while let Some(start) = result.find("```") {
+        if start + 3 > result.len() {
+            break;
+        }
         if let Some(end) = result[start + 3..].find("```") {
             let end_pos = start + 3 + end + 3;
-            result = format!("{}{}", &result[..start], &result[end_pos..]);
+            if end_pos <= result.len() {
+                result = format!("{}{}", &result[..start], &result[end_pos..]);
+            } else {
+                break;
+            }
         } else {
             // Unclosed code block - remove from start to end
             result = result[..start].to_string();

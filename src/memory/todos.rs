@@ -41,6 +41,8 @@ pub struct TodoStore {
     vector_indices: RwLock<HashMap<String, VamanaIndex>>,
     /// Storage path for persisting vector indices
     storage_path: std::path::PathBuf,
+    /// Mutex for atomic sequence number allocation (prevents TOCTOU race)
+    seq_mutex: parking_lot::Mutex<()>,
 }
 
 impl TodoStore {
@@ -74,6 +76,7 @@ impl TodoStore {
             index_db,
             vector_indices: RwLock::new(HashMap::new()),
             storage_path: todos_path,
+            seq_mutex: parking_lot::Mutex::new(()),
         })
     }
 
@@ -209,6 +212,8 @@ impl TodoStore {
     /// Get the next sequence number for a project (or user if no project) and increment the counter
     /// Key format: "seq:{user_id}:{project_id}" or "seq:{user_id}:_standalone_" for todos without project
     fn next_seq_num(&self, user_id: &str, project_id: Option<&ProjectId>) -> Result<u32> {
+        // Hold mutex to prevent TOCTOU race on concurrent seq_num allocation
+        let _lock = self.seq_mutex.lock();
         let key = match project_id {
             Some(pid) => format!("seq:{}:{}", user_id, pid.0),
             None => format!("seq:{}:_standalone_", user_id),
