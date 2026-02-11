@@ -202,10 +202,17 @@ struct LazyNerModel {
 
 impl LazyNerModel {
     fn new(config: &NerConfig) -> Result<Self> {
+        // macOS ARM64: default to 1 thread to avoid Eigen thread pool
+        // spin-to-block deadlock on heterogeneous P/E cores.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let default_threads = 1;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let default_threads = 2;
+
         let num_threads = std::env::var("SHODH_ONNX_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or(default_threads);
 
         tracing::info!(
             "Loading BERT-NER model from {:?} with {} threads",
@@ -213,10 +220,23 @@ impl LazyNerModel {
             num_threads
         );
 
-        let session = Session::builder()
+        let builder = Session::builder()
             .context("Failed to create NER session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set NER thread count")?
+            .context("Failed to set NER intra thread count")?
+            .with_inter_threads(1)
+            .context("Failed to set NER inter thread count")?;
+
+        // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
+        // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
+        // See: microsoft/onnxruntime#10270, pykeio/ort#516
+        let builder = builder
+            .with_intra_op_spinning(false)
+            .context("Failed to disable NER intra-op spinning")?
+            .with_inter_op_spinning(false)
+            .context("Failed to disable NER inter-op spinning")?;
+
+        let session = builder
             .commit_from_file(&config.model_path)
             .context("Failed to load NER ONNX model")?;
 

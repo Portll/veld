@@ -12,7 +12,7 @@
 //! - SHODH_MODEL_PATH: Base path to model files (default: ./models/minilm-l6)
 //! - SHODH_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
 //! - SHODH_LAZY_LOAD: Set to "false" to load model at startup (default: true)
-//! - SHODH_ONNX_THREADS: Number of ONNX threads (default: 2 for edge, 4 for desktop)
+//! - SHODH_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, 2 elsewhere)
 
 use anyhow::{Context, Result};
 use ort::session::Session;
@@ -37,10 +37,18 @@ struct LazyModel {
 
 impl LazyModel {
     fn new(config: &EmbeddingConfig) -> Result<Self> {
+        // macOS ARM64 (M1/M2/M3): default to 1 thread to avoid Eigen thread pool
+        // spin-to-block deadlock on heterogeneous P/E cores.
+        // See: https://github.com/microsoft/onnxruntime/issues/10270
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let default_threads = 1;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let default_threads = 2;
+
         let num_threads = std::env::var("SHODH_ONNX_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2); // Default 2 threads for edge devices
+            .unwrap_or(default_threads);
 
         tracing::info!(
             "Loading MiniLM-L6-v2 model from {:?} with {} threads",
@@ -48,10 +56,23 @@ impl LazyModel {
             num_threads
         );
 
-        let session = Session::builder()
+        let builder = Session::builder()
             .context("Failed to create session builder")?
             .with_intra_threads(num_threads)
-            .context("Failed to set thread count")?
+            .context("Failed to set intra thread count")?
+            .with_inter_threads(1)
+            .context("Failed to set inter thread count")?;
+
+        // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
+        // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
+        // See: microsoft/onnxruntime#10270, pykeio/ort#516
+        let builder = builder
+            .with_intra_op_spinning(false)
+            .context("Failed to disable intra-op spinning")?
+            .with_inter_op_spinning(false)
+            .context("Failed to disable inter-op spinning")?;
+
+        let session = builder
             .commit_from_file(&config.model_path)
             .context("Failed to load ONNX model")?;
 
@@ -640,7 +661,15 @@ impl MiniLMEmbedder {
 
         // Lazy load model on first use
         let model = self.ensure_model_loaded()?;
-        let mut session = model.session.lock();
+        let lock_timeout = std::time::Duration::from_secs(30);
+        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+            tracing::error!(
+                "ONNX session lock timed out after {}s in batch embed — \
+                 a previous inference call is likely stuck.",
+                lock_timeout.as_secs()
+            );
+            anyhow::anyhow!("ONNX session lock timeout ({}s) in batch embed", lock_timeout.as_secs())
+        })?;
 
         let batch_size = texts.len();
         let max_length = self.config.max_length;

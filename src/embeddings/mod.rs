@@ -11,7 +11,7 @@
 //! # Configuration
 //! - `SHODH_OFFLINE=true` - Disable auto-download
 //! - `SHODH_LAZY_LOAD=false` - Load model at startup
-//! - `SHODH_ONNX_THREADS=N` - Set ONNX thread count
+//! - `SHODH_ONNX_THREADS=N` - Set ONNX intra-op thread count (default: 1 on macOS ARM64, 2 elsewhere)
 
 pub mod chunking;
 pub mod circuit_breaker;
