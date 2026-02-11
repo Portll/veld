@@ -1006,7 +1006,6 @@ impl MemoryStorage {
         let index_path = path.join("memory_index");
         let index_db = Arc::new(Self::open_or_repair(&opts, &index_path, "memory_index")?);
 
-
         let write_mode = WriteMode::default();
         tracing::info!(
             "Storage initialized with {:?} write mode (latency: {})",
@@ -1062,7 +1061,9 @@ impl MemoryStorage {
                         anyhow::anyhow!("Failed to open {label} database after repair: {e}")
                     })
                 } else {
-                    Err(anyhow::anyhow!("Failed to open {label} database: {open_err}"))
+                    Err(anyhow::anyhow!(
+                        "Failed to open {label} database: {open_err}"
+                    ))
                 }
             }
         }

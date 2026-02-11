@@ -315,9 +315,7 @@ pub fn validate_relationship_strength(strength: f32) -> Result<()> {
 /// Validate a scoring weight (0.0 to 1.0 inclusive, must be finite)
 pub fn validate_weight(name: &str, value: f32) -> Result<()> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(anyhow!(
-            "{name} must be between 0.0 and 1.0, got: {value}"
-        ));
+        return Err(anyhow!("{name} must be between 0.0 and 1.0, got: {value}"));
     }
     Ok(())
 }
@@ -329,9 +327,7 @@ pub fn validate_reminder_timestamp(at: &chrono::DateTime<chrono::Utc>) -> Result
     let max_past = now - chrono::Duration::hours(1); // Allow up to 1 hour in the past (clock skew)
 
     if *at < max_past {
-        return Err(anyhow!(
-            "Reminder timestamp is in the past: {at}"
-        ));
+        return Err(anyhow!("Reminder timestamp is in the past: {at}"));
     }
 
     if *at > max_future {

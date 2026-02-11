@@ -478,8 +478,7 @@ pub async fn create_reminder(
                     reason: "Context trigger requires at least one keyword".to_string(),
                 });
             }
-            validation::validate_weight("threshold", threshold)
-                .map_validation_err("threshold")?;
+            validation::validate_weight("threshold", threshold).map_validation_err("threshold")?;
             ProspectiveTrigger::OnContext {
                 keywords,
                 threshold,

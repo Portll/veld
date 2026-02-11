@@ -668,7 +668,10 @@ impl MiniLMEmbedder {
                  a previous inference call is likely stuck.",
                 lock_timeout.as_secs()
             );
-            anyhow::anyhow!("ONNX session lock timeout ({}s) in batch embed", lock_timeout.as_secs())
+            anyhow::anyhow!(
+                "ONNX session lock timeout ({}s) in batch embed",
+                lock_timeout.as_secs()
+            )
         })?;
 
         let batch_size = texts.len();

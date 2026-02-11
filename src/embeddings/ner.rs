@@ -521,7 +521,10 @@ impl NeuralNer {
                  a previous inference call is likely stuck.",
                 lock_timeout.as_secs()
             );
-            anyhow::anyhow!("NER session lock timeout ({}s) in batch extract", lock_timeout.as_secs())
+            anyhow::anyhow!(
+                "NER session lock timeout ({}s) in batch extract",
+                lock_timeout.as_secs()
+            )
         })?;
         let outputs = session
             .run(ort::inputs![
@@ -638,7 +641,10 @@ impl NeuralNer {
                  a previous inference call is likely stuck.",
                 lock_timeout.as_secs()
             );
-            anyhow::anyhow!("NER session lock timeout ({}s) in extract", lock_timeout.as_secs())
+            anyhow::anyhow!(
+                "NER session lock timeout ({}s) in extract",
+                lock_timeout.as_secs()
+            )
         })?;
 
         // Tokenize input
