@@ -939,7 +939,7 @@ mod tests {
         });
         let req: UpsertRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.external_id, "linear:SHO-123");
-        assert_eq!(req.change_type, "update"); // default
+        assert_eq!(req.change_type, "content_updated"); // default
     }
 
     #[test]
