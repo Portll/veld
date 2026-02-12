@@ -337,7 +337,7 @@ impl KeywordExtractor {
                 .filter(|c| c.is_alphanumeric())
                 .collect::<String>();
 
-            if !clean_word.is_empty() && !self.stop_words.contains(&clean_word) {
+            if clean_word.len() >= 2 && !self.stop_words.contains(&clean_word) {
                 *word_freq.entry(clean_word).or_insert(0) += 1;
             }
         }
@@ -741,12 +741,14 @@ impl SemanticConsolidator {
         candidates.truncate(CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY);
 
         // Entity pair relationships (sorted for determinism)
+        // Filter out single-char entities and stop words to avoid noise like "as relates to c"
         if memory.experience.entities.len() >= 2 {
             let mut sorted_entities: Vec<String> = memory
                 .experience
                 .entities
                 .iter()
                 .map(|e| e.to_lowercase())
+                .filter(|e| e.len() >= 2 && !self.keyword_extractor.is_stop_word(e))
                 .collect();
             sorted_entities.sort();
             sorted_entities.dedup();
@@ -1065,9 +1067,13 @@ impl SemanticConsolidator {
             fact.source_memories.push(memory.id.clone());
         }
 
-        // Add any new entities
+        // Add any new entities (filter noise: short tokens, stop words)
         for entity in &memory.experience.entities {
-            if !fact.related_entities.contains(entity) {
+            let lower = entity.to_lowercase();
+            if lower.len() >= 2
+                && !self.keyword_extractor.is_stop_word(&lower)
+                && !fact.related_entities.contains(entity)
+            {
                 fact.related_entities.push(entity.clone());
             }
         }
