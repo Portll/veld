@@ -4161,6 +4161,10 @@ pub struct MaintenanceResult {
     pub memories_replayed: usize,
     /// Total priority score of replayed memories
     pub total_priority_score: f32,
+    /// Number of new semantic facts extracted during consolidation
+    pub facts_extracted: usize,
+    /// Number of existing facts reinforced (dedup hit) during consolidation
+    pub facts_reinforced: usize,
 }
 
 #[cfg(test)]

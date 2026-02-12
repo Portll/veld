@@ -105,10 +105,11 @@ pub async fn consolidate_memories(
     // This includes: tier consolidation, decay, graph maintenance, and memory replay
     let maintenance_result = {
         let memory = memory.clone();
+        let user_id_for_maintenance = req.user_id.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
             // run_maintenance returns the number of decayed memories
-            memory_guard.run_maintenance(0.95) // 5% decay factor
+            memory_guard.run_maintenance(0.95, &user_id_for_maintenance) // 5% decay factor
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Maintenance task panicked: {e}")))?
