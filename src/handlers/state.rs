@@ -889,13 +889,17 @@ impl MultiUserMemoryManager {
         let user_count = user_ids.len();
         let mut edges_decayed = 0;
         let mut edges_strengthened = 0;
+        let mut total_facts_extracted = 0;
+        let mut total_facts_reinforced = 0;
 
         for user_id in user_ids {
             let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
-                match memory.run_maintenance(decay_factor) {
+                match memory.run_maintenance(decay_factor, &user_id) {
                     Ok(result) => {
                         total_processed += result.decayed_count;
+                        total_facts_extracted += result.facts_extracted;
+                        total_facts_reinforced += result.facts_reinforced;
                         Some(result)
                     }
                     Err(e) => {
@@ -941,10 +945,12 @@ impl MultiUserMemoryManager {
         }
 
         tracing::info!(
-            "Maintenance complete: {} memories processed, {} edges strengthened, {} weak edges pruned across {} users",
+            "Maintenance complete: {} memories processed, {} edges strengthened, {} weak edges pruned, {} facts extracted, {} facts reinforced across {} users",
             total_processed,
             edges_strengthened,
             edges_decayed,
+            total_facts_extracted,
+            total_facts_reinforced,
             user_count
         );
 

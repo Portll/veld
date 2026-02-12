@@ -4347,6 +4347,92 @@ impl MemorySystem {
         }
     }
 
+    /// Connect extracted facts to the knowledge graph.
+    ///
+    /// For each fact, ensures all related entities exist as EntityNodes and creates
+    /// RelationshipEdges between all pairs. Uses L2Episodic tier because facts are
+    /// consolidated knowledge (survived 7-day aging + 2+ supporting memories).
+    /// `add_entity` upserts (increments mention_count if existing), and
+    /// `add_relationship` strengthens via Hebbian learning if the edge already exists.
+    fn connect_facts_to_graph(&self, facts: &[SemanticFact]) {
+        let graph = match &self.graph_memory {
+            Some(g) => g,
+            None => return,
+        };
+        let graph_guard = graph.read();
+        let now = chrono::Utc::now();
+        let mut entities_added = 0;
+        let mut edges_added = 0;
+
+        for fact in facts {
+            // Ensure all related entities exist as graph nodes
+            for entity_name in &fact.related_entities {
+                let entity = crate::graph_memory::EntityNode {
+                    uuid: Uuid::new_v4(),
+                    name: entity_name.clone(),
+                    labels: vec![crate::graph_memory::EntityLabel::Concept],
+                    created_at: now,
+                    last_seen_at: now,
+                    mention_count: 1,
+                    summary: String::new(),
+                    attributes: std::collections::HashMap::new(),
+                    name_embedding: None,
+                    salience: fact.confidence * 0.5,
+                    is_proper_noun: entity_name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false),
+                };
+                if graph_guard.add_entity(entity).is_ok() {
+                    entities_added += 1;
+                }
+            }
+
+            // Create edges between all pairs of related entities
+            let entities = &fact.related_entities;
+            for i in 0..entities.len() {
+                for j in (i + 1)..entities.len() {
+                    if let (Ok(Some(e1)), Ok(Some(e2))) = (
+                        graph_guard.find_entity_by_name(&entities[i]),
+                        graph_guard.find_entity_by_name(&entities[j]),
+                    ) {
+                        let edge = crate::graph_memory::RelationshipEdge {
+                            uuid: Uuid::new_v4(),
+                            from_entity: e1.uuid,
+                            to_entity: e2.uuid,
+                            relation_type: crate::graph_memory::RelationType::RelatedTo,
+                            strength: crate::graph_memory::EdgeTier::L2Episodic.initial_weight(),
+                            created_at: now,
+                            valid_at: now,
+                            invalidated_at: None,
+                            source_episode_id: None,
+                            context: fact.fact.chars().take(100).collect(),
+                            last_activated: now,
+                            activation_count: 1,
+                            ltp_status: crate::graph_memory::LtpStatus::None,
+                            tier: crate::graph_memory::EdgeTier::L2Episodic,
+                            activation_timestamps: None,
+                            entity_confidence: Some(fact.confidence),
+                        };
+                        if graph_guard.add_relationship(edge).is_ok() {
+                            edges_added += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if entities_added > 0 || edges_added > 0 {
+            tracing::debug!(
+                entities_added,
+                edges_added,
+                facts = facts.len(),
+                "Connected facts to knowledge graph"
+            );
+        }
+    }
+
     /// Get memory graph statistics
     pub fn graph_stats(&self) -> MemoryGraphStats {
         if let Some(graph) = &self.graph_memory {
@@ -4726,7 +4812,7 @@ impl MemorySystem {
     ///
     /// Returns the number of memories processed for activation decay.
     /// Also records consolidation events for introspection.
-    pub fn run_maintenance(&self, decay_factor: f32) -> Result<MaintenanceResult> {
+    pub fn run_maintenance(&self, decay_factor: f32, user_id: &str) -> Result<MaintenanceResult> {
         let start_time = std::time::Instant::now();
         let now = chrono::Utc::now();
 
@@ -4863,6 +4949,111 @@ impl MemorySystem {
                 facts_decayed,
                 facts_deleted
             );
+        }
+
+        // 3.7. Fact extraction: consolidate episodic memories into semantic facts
+        // Runs SemanticConsolidator to extract patterns, procedures, preferences, etc.
+        // Deduplicates against existing facts via Jaccard similarity (threshold 0.7)
+        // Connects newly extracted facts to the knowledge graph as L2 entity edges
+        let mut facts_extracted_count = 0;
+        let mut facts_reinforced_count = 0;
+        {
+            let all_memories = self.get_all_memories().unwrap_or_default();
+            if !all_memories.is_empty() {
+                let memories: Vec<Memory> = all_memories
+                    .into_iter()
+                    .map(|arc_mem| (*arc_mem).clone())
+                    .collect();
+
+                let consolidator = compression::SemanticConsolidator::new();
+                let consolidation_result = consolidator.consolidate(&memories);
+
+                if !consolidation_result.new_facts.is_empty() {
+                    let mut truly_new = Vec::new();
+
+                    for fact in &consolidation_result.new_facts {
+                        // Dedup: check if a similar fact already exists
+                        match self.fact_store.find_similar(user_id, &fact.fact, 0.7) {
+                            Ok(Some(mut existing)) => {
+                                // Reinforce the existing fact
+                                existing.support_count += 1;
+                                existing.last_reinforced = now;
+                                let confidence_before = existing.confidence;
+                                let boost = 0.1 * (1.0 - existing.confidence);
+                                existing.confidence = (existing.confidence + boost).min(1.0);
+
+                                // Extend source memories and related entities
+                                for src in &fact.source_memories {
+                                    if !existing.source_memories.contains(src) {
+                                        existing.source_memories.push(src.clone());
+                                    }
+                                }
+                                for entity in &fact.related_entities {
+                                    if !existing.related_entities.contains(entity) {
+                                        existing.related_entities.push(entity.clone());
+                                    }
+                                }
+
+                                if let Err(e) = self.fact_store.update(user_id, &existing) {
+                                    tracing::debug!("Failed to reinforce fact: {e}");
+                                } else {
+                                    facts_reinforced_count += 1;
+                                    self.record_consolidation_event_for_user(
+                                        user_id,
+                                        ConsolidationEvent::FactReinforced {
+                                            fact_id: existing.id.clone(),
+                                            fact_content: existing.fact.clone(),
+                                            confidence_before,
+                                            confidence_after: existing.confidence,
+                                            new_support_count: existing.support_count,
+                                            timestamp: now,
+                                        },
+                                    );
+                                }
+                            }
+                            _ => {
+                                truly_new.push(fact.clone());
+                            }
+                        }
+                    }
+
+                    // Store new facts
+                    if !truly_new.is_empty() {
+                        match self.fact_store.store_batch(user_id, &truly_new) {
+                            Ok(stored) => {
+                                facts_extracted_count = stored;
+                                for fact in &truly_new {
+                                    self.record_consolidation_event_for_user(
+                                        user_id,
+                                        ConsolidationEvent::FactExtracted {
+                                            fact_id: fact.id.clone(),
+                                            fact_content: fact.fact.clone(),
+                                            confidence: fact.confidence,
+                                            fact_type: format!("{:?}", fact.fact_type),
+                                            source_memory_count: fact.source_memories.len(),
+                                            timestamp: now,
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to store extracted facts: {e}");
+                            }
+                        }
+
+                        // Connect newly extracted facts to the knowledge graph
+                        self.connect_facts_to_graph(&truly_new);
+                    }
+
+                    if facts_extracted_count > 0 || facts_reinforced_count > 0 {
+                        tracing::debug!(
+                            extracted = facts_extracted_count,
+                            reinforced = facts_reinforced_count,
+                            "Fact consolidation during maintenance"
+                        );
+                    }
+                }
+            }
         }
 
         // 4. SHO-105 + PIPE-2: Memory replay cycle (pattern-triggered consolidation)
@@ -5056,6 +5247,8 @@ impl MemorySystem {
             edge_boosts: replay_result.edge_boosts,
             memories_replayed: replay_result.memories_replayed,
             total_priority_score: replay_result.total_priority_score,
+            facts_extracted: facts_extracted_count,
+            facts_reinforced: facts_reinforced_count,
         })
     }
 
@@ -5339,6 +5532,39 @@ impl MemorySystem {
     /// Get statistics about stored facts
     pub fn get_fact_stats(&self, user_id: &str) -> Result<facts::FactStats> {
         self.fact_store.stats(user_id)
+    }
+
+    /// Get facts associated with graph entity names.
+    ///
+    /// Bridges graph traversal → fact retrieval: when spreading activation discovers
+    /// entity nodes, this method returns the semantic facts linked to those entities.
+    /// Results are deduplicated and sorted by confidence (highest first).
+    pub fn get_facts_for_graph_entities(
+        &self,
+        user_id: &str,
+        entity_names: &[String],
+        limit_per_entity: usize,
+    ) -> Result<Vec<SemanticFact>> {
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut results = Vec::new();
+
+        for name in entity_names {
+            let facts = self
+                .fact_store
+                .find_by_entity(user_id, name, limit_per_entity)?;
+            for fact in facts {
+                if seen_ids.insert(fact.id.clone()) {
+                    results.push(fact);
+                }
+            }
+        }
+
+        results.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results)
     }
 
     /// Reinforce a fact with new supporting evidence
