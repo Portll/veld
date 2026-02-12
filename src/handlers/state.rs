@@ -34,8 +34,8 @@ use crate::graph_memory::{
     LtpStatus, RelationType, RelationshipEdge,
 };
 use crate::memory::{
-    facts::SemanticFactStore, query_parser, Experience, FeedbackStore, FileMemoryStore,
-    MemoryConfig, MemoryId, MemoryStats, MemorySystem, ProspectiveStore, SessionStore, TodoStore,
+    query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
+    MemorySystem, ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::streaming;
 
@@ -217,9 +217,6 @@ pub struct MultiUserMemoryManager {
     /// A/B testing manager for relevance scoring experiments
     pub ab_test_manager: Arc<ab_testing::ABTestManager>,
 
-    /// Semantic fact store for durable knowledge
-    pub fact_store: Arc<SemanticFactStore>,
-
     /// Session tracking store
     pub session_store: Arc<SessionStore>,
 }
@@ -383,14 +380,6 @@ impl MultiUserMemoryManager {
             info!("Backup engine initialized (auto-backup disabled)");
         }
 
-        let facts_path = base_path.join("semantic_facts");
-        let mut facts_opts = rocksdb::Options::default();
-        facts_opts.create_if_missing(true);
-        facts_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let facts_db = Arc::new(rocksdb::DB::open(&facts_opts, &facts_path)?);
-        let fact_store = Arc::new(SemanticFactStore::new(facts_db));
-        info!("Semantic fact store initialized");
-
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
@@ -416,7 +405,6 @@ impl MultiUserMemoryManager {
                 tx
             },
             ab_test_manager: Arc::new(ab_testing::ABTestManager::new()),
-            fact_store,
             session_store: Arc::new(SessionStore::new()),
         };
 
@@ -992,11 +980,6 @@ impl MultiUserMemoryManager {
         &self.feedback_store
     }
 
-    /// Get the fact store
-    pub fn fact_store(&self) -> &Arc<SemanticFactStore> {
-        &self.fact_store
-    }
-
     /// Get the session store
     pub fn session_store(&self) -> &Arc<SessionStore> {
         &self.session_store
@@ -1050,11 +1033,6 @@ impl MultiUserMemoryManager {
 
         // ProspectiveStore (reminders) databases
         for (name, db) in self.prospective_store.databases() {
-            refs.push((name.to_string(), std::sync::Arc::clone(db)));
-        }
-
-        // SemanticFactStore database
-        for (name, db) in self.fact_store.databases() {
             refs.push((name.to_string(), std::sync::Arc::clone(db)));
         }
 

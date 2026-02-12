@@ -243,9 +243,15 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use std::sync::Mutex;
+
+    /// Process-global lock for tests that manipulate environment variables.
+    /// `env::set_var` / `env::remove_var` are not thread-safe, so all tests
+    /// that touch auth env vars must hold this lock for the duration of the test.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Clear all auth-related env vars to isolate tests.
-    /// Tests MUST run with --test-threads=1 because env::set_var is process-global.
+    /// Caller MUST hold `ENV_LOCK` — this is not enforced at compile time.
     fn clear_auth_env() {
         env::remove_var("SHODH_API_KEYS");
         env::remove_var("SHODH_DEV_API_KEY");
@@ -298,6 +304,7 @@ mod tests {
 
     #[test]
     fn production_mode_detection() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
 
         assert!(!is_production_mode());
@@ -324,6 +331,7 @@ mod tests {
 
     #[test]
     fn validate_with_single_api_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_API_KEYS", "my-key");
         assert!(validate_api_key("my-key").is_ok());
@@ -333,6 +341,7 @@ mod tests {
 
     #[test]
     fn validate_with_multiple_api_keys() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_API_KEYS", "key1,key2,key3");
         assert!(validate_api_key("key1").is_ok());
@@ -344,6 +353,7 @@ mod tests {
 
     #[test]
     fn validate_api_keys_trims_whitespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_API_KEYS", " key1 , key2 ");
         assert!(validate_api_key("key1").is_ok());
@@ -355,6 +365,7 @@ mod tests {
 
     #[test]
     fn validate_with_dev_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_DEV_API_KEY", "dev-key-123");
         assert!(validate_api_key("dev-key-123").is_ok());
@@ -366,6 +377,7 @@ mod tests {
 
     #[test]
     fn validate_with_default_dev_key_when_no_env_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         assert!(validate_api_key(DEFAULT_DEV_API_KEY).is_ok());
         assert!(validate_api_key("wrong-key").is_err());
@@ -376,6 +388,7 @@ mod tests {
 
     #[test]
     fn validate_production_rejects_when_no_keys() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_ENV", "production");
         let result = validate_api_key("any-key");
@@ -389,6 +402,7 @@ mod tests {
 
     #[test]
     fn validate_production_works_with_api_keys_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_ENV", "production");
         env::set_var("SHODH_API_KEYS", "prod-key");
@@ -401,6 +415,7 @@ mod tests {
 
     #[test]
     fn validate_empty_api_keys_falls_through() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_API_KEYS", "  ");
         // Empty SHODH_API_KEYS falls through to dev key / default
@@ -410,6 +425,7 @@ mod tests {
 
     #[test]
     fn validate_empty_dev_key_uses_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_DEV_API_KEY", "  ");
         assert!(validate_api_key(DEFAULT_DEV_API_KEY).is_ok());
@@ -418,6 +434,7 @@ mod tests {
 
     #[test]
     fn api_keys_takes_priority_over_dev_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_API_KEYS", "prod-key");
         env::set_var("SHODH_DEV_API_KEY", "dev-key");
@@ -455,6 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_response_is_valid_json() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         let resp = AuthError::MissingApiKey.into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -469,6 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_key_dev_message_includes_help() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         // Not production → should include env var names in message
         let resp = AuthError::MissingApiKey.into_response();
@@ -491,6 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_key_dev_message_includes_help() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         let resp = AuthError::InvalidApiKey.into_response();
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
@@ -508,6 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_key_prod_message_is_terse() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_ENV", "production");
         let resp = AuthError::MissingApiKey.into_response();
@@ -523,6 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_key_prod_message_is_terse() {
+        let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_ENV", "production");
         let resp = AuthError::InvalidApiKey.into_response();

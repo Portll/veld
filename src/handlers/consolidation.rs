@@ -44,62 +44,23 @@ pub async fn consolidate_memories(
 
     let min_support = req.min_support;
     let min_age_days = req.min_age_days;
+    let user_id = req.user_id.clone();
 
-    // Run consolidation in blocking task
-    let result = {
+    // Run consolidation via MemorySystem::distill_facts which stores in the
+    // per-user fact store (same DB that list_facts/search_facts read from).
+    // Previously this stored in state.fact_store (a separate standalone DB)
+    // which was never read by any endpoint — a silent data loss bug.
+    let (result, warnings) = {
         let memory = memory.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-
-            // Get all memories for consolidation
-            let all_memories = memory_guard.get_all_memories()?;
-
-            // Convert SharedMemory to Memory for consolidator
-            let memories: Vec<crate::memory::types::Memory> = all_memories
-                .into_iter()
-                .map(|arc_mem| (*arc_mem).clone())
-                .collect();
-
-            // Create consolidator with custom thresholds
-            let consolidator =
-                crate::memory::SemanticConsolidator::with_thresholds(min_support, min_age_days);
-
-            // Run consolidation
-            Ok::<_, anyhow::Error>(consolidator.consolidate(&memories))
+            memory_guard.distill_facts(&user_id, min_support, min_age_days)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map(|r| (r, Vec::<String>::new()))
         .map_err(AppError::Internal)?
     };
-
-    // AUD-7: Store extracted facts in the semantic fact store
-    let mut warnings = Vec::new();
-    if !result.new_facts.is_empty() {
-        match state
-            .fact_store
-            .store_batch(&req.user_id, &result.new_facts)
-        {
-            Ok(stored) => {
-                tracing::info!(
-                    user_id = %req.user_id,
-                    facts_stored = stored,
-                    "Stored extracted facts in semantic fact store"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    user_id = %req.user_id,
-                    error = %e,
-                    "Failed to store extracted facts"
-                );
-                warnings.push(format!(
-                    "Failed to store {} extracted facts: {}",
-                    result.new_facts.len(),
-                    e
-                ));
-            }
-        }
-    }
 
     // AUD-9: Run memory replay/maintenance cycle
     // This includes: tier consolidation, decay, graph maintenance, and memory replay
@@ -147,10 +108,14 @@ pub async fn consolidate_memories(
         .with_label_values(&["success"])
         .inc();
 
+    // Combine fact counts from both the explicit distill and the maintenance loop
+    let total_extracted = result.facts_extracted + maintenance_result.facts_extracted;
+    let total_reinforced = result.facts_reinforced + maintenance_result.facts_reinforced;
+
     Ok(Json(ConsolidateResponse {
         memories_analyzed: result.memories_processed,
-        facts_extracted: result.facts_extracted,
-        facts_reinforced: result.facts_reinforced,
+        facts_extracted: total_extracted,
+        facts_reinforced: total_reinforced,
         fact_ids: result.new_fact_ids,
         memories_replayed,
         edges_strengthened,

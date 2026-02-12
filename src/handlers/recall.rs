@@ -473,21 +473,35 @@ pub async fn recall(
             }
         }
 
-        // Query fact store for facts related to these entities
-        let mut found_facts = Vec::new();
-        for entity in all_entities.iter().take(10) {
-            if let Ok(entity_facts) = state.fact_store.find_by_entity(&req.user_id, entity, 5) {
-                for fact in entity_facts {
-                    found_facts.push(RecallFact {
-                        id: fact.id.clone(),
-                        fact: fact.fact.clone(),
-                        confidence: fact.confidence,
-                        support_count: fact.support_count,
-                        related_entities: fact.related_entities.clone(),
-                    });
+        // Query the per-user fact store for facts related to these entities.
+        // Uses MemorySystem's fact_store (same DB that list_facts/search_facts read from),
+        // NOT state.fact_store which is a separate standalone DB.
+        let entity_list: Vec<String> = all_entities.into_iter().take(10).collect();
+        let found_facts = {
+            let memory = memory.clone();
+            let user_id = req.user_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let memory_guard = memory.read();
+                let mut facts = Vec::new();
+                for entity in &entity_list {
+                    if let Ok(entity_facts) = memory_guard.get_facts_by_entity(&user_id, entity, 5)
+                    {
+                        for fact in entity_facts {
+                            facts.push(RecallFact {
+                                id: fact.id.clone(),
+                                fact: fact.fact.clone(),
+                                confidence: fact.confidence,
+                                support_count: fact.support_count,
+                                related_entities: fact.related_entities.clone(),
+                            });
+                        }
+                    }
                 }
-            }
-        }
+                facts
+            })
+            .await
+            .unwrap_or_default()
+        };
 
         // Deduplicate by fact ID and take top 5 by confidence
         let mut unique_facts: std::collections::HashMap<String, RecallFact> =
