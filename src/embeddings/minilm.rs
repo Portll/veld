@@ -25,9 +25,19 @@ use tokenizers::Tokenizer;
 use super::Embedder;
 
 /// Thread-safe guard for ORT_DYLIB_PATH initialization.
-/// Using OnceLock ensures set_var is called exactly once, before other threads start.
-/// This mitigates the UB risk of concurrent env::set_var calls.
+/// Using OnceLock ensures set_var is called exactly once.
 static ORT_PATH_INIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+/// Pre-initialize the ONNX Runtime path before any async work begins.
+///
+/// # Safety
+/// This function calls `std::env::set_var` which is unsound in multi-threaded
+/// contexts (Rust 1.66+). It MUST be called before `tokio::main` spawns worker
+/// threads — i.e., very early in `async fn main()` before any `.await` or
+/// `tokio::spawn` calls. The OnceLock ensures it only runs once.
+pub fn pre_init_ort_runtime(offline_mode: bool) {
+    let _ = ORT_PATH_INIT.get_or_init(|| MiniLMEmbedder::init_ort_path_inner(offline_mode));
+}
 
 /// Lazily initialized ONNX session and tokenizer
 struct LazyModel {

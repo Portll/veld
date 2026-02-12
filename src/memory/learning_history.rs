@@ -7,7 +7,7 @@
 //! - Audit trail (what did the system learn and when)
 //!
 //! Storage schema:
-//! - `learning:{user_id}:{timestamp_nanos}` - Primary event storage (time-ordered)
+//! - `learning:{user_id}:{timestamp_nanos:020}` - Primary event storage (time-ordered)
 //! - `learning_by_memory:{user_id}:{memory_id}:{timestamp}` - Index by memory
 //! - `learning_by_type:{user_id}:{event_type}:{timestamp}` - Index by event type
 //! - `learning_stats:{user_id}` - Aggregated learning statistics
@@ -143,13 +143,19 @@ impl LearningHistoryStore {
         };
 
         let timestamp = event.timestamp();
-        let timestamp_nanos = timestamp.timestamp_nanos_opt().unwrap_or(0);
+        let timestamp_nanos = timestamp.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("learning event timestamp outside i64 nanos range, using 0");
+            0
+        });
 
         // Primary storage (time-ordered)
         // Use MessagePack (rmp-serde) - binary format that supports serde tagged enums
         let key = format!("learning:{}:{:020}", user_id, timestamp_nanos);
         let value = rmp_serde::to_vec(&stored)?;
-        self.db.put(key.as_bytes(), &value)?;
+
+        // Batch all writes atomically — avoids orphaned index entries on crash
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(key.as_bytes(), &value);
 
         // Index by memory ID
         if let Some(ref mem_id) = memory_id {
@@ -157,7 +163,7 @@ impl LearningHistoryStore {
                 "learning_by_memory:{}:{}:{:020}",
                 user_id, mem_id, timestamp_nanos
             );
-            self.db.put(mem_key.as_bytes(), key.as_bytes())?;
+            batch.put(mem_key.as_bytes(), key.as_bytes());
         }
 
         // Index related memory too (for edges/interference)
@@ -166,7 +172,7 @@ impl LearningHistoryStore {
                 "learning_by_memory:{}:{}:{:020}",
                 user_id, related_id, timestamp_nanos
             );
-            self.db.put(related_key.as_bytes(), key.as_bytes())?;
+            batch.put(related_key.as_bytes(), key.as_bytes());
         }
 
         // Index by fact ID
@@ -175,7 +181,7 @@ impl LearningHistoryStore {
                 "learning_by_fact:{}:{}:{:020}",
                 user_id, f_id, timestamp_nanos
             );
-            self.db.put(fact_key.as_bytes(), key.as_bytes())?;
+            batch.put(fact_key.as_bytes(), key.as_bytes());
         }
 
         // Index by event type
@@ -185,7 +191,9 @@ impl LearningHistoryStore {
             event_type.as_str(),
             timestamp_nanos
         );
-        self.db.put(type_key.as_bytes(), key.as_bytes())?;
+        batch.put(type_key.as_bytes(), key.as_bytes());
+
+        self.db.write(batch)?;
 
         Ok(())
     }
@@ -259,8 +267,55 @@ impl LearningHistoryStore {
                 None,
                 None,
             ),
-            // These are not significant - shouldn't be stored
-            _ => (
+            // Remaining variants are not significant learning events.
+            // Matched exhaustively so new variants cause a compile error.
+            ConsolidationEvent::MemoryStrengthened { memory_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(memory_id.clone()),
+                None,
+                None,
+            ),
+            ConsolidationEvent::MemoryDecayed { memory_id, .. }
+            | ConsolidationEvent::MemoryWeakened { memory_id, .. }
+            | ConsolidationEvent::SalienceSpikeDetected { memory_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(memory_id.clone()),
+                None,
+                None,
+            ),
+            ConsolidationEvent::EdgeFormed {
+                from_memory_id,
+                to_memory_id,
+                ..
+            }
+            | ConsolidationEvent::EdgeStrengthened {
+                from_memory_id,
+                to_memory_id,
+                ..
+            }
+            | ConsolidationEvent::EdgePruned {
+                from_memory_id,
+                to_memory_id,
+                ..
+            } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(from_memory_id.clone()),
+                Some(to_memory_id.clone()),
+                None,
+            ),
+            ConsolidationEvent::FactDecayed { fact_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                None,
+                None,
+                Some(fact_id.clone()),
+            ),
+            ConsolidationEvent::RetrievalCompetition { .. }
+            | ConsolidationEvent::PatternTriggeredReplay { .. }
+            | ConsolidationEvent::EntityPatternDetected { .. }
+            | ConsolidationEvent::SemanticClusterFormed { .. }
+            | ConsolidationEvent::TemporalClusterFormed { .. }
+            | ConsolidationEvent::BehavioralChangeDetected { .. }
+            | ConsolidationEvent::PatternDetected { .. } => (
                 LearningEventType::MaintenanceCycleCompleted,
                 None,
                 None,
@@ -275,7 +330,10 @@ impl LearningHistoryStore {
         user_id: &str,
         since: DateTime<Utc>,
     ) -> Result<Vec<StoredLearningEvent>> {
-        let since_nanos = since.timestamp_nanos_opt().unwrap_or(0);
+        let since_nanos = since.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("events_since timestamp outside i64 nanos range, using 0");
+            0
+        });
         let prefix = format!("learning:{}:", user_id);
         let start_key = format!("learning:{}:{:020}", user_id, since_nanos);
 
@@ -309,11 +367,44 @@ impl LearningHistoryStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Vec<StoredLearningEvent>> {
-        let events = self.events_since(user_id, since)?;
-        Ok(events
-            .into_iter()
-            .filter(|e| e.event.timestamp() <= until)
-            .collect())
+        let since_nanos = since.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("events_in_range since timestamp outside i64 nanos range, using 0");
+            0
+        });
+        let until_nanos = until.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!(
+                "events_in_range until timestamp outside i64 nanos range, using i64::MAX"
+            );
+            i64::MAX
+        });
+        let prefix = format!("learning:{}:", user_id);
+        let start_key = format!("learning:{}:{:020}", user_id, since_nanos);
+        let end_key = format!("learning:{}:{:020}", user_id, until_nanos);
+
+        let mut events = Vec::new();
+        let iter = self.db.iterator(IteratorMode::From(
+            start_key.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            // Stop once we pass the upper bound key
+            if key_str.as_ref() > end_key.as_str() {
+                break;
+            }
+
+            if let Ok(event) = rmp_serde::from_slice::<StoredLearningEvent>(&value) {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
     }
 
     /// Get learning events for a specific memory
@@ -577,14 +668,18 @@ impl LearningHistoryStore {
     /// Prune old learning history (keep last N days)
     pub fn prune_old_events(&self, user_id: &str, keep_days: i64) -> Result<usize> {
         let cutoff = Utc::now() - Duration::days(keep_days);
-        let cutoff_nanos = cutoff.timestamp_nanos_opt().unwrap_or(0);
+        let cutoff_nanos = cutoff.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("prune cutoff timestamp outside i64 nanos range, using 0");
+            0
+        });
 
         let prefix = format!("learning:{}:", user_id);
+        let mut batch = rocksdb::WriteBatch::default();
         let mut deleted = 0;
 
         let iter = self.db.prefix_iterator(prefix.as_bytes());
         for item in iter {
-            let (key, _) = item?;
+            let (key, value) = item?;
             let key_str = String::from_utf8_lossy(&key);
 
             if !key_str.starts_with(&prefix) {
@@ -595,14 +690,53 @@ impl LearningHistoryStore {
             if let Some(ts_str) = key_str.strip_prefix(&prefix) {
                 if let Ok(ts) = ts_str.parse::<i64>() {
                     if ts < cutoff_nanos {
-                        self.db.delete(&key)?;
+                        // Delete primary key
+                        batch.delete(&key);
+
+                        // Also delete secondary index entries for this event
+                        if let Ok(stored) = rmp_serde::from_slice::<StoredLearningEvent>(&value) {
+                            let ts_fmt = format!("{:020}", ts);
+                            if let Some(ref mem_id) = stored.memory_id {
+                                batch.delete(
+                                    format!("learning_by_memory:{}:{}:{}", user_id, mem_id, ts_fmt)
+                                        .as_bytes(),
+                                );
+                            }
+                            if let Some(ref related_id) = stored.related_memory_id {
+                                batch.delete(
+                                    format!(
+                                        "learning_by_memory:{}:{}:{}",
+                                        user_id, related_id, ts_fmt
+                                    )
+                                    .as_bytes(),
+                                );
+                            }
+                            if let Some(ref f_id) = stored.fact_id {
+                                batch.delete(
+                                    format!("learning_by_fact:{}:{}:{}", user_id, f_id, ts_fmt)
+                                        .as_bytes(),
+                                );
+                            }
+                            batch.delete(
+                                format!(
+                                    "learning_by_type:{}:{}:{}",
+                                    user_id,
+                                    stored.event_type.as_str(),
+                                    ts_fmt
+                                )
+                                .as_bytes(),
+                            );
+                        }
+
                         deleted += 1;
                     }
                 }
             }
         }
 
-        // Note: This doesn't clean up secondary indexes - could add that if needed
+        if deleted > 0 {
+            self.db.write(batch)?;
+        }
 
         Ok(deleted)
     }

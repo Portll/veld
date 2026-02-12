@@ -4,6 +4,7 @@
 - Production grade code only, no TODOs, no placeholders, no mocks, no stubs
 - Understand context, take a bird's eye view, understand architecture and data flow before fixing anything
 - Don't build, don't trunk serve - user runs in background
+- `cargo check` and `cargo clippy` are allowed (compiler frontend only, no binary output)
 - DO NOT add "Generated with Claude Code" signature or "Co-Authored-By" lines to git commits - clean commit messages only
 
 ---

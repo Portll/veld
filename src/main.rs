@@ -27,6 +27,7 @@ use tracing::info;
 use shodh_memory::{
     auth,
     config::ServerConfig,
+    embeddings::minilm::pre_init_ort_runtime,
     handlers::{self, AppState, MultiUserMemoryManager},
     metrics, middleware,
 };
@@ -131,13 +132,15 @@ use shodh_memory::constants::{
     DATABASE_FLUSH_TIMEOUT_SECS, GRACEFUL_SHUTDOWN_TIMEOUT_SECS, VECTOR_INDEX_SAVE_TIMEOUT_SECS,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Synchronous entry point: sets env vars before any threads are spawned,
+/// then hands off to the async runtime. This eliminates the unsoundness of
+/// calling `std::env::set_var` after `#[tokio::main]` has started workers.
+fn main() -> Result<()> {
     // Parse CLI arguments FIRST (enables --help without initializing storage)
     let cli = Cli::parse();
 
-    // Set environment variables from CLI args so ServerConfig::from_env() picks them up
-    // CLI args take precedence over existing env vars (clap already handles this)
+    // Set environment variables from CLI args so ServerConfig::from_env() picks them up.
+    // Safe here: no threads exist yet — we haven't built the tokio runtime.
     std::env::set_var("SHODH_HOST", &cli.host);
     std::env::set_var("SHODH_PORT", cli.port.to_string());
     std::env::set_var(
@@ -150,9 +153,26 @@ async fn main() -> Result<()> {
     std::env::set_var("SHODH_RATE_LIMIT", cli.rate_limit.to_string());
     std::env::set_var("SHODH_MAX_CONCURRENT", cli.max_concurrent.to_string());
 
+    // Pre-initialize ORT_DYLIB_PATH before any threads are spawned.
+    pre_init_ort_runtime(false);
+
+    // Set default log level if not configured (before any threads exist)
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "shodh_memory=info,tower_http=warn");
+    }
+
     // Load .env file if present (won't override CLI-set vars)
     let _ = dotenvy::dotenv();
 
+    // Build and enter the tokio runtime
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Initialize tracing
     #[cfg(feature = "telemetry")]
     {
@@ -160,9 +180,6 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(feature = "telemetry"))]
     {
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "shodh_memory=info,tower_http=warn");
-        }
         tracing_subscriber::fmt::init();
     }
 
