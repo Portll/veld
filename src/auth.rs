@@ -430,9 +430,18 @@ mod tests {
 
     #[test]
     fn auth_error_status_codes() {
-        assert_eq!(AuthError::MissingApiKey.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(AuthError::InvalidApiKey.status_code(), StatusCode::UNAUTHORIZED);
-        assert_eq!(AuthError::NotConfigured.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            AuthError::MissingApiKey.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AuthError::InvalidApiKey.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AuthError::NotConfigured.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -465,9 +474,18 @@ mod tests {
         let resp = AuthError::MissingApiKey.into_response();
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
         let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert!(parsed.message.contains("SHODH_API_KEYS"), "Should mention SHODH_API_KEYS");
-        assert!(parsed.message.contains("SHODH_DEV_API_KEY"), "Should mention SHODH_DEV_API_KEY");
-        assert!(parsed.message.contains(DEFAULT_DEV_API_KEY), "Should show the default dev key");
+        assert!(
+            parsed.message.contains("SHODH_API_KEYS"),
+            "Should mention SHODH_API_KEYS"
+        );
+        assert!(
+            parsed.message.contains("SHODH_DEV_API_KEY"),
+            "Should mention SHODH_DEV_API_KEY"
+        );
+        assert!(
+            parsed.message.contains(DEFAULT_DEV_API_KEY),
+            "Should show the default dev key"
+        );
         clear_auth_env();
     }
 
@@ -477,8 +495,14 @@ mod tests {
         let resp = AuthError::InvalidApiKey.into_response();
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
         let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
-        assert!(parsed.message.contains("SHODH_API_KEYS"), "Should mention SHODH_API_KEYS");
-        assert!(parsed.message.contains(DEFAULT_DEV_API_KEY), "Should show the default dev key");
+        assert!(
+            parsed.message.contains("SHODH_API_KEYS"),
+            "Should mention SHODH_API_KEYS"
+        );
+        assert!(
+            parsed.message.contains(DEFAULT_DEV_API_KEY),
+            "Should show the default dev key"
+        );
         clear_auth_env();
     }
 
@@ -490,7 +514,10 @@ mod tests {
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
         let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.message, "Missing X-API-Key header");
-        assert!(!parsed.message.contains("SHODH_DEV_API_KEY"), "Prod must not leak env var names");
+        assert!(
+            !parsed.message.contains("SHODH_DEV_API_KEY"),
+            "Prod must not leak env var names"
+        );
         clear_auth_env();
     }
 
@@ -502,7 +529,10 @@ mod tests {
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
         let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.message, "Invalid API key");
-        assert!(!parsed.message.contains(DEFAULT_DEV_API_KEY), "Prod must not leak default key");
+        assert!(
+            !parsed.message.contains(DEFAULT_DEV_API_KEY),
+            "Prod must not leak default key"
+        );
         clear_auth_env();
     }
 
