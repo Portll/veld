@@ -514,7 +514,10 @@ impl NeuralNer {
                 .context("Failed to create batched token_type_ids tensor")?;
 
         // Run batch inference
-        let mut session = match model.session.try_lock_for(std::time::Duration::from_secs(30)) {
+        let mut session = match model
+            .session
+            .try_lock_for(std::time::Duration::from_secs(30))
+        {
             Some(guard) => guard,
             None => {
                 tracing::warn!("NER batch session lock timeout after 30s, returning empty results");
@@ -562,8 +565,7 @@ impl NeuralNer {
                 let token_logits = &logits[start_idx..start_idx + num_labels];
 
                 // Find highest probability label without allocating a Vec
-                let Some((best_idx, best_prob)) = argmax_softmax(token_logits)
-                else {
+                let Some((best_idx, best_prob)) = argmax_softmax(token_logits) else {
                     continue; // Empty probs (shouldn't happen, but defensive)
                 };
 
@@ -630,7 +632,10 @@ impl NeuralNer {
     /// Neural extraction using ONNX model
     fn extract_neural(&self, text: &str) -> Result<Vec<NerEntity>> {
         let model = self.ensure_model_loaded()?;
-        let mut session = match model.session.try_lock_for(std::time::Duration::from_secs(30)) {
+        let mut session = match model
+            .session
+            .try_lock_for(std::time::Duration::from_secs(30))
+        {
             Some(guard) => guard,
             None => {
                 tracing::warn!("NER session lock timeout after 30s, returning empty");
@@ -706,8 +711,7 @@ impl NeuralNer {
             let token_logits = &logits[start_idx..start_idx + num_labels];
 
             // Find best label without allocating a Vec
-            let Some((best_idx, best_prob)) = argmax_softmax(token_logits)
-            else {
+            let Some((best_idx, best_prob)) = argmax_softmax(token_logits) else {
                 continue; // Empty probs (shouldn't happen, but defensive)
             };
 

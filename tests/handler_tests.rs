@@ -66,9 +66,9 @@ impl Harness {
     fn app(&self) -> Router {
         // Mirror main.rs: auth middleware only wraps protected routes.
         let public = build_public_routes(self.mgr.clone());
-        let protected = build_protected_routes(self.mgr.clone()).layer(
-            axum::middleware::from_fn(shodh_memory::auth::auth_middleware),
-        );
+        let protected = build_protected_routes(self.mgr.clone()).layer(axum::middleware::from_fn(
+            shodh_memory::auth::auth_middleware,
+        ));
         Router::new().merge(public).merge(protected)
     }
 }
@@ -175,7 +175,10 @@ async fn json_of(app: Router, req: Request<Body>) -> (StatusCode, serde_json::Va
 async fn auth_public_routes_need_no_key() {
     let h = Harness::new();
     // /health is public
-    assert_eq!(status_of(h.app(), noauth_get("/health")).await, StatusCode::OK);
+    assert_eq!(
+        status_of(h.app(), noauth_get("/health")).await,
+        StatusCode::OK
+    );
     // /health/live is public
     assert_eq!(
         status_of(h.app(), noauth_get("/health/live")).await,
@@ -215,7 +218,10 @@ async fn health_endpoint() {
     let h = Harness::new();
     let (status, body) = json_of(h.app(), authed_get("/health")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.get("status").is_some(), "health response needs 'status' field");
+    assert!(
+        body.get("status").is_some(),
+        "health response needs 'status' field"
+    );
 }
 
 #[tokio::test]
@@ -290,11 +296,7 @@ async fn list_users_empty() {
 #[tokio::test]
 async fn user_stats_fresh() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/users/test-user/stats"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/users/test-user/stats")).await;
     // Creates user on demand → should succeed
     assert!(status.is_success(), "user stats returned {status}");
 }
@@ -302,11 +304,7 @@ async fn user_stats_fresh() {
 #[tokio::test]
 async fn stats_query() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/stats?user_id=test-user"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/stats?user_id=test-user")).await;
     assert!(status.is_success(), "stats query returned {status}");
 }
 
@@ -441,10 +439,7 @@ async fn context_summary_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/context_summary",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/context_summary", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -509,11 +504,7 @@ async fn reinforce_feedback() {
 #[tokio::test]
 async fn list_memories_get_empty() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/list/test-user"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/list/test-user")).await;
     assert!(status.is_success());
 }
 
@@ -531,11 +522,7 @@ async fn list_memories_post_empty() {
 #[tokio::test]
 async fn get_memory_not_found() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/memory/nonexistent-id"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/memory/nonexistent-id")).await;
     // handler may return 404 or 422 for missing memory
     assert!(
         status == StatusCode::NOT_FOUND
@@ -625,10 +612,7 @@ async fn advanced_search_empty() {
     // Handler requires at least one criterion; sending none → 4xx.
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/search/advanced",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/search/advanced", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(
@@ -645,7 +629,10 @@ async fn advanced_search_empty() {
         ),
     )
     .await;
-    assert!(status.is_success(), "advanced_search with entity should succeed: {status}");
+    assert!(
+        status.is_success(),
+        "advanced_search with entity should succeed: {status}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -735,10 +722,7 @@ async fn lineage_list_edges_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/lineage/edges",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/lineage/edges", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -749,10 +733,7 @@ async fn lineage_stats_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/lineage/stats",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/lineage/stats", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -765,11 +746,7 @@ async fn lineage_stats_empty() {
 #[tokio::test]
 async fn graph_stats_fresh() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/graph/test-user/stats"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/graph/test-user/stats")).await;
     assert!(status.is_success());
 }
 
@@ -778,10 +755,7 @@ async fn get_all_entities_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/graph/entities/all",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/graph/entities/all", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -828,12 +802,11 @@ async fn traverse_graph_empty() {
 #[tokio::test]
 async fn graph_data_authenticated() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/graph/data/test-user"),
-    )
-    .await;
-    assert!(status.is_success(), "graph data with auth returned {status}");
+    let (status, _) = json_of(h.app(), authed_get("/api/graph/data/test-user")).await;
+    assert!(
+        status.is_success(),
+        "graph data with auth returned {status}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -949,10 +922,7 @@ async fn project_lifecycle() {
     // List projects
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/projects/list",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/projects/list", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -1045,10 +1015,7 @@ async fn verify_index_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/index/verify",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/index/verify", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -1059,10 +1026,7 @@ async fn rebuild_index_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/index/rebuild",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/index/rebuild", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -1073,10 +1037,7 @@ async fn create_backup() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/backup/create",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/backup/create", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -1087,10 +1048,7 @@ async fn list_backups_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/backup/list",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/backup/list", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -1104,11 +1062,7 @@ async fn list_backups_empty() {
 async fn file_stats() {
     let h = Harness::new();
     // Handler takes user_id as query param: Query<TodoQuery>
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/files/stats?user_id=test-user"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/files/stats?user_id=test-user")).await;
     assert!(status.is_success());
 }
 
@@ -1178,10 +1132,7 @@ async fn export_mif_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/export/mif",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/export/mif", json!({"user_id": "test-user"})),
     )
     .await;
     assert!(status.is_success());
@@ -1194,11 +1145,7 @@ async fn export_mif_empty() {
 #[tokio::test]
 async fn graph_view_html() {
     let h = Harness::new();
-    let resp = h
-        .app()
-        .oneshot(noauth_get("/graph/view"))
-        .await
-        .unwrap();
+    let resp = h.app().oneshot(noauth_get("/graph/view")).await.unwrap();
     // graph/view is public and returns HTML
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -1206,11 +1153,7 @@ async fn graph_view_html() {
 #[tokio::test]
 async fn brain_state_fresh() {
     let h = Harness::new();
-    let (status, _) = json_of(
-        h.app(),
-        authed_get("/api/brain/test-user"),
-    )
-    .await;
+    let (status, _) = json_of(h.app(), authed_get("/api/brain/test-user")).await;
     assert!(status.is_success());
 }
 
@@ -1219,10 +1162,7 @@ async fn build_visualization_empty() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/visualization/build",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/visualization/build", json!({"user_id": "test-user"})),
     )
     .await;
     // May return 200 or 404 on fresh state
@@ -1241,10 +1181,7 @@ async fn linear_sync_no_integration() {
     let h = Harness::new();
     let (status, _) = json_of(
         h.app(),
-        authed_post(
-            "/api/sync/linear",
-            json!({"user_id": "test-user"}),
-        ),
+        authed_post("/api/sync/linear", json!({"user_id": "test-user"})),
     )
     .await;
     // Without Linear API key configured, expect graceful error
@@ -1280,11 +1217,7 @@ async fn remember_then_list() {
     assert_eq!(status, StatusCode::OK);
 
     // List memories — should have at least one
-    let (status, body) = json_of(
-        h.app(),
-        authed_get("/api/list/e2e-user"),
-    )
-    .await;
+    let (status, body) = json_of(h.app(), authed_get("/api/list/e2e-user")).await;
     assert_eq!(status, StatusCode::OK);
     let memories = body.as_array().or(body["memories"].as_array());
     assert!(
@@ -1293,11 +1226,7 @@ async fn remember_then_list() {
     );
 
     // User stats should show 1 memory
-    let (status, body) = json_of(
-        h.app(),
-        authed_get("/api/users/e2e-user/stats"),
-    )
-    .await;
+    let (status, body) = json_of(h.app(), authed_get("/api/users/e2e-user/stats")).await;
     assert_eq!(status, StatusCode::OK);
     let count = body["total_memories"]
         .as_u64()

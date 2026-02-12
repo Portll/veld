@@ -39,10 +39,8 @@ impl TestHarness {
     pub fn new() -> Self {
         // Ensure the test API key is set exactly once (safe for parallel tests).
         static ENV_INIT: Once = Once::new();
-        ENV_INIT.call_once(|| {
-            unsafe {
-                std::env::set_var("SHODH_API_KEYS", TEST_API_KEY);
-            }
+        ENV_INIT.call_once(|| unsafe {
+            std::env::set_var("SHODH_API_KEYS", TEST_API_KEY);
         });
 
         let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -71,9 +69,8 @@ impl TestHarness {
     /// Mirrors `main.rs`: auth middleware wraps only the protected routes.
     pub fn router(&self) -> Router {
         let public = build_public_routes(self.manager.clone());
-        let protected = build_protected_routes(self.manager.clone()).layer(
-            axum::middleware::from_fn(crate::auth::auth_middleware),
-        );
+        let protected = build_protected_routes(self.manager.clone())
+            .layer(axum::middleware::from_fn(crate::auth::auth_middleware));
         Router::new().merge(public).merge(protected)
     }
 }
@@ -174,14 +171,15 @@ pub async fn send(app: Router, req: Request<Body>) -> (StatusCode, serde_json::V
 }
 
 /// Send a request and deserialize the body into `T`.
-pub async fn send_typed<T: DeserializeOwned>(
-    app: Router,
-    req: Request<Body>,
-) -> (StatusCode, T) {
+pub async fn send_typed<T: DeserializeOwned>(app: Router, req: Request<Body>) -> (StatusCode, T) {
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let value: T = serde_json::from_slice(&body_bytes)
-        .unwrap_or_else(|e| panic!("failed to deserialize response: {e}\nbody: {}", String::from_utf8_lossy(&body_bytes)));
+    let value: T = serde_json::from_slice(&body_bytes).unwrap_or_else(|e| {
+        panic!(
+            "failed to deserialize response: {e}\nbody: {}",
+            String::from_utf8_lossy(&body_bytes)
+        )
+    });
     (status, value)
 }

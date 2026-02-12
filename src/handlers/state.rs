@@ -61,11 +61,10 @@ impl MultiUserMemoryManagerRotationHelper {
     /// - >100K keys: streaming 2-pass (count, then delete) to avoid OOM
     fn rotate_user_audit_logs(&self, user_id: &str) -> Result<usize> {
         let cutoff_time = chrono::Utc::now() - chrono::Duration::days(self.audit_retention_days);
-        let cutoff_nanos = cutoff_time.timestamp_nanos_opt()
-            .unwrap_or_else(|| {
-                tracing::warn!("audit cutoff timestamp outside i64 nanos range, using 0");
-                0
-            });
+        let cutoff_nanos = cutoff_time.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("audit cutoff timestamp outside i64 nanos range, using 0");
+            0
+        });
         let prefix = format!("{user_id}:");
 
         // Pass 1: count total entries to determine excess
@@ -97,13 +96,17 @@ impl MultiUserMemoryManagerRotationHelper {
         for (key, _) in iter.flatten() {
             let key_str = match std::str::from_utf8(&key) {
                 Ok(s) => s,
-                Err(_) => { position += 1; continue; }
+                Err(_) => {
+                    position += 1;
+                    continue;
+                }
             };
             if !key_str.starts_with(&prefix) {
                 break;
             }
 
-            let ts = key_str.strip_prefix(&prefix)
+            let ts = key_str
+                .strip_prefix(&prefix)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0); // Malformed keys sort first → get deleted
 
@@ -112,7 +115,8 @@ impl MultiUserMemoryManagerRotationHelper {
                 removed_count += 1;
 
                 if removed_count % BATCH_FLUSH_SIZE == 0 {
-                    self.audit_db.write(std::mem::take(&mut batch))
+                    self.audit_db
+                        .write(std::mem::take(&mut batch))
                         .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
                     batch = rocksdb::WriteBatch::default();
                 }
@@ -123,7 +127,8 @@ impl MultiUserMemoryManagerRotationHelper {
 
         // Flush remaining
         if removed_count % BATCH_FLUSH_SIZE != 0 {
-            self.audit_db.write(batch)
+            self.audit_db
+                .write(batch)
                 .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
         }
 
@@ -133,8 +138,7 @@ impl MultiUserMemoryManagerRotationHelper {
                 let mut log_guard = log.write();
 
                 log_guard.retain(|event| {
-                    let event_nanos = event.timestamp.timestamp_nanos_opt()
-                        .unwrap_or(0);
+                    let event_nanos = event.timestamp.timestamp_nanos_opt().unwrap_or(0);
                     event_nanos >= cutoff_nanos
                 });
 
@@ -436,11 +440,10 @@ impl MultiUserMemoryManager {
         let key = format!(
             "{}:{:020}",
             user_id,
-            event.timestamp.timestamp_nanos_opt()
-                .unwrap_or_else(|| {
-                    tracing::warn!("audit event timestamp outside i64 nanos range, using 0");
-                    0
-                })
+            event.timestamp.timestamp_nanos_opt().unwrap_or_else(|| {
+                tracing::warn!("audit event timestamp outside i64 nanos range, using 0");
+                0
+            })
         );
         if let Ok(serialized) = bincode::serde::encode_to_vec(&event, bincode::config::standard()) {
             let db = self.audit_db.clone();
@@ -454,7 +457,8 @@ impl MultiUserMemoryManager {
         }
 
         let max_entries = self.server_config.audit_max_entries_per_user;
-        let log = self.audit_logs
+        let log = self
+            .audit_logs
             .entry(user_id.to_string())
             .or_insert_with(|| Arc::new(parking_lot::RwLock::new(VecDeque::new())))
             .clone();
@@ -541,7 +545,9 @@ impl MultiUserMemoryManager {
         if !events.is_empty() {
             self.audit_logs
                 .entry(user_id.to_string())
-                .or_insert_with(|| Arc::new(parking_lot::RwLock::new(VecDeque::from(events.clone()))));
+                .or_insert_with(|| {
+                    Arc::new(parking_lot::RwLock::new(VecDeque::from(events.clone())))
+                });
         }
 
         if let Some(mid) = memory_id {
@@ -1431,7 +1437,11 @@ impl MultiUserMemoryManager {
             .chain(issue_entities)
             .chain(verb_entities)
             .collect();
-        all_entities.sort_by(|a, b| b.1.salience.partial_cmp(&a.1.salience).unwrap_or(std::cmp::Ordering::Equal));
+        all_entities.sort_by(|a, b| {
+            b.1.salience
+                .partial_cmp(&a.1.salience)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let entity_cap = self.server_config.max_entities_per_memory;
         all_entities.truncate(entity_cap);
 

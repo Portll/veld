@@ -5113,13 +5113,14 @@ impl MemorySystem {
         // Combine events, deduplicating by (timestamp, event_type) to avoid
         // dropping distinct events that share a nanosecond timestamp.
         let mut all_events: Vec<ConsolidationEvent> = Vec::new();
-        let mut seen_keys: std::collections::HashSet<(i64, std::mem::Discriminant<ConsolidationEvent>)> =
-            std::collections::HashSet::new();
+        let mut seen_keys: std::collections::HashSet<(
+            i64,
+            std::mem::Discriminant<ConsolidationEvent>,
+        )> = std::collections::HashSet::new();
 
         // Add persisted events first (these are significant events that survived restart)
         for stored in &persisted_events {
-            let ts = stored.event.timestamp().timestamp_nanos_opt()
-                .unwrap_or(0);
+            let ts = stored.event.timestamp().timestamp_nanos_opt().unwrap_or(0);
             let key = (ts, std::mem::discriminant(&stored.event));
             if seen_keys.insert(key) {
                 all_events.push(stored.event.clone());
@@ -5127,11 +5128,9 @@ impl MemorySystem {
         }
 
         // Add ephemeral events that aren't already included
-        let until_nanos = until.timestamp_nanos_opt()
-            .unwrap_or(i64::MAX);
+        let until_nanos = until.timestamp_nanos_opt().unwrap_or(i64::MAX);
         for event in ephemeral_events {
-            let ts = event.timestamp().timestamp_nanos_opt()
-                .unwrap_or(0);
+            let ts = event.timestamp().timestamp_nanos_opt().unwrap_or(0);
             let key = (ts, std::mem::discriminant(&event));
             if ts <= until_nanos && seen_keys.insert(key) {
                 all_events.push(event);

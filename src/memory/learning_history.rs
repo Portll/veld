@@ -143,11 +143,10 @@ impl LearningHistoryStore {
         };
 
         let timestamp = event.timestamp();
-        let timestamp_nanos = timestamp.timestamp_nanos_opt()
-            .unwrap_or_else(|| {
-                tracing::warn!("learning event timestamp outside i64 nanos range, using 0");
-                0
-            });
+        let timestamp_nanos = timestamp.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("learning event timestamp outside i64 nanos range, using 0");
+            0
+        });
 
         // Primary storage (time-ordered)
         // Use MessagePack (rmp-serde) - binary format that supports serde tagged enums
@@ -284,9 +283,21 @@ impl LearningHistoryStore {
                 None,
                 None,
             ),
-            ConsolidationEvent::EdgeFormed { from_memory_id, to_memory_id, .. }
-            | ConsolidationEvent::EdgeStrengthened { from_memory_id, to_memory_id, .. }
-            | ConsolidationEvent::EdgePruned { from_memory_id, to_memory_id, .. } => (
+            ConsolidationEvent::EdgeFormed {
+                from_memory_id,
+                to_memory_id,
+                ..
+            }
+            | ConsolidationEvent::EdgeStrengthened {
+                from_memory_id,
+                to_memory_id,
+                ..
+            }
+            | ConsolidationEvent::EdgePruned {
+                from_memory_id,
+                to_memory_id,
+                ..
+            } => (
                 LearningEventType::MaintenanceCycleCompleted,
                 Some(from_memory_id.clone()),
                 Some(to_memory_id.clone()),
@@ -319,11 +330,10 @@ impl LearningHistoryStore {
         user_id: &str,
         since: DateTime<Utc>,
     ) -> Result<Vec<StoredLearningEvent>> {
-        let since_nanos = since.timestamp_nanos_opt()
-            .unwrap_or_else(|| {
-                tracing::warn!("events_since timestamp outside i64 nanos range, using 0");
-                0
-            });
+        let since_nanos = since.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("events_since timestamp outside i64 nanos range, using 0");
+            0
+        });
         let prefix = format!("learning:{}:", user_id);
         let start_key = format!("learning:{}:{:020}", user_id, since_nanos);
 
@@ -357,16 +367,16 @@ impl LearningHistoryStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Vec<StoredLearningEvent>> {
-        let since_nanos = since.timestamp_nanos_opt()
-            .unwrap_or_else(|| {
-                tracing::warn!("events_in_range since timestamp outside i64 nanos range, using 0");
-                0
-            });
-        let until_nanos = until.timestamp_nanos_opt()
-            .unwrap_or_else(|| {
-                tracing::warn!("events_in_range until timestamp outside i64 nanos range, using i64::MAX");
-                i64::MAX
-            });
+        let since_nanos = since.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("events_in_range since timestamp outside i64 nanos range, using 0");
+            0
+        });
+        let until_nanos = until.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!(
+                "events_in_range until timestamp outside i64 nanos range, using i64::MAX"
+            );
+            i64::MAX
+        });
         let prefix = format!("learning:{}:", user_id);
         let start_key = format!("learning:{}:{:020}", user_id, since_nanos);
         let end_key = format!("learning:{}:{:020}", user_id, until_nanos);
@@ -658,11 +668,10 @@ impl LearningHistoryStore {
     /// Prune old learning history (keep last N days)
     pub fn prune_old_events(&self, user_id: &str, keep_days: i64) -> Result<usize> {
         let cutoff = Utc::now() - Duration::days(keep_days);
-        let cutoff_nanos = cutoff.timestamp_nanos_opt()
-            .unwrap_or_else(|| {
-                tracing::warn!("prune cutoff timestamp outside i64 nanos range, using 0");
-                0
-            });
+        let cutoff_nanos = cutoff.timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!("prune cutoff timestamp outside i64 nanos range, using 0");
+            0
+        });
 
         let prefix = format!("learning:{}:", user_id);
         let mut batch = rocksdb::WriteBatch::default();
@@ -688,15 +697,35 @@ impl LearningHistoryStore {
                         if let Ok(stored) = rmp_serde::from_slice::<StoredLearningEvent>(&value) {
                             let ts_fmt = format!("{:020}", ts);
                             if let Some(ref mem_id) = stored.memory_id {
-                                batch.delete(format!("learning_by_memory:{}:{}:{}", user_id, mem_id, ts_fmt).as_bytes());
+                                batch.delete(
+                                    format!("learning_by_memory:{}:{}:{}", user_id, mem_id, ts_fmt)
+                                        .as_bytes(),
+                                );
                             }
                             if let Some(ref related_id) = stored.related_memory_id {
-                                batch.delete(format!("learning_by_memory:{}:{}:{}", user_id, related_id, ts_fmt).as_bytes());
+                                batch.delete(
+                                    format!(
+                                        "learning_by_memory:{}:{}:{}",
+                                        user_id, related_id, ts_fmt
+                                    )
+                                    .as_bytes(),
+                                );
                             }
                             if let Some(ref f_id) = stored.fact_id {
-                                batch.delete(format!("learning_by_fact:{}:{}:{}", user_id, f_id, ts_fmt).as_bytes());
+                                batch.delete(
+                                    format!("learning_by_fact:{}:{}:{}", user_id, f_id, ts_fmt)
+                                        .as_bytes(),
+                                );
                             }
-                            batch.delete(format!("learning_by_type:{}:{}:{}", user_id, stored.event_type.as_str(), ts_fmt).as_bytes());
+                            batch.delete(
+                                format!(
+                                    "learning_by_type:{}:{}:{}",
+                                    user_id,
+                                    stored.event_type.as_str(),
+                                    ts_fmt
+                                )
+                                .as_bytes(),
+                            );
                         }
 
                         deleted += 1;

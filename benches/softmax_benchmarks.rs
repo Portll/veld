@@ -13,7 +13,10 @@ fn softmax_then_argmax(logits: &[f32]) -> Option<(usize, f32)> {
     }
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp_sum: f32 = logits.iter().map(|x| (x - max_logit).exp()).sum();
-    let probs: Vec<f32> = logits.iter().map(|x| (x - max_logit).exp() / exp_sum).collect();
+    let probs: Vec<f32> = logits
+        .iter()
+        .map(|x| (x - max_logit).exp() / exp_sum)
+        .collect();
     probs
         .iter()
         .enumerate()
@@ -28,13 +31,9 @@ fn bench_argmax_softmax(c: &mut Criterion) {
     for size in [9, 16, 32, 128] {
         let logits: Vec<f32> = (0..size).map(|i| (i as f32) * 0.3 - 1.5).collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("fused", size),
-            &logits,
-            |b, logits| {
-                b.iter(|| argmax_softmax(black_box(logits)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("fused", size), &logits, |b, logits| {
+            b.iter(|| argmax_softmax(black_box(logits)));
+        });
 
         group.bench_with_input(
             BenchmarkId::new("alloc_baseline", size),
