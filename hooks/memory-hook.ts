@@ -354,4 +354,8 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(console.error);
+try {
+  await main();
+} catch {
+  // Silent — hooks must not crash Claude Code
+}
