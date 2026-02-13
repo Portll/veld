@@ -37,6 +37,7 @@ use crate::memory::{
     query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
     MemorySystem, ProspectiveStore, SessionStore, TodoStore,
 };
+use crate::relevance::RelevanceEngine;
 use crate::streaming;
 
 use super::types::{AuditEvent, ContextStatus, MemoryEvent};
@@ -219,6 +220,9 @@ pub struct MultiUserMemoryManager {
 
     /// Session tracking store
     pub session_store: Arc<SessionStore>,
+
+    /// Shared relevance engine for proactive memory surfacing (entity cache + learned weights persist)
+    pub relevance_engine: Arc<RelevanceEngine>,
 }
 
 impl MultiUserMemoryManager {
@@ -346,6 +350,9 @@ impl MultiUserMemoryManager {
         info!("Prospective memory store initialized");
 
         let todo_store = Arc::new(TodoStore::new(&base_path)?);
+        if let Err(e) = todo_store.load_vector_indices() {
+            tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
+        }
         info!("Todo store initialized");
 
         let file_store = Arc::new(FileMemoryStore::new(&base_path)?);
@@ -367,6 +374,9 @@ impl MultiUserMemoryManager {
 
         let keyword_extractor = Arc::new(KeywordExtractor::new());
         info!("Keyword extractor initialized (YAKE)");
+
+        let relevance_engine = Arc::new(RelevanceEngine::new(neural_ner.clone()));
+        info!("Relevance engine initialized (entity cache + learned weights)");
 
         let backup_path = base_path.join("backups");
         let backup_engine = Arc::new(backup::ShodhBackupEngine::new(backup_path)?);
@@ -406,6 +416,7 @@ impl MultiUserMemoryManager {
             },
             ab_test_manager: Arc::new(ab_testing::ABTestManager::new()),
             session_store: Arc::new(SessionStore::new()),
+            relevance_engine,
         };
 
         info!("Running initial audit log rotation...");

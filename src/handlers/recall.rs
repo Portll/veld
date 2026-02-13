@@ -145,11 +145,24 @@ pub struct ProactiveSurfacedMemory {
     pub content: String,
     pub memory_type: String,
     pub score: f32,
+    pub importance: f32,
     pub created_at: String,
     pub tags: Vec<String>,
+    /// Why this memory was surfaced ("semantic", "entity", "combined")
+    pub relevance_reason: String,
+    /// Entities from this memory that matched the query context
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_entities: Vec<String>,
     /// Embedding for semantic feedback (not serialized to response)
     #[serde(skip)]
     pub embedding: Vec<f32>,
+}
+
+/// Entity detected in the query context
+#[derive(Debug, Clone, Serialize)]
+pub struct DetectedEntityInfo {
+    pub name: String,
+    pub entity_type: String,
 }
 
 /// Todo item in proactive context response
@@ -184,6 +197,16 @@ pub struct ReminderItem {
     pub overdue_seconds: Option<i64>,
 }
 
+/// Consolidated fact surfaced in proactive context
+#[derive(Debug, Serialize)]
+pub struct ProactiveFact {
+    pub id: String,
+    pub fact: String,
+    pub confidence: f32,
+    pub support_count: usize,
+    pub related_entities: Vec<String>,
+}
+
 /// Response for proactive context
 #[derive(Debug, Serialize)]
 pub struct ProactiveContextResponse {
@@ -208,6 +231,14 @@ pub struct ProactiveContextResponse {
     /// Todo count
     #[serde(default)]
     pub todo_count: usize,
+    /// Consolidated facts from knowledge graph
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relevant_facts: Vec<ProactiveFact>,
+    /// Processing latency in milliseconds
+    pub latency_ms: f64,
+    /// Entities detected in the query context
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_entities: Vec<DetectedEntityInfo>,
 }
 
 // =============================================================================
@@ -704,6 +735,36 @@ pub async fn proactive_context(
     validation::validate_weight("recency_weight", req.recency_weight)
         .map_validation_err("recency_weight")?;
 
+    // Validate context: must be non-empty and have meaningful content
+    let trimmed_context = req.context.trim();
+    if trimmed_context.is_empty()
+        || trimmed_context
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .count()
+            < 3
+    {
+        tracing::debug!(
+            "proactive_context: empty or meaningless context, returning empty response"
+        );
+        return Ok(Json(ProactiveContextResponse {
+            memories: Vec::new(),
+            due_reminders: Vec::new(),
+            context_reminders: Vec::new(),
+            memory_count: 0,
+            reminder_count: 0,
+            ingested_memory_id: None,
+            feedback_processed: None,
+            relevant_todos: Vec::new(),
+            todo_count: 0,
+            relevant_facts: Vec::new(),
+            latency_ms: 0.0,
+            detected_entities: Vec::new(),
+        }));
+    }
+
+    let op_start = std::time::Instant::now();
+
     let memory_system = state
         .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
@@ -864,17 +925,74 @@ pub async fn proactive_context(
         None
     };
 
-    // 1. Compute context embedding first (needed for composite relevance scoring)
+    // 1 + 1.5: Compute embedding and extract NER entities in parallel
+    // Both are independent blocking tasks (~10ms + ~5ms → ~10ms parallel)
     let context_for_embedding = req.context.clone();
     let memory_for_embedding = memory_system.clone();
-    let context_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
+    let embedding_task = tokio::task::spawn_blocking(move || {
         let memory_guard = memory_for_embedding.read();
-        memory_guard
-            .compute_embedding(&context_for_embedding)
-            .unwrap_or_else(|_| vec![0.0; 384])
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?;
+        match memory_guard.compute_embedding(&context_for_embedding) {
+            Ok(emb) => (emb, true),
+            Err(e) => {
+                tracing::warn!("proactive_context: embedding computation failed: {e}, using zero vector — retrieval quality degraded");
+                (vec![0.0; 384], false)
+            }
+        }
+    });
+
+    let ner = state.get_neural_ner();
+    let context_for_ner = req.context.clone();
+    let ner_task = {
+        let ner = ner.clone();
+        tokio::task::spawn_blocking(move || match ner.extract(&context_for_ner) {
+            Ok(entities) => {
+                // Build word set from context for validating NER extractions
+                let context_words: std::collections::HashSet<&str> = context_for_ner
+                    .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                    .filter(|w| w.len() >= 3)
+                    .collect();
+
+                let filtered: Vec<_> = entities
+                    .into_iter()
+                    .filter(|e| {
+                        let t = e.text.trim();
+                        // Length: at least 3 chars
+                        if t.len() < 3 {
+                            return false;
+                        }
+                        // Filter known NER artifacts
+                        let lower = t.to_lowercase();
+                        if matches!(
+                            lower.as_str(),
+                            "undefined" | "null" | "none" | "true" | "false"
+                        ) {
+                            return false;
+                        }
+                        // Validate: entity must appear as a whole word in context,
+                        // not as a subword fragment (e.g., "ian" from "Hebbian")
+                        context_words.contains(t)
+                            || context_words.iter().any(|w| w.eq_ignore_ascii_case(t))
+                    })
+                    .collect();
+                let infos: Vec<DetectedEntityInfo> = filtered
+                    .iter()
+                    .map(|e| DetectedEntityInfo {
+                        name: e.text.clone(),
+                        entity_type: format!("{:?}", e.entity_type),
+                    })
+                    .collect();
+                let names: Vec<String> = filtered.iter().map(|e| e.text.to_lowercase()).collect();
+                (infos, names)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        })
+    };
+
+    let (embedding_result, ner_result) = tokio::join!(embedding_task, ner_task);
+    let (context_embedding, embedding_valid): (Vec<f32>, bool) = embedding_result
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Embedding task panicked: {e}")))?;
+    let (detected_entities, context_entity_names): (Vec<DetectedEntityInfo>, Vec<String>) =
+        ner_result.map_err(|e| AppError::Internal(anyhow::anyhow!("NER task panicked: {e}")))?;
 
     // 2. Retrieve memories using unified 5-layer pipeline
     // The pipeline already applies: RRF fusion + hebbian + recency + feedback (PIPE-9)
@@ -882,10 +1000,21 @@ pub async fn proactive_context(
     let context_clone = req.context.clone();
     let max_results = req.max_results;
     let user_id_for_query = req.user_id.clone();
+    let entity_names_for_recall = context_entity_names.clone();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
+
+            // Build word set from query for anti-echo detection (borrows context_clone)
+            let query_words: std::collections::HashSet<String> = context_clone
+                .split_whitespace()
+                .map(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase()
+                })
+                .filter(|w| w.len() >= 3)
+                .collect();
 
             let query = MemoryQuery {
                 user_id: Some(user_id_for_query),
@@ -895,35 +1024,137 @@ pub async fn proactive_context(
             };
             let results = memory_guard.recall(&query).unwrap_or_default();
 
-            // Use scores from 5-layer pipeline (PIPE-9: feedback momentum now applied in pipeline)
             let mut candidates: Vec<(SharedMemory, f32)> = results
                 .into_iter()
-                .filter_map(|m| {
-                    // Skip memories without embeddings (can't be meaningfully ranked)
-                    m.experience.embeddings.as_ref()?;
-
-                    // Score from unified 5-layer pipeline includes:
-                    // RRF fusion + hebbian + recency + arousal + credibility + temporal + feedback
+                .filter(|m| {
+                    // Quality gate: skip garbage/truncated memories
+                    let content = m.experience.content.trim();
+                    if content.len() < 30 {
+                        return false;
+                    }
+                    // Skip content that's mostly non-alphabetic (binary noise, IDs, etc.)
+                    let alpha_count = content.chars().filter(|c| c.is_alphabetic()).count();
+                    if alpha_count < 10 {
+                        return false;
+                    }
+                    // Anti-echo: skip memories that are just our own context echoed back
+                    // (auto-ingest stores context, which then gets retrieved for itself)
+                    if !query_words.is_empty() {
+                        let mem_words: std::collections::HashSet<String> = content
+                            .split_whitespace()
+                            .map(|w| {
+                                w.trim_matches(|c: char| !c.is_alphanumeric())
+                                    .to_lowercase()
+                            })
+                            .filter(|w| w.len() >= 3)
+                            .collect();
+                        if !mem_words.is_empty() {
+                            let overlap = query_words.intersection(&mem_words).count();
+                            let smaller = query_words.len().min(mem_words.len());
+                            // If >70% of words overlap, it's an echo — skip it
+                            if overlap * 100 / smaller >= 70 {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+                .map(|m| {
                     let score = m.get_score().unwrap_or(0.0);
-                    Some((m, score))
+                    (m, score)
                 })
                 .collect();
 
             // Sort by score (highest first) - already mostly sorted from recall()
             candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Return top results
+            // Drop results below minimum absolute score — don't pad with irrelevant filler
+            // Also drop results that are < 30% of the top score (too weak relative to best)
+            let top_score = candidates.first().map(|(_, s)| *s).unwrap_or(0.0);
+            let abs_min = 0.05_f32;
+            let relative_min = top_score * 0.30;
+            let effective_min = abs_min.max(relative_min);
+            candidates.retain(|(_, s)| *s >= effective_min);
+
+            // Normalize scores for display: scale relative to top result
+            // RRF produces low absolute values (0.01-0.05); after pipeline adjustments
+            // they're ~0.13-0.33. Rescale so top result shows 85-95% confidence.
+            if top_score > 0.0 {
+                for (_, score) in candidates.iter_mut() {
+                    *score = (*score / top_score) * 0.95;
+                }
+            }
+
+            // Return top results with entity overlap annotation
             candidates
                 .into_iter()
                 .take(max_results)
-                .map(|(m, score)| ProactiveSurfacedMemory {
-                    id: m.id.0.to_string(),
-                    content: m.experience.content.clone(),
-                    memory_type: format!("{:?}", m.experience.experience_type),
-                    score,
-                    created_at: m.created_at.to_rfc3339(),
-                    tags: m.experience.entities.clone(),
-                    embedding: m.experience.embeddings.clone().unwrap_or_default(),
+                .map(|(m, score)| {
+                    // Compute entity overlap: merge NER entities + user tags from memory
+                    // into a single pool for matching against context entities
+                    let mut memory_terms: Vec<String> = m
+                        .experience
+                        .entities
+                        .iter()
+                        .map(|e| e.to_lowercase())
+                        .collect();
+                    for tag in &m.experience.tags {
+                        let lower = tag.to_lowercase();
+                        if !memory_terms.contains(&lower) {
+                            memory_terms.push(lower);
+                        }
+                    }
+
+                    // Match context entities against memory's merged entity+tag pool
+                    // Both sides must be >= 3 chars, and substring match must cover
+                    // at least 60% of the shorter string to avoid spurious matches
+                    let matched: Vec<String> = entity_names_for_recall
+                        .iter()
+                        .filter(|ctx_ent| {
+                            ctx_ent.len() >= 3
+                                && memory_terms.iter().any(|me| {
+                                    if me.len() < 3 {
+                                        return false;
+                                    }
+                                    // Exact match
+                                    if me == ctx_ent.as_str() {
+                                        return true;
+                                    }
+                                    // Substring match: shorter must be >= 60% of longer
+                                    let (shorter, longer) = if me.len() <= ctx_ent.len() {
+                                        (me.as_str(), ctx_ent.as_str())
+                                    } else {
+                                        (ctx_ent.as_str(), me.as_str())
+                                    };
+                                    shorter.len() * 100 / longer.len() >= 60
+                                        && longer.contains(shorter)
+                                })
+                        })
+                        .cloned()
+                        .collect();
+                    let has_entity_match = !matched.is_empty();
+                    let has_semantic_match = score > 0.0;
+                    let relevance_reason = if has_entity_match && has_semantic_match {
+                        "combined"
+                    } else if has_entity_match {
+                        "entity"
+                    } else {
+                        "semantic"
+                    }
+                    .to_string();
+
+                    ProactiveSurfacedMemory {
+                        id: m.id.0.to_string(),
+                        content: m.experience.content.clone(),
+                        memory_type: format!("{:?}", m.experience.experience_type),
+                        score,
+                        importance: m.importance(),
+                        created_at: m.created_at.to_rfc3339(),
+                        tags: m.experience.tags.clone(),
+                        relevance_reason,
+                        matched_entities: matched,
+                        embedding: m.experience.embeddings.clone().unwrap_or_default(),
+                    }
                 })
                 .collect()
         })
@@ -931,7 +1162,7 @@ pub async fn proactive_context(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // 2.5. Record coactivation - strengthen associations between surfaced memories
+    // 2.5. Record coactivation - fire-and-forget (doesn't affect response)
     // When memories are retrieved together, their graph edges get stronger (Hebbian learning)
     if memories.len() >= 2 {
         let graph = graph_memory.clone();
@@ -939,21 +1170,177 @@ pub async fn proactive_context(
             .iter()
             .filter_map(|m| uuid::Uuid::parse_str(&m.id).ok())
             .collect();
-        tokio::task::spawn_blocking(move || {
-            let graph_guard = graph.write();
-            let _ = graph_guard.record_memory_coactivation(&memory_ids);
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Coactivation task panicked: {e}")))?;
+        tokio::task::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                let graph_guard = graph.write();
+                let _ = graph_guard.record_memory_coactivation(&memory_ids);
+            })
+            .await;
+        });
     }
 
-    // 3. Check due reminders
-    let user_id = req.user_id.clone();
-    let due_reminders: Vec<ReminderItem> = {
-        let prospective = state.prospective_store.clone();
+    // 3. Store pending feedback (fast, in-memory — do before parallel block)
+    if embedding_valid {
+        let surfaced_infos: Vec<feedback::SurfacedMemoryInfo> = memories
+            .iter()
+            .map(|m| {
+                let id = uuid::Uuid::parse_str(&m.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+                feedback::SurfacedMemoryInfo {
+                    id: MemoryId(id),
+                    entities: feedback::extract_entities_simple(&m.content),
+                    content_preview: m.content.chars().take(100).collect(),
+                    score: m.score,
+                    embedding: m.embedding.clone(),
+                }
+            })
+            .collect();
+
+        let pending = feedback::PendingFeedback::new(
+            req.user_id.clone(),
+            req.context.clone(),
+            context_embedding.clone(),
+            surfaced_infos,
+        );
+        let feedback_store = state.feedback_store.clone();
+        feedback_store.write().set_pending(pending);
+    }
+
+    // 4. Auto-ingest previous assistant response — fire-and-forget
+    if req.auto_ingest {
+        if let Some(ref prev_response) = req.previous_response {
+            let response_text = prev_response.trim();
+            let is_meaningful = response_text.len() > 100
+                && response_text.len() < 3000
+                && !response_text.starts_with("```")
+                && !is_boilerplate_response(response_text);
+
+            if is_meaningful {
+                let response_text_owned = response_text.to_string();
+                let memory = memory_system.clone();
+                tokio::task::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let memory_guard = memory.read();
+                        let segmenter = SegmentationEngine::new();
+                        let segments =
+                            segmenter.segment(&response_text_owned, InputSource::AutoIngest);
+                        for segment in segments {
+                            let content = format!(
+                                "[Assistant: {:?}] {}",
+                                segment.experience_type, segment.content
+                            );
+                            let experience = Experience {
+                                content,
+                                experience_type: segment.experience_type,
+                                entities: segment.entities,
+                                tags: vec![
+                                    "assistant-response".to_string(),
+                                    "auto-captured".to_string(),
+                                ],
+                                ..Default::default()
+                            };
+                            let _ = memory_guard.remember(experience, None);
+                        }
+                    })
+                    .await;
+                });
+            }
+        }
+    }
+
+    // 5. Auto-ingest user context — fire-and-forget with ID capture
+    let clean_context = strip_system_noise(&req.context);
+    let should_ingest = req.auto_ingest
+        && clean_context.len() > 50
+        && clean_context.len() < 5000
+        && !is_bare_question(&clean_context);
+
+    let ingested_memory_id = if should_ingest {
+        let context = clean_context;
+        let memory = memory_system.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let memory_guard = memory.read();
+                let segmenter = SegmentationEngine::new();
+                let segments = segmenter.segment(&context, InputSource::AutoIngest);
+                let mut first_id = None;
+                for segment in segments {
+                    let experience = Experience {
+                        content: segment.content,
+                        experience_type: segment.experience_type,
+                        entities: segment.entities,
+                        tags: vec!["auto-captured".to_string()],
+                        ..Default::default()
+                    };
+                    if let Ok(id) = memory_guard.remember(experience, None) {
+                        if first_id.is_none() {
+                            first_id = Some(id);
+                        }
+                    }
+                }
+                first_id
+            })
+            .await;
+            let _ = tx.send(result);
+        });
+        match tokio::time::timeout(std::time::Duration::from_millis(50), rx).await {
+            Ok(Ok(Ok(Some(id)))) => Some(id.0.to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // 6. Collect fact entities synchronously (fast iteration, needed before parallel block)
+    let fact_entity_list: Vec<String> = {
+        let mut all_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in &context_entity_names {
+            all_entities.insert(name.clone());
+        }
+        for mem in &memories {
+            for tag in &mem.tags {
+                let lower = tag.to_lowercase();
+                if lower.len() > 2 {
+                    all_entities.insert(lower);
+                }
+            }
+        }
+        for word in req.context.split_whitespace() {
+            let clean = word
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            if clean.len() > 3 {
+                all_entities.insert(clean);
+            }
+        }
+        all_entities.into_iter().take(15).collect()
+    };
+
+    // 7. Parallel block: due reminders + context reminders + todos + facts
+    // All 4 are independent blocking I/O operations — run concurrently via tokio::join!
+
+    // Prepare clones for parallel tasks
+    let due_uid = req.user_id.clone();
+    let due_prospective = state.prospective_store.clone();
+
+    let ctx_uid = req.user_id.clone();
+    let ctx_context = req.context.clone();
+    let ctx_emb = context_embedding.clone();
+    let ctx_memory = memory_system.clone();
+    let ctx_prospective = state.prospective_store.clone();
+
+    let todo_uid = req.user_id.clone();
+    let todo_emb = context_embedding.clone();
+    let todo_store = state.todo_store.clone();
+
+    let fact_uid = req.user_id.clone();
+    let fact_memory = memory_system.clone();
+
+    let (due_result, ctx_result, todo_result, fact_result) = tokio::join!(
+        // A: Due reminders
         tokio::task::spawn_blocking(move || {
-            prospective
-                .get_due_tasks(&user_id)
+            due_prospective
+                .get_due_tasks(&due_uid)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|t| {
@@ -977,60 +1364,16 @@ pub async fn proactive_context(
                         overdue_seconds: overdue,
                     }
                 })
-                .collect()
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
-    };
-
-    // 4. Store pending feedback for next call (with embeddings for semantic feedback)
-    {
-        let surfaced_infos: Vec<feedback::SurfacedMemoryInfo> = memories
-            .iter()
-            .map(|m| {
-                let id = uuid::Uuid::parse_str(&m.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
-                feedback::SurfacedMemoryInfo {
-                    id: MemoryId(id),
-                    entities: feedback::extract_entities_simple(&m.content),
-                    content_preview: m.content.chars().take(100).collect(),
-                    score: m.score,
-                    embedding: m.embedding.clone(),
-                }
-            })
-            .collect();
-
-        if !surfaced_infos.is_empty() {
-            let pending = feedback::PendingFeedback::new(
-                req.user_id.clone(),
-                req.context.clone(),
-                context_embedding.clone(),
-                surfaced_infos,
-            );
-            let feedback_store = state.feedback_store.clone();
-            feedback_store.write().set_pending(pending);
-        }
-    }
-
-    // Now check context triggers with semantic matching
-    let user_id = req.user_id.clone();
-    let context_for_triggers = req.context.clone();
-    let memory_for_task_embed = memory_system.clone();
-    let context_emb_for_triggers = context_embedding.clone();
-    let context_reminders: Vec<ReminderItem> = {
-        let prospective = state.prospective_store.clone();
+                .collect::<Vec<ReminderItem>>()
+        }),
+        // B: Context-triggered reminders
         tokio::task::spawn_blocking(move || {
             let embed_fn = |text: &str| -> Option<Vec<f32>> {
-                let memory_guard = memory_for_task_embed.read();
+                let memory_guard = ctx_memory.read();
                 memory_guard.compute_embedding(text).ok()
             };
-
-            prospective
-                .check_context_triggers_semantic(
-                    &user_id,
-                    &context_for_triggers,
-                    &context_emb_for_triggers,
-                    embed_fn,
-                )
+            ctx_prospective
+                .check_context_triggers_semantic(&ctx_uid, &ctx_context, &ctx_emb, embed_fn)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(t, score)| {
@@ -1049,204 +1392,176 @@ pub async fn proactive_context(
                         overdue_seconds: overdue,
                     }
                 })
-                .collect()
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
-    };
+                .collect::<Vec<ReminderItem>>()
+        }),
+        // C: Todo search (was inline blocking — now properly in spawn_blocking)
+        tokio::task::spawn_blocking(move || {
+            let semantic_results = todo_store
+                .search_similar(&todo_uid, &todo_emb, 10)
+                .unwrap_or_default();
 
-    // 5. Auto-ingest previous assistant response (if provided and meaningful)
-    // Uses segmentation engine for Hebbian-optimal atomic memories
-    if req.auto_ingest {
-        if let Some(ref prev_response) = req.previous_response {
-            // Only store meaningful responses (not empty, not just tool calls, not boilerplate)
-            let response_text = prev_response.trim();
-            let is_meaningful = response_text.len() > 100
-                && response_text.len() < 3000  // Skip very long responses (often tool outputs)
-                && !response_text.starts_with("```")
-                && !is_boilerplate_response(response_text);
-
-            if is_meaningful {
-                let response_text_owned = response_text.to_string();
-                let memory = memory_system.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    let memory_guard = memory.read();
-                    let segmenter = SegmentationEngine::new();
-
-                    // Segment assistant response into atomic memories
-                    let segments = segmenter.segment(&response_text_owned, InputSource::AutoIngest);
-
-                    for segment in segments {
-                        // Format content with type prefix for clarity
-                        let content = format!(
-                            "[Assistant: {:?}] {}",
-                            segment.experience_type, segment.content
-                        );
-                        let experience = Experience {
-                            content,
-                            experience_type: segment.experience_type,
-                            entities: segment.entities,
-                            tags: vec![
-                                "assistant-response".to_string(),
-                                "auto-captured".to_string(),
-                            ],
-                            ..Default::default()
-                        };
-                        let _ = memory_guard.remember(experience, None);
+            let mut todos_with_scores: Vec<ProactiveTodoItem> = semantic_results
+                .into_iter()
+                .filter(|(t, _score)| {
+                    matches!(
+                        t.status,
+                        TodoStatus::Todo | TodoStatus::InProgress | TodoStatus::Blocked
+                    )
+                })
+                .map(|(t, score)| {
+                    let project_name = t.project_id.as_ref().and_then(|pid| {
+                        todo_store
+                            .get_project(&todo_uid, pid)
+                            .ok()
+                            .flatten()
+                            .map(|p| p.name)
+                    });
+                    ProactiveTodoItem {
+                        id: t.id.0.to_string(),
+                        short_id: t.short_id(),
+                        content: t.content.clone(),
+                        status: format!("{:?}", t.status).to_lowercase(),
+                        priority: t.priority.indicator().to_string(),
+                        project: project_name,
+                        due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                        relevance_reason: format!("semantic: {:.0}%", score * 100.0),
+                        similarity_score: Some(score),
                     }
                 })
-                .await
-                .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
+                .collect();
+
+            // Also include in_progress todos for work continuity
+            let in_progress_candidates = todo_store
+                .list_todos_for_user(&todo_uid, None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| t.status == TodoStatus::InProgress)
+                .collect::<Vec<_>>();
+
+            let in_progress_todos: Vec<ProactiveTodoItem> = in_progress_candidates
+                .into_iter()
+                .filter(|t| !todos_with_scores.iter().any(|s| s.id == t.id.0.to_string()))
+                .map(|t| {
+                    let project_name = t.project_id.as_ref().and_then(|pid| {
+                        todo_store
+                            .get_project(&todo_uid, pid)
+                            .ok()
+                            .flatten()
+                            .map(|p| p.name)
+                    });
+                    ProactiveTodoItem {
+                        id: t.id.0.to_string(),
+                        short_id: t.short_id(),
+                        content: t.content.clone(),
+                        status: "in_progress".to_string(),
+                        priority: t.priority.indicator().to_string(),
+                        project: project_name,
+                        due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
+                        relevance_reason: "active work".to_string(),
+                        similarity_score: None,
+                    }
+                })
+                .collect();
+
+            todos_with_scores.extend(in_progress_todos);
+            todos_with_scores.sort_by(|a, b| {
+                let a_ip = a.status == "in_progress";
+                let b_ip = b.status == "in_progress";
+                match (a_ip, b_ip) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => b
+                        .similarity_score
+                        .partial_cmp(&a.similarity_score)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                }
+            });
+            todos_with_scores
+                .into_iter()
+                .take(5)
+                .collect::<Vec<ProactiveTodoItem>>()
+        }),
+        // D: Fact surfacing with quality gates
+        async {
+            if fact_entity_list.is_empty() {
+                return Ok(Vec::new());
             }
-        }
-    }
-
-    // 6. Auto-ingest user context with segmentation for Hebbian-optimal storage
-    // Apply quality filters before storing
-    let clean_context = strip_system_noise(&req.context);
-    let should_ingest = req.auto_ingest
-        && clean_context.len() > 50           // Minimum meaningful length
-        && clean_context.len() < 5000         // Allow larger contexts now (segmentation handles splitting)
-        && !is_bare_question(&clean_context); // Don't store standalone questions
-
-    let ingested_memory_id = if should_ingest {
-        let context = clean_context;
-        let memory = memory_system.clone();
-
-        let memory_id = tokio::task::spawn_blocking(move || {
-            let memory_guard = memory.read();
-            let segmenter = SegmentationEngine::new();
-
-            // Segment user context into atomic memories
-            let segments = segmenter.segment(&context, InputSource::AutoIngest);
-
-            // Store each segment, return the first memory ID
-            let mut first_id = None;
-            for segment in segments {
-                let experience = Experience {
-                    content: segment.content,
-                    experience_type: segment.experience_type,
-                    entities: segment.entities,
-                    tags: vec!["auto-captured".to_string()],
-                    ..Default::default()
-                };
-
-                if let Ok(id) = memory_guard.remember(experience, None) {
-                    if first_id.is_none() {
-                        first_id = Some(id);
+            tokio::task::spawn_blocking(move || {
+                let memory_guard = fact_memory.read();
+                let mut found: std::collections::HashMap<String, ProactiveFact> =
+                    std::collections::HashMap::new();
+                for entity in &fact_entity_list {
+                    if let Ok(entity_facts) = memory_guard.get_facts_by_entity(&fact_uid, entity, 5)
+                    {
+                        for fact in entity_facts {
+                            // Quality gate: skip low-confidence facts
+                            if fact.confidence < 0.35 {
+                                continue;
+                            }
+                            // Quality gate: skip single-source facts (unreliable)
+                            if fact.support_count < 2 {
+                                continue;
+                            }
+                            // Quality gate: skip ALL "relates to" entity-pair facts
+                            // These are auto-generated from entity co-occurrence and are
+                            // uniformly low-value noise (e.g., "X relates to Y")
+                            if fact.fact.contains(" relates to ") {
+                                continue;
+                            }
+                            // Skip facts that are too short to be meaningful
+                            if fact.fact.trim().len() < 15 {
+                                continue;
+                            }
+                            found.entry(fact.id.clone()).or_insert(ProactiveFact {
+                                id: fact.id.clone(),
+                                fact: fact.fact.clone(),
+                                confidence: fact.confidence,
+                                support_count: fact.support_count,
+                                related_entities: fact.related_entities.clone(),
+                            });
+                        }
                     }
                 }
-            }
-            first_id
-        })
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
-
-        memory_id.map(|id| id.0.to_string())
-    } else {
-        None
-    };
-
-    // 7. Surface relevant todos using semantic search
-    let relevant_todos: Vec<ProactiveTodoItem> = {
-        // Use semantic search with context embedding for todo retrieval
-        let semantic_results = state
-            .todo_store
-            .search_similar(&req.user_id, &context_embedding, 10)
-            .unwrap_or_default();
-
-        // Filter for active statuses and build ProactiveTodoItem list
-        let mut todos_with_scores: Vec<ProactiveTodoItem> = semantic_results
-            .into_iter()
-            .filter(|(t, _score)| {
-                matches!(
-                    t.status,
-                    TodoStatus::Todo | TodoStatus::InProgress | TodoStatus::Blocked
-                )
-            })
-            .map(|(t, score)| {
-                // Get project name for display
-                let project_name = t.project_id.as_ref().and_then(|pid| {
-                    state
-                        .todo_store
-                        .get_project(&req.user_id, pid)
-                        .ok()
-                        .flatten()
-                        .map(|p| p.name)
+                // Deduplicate by text similarity: if two facts share >80% words, keep higher confidence
+                let mut sorted: Vec<ProactiveFact> = found.into_values().collect();
+                sorted.sort_by(|a, b| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
-
-                ProactiveTodoItem {
-                    id: t.id.0.to_string(),
-                    short_id: t.short_id(),
-                    content: t.content.clone(),
-                    status: format!("{:?}", t.status).to_lowercase(),
-                    priority: t.priority.indicator().to_string(),
-                    project: project_name,
-                    due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
-                    relevance_reason: format!("semantic: {:.0}%", score * 100.0),
-                    similarity_score: Some(score),
+                let mut deduped: Vec<ProactiveFact> = Vec::new();
+                for fact in sorted {
+                    let fact_words: std::collections::HashSet<&str> =
+                        fact.fact.split_whitespace().collect();
+                    let is_dup = deduped.iter().any(|existing| {
+                        let existing_words: std::collections::HashSet<&str> =
+                            existing.fact.split_whitespace().collect();
+                        if fact_words.is_empty() || existing_words.is_empty() {
+                            return false;
+                        }
+                        let intersection = fact_words.intersection(&existing_words).count();
+                        let smaller = fact_words.len().min(existing_words.len());
+                        intersection * 100 / smaller >= 80
+                    });
+                    if !is_dup {
+                        deduped.push(fact);
+                    }
                 }
+                deduped.truncate(5);
+                deduped
             })
-            .collect();
+            .await
+        }
+    );
 
-        // Also include in_progress todos regardless of semantic score (work continuity)
-        let in_progress_candidates = state
-            .todo_store
-            .list_todos_for_user(&req.user_id, None)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| t.status == TodoStatus::InProgress)
-            .collect::<Vec<_>>();
-
-        // Filter out duplicates separately to avoid borrow conflict
-        let in_progress_todos: Vec<ProactiveTodoItem> = in_progress_candidates
-            .into_iter()
-            .filter(|t| {
-                // Don't duplicate if already in semantic results
-                !todos_with_scores.iter().any(|s| s.id == t.id.0.to_string())
-            })
-            .map(|t| {
-                let project_name = t.project_id.as_ref().and_then(|pid| {
-                    state
-                        .todo_store
-                        .get_project(&req.user_id, pid)
-                        .ok()
-                        .flatten()
-                        .map(|p| p.name)
-                });
-                ProactiveTodoItem {
-                    id: t.id.0.to_string(),
-                    short_id: t.short_id(),
-                    content: t.content.clone(),
-                    status: "in_progress".to_string(),
-                    priority: t.priority.indicator().to_string(),
-                    project: project_name,
-                    due_date: t.due_date.map(|d| d.format("%Y-%m-%d").to_string()),
-                    relevance_reason: "active work".to_string(),
-                    similarity_score: None,
-                }
-            })
-            .collect();
-
-        todos_with_scores.extend(in_progress_todos);
-
-        // Sort by: in_progress first, then by similarity score
-        todos_with_scores.sort_by(|a, b| {
-            let a_in_progress = a.status == "in_progress";
-            let b_in_progress = b.status == "in_progress";
-            match (a_in_progress, b_in_progress) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => b
-                    .similarity_score
-                    .partial_cmp(&a.similarity_score)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            }
-        });
-
-        todos_with_scores.into_iter().take(5).collect()
-    };
+    let due_reminders: Vec<ReminderItem> = due_result
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Due reminders task panicked: {e}")))?;
+    let context_reminders: Vec<ReminderItem> = ctx_result
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Context reminders task panicked: {e}")))?;
+    let relevant_todos: Vec<ProactiveTodoItem> = todo_result
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Todo search task panicked: {e}")))?;
+    let relevant_facts: Vec<ProactiveFact> = fact_result
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Fact surfacing task panicked: {e}")))?;
     let todo_count = relevant_todos.len();
 
     let memory_count = memories.len();
@@ -1300,6 +1615,8 @@ pub async fn proactive_context(
         );
     }
 
+    let latency_ms = op_start.elapsed().as_secs_f64() * 1000.0;
+
     Ok(Json(ProactiveContextResponse {
         memories,
         due_reminders,
@@ -1310,6 +1627,9 @@ pub async fn proactive_context(
         feedback_processed,
         relevant_todos,
         todo_count,
+        relevant_facts,
+        latency_ms,
+        detected_entities,
     }))
 }
 
@@ -1334,9 +1654,8 @@ pub async fn surface_relevant(
     let graph_memory = state
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
-    let ner = state.get_neural_ner();
-
-    let engine = relevance::RelevanceEngine::new(ner);
+    let engine = state.relevance_engine.clone();
+    let feedback_store = state.feedback_store.clone();
 
     let response = {
         let memory_sys = memory_sys.clone();
@@ -1347,7 +1666,13 @@ pub async fn surface_relevant(
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_sys.read();
             let graph_guard = graph_memory.read();
-            engine.surface_relevant(&context, &memory_guard, Some(&*graph_guard), &config)
+            engine.surface_relevant(
+                &context,
+                &memory_guard,
+                Some(&*graph_guard),
+                &config,
+                Some(&feedback_store),
+            )
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
