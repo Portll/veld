@@ -2097,7 +2097,7 @@ impl MemoryStorage {
                     continue;
                 }
                 if let Ok((memory, _)) = deserialize_memory(&value) {
-                    if !memory.compressed && memory.created_at < cutoff {
+                    if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                         memories.push(memory);
                     }
                 }
@@ -2107,10 +2107,12 @@ impl MemoryStorage {
         Ok(memories)
     }
 
-    /// Mark memories as forgotten (soft delete) with atomic batch write
-    pub fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+    /// Mark memories as forgotten (soft delete) with atomic batch write.
+    /// Returns the IDs of memories that were flagged, so callers can clean up
+    /// secondary indices (vector, BM25, graph).
+    pub fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<Vec<MemoryId>> {
         let mut batch = rocksdb::WriteBatch::default();
-        let mut count = 0;
+        let mut flagged_ids = Vec::new();
         let now = Utc::now().to_rfc3339();
 
         let iter = self.db.iterator(IteratorMode::Start);
@@ -2124,6 +2126,7 @@ impl MemoryStorage {
                         continue;
                     }
                     if memory.created_at < cutoff {
+                        flagged_ids.push(memory.id.clone());
                         memory
                             .experience
                             .metadata
@@ -2136,25 +2139,26 @@ impl MemoryStorage {
                         let updated_value =
                             bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
                         batch.put(&key, updated_value);
-                        count += 1;
                     }
                 }
             }
         }
 
-        if count > 0 {
+        if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
             self.db.write_opt(batch, &write_opts)?;
         }
 
-        Ok(count)
+        Ok(flagged_ids)
     }
 
-    /// Mark memories with low importance as forgotten with atomic batch write
-    pub fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<usize> {
+    /// Mark memories with low importance as forgotten with atomic batch write.
+    /// Returns the IDs of memories that were flagged, so callers can clean up
+    /// secondary indices (vector, BM25, graph).
+    pub fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<Vec<MemoryId>> {
         let mut batch = rocksdb::WriteBatch::default();
-        let mut count = 0;
+        let mut flagged_ids = Vec::new();
         let now = Utc::now().to_rfc3339();
 
         let iter = self.db.iterator(IteratorMode::Start);
@@ -2168,6 +2172,7 @@ impl MemoryStorage {
                         continue;
                     }
                     if memory.importance() < threshold {
+                        flagged_ids.push(memory.id.clone());
                         memory
                             .experience
                             .metadata
@@ -2180,19 +2185,18 @@ impl MemoryStorage {
                         let updated_value =
                             bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
                         batch.put(&key, updated_value);
-                        count += 1;
                     }
                 }
             }
         }
 
-        if count > 0 {
+        if !flagged_ids.is_empty() {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
             self.db.write_opt(batch, &write_opts)?;
         }
 
-        Ok(count)
+        Ok(flagged_ids)
     }
 
     /// Remove memories matching a pattern with durable writes

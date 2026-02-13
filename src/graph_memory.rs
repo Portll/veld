@@ -420,8 +420,8 @@ impl RelationshipEdge {
                 if let Some(next_tier) = self.tier.next_tier() {
                     let old_tier = self.tier;
                     self.tier = next_tier;
-                    // Reset strength to next tier's initial weight (consolidation)
-                    self.strength = next_tier.initial_weight();
+                    // Preserve strength if already above next tier's initial weight
+                    self.strength = self.strength.max(next_tier.initial_weight());
 
                     // PIPE-4: Initialize activation_timestamps on L1→L2 promotion
                     if old_tier == EdgeTier::L1Working {

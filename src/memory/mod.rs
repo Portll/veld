@@ -2559,6 +2559,15 @@ impl MemorySystem {
                     }
                 }
 
+                // Clean up BM25 keyword index
+                if let Err(e) = self.hybrid_search.remove_memory(&memory_id) {
+                    tracing::warn!(
+                        memory_id = %memory_id.0,
+                        error = %e,
+                        "Failed to clean BM25 index for deleted memory"
+                    );
+                }
+
                 // Update stats - decrement each tier count that had this memory
                 if deleted_from_any {
                     let mut stats = self.stats.write();
@@ -2591,7 +2600,15 @@ impl MemorySystem {
                 let session_removed = self.session_memory.write().remove_older_than(cutoff)?;
 
                 // Mark as forgotten in long-term (don't delete, just flag)
-                let lt_flagged = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
+                let flagged_ids = self.long_term_memory.mark_forgotten_by_age(cutoff)?;
+                let lt_flagged = flagged_ids.len();
+
+                // Clean up secondary indices for soft-forgotten memories
+                for id in &flagged_ids {
+                    self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
+                }
+                self.cleanup_graph_for_ids(&flagged_ids);
 
                 // Update stats for hard-deleted and soft-deleted tiers
                 {
@@ -2619,9 +2636,17 @@ impl MemorySystem {
                     .session_memory
                     .write()
                     .remove_below_importance(threshold)?;
-                let lt_flagged = self
+                let flagged_ids = self
                     .long_term_memory
                     .mark_forgotten_by_importance(threshold)?;
+                let lt_flagged = flagged_ids.len();
+
+                // Clean up secondary indices for soft-forgotten memories
+                for id in &flagged_ids {
+                    self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
+                }
+                self.cleanup_graph_for_ids(&flagged_ids);
 
                 // Update stats for hard-deleted and soft-deleted tiers
                 {
@@ -2661,6 +2686,13 @@ impl MemorySystem {
                 self.forget_all()?
             }
         };
+
+        // Commit BM25 changes after any deletion to make removals visible
+        if forgotten_count > 0 {
+            if let Err(e) = self.hybrid_search.commit_and_reload() {
+                tracing::warn!(error = %e, "Failed to commit BM25 after forget");
+            }
+        }
 
         Ok(forgotten_count)
     }
@@ -3355,12 +3387,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from working memory and vector index
+        // Remove from working memory and vector/BM25 index
         {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3377,12 +3410,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from session memory and vector index
+        // Remove from session memory and vector/BM25 index
         {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3396,6 +3430,7 @@ impl MemorySystem {
             if regex.is_match(&memory.experience.content) {
                 lt_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
+                let _ = self.hybrid_search.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
                 long_term_removed += 1;
                 count += 1;
@@ -3445,6 +3480,7 @@ impl MemorySystem {
             for id in &ids_to_remove {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3464,6 +3500,7 @@ impl MemorySystem {
             for id in &ids_to_remove {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3477,6 +3514,7 @@ impl MemorySystem {
             if memory.experience.tags.iter().any(|t| tags.contains(t)) {
                 all_deleted_ids.push(memory.id.clone());
                 self.retriever.remove_memory(&memory.id);
+                let _ = self.hybrid_search.remove_memory(&memory.id);
                 self.long_term_memory.delete(&memory.id)?;
                 long_term_removed += 1;
                 count += 1;
@@ -3522,12 +3560,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from working memory and vector index
+        // Remove from working memory and vector/BM25 index
         {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3544,12 +3583,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from session memory and vector index
+        // Remove from session memory and vector/BM25 index
         {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3564,6 +3604,7 @@ impl MemorySystem {
         for memory in memories {
             lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
+            let _ = self.hybrid_search.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
             long_term_removed += 1;
             count += 1;
@@ -3609,12 +3650,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from working memory and vector index
+        // Remove from working memory and vector/BM25 index
         {
             let mut working = self.working_memory.write();
             for id in &working_ids {
                 if working.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     working_removed += 1;
                     count += 1;
                 }
@@ -3631,12 +3673,13 @@ impl MemorySystem {
                 .map(|m| m.id.clone())
                 .collect()
         };
-        // Remove from session memory and vector index
+        // Remove from session memory and vector/BM25 index
         {
             let mut session = self.session_memory.write();
             for id in &session_ids {
                 if session.remove(id).is_ok() {
                     self.retriever.remove_memory(id);
+                    let _ = self.hybrid_search.remove_memory(id);
                     session_removed += 1;
                     count += 1;
                 }
@@ -3651,6 +3694,7 @@ impl MemorySystem {
         for memory in memories {
             lt_ids.push(memory.id.clone());
             self.retriever.remove_memory(&memory.id);
+            let _ = self.hybrid_search.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
             long_term_removed += 1;
             count += 1;
@@ -3715,6 +3759,7 @@ impl MemorySystem {
         let long_term_count = all_lt.len();
         for memory in all_lt {
             self.retriever.remove_memory(&memory.id);
+            let _ = self.hybrid_search.remove_memory(&memory.id);
             self.long_term_memory.delete(&memory.id)?;
         }
         count += long_term_count;
@@ -3731,6 +3776,7 @@ impl MemorySystem {
         let session_count = session_ids.len();
         for id in &session_ids {
             self.retriever.remove_memory(id);
+            let _ = self.hybrid_search.remove_memory(id);
         }
         {
             let mut session = self.session_memory.write();
@@ -3750,6 +3796,7 @@ impl MemorySystem {
         let working_count = working_ids.len();
         for id in &working_ids {
             self.retriever.remove_memory(id);
+            let _ = self.hybrid_search.remove_memory(id);
         }
         {
             let mut working = self.working_memory.write();
@@ -3757,7 +3804,50 @@ impl MemorySystem {
         }
         count += working_count;
 
-        // Step 5: Reset stats last (reflects final state)
+        // Step 5: Commit BM25 deletions
+        if let Err(e) = self.hybrid_search.commit_and_reload() {
+            tracing::warn!(error = %e, "BM25 commit failed during forget_all");
+        }
+
+        // Step 6: Clear semantic facts (GDPR — knowledge derived from memories)
+        {
+            let db = self.long_term_memory.db();
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut facts_deleted = 0usize;
+            for prefix in &["facts:", "facts_by_entity:", "facts_by_type:"] {
+                let iter = db.prefix_iterator(prefix.as_bytes());
+                for item in iter {
+                    if let Ok((key, _)) = item {
+                        if !key.starts_with(prefix.as_bytes()) {
+                            break;
+                        }
+                        batch.delete(&key);
+                        if *prefix == "facts:" {
+                            facts_deleted += 1;
+                        }
+                    }
+                }
+            }
+            // Clear temporal facts
+            let iter = db.prefix_iterator(b"temporal_facts:");
+            for item in iter {
+                if let Ok((key, _)) = item {
+                    if !key.starts_with(b"temporal_facts:") {
+                        break;
+                    }
+                    batch.delete(&key);
+                }
+            }
+            if facts_deleted > 0 || !batch.is_empty() {
+                if let Err(e) = db.write(batch) {
+                    tracing::warn!(error = %e, "Failed to clear facts during forget_all");
+                } else {
+                    tracing::info!(facts_deleted, "Semantic facts cleared during forget_all");
+                }
+            }
+        }
+
+        // Step 7: Reset stats last (reflects final state)
         {
             let mut stats = self.stats.write();
             stats.total_memories = 0;
@@ -3882,7 +3972,7 @@ impl MemorySystem {
     ) -> Result<()> {
         let mut memory = self.long_term_memory.get(memory_id)?;
         memory.set_parent(parent_id);
-        self.long_term_memory.store(&memory)
+        self.long_term_memory.update(&memory)
     }
 
     /// Get children of a memory
