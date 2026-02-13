@@ -1,11 +1,12 @@
 {
   "hooks": {
-    "SessionStart": [
+    "SubagentStop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh\""
+            "command": "bun run \"$CLAUDE_PROJECT_DIR/hooks/memory-hook.ts\"",
+            "timeout": 5000
           }
         ]
       }
