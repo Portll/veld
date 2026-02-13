@@ -460,6 +460,25 @@ impl MemorySystem {
         // Uses the same DB with "temporal_facts:", "temporal_by_entity:", "temporal_by_event:" prefixes
         let temporal_fact_store = Arc::new(temporal_facts::TemporalFactStore::new(storage.db()));
 
+        // SHO-106: Load persisted interference history from RocksDB
+        let interference_detector = {
+            let mut detector = replay::InterferenceDetector::new();
+            match storage.load_all_interference_records() {
+                Ok((history, total_events)) => {
+                    if !history.is_empty() {
+                        detector.load_history(history, total_events);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load interference history, starting fresh"
+                    );
+                }
+            }
+            Arc::new(RwLock::new(detector))
+        };
+
         Ok(Self {
             config: config.clone(),
             working_memory: Arc::new(RwLock::new(WorkingMemory::new(config.working_memory_size))),
@@ -479,8 +498,8 @@ impl MemorySystem {
             consolidation_events, // Use the shared buffer created earlier
             // SHO-105: Memory replay manager
             replay_manager: Arc::new(RwLock::new(replay::ReplayManager::new())),
-            // SHO-106: Interference detector
-            interference_detector: Arc::new(RwLock::new(replay::InterferenceDetector::new())),
+            // SHO-106: Interference detector (loaded from RocksDB)
+            interference_detector,
             // PIPE-2: Pattern detector for intelligent replay triggers
             pattern_detector: Arc::new(RwLock::new(pattern_detection::PatternDetector::new())),
             // SHO-f0e7: Semantic fact store
@@ -870,8 +889,8 @@ impl MemorySystem {
                         }
 
                         // Record interference events
-                        for event in interference_result.events {
-                            self.record_consolidation_event(event);
+                        for event in &interference_result.events {
+                            self.record_consolidation_event(event.clone());
                         }
 
                         // Handle duplicates - don't duplicate here, just log
@@ -880,6 +899,29 @@ impl MemorySystem {
                                 memory_id = %memory.id.0,
                                 "Memory detected as near-duplicate of existing memory"
                             );
+                        }
+
+                        // Persist affected interference records to RocksDB
+                        {
+                            let detector = self.interference_detector.read();
+                            let affected_ids = detector.get_affected_ids_from_check(
+                                &memory.id.0.to_string(),
+                                &interference_result,
+                            );
+                            for (id, records) in detector.get_records_for_ids(&affected_ids) {
+                                if let Err(e) =
+                                    self.long_term_memory.save_interference_records(id, records)
+                                {
+                                    tracing::debug!("Failed to persist interference records: {e}");
+                                }
+                            }
+                            let (total_events, _) = detector.stats();
+                            if let Err(e) = self
+                                .long_term_memory
+                                .save_interference_event_count(total_events)
+                            {
+                                tracing::debug!("Failed to persist interference event count: {e}");
+                            }
                         }
                     }
                 }
@@ -2263,8 +2305,8 @@ impl MemorySystem {
                 .apply_retrieval_competition(&candidates, query_text);
 
             // Record competition event if any memories were suppressed
-            if let Some(event) = competition_result.event {
-                self.record_consolidation_event(event);
+            if let Some(ref event) = competition_result.event {
+                self.record_consolidation_event(event.clone());
             }
 
             // Re-order memories based on competition results (winners first)
@@ -2282,6 +2324,27 @@ impl MemorySystem {
                     "Retrieval competition: {} memories suppressed",
                     competition_result.suppressed.len()
                 );
+            }
+
+            // Persist interference records from retrieval competition
+            {
+                let detector = self.interference_detector.read();
+                let affected_ids = detector.get_affected_ids_from_competition(&competition_result);
+                if !affected_ids.is_empty() {
+                    for (id, records) in detector.get_records_for_ids(&affected_ids) {
+                        if let Err(e) = self.long_term_memory.save_interference_records(id, records)
+                        {
+                            tracing::debug!("Failed to persist competition interference: {e}");
+                        }
+                    }
+                    let (total_events, _) = detector.stats();
+                    if let Err(e) = self
+                        .long_term_memory
+                        .save_interference_event_count(total_events)
+                    {
+                        tracing::debug!("Failed to persist interference event count: {e}");
+                    }
+                }
             }
         }
 
@@ -2568,6 +2631,9 @@ impl MemorySystem {
                     );
                 }
 
+                // Clean up interference records
+                self.cleanup_interference_for_ids(&[memory_id.clone()]);
+
                 // Update stats - decrement each tier count that had this memory
                 if deleted_from_any {
                     let mut stats = self.stats.write();
@@ -2609,6 +2675,7 @@ impl MemorySystem {
                     let _ = self.hybrid_search.remove_memory(id);
                 }
                 self.cleanup_graph_for_ids(&flagged_ids);
+                self.cleanup_interference_for_ids(&flagged_ids);
 
                 // Update stats for hard-deleted and soft-deleted tiers
                 {
@@ -2647,6 +2714,7 @@ impl MemorySystem {
                     let _ = self.hybrid_search.remove_memory(id);
                 }
                 self.cleanup_graph_for_ids(&flagged_ids);
+                self.cleanup_interference_for_ids(&flagged_ids);
 
                 // Update stats for hard-deleted and soft-deleted tiers
                 {
@@ -3365,6 +3433,24 @@ impl MemorySystem {
         }
     }
 
+    /// Clean up interference records for a batch of deleted memory IDs (best-effort)
+    fn cleanup_interference_for_ids(&self, ids: &[MemoryId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut detector = self.interference_detector.write();
+        for id in ids {
+            let id_str = id.0.to_string();
+            detector.clear_memory(&id_str);
+            if let Err(e) = self.long_term_memory.delete_interference_records(&id_str) {
+                tracing::debug!(
+                    "Interference cleanup failed for {}: {e}",
+                    &id_str[..8.min(id_str.len())]
+                );
+            }
+        }
+    }
+
     /// Forget memories matching a pattern
     ///
     /// Uses validated regex compilation with ReDoS protection
@@ -3437,13 +3523,14 @@ impl MemorySystem {
             }
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         let all_ids: Vec<MemoryId> = working_ids
             .into_iter()
             .chain(session_ids)
             .chain(lt_ids)
             .collect();
         self.cleanup_graph_for_ids(&all_ids);
+        self.cleanup_interference_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3521,8 +3608,9 @@ impl MemorySystem {
             }
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         self.cleanup_graph_for_ids(&all_deleted_ids);
+        self.cleanup_interference_for_ids(&all_deleted_ids);
 
         // Update stats
         {
@@ -3610,13 +3698,14 @@ impl MemorySystem {
             count += 1;
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         let all_ids: Vec<MemoryId> = working_ids
             .into_iter()
             .chain(session_ids)
             .chain(lt_ids)
             .collect();
         self.cleanup_graph_for_ids(&all_ids);
+        self.cleanup_interference_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3700,13 +3789,14 @@ impl MemorySystem {
             count += 1;
         }
 
-        // Clean up graph episodes for all deleted memories
+        // Clean up graph episodes and interference records for all deleted memories
         let all_ids: Vec<MemoryId> = working_ids
             .into_iter()
             .chain(session_ids)
             .chain(lt_ids)
             .collect();
         self.cleanup_graph_for_ids(&all_ids);
+        self.cleanup_interference_for_ids(&all_ids);
 
         // Update stats
         {
@@ -3814,7 +3904,12 @@ impl MemorySystem {
             let db = self.long_term_memory.db();
             let mut batch = rocksdb::WriteBatch::default();
             let mut facts_deleted = 0usize;
-            for prefix in &["facts:", "facts_by_entity:", "facts_by_type:"] {
+            for prefix in &[
+                "facts:",
+                "facts_by_entity:",
+                "facts_by_type:",
+                "facts_embedding:",
+            ] {
                 let iter = db.prefix_iterator(prefix.as_bytes());
                 for item in iter {
                     if let Ok((key, _)) = item {
@@ -3847,7 +3942,16 @@ impl MemorySystem {
             }
         }
 
-        // Step 7: Reset stats last (reflects final state)
+        // Step 7: Clear interference history (in-memory + persisted)
+        {
+            let mut detector = self.interference_detector.write();
+            *detector = replay::InterferenceDetector::new();
+        }
+        if let Err(e) = self.long_term_memory.clear_all_interference_records() {
+            tracing::warn!(error = %e, "Failed to clear interference records during forget_all");
+        }
+
+        // Step 8: Reset stats last (reflects final state)
         {
             let mut stats = self.stats.write();
             stats.total_memories = 0;
@@ -5043,7 +5147,7 @@ impl MemorySystem {
 
         // 3.7. Fact extraction: consolidate episodic memories into semantic facts
         // Runs SemanticConsolidator to extract patterns, procedures, preferences, etc.
-        // Deduplicates against existing facts via Jaccard similarity (threshold 0.7)
+        // Deduplicates against existing facts via hybrid embedding+entity+polarity pipeline
         // Connects newly extracted facts to the knowledge graph as L2 entity edges
         let mut facts_extracted_count = 0;
         let mut facts_reinforced_count = 0;
@@ -5059,11 +5163,40 @@ impl MemorySystem {
                 let consolidation_result = consolidator.consolidate(&memories);
 
                 if !consolidation_result.new_facts.is_empty() {
-                    let mut truly_new = Vec::new();
+                    // Batch-encode all new fact texts for hybrid dedup
+                    let fact_texts: Vec<&str> = consolidation_result
+                        .new_facts
+                        .iter()
+                        .map(|f| f.fact.as_str())
+                        .collect();
+                    let fact_embeddings: Vec<Option<Vec<f32>>> = match self
+                        .embedder
+                        .encode_batch(&fact_texts)
+                    {
+                        Ok(embs) => embs.into_iter().map(Some).collect(),
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Fact embedding batch failed, falling back to Jaccard-only dedup"
+                            );
+                            vec![None; fact_texts.len()]
+                        }
+                    };
 
-                    for fact in &consolidation_result.new_facts {
-                        // Dedup: check if a similar fact already exists
-                        match self.fact_store.find_similar(user_id, &fact.fact, 0.7) {
+                    let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
+
+                    for (fact, embedding) in consolidation_result
+                        .new_facts
+                        .iter()
+                        .zip(fact_embeddings.into_iter())
+                    {
+                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
+                        match self.fact_store.find_similar(
+                            user_id,
+                            &fact.fact,
+                            &fact.related_entities,
+                            embedding.as_deref(),
+                        ) {
                             Ok(Some(mut existing)) => {
                                 // Reinforce the existing fact
                                 existing.support_count += 1;
@@ -5087,6 +5220,14 @@ impl MemorySystem {
                                 if let Err(e) = self.fact_store.update(user_id, &existing) {
                                     tracing::debug!("Failed to reinforce fact: {e}");
                                 } else {
+                                    // Update existing fact's embedding with latest encoding
+                                    if let Some(ref emb) = embedding {
+                                        let _ = self.fact_store.store_embedding(
+                                            user_id,
+                                            &existing.id,
+                                            emb,
+                                        );
+                                    }
                                     facts_reinforced_count += 1;
                                     self.record_consolidation_event_for_user(
                                         user_id,
@@ -5102,17 +5243,24 @@ impl MemorySystem {
                                 }
                             }
                             _ => {
-                                truly_new.push(fact.clone());
+                                truly_new.push((fact.clone(), embedding));
                             }
                         }
                     }
 
                     // Store new facts
                     if !truly_new.is_empty() {
-                        match self.fact_store.store_batch(user_id, &truly_new) {
+                        let facts_only: Vec<SemanticFact> =
+                            truly_new.iter().map(|(f, _)| f.clone()).collect();
+                        match self.fact_store.store_batch(user_id, &facts_only) {
                             Ok(stored) => {
                                 facts_extracted_count = stored;
-                                for fact in &truly_new {
+                                // Store embeddings for newly persisted facts
+                                for (fact, embedding) in &truly_new {
+                                    if let Some(emb) = embedding {
+                                        let _ =
+                                            self.fact_store.store_embedding(user_id, &fact.id, emb);
+                                    }
                                     self.record_consolidation_event_for_user(
                                         user_id,
                                         ConsolidationEvent::FactExtracted {
@@ -5132,7 +5280,7 @@ impl MemorySystem {
                         }
 
                         // Connect newly extracted facts to the knowledge graph
-                        self.connect_facts_to_graph(&truly_new);
+                        self.connect_facts_to_graph(&facts_only);
                     }
 
                     if facts_extracted_count > 0 || facts_reinforced_count > 0 {
@@ -5545,6 +5693,14 @@ impl MemorySystem {
                 facts_stored = stored,
                 "Semantic distillation complete"
             );
+
+            // Batch-encode and store embeddings for distilled facts
+            let texts: Vec<&str> = result.new_facts.iter().map(|f| f.fact.as_str()).collect();
+            if let Ok(batch_embs) = self.embedder.encode_batch(&texts) {
+                for (fact, emb) in result.new_facts.iter().zip(batch_embs.iter()) {
+                    let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
+                }
+            }
 
             // Record consolidation event for each fact (persists significant events)
             for fact in &result.new_facts {
