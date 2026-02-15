@@ -30,7 +30,6 @@ pub fn build_public_routes(state: AppState) -> Router {
         // =================================================================
         // HEALTH & KUBERNETES PROBES
         // =================================================================
-        .route("/", get(health::health)) // Cloudflare compat alias
         .route("/health", get(health::health))
         .route("/health/live", get(health::health_live))
         .route("/health/ready", get(health::health_ready))
