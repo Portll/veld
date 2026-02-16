@@ -320,12 +320,7 @@ impl MemoryLogger {
         }
 
         let ratio = (compressed_size as f32 / original_size as f32 * 100.0) as usize;
-        debug!(
-            original_size,
-            compressed_size,
-            ratio,
-            "Memory compressed"
-        );
+        debug!(original_size, compressed_size, ratio, "Memory compressed");
     }
 
     /// Log retrieval
