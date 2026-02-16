@@ -146,11 +146,7 @@ impl ReplayManager {
             .collect();
 
         // Sort by priority (highest first)
-        candidates.sort_by(|a, b| {
-            b.priority_score
-                .partial_cmp(&a.priority_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| b.priority_score.total_cmp(&a.priority_score));
 
         // Take top REPLAY_BATCH_SIZE candidates
         candidates.truncate(REPLAY_BATCH_SIZE);
@@ -431,7 +427,7 @@ impl InterferenceDetector {
             .collect();
 
         // Sort by score descending
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut winners: Vec<(String, f32)> = Vec::new();
         let mut suppressed: Vec<String> = Vec::new();

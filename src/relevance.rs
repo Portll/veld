@@ -863,11 +863,7 @@ impl RelevanceEngine {
             .collect();
 
         // Sort by relevance score (descending)
-        results.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
 
         // Quality-based filtering: only return memories above minimum relevance
         // This prevents returning low-quality matches just to fill max_results
@@ -1067,11 +1063,7 @@ impl RelevanceEngine {
             )
             .collect();
 
-        results.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
 
         // Quality-based filtering: only return memories above minimum relevance
         const MIN_RELEVANCE_SCORE: f32 = 0.25;
@@ -1271,11 +1263,7 @@ impl RelevanceEngine {
                 if !candidate_ids.is_empty() {
                     // Sort by score descending and take top candidates
                     let mut sorted_candidates: Vec<_> = candidate_ids.into_iter().collect();
-                    sorted_candidates.sort_by(|a, b| {
-                        b.1 .0
-                            .partial_cmp(&a.1 .0)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    sorted_candidates.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
 
                     for (memory_id, (score, matched)) in
                         sorted_candidates.into_iter().take(max_candidates)

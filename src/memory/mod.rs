@@ -1304,9 +1304,7 @@ impl MemorySystem {
             let temporal_b = Self::calculate_temporal_relevance(age_days_b);
             let score_b = b.importance() * temporal_b;
 
-            score_b
-                .partial_cmp(&score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            score_b.total_cmp(&score_a)
         });
 
         memories.truncate(query.max_results);
@@ -1838,7 +1836,7 @@ impl MemorySystem {
                 }
                 let mut r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
                 // CRITICAL: Sort by activation score so RRF rank is meaningful
-                r.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                r.sort_by(|a, b| b.1.total_cmp(&a.1));
                 if !r.is_empty() {
                     tracing::debug!("Layer 2: {} graph results, {} query entities, bidirectional={}, top_activation={:.3}",
                         r.len(), entity_count, query_entities.len() >= 2, r.first().map(|x| x.1).unwrap_or(0.0));
@@ -2094,7 +2092,7 @@ impl MemorySystem {
             }
 
             let mut res: Vec<_> = fused.into_iter().collect();
-            res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            res.sort_by(|a, b| b.1.total_cmp(&a.1));
             res.truncate(query.max_results);
             tracing::debug!("Layer 4: {} fused results", res.len());
             (res, heb)
@@ -2344,9 +2342,7 @@ impl MemorySystem {
             memories.sort_by(|a, b| {
                 let score_a = Self::linguistic_boost(&a.experience.content, &analysis);
                 let score_b = Self::linguistic_boost(&b.experience.content, &analysis);
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                score_b.total_cmp(&score_a)
             });
         }
 
@@ -2500,7 +2496,7 @@ impl MemorySystem {
         }
 
         // Sort by adjusted score (descending)
-        boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        boosted.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Rebuild memories with updated scores
         boosted
@@ -6151,11 +6147,7 @@ impl MemorySystem {
             }
         }
 
-        results.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         Ok(results)
     }
 

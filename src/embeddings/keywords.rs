@@ -126,11 +126,7 @@ impl KeywordExtractor {
             .collect();
 
         // Sort by importance descending
-        keywords.sort_by(|a, b| {
-            b.importance
-                .partial_cmp(&a.importance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        keywords.sort_by(|a, b| b.importance.total_cmp(&a.importance));
         keywords
     }
 

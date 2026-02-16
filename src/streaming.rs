@@ -1304,8 +1304,7 @@ impl StreamingMemoryExtractor {
                     .collect();
 
                 // Sort by score descending
-                candidates
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
                 // Filter by threshold, cooldown, and limit
                 let sessions_guard = futures::executor::block_on(async { sessions.read().await });

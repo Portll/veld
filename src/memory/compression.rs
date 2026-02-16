@@ -818,7 +818,7 @@ impl SemanticConsolidator {
     fn select_representative(members: &[(String, MemoryId, f32)]) -> &str {
         members
             .iter()
-            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.2.total_cmp(&b.2))
             .map(|(text, _, _)| text.as_str())
             .unwrap_or("")
     }
@@ -924,7 +924,7 @@ impl SemanticConsolidator {
         }
 
         // Sort by confidence descending so we keep higher-confidence versions
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut kept: Vec<(String, f32, HashSet<String>)> = Vec::new();
         for (text, conf) in candidates {

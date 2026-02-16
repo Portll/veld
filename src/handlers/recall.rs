@@ -543,11 +543,7 @@ pub async fn recall(
             unique_facts.entry(fact.id.clone()).or_insert(fact);
         }
         let mut sorted_facts: Vec<RecallFact> = unique_facts.into_values().collect();
-        sorted_facts.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sorted_facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         sorted_facts.truncate(5);
         sorted_facts
     };
@@ -1068,7 +1064,7 @@ pub async fn proactive_context(
                 .collect();
 
             // Sort by score (highest first) - already mostly sorted from recall()
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             // Drop results below minimum absolute score — don't pad with irrelevant filler
             // Also drop results that are < 30% of the top score (too weak relative to best)
@@ -1475,8 +1471,8 @@ pub async fn proactive_context(
                     (false, true) => std::cmp::Ordering::Greater,
                     _ => b
                         .similarity_score
-                        .partial_cmp(&a.similarity_score)
-                        .unwrap_or(std::cmp::Ordering::Equal),
+                        .unwrap_or(0.0)
+                        .total_cmp(&a.similarity_score.unwrap_or(0.0)),
                 }
             });
             todos_with_scores
@@ -1527,11 +1523,7 @@ pub async fn proactive_context(
                 }
                 // Deduplicate by text similarity: if two facts share >80% words, keep higher confidence
                 let mut sorted: Vec<ProactiveFact> = found.into_values().collect();
-                sorted.sort_by(|a, b| {
-                    b.confidence
-                        .partial_cmp(&a.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sorted.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
                 let mut deduped: Vec<ProactiveFact> = Vec::new();
                 for fact in sorted {
                     let fact_words: std::collections::HashSet<&str> =

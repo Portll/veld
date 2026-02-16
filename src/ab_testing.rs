@@ -1084,7 +1084,7 @@ impl ABTestAnalyzer {
             lifts.push(lift);
         }
 
-        lifts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        lifts.sort_by(|a, b| a.total_cmp(b));
 
         let prob_treatment_better = treatment_wins as f64 / n_samples as f64;
         let expected_lift = lift_sum / n_samples as f64;
@@ -2212,8 +2212,8 @@ mod tests {
             .collect();
 
         // Sort by score descending
-        control_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        treatment_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        control_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        treatment_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         println!("🔍 RANKING COMPARISON (top 8):");
         println!("   Control ranking:");

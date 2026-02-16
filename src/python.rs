@@ -1010,7 +1010,7 @@ impl PyMemorySystem {
             mut items: Vec<(String, String, f32, String)>,
             max: usize,
         ) -> Vec<(String, String, f32, String)> {
-            items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            items.sort_by(|a, b| b.2.total_cmp(&a.2));
             items.truncate(max);
             items
         }
@@ -1860,7 +1860,7 @@ impl PyMemorySystem {
             .collect();
 
         // Sort by score and take top results
-        scored_memories.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_memories.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored_memories.truncate(max_results);
 
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;

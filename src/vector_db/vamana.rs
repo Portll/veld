@@ -667,11 +667,7 @@ impl VamanaIndex {
 
         // Sort candidates by distance (NaN values sort to end)
         let mut sorted_candidates = candidates.to_vec();
-        sorted_candidates.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sorted_candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
 
         // Pre-load all candidate vectors to avoid repeated storage lookups
         // This trades memory for CPU - worth it for the O(n²) inner loop
@@ -918,8 +914,7 @@ impl VamanaIndex {
                         .collect();
 
                     // Sort by distance (lower = closer for all metrics)
-                    neighbor_distances
-                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                    neighbor_distances.sort_by(|a, b| a.1.total_cmp(&b.1));
 
                     // Keep only max_degree closest neighbors
                     graph[neighbor_id as usize].neighbors = neighbor_distances
@@ -1152,7 +1147,7 @@ impl VamanaIndex {
             distances.push((id, dist));
         }
 
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        distances.sort_by(|a, b| a.1.total_cmp(&b.1));
         distances.truncate(k);
 
         Ok(distances)
@@ -1603,9 +1598,7 @@ impl Eq for SearchCandidate {}
 
 impl Ord for SearchCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.distance
-            .partial_cmp(&other.distance)
-            .unwrap_or(Ordering::Equal)
+        self.distance.total_cmp(&other.distance)
     }
 }
 
