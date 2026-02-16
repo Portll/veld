@@ -219,6 +219,7 @@ pub struct RecallMemory {
     pub importance: f32,
     pub created_at: String,
     pub score: f32,
+    pub tier: String,
 }
 
 #[derive(Serialize)]

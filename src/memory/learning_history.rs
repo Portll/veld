@@ -321,6 +321,31 @@ impl LearningHistoryStore {
                 None,
                 None,
             ),
+            // Memory-Edge Tier Coupling events
+            ConsolidationEvent::EdgePromotionBoostApplied { memory_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(memory_id.clone()),
+                None,
+                None,
+            ),
+            ConsolidationEvent::GraphOrphanDetected { memory_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(memory_id.clone()),
+                None,
+                None,
+            ),
+            ConsolidationEvent::GraphAdjustedPromotion { memory_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(memory_id.clone()),
+                None,
+                None,
+            ),
+            ConsolidationEvent::GraphDecayConsolidated { .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                None,
+                None,
+                None,
+            ),
         }
     }
 

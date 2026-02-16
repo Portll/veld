@@ -910,13 +910,39 @@ impl MultiUserMemoryManager {
                 None
             };
 
+            // Direction 1: Edge strengthening + promotion boost propagation
             if let Some(ref result) = maintenance_result {
                 if !result.edge_boosts.is_empty() {
                     if let Ok(graph) = self.get_user_graph(&user_id) {
                         let graph_guard = graph.read();
                         match graph_guard.strengthen_memory_edges(&result.edge_boosts) {
-                            Ok(count) => {
+                            Ok((count, promotion_boosts)) => {
                                 edges_strengthened += count;
+
+                                // Direction 1: Apply edge promotion boosts to memory importance
+                                if !promotion_boosts.is_empty() {
+                                    if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                                        let memory = memory_lock.read();
+                                        match memory.apply_edge_promotion_boosts(&promotion_boosts)
+                                        {
+                                            Ok(boosted) => {
+                                                tracing::debug!(
+                                                    user_id = %user_id,
+                                                    boosted,
+                                                    promotions = promotion_boosts.len(),
+                                                    "Applied edge promotion boosts"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "Edge promotion boost failed for user {}: {}",
+                                                    user_id,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -930,11 +956,38 @@ impl MultiUserMemoryManager {
                 }
             }
 
+            // Direction 2: Graph decay + orphan compensation
             if let Ok(graph) = self.get_user_graph(&user_id) {
                 let graph_guard = graph.read();
                 match graph_guard.apply_decay() {
-                    Ok(pruned) => {
-                        edges_decayed += pruned;
+                    Ok(decay_result) => {
+                        edges_decayed += decay_result.pruned_count;
+
+                        // Direction 2: Compensate memories that lost all graph edges
+                        if !decay_result.orphaned_entity_ids.is_empty() {
+                            if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                                let memory = memory_lock.read();
+                                match memory
+                                    .compensate_orphaned_memories(&decay_result.orphaned_entity_ids)
+                                {
+                                    Ok(compensated) => {
+                                        tracing::debug!(
+                                            user_id = %user_id,
+                                            compensated,
+                                            orphaned = decay_result.orphaned_entity_ids.len(),
+                                            "Compensated orphaned memories"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Orphan compensation failed for user {}: {}",
+                                            user_id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::debug!("Graph decay failed for user {}: {}", user_id, e);

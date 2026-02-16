@@ -3269,7 +3269,7 @@ impl MemorySystem {
         let now = chrono::Utc::now();
         let min_age = chrono::Duration::seconds(TIER_PROMOTION_WORKING_AGE_SECS);
 
-        // Find eligible memories (importance + time threshold)
+        // Find eligible memories (importance + time threshold, with graph-adjusted threshold)
         let to_promote: Vec<SharedMemory> = {
             let working = self.working_memory.read();
             working
@@ -3278,7 +3278,9 @@ impl MemorySystem {
                 .filter(|m| {
                     let age = now - m.created_at;
                     let importance = m.importance();
-                    importance >= TIER_PROMOTION_WORKING_IMPORTANCE && age >= min_age
+                    let threshold =
+                        self.graph_adjusted_threshold(m, TIER_PROMOTION_WORKING_IMPORTANCE);
+                    importance >= threshold && age >= min_age
                 })
                 .collect()
         };
@@ -3327,7 +3329,7 @@ impl MemorySystem {
         let now = chrono::Utc::now();
         let min_age = chrono::Duration::seconds(TIER_PROMOTION_SESSION_AGE_SECS);
 
-        // Find eligible memories (importance + time threshold)
+        // Find eligible memories (importance + time threshold, with graph-adjusted threshold)
         let to_promote: Vec<SharedMemory> = {
             let session = self.session_memory.read();
             session
@@ -3336,7 +3338,9 @@ impl MemorySystem {
                 .filter(|m| {
                     let age = now - m.created_at;
                     let importance = m.importance();
-                    importance >= TIER_PROMOTION_SESSION_IMPORTANCE && age >= min_age
+                    let threshold =
+                        self.graph_adjusted_threshold(m, TIER_PROMOTION_SESSION_IMPORTANCE);
+                    importance >= threshold && age >= min_age
                 })
                 .collect()
         };
@@ -3395,6 +3399,181 @@ impl MemorySystem {
             );
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Memory-Edge Tier Coupling Methods
+    // =========================================================================
+
+    /// Calculate graph-adjusted importance threshold for tier promotion (Direction 3).
+    ///
+    /// Well-connected memories (many L2+ edges) get a discount on the promotion threshold.
+    /// Isolated memories (entities but no edges) get a penalty.
+    /// Memories with no entities are unaffected (no graph context to evaluate).
+    fn graph_adjusted_threshold(&self, memory: &Memory, base_threshold: f32) -> f32 {
+        use crate::constants::*;
+
+        let graph = match &self.graph_memory {
+            Some(g) => g,
+            None => return base_threshold,
+        };
+
+        if memory.entity_refs.is_empty() {
+            return base_threshold;
+        }
+
+        let graph_guard = graph.read();
+        let mut l2_plus_count = 0usize;
+
+        for entity_ref in &memory.entity_refs {
+            if let Ok(edges) = graph_guard.get_entity_relationships(&entity_ref.entity_id) {
+                for edge in &edges {
+                    if matches!(
+                        edge.tier,
+                        crate::graph_memory::EdgeTier::L2Episodic
+                            | crate::graph_memory::EdgeTier::L3Semantic
+                    ) {
+                        l2_plus_count += 1;
+                    }
+                }
+            }
+        }
+
+        if l2_plus_count == 0 {
+            // Memory has entities but no strong edges — penalize
+            base_threshold * (1.0 + GRAPH_HEALTH_NO_EDGES_PENALTY as f32)
+        } else {
+            // Discount proportional to edge count, capped at saturation
+            let ratio = (l2_plus_count as f64 / GRAPH_HEALTH_EDGE_SATURATION).min(1.0);
+            base_threshold * (1.0 - (GRAPH_HEALTH_PROMOTION_DISCOUNT * ratio) as f32)
+        }
+    }
+
+    /// Apply importance boosts to memories whose edges were promoted (Direction 1).
+    ///
+    /// When an edge promotes from L1→L2 or L2→L3, the memories involved get
+    /// a small importance boost, reflecting that they participate in a consolidating
+    /// relationship. Uses interior mutability — `set_importance` works through Arc.
+    pub fn apply_edge_promotion_boosts(
+        &self,
+        boosts: &[crate::memory::types::EdgePromotionBoost],
+    ) -> Result<usize> {
+        let mut applied = 0;
+
+        for boost in boosts {
+            let memory_id = match uuid::Uuid::parse_str(&boost.memory_id) {
+                Ok(uuid) => MemoryId(uuid),
+                Err(_) => continue,
+            };
+
+            // Search across tiers: working → session → long-term
+            let found = self
+                .working_memory
+                .read()
+                .get(&memory_id)
+                .or_else(|| self.session_memory.read().get(&memory_id));
+
+            if let Some(memory) = found {
+                let new_importance = (memory.importance() + boost.boost as f32).min(1.0);
+                memory.set_importance(new_importance);
+                self.record_consolidation_event(ConsolidationEvent::EdgePromotionBoostApplied {
+                    memory_id: boost.memory_id.clone(),
+                    entity_name: boost.entity_name.clone(),
+                    old_tier: boost.old_tier.clone(),
+                    new_tier: boost.new_tier.clone(),
+                    importance_boost: boost.boost,
+                    new_importance: new_importance as f64,
+                    timestamp: chrono::Utc::now(),
+                });
+                applied += 1;
+            } else if let Ok(memory) = self.long_term_memory.get(&memory_id) {
+                let new_importance = (memory.importance() + boost.boost as f32).min(1.0);
+                memory.set_importance(new_importance);
+                if let Err(e) = self.long_term_memory.store(&memory) {
+                    tracing::debug!(
+                        "Failed to persist edge promotion boost for {}: {}",
+                        boost.memory_id,
+                        e
+                    );
+                    continue;
+                }
+                self.record_consolidation_event(ConsolidationEvent::EdgePromotionBoostApplied {
+                    memory_id: boost.memory_id.clone(),
+                    entity_name: boost.entity_name.clone(),
+                    old_tier: boost.old_tier.clone(),
+                    new_tier: boost.new_tier.clone(),
+                    importance_boost: boost.boost,
+                    new_importance: new_importance as f64,
+                    timestamp: chrono::Utc::now(),
+                });
+                applied += 1;
+            }
+        }
+
+        if applied > 0 {
+            tracing::debug!(
+                "Applied {} edge promotion boosts to memory importance",
+                applied
+            );
+        }
+
+        Ok(applied)
+    }
+
+    /// Apply compensatory boost to memories that lost all graph edges (Direction 2).
+    ///
+    /// When graph decay prunes edges and leaves entities orphaned, the memories
+    /// referencing those entities get a small importance boost to prevent immediate
+    /// decay death. This gives them one more maintenance cycle to prove value.
+    pub fn compensate_orphaned_memories(&self, orphaned_entity_ids: &[String]) -> Result<usize> {
+        use crate::constants::ORPHAN_COMPENSATORY_BOOST;
+
+        if orphaned_entity_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let orphaned_set: std::collections::HashSet<&str> =
+            orphaned_entity_ids.iter().map(|s| s.as_str()).collect();
+
+        let mut compensated = 0;
+
+        // Scan working + session memories for references to orphaned entities
+        let tiers: Vec<Vec<SharedMemory>> = vec![
+            self.working_memory.read().all_memories(),
+            self.session_memory.read().all_memories(),
+        ];
+
+        for memories in &tiers {
+            for memory in memories {
+                let entity_count = memory
+                    .entity_refs
+                    .iter()
+                    .filter(|e| orphaned_set.contains(e.entity_id.to_string().as_str()))
+                    .count();
+                if entity_count > 0 {
+                    let new_importance =
+                        (memory.importance() + ORPHAN_COMPENSATORY_BOOST as f32).min(1.0);
+                    memory.set_importance(new_importance);
+                    self.record_consolidation_event(ConsolidationEvent::GraphOrphanDetected {
+                        memory_id: memory.id.0.to_string(),
+                        entity_count,
+                        compensatory_boost: ORPHAN_COMPENSATORY_BOOST,
+                        timestamp: chrono::Utc::now(),
+                    });
+                    compensated += 1;
+                }
+            }
+        }
+
+        if compensated > 0 {
+            tracing::debug!(
+                "Compensated {} orphaned memories (from {} orphaned entities)",
+                compensated,
+                orphaned_entity_ids.len()
+            );
+        }
+
+        Ok(compensated)
     }
 
     /// Compress old memories to save space
@@ -5275,10 +5454,10 @@ impl MemorySystem {
             );
         }
 
-        // 3. Graph maintenance: prune weak edges
-        // Note: Graph maintenance doesn't currently report pruned edges,
-        // but the retriever could be modified to return pruning stats
-        self.graph_maintenance();
+        // 3. Graph maintenance moved to state.rs run_maintenance_all_users()
+        // This fixes the double-decay bug: apply_decay() was called both here
+        // (via graph_maintenance()) and in state.rs. Now only state.rs calls it,
+        // and the result is used for orphan detection (Direction 2 coupling).
 
         // 3.5. Temporal fact decay: decay/delete stale facts
         // Facts that haven't been reinforced lose confidence over time

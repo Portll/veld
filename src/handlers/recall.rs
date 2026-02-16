@@ -148,6 +148,7 @@ pub struct ProactiveSurfacedMemory {
     pub importance: f32,
     pub created_at: String,
     pub tags: Vec<String>,
+    pub tier: String,
     /// Why this memory was surfaced ("semantic", "entity", "combined")
     pub relevance_reason: String,
     /// Entities from this memory that matched the query context
@@ -424,6 +425,7 @@ pub async fn recall(
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
                 score,
+                tier: format!("{:?}", m.tier),
             }
         })
         .collect();
@@ -1151,6 +1153,7 @@ pub async fn proactive_context(
                         importance: m.importance(),
                         created_at: m.created_at.to_rfc3339(),
                         tags: m.experience.tags.clone(),
+                        tier: format!("{:?}", m.tier),
                         relevance_reason,
                         matched_entities: matched,
                         embedding: m.experience.embeddings.clone().unwrap_or_default(),
@@ -1761,6 +1764,7 @@ pub async fn recall_tracked(
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
                 score,
+                tier: format!("{:?}", m.tier),
             }
         })
         .collect();
