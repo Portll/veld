@@ -209,11 +209,7 @@ impl InjectionEngine {
         mut candidates: Vec<InjectionCandidate>,
     ) -> Vec<MemoryId> {
         // Sort by relevance descending
-        candidates.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
 
         let selected: Vec<MemoryId> = candidates
             .into_iter()

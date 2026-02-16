@@ -924,7 +924,7 @@ pub fn argmax_softmax(logits: &[f32]) -> Option<(usize, f32)> {
     logits
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(idx, &val)| (idx, (val - max_logit).exp() / exp_sum))
 }
 

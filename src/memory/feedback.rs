@@ -545,7 +545,7 @@ impl FeedbackMomentum {
         self.helpful_contexts
             .iter()
             .map(|fp| fp.similarity(current))
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.total_cmp(b))
     }
 
     /// Check if current context matches misleading pattern
@@ -553,7 +553,7 @@ impl FeedbackMomentum {
         self.misleading_contexts
             .iter()
             .map(|fp| fp.similarity(current))
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.total_cmp(b))
     }
 
     /// Apply time-based decay to momentum (AUD-6)

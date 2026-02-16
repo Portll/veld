@@ -226,7 +226,7 @@ fn spread_single_direction(
         let max_activation = activation_map
             .values()
             .cloned()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(1.0);
 
         if max_activation > SPREADING_NORMALIZATION_FACTOR {
@@ -620,7 +620,7 @@ pub fn spreading_activation_retrieve_with_stats(
             let max_activation = activation_map
                 .values()
                 .cloned()
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.total_cmp(b))
                 .unwrap_or(1.0);
 
             if max_activation > SPREADING_NORMALIZATION_FACTOR {
@@ -791,11 +791,7 @@ pub fn spreading_activation_retrieve_with_stats(
     }
 
     // Step 6: Sort by final score (descending)
-    scored_memories.sort_by(|a, b| {
-        b.final_score
-            .partial_cmp(&a.final_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
 
     // Step 7: Apply limit
     scored_memories.truncate(query.max_results);
@@ -977,7 +973,7 @@ mod tests {
         use crate::constants::SPREADING_NORMALIZATION_FACTOR;
 
         // Simulate activation accumulation over hops
-        let mut activations = vec![1.0, 0.8, 0.5, 0.3];
+        let mut activations: Vec<f32> = vec![1.0, 0.8, 0.5, 0.3];
 
         // Simulate 5 hops of accumulation (each hop adds to existing)
         for _ in 0..5 {
@@ -989,7 +985,7 @@ mod tests {
             let max_activation = activations
                 .iter()
                 .cloned()
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.total_cmp(b))
                 .unwrap_or(1.0);
 
             if max_activation > SPREADING_NORMALIZATION_FACTOR {
@@ -1004,7 +1000,7 @@ mod tests {
         let final_max = activations
             .iter()
             .cloned()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(0.0);
 
         assert!(final_max <= SPREADING_NORMALIZATION_FACTOR + 0.001);

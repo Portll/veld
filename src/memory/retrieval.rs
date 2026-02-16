@@ -814,7 +814,7 @@ impl RetrievalEngine {
 
         // Convert to vec and sort by similarity descending (highest first)
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1));
         memory_ids.truncate(limit);
 
         Ok(memory_ids)
@@ -880,7 +880,7 @@ impl RetrievalEngine {
 
         // Convert to vec and sort by similarity descending (highest first)
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1));
         memory_ids.truncate(limit);
 
         Ok(memory_ids)
@@ -1109,7 +1109,7 @@ impl RetrievalEngine {
             })
             .collect();
 
-        sorted.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         Ok(sorted.into_iter().take(limit).map(|(_, m)| m).collect())
     }
@@ -1152,9 +1152,7 @@ impl RetrievalEngine {
                 Some(geo) => geo_filter.haversine_distance(geo[0], geo[1]),
                 None => f64::MAX,
             };
-            dist_a
-                .partial_cmp(&dist_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            dist_a.total_cmp(&dist_b)
         });
 
         memories.truncate(limit);
@@ -1213,9 +1211,7 @@ impl RetrievalEngine {
         memories.sort_by(|a, b| {
             let reward_a = a.experience.reward.unwrap_or(0.0);
             let reward_b = b.experience.reward.unwrap_or(0.0);
-            reward_b
-                .partial_cmp(&reward_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            reward_b.total_cmp(&reward_a)
         });
 
         memories.truncate(limit);

@@ -1491,11 +1491,7 @@ impl MultiUserMemoryManager {
             .chain(issue_entities)
             .chain(verb_entities)
             .collect();
-        all_entities.sort_by(|a, b| {
-            b.1.salience
-                .partial_cmp(&a.1.salience)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        all_entities.sort_by(|a, b| b.1.salience.total_cmp(&a.1.salience));
         let entity_cap = self.server_config.max_entities_per_memory;
         all_entities.truncate(entity_cap);
 

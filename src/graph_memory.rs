@@ -1506,7 +1506,7 @@ impl GraphMemory {
         }
 
         // Sort by score descending
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Take top results
         for (uuid, _score) in scored.into_iter().take(max_results) {
@@ -1697,7 +1697,7 @@ impl GraphMemory {
             match a.2.cmp(&b.2) {
                 CmpOrdering::Equal => {
                     // Within same protection class, weaker edges first (prune candidates)
-                    a.1.partial_cmp(&b.1).unwrap_or(CmpOrdering::Equal)
+                    a.1.total_cmp(&b.1)
                 }
                 other => other,
             }
@@ -1792,11 +1792,7 @@ impl GraphMemory {
         }
 
         // Phase 3: Sort by effective strength descending (strongest first)
-        edges.sort_by(|a, b| {
-            b.effective_strength()
-                .partial_cmp(&a.effective_strength())
-                .unwrap_or(CmpOrdering::Equal)
-        });
+        edges.sort_by(|a, b| b.effective_strength().total_cmp(&a.effective_strength()));
 
         // Phase 4: Truncate to limit if specified
         if let Some(max) = limit {
@@ -2344,9 +2340,7 @@ impl GraphMemory {
         impl Ord for PQEntry {
             fn cmp(&self, other: &Self) -> CmpOrdering {
                 // BinaryHeap is a max-heap: higher score = popped first = explored first
-                self.score
-                    .partial_cmp(&other.score)
-                    .unwrap_or(CmpOrdering::Equal)
+                self.score.total_cmp(&other.score)
             }
         }
 
@@ -2458,11 +2452,7 @@ impl GraphMemory {
         }
 
         // Sort entities by path score (decay_factor) descending
-        all_entities.sort_by(|a, b| {
-            b.decay_factor
-                .partial_cmp(&a.decay_factor)
-                .unwrap_or(CmpOrdering::Equal)
-        });
+        all_entities.sort_by(|a, b| b.decay_factor.total_cmp(&a.decay_factor));
 
         // Hebbian strengthening
         if !edges_to_strengthen.is_empty() {
@@ -3250,7 +3240,7 @@ impl GraphMemory {
         }
 
         // Sort by strength descending and limit
-        associations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        associations.sort_by(|a, b| b.1.total_cmp(&a.1));
         associations.truncate(max_results);
 
         Ok(associations)
@@ -3507,11 +3497,7 @@ impl GraphMemory {
         }
 
         // Sort by strength (strongest first)
-        relationships.sort_by(|a, b| {
-            b.strength
-                .partial_cmp(&a.strength)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        relationships.sort_by(|a, b| b.strength.total_cmp(&a.strength));
 
         Ok(relationships)
     }
