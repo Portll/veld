@@ -359,7 +359,11 @@ impl RelationshipEdge {
     /// - Detects sustained patterns (10+ total or 5+ over 30 days) → full protection
     ///
     /// Also handles tier promotion (L1→L2→L3) when strength exceeds tier threshold.
-    pub fn strengthen(&mut self) {
+    ///
+    /// Returns `Some((old_tier_name, new_tier_name))` if a tier promotion occurred,
+    /// `None` otherwise. This enables the memory-edge coupling: edge promotions
+    /// can signal the memory layer to boost the associated memory's importance.
+    pub fn strengthen(&mut self) -> Option<(String, String)> {
         use crate::constants::*;
 
         let now = Utc::now();
@@ -415,6 +419,7 @@ impl RelationshipEdge {
         }
 
         // Tier promotion: check if strength exceeds current tier's promotion threshold
+        let mut promotion_result = None;
         if let Some(threshold) = self.tier.promotion_threshold() {
             if self.strength >= threshold {
                 if let Some(next_tier) = self.tier.next_tier() {
@@ -449,6 +454,9 @@ impl RelationshipEdge {
                         old_tier,
                         self.tier
                     );
+
+                    promotion_result =
+                        Some((format!("{:?}", old_tier), format!("{:?}", self.tier)));
                 }
             }
         }
@@ -456,6 +464,8 @@ impl RelationshipEdge {
         // PIPE-5: L3 auto-LTP removed - now handled by unified ltp_readiness()
         // The readiness formula combines strength + activation count + entity confidence,
         // ensuring both intensity and repetition evidence are required for Full LTP.
+
+        promotion_result
     }
 
     /// Record an activation timestamp (PIPE-4)
@@ -1584,7 +1594,7 @@ impl GraphMemory {
             self.find_relationship_between(&edge.from_entity, &edge.to_entity)?
         {
             // Strengthen existing edge instead of creating duplicate
-            existing.strengthen();
+            let _ = existing.strengthen();
             existing.last_activated = Utc::now();
 
             // Update context if new context is more informative
@@ -2893,7 +2903,7 @@ impl GraphMemory {
         let _guard = self.synapse_update_lock.lock();
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
-            edge.strengthen();
+            let _ = edge.strengthen();
 
             let key = edge.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
@@ -2922,7 +2932,7 @@ impl GraphMemory {
 
         for edge_uuid in edge_uuids {
             if let Some(mut edge) = self.get_relationship(edge_uuid)? {
-                edge.strengthen();
+                let _ = edge.strengthen();
 
                 let key = edge.uuid.as_bytes();
                 match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
@@ -2981,7 +2991,7 @@ impl GraphMemory {
 
                 if let Some(mut edge) = existing_edge {
                     // Strengthen existing edge
-                    edge.strengthen();
+                    let _ = edge.strengthen();
                     let key = edge.uuid.as_bytes();
                     if let Ok(value) =
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
@@ -3068,15 +3078,23 @@ impl GraphMemory {
     ///
     /// Takes edge boosts from memory replay and applies Hebbian strengthening.
     /// Creates edges if they don't exist, strengthens if they do.
-    /// Returns the number of edges successfully strengthened.
-    pub fn strengthen_memory_edges(&self, edge_boosts: &[(String, String, f32)]) -> Result<usize> {
+    ///
+    /// Returns (count_strengthened, promotion_boosts) where promotion_boosts contains
+    /// signals for any edge tier promotions that occurred (Direction 1 coupling).
+    pub fn strengthen_memory_edges(
+        &self,
+        edge_boosts: &[(String, String, f32)],
+    ) -> Result<(usize, Vec<crate::memory::types::EdgePromotionBoost>)> {
+        use crate::constants::{EDGE_PROMOTION_MEMORY_BOOST_L2, EDGE_PROMOTION_MEMORY_BOOST_L3};
+
         if edge_boosts.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let _guard = self.synapse_update_lock.lock();
         let mut batch = WriteBatch::default();
         let mut strengthened = 0;
+        let mut promotion_boosts = Vec::new();
 
         for (from_id_str, to_id_str, _boost) in edge_boosts {
             // Parse UUIDs
@@ -3099,13 +3117,42 @@ impl GraphMemory {
             let existing_edge = self.find_edge_between_entities(&from_uuid, &to_uuid)?;
 
             if let Some(mut edge) = existing_edge {
-                // Strengthen existing edge
-                edge.strengthen();
+                // Strengthen existing edge — capture tier promotion if it occurs
+                let promotion = edge.strengthen();
                 let key = edge.uuid.as_bytes();
                 if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put(key, value);
                     strengthened += 1;
+
+                    // If a tier promotion occurred, emit boost signals for both memories
+                    if let Some((old_tier, new_tier)) = promotion {
+                        let boost = if new_tier.contains("L2") {
+                            EDGE_PROMOTION_MEMORY_BOOST_L2
+                        } else {
+                            EDGE_PROMOTION_MEMORY_BOOST_L3
+                        };
+                        let entity_name = format!(
+                            "{}↔{}",
+                            &from_id_str[..8.min(from_id_str.len())],
+                            &to_id_str[..8.min(to_id_str.len())]
+                        );
+                        // Boost both memories involved in the promoted edge
+                        promotion_boosts.push(crate::memory::types::EdgePromotionBoost {
+                            memory_id: from_id_str.clone(),
+                            entity_name: entity_name.clone(),
+                            old_tier: old_tier.clone(),
+                            new_tier: new_tier.clone(),
+                            boost,
+                        });
+                        promotion_boosts.push(crate::memory::types::EdgePromotionBoost {
+                            memory_id: to_id_str.clone(),
+                            entity_name,
+                            old_tier,
+                            new_tier,
+                            boost,
+                        });
+                    }
                 }
             } else {
                 // Create new ReplayStrengthened edge
@@ -3149,12 +3196,13 @@ impl GraphMemory {
         if strengthened > 0 {
             self.relationships_db.write(batch)?;
             tracing::debug!(
-                "Applied {} edge boosts from replay consolidation",
-                strengthened
+                "Applied {} edge boosts from replay consolidation ({} tier promotions)",
+                strengthened,
+                promotion_boosts.len()
             );
         }
 
-        Ok(strengthened)
+        Ok((strengthened, promotion_boosts))
     }
 
     /// Find memories associated with a given memory through co-retrieval
@@ -3344,22 +3392,36 @@ impl GraphMemory {
     /// Called during maintenance cycle to:
     /// 1. Apply time-based decay to all edge strengths
     /// 2. Remove edges that have decayed below threshold
+    /// 3. Detect orphaned entities (entities that lost all their edges)
     ///
-    /// Returns the number of edges pruned.
-    pub fn apply_decay(&self) -> Result<usize> {
-        // Get all edge UUIDs
-        let edge_uuids: Vec<Uuid> = self
-            .get_all_relationships()?
-            .into_iter()
-            .map(|e| e.uuid)
-            .collect();
+    /// Returns a `GraphDecayResult` with pruned count and orphaned entity/memory IDs
+    /// for Direction 2 coupling (edge pruning → orphan detection).
+    pub fn apply_decay(&self) -> Result<crate::memory::types::GraphDecayResult> {
+        // Get all edges (need full data for orphan tracking)
+        let all_edges = self.get_all_relationships()?;
+        let edge_uuids: Vec<Uuid> = all_edges.iter().map(|e| e.uuid).collect();
 
         if edge_uuids.is_empty() {
-            return Ok(0);
+            return Ok(crate::memory::types::GraphDecayResult::default());
         }
 
         // Apply decay and get edges to prune
         let to_prune = self.batch_decay_synapses(&edge_uuids)?;
+
+        if to_prune.is_empty() {
+            return Ok(crate::memory::types::GraphDecayResult::default());
+        }
+
+        // Collect entity UUIDs from edges being pruned (candidates for orphan status)
+        let pruned_set: std::collections::HashSet<Uuid> = to_prune.iter().copied().collect();
+        let mut orphan_candidates: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::new();
+        for edge in &all_edges {
+            if pruned_set.contains(&edge.uuid) {
+                orphan_candidates.insert(edge.from_entity);
+                orphan_candidates.insert(edge.to_entity);
+            }
+        }
 
         // Delete pruned edges
         let mut pruned_count = 0;
@@ -3369,15 +3431,29 @@ impl GraphMemory {
             }
         }
 
+        // Check which candidate entities became orphaned (lost ALL edges)
+        let mut orphaned_entity_ids = Vec::new();
+        for entity_uuid in &orphan_candidates {
+            let remaining = self.get_entity_relationships(entity_uuid)?;
+            if remaining.is_empty() {
+                orphaned_entity_ids.push(entity_uuid.to_string());
+            }
+        }
+
         if pruned_count > 0 {
             tracing::debug!(
-                "Graph decay: {} edges pruned (of {} total)",
+                "Graph decay: {} edges pruned (of {} total), {} entities orphaned",
                 pruned_count,
-                edge_uuids.len()
+                edge_uuids.len(),
+                orphaned_entity_ids.len()
             );
         }
 
-        Ok(pruned_count)
+        Ok(crate::memory::types::GraphDecayResult {
+            pruned_count,
+            orphaned_entity_ids,
+            orphaned_memory_ids: Vec::new(), // Populated by memory layer via entity→memory lookup
+        })
     }
 
     /// Get graph statistics - O(1) using atomic counters
@@ -4883,7 +4959,7 @@ mod tests {
         let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
         let initial_strength = edge.strength;
 
-        edge.strengthen();
+        let _ = edge.strengthen();
 
         // With tier boost (L2 gets 80% of TIER_CO_ACCESS_BOOST), strength should increase
         let tier_boost = TIER_CO_ACCESS_BOOST * 0.8;
@@ -4901,7 +4977,7 @@ mod tests {
         // Use L3 tier (no promotion) with high initial strength
         let mut edge = create_test_edge_with_tier(0.95, 0, EdgeTier::L3Semantic);
 
-        edge.strengthen();
+        let _ = edge.strengthen();
 
         // High strength should still increase but slowly (asymptotic to 1.0)
         // L3 tier boost = TIER_CO_ACCESS_BOOST * 0.5 = 0.075
@@ -4922,7 +4998,7 @@ mod tests {
         // Use L2 tier (tier_boost = TIER_CO_ACCESS_BOOST * 0.8) at 0.3 to avoid promotion
         let mut edge = create_test_edge_with_tier(0.3, 0, EdgeTier::L2Episodic);
 
-        edge.strengthen();
+        let _ = edge.strengthen();
 
         // L2 tier boost = 0.15 * 0.8 = 0.12
         // Expected: 0.3 + (0.1 + 0.12) * (1 - 0.3) = 0.3 + 0.22 * 0.7 = 0.454
@@ -4942,7 +5018,7 @@ mod tests {
 
         // Strengthen 10 times (LTP_THRESHOLD = 10)
         for _ in 0..10 {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
 
         assert!(
@@ -4966,7 +5042,7 @@ mod tests {
 
         // Strengthen 5 times (LTP_BURST_THRESHOLD = 5) within 24 hours
         for _ in 0..5 {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
 
         // Should have burst LTP (5+ activations in 24h)
@@ -4985,7 +5061,7 @@ mod tests {
 
         // Strengthen a few times
         for _ in 0..3 {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
 
         // Should have recorded timestamps (edge may have promoted to L3, but still tracks)
@@ -5019,7 +5095,7 @@ mod tests {
 
         // Strengthen until it promotes to L2 (L1_PROMOTION_THRESHOLD = 0.5)
         while matches!(edge.tier, EdgeTier::L1Working) {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
 
         // After promotion to L2, should start tracking
@@ -5057,7 +5133,7 @@ mod tests {
 
         // Get to burst LTP (5 activations)
         for _ in 0..5 {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
         assert!(
             matches!(edge.ltp_status, LtpStatus::Burst { .. }),
@@ -5067,7 +5143,7 @@ mod tests {
 
         // Continue strengthening to Full LTP (10 total)
         for _ in 0..5 {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
 
         // Should now be Full (upgraded from Burst via 10 activations)
@@ -5083,7 +5159,7 @@ mod tests {
 
         // Record some activations
         for _ in 0..5 {
-            edge.strengthen();
+            let _ = edge.strengthen();
         }
 
         let now = Utc::now();

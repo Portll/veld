@@ -1431,7 +1431,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             response += `• ${matchBar} ${score}% │ ${timeStr}\n`;
             response += `  ${content.slice(0, 200)}${content.length > 200 ? '...' : ''}\n`;
-            response += `  ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
+            response += `  ┗━ ${getType(m)}${m.tier ? ` │ ${m.tier}` : ''} │ ${m.id.slice(0, 8)}...\n`;
             if (i < memories.length - 1) response += `\n`;
           }
         }
@@ -1638,7 +1638,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }[getType(m)] || '📦';
 
           response += `${String(i + 1).padStart(2)}. ${typeIcon} ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
-          response += `    ┗━ ${getType(m)} │ ${m.id.slice(0, 8)}...\n`;
+          response += `    ┗━ ${getType(m)}${m.tier ? ` │ ${m.tier}` : ''} │ ${m.id.slice(0, 8)}...\n`;
         }
 
         return {
@@ -2186,7 +2186,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               const sentenceEnd = preview.slice(0, 200).lastIndexOf('. ');
               preview = sentenceEnd > 80 ? preview.slice(0, sentenceEnd + 1) : preview.slice(0, 200) + '...';
             }
-            return `${i + 1}. ${importanceBar} [${score}%]${timeStr} ${preview}\n   ${m.memory_type} | ${m.relevance_reason}${entityMatchStr}${tagsStr}`;
+            return `${i + 1}. ${importanceBar} [${score}%]${timeStr} ${preview}\n   ${m.memory_type}${m.tier ? ` | ${m.tier}` : ''} | ${m.relevance_reason}${entityMatchStr}${tagsStr}`;
           })
           .join("\n\n");
 
@@ -2991,6 +2991,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
           importance: number;
           created_at: string;
+          tier?: string;
           parent_id?: string;
           children_ids: string[];
           children_count: number;
@@ -3021,7 +3022,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let response = `Memory: ${memory.id}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Type: ${memory.experience.experience_type} | Tags: ${tags}\n`;
-        response += `Created: ${created} | Importance: ${(memory.importance * 100).toFixed(0)}%\n`;
+        response += `Tier: ${memory.tier || 'Unknown'} | Created: ${created} | Importance: ${(memory.importance * 100).toFixed(0)}%\n`;
 
         // Hierarchy info
         if (memory.parent_id) {
@@ -3457,7 +3458,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
         });
         const memories = result.memories || [];
         const memoryText = memories.length > 0
-          ? memories.map((m) => `- ${getContent(m)} (${getType(m)})`).join("\n")
+          ? memories.map((m) => `- ${getContent(m)} (${getType(m)}${m.tier ? ` | ${m.tier}` : ''})`).join("\n")
           : "No memories found.";
         return {
           messages: [

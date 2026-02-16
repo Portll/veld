@@ -75,6 +75,7 @@ pub struct ListMemoryItem {
     pub importance: f32,
     pub tags: Vec<String>,
     pub created_at: String,
+    pub tier: String,
 }
 
 // =============================================================================
@@ -303,6 +304,7 @@ pub async fn list_memories(
             importance: m.importance(),
             tags: m.experience.entities.clone(),
             created_at: m.created_at.to_rfc3339(),
+            tier: format!("{:?}", m.tier),
         })
         .collect();
 
@@ -409,6 +411,7 @@ async fn list_memories_inner(
             importance: m.importance(),
             tags: m.experience.entities.clone(),
             created_at: m.created_at.to_rfc3339(),
+            tier: format!("{:?}", m.tier),
         })
         .collect();
 

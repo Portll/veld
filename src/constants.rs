@@ -609,6 +609,68 @@ pub const POTENTIATION_MAINTENANCE_BOOST: f32 = 0.005; // 0.5% per cycle
 /// - Prevents potentiation of noise/rarely-used memories
 pub const POTENTIATION_ACCESS_THRESHOLD: u32 = 3;
 
+// =============================================================================
+// MEMORY-EDGE TIER COUPLING CONSTANTS
+// =============================================================================
+// These constants control the bidirectional coupling between memory tiers
+// (Working→Session→LongTerm) and edge tiers (L1→L2→L3).
+//
+// Reference: Fusi et al. (2005) "Cascade models of synaptically stored memories"
+// Principle: Multi-scale consolidation requires cross-system feedback signals.
+// =============================================================================
+
+/// When an edge promotes L1→L2, boost the source memory's importance by this amount.
+/// Rationale: episodic consolidation signals genuine utility.
+///
+/// Justification:
+/// - 0.015 is ~3x the per-cycle potentiation boost (0.005)
+/// - L1→L2 promotion means the edge survived initial decay — meaningful signal
+/// - Small enough to avoid runaway inflation from many edges promoting simultaneously
+pub const EDGE_PROMOTION_MEMORY_BOOST_L2: f64 = 0.015;
+
+/// When an edge promotes L2→L3, boost the source memory's importance by this amount.
+/// Rationale: semantic permanence is a strong signal of value.
+///
+/// Justification:
+/// - 0.03 is 2x the L1→L2 boost — semantic promotion is rarer and more significant
+/// - L2→L3 means the edge survived sustained use — memory is genuinely useful
+pub const EDGE_PROMOTION_MEMORY_BOOST_L3: f64 = 0.03;
+
+/// When a memory loses all graph edges (orphaned), apply this compensatory boost.
+/// Prevents immediate decay death; gives the memory one more cycle to prove value.
+///
+/// Justification:
+/// - 0.05 raises a memory at floor (0.05) to 0.10 — buys ~1-2 more cycles
+/// - Not large enough to promote a memory on its own
+/// - Analogous to "synaptic tagging" — recently connected memories get brief protection
+pub const ORPHAN_COMPENSATORY_BOOST: f64 = 0.05;
+
+/// When a memory has strong graph connections (>= GRAPH_HEALTH_EDGE_SATURATION L2+ edges),
+/// reduce the importance threshold for tier promotion by this fraction.
+/// E.g., Session→LongTerm normally requires 0.50; with discount: 0.50 * (1 - 0.15) = 0.425
+///
+/// Justification:
+/// - Well-connected memories have proven relational value even if importance is borderline
+/// - 15% discount is conservative — won't promote clearly unimportant memories
+pub const GRAPH_HEALTH_PROMOTION_DISCOUNT: f64 = 0.15;
+
+/// When a memory has zero graph edges, increase the importance threshold for tier promotion.
+/// Penalizes isolated memories that have entities but no surviving connections.
+/// E.g., Session→LongTerm normally requires 0.50; with penalty: 0.50 * (1 + 0.10) = 0.55
+///
+/// Justification:
+/// - Isolated memories lack relational context — they need higher intrinsic importance
+/// - 10% penalty is mild — doesn't block promotion, just raises the bar
+pub const GRAPH_HEALTH_NO_EDGES_PENALTY: f64 = 0.10;
+
+/// Number of L2+ (Episodic or Semantic tier) edges for full promotion discount.
+/// Below this count, the discount scales linearly.
+///
+/// Justification:
+/// - 3 L2+ edges means the memory participates in multiple consolidated relationships
+/// - Achievable but not trivial — requires sustained co-activation patterns
+pub const GRAPH_HEALTH_EDGE_SATURATION: f64 = 3.0;
+
 /// Default compression age (days)
 pub const DEFAULT_COMPRESSION_AGE_DAYS: u32 = 7;
 

@@ -4181,6 +4181,33 @@ pub struct MaintenanceResult {
     pub facts_reinforced: usize,
 }
 
+/// Signal emitted when an edge tier promotion occurs during strengthen().
+/// Used to propagate edge-tier promotions back to memory importance (Direction 1 coupling).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgePromotionBoost {
+    /// The memory ID whose importance should be boosted
+    pub memory_id: String,
+    /// The entity name involved in the promoted edge
+    pub entity_name: String,
+    /// The old tier before promotion (e.g., "L1Working")
+    pub old_tier: String,
+    /// The new tier after promotion (e.g., "L2Episodic")
+    pub new_tier: String,
+    /// The importance boost to apply
+    pub boost: f64,
+}
+
+/// Result of graph decay with details needed for orphan detection (Direction 2 coupling).
+#[derive(Debug, Clone, Default)]
+pub struct GraphDecayResult {
+    /// Number of edges pruned during decay
+    pub pruned_count: usize,
+    /// Entity IDs that lost all their edges (became orphaned)
+    pub orphaned_entity_ids: Vec<String>,
+    /// Memory IDs associated with orphaned entities
+    pub orphaned_memory_ids: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

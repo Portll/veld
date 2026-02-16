@@ -248,6 +248,46 @@ pub enum ConsolidationEvent {
         memory_ids: Vec<String>,
         timestamp: DateTime<Utc>,
     },
+
+    // Memory-Edge Tier Coupling Events
+    // Direction 1: Edge tier promotion → Memory importance boost
+    /// Edge tier promotion boosted a memory's importance
+    EdgePromotionBoostApplied {
+        memory_id: String,
+        entity_name: String,
+        old_tier: String,
+        new_tier: String,
+        importance_boost: f64,
+        new_importance: f64,
+        timestamp: DateTime<Utc>,
+    },
+
+    // Direction 2: Edge pruning → Orphan detection
+    /// Memory became a graph orphan (lost all edges)
+    GraphOrphanDetected {
+        memory_id: String,
+        entity_count: usize,
+        compensatory_boost: f64,
+        timestamp: DateTime<Utc>,
+    },
+
+    // Direction 3: Graph health → Promotion threshold adjustment
+    /// Memory tier promotion threshold adjusted by graph health
+    GraphAdjustedPromotion {
+        memory_id: String,
+        base_threshold: f64,
+        adjusted_threshold: f64,
+        l2_plus_edge_count: usize,
+        promoted: bool,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Graph decay consolidated into single call site (double-decay fix diagnostic)
+    GraphDecayConsolidated {
+        pruned_count: usize,
+        orphaned_entities: usize,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Types of memory interference (SHO-106)
@@ -852,6 +892,12 @@ impl ConsolidationEventBuffer {
                 ConsolidationEvent::PatternDetected { .. } => {
                     // Generic pattern - logged for introspection
                 }
+
+                // Memory-Edge Tier Coupling events — logged for introspection
+                ConsolidationEvent::EdgePromotionBoostApplied { .. } => {}
+                ConsolidationEvent::GraphOrphanDetected { .. } => {}
+                ConsolidationEvent::GraphAdjustedPromotion { .. } => {}
+                ConsolidationEvent::GraphDecayConsolidated { .. } => {}
             }
         }
 
@@ -1180,6 +1226,12 @@ impl ConsolidationEventBuffer {
                 ConsolidationEvent::SalienceSpikeDetected { .. } => {}
                 ConsolidationEvent::BehavioralChangeDetected { .. } => {}
                 ConsolidationEvent::PatternDetected { .. } => {}
+
+                // Memory-Edge Tier Coupling events — logged for introspection
+                ConsolidationEvent::EdgePromotionBoostApplied { .. } => {}
+                ConsolidationEvent::GraphOrphanDetected { .. } => {}
+                ConsolidationEvent::GraphAdjustedPromotion { .. } => {}
+                ConsolidationEvent::GraphDecayConsolidated { .. } => {}
             }
         }
 
@@ -1218,6 +1270,11 @@ impl ConsolidationEvent {
             ConsolidationEvent::SalienceSpikeDetected { timestamp, .. } => *timestamp,
             ConsolidationEvent::BehavioralChangeDetected { timestamp, .. } => *timestamp,
             ConsolidationEvent::PatternDetected { timestamp, .. } => *timestamp,
+            // Memory-Edge Tier Coupling events
+            ConsolidationEvent::EdgePromotionBoostApplied { timestamp, .. } => *timestamp,
+            ConsolidationEvent::GraphOrphanDetected { timestamp, .. } => *timestamp,
+            ConsolidationEvent::GraphAdjustedPromotion { timestamp, .. } => *timestamp,
+            ConsolidationEvent::GraphDecayConsolidated { timestamp, .. } => *timestamp,
         }
     }
 
@@ -1261,6 +1318,11 @@ impl ConsolidationEvent {
                 | ConsolidationEvent::SemanticClusterFormed { .. }
                 | ConsolidationEvent::SalienceSpikeDetected { .. }
                 | ConsolidationEvent::PatternDetected { .. }
+                // Memory-Edge Tier Coupling events are significant
+                | ConsolidationEvent::EdgePromotionBoostApplied { .. }
+                | ConsolidationEvent::GraphOrphanDetected { .. }
+                | ConsolidationEvent::GraphAdjustedPromotion { .. }
+                | ConsolidationEvent::GraphDecayConsolidated { .. }
         )
     }
 }
