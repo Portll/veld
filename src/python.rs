@@ -465,6 +465,9 @@ impl PyMemorySystem {
             media_refs: vec![],
             // Temporal extraction
             temporal_refs: vec![],
+            // NER + co-occurrence (populated by handler pipeline, empty for direct Python API)
+            ner_entities: vec![],
+            cooccurrence_pairs: vec![],
         };
 
         let memory_id = self
