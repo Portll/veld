@@ -28,17 +28,20 @@ import * as path from "path";
 import * as fs from "fs";
 import { fileURLToPath } from "url";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename = (typeof import.meta !== "undefined" && import.meta.url) ? fileURLToPath(import.meta.url) : "";
+const __dirname = __filename ? path.dirname(__filename) : process.cwd();
 
 // Configuration
 const API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
 const WS_URL = API_URL.replace(/^http/, "ws") + "/api/stream";
 const USER_ID = process.env.SHODH_USER_ID || "claude-code";
 
+// Sandbox mode — used by Smithery to scan tools without a running backend
+const SANDBOX_MODE = process.env.SMITHERY_SANDBOX === "true";
+
 // API Key - required for authentication
 // Set via SHODH_API_KEY env var, or configure in MCP settings
-const API_KEY = process.env.SHODH_API_KEY;
+const API_KEY = process.env.SHODH_API_KEY || (SANDBOX_MODE ? "sandbox" : "");
 if (!API_KEY) {
   console.error("ERROR: SHODH_API_KEY environment variable not set.");
   console.error("");
@@ -3962,8 +3965,16 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
+// Smithery sandbox export — allows tool scanning without a running backend
+export function createSandboxServer() {
+  process.env.SMITHERY_SANDBOX = "true";
+  return server;
+}
+
 // Start server
 async function main() {
+  if (SANDBOX_MODE) return;
+
   // Ensure backend is running
   await ensureServerRunning();
 
