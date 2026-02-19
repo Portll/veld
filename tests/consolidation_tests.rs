@@ -1052,10 +1052,16 @@ fn test_consolidation_event_buffer_clear() {
 
     // Generate some events (need 2+ memories for coactivation)
     system
-        .remember(create_experience("Buffer clear test with important data"), None)
+        .remember(
+            create_experience("Buffer clear test with important data"),
+            None,
+        )
         .unwrap();
     system
-        .remember(create_experience("Buffer overflow prevention in systems"), None)
+        .remember(
+            create_experience("Buffer overflow prevention in systems"),
+            None,
+        )
         .unwrap();
     let query = Query {
         query_text: Some("Buffer".to_string()),
@@ -1230,10 +1236,16 @@ fn test_consolidation_events_list() {
 
     // Record multiple memories (coactivation needs 2+)
     system
-        .remember(create_experience("Test consolidation events list for tracking"), None)
+        .remember(
+            create_experience("Test consolidation events list for tracking"),
+            None,
+        )
         .unwrap();
     system
-        .remember(create_experience("Consolidation events are important for monitoring"), None)
+        .remember(
+            create_experience("Consolidation events are important for monitoring"),
+            None,
+        )
         .unwrap();
 
     for _ in 0..7 {
@@ -1309,7 +1321,10 @@ fn test_consolidation_event_count() {
         .remember(create_experience("Test event count tracking system"), None)
         .unwrap();
     system
-        .remember(create_experience("Event count should increase with operations"), None)
+        .remember(
+            create_experience("Event count should increase with operations"),
+            None,
+        )
         .unwrap();
 
     for _ in 0..7 {

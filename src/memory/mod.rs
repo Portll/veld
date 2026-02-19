@@ -1546,7 +1546,12 @@ impl MemorySystem {
                     .iter()
                     .skip(1) // Skip the entity itself
                     .map(|e| e.text.as_str())
-                    .chain(query_analysis.relational_context.iter().map(|r| r.stem.as_str()))
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.stem.as_str()),
+                    )
                     .chain(
                         query_analysis
                             .discriminative_modifiers
@@ -1701,7 +1706,8 @@ impl MemorySystem {
                     );
                 }
                 // Count entities in query for adaptive boost (multi-hop detection)
-                let entity_count = query_analysis.focal_entities.len() + query_analysis.discriminative_modifiers.len();
+                let entity_count = query_analysis.focal_entities.len()
+                    + query_analysis.discriminative_modifiers.len();
 
                 // First, collect all query entity UUIDs
                 // Include nouns, adjectives, AND verbs for multi-hop reasoning
@@ -1710,9 +1716,24 @@ impl MemorySystem {
                     .focal_entities
                     .iter()
                     .map(|e| e.text.as_str())
-                    .chain(query_analysis.discriminative_modifiers.iter().map(|m| m.text.as_str()))
-                    .chain(query_analysis.relational_context.iter().map(|r| r.text.as_str()))
-                    .chain(query_analysis.relational_context.iter().map(|r| r.stem.as_str()))
+                    .chain(
+                        query_analysis
+                            .discriminative_modifiers
+                            .iter()
+                            .map(|m| m.text.as_str()),
+                    )
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.text.as_str()),
+                    )
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.stem.as_str()),
+                    )
                 {
                     if let Ok(Some(ent)) = g.find_entity_by_name(e) {
                         query_entities.push(ent.uuid);

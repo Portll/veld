@@ -1069,55 +1069,58 @@ pub async fn proactive_context(
 
             // Compute entity matches and boost scores BEFORE quality gate
             let context_entity_count = entity_names_for_recall.len().max(1);
-            let mut enriched: Vec<(std::sync::Arc<crate::memory::types::Memory>, f32, Vec<String>)> =
-                candidates
-                    .into_iter()
-                    .map(|(m, mut score)| {
-                        let mut memory_terms: Vec<String> = m
-                            .experience
-                            .entities
-                            .iter()
-                            .map(|e| e.to_lowercase())
-                            .collect();
-                        for tag in &m.experience.tags {
-                            let lower = tag.to_lowercase();
-                            if !memory_terms.contains(&lower) {
-                                memory_terms.push(lower);
-                            }
+            let mut enriched: Vec<(
+                std::sync::Arc<crate::memory::types::Memory>,
+                f32,
+                Vec<String>,
+            )> = candidates
+                .into_iter()
+                .map(|(m, mut score)| {
+                    let mut memory_terms: Vec<String> = m
+                        .experience
+                        .entities
+                        .iter()
+                        .map(|e| e.to_lowercase())
+                        .collect();
+                    for tag in &m.experience.tags {
+                        let lower = tag.to_lowercase();
+                        if !memory_terms.contains(&lower) {
+                            memory_terms.push(lower);
                         }
+                    }
 
-                        let matched: Vec<String> = entity_names_for_recall
-                            .iter()
-                            .filter(|ctx_ent| {
-                                ctx_ent.len() >= 3
-                                    && memory_terms.iter().any(|me| {
-                                        if me.len() < 3 {
-                                            return false;
-                                        }
-                                        if me == ctx_ent.as_str() {
-                                            return true;
-                                        }
-                                        let (shorter, longer) = if me.len() <= ctx_ent.len() {
-                                            (me.as_str(), ctx_ent.as_str())
-                                        } else {
-                                            (ctx_ent.as_str(), me.as_str())
-                                        };
-                                        shorter.len() * 100 / longer.len() >= 60
-                                            && longer.contains(shorter)
-                                    })
-                            })
-                            .cloned()
-                            .collect();
+                    let matched: Vec<String> = entity_names_for_recall
+                        .iter()
+                        .filter(|ctx_ent| {
+                            ctx_ent.len() >= 3
+                                && memory_terms.iter().any(|me| {
+                                    if me.len() < 3 {
+                                        return false;
+                                    }
+                                    if me == ctx_ent.as_str() {
+                                        return true;
+                                    }
+                                    let (shorter, longer) = if me.len() <= ctx_ent.len() {
+                                        (me.as_str(), ctx_ent.as_str())
+                                    } else {
+                                        (ctx_ent.as_str(), me.as_str())
+                                    };
+                                    shorter.len() * 100 / longer.len() >= 60
+                                        && longer.contains(shorter)
+                                })
+                        })
+                        .cloned()
+                        .collect();
 
-                        // Apply entity match boost: weight * (matched / total context entities)
-                        if !matched.is_empty() {
-                            score += entity_match_weight
-                                * (matched.len() as f32 / context_entity_count as f32);
-                        }
+                    // Apply entity match boost: weight * (matched / total context entities)
+                    if !matched.is_empty() {
+                        score += entity_match_weight
+                            * (matched.len() as f32 / context_entity_count as f32);
+                    }
 
-                        (m, score, matched)
-                    })
-                    .collect();
+                    (m, score, matched)
+                })
+                .collect();
 
             // Sort by boosted score (highest first)
             enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -1261,8 +1264,9 @@ pub async fn proactive_context(
     // 5. Auto-ingest user context — fire-and-forget with ID capture
     // Dedup: skip if identical content was ingested within the last 5 seconds
     // (prevents hook + MCP tool from double-ingesting the same user message)
-    static INGEST_DEDUP: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
-        std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    static INGEST_DEDUP: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
     let clean_context = strip_system_noise(&req.context);
     let content_hash = {

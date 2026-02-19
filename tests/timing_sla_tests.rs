@@ -606,7 +606,9 @@ fn test_sla_maintenance_latency() {
 
     // Measure maintenance operation
     let start = Instant::now();
-    let processed = system.run_maintenance(0.95, "test-user").expect("Maintenance failed");
+    let processed = system
+        .run_maintenance(0.95, "test-user")
+        .expect("Maintenance failed");
     let duration = start.elapsed().as_millis();
 
     // Maintenance of 100 memories should be < 1s
