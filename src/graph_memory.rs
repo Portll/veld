@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::constants::{ENTITY_CONCEPT_MERGE_THRESHOLD, LTP_MIN_STRENGTH};
+use crate::constants::{ENTITY_CONCEPT_MERGE_THRESHOLD, LTP_MIN_STRENGTH, LTP_PRUNE_FLOOR};
 
 /// Entity node in the knowledge graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -681,10 +681,27 @@ impl RelationshipEdge {
             self.strength = LTP_MIN_STRENGTH;
         }
 
+        // Downgrade expired burst LTP before prune decision
+        // decay_factor() already returns 1.0 for expired bursts (correct rate),
+        // but is_potentiated() still returns true — preventing pruning
+        if self.ltp_status.is_burst_expired() {
+            if self.detect_weekly_pattern() {
+                self.ltp_status = LtpStatus::Weekly;
+            } else {
+                self.ltp_status = LtpStatus::None;
+            }
+        }
+
+        // Strip LTP protection from near-zero edges (zombie edge cleanup)
+        // Prevents immortal edges that retain LTP despite negligible strength
+        if self.ltp_status.is_potentiated() && self.strength <= LTP_PRUNE_FLOOR {
+            self.ltp_status = LtpStatus::None;
+        }
+
         // Return whether this synapse should be pruned
         // Prune if: exceeded max age OR below prune threshold (unless any LTP protection)
         if self.ltp_status.is_potentiated() {
-            false // Never prune potentiated edges (any level)
+            false
         } else {
             exceeded_max_age || self.strength <= prune_threshold
         }
@@ -1238,7 +1255,8 @@ impl GraphMemory {
         }
 
         // Tier 3: Stemmed match (O(1)) — "running" matches "run"
-        if existing_uuid.is_none() {
+        // Skip for proper nouns to prevent "Paris" → "pari" merging with "Parison"
+        if existing_uuid.is_none() && !entity.is_proper_noun {
             let stemmer = Stemmer::create(Algorithm::English);
             let stemmed_name = Self::stem_entity_name(&stemmer, &entity.name);
             let index = self.entity_stemmed_index.read();
@@ -1333,7 +1351,8 @@ impl GraphMemory {
             let mut lowercase_index = self.entity_lowercase_index.write();
             lowercase_index.insert(lowercase_name.clone(), entity.uuid);
         }
-        {
+        // Skip stemmed index for proper nouns to prevent "Paris" → "pari" collisions
+        if !entity.is_proper_noun {
             let mut stemmed_index = self.entity_stemmed_index.write();
             stemmed_index.insert(stemmed_name.clone(), entity.uuid);
         }
@@ -1356,8 +1375,10 @@ impl GraphMemory {
             .put(entity.name.as_bytes(), entity.uuid.as_bytes())?;
         self.entity_lowercase_index_db
             .put(lowercase_name.as_bytes(), entity.uuid.as_bytes())?;
-        self.entity_stemmed_index_db
-            .put(stemmed_name.as_bytes(), entity.uuid.as_bytes())?;
+        if !entity.is_proper_noun {
+            self.entity_stemmed_index_db
+                .put(stemmed_name.as_bytes(), entity.uuid.as_bytes())?;
+        }
 
         // Store entity in database
         let key = entity.uuid.as_bytes();
@@ -1383,6 +1404,102 @@ impl GraphMemory {
             }
             None => Ok(None),
         }
+    }
+
+    /// Delete an entity and all its index entries.
+    ///
+    /// Removes the entity from:
+    /// 1. `entities_db` (primary storage)
+    /// 2. `entity_name_index` (exact name → UUID)
+    /// 3. `entity_lowercase_index` (lowercase name → UUID)
+    /// 4. `entity_stemmed_index` (stemmed name → UUID)
+    /// 5. `entity_embedding_cache` (in-memory embedding vector)
+    /// 6. `entity_pair_index_db` (co-occurrence pair entries)
+    /// 7. Decrements `entity_count`
+    ///
+    /// Returns true if the entity existed and was deleted.
+    pub fn delete_entity(&self, uuid: &Uuid) -> Result<bool> {
+        let entity = match self.get_entity(uuid)? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+
+        // 1. Remove from entities_db
+        self.entities_db.delete(uuid.as_bytes())?;
+
+        // 2-3-4. Remove from name indices (in-memory + persisted)
+        let lowercase_name = entity.name.to_lowercase();
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stemmed_name = Self::stem_entity_name(&stemmer, &entity.name);
+
+        {
+            let mut index = self.entity_name_index.write();
+            index.remove(&entity.name);
+        }
+        self.entity_name_index_db.delete(entity.name.as_bytes())?;
+
+        {
+            let mut index = self.entity_lowercase_index.write();
+            index.remove(&lowercase_name);
+        }
+        self.entity_lowercase_index_db
+            .delete(lowercase_name.as_bytes())?;
+
+        {
+            let mut index = self.entity_stemmed_index.write();
+            index.remove(&stemmed_name);
+        }
+        self.entity_stemmed_index_db
+            .delete(stemmed_name.as_bytes())?;
+
+        // 5. Remove from embedding cache
+        {
+            let mut cache = self.entity_embedding_cache.write();
+            cache.retain(|(id, _)| id != uuid);
+        }
+
+        // 6. Remove entity_pair_index entries (prefix scan)
+        let prefix = format!("{}:", uuid);
+        let mut pairs_to_delete = Vec::new();
+        let iter = self.entity_pair_index_db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    let key_str = String::from_utf8_lossy(&key);
+                    if key_str.starts_with(&prefix) {
+                        pairs_to_delete.push(key.to_vec());
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Also scan for reverse direction (other_uuid:this_uuid)
+        let suffix = format!(":{}", uuid);
+        let iter = self
+            .entity_pair_index_db
+            .iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    let key_str = String::from_utf8_lossy(&key);
+                    if key_str.ends_with(&suffix) {
+                        pairs_to_delete.push(key.to_vec());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        for key in &pairs_to_delete {
+            self.entity_pair_index_db.delete(key)?;
+        }
+
+        // 7. Decrement counter
+        self.entity_count.fetch_sub(1, Ordering::Relaxed);
+
+        tracing::debug!("Deleted orphaned entity '{}' (uuid={})", entity.name, uuid);
+        Ok(true)
     }
 
     /// Find entity by name (case-insensitive, O(1) lookup)
@@ -1429,27 +1546,53 @@ impl GraphMemory {
 
         // Tier 4 & 5: Fuzzy matching (O(n) but bounded)
         // Only do fuzzy matching for names >= 3 chars to avoid noise
+        // Deterministic: collect ALL matches, pick highest salience (break ties by shortest name)
         if name.len() >= 3 {
             let lowercase_index = self.entity_lowercase_index.read();
+            let mut candidates: Vec<(Uuid, String)> = Vec::new();
 
             // Tier 4: Substring match - query is substring of entity
             // e.g., "York" matches "New York City"
             for (entity_name, uuid) in lowercase_index.iter() {
                 if entity_name.contains(&name_lower) {
-                    return self.get_entity(uuid);
+                    candidates.push((*uuid, entity_name.clone()));
                 }
             }
 
-            // Tier 5: Word-level match - query matches a word in entity
-            // e.g., "York" matches "New York" (word boundary)
-            let query_words: Vec<&str> = name_lower.split_whitespace().collect();
-            for (entity_name, uuid) in lowercase_index.iter() {
-                let entity_words: Vec<&str> = entity_name.split_whitespace().collect();
-                // Check if any query word matches any entity word
-                for qw in &query_words {
-                    if entity_words.iter().any(|ew| ew == qw || ew.starts_with(qw)) {
-                        return self.get_entity(uuid);
+            // Tier 5: Word-level match (only if Tier 4 found nothing)
+            if candidates.is_empty() {
+                let query_words: Vec<&str> = name_lower.split_whitespace().collect();
+                for (entity_name, uuid) in lowercase_index.iter() {
+                    let entity_words: Vec<&str> = entity_name.split_whitespace().collect();
+                    for qw in &query_words {
+                        if entity_words.iter().any(|ew| ew == qw || ew.starts_with(qw)) {
+                            candidates.push((*uuid, entity_name.clone()));
+                            break;
+                        }
                     }
+                }
+            }
+
+            // Pick best candidate: highest salience, then shortest name for ties
+            if !candidates.is_empty() {
+                let mut best: Option<(Uuid, f32, usize)> = None; // (uuid, salience, name_len)
+                for (uuid, name) in &candidates {
+                    let salience = self.get_entity(uuid)?.map(|e| e.salience).unwrap_or(0.0);
+                    match &best {
+                        Some((_, best_sal, best_len))
+                            if salience > *best_sal
+                                || (salience == *best_sal && name.len() < *best_len) =>
+                        {
+                            best = Some((*uuid, salience, name.len()));
+                        }
+                        None => {
+                            best = Some((*uuid, salience, name.len()));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some((uuid, _, _)) = best {
+                    return self.get_entity(&uuid);
                 }
             }
         }
@@ -2184,6 +2327,19 @@ impl GraphMemory {
         start_uuid: &Uuid,
         max_depth: usize,
     ) -> Result<GraphTraversal> {
+        self.traverse_from_entity_filtered(start_uuid, max_depth, None)
+    }
+
+    /// BFS graph traversal with optional minimum edge strength filter.
+    ///
+    /// When `min_strength` is Some, edges below the threshold are skipped
+    /// during traversal and NOT Hebbianly strengthened (prevents ghost edge revival).
+    pub fn traverse_from_entity_filtered(
+        &self,
+        start_uuid: &Uuid,
+        max_depth: usize,
+        min_strength: Option<f32>,
+    ) -> Result<GraphTraversal> {
         // Performance limits
         const MAX_ENTITIES: usize = 200;
         const MAX_EDGES_PER_NODE: usize = 100;
@@ -2234,12 +2390,22 @@ impl GraphMemory {
                         continue;
                     }
 
-                    // Collect edge UUID for Hebbian strengthening
+                    // Compute effective strength (lazy decay calculation)
+                    let effective = edge.effective_strength();
+
+                    // Skip weak edges if min_strength filter is set
+                    if let Some(threshold) = min_strength {
+                        if effective < threshold {
+                            continue;
+                        }
+                    }
+
+                    // Collect edge UUID for Hebbian strengthening (only for traversed edges)
                     edges_to_strengthen.push(edge.uuid);
 
-                    // Return edge with effective strength (lazy decay calculation)
+                    // Return edge with effective strength
                     let mut edge_with_decay = edge.clone();
-                    edge_with_decay.strength = edge_with_decay.effective_strength();
+                    edge_with_decay.strength = effective;
                     all_edges.push(edge_with_decay);
 
                     // Add connected entity
@@ -3185,6 +3351,40 @@ impl GraphMemory {
 
         if strengthened > 0 {
             self.relationships_db.write(batch)?;
+
+            // Index new replay edges in entity_edges_db so they're visible to
+            // traversal and degree-cap enforcement (GQ-11 fix)
+            let mut entities_to_prune = Vec::new();
+            for (from_id_str, to_id_str, _boost) in edge_boosts {
+                let from_uuid = match Uuid::parse_str(from_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let to_uuid = match Uuid::parse_str(to_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                // Only index edges that we actually wrote (find_edge_between_entities returns
+                // the edge if it existed before, so new edges are the ones that didn't exist)
+                if let Ok(Some(edge)) = self.find_edge_between_entities(&from_uuid, &to_uuid) {
+                    if edge.context == "replay_strengthened" && edge.activation_count <= 1 {
+                        if let Err(e) = self.index_entity_edge(&from_uuid, &edge.uuid) {
+                            tracing::debug!("Failed to index replay edge for entity: {}", e);
+                        }
+                        if let Err(e) = self.index_entity_edge(&to_uuid, &edge.uuid) {
+                            tracing::debug!("Failed to index replay edge for entity: {}", e);
+                        }
+                        entities_to_prune.push(from_uuid);
+                        entities_to_prune.push(to_uuid);
+                    }
+                }
+            }
+
+            // Enforce degree cap on affected entities
+            for entity_uuid in &entities_to_prune {
+                let _ = self.prune_entity_if_over_degree(entity_uuid);
+            }
+
             tracing::debug!(
                 "Applied {} edge boosts from replay consolidation ({} tier promotions)",
                 strengthened,
@@ -3377,6 +3577,41 @@ impl GraphMemory {
         Ok(to_prune)
     }
 
+    /// Apply decay to already-loaded edges in-place, avoiding double deserialization.
+    ///
+    /// Mutates edges directly, serializes results into a WriteBatch, and returns
+    /// the UUIDs of edges that should be pruned. Used by `apply_decay()` which
+    /// already has the full edge list from `get_all_relationships()`.
+    fn batch_decay_edges_in_place(&self, edges: &mut [RelationshipEdge]) -> Result<Vec<Uuid>> {
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.synapse_update_lock.lock();
+        let mut batch = WriteBatch::default();
+        let mut to_prune = Vec::new();
+
+        for edge in edges.iter_mut() {
+            let should_prune = edge.decay();
+
+            let key = edge.uuid.as_bytes();
+            match bincode::serde::encode_to_vec(&*edge, bincode::config::standard()) {
+                Ok(value) => {
+                    batch.put(key, value);
+                    if should_prune {
+                        to_prune.push(edge.uuid);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to serialize edge {}: {}", edge.uuid, e);
+                }
+            }
+        }
+
+        self.relationships_db.write(batch)?;
+        Ok(to_prune)
+    }
+
     /// Apply decay to all synapses and prune weak edges (AUD-2)
     ///
     /// Called during maintenance cycle to:
@@ -3388,15 +3623,14 @@ impl GraphMemory {
     /// for Direction 2 coupling (edge pruning → orphan detection).
     pub fn apply_decay(&self) -> Result<crate::memory::types::GraphDecayResult> {
         // Get all edges (need full data for orphan tracking)
-        let all_edges = self.get_all_relationships()?;
-        let edge_uuids: Vec<Uuid> = all_edges.iter().map(|e| e.uuid).collect();
+        let mut all_edges = self.get_all_relationships()?;
 
-        if edge_uuids.is_empty() {
+        if all_edges.is_empty() {
             return Ok(crate::memory::types::GraphDecayResult::default());
         }
 
-        // Apply decay and get edges to prune
-        let to_prune = self.batch_decay_synapses(&edge_uuids)?;
+        // Apply decay in-place on already-deserialized edges (avoids double deserialization)
+        let to_prune = self.batch_decay_edges_in_place(&mut all_edges)?;
 
         if to_prune.is_empty() {
             return Ok(crate::memory::types::GraphDecayResult::default());
@@ -3422,11 +3656,15 @@ impl GraphMemory {
         }
 
         // Check which candidate entities became orphaned (lost ALL edges)
+        // Delete orphaned entities to prevent stale index pollution
         let mut orphaned_entity_ids = Vec::new();
         for entity_uuid in &orphan_candidates {
             let remaining = self.get_entity_relationships(entity_uuid)?;
             if remaining.is_empty() {
                 orphaned_entity_ids.push(entity_uuid.to_string());
+                if let Err(e) = self.delete_entity(entity_uuid) {
+                    tracing::warn!("Failed to delete orphaned entity {}: {}", entity_uuid, e);
+                }
             }
         }
 
@@ -3434,7 +3672,7 @@ impl GraphMemory {
             tracing::debug!(
                 "Graph decay: {} edges pruned (of {} total), {} entities orphaned",
                 pruned_count,
-                edge_uuids.len(),
+                all_edges.len(),
                 orphaned_entity_ids.len()
             );
         }
@@ -4626,8 +4864,8 @@ impl EntityExtractor {
                 continue;
             }
 
-            // Check for known organization keywords (direct match)
-            if self.org_keywords.contains(&lower) && !seen.contains(&lower) {
+            // Check for known organization keywords (direct match, min 2 chars to filter "x" noise)
+            if lower.len() >= 2 && self.org_keywords.contains(&lower) && !seen.contains(&lower) {
                 let entity = ExtractedEntity {
                     name: clean_word.to_string(),
                     label: EntityLabel::Organization,
@@ -4738,8 +4976,10 @@ impl EntityExtractor {
                 if matches!(entity_label, EntityLabel::Other(_)) {
                     if entity_name.contains(' ') {
                         // Multi-word capitalized sequences (like "John Smith", "New York")
-                        // are likely proper names - extract as Person
-                        entity_label = EntityLabel::Person;
+                        // are likely proper names — use Concept as safe default
+                        // Concept(0.4) + proper noun boost(1.2x) = 0.48 salience
+                        // Hebbian strengthening will promote genuinely important entities
+                        entity_label = EntityLabel::Concept;
                     } else {
                         // Single capitalized word not in any keyword list
                         // Skip it - we don't have enough evidence it's a real entity
@@ -5486,16 +5726,36 @@ mod tests {
     }
 
     #[test]
-    fn test_potentiated_never_pruned() {
-        // Use L2 tier for testing
-        let mut edge = create_test_edge_with_tier(LTP_MIN_STRENGTH, 30, EdgeTier::L2Episodic);
+    fn test_potentiated_above_floor_never_pruned() {
+        // Potentiated edge above LTP_PRUNE_FLOOR should be protected
+        let mut edge = create_test_edge_with_tier(0.1, 30, EdgeTier::L2Episodic);
         edge.ltp_status = LtpStatus::Full;
 
         let should_prune = edge.decay();
 
         assert!(
             !should_prune,
-            "Potentiated edges should never be pruned regardless of strength"
+            "Potentiated edges above LTP_PRUNE_FLOOR should not be pruned"
+        );
+    }
+
+    #[test]
+    fn test_potentiated_at_floor_stripped_and_prunable() {
+        // Potentiated edge at/below LTP_PRUNE_FLOOR should have LTP stripped
+        let mut edge = create_test_edge_with_tier(LTP_MIN_STRENGTH, 30, EdgeTier::L2Episodic);
+        edge.ltp_status = LtpStatus::Full;
+
+        let should_prune = edge.decay();
+
+        // LTP gets stripped because strength <= LTP_PRUNE_FLOOR,
+        // then normal prune logic applies (strength at floor, past max age)
+        assert!(
+            should_prune,
+            "Zombie potentiated edges at floor strength should be prunable"
+        );
+        assert!(
+            matches!(edge.ltp_status, LtpStatus::None),
+            "LTP status should be stripped when strength at floor"
         );
     }
 

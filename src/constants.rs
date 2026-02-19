@@ -934,6 +934,18 @@ pub const LTP_DECAY_FACTOR: f32 = 0.1;
 /// - Matches SPREADING_ACTIVATION_THRESHOLD
 pub const LTP_MIN_STRENGTH: f32 = 0.01;
 
+/// LTP prune floor — strip LTP protection when strength reaches this level
+///
+/// If a potentiated edge's strength drops to LTP_PRUNE_FLOOR, its LTP status
+/// is downgraded to None and normal prune logic applies. This prevents
+/// immortal zombie edges that retain LTP protection despite near-zero strength.
+///
+/// Justification:
+/// - 0.05 is above LTP_MIN_STRENGTH (0.01) so the edge has meaningfully decayed
+/// - 5x above the absolute floor gives enough margin for recovery attempts
+/// - Without this, Weekly/Full edges persist forever even if never reactivated
+pub const LTP_PRUNE_FLOOR: f32 = 0.05;
+
 // =============================================================================
 // MULTI-SCALE LTP CONSTANTS (PIPE-4)
 // Based on multi-timescale memory consolidation research
