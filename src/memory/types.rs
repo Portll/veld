@@ -1972,6 +1972,11 @@ pub struct Query {
     /// This prevents episode bleeding where unrelated memories mix in results
     pub episode_id: Option<String>,
 
+    // === Scoring Parameters ===
+    /// Weight for recency boost in unified scoring (0.0-1.0)
+    /// When None, uses hardcoded default (0.1 = 10% contribution)
+    pub recency_weight: Option<f32>,
+
     // === Result Control ===
     pub max_results: usize,
     pub retrieval_mode: RetrievalMode,
@@ -2055,6 +2060,7 @@ impl Default for Query {
             confidence_range: None,
             prospective_signals: None,
             episode_id: None,
+            recency_weight: None,
             max_results: DEFAULT_MAX_RESULTS,
             retrieval_mode: RetrievalMode::Hybrid,
             offset: 0,
@@ -2270,6 +2276,11 @@ impl QueryBuilder {
 
     pub fn time_range(mut self, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
         self.query.time_range = Some((start, end));
+        self
+    }
+
+    pub fn recency_weight(mut self, weight: f32) -> Self {
+        self.query.recency_weight = Some(weight);
         self
     }
 

@@ -119,7 +119,7 @@ fn default_proactive_max_results() -> usize {
 }
 
 fn default_semantic_threshold() -> f32 {
-    0.45 // Lowered from 0.65 - composite relevance scores blend multiple signals
+    0.05 // Minimum absolute score for quality gate on composite pipeline scores
 }
 
 fn default_entity_weight() -> f32 {
@@ -999,6 +999,9 @@ pub async fn proactive_context(
     let max_results = req.max_results;
     let user_id_for_query = req.user_id.clone();
     let entity_names_for_recall = context_entity_names.clone();
+    let entity_match_weight = req.entity_match_weight;
+    let recency_weight = req.recency_weight;
+    let semantic_threshold = req.semantic_threshold;
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
         tokio::task::spawn_blocking(move || {
@@ -1018,11 +1021,12 @@ pub async fn proactive_context(
                 user_id: Some(user_id_for_query),
                 query_text: Some(context_clone),
                 max_results,
+                recency_weight: Some(recency_weight),
                 ..Default::default()
             };
             let results = memory_guard.recall(&query).unwrap_or_default();
 
-            let mut candidates: Vec<(SharedMemory, f32)> = results
+            let candidates: Vec<(SharedMemory, f32)> = results
                 .into_iter()
                 .filter(|m| {
                     // Quality gate: skip garbage/truncated memories
@@ -1063,73 +1067,81 @@ pub async fn proactive_context(
                 })
                 .collect();
 
-            // Sort by score (highest first) - already mostly sorted from recall()
-            candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+            // Compute entity matches and boost scores BEFORE quality gate
+            let context_entity_count = entity_names_for_recall.len().max(1);
+            let mut enriched: Vec<(std::sync::Arc<crate::memory::types::Memory>, f32, Vec<String>)> =
+                candidates
+                    .into_iter()
+                    .map(|(m, mut score)| {
+                        let mut memory_terms: Vec<String> = m
+                            .experience
+                            .entities
+                            .iter()
+                            .map(|e| e.to_lowercase())
+                            .collect();
+                        for tag in &m.experience.tags {
+                            let lower = tag.to_lowercase();
+                            if !memory_terms.contains(&lower) {
+                                memory_terms.push(lower);
+                            }
+                        }
+
+                        let matched: Vec<String> = entity_names_for_recall
+                            .iter()
+                            .filter(|ctx_ent| {
+                                ctx_ent.len() >= 3
+                                    && memory_terms.iter().any(|me| {
+                                        if me.len() < 3 {
+                                            return false;
+                                        }
+                                        if me == ctx_ent.as_str() {
+                                            return true;
+                                        }
+                                        let (shorter, longer) = if me.len() <= ctx_ent.len() {
+                                            (me.as_str(), ctx_ent.as_str())
+                                        } else {
+                                            (ctx_ent.as_str(), me.as_str())
+                                        };
+                                        shorter.len() * 100 / longer.len() >= 60
+                                            && longer.contains(shorter)
+                                    })
+                            })
+                            .cloned()
+                            .collect();
+
+                        // Apply entity match boost: weight * (matched / total context entities)
+                        if !matched.is_empty() {
+                            score += entity_match_weight
+                                * (matched.len() as f32 / context_entity_count as f32);
+                        }
+
+                        (m, score, matched)
+                    })
+                    .collect();
+
+            // Sort by boosted score (highest first)
+            enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             // Drop results below minimum absolute score — don't pad with irrelevant filler
             // Also drop results that are < 30% of the top score (too weak relative to best)
-            let top_score = candidates.first().map(|(_, s)| *s).unwrap_or(0.0);
-            let abs_min = 0.05_f32;
+            let top_score = enriched.first().map(|(_, s, _)| *s).unwrap_or(0.0);
+            let abs_min = semantic_threshold;
             let relative_min = top_score * 0.30;
             let effective_min = abs_min.max(relative_min);
-            candidates.retain(|(_, s)| *s >= effective_min);
+            enriched.retain(|(_, s, _)| *s >= effective_min);
 
             // Normalize scores for display: scale relative to top result
-            // RRF produces low absolute values (0.01-0.05); after pipeline adjustments
-            // they're ~0.13-0.33. Rescale so top result shows 85-95% confidence.
             if top_score > 0.0 {
-                for (_, score) in candidates.iter_mut() {
+                for (_, score, _) in enriched.iter_mut() {
                     *score = (*score / top_score) * 0.95;
                 }
             }
 
             // Return top results with entity overlap annotation
-            candidates
+            enriched
                 .into_iter()
                 .take(max_results)
-                .map(|(m, score)| {
-                    // Compute entity overlap: merge NER entities + user tags from memory
-                    // into a single pool for matching against context entities
-                    let mut memory_terms: Vec<String> = m
-                        .experience
-                        .entities
-                        .iter()
-                        .map(|e| e.to_lowercase())
-                        .collect();
-                    for tag in &m.experience.tags {
-                        let lower = tag.to_lowercase();
-                        if !memory_terms.contains(&lower) {
-                            memory_terms.push(lower);
-                        }
-                    }
-
-                    // Match context entities against memory's merged entity+tag pool
-                    // Both sides must be >= 3 chars, and substring match must cover
-                    // at least 60% of the shorter string to avoid spurious matches
-                    let matched: Vec<String> = entity_names_for_recall
-                        .iter()
-                        .filter(|ctx_ent| {
-                            ctx_ent.len() >= 3
-                                && memory_terms.iter().any(|me| {
-                                    if me.len() < 3 {
-                                        return false;
-                                    }
-                                    // Exact match
-                                    if me == ctx_ent.as_str() {
-                                        return true;
-                                    }
-                                    // Substring match: shorter must be >= 60% of longer
-                                    let (shorter, longer) = if me.len() <= ctx_ent.len() {
-                                        (me.as_str(), ctx_ent.as_str())
-                                    } else {
-                                        (ctx_ent.as_str(), me.as_str())
-                                    };
-                                    shorter.len() * 100 / longer.len() >= 60
-                                        && longer.contains(shorter)
-                                })
-                        })
-                        .cloned()
-                        .collect();
+                .map(|(m, score, matched)| {
                     let has_entity_match = !matched.is_empty();
                     let has_semantic_match = score > 0.0;
                     let relevance_reason = if has_entity_match && has_semantic_match {
@@ -1247,8 +1259,31 @@ pub async fn proactive_context(
     }
 
     // 5. Auto-ingest user context — fire-and-forget with ID capture
+    // Dedup: skip if identical content was ingested within the last 5 seconds
+    // (prevents hook + MCP tool from double-ingesting the same user message)
+    static INGEST_DEDUP: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
     let clean_context = strip_system_noise(&req.context);
+    let content_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        clean_context.hash(&mut hasher);
+        hasher.finish()
+    };
+    let is_duplicate = {
+        let mut dedup = INGEST_DEDUP.lock();
+        dedup.retain(|_, t| t.elapsed().as_secs() < 10);
+        match dedup.entry(content_hash) {
+            std::collections::hash_map::Entry::Occupied(_) => true,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(std::time::Instant::now());
+                false
+            }
+        }
+    };
     let should_ingest = req.auto_ingest
+        && !is_duplicate
         && clean_context.len() > 50
         && clean_context.len() < 5000
         && !is_bare_question(&clean_context);
