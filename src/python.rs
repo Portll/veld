@@ -788,6 +788,7 @@ impl PyMemorySystem {
             confidence_range,
             prospective_signals: None,
             episode_id: None,
+            recency_weight: None,
             max_results: limit,
             retrieval_mode,
             offset: 0,
@@ -1822,6 +1823,7 @@ impl PyMemorySystem {
             confidence_range: None,
             prospective_signals: None,
             episode_id: None,
+            recency_weight: None,
             max_results: max_results * 2, // Get more for filtering
             retrieval_mode: RetrievalMode::Hybrid,
             offset: 0,

@@ -1444,6 +1444,8 @@ impl MemorySystem {
         // Instead, we detect the query pattern, expand with synonyms, and boost
         // memories containing the entity + attribute values.
         let query_type = query_parser::classify_query(query_text);
+        // Single parse for all layers (was called 3x: temporal facts, graph expansion, linguistic boost)
+        let query_analysis = query_parser::analyze_query(query_text);
         let attribute_boost_ids: HashSet<MemoryId> = match &query_type {
             query_parser::QueryType::Attribute(attr_query) => {
                 tracing::debug!(
@@ -1528,29 +1530,30 @@ impl MemorySystem {
         // 2. Extract entity (Melanie) and event keywords (paint, sunrise, camping)
         // 3. Look up temporal facts matching these
         // 4. Boost the source memories of matching facts
-        // Temporal fact lookup - IDs collected for future use in unified boost
-        // Currently Layer 5 handles temporal boost via temporal_refs matching
-        let _temporal_fact_boost_ids: HashSet<MemoryId> = if has_temporal_query {
+        // Temporal fact lookup - boost source memories of matching facts in Layer 4.5
+        let temporal_fact_boost_ids: HashSet<MemoryId> = if has_temporal_query {
             if let Some(user_id) = &query.user_id {
-                // Parse query for entity and event keywords
-                let analysis = query_parser::analyze_query(query_text);
-
                 // Get entity name (first focal entity)
-                let entity = analysis
+                let entity = query_analysis
                     .focal_entities
                     .first()
                     .map(|e| e.text.clone())
                     .unwrap_or_default();
 
                 // Get event keywords from nouns, verbs, and modifiers
-                let event_keywords: Vec<&str> = analysis
+                let event_keywords: Vec<&str> = query_analysis
                     .focal_entities
                     .iter()
                     .skip(1) // Skip the entity itself
                     .map(|e| e.text.as_str())
-                    .chain(analysis.relational_context.iter().map(|r| r.stem.as_str()))
                     .chain(
-                        analysis
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.stem.as_str()),
+                    )
+                    .chain(
+                        query_analysis
                             .discriminative_modifiers
                             .iter()
                             .map(|m| m.text.as_str()),
@@ -1688,14 +1691,13 @@ impl MemorySystem {
         ) = {
             if let Some(graph) = &self.graph_memory {
                 let g = graph.read();
-                let a = query_parser::analyze_query(query_text);
                 // Extract IC weights for BM25 term boosting
-                let weights = a.to_ic_weights();
+                let weights = query_analysis.to_ic_weights();
                 // Extract phrase boosts for exact phrase matching (e.g., "support group")
-                let phrases = a.to_phrase_boosts();
+                let phrases = query_analysis.to_phrase_boosts();
                 // Extract keyword discriminativeness for dynamic weight adjustment
                 // High discriminativeness → trust BM25 more for rare keywords like "sunrise"
-                let (disc, disc_keywords) = a.keyword_discriminativeness();
+                let (disc, disc_keywords) = query_analysis.keyword_discriminativeness();
                 if disc > 0.5 && !disc_keywords.is_empty() {
                     tracing::debug!(
                         "Layer 2: YAKE discriminative keywords: {:?} (disc={:.2})",
@@ -1704,18 +1706,34 @@ impl MemorySystem {
                     );
                 }
                 // Count entities in query for adaptive boost (multi-hop detection)
-                let entity_count = a.focal_entities.len() + a.discriminative_modifiers.len();
+                let entity_count = query_analysis.focal_entities.len()
+                    + query_analysis.discriminative_modifiers.len();
 
                 // First, collect all query entity UUIDs
                 // Include nouns, adjectives, AND verbs for multi-hop reasoning
                 let mut query_entities: Vec<uuid::Uuid> = Vec::new();
-                for e in a
+                for e in query_analysis
                     .focal_entities
                     .iter()
                     .map(|e| e.text.as_str())
-                    .chain(a.discriminative_modifiers.iter().map(|m| m.text.as_str()))
-                    .chain(a.relational_context.iter().map(|r| r.text.as_str()))
-                    .chain(a.relational_context.iter().map(|r| r.stem.as_str()))
+                    .chain(
+                        query_analysis
+                            .discriminative_modifiers
+                            .iter()
+                            .map(|m| m.text.as_str()),
+                    )
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.text.as_str()),
+                    )
+                    .chain(
+                        query_analysis
+                            .relational_context
+                            .iter()
+                            .map(|r| r.stem.as_str()),
+                    )
                 {
                     if let Ok(Some(ent)) = g.find_entity_by_name(e) {
                         query_entities.push(ent.uuid);
@@ -1727,14 +1745,9 @@ impl MemorySystem {
                 let d = if !query_entities.is_empty() {
                     g.entities_average_density(&query_entities).ok().flatten()
                 } else {
-                    // Fallback to global density when no entities found
-                    g.get_stats().ok().and_then(|s| {
-                        if s.entity_count > 0 {
-                            Some(s.relationship_count as f32 / s.entity_count as f32)
-                        } else {
-                            None
-                        }
-                    })
+                    // No query entities — skip density calculation.
+                    // The default weights (0.6, 0.3, 0.1) handle this case correctly.
+                    None
                 };
 
                 let mut ids = Vec::new();
@@ -1844,14 +1857,13 @@ impl MemorySystem {
                 (r, d, entity_count, weights, phrases, disc)
             } else {
                 // No graph memory - still analyze query for IC weights and phrase boosts
-                let a = query_parser::analyze_query(query_text);
-                let (disc, _) = a.keyword_discriminativeness();
+                let (disc, _) = query_analysis.keyword_discriminativeness();
                 (
                     Vec::new(),
                     None,
                     0,
-                    a.to_ic_weights(),
-                    a.to_phrase_boosts(),
+                    query_analysis.to_ic_weights(),
+                    query_analysis.to_phrase_boosts(),
                     disc,
                 )
             }
@@ -1885,6 +1897,7 @@ impl MemorySystem {
             offset: query.offset,
             episode_id: query.episode_id.clone(),
             prospective_signals: query.prospective_signals.clone(),
+            recency_weight: query.recency_weight,
         };
 
         // ===========================================================================
@@ -2041,6 +2054,32 @@ impl MemorySystem {
             }
 
             // ===========================================================================
+            // LAYER 4.55: TEMPORAL FACT BOOST
+            // ===========================================================================
+            // Source memories of matching temporal facts get a moderate boost.
+            // This ensures "When did Melanie paint a sunrise?" boosts the memory that
+            // recorded the event, not just memories with temporal_refs.
+            if !temporal_fact_boost_ids.is_empty() {
+                const TEMPORAL_FACT_BOOST: f32 = 0.4;
+                let mut boosted_count = 0;
+                for id in &temporal_fact_boost_ids {
+                    if fused.contains_key(id) {
+                        *fused.get_mut(id).unwrap() += TEMPORAL_FACT_BOOST;
+                        boosted_count += 1;
+                    } else {
+                        fused.insert(id.clone(), TEMPORAL_FACT_BOOST);
+                        boosted_count += 1;
+                    }
+                }
+                if boosted_count > 0 {
+                    tracing::info!(
+                        "Layer 4.55: Boosted {} memories from temporal fact matches",
+                        boosted_count
+                    );
+                }
+            }
+
+            // ===========================================================================
             // LAYER 4.6: INTERFERENCE-AWARE SCORING (PIPE-3)
             // ===========================================================================
             // Research basis: Anderson & Neely (1996) - Retrieval-induced forgetting
@@ -2122,10 +2161,11 @@ impl MemorySystem {
             let base_score = score + hebbian_boost * 0.1;
 
             // Helper to apply unified scoring (recency + arousal + credibility + temporal)
+            let recency_scale = query.recency_weight.unwrap_or(0.1);
             let with_unified_score = |mem: &SharedMemory, base: f32| -> SharedMemory {
-                // Recency decay: exponential decay based on age (10% contribution)
+                // Recency decay: exponential decay based on age
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
-                let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * 0.1;
+                let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale;
 
                 // Emotional arousal boost: high arousal = more salient (5% contribution)
                 // Research: LaBar & Cabeza (2006) - emotionally arousing events better remembered
@@ -2245,65 +2285,9 @@ impl MemorySystem {
                 Ok(memory) => {
                     // CRITICAL FIX: Apply filters before adding to results
                     if self.retriever.matches_filters(&memory, &vector_query) {
-                        // Apply unified scoring (hebbian + recency + arousal + credibility + temporal)
-                        let hours_old = (now - memory.created_at).num_hours().max(0) as f32;
-                        let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * 0.1;
-
-                        // Emotional arousal boost (5% contribution)
-                        let arousal_boost = memory
-                            .experience
-                            .context
-                            .as_ref()
-                            .map(|c| c.emotional.arousal * 0.05)
-                            .unwrap_or(0.0);
-
-                        // Source credibility boost (5% contribution)
-                        let credibility_boost = memory
-                            .experience
-                            .context
-                            .as_ref()
-                            .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
-                            .unwrap_or(0.0);
-
-                        // TEMPORAL BOOST (TEMPR approach - key for multi-hop retrieval)
-                        let temporal_boost =
-                            if has_temporal_query && !memory.experience.temporal_refs.is_empty() {
-                                let mut best_match = 0.0_f32;
-                                for mem_ref in &memory.experience.temporal_refs {
-                                    for query_ref in &query_temporal.refs {
-                                        if mem_ref == &query_ref.date.to_string() {
-                                            best_match = best_match.max(0.25);
-                                        } else if let Ok(mem_date) =
-                                            chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
-                                        {
-                                            let days_diff =
-                                                (mem_date - query_ref.date).num_days().abs();
-                                            if days_diff <= 7 {
-                                                let proximity_boost =
-                                                    0.15 * (1.0 - days_diff as f32 / 7.0);
-                                                best_match = best_match.max(proximity_boost);
-                                            } else if days_diff <= 30 {
-                                                let proximity_boost =
-                                                    0.05 * (1.0 - days_diff as f32 / 30.0);
-                                                best_match = best_match.max(proximity_boost);
-                                            }
-                                        }
-                                    }
-                                }
-                                best_match
-                            } else {
-                                0.0
-                            };
-
-                        let final_score = base_score
-                            + recency_boost
-                            + arousal_boost
-                            + credibility_boost
-                            + temporal_boost;
-
-                        let mut scored_memory = memory;
-                        scored_memory.set_score(final_score);
-                        memories.push(Arc::new(scored_memory));
+                        // Reuse unified scoring (includes feedback_multiplier)
+                        let shared = Arc::new(memory);
+                        memories.push(with_unified_score(&shared, base_score));
                         if !sources.contains(&"longterm") {
                             sources.push("longterm");
                         }
@@ -2336,12 +2320,13 @@ impl MemorySystem {
             "Cache-aware retrieval completed"
         );
 
-        // Re-rank using linguistic analysis (focal entities boost)
-        let analysis = query_parser::analyze_query(query_text);
-        if !analysis.focal_entities.is_empty() {
+        // Linguistic analysis: additive boost (5% of IC weight), not a full re-sort
+        if !query_analysis.focal_entities.is_empty() {
             memories.sort_by(|a, b| {
-                let score_a = Self::linguistic_boost(&a.experience.content, &analysis);
-                let score_b = Self::linguistic_boost(&b.experience.content, &analysis);
+                let score_a = a.score.unwrap_or(0.0)
+                    + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05;
+                let score_b = b.score.unwrap_or(0.0)
+                    + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
                 score_b.total_cmp(&score_a)
             });
         }
@@ -2362,7 +2347,7 @@ impl MemorySystem {
                 .enumerate()
                 .map(|(i, m)| {
                     let relevance = 1.0 - (i as f32 / memories.len() as f32) * 0.3; // Position-based score
-                    let similarity = m.importance(); // Use importance as proxy for query relevance
+                    let similarity = m.score.unwrap_or(0.5); // Use computed retrieval score
                     (m.id.0.to_string(), relevance, similarity)
                 })
                 .collect();
@@ -2430,8 +2415,28 @@ impl MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
-                    tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                match graph.read().record_memory_coactivation(&memory_uuids) {
+                    Ok(edges_updated) if edges_updated > 0 => {
+                        // Record consolidation events for coactivation visibility
+                        for i in 0..memories.len().min(5) {
+                            for j in (i + 1)..memories.len().min(5) {
+                                self.record_consolidation_event(
+                                    introspection::ConsolidationEvent::EdgeStrengthened {
+                                        from_memory_id: memories[i].id.0.to_string(),
+                                        to_memory_id: memories[j].id.0.to_string(),
+                                        strength_before: 0.0,
+                                        strength_after: 0.025,
+                                        co_activations: 1,
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                    }
+                    _ => {}
                 }
             }
         }

@@ -7,7 +7,10 @@
 //! - Importance-based retention
 //! - Auto-compression triggers
 
+use std::sync::Arc;
+
 use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
+use shodh_memory::graph_memory::GraphMemory;
 use shodh_memory::memory::{
     Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem, MemoryTier,
 };
@@ -32,7 +35,7 @@ fn create_experience_with_ner(content: &str, ner: &NeuralNer) -> Experience {
     }
 }
 
-/// Create test memory system
+/// Create test memory system with knowledge graph
 fn setup_memory_system() -> (MemorySystem, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
@@ -45,7 +48,10 @@ fn setup_memory_system() -> (MemorySystem, TempDir) {
         importance_threshold: 0.7,
     };
 
-    let memory_system = MemorySystem::new(config).expect("Failed to create memory system");
+    let mut memory_system = MemorySystem::new(config).expect("Failed to create memory system");
+    let graph_path = temp_dir.path().join("graph");
+    let graph = GraphMemory::new(&graph_path).expect("Failed to create graph memory");
+    memory_system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(graph)));
     (memory_system, temp_dir)
 }
 
@@ -930,7 +936,9 @@ fn test_consolidation_report_after_retrieval() {
     // Note: strengthening only occurs when importance actually changes
     // which happens after 5+ accesses
     assert!(
-        !report.strengthened_memories.is_empty() || !report.formed_associations.is_empty(),
+        !report.strengthened_memories.is_empty()
+            || !report.formed_associations.is_empty()
+            || !report.strengthened_associations.is_empty(),
         "Expected at least one strengthening or association event"
     );
 }
@@ -947,7 +955,7 @@ fn test_consolidation_report_after_maintenance() {
     }
 
     // Run maintenance to potentially trigger decay events (0.95 = standard decay factor)
-    system.run_maintenance(0.95).unwrap();
+    system.run_maintenance(0.95, "test-user").unwrap();
 
     // Get report
     let report = system.get_consolidation_report(epoch(), None);
@@ -1042,9 +1050,18 @@ fn test_consolidation_report_time_filtering() {
 fn test_consolidation_event_buffer_clear() {
     let (system, _temp) = setup_memory_system();
 
-    // Generate some events
+    // Generate some events (need 2+ memories for coactivation)
     system
-        .remember(create_experience("Buffer clear test"), None)
+        .remember(
+            create_experience("Buffer clear test with important data"),
+            None,
+        )
+        .unwrap();
+    system
+        .remember(
+            create_experience("Buffer overflow prevention in systems"),
+            None,
+        )
         .unwrap();
     let query = Query {
         query_text: Some("Buffer".to_string()),
@@ -1098,7 +1115,7 @@ fn test_consolidation_report_stats_consistency() {
     }
 
     // Run maintenance with standard decay factor
-    system.run_maintenance(0.95).unwrap();
+    system.run_maintenance(0.95, "test-user").unwrap();
 
     // Get report
     let report = system.get_consolidation_report(epoch(), None);
@@ -1217,9 +1234,18 @@ fn test_edge_events_have_strength_values() {
 fn test_consolidation_events_list() {
     let (system, _temp) = setup_memory_system();
 
-    // Record and retrieve a memory
+    // Record multiple memories (coactivation needs 2+)
     system
-        .remember(create_experience("Test consolidation events list"), None)
+        .remember(
+            create_experience("Test consolidation events list for tracking"),
+            None,
+        )
+        .unwrap();
+    system
+        .remember(
+            create_experience("Consolidation events are important for monitoring"),
+            None,
+        )
         .unwrap();
 
     for _ in 0..7 {
@@ -1290,9 +1316,15 @@ fn test_consolidation_event_count() {
     let initial_count = system.consolidation_event_count();
     assert_eq!(initial_count, 0, "Initial event count should be zero");
 
-    // Record a memory and do some retrievals
+    // Record memories and do some retrievals (coactivation needs 2+)
     system
-        .remember(create_experience("Test event count"), None)
+        .remember(create_experience("Test event count tracking system"), None)
+        .unwrap();
+    system
+        .remember(
+            create_experience("Event count should increase with operations"),
+            None,
+        )
         .unwrap();
 
     for _ in 0..7 {
