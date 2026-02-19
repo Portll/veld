@@ -749,8 +749,10 @@ impl MemorySystem {
                             let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
                             EDGE_SEMANTIC_WEIGHT_FLOOR + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
                         }
-                        // No embeddings available → full weight (legacy behavior)
-                        _ => 1.0,
+                        // No embeddings available → conservative weight
+                        // Must stay above L1_PRUNE_THRESHOLD / L1_INITIAL_WEIGHT = 0.1/0.3 ≈ 0.334
+                        // so cold-start edges aren't born already prunable
+                        _ => 0.35,
                     };
 
                     let edge = crate::graph_memory::RelationshipEdge {
