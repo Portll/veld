@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use parking_lot::RwLock;
-use rocksdb::{Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,16 +29,20 @@ use crate::vector_db::{VamanaConfig, VamanaIndex};
 /// Embedding dimension (MiniLM-L6-v2)
 const EMBEDDING_DIM: usize = 384;
 
+const CF_TODOS: &str = "todos";
+const CF_PROJECTS: &str = "projects";
+const CF_TODO_INDEX: &str = "todo_index";
+
 /// Migrate unpadded `due:{ts}:{uid}:{id}` keys to zero-padded `due:{:020}:{uid}:{id}` format.
 ///
 /// Prior versions wrote bare timestamps (e.g. `due:1739404800:user:uuid`), which break
 /// lexicographic ordering (`"9" > "10"`). Zero-padding to 20 digits ensures
 /// lex order = chronological order, enabling ordered range scans.
-fn migrate_due_key_padding(index_db: &DB) -> Result<usize> {
+fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
     let mut batch = WriteBatch::default();
     let mut count = 0;
 
-    for item in index_db.prefix_iterator(b"due:") {
+    for item in db.prefix_iterator_cf(index_cf, b"due:") {
         let (key, value) = item.context("Failed to read due index during migration")?;
         let key_str = std::str::from_utf8(&key).context("Non-UTF8 key in todo due index")?;
 
@@ -55,15 +59,14 @@ fn migrate_due_key_padding(index_db: &DB) -> Result<usize> {
 
         if let Ok(ts) = parts[1].parse::<i64>() {
             let new_key = format!("due:{:020}:{}:{}", ts, parts[2], parts[3]);
-            batch.delete(&*key);
-            batch.put(new_key.as_bytes(), &*value);
+            batch.delete_cf(index_cf, &*key);
+            batch.put_cf(index_cf, new_key.as_bytes(), &*value);
             count += 1;
         }
     }
 
     if count > 0 {
-        index_db
-            .write(batch)
+        db.write(batch)
             .context("Failed to write migrated todo due keys")?;
         tracing::info!(count, "Migrated todo due keys to zero-padded format");
     }
@@ -73,12 +76,8 @@ fn migrate_due_key_padding(index_db: &DB) -> Result<usize> {
 
 /// Storage and query engine for todos and projects
 pub struct TodoStore {
-    /// Main todo storage: key = {user_id}:{todo_id}
-    todo_db: Arc<DB>,
-    /// Project storage: key = {user_id}:{project_id}
-    project_db: Arc<DB>,
-    /// Index database for efficient queries
-    index_db: Arc<DB>,
+    /// Shared RocksDB instance with column families for todos, projects, and indices
+    db: Arc<DB>,
     /// Vector index for semantic search (per-user indices)
     vector_indices: RwLock<HashMap<String, VamanaIndex>>,
     /// Storage path for persisting vector indices
@@ -88,41 +87,106 @@ pub struct TodoStore {
 }
 
 impl TodoStore {
-    /// Create a new todo store at the given path
-    pub fn new(storage_path: &Path) -> Result<Self> {
+    /// Column family descriptors required by the TodoStore.
+    /// The caller must include these (plus `"default"`) when opening the shared DB.
+    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
+        let mut cf_opts = Options::default();
+        cf_opts.create_if_missing(true);
+        cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        vec![
+            ColumnFamilyDescriptor::new(CF_TODOS, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(CF_PROJECTS, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(CF_TODO_INDEX, cf_opts),
+        ]
+    }
+
+    fn todos_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(CF_TODOS).expect("todos CF must exist")
+    }
+    fn projects_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_PROJECTS)
+            .expect("projects CF must exist")
+    }
+    fn todo_index_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_TODO_INDEX)
+            .expect("todo_index CF must exist")
+    }
+
+    /// Create a new todo store backed by the given shared DB
+    pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
         let todos_path = storage_path.join("todos");
         std::fs::create_dir_all(&todos_path)?;
 
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_max_write_buffer_number(2);
-        opts.set_write_buffer_size(32 * 1024 * 1024); // 32MB
-
-        let todo_db =
-            Arc::new(DB::open(&opts, todos_path.join("items")).context("Failed to open todos DB")?);
-
-        let project_db = Arc::new(
-            DB::open(&opts, todos_path.join("projects")).context("Failed to open projects DB")?,
-        );
-
-        let index_db = Arc::new(
-            DB::open(&opts, todos_path.join("index")).context("Failed to open todos index DB")?,
-        );
+        // Migrate from old separate-DB layout if needed
+        Self::migrate_from_separate_dbs(&todos_path, &db)?;
 
         // Migrate any unpadded due keys from prior versions
-        migrate_due_key_padding(&index_db)?;
+        let index_cf = db
+            .cf_handle(CF_TODO_INDEX)
+            .expect("todo_index CF must exist");
+        migrate_due_key_padding(&db, index_cf)?;
 
         tracing::info!("Todo store initialized");
 
         Ok(Self {
-            todo_db,
-            project_db,
-            index_db,
+            db,
             vector_indices: RwLock::new(HashMap::new()),
             storage_path: todos_path,
             seq_mutex: parking_lot::Mutex::new(()),
         })
+    }
+
+    /// Migrate data from the old separate-DB layout (items/, projects/, index/ sub-dirs)
+    /// into the unified column-family DB. After migration, old dirs are renamed to
+    /// `{name}.pre_cf_migration` so the migration is idempotent.
+    fn migrate_from_separate_dbs(todos_path: &Path, db: &DB) -> Result<()> {
+        let old_dirs: &[(&str, &str)] = &[
+            ("items", CF_TODOS),
+            ("projects", CF_PROJECTS),
+            ("index", CF_TODO_INDEX),
+        ];
+
+        for (old_name, cf_name) in old_dirs {
+            let old_dir = todos_path.join(old_name);
+            if !old_dir.is_dir() {
+                continue;
+            }
+
+            let cf = db
+                .cf_handle(cf_name)
+                .unwrap_or_else(|| panic!("{cf_name} CF must exist"));
+            let old_opts = Options::default();
+            match DB::open_for_read_only(&old_opts, &old_dir, false) {
+                Ok(old_db) => {
+                    let mut batch = WriteBatch::default();
+                    let mut count = 0usize;
+                    for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
+                        batch.put_cf(cf, &key, &value);
+                        count += 1;
+                        if count % 10_000 == 0 {
+                            db.write(std::mem::take(&mut batch))?;
+                        }
+                    }
+                    if !batch.is_empty() {
+                        db.write(batch)?;
+                    }
+                    drop(old_db);
+                    tracing::info!("  todos/{old_name}: migrated {count} entries to {cf_name} CF");
+
+                    let backup = todos_path.join(format!("{old_name}.pre_cf_migration"));
+                    if let Err(e) = std::fs::rename(&old_dir, &backup) {
+                        tracing::warn!("Could not rename old {old_name} dir: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not open old {old_name} DB for migration: {e}");
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get or create a Vamana vector index for a user
@@ -172,7 +236,7 @@ impl TodoStore {
         if let Some(index) = indices.get(user_id) {
             let results = index.search(query_embedding, limit)?;
 
-            // Find todos by vector_id (stored in index_db)
+            // Find todos by vector_id (stored in todo_index CF)
             let mut todo_results = Vec::new();
             for (vector_id, score) in results {
                 if let Some(todo) = self.get_todo_by_vector_id(user_id, vector_id)? {
@@ -185,10 +249,10 @@ impl TodoStore {
         }
     }
 
-    /// Get a todo by its vector index ID (stored in index_db)
+    /// Get a todo by its vector index ID (stored in todo_index CF)
     fn get_todo_by_vector_id(&self, user_id: &str, vector_id: u32) -> Result<Option<Todo>> {
         let key = format!("vector_id:{}:{}", user_id, vector_id);
-        if let Some(data) = self.index_db.get(key.as_bytes())? {
+        if let Some(data) = self.db.get_cf(self.todo_index_cf(), key.as_bytes())? {
             let todo_id_str = String::from_utf8_lossy(&data);
             if let Ok(uuid) = Uuid::parse_str(&todo_id_str) {
                 return self.get_todo(user_id, &TodoId(uuid));
@@ -205,8 +269,11 @@ impl TodoStore {
         todo_id: &TodoId,
     ) -> Result<()> {
         let key = format!("vector_id:{}:{}", user_id, vector_id);
-        self.index_db
-            .put(key.as_bytes(), todo_id.0.to_string().as_bytes())?;
+        self.db.put_cf(
+            self.todo_index_cf(),
+            key.as_bytes(),
+            todo_id.0.to_string().as_bytes(),
+        )?;
         Ok(())
     }
 
@@ -263,7 +330,7 @@ impl TodoStore {
             Some(pid) => format!("seq:{}:{}", user_id, pid.0),
             None => format!("seq:{}:_standalone_", user_id),
         };
-        let current = match self.index_db.get(key.as_bytes())? {
+        let current = match self.db.get_cf(self.todo_index_cf(), key.as_bytes())? {
             Some(data) => {
                 if data.len() >= 4 {
                     let bytes: [u8; 4] = [data[0], data[1], data[2], data[3]];
@@ -275,7 +342,8 @@ impl TodoStore {
             None => 0,
         };
         let next = current + 1;
-        self.index_db.put(key.as_bytes(), next.to_le_bytes())?;
+        self.db
+            .put_cf(self.todo_index_cf(), key.as_bytes(), next.to_le_bytes())?;
         Ok(next)
     }
 
@@ -319,8 +387,8 @@ impl TodoStore {
         let key = format!("{}:{}", todo_to_store.user_id, todo_to_store.id.0);
         let value = serde_json::to_vec(&todo_to_store).context("Failed to serialize todo")?;
 
-        self.todo_db
-            .put(key.as_bytes(), &value)
+        self.db
+            .put_cf(self.todos_cf(), key.as_bytes(), &value)
             .context("Failed to store todo")?;
 
         self.update_todo_indices(&todo_to_store)?;
@@ -340,14 +408,15 @@ impl TodoStore {
     fn update_todo_indices(&self, todo: &Todo) -> Result<()> {
         let mut batch = WriteBatch::default();
         let id_str = todo.id.0.to_string();
+        let index_cf = self.todo_index_cf();
 
         // Index by user (for listing)
         let user_key = format!("user:{}:{}", todo.user_id, id_str);
-        batch.put(user_key.as_bytes(), b"1");
+        batch.put_cf(index_cf, user_key.as_bytes(), b"1");
 
         // Index by status
         let status_key = format!("status:{:?}:{}:{}", todo.status, todo.user_id, id_str);
-        batch.put(status_key.as_bytes(), b"1");
+        batch.put_cf(index_cf, status_key.as_bytes(), b"1");
 
         // Index by priority
         let priority_key = format!(
@@ -356,33 +425,33 @@ impl TodoStore {
             todo.user_id,
             id_str
         );
-        batch.put(priority_key.as_bytes(), b"1");
+        batch.put_cf(index_cf, priority_key.as_bytes(), b"1");
 
         // Index by project
         if let Some(ref project_id) = todo.project_id {
             let project_key = format!("project:{}:{}:{}", project_id.0, todo.user_id, id_str);
-            batch.put(project_key.as_bytes(), b"1");
+            batch.put_cf(index_cf, project_key.as_bytes(), b"1");
         }
 
         // Index by due date (zero-padded for correct lexicographic ordering)
         if let Some(ref due) = todo.due_date {
             let due_key = format!("due:{:020}:{}:{}", due.timestamp(), todo.user_id, id_str);
-            batch.put(due_key.as_bytes(), b"1");
+            batch.put_cf(index_cf, due_key.as_bytes(), b"1");
         }
 
         // Index by context
         for ctx in &todo.contexts {
             let ctx_key = format!("context:{}:{}:{}", ctx.to_lowercase(), todo.user_id, id_str);
-            batch.put(ctx_key.as_bytes(), b"1");
+            batch.put_cf(index_cf, ctx_key.as_bytes(), b"1");
         }
 
         // Index by parent (for subtasks)
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
-            batch.put(parent_key.as_bytes(), todo.user_id.as_bytes());
+            batch.put_cf(index_cf, parent_key.as_bytes(), todo.user_id.as_bytes());
         }
 
-        self.index_db
+        self.db
             .write(batch)
             .context("Failed to update todo indices")?;
 
@@ -393,12 +462,13 @@ impl TodoStore {
     fn remove_todo_indices(&self, todo: &Todo) -> Result<()> {
         let mut batch = WriteBatch::default();
         let id_str = todo.id.0.to_string();
+        let index_cf = self.todo_index_cf();
 
         let user_key = format!("user:{}:{}", todo.user_id, id_str);
-        batch.delete(user_key.as_bytes());
+        batch.delete_cf(index_cf, user_key.as_bytes());
 
         let status_key = format!("status:{:?}:{}:{}", todo.status, todo.user_id, id_str);
-        batch.delete(status_key.as_bytes());
+        batch.delete_cf(index_cf, status_key.as_bytes());
 
         let priority_key = format!(
             "priority:{}:{}:{}",
@@ -406,29 +476,29 @@ impl TodoStore {
             todo.user_id,
             id_str
         );
-        batch.delete(priority_key.as_bytes());
+        batch.delete_cf(index_cf, priority_key.as_bytes());
 
         if let Some(ref project_id) = todo.project_id {
             let project_key = format!("project:{}:{}:{}", project_id.0, todo.user_id, id_str);
-            batch.delete(project_key.as_bytes());
+            batch.delete_cf(index_cf, project_key.as_bytes());
         }
 
         if let Some(ref due) = todo.due_date {
             let due_key = format!("due:{:020}:{}:{}", due.timestamp(), todo.user_id, id_str);
-            batch.delete(due_key.as_bytes());
+            batch.delete_cf(index_cf, due_key.as_bytes());
         }
 
         for ctx in &todo.contexts {
             let ctx_key = format!("context:{}:{}:{}", ctx.to_lowercase(), todo.user_id, id_str);
-            batch.delete(ctx_key.as_bytes());
+            batch.delete_cf(index_cf, ctx_key.as_bytes());
         }
 
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
-            batch.delete(parent_key.as_bytes());
+            batch.delete_cf(index_cf, parent_key.as_bytes());
         }
 
-        self.index_db.write(batch)?;
+        self.db.write(batch)?;
         Ok(())
     }
 
@@ -436,7 +506,7 @@ impl TodoStore {
     pub fn get_todo(&self, user_id: &str, todo_id: &TodoId) -> Result<Option<Todo>> {
         let key = format!("{}:{}", user_id, todo_id.0);
 
-        match self.todo_db.get(key.as_bytes())? {
+        match self.db.get_cf(self.todos_cf(), key.as_bytes())? {
             Some(value) => {
                 let mut todo: Todo =
                     serde_json::from_slice(&value).context("Failed to deserialize todo")?;
@@ -533,9 +603,9 @@ impl TodoStore {
             // Cascade delete subtasks to prevent orphans
             let subtasks = self.list_subtasks(todo_id)?;
             for subtask in &subtasks {
-                self.remove_todo_indices(&subtask)?;
+                self.remove_todo_indices(subtask)?;
                 let subtask_key = format!("{}:{}", subtask.user_id, subtask.id.0);
-                self.todo_db.delete(subtask_key.as_bytes())?;
+                self.db.delete_cf(self.todos_cf(), subtask_key.as_bytes())?;
                 tracing::debug!(
                     todo_id = %subtask.id,
                     parent_id = %todo_id,
@@ -544,7 +614,7 @@ impl TodoStore {
             }
 
             self.remove_todo_indices(&todo)?;
-            self.todo_db.delete(key.as_bytes())?;
+            self.db.delete_cf(self.todos_cf(), key.as_bytes())?;
             tracing::debug!(
                 todo_id = %todo_id,
                 subtasks_deleted = subtasks.len(),
@@ -756,7 +826,9 @@ impl TodoStore {
         let prefix = format!("user:{}:", user_id);
         let mut todos = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
 
         for item in iter {
             let (key, _) = item?;
@@ -816,7 +888,9 @@ impl TodoStore {
         let prefix = format!("project:{}:{}:", project_id.0, user_id);
         let mut todos = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
 
         for item in iter {
             let (key, _) = item?;
@@ -843,7 +917,9 @@ impl TodoStore {
         let prefix = format!("context:{}:{}:", ctx_lower, user_id);
         let mut todos = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
 
         for item in iter {
             let (key, _) = item?;
@@ -900,7 +976,9 @@ impl TodoStore {
         let prefix = format!("parent:{}:", parent_id.0);
         let mut todos = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
 
         for item in iter {
             let (key, value) = item?;
@@ -932,11 +1010,12 @@ impl TodoStore {
         let key = format!("{}:{}", project.user_id, project.id.0);
         let value = serde_json::to_vec(project).context("Failed to serialize project")?;
 
-        self.project_db.put(key.as_bytes(), &value)?;
+        self.db.put_cf(self.projects_cf(), key.as_bytes(), &value)?;
 
         // Index by user
         let user_key = format!("user:{}:{}", project.user_id, project.id.0);
-        self.index_db.put(user_key.as_bytes(), b"p")?; // 'p' for project
+        self.db
+            .put_cf(self.todo_index_cf(), user_key.as_bytes(), b"p")?; // 'p' for project
 
         // Index by name (for lookup) - store as string for easy parsing
         let name_key = format!(
@@ -944,8 +1023,11 @@ impl TodoStore {
             project.name.to_lowercase(),
             project.user_id
         );
-        self.index_db
-            .put(name_key.as_bytes(), project.id.0.to_string().as_bytes())?;
+        self.db.put_cf(
+            self.todo_index_cf(),
+            name_key.as_bytes(),
+            project.id.0.to_string().as_bytes(),
+        )?;
 
         // Index by parent (for sub-projects)
         if let Some(ref parent_id) = project.parent_id {
@@ -953,7 +1035,8 @@ impl TodoStore {
                 "project_parent:{}:{}:{}",
                 project.user_id, parent_id.0, project.id.0
             );
-            self.index_db.put(parent_key.as_bytes(), b"1")?;
+            self.db
+                .put_cf(self.todo_index_cf(), parent_key.as_bytes(), b"1")?;
         }
 
         tracing::debug!(project_id = %project.id.0, name = %project.name, parent = ?project.parent_id, "Stored project");
@@ -965,7 +1048,7 @@ impl TodoStore {
     pub fn get_project(&self, user_id: &str, project_id: &ProjectId) -> Result<Option<Project>> {
         let key = format!("{}:{}", user_id, project_id.0);
 
-        match self.project_db.get(key.as_bytes())? {
+        match self.db.get_cf(self.projects_cf(), key.as_bytes())? {
             Some(value) => {
                 let project: Project =
                     serde_json::from_slice(&value).context("Failed to deserialize project")?;
@@ -979,7 +1062,7 @@ impl TodoStore {
     pub fn find_project_by_name(&self, user_id: &str, name: &str) -> Result<Option<Project>> {
         let name_key = format!("project_name:{}:{}", name.to_lowercase(), user_id);
 
-        if let Some(value) = self.index_db.get(name_key.as_bytes())? {
+        if let Some(value) = self.db.get_cf(self.todo_index_cf(), name_key.as_bytes())? {
             if let Ok(uuid) = Uuid::parse_str(&String::from_utf8_lossy(&value)) {
                 return self.get_project(user_id, &ProjectId(uuid));
             }
@@ -1004,8 +1087,8 @@ impl TodoStore {
         let mut projects = Vec::new();
 
         let iter = self
-            .project_db
-            .prefix_iterator(format!("{}:", user_id).as_bytes());
+            .db
+            .prefix_iterator_cf(self.projects_cf(), format!("{}:", user_id).as_bytes());
 
         for item in iter {
             let (key, value) = item?;
@@ -1030,7 +1113,9 @@ impl TodoStore {
         let mut subprojects = Vec::new();
 
         let prefix = format!("project_parent:{}:{}:", user_id, parent_id.0);
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
 
         for item in iter {
             let (key, _) = item?;
@@ -1138,7 +1223,8 @@ impl TodoStore {
                 if project.name != old_name {
                     let old_name_key =
                         format!("project_name:{}:{}", old_name.to_lowercase(), user_id);
-                    self.index_db.delete(old_name_key.as_bytes())?;
+                    self.db
+                        .delete_cf(self.todo_index_cf(), old_name_key.as_bytes())?;
                 }
 
                 self.store_project(&project)?;
@@ -1174,14 +1260,16 @@ impl TodoStore {
 
             // Delete project
             let key = format!("{}:{}", user_id, project_id.0);
-            self.project_db.delete(key.as_bytes())?;
+            self.db.delete_cf(self.projects_cf(), key.as_bytes())?;
 
             // Delete indices
             let user_key = format!("user:{}:{}", user_id, project_id.0);
-            self.index_db.delete(user_key.as_bytes())?;
+            self.db
+                .delete_cf(self.todo_index_cf(), user_key.as_bytes())?;
 
             let name_key = format!("project_name:{}:{}", project.name.to_lowercase(), user_id);
-            self.index_db.delete(name_key.as_bytes())?;
+            self.db
+                .delete_cf(self.todo_index_cf(), name_key.as_bytes())?;
 
             // Delete parent index (if this was a sub-project)
             if let Some(ref parent_id) = project.parent_id {
@@ -1189,7 +1277,8 @@ impl TodoStore {
                     "project_parent:{}:{}:{}",
                     user_id, parent_id.0, project_id.0
                 );
-                self.index_db.delete(parent_key.as_bytes())?;
+                self.db
+                    .delete_cf(self.todo_index_cf(), parent_key.as_bytes())?;
             }
 
             Ok(true)
@@ -1202,18 +1291,19 @@ impl TodoStore {
     // STATS
     // =========================================================================
 
-    /// Flush all RocksDB databases and save vector indices to disk (critical for graceful shutdown)
+    /// Flush all RocksDB column families and save vector indices to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
-        // Flush RocksDB databases
-        self.todo_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush todo_db: {e}"))?;
-        self.project_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush project_db: {e}"))?;
-        self.index_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush index_db: {e}"))?;
+        use rocksdb::FlushOptions;
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(true);
+
+        for cf_name in &[CF_TODOS, CF_PROJECTS, CF_TODO_INDEX] {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                self.db
+                    .flush_cf_opt(cf, &flush_opts)
+                    .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
+            }
+        }
 
         // Save vector indices
         self.save_vector_indices()
@@ -1222,13 +1312,9 @@ impl TodoStore {
         Ok(())
     }
 
-    /// Get references to all RocksDB databases for backup
+    /// Get reference to the shared RocksDB database for backup
     pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![
-            ("todo_items", &self.todo_db),
-            ("todo_projects", &self.project_db),
-            ("todo_index", &self.index_db),
-        ]
+        vec![("todos_shared", &self.db)]
     }
 
     /// Get overall todo stats for a user
@@ -1295,9 +1381,26 @@ mod tests {
     use crate::memory::types::Recurrence;
     use tempfile::TempDir;
 
+    fn open_test_shared_db(path: &Path) -> Arc<DB> {
+        let shared_path = path.join("shared");
+        std::fs::create_dir_all(&shared_path).unwrap();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        let cfs = vec![
+            ColumnFamilyDescriptor::new("default", opts.clone()),
+            ColumnFamilyDescriptor::new(CF_TODOS, opts.clone()),
+            ColumnFamilyDescriptor::new(CF_PROJECTS, opts.clone()),
+            ColumnFamilyDescriptor::new(CF_TODO_INDEX, opts.clone()),
+        ];
+        Arc::new(DB::open_cf_descriptors(&opts, &shared_path, cfs).unwrap())
+    }
+
     fn setup_store() -> (TodoStore, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let store = TodoStore::new(temp_dir.path()).unwrap();
+        let db = open_test_shared_db(temp_dir.path());
+        let store = TodoStore::new(db, temp_dir.path()).unwrap();
         (store, temp_dir)
     }
 
@@ -1350,43 +1453,45 @@ mod tests {
     #[test]
     fn test_due_key_migration_and_ordering() {
         let temp_dir = TempDir::new().unwrap();
-        let todos_path = temp_dir.path().join("todos");
-        std::fs::create_dir_all(&todos_path).unwrap();
-
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        let index_db = DB::open(&opts, todos_path.join("index")).unwrap();
+        let db = open_test_shared_db(temp_dir.path());
+        let index_cf = db.cf_handle(CF_TODO_INDEX).unwrap();
 
         let todo_id_a = Uuid::new_v4();
         let todo_id_b = Uuid::new_v4();
         // ts_a = 9 (1 digit), ts_b = 10 (2 digits)
         // Without padding: "due:9:..." > "due:10:..." lexicographically (wrong)
-        index_db
-            .put(format!("due:9:user1:{}", todo_id_a).as_bytes(), b"1")
-            .unwrap();
-        index_db
-            .put(format!("due:10:user1:{}", todo_id_b).as_bytes(), b"1")
-            .unwrap();
+        db.put_cf(
+            index_cf,
+            format!("due:9:user1:{}", todo_id_a).as_bytes(),
+            b"1",
+        )
+        .unwrap();
+        db.put_cf(
+            index_cf,
+            format!("due:10:user1:{}", todo_id_b).as_bytes(),
+            b"1",
+        )
+        .unwrap();
 
         // Run migration
-        let migrated = migrate_due_key_padding(&index_db).unwrap();
+        let migrated = migrate_due_key_padding(&db, index_cf).unwrap();
         assert_eq!(migrated, 2);
 
         // Verify old keys are gone
-        assert!(index_db
-            .get(format!("due:9:user1:{}", todo_id_a).as_bytes())
+        assert!(db
+            .get_cf(index_cf, format!("due:9:user1:{}", todo_id_a).as_bytes())
             .unwrap()
             .is_none());
-        assert!(index_db
-            .get(format!("due:10:user1:{}", todo_id_b).as_bytes())
+        assert!(db
+            .get_cf(index_cf, format!("due:10:user1:{}", todo_id_b).as_bytes())
             .unwrap()
             .is_none());
 
         // Verify new padded keys exist
         let key_a = format!("due:{:020}:user1:{}", 9_i64, todo_id_a);
         let key_b = format!("due:{:020}:user1:{}", 10_i64, todo_id_b);
-        assert!(index_db.get(key_a.as_bytes()).unwrap().is_some());
-        assert!(index_db.get(key_b.as_bytes()).unwrap().is_some());
+        assert!(db.get_cf(index_cf, key_a.as_bytes()).unwrap().is_some());
+        assert!(db.get_cf(index_cf, key_b.as_bytes()).unwrap().is_some());
 
         // Verify lexicographic order is now correct: 9 < 10
         assert!(
@@ -1395,7 +1500,7 @@ mod tests {
         );
 
         // Re-running migration should be a no-op
-        let migrated_again = migrate_due_key_padding(&index_db).unwrap();
+        let migrated_again = migrate_due_key_padding(&db, index_cf).unwrap();
         assert_eq!(migrated_again, 0);
     }
 

@@ -5,17 +5,23 @@
 //! - Context-based triggers (keyword match, semantic similarity)
 //!
 //! Architecture:
-//! - ProspectiveTask stored in dedicated RocksDB for operational tracking
+//! - ProspectiveTask stored in "prospective" column family of shared RocksDB
+//! - Secondary indices in "prospective_index" column family
 //! - Memory with ExperienceType::Intention created for semantic integration
 //! - Uses Hebbian learning for decay (same as regular memories)
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rocksdb::{Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
 
 use super::types::{ProspectiveTask, ProspectiveTaskId, ProspectiveTaskStatus, ProspectiveTrigger};
+
+/// Column family for main task storage (key = `{user_id}:{task_id}`)
+const CF_PROSPECTIVE: &str = "prospective";
+/// Column family for secondary indices (due dates, status, keyword lookups)
+const CF_PROSPECTIVE_INDEX: &str = "prospective_index";
 
 /// Compute cosine similarity between two embedding vectors
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -39,11 +45,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Prior versions wrote bare timestamps (e.g. `due:1739404800:uuid`), which break
 /// lexicographic ordering (`"9" > "10"`). Zero-padding to 20 digits ensures
 /// lex order = chronological order, enabling early-termination scans.
-fn migrate_due_key_padding(index_db: &DB) -> Result<usize> {
+fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
     let mut batch = WriteBatch::default();
     let mut count = 0;
 
-    for item in index_db.prefix_iterator(b"due:") {
+    for item in db.prefix_iterator_cf(index_cf, b"due:") {
         let (key, value) = item.context("Failed to read due index during migration")?;
         let key_str = std::str::from_utf8(&key).context("Non-UTF8 key in prospective due index")?;
 
@@ -60,15 +66,14 @@ fn migrate_due_key_padding(index_db: &DB) -> Result<usize> {
 
         if let Ok(ts) = parts[1].parse::<i64>() {
             let new_key = format!("due:{:020}:{}", ts, parts[2]);
-            batch.delete(&*key);
-            batch.put(new_key.as_bytes(), &*value);
+            batch.delete_cf(index_cf, &*key);
+            batch.put_cf(index_cf, new_key.as_bytes(), &*value);
             count += 1;
         }
     }
 
     if count > 0 {
-        index_db
-            .write(batch)
+        db.write(batch)
             .context("Failed to write migrated prospective due keys")?;
         tracing::info!(count, "Migrated prospective due keys to zero-padded format");
     }
@@ -78,61 +83,129 @@ fn migrate_due_key_padding(index_db: &DB) -> Result<usize> {
 
 /// Storage and query engine for prospective memory (reminders)
 pub struct ProspectiveStore {
-    /// Main task storage: key = {user_id}:{task_id}
+    /// Shared RocksDB instance with "prospective" and "prospective_index" column families
     db: Arc<DB>,
-    /// Index database for efficient queries
-    index_db: Arc<DB>,
 }
 
 impl ProspectiveStore {
-    /// Create a new prospective store at the given path
-    pub fn new(storage_path: &Path) -> Result<Self> {
-        let prospective_path = storage_path.join("prospective");
-        std::fs::create_dir_all(&prospective_path)?;
-
+    /// Return the column family descriptors needed by ProspectiveStore.
+    ///
+    /// Call this when opening the shared DB so the CFs are registered.
+    pub fn column_family_descriptors() -> Vec<ColumnFamilyDescriptor> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
-        // Smaller buffers - prospective tasks are low volume
-        opts.set_max_write_buffer_number(2);
-        opts.set_write_buffer_size(16 * 1024 * 1024); // 16MB
-
-        let db = Arc::new(
-            DB::open(&opts, prospective_path.join("tasks"))
-                .context("Failed to open prospective tasks DB")?,
-        );
-
-        let index_db = Arc::new(
-            DB::open(&opts, prospective_path.join("index"))
-                .context("Failed to open prospective index DB")?,
-        );
-
-        // Migrate any unpadded due keys from prior versions
-        migrate_due_key_padding(&index_db)?;
-
-        tracing::info!("Prospective memory store initialized");
-
-        Ok(Self { db, index_db })
+        vec![
+            ColumnFamilyDescriptor::new(CF_PROSPECTIVE, opts.clone()),
+            ColumnFamilyDescriptor::new(CF_PROSPECTIVE_INDEX, opts),
+        ]
     }
 
-    /// Flush all RocksDB databases to disk (critical for graceful shutdown)
-    pub fn flush(&self) -> Result<()> {
+    /// CF accessor for the main task storage column family
+    fn tasks_cf(&self) -> &ColumnFamily {
         self.db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush prospective_db: {e}"))?;
-        self.index_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush prospective index_db: {e}"))?;
+            .cf_handle(CF_PROSPECTIVE)
+            .expect("prospective CF must exist")
+    }
+
+    /// CF accessor for the secondary index column family
+    fn index_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_PROSPECTIVE_INDEX)
+            .expect("prospective_index CF must exist")
+    }
+
+    /// Create a new prospective store backed by the given shared DB.
+    ///
+    /// The DB must have been opened with the column families returned by
+    /// [`column_family_descriptors()`].  On first run after the migration,
+    /// data from the old separate `tasks/` and `index/` sub-DBs is copied
+    /// into the corresponding CFs and the old directories are renamed.
+    pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
+        let prospective_path = storage_path.join("prospective");
+        std::fs::create_dir_all(&prospective_path)?;
+
+        Self::migrate_from_separate_dbs(&prospective_path, &db)?;
+
+        let index_cf = db
+            .cf_handle(CF_PROSPECTIVE_INDEX)
+            .expect("prospective_index CF must exist");
+        migrate_due_key_padding(&db, index_cf)?;
+
+        tracing::info!("Prospective memory store initialized");
+        Ok(Self { db })
+    }
+
+    /// One-time migration: copy data from legacy separate RocksDB instances
+    /// (`prospective/tasks/` and `prospective/index/`) into the shared DB's
+    /// column families, then rename the old directories so we don't re-migrate.
+    fn migrate_from_separate_dbs(prospective_path: &Path, db: &DB) -> Result<()> {
+        let old_dirs: &[(&str, &str)] =
+            &[("tasks", CF_PROSPECTIVE), ("index", CF_PROSPECTIVE_INDEX)];
+
+        for (old_name, cf_name) in old_dirs {
+            let old_dir = prospective_path.join(old_name);
+            if !old_dir.is_dir() {
+                continue;
+            }
+
+            let cf = db
+                .cf_handle(cf_name)
+                .unwrap_or_else(|| panic!("{cf_name} CF must exist"));
+            let old_opts = Options::default();
+            match DB::open_for_read_only(&old_opts, &old_dir, false) {
+                Ok(old_db) => {
+                    let mut batch = WriteBatch::default();
+                    let mut count = 0usize;
+                    for item in old_db.iterator(rocksdb::IteratorMode::Start) {
+                        if let Ok((key, value)) = item {
+                            batch.put_cf(cf, &key, &value);
+                            count += 1;
+                            if count % 10_000 == 0 {
+                                db.write(std::mem::take(&mut batch))?;
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        db.write(batch)?;
+                    }
+                    drop(old_db);
+                    tracing::info!(
+                        "  prospective/{old_name}: migrated {count} entries to {cf_name} CF"
+                    );
+
+                    let backup = prospective_path.join(format!("{old_name}.pre_cf_migration"));
+                    if let Err(e) = std::fs::rename(&old_dir, &backup) {
+                        tracing::warn!("Could not rename old {old_name} dir: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not open old {old_name} DB for migration: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush all column families to disk (critical for graceful shutdown)
+    pub fn flush(&self) -> Result<()> {
+        use rocksdb::FlushOptions;
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(true);
+        for cf_name in &[CF_PROSPECTIVE, CF_PROSPECTIVE_INDEX] {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                self.db
+                    .flush_cf_opt(cf, &flush_opts)
+                    .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
+            }
+        }
         Ok(())
     }
 
     /// Get references to all RocksDB databases for backup
     pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![
-            ("prospective_tasks", &self.db),
-            ("prospective_index", &self.index_db),
-        ]
+        vec![("prospective_shared", &self.db)]
     }
 
     /// Store a new prospective task
@@ -143,7 +216,7 @@ impl ProspectiveStore {
             serde_json::to_vec(task).context("Failed to serialize prospective task to JSON")?;
 
         self.db
-            .put(key.as_bytes(), &value)
+            .put_cf(self.tasks_cf(), key.as_bytes(), &value)
             .context("Failed to store prospective task")?;
 
         // Update indices
@@ -165,17 +238,17 @@ impl ProspectiveStore {
 
         // Index by user (for listing user's reminders)
         let user_key = format!("user:{}:{}", task.user_id, task.id);
-        batch.put(user_key.as_bytes(), b"1");
+        batch.put_cf(self.index_cf(), user_key.as_bytes(), b"1");
 
         // Index by status
         let status_key = format!("status:{:?}:{}:{}", task.status, task.user_id, task.id);
-        batch.put(status_key.as_bytes(), b"1");
+        batch.put_cf(self.index_cf(), status_key.as_bytes(), b"1");
 
         // Index by due time (for time-based trigger queries)
         // Zero-padded to 20 digits for correct lexicographic ordering
         if let Some(due_at) = task.trigger.due_at() {
             let due_key = format!("due:{:020}:{}", due_at.timestamp(), task.id);
-            batch.put(due_key.as_bytes(), task.user_id.as_bytes());
+            batch.put_cf(self.index_cf(), due_key.as_bytes(), task.user_id.as_bytes());
         }
 
         // Index context triggers by keywords
@@ -187,11 +260,11 @@ impl ProspectiveStore {
                     task.user_id,
                     task.id
                 );
-                batch.put(kw_key.as_bytes(), b"1");
+                batch.put_cf(self.index_cf(), kw_key.as_bytes(), b"1");
             }
         }
 
-        self.index_db
+        self.db
             .write(batch)
             .context("Failed to update prospective indices")?;
 
@@ -206,7 +279,7 @@ impl ProspectiveStore {
     ) -> Result<Option<ProspectiveTask>> {
         let key = format!("{}:{}", user_id, task_id);
 
-        match self.db.get(key.as_bytes())? {
+        match self.db.get_cf(self.tasks_cf(), key.as_bytes())? {
             Some(value) => {
                 let task: ProspectiveTask = serde_json::from_slice(&value)
                     .context("Failed to deserialize prospective task from JSON")?;
@@ -232,25 +305,25 @@ impl ProspectiveStore {
             let mut batch = WriteBatch::default();
 
             let user_key = format!("user:{}:{}", user_id, task_id);
-            batch.delete(user_key.as_bytes());
+            batch.delete_cf(self.index_cf(), user_key.as_bytes());
 
             let status_key = format!("status:{:?}:{}:{}", task.status, user_id, task_id);
-            batch.delete(status_key.as_bytes());
+            batch.delete_cf(self.index_cf(), status_key.as_bytes());
 
             if let Some(due_at) = task.trigger.due_at() {
                 let due_key = format!("due:{:020}:{}", due_at.timestamp(), task_id);
-                batch.delete(due_key.as_bytes());
+                batch.delete_cf(self.index_cf(), due_key.as_bytes());
             }
 
             if let ProspectiveTrigger::OnContext { ref keywords, .. } = task.trigger {
                 for keyword in keywords {
                     let kw_key =
                         format!("context:{}:{}:{}", keyword.to_lowercase(), user_id, task_id);
-                    batch.delete(kw_key.as_bytes());
+                    batch.delete_cf(self.index_cf(), kw_key.as_bytes());
                 }
             }
 
-            self.index_db.write(batch)?;
+            self.db.write(batch)?;
         }
 
         Ok(())
@@ -261,7 +334,7 @@ impl ProspectiveStore {
         let key = format!("{}:{}", user_id, task_id);
 
         // Check if exists
-        if self.db.get(key.as_bytes())?.is_none() {
+        if self.db.get_cf(self.tasks_cf(), key.as_bytes())?.is_none() {
             return Ok(false);
         }
 
@@ -269,7 +342,7 @@ impl ProspectiveStore {
         self.remove_indices(user_id, task_id)?;
 
         // Delete task
-        self.db.delete(key.as_bytes())?;
+        self.db.delete_cf(self.tasks_cf(), key.as_bytes())?;
 
         tracing::debug!(task_id = %task_id, user_id = %user_id, "Deleted prospective task");
 
@@ -285,7 +358,10 @@ impl ProspectiveStore {
         let prefix = format!("user:{}:", user_id);
         let mut tasks = Vec::new();
 
-        for item in self.index_db.prefix_iterator(prefix.as_bytes()) {
+        for item in self
+            .db
+            .prefix_iterator_cf(self.index_cf(), prefix.as_bytes())
+        {
             let (key, _) = item.context("Failed to read index entry")?;
             let key_str = String::from_utf8_lossy(&key);
 
@@ -327,7 +403,7 @@ impl ProspectiveStore {
 
         // Scan due index for tasks with due_time <= now
         // Key format: due:{timestamp}:{task_id}
-        for item in self.index_db.prefix_iterator(b"due:") {
+        for item in self.db.prefix_iterator_cf(self.index_cf(), b"due:") {
             let (key, value) = item.context("Failed to read due index")?;
             let key_str = String::from_utf8_lossy(&key);
 
@@ -591,9 +667,25 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn open_test_db(path: &Path) -> Arc<DB> {
+        let shared_path = path.join("shared");
+        std::fs::create_dir_all(&shared_path).unwrap();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        let cfs = vec![
+            ColumnFamilyDescriptor::new("default", opts.clone()),
+            ColumnFamilyDescriptor::new(CF_PROSPECTIVE, opts.clone()),
+            ColumnFamilyDescriptor::new(CF_PROSPECTIVE_INDEX, opts.clone()),
+        ];
+        Arc::new(DB::open_cf_descriptors(&opts, &shared_path, cfs).unwrap())
+    }
+
     fn setup_store() -> (TempDir, ProspectiveStore) {
         let temp_dir = TempDir::new().unwrap();
-        let store = ProspectiveStore::new(temp_dir.path()).unwrap();
+        let db = open_test_db(temp_dir.path());
+        let store = ProspectiveStore::new(db, temp_dir.path()).unwrap();
         (temp_dir, store)
     }
 
@@ -731,44 +823,49 @@ mod tests {
     #[test]
     fn test_due_key_migration_and_ordering() {
         let temp_dir = TempDir::new().unwrap();
-        let prospective_path = temp_dir.path().join("prospective");
-        std::fs::create_dir_all(&prospective_path).unwrap();
+        let db = open_test_db(temp_dir.path());
 
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        let index_db = DB::open(&opts, prospective_path.join("index")).unwrap();
+        let index_cf = db
+            .cf_handle(CF_PROSPECTIVE_INDEX)
+            .expect("prospective_index CF must exist");
 
         // Write unpadded keys simulating old format
         let task_id_a = uuid::Uuid::new_v4();
         let task_id_b = uuid::Uuid::new_v4();
         // ts_a = 9 (1 digit), ts_b = 10 (2 digits)
         // Without padding: "due:9:..." > "due:10:..." lexicographically (wrong)
-        index_db
-            .put(format!("due:9:{}", task_id_a).as_bytes(), b"user-1")
-            .unwrap();
-        index_db
-            .put(format!("due:10:{}", task_id_b).as_bytes(), b"user-1")
-            .unwrap();
+        db.put_cf(
+            index_cf,
+            format!("due:9:{}", task_id_a).as_bytes(),
+            b"user-1",
+        )
+        .unwrap();
+        db.put_cf(
+            index_cf,
+            format!("due:10:{}", task_id_b).as_bytes(),
+            b"user-1",
+        )
+        .unwrap();
 
         // Run migration
-        let migrated = migrate_due_key_padding(&index_db).unwrap();
+        let migrated = migrate_due_key_padding(&db, index_cf).unwrap();
         assert_eq!(migrated, 2);
 
         // Verify old keys are gone
-        assert!(index_db
-            .get(format!("due:9:{}", task_id_a).as_bytes())
+        assert!(db
+            .get_cf(index_cf, format!("due:9:{}", task_id_a).as_bytes())
             .unwrap()
             .is_none());
-        assert!(index_db
-            .get(format!("due:10:{}", task_id_b).as_bytes())
+        assert!(db
+            .get_cf(index_cf, format!("due:10:{}", task_id_b).as_bytes())
             .unwrap()
             .is_none());
 
         // Verify new padded keys exist
         let key_a = format!("due:{:020}:{}", 9_i64, task_id_a);
         let key_b = format!("due:{:020}:{}", 10_i64, task_id_b);
-        assert!(index_db.get(key_a.as_bytes()).unwrap().is_some());
-        assert!(index_db.get(key_b.as_bytes()).unwrap().is_some());
+        assert!(db.get_cf(index_cf, key_a.as_bytes()).unwrap().is_some());
+        assert!(db.get_cf(index_cf, key_b.as_bytes()).unwrap().is_some());
 
         // Verify lexicographic order is now correct: 9 < 10
         assert!(
@@ -777,7 +874,7 @@ mod tests {
         );
 
         // Re-running migration should be a no-op
-        let migrated_again = migrate_due_key_padding(&index_db).unwrap();
+        let migrated_again = migrate_due_key_padding(&db, index_cf).unwrap();
         assert_eq!(migrated_again, 0);
     }
 
