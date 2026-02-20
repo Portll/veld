@@ -10,6 +10,7 @@
   <a href="https://crates.io/crates/shodh-memory"><img src="https://img.shields.io/crates/v/shodh-memory.svg" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
+  <a href="https://hub.docker.com/r/varunshodh/shodh-memory"><img src="https://img.shields.io/docker/pulls/varunshodh/shodh-memory.svg?logo=docker" alt="Docker"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 
@@ -34,6 +35,7 @@ Choose your platform:
 
 | Platform | Install | Documentation |
 |----------|---------|---------------|
+| **Docker** | `docker run -d -p 3030:3030 -v shodh-data:/data varunshodh/shodh-memory` | [Docker Hub](https://hub.docker.com/r/varunshodh/shodh-memory) |
 | **Claude / Cursor** | `claude mcp add shodh-memory -- npx -y @shodh/memory-mcp` | [MCP Setup](#claude--cursor-mcp) |
 | **Python** | `pip install shodh-memory` | [Python Docs](https://pypi.org/project/shodh-memory/) |
 | **Rust** | `cargo add shodh-memory` | [Rust Docs](https://crates.io/crates/shodh-memory) |
@@ -119,7 +121,7 @@ curl -L https://github.com/varun29ankuS/shodh-memory/releases/latest/download/sh
 ./shodh-memory
 
 # Option B: Docker
-docker run -d -p 3030:3030 -e SHODH_HOST=0.0.0.0 -v shodh-data:/data roshera/shodh-memory
+docker run -d -p 3030:3030 -e SHODH_HOST=0.0.0.0 -v shodh-data:/data varunshodh/shodh-memory
 ```
 
 Wait for "Server ready!" message before proceeding.
@@ -402,10 +404,9 @@ memory.example.com {
 ### Docker Compose (Production)
 
 ```yaml
-version: '3.8'
 services:
   shodh-memory:
-    image: roshera/shodh-memory:latest
+    image: varunshodh/shodh-memory:latest
     environment:
       - SHODH_ENV=production
       - SHODH_HOST=0.0.0.0
@@ -453,4 +454,4 @@ Apache 2.0
 
 ---
 
-[MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=shodh) · [PyPI](https://pypi.org/project/shodh-memory/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [crates.io](https://crates.io/crates/shodh-memory) · [Docs](https://www.shodh-rag.com/memory)
+[MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=shodh) · [Docker Hub](https://hub.docker.com/r/varunshodh/shodh-memory) · [PyPI](https://pypi.org/project/shodh-memory/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [crates.io](https://crates.io/crates/shodh-memory) · [Docs](https://www.shodh-rag.com/memory)
