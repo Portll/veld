@@ -229,9 +229,8 @@ async fn async_main() -> Result<()> {
     // NOT "n requests per second". We must use `period()` with the correct cell interval.
     let rate_limit_enabled = server_config.rate_limit_per_second > 0;
     let governor_layer = if rate_limit_enabled {
-        let cell_interval = std::time::Duration::from_nanos(
-            1_000_000_000 / server_config.rate_limit_per_second,
-        );
+        let cell_interval =
+            std::time::Duration::from_nanos(1_000_000_000 / server_config.rate_limit_per_second);
         let governor_conf = GovernorConfigBuilder::default()
             .period(cell_interval)
             .burst_size(server_config.rate_limit_burst)
