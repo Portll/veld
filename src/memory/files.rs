@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use glob::Pattern;
-use rocksdb::{Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -23,45 +23,102 @@ use super::types::{
     LearnedFrom, ProjectId,
 };
 
+const CF_FILES: &str = "files";
+const CF_FILE_INDEX: &str = "file_index";
+
 /// Storage and query engine for file memories
 pub struct FileMemoryStore {
-    /// Main file memory storage: key = {user_id}:{file_id}
-    file_db: Arc<DB>,
-    /// Index database for efficient queries
-    index_db: Arc<DB>,
+    db: Arc<DB>,
     /// Default configuration
     config: CodebaseConfig,
 }
 
 impl FileMemoryStore {
-    /// Create a new file memory store at the given path
-    pub fn new(storage_path: &Path) -> Result<Self> {
+    /// CF accessor for the files column family
+    fn files_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(CF_FILES).expect("files CF must exist")
+    }
+
+    /// CF accessor for the file_index column family
+    fn file_index_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_FILE_INDEX)
+            .expect("file_index CF must exist")
+    }
+
+    /// Return CF descriptors needed by this store. The caller must include
+    /// these when opening the shared RocksDB instance.
+    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
+        let mut cf_opts = Options::default();
+        cf_opts.create_if_missing(true);
+        vec![
+            ColumnFamilyDescriptor::new(CF_FILES, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(CF_FILE_INDEX, cf_opts),
+        ]
+    }
+
+    /// Create a new file memory store backed by a shared DB that already
+    /// contains the required column families (`files`, `file_index`).
+    pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
         let files_path = storage_path.join("files");
         std::fs::create_dir_all(&files_path)?;
 
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_max_write_buffer_number(2);
-        opts.set_write_buffer_size(32 * 1024 * 1024); // 32MB
-
-        let file_db = Arc::new(
-            DB::open(&opts, files_path.join("memories"))
-                .context("Failed to open file memories DB")?,
-        );
-
-        let index_db = Arc::new(
-            DB::open(&opts, files_path.join("index"))
-                .context("Failed to open file memories index DB")?,
-        );
+        Self::migrate_from_separate_dbs(&files_path, &db)?;
 
         tracing::info!("File memory store initialized");
-
         Ok(Self {
-            file_db,
-            index_db,
+            db,
             config: CodebaseConfig::default(),
         })
+    }
+
+    /// One-time migration: copy data from the old separate-DB layout
+    /// (`files/memories` and `files/index`) into the column families of the
+    /// shared DB, then rename the old directories so the migration is
+    /// not repeated.
+    fn migrate_from_separate_dbs(files_path: &Path, db: &DB) -> Result<()> {
+        let old_dirs: &[(&str, &str)] = &[("memories", CF_FILES), ("index", CF_FILE_INDEX)];
+
+        for (old_name, cf_name) in old_dirs {
+            let old_dir = files_path.join(old_name);
+            if !old_dir.is_dir() {
+                continue;
+            }
+
+            let cf = db
+                .cf_handle(cf_name)
+                .unwrap_or_else(|| panic!("{cf_name} CF must exist"));
+            let old_opts = Options::default();
+            match DB::open_for_read_only(&old_opts, &old_dir, false) {
+                Ok(old_db) => {
+                    let mut batch = WriteBatch::default();
+                    let mut count = 0usize;
+                    for item in old_db.iterator(rocksdb::IteratorMode::Start) {
+                        if let Ok((key, value)) = item {
+                            batch.put_cf(cf, &key, &value);
+                            count += 1;
+                            if count % 10_000 == 0 {
+                                db.write(std::mem::take(&mut batch))?;
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        db.write(batch)?;
+                    }
+                    drop(old_db);
+                    tracing::info!("  files/{old_name}: migrated {count} entries to {cf_name} CF");
+
+                    let backup = files_path.join(format!("{old_name}.pre_cf_migration"));
+                    if let Err(e) = std::fs::rename(&old_dir, &backup) {
+                        tracing::warn!("Could not rename old {old_name} dir: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not open old {old_name} DB for migration: {e}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Set custom configuration
@@ -70,23 +127,24 @@ impl FileMemoryStore {
         self
     }
 
-    /// Flush all RocksDB databases to disk (critical for graceful shutdown)
+    /// Flush all column families to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
-        self.file_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush file_db: {e}"))?;
-        self.index_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush file index_db: {e}"))?;
+        use rocksdb::FlushOptions;
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(true);
+        for cf_name in &[CF_FILES, CF_FILE_INDEX] {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                self.db
+                    .flush_cf_opt(cf, &flush_opts)
+                    .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
+            }
+        }
         Ok(())
     }
 
     /// Get references to all RocksDB databases for backup
     pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![
-            ("file_memories", &self.file_db),
-            ("file_index", &self.index_db),
-        ]
+        vec![("files_shared", &self.db)]
     }
 
     // =========================================================================
@@ -98,8 +156,8 @@ impl FileMemoryStore {
         let key = format!("{}:{}", file_memory.user_id, file_memory.id.0);
         let value = serde_json::to_vec(file_memory).context("Failed to serialize file memory")?;
 
-        self.file_db
-            .put(key.as_bytes(), &value)
+        self.db
+            .put_cf(self.files_cf(), key.as_bytes(), &value)
             .context("Failed to store file memory")?;
 
         self.update_indices(file_memory)?;
@@ -118,7 +176,7 @@ impl FileMemoryStore {
     pub fn get(&self, user_id: &str, file_id: &FileMemoryId) -> Result<Option<FileMemory>> {
         let key = format!("{}:{}", user_id, file_id.0);
 
-        match self.file_db.get(key.as_bytes())? {
+        match self.db.get_cf(self.files_cf(), key.as_bytes())? {
             Some(value) => {
                 let file_memory: FileMemory =
                     serde_json::from_slice(&value).context("Failed to deserialize file memory")?;
@@ -143,7 +201,7 @@ impl FileMemoryStore {
             Self::hash_path(path)
         );
 
-        match self.index_db.get(path_key.as_bytes())? {
+        match self.db.get_cf(self.file_index_cf(), path_key.as_bytes())? {
             Some(file_id_bytes) => {
                 let file_id_str =
                     String::from_utf8(file_id_bytes.to_vec()).context("Invalid file ID")?;
@@ -171,7 +229,7 @@ impl FileMemoryStore {
     pub fn delete(&self, user_id: &str, file_id: &FileMemoryId) -> Result<bool> {
         if let Some(file_memory) = self.get(user_id, file_id)? {
             let key = format!("{}:{}", user_id, file_id.0);
-            self.file_db.delete(key.as_bytes())?;
+            self.db.delete_cf(self.files_cf(), key.as_bytes())?;
             self.remove_indices(&file_memory)?;
 
             tracing::debug!(
@@ -213,7 +271,9 @@ impl FileMemoryStore {
         let prefix = format!("user:{}:", user_id);
         let mut files = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
         for item in iter {
             let (key, file_id_bytes) = item?;
             let key_str = String::from_utf8_lossy(&key);
@@ -254,7 +314,9 @@ impl FileMemoryStore {
         let prefix = format!("project:{}:{}:", user_id, project_id.0);
         let mut files = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
         for item in iter {
             let (key, file_id_bytes) = item?;
             let key_str = String::from_utf8_lossy(&key);
@@ -296,7 +358,9 @@ impl FileMemoryStore {
         let prefix = format!("type:{}:{}:{}:", user_id, project_id.0, type_str);
         let mut files = Vec::new();
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
         for item in iter {
             let (key, file_id_bytes) = item?;
             let key_str = String::from_utf8_lossy(&key);
@@ -328,7 +392,9 @@ impl FileMemoryStore {
         let prefix = format!("project:{}:{}:", user_id, project_id.0);
         let mut count = 0;
 
-        let iter = self.index_db.prefix_iterator(prefix.as_bytes());
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
         for item in iter {
             let (key, _) = item?;
             let key_str = String::from_utf8_lossy(&key);
@@ -1030,14 +1096,15 @@ impl FileMemoryStore {
     fn update_indices(&self, file: &FileMemory) -> Result<()> {
         let mut batch = WriteBatch::default();
         let id_str = file.id.0.to_string();
+        let idx_cf = self.file_index_cf();
 
         // Index by user
         let user_key = format!("user:{}:{}", file.user_id, id_str);
-        batch.put(user_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(idx_cf, user_key.as_bytes(), id_str.as_bytes());
 
         // Index by project
         let project_key = format!("project:{}:{}:{}", file.user_id, file.project_id.0, id_str);
-        batch.put(project_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(idx_cf, project_key.as_bytes(), id_str.as_bytes());
 
         // Index by path (for fast lookup)
         let path_key = format!(
@@ -1046,7 +1113,7 @@ impl FileMemoryStore {
             file.project_id.0,
             Self::hash_path(&file.path)
         );
-        batch.put(path_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(idx_cf, path_key.as_bytes(), id_str.as_bytes());
 
         // Index by file type
         let type_str = format!("{:?}", file.file_type);
@@ -1054,9 +1121,9 @@ impl FileMemoryStore {
             "type:{}:{}:{}:{}",
             file.user_id, file.project_id.0, type_str, id_str
         );
-        batch.put(type_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(idx_cf, type_key.as_bytes(), id_str.as_bytes());
 
-        self.index_db
+        self.db
             .write(batch)
             .context("Failed to update file memory indices")?;
 
@@ -1066,12 +1133,13 @@ impl FileMemoryStore {
     fn remove_indices(&self, file: &FileMemory) -> Result<()> {
         let mut batch = WriteBatch::default();
         let id_str = file.id.0.to_string();
+        let idx_cf = self.file_index_cf();
 
         let user_key = format!("user:{}:{}", file.user_id, id_str);
-        batch.delete(user_key.as_bytes());
+        batch.delete_cf(idx_cf, user_key.as_bytes());
 
         let project_key = format!("project:{}:{}:{}", file.user_id, file.project_id.0, id_str);
-        batch.delete(project_key.as_bytes());
+        batch.delete_cf(idx_cf, project_key.as_bytes());
 
         let path_key = format!(
             "path:{}:{}:{}",
@@ -1079,16 +1147,16 @@ impl FileMemoryStore {
             file.project_id.0,
             Self::hash_path(&file.path)
         );
-        batch.delete(path_key.as_bytes());
+        batch.delete_cf(idx_cf, path_key.as_bytes());
 
         let type_str = format!("{:?}", file.file_type);
         let type_key = format!(
             "type:{}:{}:{}:{}",
             file.user_id, file.project_id.0, type_str, id_str
         );
-        batch.delete(type_key.as_bytes());
+        batch.delete_cf(idx_cf, type_key.as_bytes());
 
-        self.index_db.write(batch)?;
+        self.db.write(batch)?;
         Ok(())
     }
 
@@ -1161,7 +1229,20 @@ mod tests {
 
     fn create_test_store() -> (FileMemoryStore, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let store = FileMemoryStore::new(temp_dir.path()).unwrap();
+        let db_path = temp_dir.path().join("files_db");
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+
+        let mut cfs = vec![ColumnFamilyDescriptor::new("default", {
+            let mut o = Options::default();
+            o.create_if_missing(true);
+            o
+        })];
+        cfs.extend(FileMemoryStore::cf_descriptors());
+        let db = Arc::new(DB::open_cf_descriptors(&opts, &db_path, cfs).unwrap());
+        let store = FileMemoryStore::new(db, temp_dir.path()).unwrap();
         (store, temp_dir)
     }
 

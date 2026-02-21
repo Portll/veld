@@ -3,7 +3,9 @@
 use anyhow::{anyhow, Context, Result};
 use bincode;
 use chrono::{DateTime, Utc};
-use rocksdb::{IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -946,10 +948,16 @@ fn crc32_simple(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Column family name for secondary indices (tags, types, timestamps, etc.)
+const CF_INDEX: &str = "memory_index";
+
 /// Storage engine for long-term memory persistence
+///
+/// Uses a single RocksDB instance with 2 column families:
+/// - default: main memory data (also shared by LearningHistoryStore, TemporalFactStore, etc. via key prefixes)
+/// - `memory_index`: secondary indices for tag/type/timestamp queries
 pub struct MemoryStorage {
     db: Arc<DB>,
-    index_db: Arc<DB>, // Secondary indices
     /// Base storage path for all memory data
     storage_path: PathBuf,
     /// Write mode (sync vs async) - affects latency vs durability tradeoff
@@ -957,13 +965,22 @@ pub struct MemoryStorage {
 }
 
 impl MemoryStorage {
+    /// CF accessor for the memory_index column family
+    fn index_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_INDEX)
+            .expect("memory_index CF must exist")
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         // Create directories if they don't exist
-        std::fs::create_dir_all(path)?;
+        let storage_path = path.join("storage");
+        std::fs::create_dir_all(&storage_path)?;
 
         // Configure RocksDB options for PRODUCTION durability + performance
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
         // ========================================================================
@@ -998,13 +1015,24 @@ impl MemoryStorage {
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 for fast reads
         opts.set_block_based_table_factory(&block_opts);
 
-        // Open main database (with auto-repair on corruption)
-        let main_path = path.join("memories");
-        let db = Arc::new(Self::open_or_repair(&opts, &main_path, "memories")?);
+        // Open single database with column families (index CF uses lighter settings)
+        let main_opts = opts.clone();
+        let db = Arc::new(Self::open_or_repair_cf(&opts, &storage_path, move || {
+            vec![
+                ColumnFamilyDescriptor::new("default", main_opts.clone()),
+                ColumnFamilyDescriptor::new(CF_INDEX, {
+                    let mut idx_opts = Options::default();
+                    idx_opts.create_if_missing(true);
+                    idx_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                    idx_opts.set_max_write_buffer_number(2);
+                    idx_opts.set_write_buffer_size(32 * 1024 * 1024);
+                    idx_opts
+                }),
+            ]
+        })?);
 
-        // Open index database (with auto-repair on corruption)
-        let index_path = path.join("memory_index");
-        let index_db = Arc::new(Self::open_or_repair(&opts, &index_path, "memory_index")?);
+        // Migrate from old separate-DB layout if needed
+        Self::migrate_from_separate_dbs(path, &db)?;
 
         let write_mode = WriteMode::default();
         tracing::info!(
@@ -1019,18 +1047,23 @@ impl MemoryStorage {
 
         Ok(Self {
             db,
-            index_db,
             storage_path: path.to_path_buf(),
             write_mode,
         })
     }
 
-    /// Open a RocksDB database, automatically repairing if corruption is detected.
+    /// Open a RocksDB database with column families, automatically repairing if corruption is detected.
     ///
     /// On hard kills (ONNX deadlock, OOM, kill -9), RocksDB SST files can be left
     /// in a partially written state. This attempts repair before giving up.
-    fn open_or_repair(opts: &Options, path: &Path, label: &str) -> Result<DB> {
-        match DB::open(opts, path) {
+    ///
+    /// Takes a builder closure because `ColumnFamilyDescriptor` is not `Clone` —
+    /// we need to rebuild descriptors for the retry path after repair.
+    fn open_or_repair_cf<F>(opts: &Options, path: &Path, build_cfs: F) -> Result<DB>
+    where
+        F: Fn() -> Vec<ColumnFamilyDescriptor>,
+    {
+        match DB::open_cf_descriptors(opts, path, build_cfs()) {
             Ok(db) => Ok(db),
             Err(open_err) => {
                 let err_str = open_err.to_string();
@@ -1042,31 +1075,129 @@ impl MemoryStorage {
                     || err_str.contains("CURRENT")
                 {
                     tracing::warn!(
-                        db = label,
                         error = %open_err,
-                        "RocksDB corruption detected, attempting repair"
+                        "RocksDB corruption detected in memory storage, attempting repair"
                     );
                     if let Err(repair_err) = DB::repair(opts, path) {
                         tracing::error!(
-                            db = label,
                             error = %repair_err,
-                            "RocksDB repair failed"
+                            "RocksDB repair failed for memory storage"
                         );
                         return Err(anyhow::anyhow!(
-                            "Failed to open or repair {label} database: open={open_err}, repair={repair_err}"
+                            "Failed to open or repair memory storage: open={open_err}, repair={repair_err}"
                         ));
                     }
-                    tracing::info!(db = label, "RocksDB repair succeeded, reopening");
-                    DB::open(opts, path).map_err(|e| {
-                        anyhow::anyhow!("Failed to open {label} database after repair: {e}")
+                    tracing::info!("RocksDB repair succeeded for memory storage, reopening");
+                    DB::open_cf_descriptors(opts, path, build_cfs()).map_err(|e| {
+                        anyhow::anyhow!("Failed to open memory storage after repair: {e}")
                     })
                 } else {
-                    Err(anyhow::anyhow!(
-                        "Failed to open {label} database: {open_err}"
-                    ))
+                    Err(anyhow::anyhow!("Failed to open memory storage: {open_err}"))
                 }
             }
         }
+    }
+
+    /// Migrate from old separate-DB layout (memories/ + memory_index/) to single CF-based DB.
+    ///
+    /// Detects whether old directories exist and the new CFs are empty, then bulk-copies
+    /// all data into the unified DB. Old directories are renamed to *.pre_cf_migration
+    /// for rollback safety.
+    fn migrate_from_separate_dbs(base_path: &Path, db: &DB) -> Result<()> {
+        let old_memories_dir = base_path.join("memories");
+        let old_index_dir = base_path.join("memory_index");
+
+        let has_old_memories = old_memories_dir.is_dir();
+        let has_old_index = old_index_dir.is_dir();
+
+        if !has_old_memories && !has_old_index {
+            return Ok(());
+        }
+
+        tracing::info!("Detected old separate-DB layout, migrating to column families...");
+        let mut total_migrated = 0usize;
+
+        // Migrate main memories → default CF
+        if has_old_memories {
+            let old_opts = Options::default();
+            match DB::open_for_read_only(&old_opts, &old_memories_dir, false) {
+                Ok(old_db) => {
+                    let mut batch = WriteBatch::default();
+                    let mut count = 0usize;
+                    for item in old_db.iterator(IteratorMode::Start) {
+                        if let Ok((key, value)) = item {
+                            batch.put(&key, &value);
+                            count += 1;
+                            if count % 10_000 == 0 {
+                                db.write(std::mem::take(&mut batch))?;
+                                tracing::info!("  memories: migrated {count} entries...");
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        db.write(batch)?;
+                    }
+                    drop(old_db);
+                    total_migrated += count;
+                    tracing::info!("  memories: migrated {count} entries to default CF");
+
+                    let backup_name = base_path.join("memories.pre_cf_migration");
+                    if let Err(e) = std::fs::rename(&old_memories_dir, &backup_name) {
+                        tracing::warn!("Could not rename old memories dir: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not open old memories DB for migration: {e}");
+                }
+            }
+        }
+
+        // Migrate index → memory_index CF
+        if has_old_index {
+            let index_cf = db
+                .cf_handle(CF_INDEX)
+                .expect("memory_index CF must exist during migration");
+
+            let old_opts = Options::default();
+            match DB::open_for_read_only(&old_opts, &old_index_dir, false) {
+                Ok(old_db) => {
+                    let mut batch = WriteBatch::default();
+                    let mut count = 0usize;
+                    for item in old_db.iterator(IteratorMode::Start) {
+                        if let Ok((key, value)) = item {
+                            batch.put_cf(&index_cf, &key, &value);
+                            count += 1;
+                            if count % 10_000 == 0 {
+                                db.write(std::mem::take(&mut batch))?;
+                                tracing::info!("  index: migrated {count} entries...");
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        db.write(batch)?;
+                    }
+                    drop(old_db);
+                    total_migrated += count;
+                    tracing::info!("  index: migrated {count} entries to {CF_INDEX} CF");
+
+                    let backup_name = base_path.join("memory_index.pre_cf_migration");
+                    if let Err(e) = std::fs::rename(&old_index_dir, &backup_name) {
+                        tracing::warn!("Could not rename old memory_index dir: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not open old memory_index DB for migration: {e}");
+                }
+            }
+        }
+
+        if total_migrated > 0 {
+            tracing::info!(
+                "Memory storage migration complete: {total_migrated} total entries migrated"
+            );
+        }
+
+        Ok(())
     }
 
     /// Get the base storage path
@@ -1118,6 +1249,7 @@ impl MemoryStorage {
 
     /// Update secondary indices for efficient retrieval
     fn update_indices(&self, memory: &Memory) -> Result<()> {
+        let idx = self.index_cf();
         let mut batch = WriteBatch::default();
 
         // === Standard Indices ===
@@ -1131,32 +1263,32 @@ impl MemoryStorage {
             memory.created_at.format("%Y%m%d"),
             memory.id.0
         );
-        batch.put(date_key.as_bytes(), b"1");
+        batch.put_cf(idx, date_key.as_bytes(), b"1");
 
         // Index by type
         let type_key = format!(
             "type:{:?}:{}",
             memory.experience.experience_type, memory.id.0
         );
-        batch.put(type_key.as_bytes(), b"1");
+        batch.put_cf(idx, type_key.as_bytes(), b"1");
 
         // Index by importance (quantized into buckets)
         let importance_bucket = (memory.importance() * 10.0) as u32;
         let importance_key = format!("importance:{}:{}", importance_bucket, memory.id.0);
-        batch.put(importance_key.as_bytes(), b"1");
+        batch.put_cf(idx, importance_key.as_bytes(), b"1");
 
         // Index by entities (case-insensitive for tag search compatibility)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
             let entity_key = format!("entity:{}:{}", normalized_entity, memory.id.0);
-            batch.put(entity_key.as_bytes(), b"1");
+            batch.put_cf(idx, entity_key.as_bytes(), b"1");
         }
 
         // Index by tags (separate from entities for explicit tag queries)
         for tag in &memory.experience.tags {
             let normalized_tag = tag.to_lowercase();
             let tag_key = format!("tag:{}:{}", normalized_tag, memory.id.0);
-            batch.put(tag_key.as_bytes(), b"1");
+            batch.put_cf(idx, tag_key.as_bytes(), b"1");
         }
 
         // Index by episode_id (for temporal/episodic retrieval)
@@ -1164,12 +1296,12 @@ impl MemoryStorage {
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
                 let episode_key = format!("episode:{}:{}", episode_id, memory.id.0);
-                batch.put(episode_key.as_bytes(), b"1");
+                batch.put_cf(idx, episode_key.as_bytes(), b"1");
 
                 // Also index by sequence within episode for temporal ordering
                 if let Some(seq) = ctx.episode.sequence_number {
                     let seq_key = format!("episode_seq:{}:{}:{}", episode_id, seq, memory.id.0);
-                    batch.put(seq_key.as_bytes(), b"1");
+                    batch.put_cf(idx, seq_key.as_bytes(), b"1");
                 }
             }
         }
@@ -1179,13 +1311,13 @@ impl MemoryStorage {
         // Index by robot_id (for multi-robot systems)
         if let Some(ref robot_id) = memory.experience.robot_id {
             let robot_key = format!("robot:{}:{}", robot_id, memory.id.0);
-            batch.put(robot_key.as_bytes(), b"1");
+            batch.put_cf(idx, robot_key.as_bytes(), b"1");
         }
 
         // Index by mission_id (for mission context retrieval)
         if let Some(ref mission_id) = memory.experience.mission_id {
             let mission_key = format!("mission:{}:{}", mission_id, memory.id.0);
-            batch.put(mission_key.as_bytes(), b"1");
+            batch.put_cf(idx, mission_key.as_bytes(), b"1");
         }
 
         // Index by geo_location (for spatial queries) using geohash
@@ -1197,13 +1329,13 @@ impl MemoryStorage {
             // Use precision 10 for warehouse-level accuracy (~1.2m cells)
             let geohash = super::types::geohash_encode(lat, lon, 10);
             let geo_key = format!("geo:{}:{}", geohash, memory.id.0);
-            batch.put(geo_key.as_bytes(), b"1");
+            batch.put_cf(idx, geo_key.as_bytes(), b"1");
         }
 
         // Index by action_type (for action-based retrieval)
         if let Some(ref action_type) = memory.experience.action_type {
             let action_key = format!("action:{}:{}", action_type, memory.id.0);
-            batch.put(action_key.as_bytes(), b"1");
+            batch.put_cf(idx, action_key.as_bytes(), b"1");
         }
 
         // Index by reward (bucketed, for RL-style queries)
@@ -1212,7 +1344,7 @@ impl MemoryStorage {
             let clamped_reward = reward.clamp(-1.0, 1.0);
             let reward_bucket = ((clamped_reward + 1.0) * 10.0) as i32;
             let reward_key = format!("reward:{}:{}", reward_bucket, memory.id.0);
-            batch.put(reward_key.as_bytes(), b"1");
+            batch.put_cf(idx, reward_key.as_bytes(), b"1");
         }
 
         // === External Linking Index ===
@@ -1222,7 +1354,7 @@ impl MemoryStorage {
         if let Some(ref external_id) = memory.external_id {
             let external_key = format!("external:{}:{}", external_id, memory.id.0);
             // Store memory_id as value for direct lookup
-            batch.put(external_key.as_bytes(), memory.id.0.as_bytes());
+            batch.put_cf(idx, external_key.as_bytes(), memory.id.0.as_bytes());
         }
 
         // === Hierarchy Index ===
@@ -1231,13 +1363,13 @@ impl MemoryStorage {
         // Enables O(1) lookup of all children for a parent
         if let Some(ref parent_id) = memory.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, memory.id.0);
-            batch.put(parent_key.as_bytes(), b"1");
+            batch.put_cf(idx, parent_key.as_bytes(), b"1");
         }
 
         // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.index_db.write_opt(batch, &write_opts)?;
+        self.db.write_opt(batch, &write_opts)?;
         Ok(())
     }
 
@@ -1293,10 +1425,10 @@ impl MemoryStorage {
         // Index key format: external:{external_id}:{memory_id}
         let prefix = format!("external:{external_id}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
 
         for (key, _value) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
@@ -1359,46 +1491,47 @@ impl MemoryStorage {
             }
         };
 
+        let idx = self.index_cf();
         let mut batch = WriteBatch::default();
 
         // Reconstruct and delete all index keys directly (O(k) instead of O(n))
 
         // Date index
         let date_key = format!("date:{}:{}", memory.created_at.format("%Y%m%d"), id.0);
-        batch.delete(date_key.as_bytes());
+        batch.delete_cf(idx, date_key.as_bytes());
 
         // Type index
         let type_key = format!("type:{:?}:{}", memory.experience.experience_type, id.0);
-        batch.delete(type_key.as_bytes());
+        batch.delete_cf(idx, type_key.as_bytes());
 
         // Importance index
         let importance_bucket = (memory.importance() * 10.0) as u32;
         let importance_key = format!("importance:{}:{}", importance_bucket, id.0);
-        batch.delete(importance_key.as_bytes());
+        batch.delete_cf(idx, importance_key.as_bytes());
 
         // Entity indices (must match the to_lowercase() normalization in update_indices)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
             let entity_key = format!("entity:{}:{}", normalized_entity, id.0);
-            batch.delete(entity_key.as_bytes());
+            batch.delete_cf(idx, entity_key.as_bytes());
         }
 
         // Tag indices
         for tag in &memory.experience.tags {
             let normalized_tag = tag.to_lowercase();
             let tag_key = format!("tag:{}:{}", normalized_tag, id.0);
-            batch.delete(tag_key.as_bytes());
+            batch.delete_cf(idx, tag_key.as_bytes());
         }
 
         // Episode indices
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
                 let episode_key = format!("episode:{}:{}", episode_id, id.0);
-                batch.delete(episode_key.as_bytes());
+                batch.delete_cf(idx, episode_key.as_bytes());
 
                 if let Some(seq) = ctx.episode.sequence_number {
                     let seq_key = format!("episode_seq:{}:{}:{}", episode_id, seq, id.0);
-                    batch.delete(seq_key.as_bytes());
+                    batch.delete_cf(idx, seq_key.as_bytes());
                 }
             }
         }
@@ -1406,26 +1539,26 @@ impl MemoryStorage {
         // Robot index
         if let Some(ref robot_id) = memory.experience.robot_id {
             let robot_key = format!("robot:{}:{}", robot_id, id.0);
-            batch.delete(robot_key.as_bytes());
+            batch.delete_cf(idx, robot_key.as_bytes());
         }
 
         // Mission index
         if let Some(ref mission_id) = memory.experience.mission_id {
             let mission_key = format!("mission:{}:{}", mission_id, id.0);
-            batch.delete(mission_key.as_bytes());
+            batch.delete_cf(idx, mission_key.as_bytes());
         }
 
         // Geo index
         if let Some(geo) = memory.experience.geo_location {
             let geohash = super::types::geohash_encode(geo[0], geo[1], 10);
             let geo_key = format!("geo:{}:{}", geohash, id.0);
-            batch.delete(geo_key.as_bytes());
+            batch.delete_cf(idx, geo_key.as_bytes());
         }
 
         // Action index
         if let Some(ref action_type) = memory.experience.action_type {
             let action_key = format!("action:{}:{}", action_type, id.0);
-            batch.delete(action_key.as_bytes());
+            batch.delete_cf(idx, action_key.as_bytes());
         }
 
         // Reward index (must match the clamp in update_indices)
@@ -1433,25 +1566,25 @@ impl MemoryStorage {
             let clamped_reward = reward.clamp(-1.0, 1.0);
             let reward_bucket = ((clamped_reward + 1.0) * 10.0) as i32;
             let reward_key = format!("reward:{}:{}", reward_bucket, id.0);
-            batch.delete(reward_key.as_bytes());
+            batch.delete_cf(idx, reward_key.as_bytes());
         }
 
         // External linking index
         if let Some(ref external_id) = memory.external_id {
             let external_key = format!("external:{}:{}", external_id, id.0);
-            batch.delete(external_key.as_bytes());
+            batch.delete_cf(idx, external_key.as_bytes());
         }
 
         // Parent index (hierarchy)
         if let Some(ref parent_id) = memory.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id.0);
-            batch.delete(parent_key.as_bytes());
+            batch.delete_cf(idx, parent_key.as_bytes());
         }
 
         // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        self.index_db.write_opt(batch, &write_opts)?;
+        self.db.write_opt(batch, &write_opts)?;
         Ok(())
     }
 
@@ -1568,10 +1701,10 @@ impl MemoryStorage {
         // Keys are: date:YYYYMMDD:uuid, so date:20251207~ comes after all Dec 7 entries
         let end_key = format!("date:{}~", end.format("%Y%m%d"));
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            start_key.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _value) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if &*key_str > end_key.as_str() {
@@ -1596,10 +1729,10 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let prefix = format!("type:{exp_type:?}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
@@ -1623,10 +1756,10 @@ impl MemoryStorage {
 
         for bucket in min_bucket..=max_bucket {
             let prefix = format!("importance:{bucket}:");
-            let iter = self.index_db.iterator(IteratorMode::From(
-                prefix.as_bytes(),
-                rocksdb::Direction::Forward,
-            ));
+            let iter = self.db.iterator_cf(
+                self.index_cf(),
+                IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            );
 
             for (key, _) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
@@ -1651,10 +1784,10 @@ impl MemoryStorage {
         let normalized_entity = entity.to_lowercase();
         let prefix = format!("entity:{normalized_entity}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
@@ -1682,10 +1815,10 @@ impl MemoryStorage {
             // Normalize to lowercase for case-insensitive matching
             let normalized_tag = tag.to_lowercase();
             let prefix = format!("tag:{normalized_tag}:");
-            let iter = self.index_db.iterator(IteratorMode::From(
-                prefix.as_bytes(),
-                rocksdb::Direction::Forward,
-            ));
+            let iter = self.db.iterator_cf(
+                self.index_cf(),
+                IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            );
             for (key, _) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
                 if !key_str.starts_with(&prefix) {
@@ -1708,10 +1841,10 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let prefix = format!("episode:{episode_id}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
@@ -1740,10 +1873,10 @@ impl MemoryStorage {
         // Scan the episode_seq index which has format: episode_seq:{episode_id}:{seq}:{memory_id}
         let prefix = format!("episode_seq:{episode_id}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
 
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
@@ -1785,10 +1918,10 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let prefix = format!("robot:{robot_id}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
@@ -1809,10 +1942,10 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let prefix = format!("mission:{mission_id}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
@@ -1849,10 +1982,10 @@ impl MemoryStorage {
         // Scan only the relevant geohash cells (9 cells = center + 8 neighbors)
         for geohash_prefix in prefixes {
             let prefix = format!("geo:{}:", geohash_prefix);
-            let iter = self.index_db.iterator(IteratorMode::From(
-                prefix.as_bytes(),
-                rocksdb::Direction::Forward,
-            ));
+            let iter = self.db.iterator_cf(
+                self.index_cf(),
+                IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            );
 
             for (key, _value) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
@@ -1887,10 +2020,10 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let prefix = format!("action:{action_type}:");
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
             if !key_str.starts_with(&prefix) {
@@ -1919,10 +2052,10 @@ impl MemoryStorage {
 
         for bucket in min_bucket..=max_bucket {
             let prefix = format!("reward:{bucket}:");
-            let iter = self.index_db.iterator(IteratorMode::From(
-                prefix.as_bytes(),
-                rocksdb::Direction::Forward,
-            ));
+            let iter = self.db.iterator_cf(
+                self.index_cf(),
+                IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            );
 
             for (key, _) in iter.log_errors() {
                 let key_str = String::from_utf8_lossy(&key);
@@ -1949,10 +2082,10 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         let prefix = format!("parent:{}:", parent_id.0);
 
-        let iter = self.index_db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let iter = self.db.iterator_cf(
+            self.index_cf(),
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
 
         for (key, _) in iter.log_errors() {
             let key_str = String::from_utf8_lossy(&key);
@@ -2497,23 +2630,22 @@ impl MemoryStorage {
         Ok((migrated, already_current, failed))
     }
 
-    /// Flush both databases to ensure all data is persisted (critical for graceful shutdown)
+    /// Flush all column families to ensure data is persisted (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
         use rocksdb::FlushOptions;
 
-        // Create flush options with explicit wait
         let mut flush_opts = FlushOptions::default();
         flush_opts.set_wait(true); // Block until flush is complete
 
-        // Flush main memory database
+        // Single DB flush covers both default and index CFs
         self.db
             .flush_opt(&flush_opts)
-            .map_err(|e| anyhow::anyhow!("Failed to flush main database: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to flush memory storage: {e}"))?;
 
-        // Flush index database
-        self.index_db
-            .flush_opt(&flush_opts)
-            .map_err(|e| anyhow::anyhow!("Failed to flush index database: {e}"))?;
+        // Explicitly flush the index CF (RocksDB flush_opt only flushes default CF)
+        self.db
+            .flush_cf_opt(self.index_cf(), &flush_opts)
+            .map_err(|e| anyhow::anyhow!("Failed to flush index CF: {e}"))?;
 
         Ok(())
     }

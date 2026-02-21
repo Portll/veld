@@ -47,13 +47,21 @@ pub type ContextSessions = DashMap<String, ContextStatus>;
 
 /// Helper struct for audit log rotation (allows spawn_blocking with minimal clone)
 struct MultiUserMemoryManagerRotationHelper {
-    audit_db: Arc<rocksdb::DB>,
+    shared_db: Arc<rocksdb::DB>,
     audit_logs: Arc<DashMap<String, Arc<parking_lot::RwLock<VecDeque<AuditEvent>>>>>,
     audit_retention_days: i64,
     audit_max_entries: usize,
 }
 
+const CF_AUDIT: &str = "audit";
+
 impl MultiUserMemoryManagerRotationHelper {
+    fn audit_cf(&self) -> &rocksdb::ColumnFamily {
+        self.shared_db
+            .cf_handle(CF_AUDIT)
+            .expect("audit CF must exist")
+    }
+
     /// Rotate audit logs for a user - delete old entries and enforce max count.
     ///
     /// Keys are `{user_id}:{timestamp_nanos:020}` so RocksDB returns them in
@@ -67,10 +75,11 @@ impl MultiUserMemoryManagerRotationHelper {
             0
         });
         let prefix = format!("{user_id}:");
+        let audit = self.audit_cf();
 
         // Pass 1: count total entries to determine excess
         let mut total_count = 0usize;
-        let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
+        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
         for (key, _) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
@@ -93,7 +102,7 @@ impl MultiUserMemoryManagerRotationHelper {
         let mut removed_count = 0usize;
         let mut position = 0usize;
 
-        let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
+        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
         for (key, _) in iter.flatten() {
             let key_str = match std::str::from_utf8(&key) {
                 Ok(s) => s,
@@ -112,11 +121,11 @@ impl MultiUserMemoryManagerRotationHelper {
                 .unwrap_or(0); // Malformed keys sort first → get deleted
 
             if ts < cutoff_nanos || position < excess_count {
-                batch.delete(&key);
+                batch.delete_cf(audit, &key);
                 removed_count += 1;
 
                 if removed_count % BATCH_FLUSH_SIZE == 0 {
-                    self.audit_db
+                    self.shared_db
                         .write(std::mem::take(&mut batch))
                         .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
                     batch = rocksdb::WriteBatch::default();
@@ -128,7 +137,7 @@ impl MultiUserMemoryManagerRotationHelper {
 
         // Flush remaining
         if removed_count % BATCH_FLUSH_SIZE != 0 {
-            self.audit_db
+            self.shared_db
                 .write(batch)
                 .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
         }
@@ -161,8 +170,8 @@ pub struct MultiUserMemoryManager {
     /// Per-user audit logs (in-memory cache)
     pub audit_logs: Arc<DashMap<String, Arc<parking_lot::RwLock<VecDeque<AuditEvent>>>>>,
 
-    /// Persistent audit log storage
-    pub audit_db: Arc<rocksdb::DB>,
+    /// Shared DB for all global stores (todos, reminders, files, feedback, audit)
+    pub shared_db: Arc<rocksdb::DB>,
 
     /// Base storage path
     pub base_path: std::path::PathBuf,
@@ -228,12 +237,6 @@ pub struct MultiUserMemoryManager {
 impl MultiUserMemoryManager {
     pub fn new(base_path: std::path::PathBuf, server_config: ServerConfig) -> Result<Self> {
         std::fs::create_dir_all(&base_path)?;
-
-        let audit_path = base_path.join("audit_logs");
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        let audit_db = Arc::new(rocksdb::DB::open(&opts, audit_path)?);
 
         let (event_broadcaster, _) = tokio::sync::broadcast::channel(1024);
 
@@ -350,20 +353,70 @@ impl MultiUserMemoryManager {
             })
             .build();
 
-        let prospective_store = Arc::new(ProspectiveStore::new(&base_path)?);
+        // Open a single shared DB for all global stores (todos, reminders, files, feedback, audit).
+        // This dramatically reduces file descriptor usage compared to separate DBs per store.
+        let shared_db = {
+            use rocksdb::{ColumnFamilyDescriptor, Options as RocksOptions};
+            let shared_db_path = base_path.join("shared");
+            std::fs::create_dir_all(&shared_db_path)?;
+
+            let mut db_opts = RocksOptions::default();
+            db_opts.create_if_missing(true);
+            db_opts.create_missing_column_families(true);
+            db_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+            db_opts.set_max_write_buffer_number(2);
+            db_opts.set_write_buffer_size(32 * 1024 * 1024); // 32MB
+
+            // Collect CF descriptors from all stores + audit
+            let mut cfs = vec![ColumnFamilyDescriptor::new("default", {
+                let mut o = RocksOptions::default();
+                o.create_if_missing(true);
+                o
+            })];
+            cfs.extend(TodoStore::cf_descriptors());
+            cfs.extend(ProspectiveStore::column_family_descriptors());
+            cfs.extend(FileMemoryStore::cf_descriptors());
+            // Feedback CF
+            cfs.push(ColumnFamilyDescriptor::new(
+                crate::memory::feedback::CF_FEEDBACK,
+                {
+                    let mut o = RocksOptions::default();
+                    o.create_if_missing(true);
+                    o.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                    o
+                },
+            ));
+            // Audit CF
+            cfs.push(ColumnFamilyDescriptor::new("audit", {
+                let mut o = RocksOptions::default();
+                o.create_if_missing(true);
+                o.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                o
+            }));
+
+            Arc::new(
+                rocksdb::DB::open_cf_descriptors(&db_opts, &shared_db_path, cfs)
+                    .context("Failed to open shared DB with column families")?,
+            )
+        };
+
+        // Migrate old audit_logs DB into shared DB audit CF
+        Self::migrate_audit_db(&base_path, &shared_db)?;
+
+        let prospective_store = Arc::new(ProspectiveStore::new(shared_db.clone(), &base_path)?);
         info!("Prospective memory store initialized");
 
-        let todo_store = Arc::new(TodoStore::new(&base_path)?);
+        let todo_store = Arc::new(TodoStore::new(shared_db.clone(), &base_path)?);
         if let Err(e) = todo_store.load_vector_indices() {
             tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
         }
         info!("Todo store initialized");
 
-        let file_store = Arc::new(FileMemoryStore::new(&base_path)?);
+        let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), &base_path)?);
         info!("File memory store initialized");
 
         let feedback_store = Arc::new(parking_lot::RwLock::new(
-            FeedbackStore::with_persistence(base_path.join("feedback")).unwrap_or_else(|e| {
+            FeedbackStore::with_shared_db(shared_db.clone(), &base_path).unwrap_or_else(|e| {
                 tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
                 FeedbackStore::new()
             }),
@@ -399,7 +452,7 @@ impl MultiUserMemoryManager {
         let manager = Self {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
-            audit_db,
+            shared_db,
             base_path,
             default_config: MemoryConfig::default(),
             audit_log_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -433,6 +486,86 @@ impl MultiUserMemoryManager {
         Ok(manager)
     }
 
+    /// Get the audit column family handle from the shared DB
+    fn audit_cf(&self) -> &rocksdb::ColumnFamily {
+        self.shared_db
+            .cf_handle(CF_AUDIT)
+            .expect("audit CF must exist in shared DB")
+    }
+
+    /// Migrate old standalone audit_logs DB into the shared DB's audit CF.
+    /// Old directory is renamed to `audit_logs.pre_cf_migration` for rollback safety.
+    fn migrate_audit_db(base_path: &std::path::Path, shared_db: &rocksdb::DB) -> Result<()> {
+        let old_dir = base_path.join("audit_logs");
+        if !old_dir.exists() {
+            return Ok(());
+        }
+
+        let audit_cf = shared_db
+            .cf_handle(CF_AUDIT)
+            .expect("audit CF must exist in shared DB");
+
+        // Check if CF already has data (migration already done)
+        let mut has_data = false;
+        let mut iter = shared_db.raw_iterator_cf(audit_cf);
+        iter.seek_to_first();
+        if iter.valid() {
+            has_data = true;
+        }
+        if has_data {
+            tracing::info!(
+                "Audit CF already has data, skipping migration from {:?}",
+                old_dir
+            );
+            return Ok(());
+        }
+
+        tracing::info!("Migrating audit_logs from standalone DB to shared DB audit CF...");
+
+        let old_opts = rocksdb::Options::default();
+        let old_db = rocksdb::DB::open_for_read_only(&old_opts, &old_dir, false)
+            .context("Failed to open old audit_logs DB for migration")?;
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut count = 0usize;
+        const BATCH_SIZE: usize = 10_000;
+
+        let iter = old_db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| anyhow::anyhow!("audit migration iter error: {e}"))?;
+            batch.put_cf(audit_cf, &key, &value);
+            count += 1;
+
+            if count % BATCH_SIZE == 0 {
+                shared_db
+                    .write(std::mem::take(&mut batch))
+                    .map_err(|e| anyhow::anyhow!("audit migration batch write error: {e}"))?;
+                batch = rocksdb::WriteBatch::default();
+            }
+        }
+
+        if count % BATCH_SIZE != 0 {
+            shared_db
+                .write(batch)
+                .map_err(|e| anyhow::anyhow!("audit migration final batch error: {e}"))?;
+        }
+
+        drop(old_db);
+
+        let renamed = old_dir.with_file_name("audit_logs.pre_cf_migration");
+        std::fs::rename(&old_dir, &renamed)
+            .context("Failed to rename old audit_logs dir after migration")?;
+
+        tracing::info!(
+            "Migrated {} audit entries from standalone DB to shared CF, old dir renamed to {:?}",
+            count,
+            renamed
+        );
+
+        Ok(())
+    }
+
     /// Log audit event (non-blocking with background persistence)
     pub fn log_event(&self, user_id: &str, event_type: &str, memory_id: &str, details: &str) {
         let event = AuditEvent {
@@ -451,11 +584,12 @@ impl MultiUserMemoryManager {
             })
         );
         if let Ok(serialized) = bincode::serde::encode_to_vec(&event, bincode::config::standard()) {
-            let db = self.audit_db.clone();
+            let db = self.shared_db.clone();
             let key_bytes = key.into_bytes();
 
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = db.put(&key_bytes, &serialized) {
+                let audit = db.cf_handle(CF_AUDIT).expect("audit CF must exist");
+                if let Err(e) = db.put_cf(&audit, &key_bytes, &serialized) {
                     tracing::error!("Failed to persist audit log: {}", e);
                 }
             });
@@ -480,7 +614,7 @@ impl MultiUserMemoryManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if count % self.server_config.audit_rotation_check_interval == 0 && count > 0 {
-            let audit_db = self.audit_db.clone();
+            let shared_db = self.shared_db.clone();
             let audit_logs = self.audit_logs.clone();
             let user_id_clone = user_id.to_string();
 
@@ -489,7 +623,7 @@ impl MultiUserMemoryManager {
 
             tokio::task::spawn_blocking(move || {
                 let manager = MultiUserMemoryManagerRotationHelper {
-                    audit_db,
+                    shared_db,
                     audit_logs,
                     audit_retention_days,
                     audit_max_entries,
@@ -531,7 +665,8 @@ impl MultiUserMemoryManager {
         let mut events = Vec::new();
         let prefix = format!("{user_id}:");
 
-        let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
+        let audit = self.audit_cf();
+        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
         for (key, value) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
@@ -666,12 +801,18 @@ impl MultiUserMemoryManager {
                         if let Some(name) = entry.file_name().to_str() {
                             // Filter out system directories
                             if name != "audit_logs"
+                                && name != "audit_logs.pre_cf_migration"
                                 && name != "backups"
                                 && name != "feedback"
+                                && name != "feedback.pre_cf_migration"
                                 && name != "semantic_facts"
                                 && name != "files"
+                                && name != "files.pre_cf_migration"
                                 && name != "prospective"
+                                && name != "prospective.pre_cf_migration"
                                 && name != "todos"
+                                && name != "todos.pre_cf_migration"
+                                && name != "shared"
                             {
                                 users.push(name.to_string());
                             }
@@ -688,7 +829,8 @@ impl MultiUserMemoryManager {
     pub fn get_audit_logs(&self, user_id: &str, limit: usize) -> Vec<AuditEvent> {
         let mut events: Vec<AuditEvent> = Vec::new();
         let prefix = format!("{user_id}:");
-        let iter = self.audit_db.prefix_iterator(prefix.as_bytes());
+        let audit = self.audit_cf();
+        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
         for (key, value) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
@@ -711,34 +853,11 @@ impl MultiUserMemoryManager {
     pub fn flush_all_databases(&self) -> Result<()> {
         info!("Flushing all databases to disk...");
 
-        self.audit_db
+        // Single flush covers all shared stores (todos, prospective, files, feedback, audit)
+        self.shared_db
             .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush audit database: {e}"))?;
-        info!("  Audit database flushed");
-
-        if let Err(e) = self.todo_store.flush() {
-            tracing::warn!("  Failed to flush todo store: {}", e);
-        } else {
-            info!("  Todo store flushed");
-        }
-
-        if let Err(e) = self.file_store.flush() {
-            tracing::warn!("  Failed to flush file store: {}", e);
-        } else {
-            info!("  File memory store flushed");
-        }
-
-        if let Err(e) = self.prospective_store.flush() {
-            tracing::warn!("  Failed to flush prospective store: {}", e);
-        } else {
-            info!("  Prospective store flushed");
-        }
-
-        if let Err(e) = self.feedback_store.write().flush() {
-            tracing::warn!("  Failed to flush feedback store: {}", e);
-        } else {
-            info!("  Feedback store flushed");
-        }
+            .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
+        info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
 
         let user_entries: Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> = self
             .user_memories
@@ -760,7 +879,7 @@ impl MultiUserMemoryManager {
         }
 
         info!(
-            "All databases flushed: audit, todos, files, prospective, feedback, {} user memories",
+            "All databases flushed: shared (5 stores), {} user memories",
             flushed
         );
 
@@ -801,7 +920,10 @@ impl MultiUserMemoryManager {
         let mut total_removed = 0;
 
         let mut user_ids = std::collections::HashSet::new();
-        let iter = self.audit_db.iterator(rocksdb::IteratorMode::Start);
+        let audit = self.audit_cf();
+        let iter = self
+            .shared_db
+            .iterator_cf(audit, rocksdb::IteratorMode::Start);
 
         for (key, _) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -812,7 +934,7 @@ impl MultiUserMemoryManager {
         }
 
         let helper = MultiUserMemoryManagerRotationHelper {
-            audit_db: self.audit_db.clone(),
+            shared_db: self.shared_db.clone(),
             audit_logs: self.audit_logs.clone(),
             audit_retention_days: self.server_config.audit_retention_days as i64,
             audit_max_entries: self.server_config.audit_max_entries_per_user,
@@ -1092,37 +1214,10 @@ impl MultiUserMemoryManager {
     }
 
     /// Collect references to all secondary store databases for comprehensive backup.
-    /// Returns (name, Arc<DB>) pairs for each available store.
+    /// All shared stores (todos, prospective, files, feedback, audit) share a single DB,
+    /// so we return one reference. BackupEngine handles all CFs automatically.
     pub fn collect_secondary_store_refs(&self) -> Vec<(String, std::sync::Arc<rocksdb::DB>)> {
-        let mut refs = Vec::new();
-
-        // TodoStore databases
-        for (name, db) in self.todo_store.databases() {
-            refs.push((name.to_string(), std::sync::Arc::clone(db)));
-        }
-
-        // ProspectiveStore (reminders) databases
-        for (name, db) in self.prospective_store.databases() {
-            refs.push((name.to_string(), std::sync::Arc::clone(db)));
-        }
-
-        // FileMemoryStore databases
-        for (name, db) in self.file_store.databases() {
-            refs.push((name.to_string(), std::sync::Arc::clone(db)));
-        }
-
-        // FeedbackStore database (if available)
-        if let Some(db) = self.feedback_store.read().database() {
-            refs.push(("feedback".to_string(), std::sync::Arc::clone(db)));
-        }
-
-        // Audit log database
-        refs.push((
-            "audit_logs".to_string(),
-            std::sync::Arc::clone(&self.audit_db),
-        ));
-
-        refs
+        vec![("shared".to_string(), std::sync::Arc::clone(&self.shared_db))]
     }
 
     /// Run backups for all active users

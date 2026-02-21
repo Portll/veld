@@ -6,7 +6,7 @@
 //! type-dependent inertia to prevent noise from destabilizing useful memories.
 
 use chrono::{DateTime, Duration, Utc};
-use rocksdb::{Options, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -17,6 +17,9 @@ use crate::memory::types::{ExperienceType, MemoryId};
 // =============================================================================
 // CONSTANTS
 // =============================================================================
+
+/// Column family name for feedback data in the shared RocksDB instance
+pub(crate) const CF_FEEDBACK: &str = "feedback";
 
 /// Maximum number of recent signals to keep for trend detection
 const MAX_RECENT_SIGNALS: usize = 20;
@@ -1032,25 +1035,165 @@ impl FeedbackStore {
         Self::default()
     }
 
-    /// Create persistent store with RocksDB backend
-    pub fn with_persistence<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    /// Get a reference to the feedback column family handle.
+    /// Returns `None` when running in-memory only or when the CF is missing.
+    fn feedback_cf(&self) -> Option<&ColumnFamily> {
+        self.db.as_ref().and_then(|db| db.cf_handle(CF_FEEDBACK))
+    }
 
-        let db = DB::open(&opts, path.as_ref())?;
-        let db = Arc::new(db);
+    /// Create persistent store backed by a shared RocksDB instance.
+    ///
+    /// The caller is responsible for opening the DB with the `CF_FEEDBACK` column
+    /// family already declared. On first use this constructor migrates data from
+    /// the legacy standalone `feedback/` DB directory into the shared CF.
+    pub fn with_shared_db(db: Arc<DB>, base_path: &Path) -> anyhow::Result<Self> {
+        Self::migrate_from_separate_db(base_path, &db)?;
 
-        // Load all momentum entries from disk
+        let cf = db.cf_handle(CF_FEEDBACK).expect("feedback CF must exist");
+
+        // Load all momentum entries from the feedback CF
         let mut momentum = HashMap::new();
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let iter = db.prefix_iterator_cf(cf, b"momentum:");
         for item in iter {
             if let Ok((key, value)) = item {
                 if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if key_str.starts_with("momentum:") {
-                        if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
-                            momentum.insert(m.memory_id.clone(), m);
+                    if !key_str.starts_with("momentum:") {
+                        break;
+                    }
+                    if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
+                        momentum.insert(m.memory_id.clone(), m);
+                    }
+                }
+            }
+        }
+
+        let mut pending = HashMap::new();
+        let iter = db.prefix_iterator_cf(cf, b"pending:");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if !key_str.starts_with("pending:") {
+                        break;
+                    }
+                    if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
+                        if !p.is_expired() {
+                            pending.insert(p.user_id.clone(), p);
+                        } else {
+                            let _ = db.delete_cf(cf, key_str.as_bytes());
                         }
+                    }
+                }
+            }
+        }
+
+        let mut previous_context = HashMap::new();
+        let iter = db.prefix_iterator_cf(cf, b"prev_ctx:");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if !key_str.starts_with("prev_ctx:") {
+                        break;
+                    }
+                    if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
+                        let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
+                        previous_context.insert(user_id.to_string(), ctx);
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded {} momentum, {} pending, {} previous context from shared feedback CF",
+            momentum.len(),
+            pending.len(),
+            previous_context.len()
+        );
+
+        Ok(Self {
+            momentum,
+            pending,
+            previous_context,
+            db: Some(db),
+            dirty: HashSet::new(),
+        })
+    }
+
+    /// Migrate data from the legacy standalone `feedback/` RocksDB directory
+    /// into the `CF_FEEDBACK` column family of the shared DB.
+    ///
+    /// The old directory is renamed to `feedback.pre_cf_migration` so it can be
+    /// restored manually if needed.
+    fn migrate_from_separate_db(base_path: &Path, db: &DB) -> anyhow::Result<()> {
+        let old_dir = base_path.join("feedback");
+        if !old_dir.is_dir() {
+            return Ok(());
+        }
+
+        let cf = db.cf_handle(CF_FEEDBACK).expect("feedback CF must exist");
+        let old_opts = Options::default();
+        match DB::open_for_read_only(&old_opts, &old_dir, false) {
+            Ok(old_db) => {
+                let mut batch = WriteBatch::default();
+                let mut count = 0usize;
+                for item in old_db.iterator(IteratorMode::Start) {
+                    if let Ok((key, value)) = item {
+                        batch.put_cf(cf, &key, &value);
+                        count += 1;
+                        if count % 10_000 == 0 {
+                            db.write(std::mem::take(&mut batch))?;
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    db.write(batch)?;
+                }
+                drop(old_db);
+                tracing::info!("  feedback: migrated {count} entries to {CF_FEEDBACK} CF");
+
+                let backup = base_path.join("feedback.pre_cf_migration");
+                if let Err(e) = std::fs::rename(&old_dir, &backup) {
+                    tracing::warn!("Could not rename old feedback dir: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("Could not open old feedback DB for migration: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Create persistent store with its own standalone RocksDB instance.
+    ///
+    /// Primarily useful for tests and standalone operation. In production, prefer
+    /// [`with_shared_db`](Self::with_shared_db) to share a single DB instance.
+    pub fn with_persistence<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+
+        let cfs = vec![
+            ColumnFamilyDescriptor::new("default", Options::default()),
+            ColumnFamilyDescriptor::new(CF_FEEDBACK, {
+                let mut cf_opts = Options::default();
+                cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                cf_opts
+            }),
+        ];
+        let db = DB::open_cf_descriptors(&opts, path.as_ref(), cfs)?;
+        let db = Arc::new(db);
+
+        let cf = db.cf_handle(CF_FEEDBACK).expect("feedback CF must exist");
+
+        // Load all momentum entries from the feedback CF
+        let mut momentum = HashMap::new();
+        let iter = db.prefix_iterator_cf(cf, b"momentum:");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if !key_str.starts_with("momentum:") {
+                        break;
+                    }
+                    if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
+                        momentum.insert(m.memory_id.clone(), m);
                     }
                 }
             }
@@ -1058,48 +1201,46 @@ impl FeedbackStore {
 
         // Also load pending feedback entries (filter expired ones)
         let mut pending = HashMap::new();
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let iter = db.prefix_iterator_cf(cf, b"pending:");
         for item in iter {
             if let Ok((key, value)) = item {
                 if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if key_str.starts_with("pending:") {
-                        if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
-                            if !p.is_expired() {
-                                pending.insert(p.user_id.clone(), p);
-                            } else {
-                                // Clean up expired pending feedback from disk
-                                let _ = db.delete(key_str.as_bytes());
-                            }
+                    if !key_str.starts_with("pending:") {
+                        break;
+                    }
+                    if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
+                        if !p.is_expired() {
+                            pending.insert(p.user_id.clone(), p);
+                        } else {
+                            // Clean up expired pending feedback from disk
+                            let _ = db.delete_cf(cf, key_str.as_bytes());
                         }
                     }
                 }
             }
         }
-
-        tracing::info!(
-            "Loaded {} feedback momentum entries and {} pending feedback from disk",
-            momentum.len(),
-            pending.len()
-        );
 
         // Load previous context entries
         let mut previous_context = HashMap::new();
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let iter = db.prefix_iterator_cf(cf, b"prev_ctx:");
         for item in iter {
             if let Ok((key, value)) = item {
                 if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if key_str.starts_with("prev_ctx:") {
-                        if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
-                            let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
-                            previous_context.insert(user_id.to_string(), ctx);
-                        }
+                    if !key_str.starts_with("prev_ctx:") {
+                        break;
+                    }
+                    if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
+                        let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
+                        previous_context.insert(user_id.to_string(), ctx);
                     }
                 }
             }
         }
 
         tracing::info!(
-            "Loaded {} previous context entries from disk",
+            "Loaded {} momentum, {} pending, {} previous context from feedback CF",
+            momentum.len(),
+            pending.len(),
             previous_context.len()
         );
 
@@ -1120,9 +1261,9 @@ impl FeedbackStore {
     ) -> &mut FeedbackMomentum {
         // Check if we need to load from disk
         if !self.momentum.contains_key(&memory_id) {
-            if let Some(ref db) = self.db {
+            if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
                 let key = format!("momentum:{}", memory_id.0);
-                if let Ok(Some(data)) = db.get(key.as_bytes()) {
+                if let Ok(Some(data)) = db.get_cf(cf, key.as_bytes()) {
                     if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&data) {
                         self.momentum.insert(memory_id.clone(), m);
                     }
@@ -1152,10 +1293,10 @@ impl FeedbackStore {
         self.pending.insert(user_id.clone(), pending.clone());
 
         // Persist to disk
-        if let Some(ref db) = self.db {
+        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
             let key = format!("pending:{}", user_id);
             if let Ok(value) = serde_json::to_vec(&pending) {
-                if let Err(e) = db.put(key.as_bytes(), &value) {
+                if let Err(e) = db.put_cf(cf, key.as_bytes(), &value) {
                     tracing::warn!("Failed to persist pending feedback: {}", e);
                 }
             }
@@ -1167,9 +1308,9 @@ impl FeedbackStore {
         let result = self.pending.remove(user_id);
 
         // Remove from disk
-        if let Some(ref db) = self.db {
+        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
             let key = format!("pending:{}", user_id);
-            let _ = db.delete(key.as_bytes());
+            let _ = db.delete_cf(cf, key.as_bytes());
         }
 
         result
@@ -1205,10 +1346,10 @@ impl FeedbackStore {
             .insert(user_id.to_string(), prev_ctx.clone());
 
         // Persist to disk
-        if let Some(ref db) = self.db {
+        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
             let key = format!("prev_ctx:{}", user_id);
             if let Ok(value) = serde_json::to_vec(&prev_ctx) {
-                if let Err(e) = db.put(key.as_bytes(), &value) {
+                if let Err(e) = db.put_cf(cf, key.as_bytes(), &value) {
                     tracing::warn!("Failed to persist previous context: {}", e);
                 }
             }
@@ -1249,13 +1390,20 @@ impl FeedbackStore {
         let Some(ref db) = self.db else {
             return Ok(0);
         };
+        let Some(cf) = db.cf_handle(CF_FEEDBACK) else {
+            return Ok(0);
+        };
+
+        // Drain dirty set first so the mutable borrow is released before we
+        // take shared references to self.momentum / self.pending below.
+        let dirty: Vec<MemoryId> = self.dirty.drain().collect();
 
         let mut flushed = 0;
-        for memory_id in self.dirty.drain() {
-            if let Some(momentum) = self.momentum.get(&memory_id) {
+        for memory_id in &dirty {
+            if let Some(momentum) = self.momentum.get(memory_id) {
                 let key = format!("momentum:{}", memory_id.0);
                 let value = serde_json::to_vec(momentum)?;
-                db.put(key.as_bytes(), &value)?;
+                db.put_cf(cf, key.as_bytes(), &value)?;
                 flushed += 1;
             }
         }
@@ -1264,12 +1412,15 @@ impl FeedbackStore {
         for (user_id, pending) in &self.pending {
             let key = format!("pending:{}", user_id);
             let value = serde_json::to_vec(pending)?;
-            db.put(key.as_bytes(), &value)?;
+            db.put_cf(cf, key.as_bytes(), &value)?;
         }
 
-        // Flush the RocksDB WAL to ensure data persistence (critical for graceful shutdown)
-        db.flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush feedback_db WAL: {e}"))?;
+        // Flush the feedback CF to ensure data persistence (critical for graceful shutdown)
+        use rocksdb::FlushOptions;
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(true);
+        db.flush_cf_opt(cf, &flush_opts)
+            .map_err(|e| anyhow::anyhow!("Failed to flush feedback CF: {e}"))?;
 
         if flushed > 0 {
             tracing::debug!("Flushed {} feedback momentum entries to disk", flushed);
