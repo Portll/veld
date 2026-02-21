@@ -997,20 +997,20 @@ impl MemoryStorage {
         // WAL stays in default location (same as data dir) - avoids corruption issues
         opts.set_manual_wal_flush(false); // Auto-flush WAL entries
 
-        // Write performance optimizations for 10M+ memories per user
-        opts.set_max_write_buffer_number(4);
-        opts.set_write_buffer_size(128 * 1024 * 1024); // 128MB write buffer (2x for scale)
+        // Write performance — sized for edge deployment (tune up via env for heavy workloads)
+        opts.set_max_write_buffer_number(2);
+        opts.set_write_buffer_size(32 * 1024 * 1024); // 32MB write buffer
         opts.set_level_zero_file_num_compaction_trigger(4);
-        opts.set_target_file_size_base(128 * 1024 * 1024); // 128MB SST files
-        opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB L1
+        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SST files
+        opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB L1
         opts.set_max_background_jobs(4);
         opts.set_level_compaction_dynamic_level_bytes(true);
 
-        // Read performance optimizations for 10M+ memories
+        // Read performance — 64MB block cache covers ~16K blocks, ample for edge use
         use rocksdb::{BlockBasedOptions, Cache};
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_bloom_filter(10.0, false); // 10 bits/key = ~1% FPR
-        block_opts.set_block_cache(&Cache::new_lru_cache(512 * 1024 * 1024)); // 512MB cache
+        block_opts.set_block_cache(&Cache::new_lru_cache(64 * 1024 * 1024)); // 64MB cache
         block_opts.set_cache_index_and_filter_blocks(true);
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 for fast reads
         opts.set_block_based_table_factory(&block_opts);

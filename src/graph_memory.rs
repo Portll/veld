@@ -1053,6 +1053,8 @@ impl GraphMemory {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_write_buffer_size(16 * 1024 * 1024); // 16MB — graph entries are small KV pairs
+        opts.set_max_write_buffer_number(2);
 
         // Build column family descriptors — all CFs share the same options
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = GRAPH_CF_NAMES

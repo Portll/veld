@@ -191,9 +191,9 @@ impl BM25Index {
             Index::create_in_dir(path, schema.clone()).context("Failed to create BM25 index")?
         };
 
-        // 50MB writer heap
+        // 15MB writer heap — sufficient for edge workloads
         let writer = index
-            .writer(50_000_000)
+            .writer(15_000_000)
             .context("Failed to create index writer")?;
 
         let reader = index

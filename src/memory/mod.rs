@@ -489,10 +489,9 @@ impl MemorySystem {
             compressor: CompressionPipeline::new(),
             retriever,
             embedder,
-            // LRU embedding caches: max 10,000 entries each (~15MB for 384-dim embeddings)
-            // Prevents unbounded memory growth while maintaining high hit rates
-            query_cache: moka::sync::Cache::builder().max_capacity(10_000).build(),
-            content_cache: moka::sync::Cache::builder().max_capacity(10_000).build(),
+            // LRU embedding caches: max 2,000 entries each (~3MB for 384-dim embeddings)
+            query_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
+            content_cache: moka::sync::Cache::builder().max_capacity(2_000).build(),
             stats: Arc::new(RwLock::new(initial_stats)),
             logger,
             consolidation_events, // Use the shared buffer created earlier
