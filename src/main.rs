@@ -224,16 +224,22 @@ async fn async_main() -> Result<()> {
     }
 
     // Configure rate limiting (0 = disabled, for localhost/embedded use)
+    //
+    // IMPORTANT: tower-governor's `per_second(n)` means "replenish 1 cell every n seconds",
+    // NOT "n requests per second". We must use `period()` with the correct cell interval.
     let rate_limit_enabled = server_config.rate_limit_per_second > 0;
     let governor_layer = if rate_limit_enabled {
+        let cell_interval = std::time::Duration::from_nanos(
+            1_000_000_000 / server_config.rate_limit_per_second,
+        );
         let governor_conf = GovernorConfigBuilder::default()
-            .per_second(server_config.rate_limit_per_second)
+            .period(cell_interval)
             .burst_size(server_config.rate_limit_burst)
             .finish()
             .expect("Failed to build governor rate limiter configuration");
         info!(
-            "Rate limiting: {} req/sec, burst of {}",
-            server_config.rate_limit_per_second, server_config.rate_limit_burst
+            "Rate limiting: {} req/sec (cell interval: {:?}), burst of {}",
+            server_config.rate_limit_per_second, cell_interval, server_config.rate_limit_burst
         );
         Some(GovernorLayer::new(governor_conf))
     } else {
