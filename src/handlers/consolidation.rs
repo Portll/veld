@@ -11,7 +11,8 @@ use super::types::{
     ConsolidateResponse, CreateBackupRequest, ListBackupsRequest, ListBackupsResponse, MemoryEvent,
     MigrateLegacyRequest, MigrateLegacyResponse, PurgeBackupsRequest, PurgeBackupsResponse,
     RebuildIndexRequest, RebuildIndexResponse, RepairIndexRequest, RepairIndexResponse,
-    VerifyBackupRequest, VerifyBackupResponse, VerifyIndexRequest,
+    RestoreBackupRequest, RestoreBackupResponse, VerifyBackupRequest, VerifyBackupResponse,
+    VerifyIndexRequest,
 };
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
@@ -367,12 +368,22 @@ pub async fn create_backup(
         .map(|(name, db)| crate::backup::SecondaryStoreRef { name, db })
         .collect();
 
-    let result = if store_refs.is_empty() {
+    // Get graph DB reference for backup (per-user graph at {user_id}/graph/)
+    let graph_lock = state.get_user_graph(&req.user_id).ok();
+    let graph_guard = graph_lock.as_ref().map(|g| g.read());
+    let graph_db_ref = graph_guard.as_ref().map(|g| g.get_db());
+
+    let result = if store_refs.is_empty() && graph_db_ref.is_none() {
         state.backup_engine().create_backup(&db, &req.user_id)
     } else {
         state
             .backup_engine()
-            .create_comprehensive_backup(&db, &req.user_id, &store_refs)
+            .create_comprehensive_backup_with_graph(
+                &db,
+                &req.user_id,
+                &store_refs,
+                graph_db_ref,
+            )
     };
 
     match result {
@@ -476,6 +487,96 @@ pub async fn purge_backups(
         }
         Err(e) => Err(AppError::Internal(e)),
     }
+}
+
+/// Restore a user's data from a backup (memories, secondary stores, and graph)
+///
+/// This endpoint:
+/// 1. Closes the user's current memory/graph sessions
+/// 2. Restores main memories DB from backup
+/// 3. Restores secondary stores (shared DB with todos, reminders, etc.)
+/// 4. Restores graph DB if present in backup
+/// 5. Re-initializes the user's memory and graph systems
+pub async fn restore_backup(
+    State(state): State<AppState>,
+    Json(req): Json<RestoreBackupRequest>,
+) -> Result<Json<RestoreBackupResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let user_id = req.user_id.clone();
+
+    // Determine restore paths based on server's base path
+    let memory_db_path = state.base_path().join(&user_id).join("memory.db");
+    let shared_db_path = state.base_path().join("shared_stores");
+    let graph_path = state.base_path().join(&user_id).join("graph").join("graph");
+
+    // Evict user from caches so DB handles are released
+    state.evict_user(&user_id);
+
+    // Build secondary restore paths
+    let secondary_restore_paths: Vec<(&str, &std::path::Path)> =
+        vec![("shared", shared_db_path.as_path())];
+
+    // Execute restore
+    let restored_stores = state
+        .backup_engine()
+        .restore_comprehensive_backup(
+            &user_id,
+            req.backup_id,
+            &memory_db_path,
+            &secondary_restore_paths,
+        )
+        .map_err(AppError::Internal)?;
+
+    // Restore graph checkpoint if present in backup
+    let resolved_backup_id = req.backup_id.unwrap_or_else(|| {
+        state
+            .backup_engine()
+            .list_backups(&user_id)
+            .ok()
+            .and_then(|b| b.last().map(|m| m.backup_id))
+            .unwrap_or(0)
+    });
+    let graph_checkpoint = state
+        .backup_engine()
+        .backup_path()
+        .join(&user_id)
+        .join(format!("secondary_{resolved_backup_id}"))
+        .join("graph");
+
+    let mut all_restored = restored_stores;
+    if graph_checkpoint.exists() {
+        // Remove existing graph and copy from backup
+        if graph_path.exists() {
+            let _ = std::fs::remove_dir_all(&graph_path);
+        }
+        if let Err(e) = crate::backup::copy_dir_recursive_pub(&graph_checkpoint, &graph_path) {
+            tracing::warn!(error = %e, "Failed to restore graph DB from backup");
+        } else {
+            all_restored.push("graph".to_string());
+            tracing::info!("Graph DB restored from backup");
+        }
+    }
+
+    state.log_event(
+        &user_id,
+        "BACKUP_RESTORED",
+        &format!("backup_{}", req.backup_id.unwrap_or(0)),
+        &format!(
+            "Restored {} stores: {:?}",
+            all_restored.len(),
+            all_restored
+        ),
+    );
+
+    Ok(Json(RestoreBackupResponse {
+        success: true,
+        message: format!(
+            "Restore complete for user '{}'. Restored: {:?}. Server restart recommended to re-initialize all caches.",
+            user_id, all_restored
+        ),
+        restored_stores: all_restored,
+    }))
 }
 
 // =============================================================================

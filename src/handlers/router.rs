@@ -171,6 +171,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/backup/verify", post(consolidation::verify_backup))
         .route("/api/backup/purge", post(consolidation::purge_backups))
         .route("/api/backups/purge", post(consolidation::purge_backups)) // MCP alias
+        .route("/api/backup/restore", post(consolidation::restore_backup))
         // =================================================================
         // FACTS
         // =================================================================

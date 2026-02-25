@@ -733,6 +733,25 @@ impl MultiUserMemoryManager {
         Ok(memory_arc)
     }
 
+    /// Evict a user's memory and graph from in-memory caches (releases DB handles).
+    /// Does NOT delete data — used before restore to release file locks.
+    pub fn evict_user(&self, user_id: &str) {
+        self.user_memories.invalidate(user_id);
+        self.graph_memories.invalidate(user_id);
+        self.user_memories.run_pending_tasks();
+        self.graph_memories.run_pending_tasks();
+
+        #[cfg(target_os = "windows")]
+        {
+            // Windows needs extra time to release file handles
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            self.user_memories.run_pending_tasks();
+            self.graph_memories.run_pending_tasks();
+        }
+
+        tracing::info!(user_id = user_id, "Evicted user caches for restore");
+    }
+
     /// Delete user data (GDPR compliance)
     ///
     /// Cleans up:
@@ -1581,9 +1600,12 @@ impl MultiUserMemoryManager {
                         .iter()
                         .map(|(n, d)| crate::backup::SecondaryStoreRef { name: n, db: d })
                         .collect();
+                    let graph_lock = self.get_user_graph(name).ok();
+                    let graph_guard = graph_lock.as_ref().map(|g| g.read());
+                    let graph_db_ref = graph_guard.as_ref().map(|g| g.get_db());
                     match self
                         .backup_engine
-                        .create_comprehensive_backup(&db, name, &store_refs)
+                        .create_comprehensive_backup_with_graph(&db, name, &store_refs, graph_db_ref)
                     {
                         Ok(metadata) => {
                             tracing::info!(

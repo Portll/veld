@@ -1005,6 +1005,11 @@ pub struct GraphMemory {
 }
 
 impl GraphMemory {
+    /// Get a reference to the underlying RocksDB instance (for backup/checkpoint).
+    pub fn get_db(&self) -> &DB {
+        &self.db
+    }
+
     // Column family accessors — cheap HashMap lookups on DB internals
     fn entities_cf(&self) -> &ColumnFamily {
         self.db
