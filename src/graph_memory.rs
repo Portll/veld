@@ -2170,7 +2170,18 @@ impl GraphMemory {
         }
 
         // Phase 3: Sort by effective strength descending (strongest first)
-        edges.sort_by(|a, b| b.effective_strength().total_cmp(&a.effective_strength()));
+        // Snapshot strengths BEFORE sorting — effective_strength() calls Utc::now()
+        // internally, so repeated calls during sort can return different values,
+        // violating total ordering (Rust 1.81+ panics on this).
+        let mut strength_cache: HashMap<Uuid, f32> = HashMap::with_capacity(edges.len());
+        for edge in &edges {
+            strength_cache.insert(edge.uuid, edge.effective_strength());
+        }
+        edges.sort_by(|a, b| {
+            let sa = strength_cache.get(&a.uuid).copied().unwrap_or(0.0);
+            let sb = strength_cache.get(&b.uuid).copied().unwrap_or(0.0);
+            sb.total_cmp(&sa)
+        });
 
         // Phase 3.5: Opportunistic pruning — queue edges that have decayed below
         // their tier's threshold for batch deletion on next maintenance cycle.
