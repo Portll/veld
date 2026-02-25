@@ -863,12 +863,19 @@ impl MemorySystem {
                             self.record_consolidation_event(event.clone());
                         }
 
-                        // Handle duplicates - don't duplicate here, just log
+                        // Handle duplicates: suppress the near-duplicate to near-zero importance
+                        // so it decays naturally. We can't delete it here because callers
+                        // expect the returned MemoryId to be retrievable.
                         if interference_result.is_duplicate {
-                            tracing::debug!(
+                            tracing::info!(
                                 memory_id = %memory.id.0,
-                                "Memory detected as near-duplicate of existing memory"
+                                "Near-duplicate detected (≥0.95 cosine), suppressing importance"
                             );
+                            // Heavy decay: drop to ~1% importance so natural decay removes it
+                            memory.decay_importance(0.99);
+                            if let Err(e) = self.long_term_memory.update(&memory) {
+                                tracing::debug!("Failed to suppress duplicate importance: {e}");
+                            }
                         }
 
                         // Persist affected interference records to RocksDB

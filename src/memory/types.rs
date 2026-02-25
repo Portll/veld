@@ -575,6 +575,12 @@ pub struct NerEntityRecord {
     /// NER type: "PER", "ORG", "LOC", "MISC"
     pub entity_type: String,
     pub confidence: f32,
+    /// Character offset of entity start in source content
+    #[serde(default)]
+    pub start_char: Option<usize>,
+    /// Character offset of entity end in source content
+    #[serde(default)]
+    pub end_char: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

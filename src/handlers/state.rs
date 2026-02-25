@@ -1670,8 +1670,8 @@ impl MultiUserMemoryManager {
                         _ => NerEntityType::Misc,
                     },
                     confidence: record.confidence,
-                    start: 0,
-                    end: record.text.len(),
+                    start: record.start_char.unwrap_or(0),
+                    end: record.end_char.unwrap_or(record.text.len()),
                 })
                 .collect()
         } else if !experience.entities.is_empty() {
