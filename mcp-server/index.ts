@@ -704,6 +704,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "backup_restore",
+        description: "Restore a previously created backup by ID. This replaces all current data for the user with the backup contents. Server restart is recommended after restore.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            backup_id: {
+              type: "number",
+              description: "The backup ID to restore (from backup_list)",
+            },
+          },
+          required: ["backup_id"],
+        },
+      },
+      {
         name: "consolidation_report",
         description: "Get a report of what the memory system has been learning. Shows memory strengthening/decay events, edge formation, fact extraction, and maintenance cycles. Use this to understand how your memories are evolving.",
         inputSchema: {
@@ -1996,6 +2010,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           response += `✓ Purged ${result.purged_count} old backup(s)\n`;
           response += `Kept ${keep_count} most recent backup(s)`;
+        }
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "backup_restore": {
+        const { backup_id } = args as { backup_id: number };
+
+        interface RestoreBackupResponse {
+          success: boolean;
+          message: string;
+          restored_stores: string[];
+        }
+
+        const result = await apiCall<RestoreBackupResponse>("/api/backup/restore", "POST", {
+          user_id: USER_ID,
+          backup_id,
+        });
+
+        let response = `🔄 Backup Restore\n`;
+        response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        if (result.success) {
+          response += `✓ Backup #${backup_id} restored successfully\n`;
+          if (result.restored_stores.length > 0) {
+            response += `Restored stores: ${result.restored_stores.join(", ")}\n`;
+          }
+          response += `\n⚠️ ${result.message}`;
+        } else {
+          response += `✗ Restore failed: ${result.message}`;
         }
 
         return {

@@ -570,6 +570,20 @@ pub struct PurgeBackupsResponse {
     pub purged_count: usize,
 }
 
+#[derive(Deserialize)]
+pub struct RestoreBackupRequest {
+    pub user_id: String,
+    #[serde(default)]
+    pub backup_id: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct RestoreBackupResponse {
+    pub success: bool,
+    pub message: String,
+    pub restored_stores: Vec<String>,
+}
+
 // =============================================================================
 // CONTEXT STATUS
 // =============================================================================

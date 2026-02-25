@@ -74,6 +74,11 @@ impl ShodhBackupEngine {
         Ok(Self { backup_path })
     }
 
+    /// Get the backup storage path.
+    pub fn backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+
     /// Create a full backup of a RocksDB database
     ///
     /// # Arguments
@@ -145,15 +150,27 @@ impl ShodhBackupEngine {
         Ok(metadata)
     }
 
-    /// Create a comprehensive backup of the main database and all secondary stores.
+    /// Create a comprehensive backup of the main database, secondary stores, and graph.
     ///
     /// Uses RocksDB BackupEngine for the main memories DB and Checkpoint API
-    /// for secondary stores (todos, reminders, facts, files, feedback, audit).
+    /// for secondary stores (todos, reminders, facts, files, feedback, audit)
+    /// and the knowledge graph database.
     pub fn create_comprehensive_backup(
         &self,
         db: &DB,
         user_id: &str,
         secondary_stores: &[SecondaryStoreRef<'_>],
+    ) -> Result<BackupMetadata> {
+        self.create_comprehensive_backup_with_graph(db, user_id, secondary_stores, None)
+    }
+
+    /// Create a comprehensive backup including the knowledge graph DB.
+    pub fn create_comprehensive_backup_with_graph(
+        &self,
+        db: &DB,
+        user_id: &str,
+        secondary_stores: &[SecondaryStoreRef<'_>],
+        graph_db: Option<&DB>,
     ) -> Result<BackupMetadata> {
         // Step 1: Create main memories backup (existing logic)
         let mut metadata = self.create_backup(db, user_id)?;
@@ -164,6 +181,21 @@ impl ShodhBackupEngine {
             .join(user_id)
             .join(format!("secondary_{}", metadata.backup_id));
         fs::create_dir_all(&secondary_dir)?;
+
+        // Step 2a: Checkpoint graph DB if provided
+        if let Some(graph) = graph_db {
+            let graph_checkpoint_dir = secondary_dir.join("graph");
+            let checkpoint = Checkpoint::new(graph)
+                .map_err(|e| anyhow!("Failed to create checkpoint handle for graph DB: {}", e))?;
+            checkpoint
+                .create_checkpoint(&graph_checkpoint_dir)
+                .map_err(|e| {
+                    let _ = fs::remove_dir_all(&graph_checkpoint_dir);
+                    anyhow!("Failed to checkpoint graph DB: {}", e)
+                })?;
+            let graph_size = dir_size(&graph_checkpoint_dir).unwrap_or(0);
+            tracing::debug!(size_kb = graph_size / 1024, "Graph DB checkpointed");
+        }
 
         let mut backed_up_stores = Vec::new();
         let mut total_secondary_bytes: u64 = 0;
@@ -180,43 +212,38 @@ impl ShodhBackupEngine {
                 continue;
             }
 
-            match Checkpoint::new(store_ref.db) {
-                Ok(checkpoint) => {
-                    if let Err(e) = checkpoint.create_checkpoint(&store_checkpoint_dir) {
-                        tracing::warn!(
-                            store = store_ref.name,
-                            error = %e,
-                            "Failed to checkpoint secondary store, skipping"
-                        );
-                        // Clean up partial checkpoint
-                        if let Err(cleanup_err) = fs::remove_dir_all(&store_checkpoint_dir) {
-                            tracing::warn!(
-                                store = store_ref.name,
-                                error = %cleanup_err,
-                                "Failed to clean up partial checkpoint directory"
-                            );
-                        }
-                        continue;
-                    }
+            let checkpoint = Checkpoint::new(store_ref.db).map_err(|e| {
+                anyhow!(
+                    "Failed to create checkpoint handle for secondary store '{}': {}",
+                    store_ref.name,
+                    e
+                )
+            })?;
 
-                    let store_size = dir_size(&store_checkpoint_dir).unwrap_or(0);
-                    total_secondary_bytes += store_size;
-                    backed_up_stores.push(store_ref.name.to_string());
-
-                    tracing::debug!(
-                        store = store_ref.name,
-                        size_kb = store_size / 1024,
-                        "Secondary store checkpointed"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        store = store_ref.name,
-                        error = %e,
-                        "Failed to create checkpoint handle for secondary store"
-                    );
-                }
+            if let Err(e) = checkpoint.create_checkpoint(&store_checkpoint_dir) {
+                // Clean up partial checkpoint before returning error
+                let _ = fs::remove_dir_all(&store_checkpoint_dir);
+                return Err(anyhow!(
+                    "Failed to checkpoint secondary store '{}': {}",
+                    store_ref.name,
+                    e
+                ));
             }
+
+            let store_size = dir_size(&store_checkpoint_dir).unwrap_or(0);
+            total_secondary_bytes += store_size;
+            backed_up_stores.push(store_ref.name.to_string());
+
+            tracing::debug!(
+                store = store_ref.name,
+                size_kb = store_size / 1024,
+                "Secondary store checkpointed"
+            );
+        }
+
+        // Track graph in metadata if it was checkpointed
+        if graph_db.is_some() {
+            backed_up_stores.push("graph".to_string());
         }
 
         // Step 3: Update metadata with secondary store info
@@ -533,19 +560,39 @@ impl ShodhBackupEngine {
     fn calculate_backup_checksum(&self, backup_dir: &Path, backup_id: u32) -> Result<String> {
         let mut hasher = Sha256::new();
 
-        // Hash the backup ID directory contents
+        // Hash main backup directory (sorted by filename for deterministic ordering)
         let backup_path = backup_dir.join(format!("{backup_id}"));
+        self.hash_directory_sorted(&backup_path, &mut hasher)?;
 
-        if backup_path.exists() {
-            for entry in fs::read_dir(&backup_path)? {
-                let entry = entry?;
-                let file_contents = fs::read(entry.path())?;
-                hasher.update(&file_contents);
-            }
-        }
+        // Hash secondary store directory (B5: was previously excluded)
+        let secondary_path = backup_dir.join(format!("secondary_{backup_id}"));
+        self.hash_directory_sorted(&secondary_path, &mut hasher)?;
 
         let result = hasher.finalize();
         Ok(format!("{result:x}"))
+    }
+
+    fn hash_directory_sorted(&self, dir: &Path, hasher: &mut Sha256) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            // Hash filename for rename detection
+            hasher.update(entry.file_name().to_string_lossy().as_bytes());
+            if path.is_dir() {
+                // Recurse into subdirectories (secondary stores have nested structure)
+                self.hash_directory_sorted(&path, hasher)?;
+            } else {
+                let file_contents = fs::read(&path)?;
+                hasher.update(&file_contents);
+            }
+        }
+        Ok(())
     }
 
     fn estimate_memory_count(&self, db: &DB) -> Result<usize> {
@@ -559,6 +606,11 @@ impl ShodhBackupEngine {
 
         Ok(count)
     }
+}
+
+/// Public wrapper for copy_dir_recursive (used by restore handler).
+pub fn copy_dir_recursive_pub(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_recursive(src, dst)
 }
 
 /// Calculate total size of a directory recursively

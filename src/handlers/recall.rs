@@ -324,22 +324,27 @@ pub async fn recall(
             let memory_guard = memory_for_recall.read();
 
             // 1. Compute query embedding (reused for prospective + recall)
-            let query_embedding = memory_guard
+            let query_embedding_opt = memory_guard
                 .compute_embedding(&query_for_recall)
-                .unwrap_or_else(|_| vec![0.0; 384]);
+                .ok();
 
             // 2. Semantic prospective matching (fixes C5: was keyword-only)
-            let embed_fn =
-                |text: &str| -> Option<Vec<f32>> { memory_guard.compute_embedding(text).ok() };
-
-            let matched_tasks = prospective_for_recall
-                .check_context_triggers_semantic(
-                    &user_id_for_recall,
-                    &query_for_recall,
-                    &query_embedding,
+            // Skip semantic matching if embedding failed — keyword matching still works
+            let matched_tasks = if let Some(ref query_embedding) = query_embedding_opt {
+                let embed_fn =
+                    |text: &str| -> Option<Vec<f32>> { memory_guard.compute_embedding(text).ok() };
+                prospective_for_recall
+                    .check_context_triggers_semantic(
+                        &user_id_for_recall,
+                        &query_for_recall,
+                        query_embedding,
                     embed_fn,
                 )
-                .unwrap_or_default();
+                .unwrap_or_default()
+            } else {
+                tracing::warn!("Embedding failed — skipping semantic prospective matching, recall proceeds via text");
+                Vec::new()
+            };
 
             // 3. Build signals and response reminders from matched tasks
             let mut signals: Vec<String> = Vec::new();
@@ -1037,8 +1042,8 @@ pub async fn proactive_context(
         match memory_guard.compute_embedding(&context_for_embedding) {
             Ok(emb) => (emb, true),
             Err(e) => {
-                tracing::warn!("proactive_context: embedding computation failed: {e}, using zero vector — retrieval quality degraded");
-                (vec![0.0; 384], false)
+                tracing::warn!("proactive_context: embedding computation failed: {e}, skipping embedding-dependent operations");
+                (Vec::new(), false)
             }
         }
     });
