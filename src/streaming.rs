@@ -914,13 +914,23 @@ impl StreamingMemoryExtractor {
                     metadata: HashMap::new(),
                 };
 
-                let mut sessions = self.sessions.write().await;
-                let session = sessions.get_mut(session_id).unwrap();
-                session.buffer_message(msg);
+                let should_extract = {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(session) = sessions.get_mut(session_id) {
+                        session.buffer_message(msg);
+                        session.should_extract_by_time() || session.should_extract_by_size()
+                    } else {
+                        return ExtractionResult::Error {
+                            code: "SESSION_NOT_FOUND".to_string(),
+                            message: format!("Session '{}' not found", session_id),
+                            fatal: true,
+                            timestamp: Utc::now(),
+                        };
+                    }
+                };
 
                 // Sensors use time-based extraction primarily
-                if session.should_extract_by_time() || session.should_extract_by_size() {
-                    drop(sessions);
+                if should_extract {
                     return self.extract_memories(session_id, memory_system).await;
                 }
 
@@ -1258,18 +1268,33 @@ impl StreamingMemoryExtractor {
         let max_results = max_per_message * 2; // Fetch more for filtering
         let context_emb = context_embedding.clone();
 
+        // Snapshot injection cooldowns BEFORE spawn_blocking to avoid
+        // nested block_on() inside blocking thread (thread pool starvation risk)
+        let cooldown_snapshot: HashSet<String> = {
+            let sessions_guard = self.sessions.read().await;
+            if let Some(session) = sessions_guard.get(session_id) {
+                session
+                    .injection_cooldowns
+                    .iter()
+                    .filter(|(_, ts)| {
+                        let elapsed = Utc::now().signed_duration_since(**ts).num_seconds() as u64;
+                        elapsed < cooldown_seconds
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            } else {
+                HashSet::new()
+            }
+        };
+
         let surfaced: Vec<SurfacedStreamMemory> = {
             let memory = memory_system.clone();
             let graph = graph_memory.clone();
-            let sessions = self.sessions.clone();
-            let session_id_owned = session_id.to_string();
 
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory.read();
                 let graph_guard = graph.read();
-                // PIPE-9: feedback momentum now applied in pipeline, no post-hoc adjustment needed
                 let now = Utc::now();
-                let _ = cooldown_seconds; // Used for session cooldown check
 
                 // Semantic query
                 let query = MemoryQuery {
@@ -1306,20 +1331,16 @@ impl StreamingMemoryExtractor {
                 // Sort by score descending
                 candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-                // Filter by threshold, cooldown, and limit
-                let sessions_guard = futures::executor::block_on(async { sessions.read().await });
-
+                // Filter by threshold, cooldown snapshot, and limit
                 candidates
                     .into_iter()
                     .filter(|(m, score, _, _, _)| {
                         if *score < min_relevance {
                             return false;
                         }
-                        // Check cooldown
-                        if let Some(session) = sessions_guard.get(&session_id_owned) {
-                            if session.is_on_injection_cooldown(&m.id.0.to_string()) {
-                                return false;
-                            }
+                        // Check cooldown from pre-captured snapshot
+                        if cooldown_snapshot.contains(&m.id.0.to_string()) {
+                            return false;
                         }
                         true
                     })

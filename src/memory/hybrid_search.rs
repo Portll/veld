@@ -801,10 +801,19 @@ impl HybridSearchEngine {
             if !to_rerank.is_empty() {
                 let reranked = reranker.rerank(query, to_rerank)?;
 
-                // Build rerank map
+                // Build rerank map with cosine similarities (range [-1, 1])
                 let rerank_map: HashMap<MemoryId, f32> = reranked.into_iter().collect();
 
+                // Normalize rerank scores to [0, 1] for scale-compatible blending
+                // Cosine similarity ∈ [-1, 1] → shift to [0, 1]
+                let rerank_normalized: HashMap<MemoryId, f32> = rerank_map
+                    .iter()
+                    .map(|(id, s)| (id.clone(), (s + 1.0) / 2.0))
+                    .collect();
+
                 // Combine reranked results with non-reranked
+                // Blend: 0.6 * RRF + 0.4 * normalized_rerank (preserves RRF scale)
+                const RERANK_BLEND: f32 = 0.4;
                 let mut results: Vec<HybridSearchResult> = Vec::new();
 
                 for (memory_id, rrf_score) in fused {
@@ -812,8 +821,14 @@ impl HybridSearchEngine {
                     let vector_info = vector_map.get(&memory_id);
                     let rerank_score = rerank_map.get(&memory_id).copied();
 
-                    // Final score: if reranked, use rerank score, else use RRF
-                    let final_score = rerank_score.unwrap_or(rrf_score);
+                    // Blend rerank with RRF to preserve score scale
+                    let final_score = if let Some(norm_rerank) =
+                        rerank_normalized.get(&memory_id).copied()
+                    {
+                        (1.0 - RERANK_BLEND) * rrf_score + RERANK_BLEND * norm_rerank * rrf_score
+                    } else {
+                        rrf_score
+                    };
 
                     results.push(HybridSearchResult {
                         memory_id,
