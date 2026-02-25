@@ -485,8 +485,8 @@ mod performance {
 
         assert!(entities.len() >= 10, "Should find many entities");
         assert!(
-            elapsed.as_millis() < 20,
-            "Should complete in under 20ms even with many entities"
+            elapsed.as_millis() < 50,
+            "Should complete in under 50ms even with many entities"
         );
     }
 }

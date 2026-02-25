@@ -319,6 +319,8 @@ pub async fn remember(
                         text: e.text,
                         entity_type: e.entity_type.as_str().to_string(),
                         confidence: e.confidence,
+                        start_char: Some(e.start),
+                        end_char: Some(e.end),
                     })
                     .collect::<Vec<NerEntityRecord>>(),
                 Err(e) => {
@@ -618,6 +620,8 @@ pub async fn batch_remember(
                         text: e.text,
                         entity_type: e.entity_type.as_str().to_string(),
                         confidence: e.confidence,
+                        start_char: Some(e.start),
+                        end_char: Some(e.end),
                     })
                     .collect(),
                 Err(e) => {
@@ -788,6 +792,8 @@ pub async fn upsert_memory(
                 text: e.text,
                 entity_type: e.entity_type.as_str().to_string(),
                 confidence: e.confidence,
+                start_char: Some(e.start),
+                end_char: Some(e.end),
             })
             .collect(),
         Err(e) => {

@@ -240,6 +240,8 @@ pub struct ListTodosRequest {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
 }
 
 /// Request to update a todo
@@ -1245,6 +1247,15 @@ pub async fn list_todos(
                 });
             }
             _ => {}
+        }
+    }
+
+    // Filter by priority
+    if let Some(ref priority_str) = req.priority {
+        if let Some(target_priority) =
+            crate::memory::types::TodoPriority::from_str_loose(priority_str)
+        {
+            todos.retain(|t| t.priority == target_priority);
         }
     }
 
