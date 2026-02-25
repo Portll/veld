@@ -1603,10 +1603,12 @@ impl MultiUserMemoryManager {
                     let graph_lock = self.get_user_graph(name).ok();
                     let graph_guard = graph_lock.as_ref().map(|g| g.read());
                     let graph_db_ref = graph_guard.as_ref().map(|g| g.get_db());
-                    match self
-                        .backup_engine
-                        .create_comprehensive_backup_with_graph(&db, name, &store_refs, graph_db_ref)
-                    {
+                    match self.backup_engine.create_comprehensive_backup_with_graph(
+                        &db,
+                        name,
+                        &store_refs,
+                        graph_db_ref,
+                    ) {
                         Ok(metadata) => {
                             tracing::info!(
                                 user_id = name,

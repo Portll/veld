@@ -185,13 +185,14 @@ impl ShodhBackupEngine {
         // Step 2a: Checkpoint graph DB if provided
         if let Some(graph) = graph_db {
             let graph_checkpoint_dir = secondary_dir.join("graph");
-            let checkpoint = Checkpoint::new(graph).map_err(|e| {
-                anyhow!("Failed to create checkpoint handle for graph DB: {}", e)
-            })?;
-            checkpoint.create_checkpoint(&graph_checkpoint_dir).map_err(|e| {
-                let _ = fs::remove_dir_all(&graph_checkpoint_dir);
-                anyhow!("Failed to checkpoint graph DB: {}", e)
-            })?;
+            let checkpoint = Checkpoint::new(graph)
+                .map_err(|e| anyhow!("Failed to create checkpoint handle for graph DB: {}", e))?;
+            checkpoint
+                .create_checkpoint(&graph_checkpoint_dir)
+                .map_err(|e| {
+                    let _ = fs::remove_dir_all(&graph_checkpoint_dir);
+                    anyhow!("Failed to checkpoint graph DB: {}", e)
+                })?;
             let graph_size = dir_size(&graph_checkpoint_dir).unwrap_or(0);
             tracing::debug!(size_kb = graph_size / 1024, "Graph DB checkpointed");
         }
@@ -576,9 +577,7 @@ impl ShodhBackupEngine {
             return Ok(());
         }
 
-        let mut entries: Vec<_> = fs::read_dir(dir)?
-            .filter_map(|e| e.ok())
-            .collect();
+        let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
 
         for entry in entries {

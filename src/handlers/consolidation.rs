@@ -378,12 +378,7 @@ pub async fn create_backup(
     } else {
         state
             .backup_engine()
-            .create_comprehensive_backup_with_graph(
-                &db,
-                &req.user_id,
-                &store_refs,
-                graph_db_ref,
-            )
+            .create_comprehensive_backup_with_graph(&db, &req.user_id, &store_refs, graph_db_ref)
     };
 
     match result {
@@ -562,11 +557,7 @@ pub async fn restore_backup(
         &user_id,
         "BACKUP_RESTORED",
         &format!("backup_{}", req.backup_id.unwrap_or(0)),
-        &format!(
-            "Restored {} stores: {:?}",
-            all_restored.len(),
-            all_restored
-        ),
+        &format!("Restored {} stores: {:?}", all_restored.len(), all_restored),
     );
 
     Ok(Json(RestoreBackupResponse {
