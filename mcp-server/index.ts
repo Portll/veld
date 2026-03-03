@@ -26,6 +26,7 @@ import {
 import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
+import * as crypto from "crypto";
 import { fileURLToPath } from "url";
 
 const __filename = (typeof import.meta !== "undefined" && import.meta.url) ? fileURLToPath(import.meta.url) : "";
@@ -36,23 +37,38 @@ const API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
 const WS_URL = API_URL.replace(/^http/, "ws") + "/api/stream";
 const USER_ID = process.env.SHODH_USER_ID || "claude-code";
 
+// Detect whether the server is local (safe for auto-generated keys)
+function isLocalServer(): boolean {
+  try {
+    const url = new URL(API_URL);
+    const host = url.hostname;
+    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "0.0.0.0";
+  } catch {
+    return false;
+  }
+}
+
 // Sandbox mode — used by Smithery to scan tools without a running backend
 const SANDBOX_MODE = process.env.SMITHERY_SANDBOX === "true";
 
-// API Key - required for authentication
+// API Key - required for remote servers, auto-generated for local
 // Set via SHODH_API_KEY env var, or configure in MCP settings
-const API_KEY = process.env.SHODH_API_KEY || (SANDBOX_MODE ? "sandbox" : "");
+let API_KEY = process.env.SHODH_API_KEY || (SANDBOX_MODE ? "sandbox" : "");
 if (!API_KEY) {
-  console.error("ERROR: SHODH_API_KEY environment variable not set.");
-  console.error("");
-  console.error("To fix, add to your MCP config (claude_desktop_config.json or mcp.json):");
-  console.error(`  "env": { "SHODH_API_KEY": "your-api-key" }`);
-  console.error("");
-  console.error("Or set in your shell:");
-  console.error("  export SHODH_API_KEY=your-api-key");
-  console.error("");
-  console.error("For local development, use the same key set in SHODH_DEV_API_KEY on the server.");
-  process.exit(1);
+  if (isLocalServer()) {
+    // Auto-generate a random key for local development — zero config
+    API_KEY = crypto.randomBytes(32).toString("hex");
+    console.error("[shodh-memory] No API key set — auto-generated for local server.");
+  } else {
+    console.error("ERROR: SHODH_API_KEY is required for remote servers.");
+    console.error("");
+    console.error("To fix, add to your MCP config (claude_desktop_config.json or mcp.json):");
+    console.error(`  "env": { "SHODH_API_KEY": "your-api-key" }`);
+    console.error("");
+    console.error("Or set in your shell:");
+    console.error("  export SHODH_API_KEY=your-api-key");
+    process.exit(1);
+  }
 }
 const RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1000;
@@ -3979,10 +3995,35 @@ async function waitForServer(maxAttempts: number = 30): Promise<boolean> {
   return false;
 }
 
+async function validateApiKey(): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(`${API_URL}/api/health`, {
+      headers: { "X-API-Key": API_KEY },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureServerRunning(): Promise<void> {
   // Check if already running
   if (await isServerRunning()) {
     console.error("[shodh-memory] Backend server already running at", API_URL);
+    // If we auto-generated a key, verify it works against the running server
+    if (!process.env.SHODH_API_KEY && isLocalServer()) {
+      const keyWorks = await validateApiKey();
+      if (!keyWorks) {
+        console.error("[shodh-memory] WARNING: Auto-generated key rejected by running server.");
+        console.error("[shodh-memory] The server was started with a different API key.");
+        console.error("[shodh-memory] Set SHODH_API_KEY to match the server's key, or restart");
+        console.error("[shodh-memory] the server without SHODH_DEV_API_KEY to use auto-generated keys.");
+      }
+    }
     return;
   }
 
