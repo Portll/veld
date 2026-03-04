@@ -16,8 +16,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::constants::{
-    ENTITY_CONCEPT_MERGE_THRESHOLD, ENTITY_EMBEDDING_CACHE_MAX, LTP_MIN_STRENGTH,
-    LTP_PRUNE_FLOOR,
+    ENTITY_CONCEPT_MERGE_THRESHOLD, ENTITY_EMBEDDING_CACHE_MAX, LTP_MIN_STRENGTH, LTP_PRUNE_FLOOR,
 };
 
 // Column family names for the unified graph database
