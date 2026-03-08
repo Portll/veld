@@ -25,7 +25,9 @@ use crate::memory::segmentation::{InputSource, SegmentationEngine};
 use crate::memory::sessions::SessionEvent;
 use crate::memory::storage::SearchCriteria;
 use crate::memory::types::MemoryId;
-use crate::memory::{Experience, ExperienceType, Query as MemoryQuery, RetrievalMode, SharedMemory};
+use crate::memory::{
+    Experience, ExperienceType, Query as MemoryQuery, RetrievalMode, SharedMemory,
+};
 use crate::memory::{ProspectiveTrigger, TodoStatus};
 use crate::metrics;
 use crate::relevance;

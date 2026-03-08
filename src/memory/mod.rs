@@ -1896,7 +1896,10 @@ impl MemorySystem {
                 (r, d, entity_count, weights, phrases, disc)
             } else {
                 if !use_graph && self.graph_memory.is_some() {
-                    tracing::debug!("Layer 2: SKIPPED (retrieval_mode={:?})", query.retrieval_mode);
+                    tracing::debug!(
+                        "Layer 2: SKIPPED (retrieval_mode={:?})",
+                        query.retrieval_mode
+                    );
                 }
                 // No graph traversal - still analyze query for IC weights and phrase boosts
                 let (disc, _) = query_analysis.keyword_discriminativeness();
