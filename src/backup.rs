@@ -661,6 +661,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocksdb::Options;
+    use serde_json::Value;
     use tempfile::TempDir;
 
     #[test]
@@ -690,5 +692,134 @@ mod tests {
 
         assert_eq!(metadata.backup_id, deserialized.backup_id);
         assert_eq!(metadata.user_id, deserialized.user_id);
+    }
+
+    #[test]
+    fn test_dir_size_counts_nested_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        fs::write(root.join("a.txt"), b"12345").unwrap();
+        fs::write(nested.join("b.txt"), b"1234567890").unwrap();
+
+        let size = dir_size(root).unwrap();
+        assert_eq!(size, 15);
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_pub_copies_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+        fs::create_dir_all(src.join("deep")).unwrap();
+        fs::write(src.join("file1.txt"), b"alpha").unwrap();
+        fs::write(src.join("deep").join("file2.txt"), b"beta").unwrap();
+
+        copy_dir_recursive_pub(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("file1.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            fs::read(dst.join("deep").join("file2.txt")).unwrap(),
+            b"beta"
+        );
+    }
+
+    #[test]
+    fn test_list_backups_empty_when_user_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = ShodhBackupEngine::new(temp_dir.path().to_path_buf()).unwrap();
+        let backups = engine.list_backups("missing-user").unwrap();
+        assert!(backups.is_empty());
+    }
+
+    #[test]
+    fn test_verify_backup_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let db_path = temp_dir.path().join("db");
+        let user_id = "user1";
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, &db_path).unwrap();
+        db.put(b"k1", b"v1").unwrap();
+        db.put(b"k2", b"v2").unwrap();
+
+        let engine = ShodhBackupEngine::new(backup_root.clone()).unwrap();
+        let metadata = engine.create_backup(&db, user_id).unwrap();
+
+        let verified = engine.verify_backup(user_id, metadata.backup_id).unwrap();
+        assert!(verified);
+    }
+
+    #[test]
+    fn test_verify_backup_detects_checksum_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let db_path = temp_dir.path().join("db");
+        let user_id = "user2";
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, &db_path).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        let engine = ShodhBackupEngine::new(backup_root.clone()).unwrap();
+        let metadata = engine.create_backup(&db, user_id).unwrap();
+
+        let metadata_path = backup_root
+            .join(user_id)
+            .join(format!("backup_{}.json", metadata.backup_id));
+        let json = fs::read_to_string(&metadata_path).unwrap();
+        let mut parsed: Value = serde_json::from_str(&json).unwrap();
+        parsed["checksum"] = Value::String("0000badchecksum".to_string());
+        fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&parsed).unwrap(),
+        )
+        .unwrap();
+
+        let verified = engine.verify_backup(user_id, metadata.backup_id).unwrap();
+        assert!(!verified);
+    }
+
+    #[test]
+    fn test_purge_old_backups_validates_keep_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = ShodhBackupEngine::new(temp_dir.path().to_path_buf()).unwrap();
+        let err = engine.purge_old_backups("user", 0).unwrap_err();
+        assert!(err.to_string().contains("keep_count must be >= 1"));
+    }
+
+    #[test]
+    fn test_purge_old_backups_removes_old_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let db_path = temp_dir.path().join("db");
+        let user_id = "purge-user";
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, &db_path).unwrap();
+
+        let engine = ShodhBackupEngine::new(backup_root.clone()).unwrap();
+        db.put(b"k1", b"v1").unwrap();
+        let first = engine.create_backup(&db, user_id).unwrap();
+        db.put(b"k2", b"v2").unwrap();
+        let second = engine.create_backup(&db, user_id).unwrap();
+
+        let purged = engine.purge_old_backups(user_id, 1).unwrap();
+        assert_eq!(purged, 1);
+
+        let remaining = engine.list_backups(user_id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].backup_id, second.backup_id);
+
+        let first_metadata_path = backup_root
+            .join(user_id)
+            .join(format!("backup_{}.json", first.backup_id));
+        assert!(!first_metadata_path.exists());
     }
 }

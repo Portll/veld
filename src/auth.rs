@@ -259,16 +259,10 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
             // WebSocket fallback: check query parameter for api_key
             // Node.js WebSocket API doesn't support custom headers, so
             // clients can pass ?api_key=... in the URL instead
-            request
-                .uri()
-                .query()
-                .and_then(|q| {
-                    q.split('&')
-                        .find_map(|pair| {
-                            pair.strip_prefix("api_key=")
-                                .map(|v| v.to_string())
-                        })
-                })
+            request.uri().query().and_then(|q| {
+                q.split('&')
+                    .find_map(|pair| pair.strip_prefix("api_key=").map(|v| v.to_string()))
+            })
         }) {
         Some(key) => key,
         None => return AuthError::MissingApiKey.into_response(),

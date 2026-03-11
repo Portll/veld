@@ -277,6 +277,18 @@ pub static ROCKSDB_OPS_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("ROCKSDB_OPS_DURATION metric must be valid at compile time")
 });
 
+/// Fallback deserialization branch hits (legacy migration observability)
+pub static LEGACY_FALLBACK_BRANCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "shodh_legacy_fallback_branch_total",
+            "Total fallback deserialization branch hits",
+        ),
+        &["branch"],
+    )
+    .expect("LEGACY_FALLBACK_BRANCH_TOTAL metric must be valid at compile time")
+});
+
 // ============================================================================
 // Error Metrics
 // ============================================================================
@@ -517,6 +529,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Storage metrics
     register!(ROCKSDB_OPS_TOTAL, "ROCKSDB_OPS_TOTAL");
     register!(ROCKSDB_OPS_DURATION, "ROCKSDB_OPS_DURATION");
+    register!(LEGACY_FALLBACK_BRANCH_TOTAL, "LEGACY_FALLBACK_BRANCH_TOTAL");
 
     // Error metrics
     register!(ERRORS_TOTAL, "ERRORS_TOTAL");

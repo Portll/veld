@@ -579,11 +579,13 @@ fn test_should_decay_fact_old_unreinforced() {
     let old_fact = SemanticFact {
         id: "old_fact".to_string(),
         fact: "Old unused fact".to_string(),
-        confidence: 0.3,
+        // Keep confidence at the deletion threshold so modest additional decay
+        // from long inactivity deterministically crosses the cutoff.
+        confidence: 0.1,
         support_count: 1,
         source_memories: vec![],
         related_entities: vec![],
-        created_at: Utc::now() - Duration::days(100),
+        created_at: Utc::now() - Duration::days(365),
         last_reinforced: Utc::now() - Duration::days(100),
         fact_type: FactType::Pattern,
     };

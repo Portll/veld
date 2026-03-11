@@ -315,4 +315,52 @@ mod tests {
 
         assert!(aggressive < normal);
     }
+
+    #[test]
+    fn test_tier_decay_factor_l1_with_and_without_ltp() {
+        let (unprotected, _) = tier_decay_factor(24.0, 0, 1.0);
+        let (protected, _) = tier_decay_factor(24.0, 0, 0.5);
+        assert!(protected > unprotected);
+    }
+
+    #[test]
+    fn test_tier_decay_factor_l1_prune_threshold() {
+        let (factor_at_max_age, should_prune_at_max_age) = tier_decay_factor(48.0, 0, 1.0);
+        // At max age boundary, L1 should still not prune because pruning requires "greater than" max age.
+        assert!(factor_at_max_age > 0.1);
+        assert!(!should_prune_at_max_age);
+
+        let (factor_past_max_age, should_prune_past_max_age) = tier_decay_factor(96.0, 0, 1.0);
+        assert!(factor_past_max_age < 0.1);
+        assert!(should_prune_past_max_age);
+    }
+
+    #[test]
+    fn test_tier_decay_factor_l3_long_tail() {
+        let (factor_1y, prune_1y) = tier_decay_factor(365.0 * 24.0, 2, 1.0);
+        assert!(factor_1y > 0.7);
+        assert!(!prune_1y);
+
+        let (factor_3y, prune_3y) = tier_decay_factor(3.0 * 365.0 * 24.0, 2, 1.0);
+        assert!(factor_3y > 0.45);
+        assert!(!prune_3y);
+    }
+
+    #[test]
+    fn test_tier_decay_zero_and_negative_elapsed() {
+        let (zero_factor, zero_prune) = tier_decay_factor(0.0, 1, 1.0);
+        assert_eq!(zero_factor, 1.0);
+        assert!(!zero_prune);
+
+        let (neg_factor, neg_prune) = tier_decay_factor(-10.0, 1, 1.0);
+        assert_eq!(neg_factor, 1.0);
+        assert!(!neg_prune);
+    }
+
+    #[test]
+    fn test_tier_decay_invalid_tier_defaults_to_l3() {
+        let (invalid_tier, _) = tier_decay_factor(24.0, 9, 1.0);
+        let (l3, _) = tier_decay_factor(24.0, 2, 1.0);
+        assert_eq!(invalid_tier, l3);
+    }
 }
