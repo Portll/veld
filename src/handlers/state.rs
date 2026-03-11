@@ -611,6 +611,9 @@ impl MultiUserMemoryManager {
         drop(old_db);
 
         let renamed = old_dir.with_file_name("audit_logs.pre_cf_migration");
+        if renamed.exists() {
+            let _ = std::fs::remove_dir_all(&renamed);
+        }
         std::fs::rename(&old_dir, &renamed)
             .context("Failed to rename old audit_logs dir after migration")?;
 

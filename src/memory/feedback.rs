@@ -1127,6 +1127,9 @@ impl FeedbackStore {
                 tracing::info!("  feedback: migrated {count} entries to {CF_FEEDBACK} CF");
 
                 let backup = base_path.join("feedback.pre_cf_migration");
+                if backup.exists() {
+                    let _ = std::fs::remove_dir_all(&backup);
+                }
                 if let Err(e) = std::fs::rename(&old_dir, &backup) {
                     tracing::warn!("Could not rename old feedback dir: {e}");
                 }

@@ -732,6 +732,29 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
             .inc();
     }
 
+    // Try current format first (bincode 2.x with current Memory/Experience)
+    // This is the hot path — avoid any allocations before this check.
+    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
+        Ok((memory, _)) => {
+            return Ok((memory, false));
+        } // Current format, no migration needed
+        Err(e) => {
+            // Current format failed — enter fallback chain.
+            // From here on we collect errors for diagnostics.
+            return deserialize_legacy_fallback(data, e, record_branch);
+        }
+    }
+}
+
+/// Fallback deserialization chain for legacy memory formats.
+///
+/// Separated from `deserialize_with_fallback` so the hot path (current format)
+/// stays allocation-free and the compiler can inline/optimize it independently.
+fn deserialize_legacy_fallback(
+    data: &[u8],
+    first_error: bincode::error::DecodeError,
+    record_branch: fn(&str),
+) -> Result<(Memory, bool)> {
     // Log detailed errors for first entry only to help debug format issues
     static DEBUG_ENTRY_LOGGED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -739,14 +762,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
 
     // Collect all errors for debugging
     let mut errors: Vec<(&str, String)> = Vec::new();
-
-    // Try current format first (bincode 2.x with current Memory/Experience)
-    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
-        Ok((memory, _)) => {
-            return Ok((memory, false));
-        } // Current format, no migration needed
-        Err(e) => errors.push(("bincode2 Memory", e.to_string())),
-    }
+    errors.push(("bincode2 Memory", first_error.to_string()));
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
@@ -1183,6 +1199,9 @@ impl MemoryStorage {
                     tracing::info!("  memories: migrated {count} entries to default CF");
 
                     let backup_name = base_path.join("memories.pre_cf_migration");
+                    if backup_name.exists() {
+                        let _ = std::fs::remove_dir_all(&backup_name);
+                    }
                     if let Err(e) = std::fs::rename(&old_memories_dir, &backup_name) {
                         tracing::warn!("Could not rename old memories dir: {e}");
                     }
@@ -1222,6 +1241,9 @@ impl MemoryStorage {
                     tracing::info!("  index: migrated {count} entries to {CF_INDEX} CF");
 
                     let backup_name = base_path.join("memory_index.pre_cf_migration");
+                    if backup_name.exists() {
+                        let _ = std::fs::remove_dir_all(&backup_name);
+                    }
                     if let Err(e) = std::fs::rename(&old_index_dir, &backup_name) {
                         tracing::warn!("Could not rename old memory_index dir: {e}");
                     }

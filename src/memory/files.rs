@@ -109,6 +109,9 @@ impl FileMemoryStore {
                     tracing::info!("  files/{old_name}: migrated {count} entries to {cf_name} CF");
 
                     let backup = files_path.join(format!("{old_name}.pre_cf_migration"));
+                    if backup.exists() {
+                        let _ = std::fs::remove_dir_all(&backup);
+                    }
                     if let Err(e) = std::fs::rename(&old_dir, &backup) {
                         tracing::warn!("Could not rename old {old_name} dir: {e}");
                     }

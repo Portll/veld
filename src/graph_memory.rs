@@ -1198,9 +1198,10 @@ impl GraphMemory {
             {
                 // CF already has data — just rename the old dir
                 let renamed = base_path.join(format!("{}.pre_cf_migration", old_name));
-                if !renamed.exists() {
-                    let _ = std::fs::rename(&old_path, &renamed);
+                if renamed.exists() {
+                    let _ = std::fs::remove_dir_all(&renamed);
                 }
+                let _ = std::fs::rename(&old_path, &renamed);
                 continue;
             }
 
@@ -1237,6 +1238,9 @@ impl GraphMemory {
 
                     // Rename old directory for rollback safety
                     let renamed = base_path.join(format!("{}.pre_cf_migration", old_name));
+                    if renamed.exists() {
+                        let _ = std::fs::remove_dir_all(&renamed);
+                    }
                     if let Err(e) = std::fs::rename(&old_path, &renamed) {
                         tracing::warn!(
                             "Migrated {} entries from {} but failed to rename: {}",
