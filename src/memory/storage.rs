@@ -3535,7 +3535,8 @@ mod tests {
 
         assert_eq!(decoded.id, id);
         assert!(!is_legacy);
-        assert_eq!(after, before + 1);
+        // Current format is not a fallback — metric should NOT increment
+        assert_eq!(after, before);
     }
 
     #[test]
