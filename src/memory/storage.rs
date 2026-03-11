@@ -743,7 +743,6 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     // Try current format first (bincode 2.x with current Memory/Experience)
     match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
         Ok((memory, _)) => {
-            record_branch("bincode2_memory");
             return Ok((memory, false));
         } // Current format, no migration needed
         Err(e) => errors.push(("bincode2 Memory", e.to_string())),

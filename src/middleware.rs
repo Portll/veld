@@ -101,10 +101,11 @@ pub async fn request_id(mut req: Request, next: Next) -> Response {
 /// Adds:
 /// - X-Content-Type-Options: nosniff (prevent MIME-type sniffing)
 /// - X-Frame-Options: DENY (prevent clickjacking)
-/// - Content-Security-Policy: default-src 'none' (restrict resource loading)
+/// - Content-Security-Policy: route-specific policy (strict default for API, relaxed for graph viewer)
 /// - Cache-Control: no-store (prevent caching of API responses)
 /// - Strict-Transport-Security (HSTS) in production mode only
 pub async fn security_headers(req: Request, next: Next) -> Response {
+    let csp = content_security_policy_for_path(req.uri().path());
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
 
@@ -113,10 +114,7 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
-    headers.insert(
-        "Content-Security-Policy",
-        HeaderValue::from_static("default-src 'none'"),
-    );
+    headers.insert("Content-Security-Policy", HeaderValue::from_static(csp));
     headers.insert("Cache-Control", HeaderValue::from_static("no-store"));
 
     // HSTS in production only (requires HTTPS to be meaningful)
@@ -128,6 +126,16 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     }
 
     response
+}
+
+fn content_security_policy_for_path(path: &str) -> &'static str {
+    if path == "/graph/view" {
+        // Graph viewer requires inline script/style and external CDN scripts.
+        // Keep everything else denied and only allow same-origin data/event streams.
+        "default-src 'none'; script-src 'self' 'unsafe-inline' https://d3js.org https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    } else {
+        "default-src 'none'"
+    }
 }
 
 /// Slow request warning threshold (seconds)
@@ -459,5 +467,37 @@ mod tests {
         assert!(hsts.contains("max-age="));
 
         std::env::remove_var("SHODH_ENV");
+    }
+
+    #[tokio::test]
+    async fn security_headers_relaxed_for_graph_view() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use axum::middleware::from_fn;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        std::env::remove_var("SHODH_ENV");
+
+        let app = Router::new()
+            .route("/graph/view", get(|| async { "ok" }))
+            .layer(from_fn(security_headers));
+
+        let req = HttpRequest::builder()
+            .uri("/graph/view")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let csp = resp
+            .headers()
+            .get("Content-Security-Policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self' 'unsafe-inline' https://d3js.org"));
+        assert!(csp.contains("connect-src 'self'"));
     }
 }

@@ -3484,6 +3484,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "flate2",
+ "form_urlencoded",
  "futures",
  "glob",
  "hex",

@@ -1,7 +1,8 @@
 export function isLocalHostFromUrl(apiUrl: string): boolean {
   try {
     const url = new URL(apiUrl);
-    const host = url.hostname;
+    // URL.hostname keeps brackets around IPv6 literals (e.g. "[::1]"), strip them.
+    const host = url.hostname.replace(/^\[|\]$/g, "");
     return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "0.0.0.0";
   } catch {
     return false;

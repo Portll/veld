@@ -393,7 +393,9 @@ impl ShodhBackupEngine {
 
                 // Safe restore: copy to temp dir first, then atomic swap.
                 // This prevents data loss if copy fails midway.
-                let temp_path = target_path.with_extension("restore_tmp");
+                let mut tmp_os = target_path.as_os_str().to_os_string();
+                tmp_os.push(".restore_tmp");
+                let temp_path = PathBuf::from(tmp_os);
                 if temp_path.exists() {
                     fs::remove_dir_all(&temp_path).map_err(|e| {
                         anyhow!(

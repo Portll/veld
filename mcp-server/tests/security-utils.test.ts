@@ -18,10 +18,8 @@ describe("isLocalHostFromUrl", () => {
     expect(isLocalHostFromUrl("http://127.0.0.1:3030")).toBe(true);
   });
 
-  it("returns false for ::1 with brackets (URL parser includes brackets)", () => {
-    // Note: new URL("http://[::1]:3030").hostname === "[::1]" in Node.js
-    // The implementation checks for "::1" without brackets, so this is false
-    expect(isLocalHostFromUrl("http://[::1]:3030")).toBe(false);
+  it("returns true for IPv6 loopback [::1]", () => {
+    expect(isLocalHostFromUrl("http://[::1]:3030")).toBe(true);
   });
 
   it("returns true for 0.0.0.0", () => {
