@@ -148,16 +148,16 @@ shodh-tui
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/dashboard.jpg" width="700" alt="Shodh Dashboard">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/recall.png" width="700" alt="Shodh Recall">
 </p>
 
-<p align="center"><i>Real-time activity feed, memory tiers, and detailed inspection</i></p>
+<p align="center"><i>Semantic recall with hybrid search — relevance scores, memory tiers, and activity feed</i></p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/graph-map.jpg" width="700" alt="Shodh Graph Map">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/projects-todos.jpg" width="700" alt="Shodh Projects & Todos">
 </p>
 
-<p align="center"><i>Knowledge graph — entity connections strengthened through use</i></p>
+<p align="center"><i>GTD task management — projects, todos, comments, and causal lineage</i></p>
 
 ## 47 MCP Tools
 
