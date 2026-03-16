@@ -9,7 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 const VERSION = require('../package.json').version;
 const REPO = 'varun29ankuS/shodh-memory';
@@ -71,10 +71,10 @@ function download(url, dest) {
 // Extract archive
 function extract(archive, dest, platformInfo) {
   if (platformInfo.ext === '.tar.gz') {
-    execSync(`tar -xzf "${archive}" -C "${dest}"`, { stdio: 'inherit' });
+    execFileSync('tar', ['-xzf', archive, '-C', dest], { stdio: 'inherit' });
   } else if (platformInfo.ext === '.zip') {
     // Use PowerShell on Windows
-    execSync(`powershell -Command "Expand-Archive -Path '${archive}' -DestinationPath '${dest}' -Force"`, { stdio: 'inherit' });
+    execFileSync('powershell', ['-Command', `Expand-Archive -Path '${archive}' -DestinationPath '${dest}' -Force`], { stdio: 'inherit' });
   }
 }
 

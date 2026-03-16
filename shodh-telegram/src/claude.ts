@@ -88,7 +88,7 @@ Keep responses brief - this is mobile chat.`;
     const fullPrompt = `${systemContext}\n\nUser: ${userMessage}`;
 
     const claude = spawn("claude", ["-p", "--dangerously-skip-permissions"], {
-      shell: true,
+      shell: process.platform === "win32",
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -148,7 +148,7 @@ Do it now - don't just explain. Actually run the commands needed.
 Keep the response brief - just confirm what you did.`;
 
     const claude = spawn("claude", ["-p", "--dangerously-skip-permissions"], {
-      shell: true,
+      shell: process.platform === "win32",
       cwd: process.cwd(),
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],

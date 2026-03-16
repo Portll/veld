@@ -40,7 +40,7 @@ async function generateWithClaudeCLI(
     // Use --dangerously-skip-permissions to avoid interactive prompts
     // and --verbose to see what's happening
     const claude = spawn("claude", ["-p", "--dangerously-skip-permissions"], {
-      shell: true,
+      shell: process.platform === "win32",
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
