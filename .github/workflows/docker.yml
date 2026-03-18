@@ -29,12 +29,16 @@ jobs:
 
       - name: Determine version and image name
         id: version
+        env:
+          REPO_NAME: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
           # Lowercase the GHCR image name (Docker requires lowercase tags)
-          GHCR_IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          GHCR_IMAGE="ghcr.io/$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')"
           echo "GHCR_IMAGE=$GHCR_IMAGE" >> $GITHUB_OUTPUT
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "VERSION=$VERSION_INPUT" >> $GITHUB_OUTPUT
           else
             echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
           fi
