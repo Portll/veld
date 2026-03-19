@@ -91,7 +91,11 @@ enum Commands {
     /// Launch the TUI dashboard
     Tui {
         /// API URL for the memory server
-        #[arg(long, env = "SHODH_SERVER_URL", default_value = "http://127.0.0.1:3030")]
+        #[arg(
+            long,
+            env = "SHODH_SERVER_URL",
+            default_value = "http://127.0.0.1:3030"
+        )]
         api_url: String,
 
         /// API key for authentication
@@ -544,7 +548,11 @@ fn handle_doctor() -> Result<()> {
                 let _ = std::fs::remove_dir(&storage);
             }
             Err(e) => {
-                eprintln!("  ✗ Storage directory NOT writable: {} ({})", storage.display(), e);
+                eprintln!(
+                    "  ✗ Storage directory NOT writable: {} ({})",
+                    storage.display(),
+                    e
+                );
                 all_ok = false;
             }
         }
@@ -586,10 +594,7 @@ fn handle_doctor() -> Result<()> {
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
 
-    match client
-        .get(format!("http://127.0.0.1:{port}/health"))
-        .send()
-    {
+    match client.get(format!("http://127.0.0.1:{port}/health")).send() {
         Ok(r) if r.status().is_success() => {
             let body: serde_json::Value = r.json().unwrap_or_default();
             let version = body
@@ -599,10 +604,7 @@ fn handle_doctor() -> Result<()> {
             eprintln!("  ✓ Server is running (v{version})");
         }
         Ok(r) => {
-            eprintln!(
-                "  ⚠ Port {port} responds but returned {}",
-                r.status()
-            );
+            eprintln!("  ⚠ Port {port} responds but returned {}", r.status());
             all_ok = false;
         }
         Err(_) => {
