@@ -39,6 +39,19 @@ Every other memory system delegates intelligence to LLM API calls — that's why
 
 ## Get Started
 
+### Unified CLI
+
+```bash
+# Download from GitHub Releases (or brew tap varun29ankuS/shodh-memory && brew install shodh-memory)
+shodh init       # First-time setup — creates config, generates API key, downloads AI model
+shodh server     # Start the memory server on :3030
+shodh tui        # Launch the TUI dashboard
+shodh status     # Check server health
+shodh doctor     # Diagnose issues
+```
+
+One binary, all functionality. No Docker, no API keys, no external dependencies.
+
 ### Claude Code (one command)
 
 ```bash
@@ -145,7 +158,7 @@ Single binary. No GPU required. Content-hash dedup ensures identical memories ar
 ## TUI Dashboard
 
 ```bash
-shodh-tui
+shodh tui
 ```
 
 <p align="center">

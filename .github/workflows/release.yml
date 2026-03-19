@@ -98,6 +98,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           mkdir -p package
+          cp target/${{ matrix.target }}/release/shodh package/
           cp target/${{ matrix.target }}/release/shodh-memory-server package/
           cp tui/target/${{ matrix.target }}/release/shodh-tui package/
           cp ${{ matrix.ort_lib_name }} package/
@@ -105,9 +106,10 @@ jobs:
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
           export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
-          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
+          exec "$SCRIPT_DIR/shodh" server "$@"
           EOF
           chmod +x package/shodh-memory
+          chmod +x package/shodh
           chmod +x package/shodh-memory-server
           chmod +x package/shodh-tui
           tar -czvf ${{ matrix.name }}.tar.gz -C package .
@@ -116,6 +118,7 @@ jobs:
         if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
         run: |
           mkdir -p package
+          cp target/${{ matrix.target }}/release/shodh package/
           cp target/${{ matrix.target }}/release/shodh-memory-server package/
           cp tui/target/${{ matrix.target }}/release/shodh-tui package/
           cp ${{ matrix.ort_lib_name }} package/
@@ -123,9 +126,10 @@ jobs:
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
           export DYLD_LIBRARY_PATH="$SCRIPT_DIR:$DYLD_LIBRARY_PATH"
-          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
+          exec "$SCRIPT_DIR/shodh" server "$@"
           EOF
           chmod +x package/shodh-memory
+          chmod +x package/shodh
           chmod +x package/shodh-memory-server
           chmod +x package/shodh-tui
           tar -czvf ${{ matrix.name }}.tar.gz -C package .
@@ -135,6 +139,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path package
+          Copy-Item "target\${{ matrix.target }}\release\shodh.exe" -Destination "package\"
           Copy-Item "target\${{ matrix.target }}\release\shodh-memory-server.exe" -Destination "package\"
           Copy-Item "tui\target\${{ matrix.target }}\release\shodh-tui.exe" -Destination "package\"
           Copy-Item "onnxruntime.dll" -Destination "package\"
@@ -142,7 +147,7 @@ jobs:
           @echo off
           set "SCRIPT_DIR=%~dp0"
           set "PATH=%SCRIPT_DIR%;%PATH%"
-          "%SCRIPT_DIR%shodh-memory-server.exe" %*
+          "%SCRIPT_DIR%shodh.exe" server %*
           "@ | Out-File -FilePath "package\shodh-memory.bat" -Encoding ASCII
           Compress-Archive -Path "package\*" -DestinationPath "${{ matrix.name }}.zip"
 
@@ -193,6 +198,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p package
+          cp target/aarch64-unknown-linux-gnu/release/shodh package/
           cp target/aarch64-unknown-linux-gnu/release/shodh-memory-server package/
           cp tui/target/aarch64-unknown-linux-gnu/release/shodh-tui package/
           cp libonnxruntime.so package/
@@ -200,9 +206,10 @@ jobs:
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
           export LD_LIBRARY_PATH="$SCRIPT_DIR:$LD_LIBRARY_PATH"
-          exec "$SCRIPT_DIR/shodh-memory-server" "$@"
+          exec "$SCRIPT_DIR/shodh" server "$@"
           EOF
           chmod +x package/shodh-memory
+          chmod +x package/shodh
           chmod +x package/shodh-memory-server
           chmod +x package/shodh-tui
           tar -czvf shodh-memory-linux-arm64.tar.gz -C package .

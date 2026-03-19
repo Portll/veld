@@ -32,6 +32,7 @@ pub mod middleware;
 pub mod mif;
 pub mod query_parsing;
 pub mod relevance;
+pub mod server;
 pub mod similarity;
 pub mod streaming;
 pub mod tracing_setup;
