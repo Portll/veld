@@ -249,13 +249,15 @@ ros2 run zenoh_bridge_ros2dds zenoh_bridge_ros2dds
 
 | Operation | Key Expression | Description |
 |-----------|---------------|-------------|
-| Remember | `shodh/{robot_id}/remember` | Store with GPS, local position, heading, sensor data, mission context |
-| Recall | `shodh/{robot_id}/recall` | Spatial search (haversine), mission replay, RL reward-based retrieval |
-| Stream | `shodh/{robot_id}/stream/sensor` | Auto-remember high-frequency sensor data via extraction pipeline |
-| Mission | `shodh/{robot_id}/mission/start` | Track mission boundaries, searchable across missions |
+| Remember | `shodh/{user_id}/remember` | Store with GPS, local position, heading, sensor data, mission context |
+| Recall | `shodh/{user_id}/recall` | Spatial search (haversine), mission replay, RL reward-based retrieval |
+| Stream | `shodh/{user_id}/stream/sensor` | Auto-remember high-frequency sensor data via extraction pipeline |
+| Mission | `shodh/{user_id}/mission/start` | Track mission boundaries, searchable across missions |
 | Fleet | `shodh/fleet/**` | Automatic peer discovery via Zenoh liveliness tokens |
 
-Every Experience stores 30+ robotics fields: `geo_location`, `local_position`, `heading`, `sensor_data`, `robot_id`, `mission_id`, `action_type`, `reward`, `terrain_type`, `nearby_agents`, failure/anomaly tracking, decision context, and outcome learning.
+Each robot uses its own `user_id` as the key segment (e.g., `shodh/spot-1/remember`). The `robot_id` is an optional payload field for fleet grouping.
+
+Every Experience carries 26 robotics-specific fields: `geo_location`, `local_position`, `heading`, `sensor_data`, `robot_id`, `mission_id`, `action_type`, `reward`, `terrain_type`, `nearby_agents`, `decision_context`, `action_params`, `outcome_type`, `confidence`, failure/anomaly tracking, recovery actions, and prediction learning.
 
 <details>
 <summary>Zenoh remember example (robot publishing a memory)</summary>
