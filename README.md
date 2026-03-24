@@ -4,7 +4,7 @@
 
 <h1 align="center">Shodh-Memory</h1>
 
-<p align="center"><b>Your AI agent remembers what matters, forgets what doesn't, and gets smarter the more you use it.</b></p>
+<p align="center"><b>Persistent cognitive memory for AI agents and robots. Remembers what matters, forgets what doesn't, gets smarter with use.</b></p>
 
 <p align="center">
   <a href="https://github.com/varun29ankuS/shodh-memory/actions"><img src="https://github.com/varun29ankuS/shodh-memory/workflows/CI/badge.svg" alt="build"></a>
@@ -20,9 +20,9 @@
 
 ---
 
-AI agents forget everything between sessions. They repeat mistakes, lose context, and treat every conversation like the first one.
+AI agents forget everything between sessions. Robots lose context between missions. They repeat mistakes, miss patterns, and treat every interaction like the first one.
 
-Shodh-Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. No API keys. No cloud. No external databases. One binary.
+Shodh-Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. Works for chat agents (MCP/HTTP), robots (Zenoh/ROS2), and edge devices. No API keys. No cloud. No external databases. One binary.
 
 ## Why Not Just Use mem0 / Cognee / Zep?
 
@@ -34,6 +34,7 @@ Shodh-Memory fixes this. It's persistent memory that actually learns — memorie
 | Learns from usage | **Yes** (Hebbian) | No | No | No |
 | Forgets irrelevant data | **Yes** (decay) | No | No | Temporal only |
 | Runs fully offline | **Yes** | No | No | No |
+| Robotics / ROS2 native | **Yes** (Zenoh) | No | No | No |
 | Binary size | **~17MB** | pip install + API keys | pip install + API keys + Neo4j | Cloud only |
 
 Every other memory system delegates intelligence to LLM API calls — that's why they're slow, expensive, and can't work offline. Shodh uses algorithmic intelligence: local embeddings, mathematical decay, learned associations. No LLM in the loop.
@@ -231,6 +232,87 @@ curl -X POST http://localhost:3030/api/recall \
   -d '{"user_id": "user-1", "query": "user preferences", "limit": 5}'
 ```
 </details>
+
+## Robotics & ROS2
+
+Shodh-Memory isn't just for chat agents. It's persistent memory for robots — Spot, drones, humanoids, any system running ROS2 or Zenoh.
+
+```bash
+# Enable Zenoh transport (compile with --features zenoh)
+SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 shodh server
+
+# ROS2 robots connect via zenoh-bridge-ros2dds or rmw_zenoh — zero code changes
+ros2 run zenoh_bridge_ros2dds zenoh_bridge_ros2dds
+```
+
+**What robots can do over Zenoh:**
+
+| Operation | Key Expression | Description |
+|-----------|---------------|-------------|
+| Remember | `shodh/{robot_id}/remember` | Store with GPS, local position, heading, sensor data, mission context |
+| Recall | `shodh/{robot_id}/recall` | Spatial search (haversine), mission replay, RL reward-based retrieval |
+| Stream | `shodh/{robot_id}/stream/sensor` | Auto-remember high-frequency sensor data via extraction pipeline |
+| Mission | `shodh/{robot_id}/mission/start` | Track mission boundaries, searchable across missions |
+| Fleet | `shodh/fleet/**` | Automatic peer discovery via Zenoh liveliness tokens |
+
+Every Experience stores 30+ robotics fields: `geo_location`, `local_position`, `heading`, `sensor_data`, `robot_id`, `mission_id`, `action_type`, `reward`, `terrain_type`, `nearby_agents`, failure/anomaly tracking, decision context, and outcome learning.
+
+<details>
+<summary>Zenoh remember example (robot publishing a memory)</summary>
+
+```json
+{
+  "user_id": "spot-1",
+  "content": "Detected crack in concrete at waypoint alpha",
+  "robot_id": "spot_v2",
+  "mission_id": "building_inspection_2026",
+  "geo_location": [37.7749, -122.4194, 10.0],
+  "local_position": [12.5, 3.2, 0.0],
+  "heading": 90.0,
+  "sensor_data": {"battery": 72.5, "temperature": 28.3},
+  "action_type": "inspect",
+  "reward": 0.9,
+  "terrain_type": "indoor",
+  "tags": ["crack", "concrete", "structural"]
+}
+```
+</details>
+
+<details>
+<summary>Zenoh spatial recall example (robot querying nearby memories)</summary>
+
+```json
+{
+  "user_id": "spot-1",
+  "query": "structural damage near entrance",
+  "mode": "spatial",
+  "lat": 37.7749,
+  "lon": -122.4194,
+  "radius_meters": 50.0,
+  "mission_id": "building_inspection_2026"
+}
+```
+</details>
+
+<details>
+<summary>Environment variables</summary>
+
+```bash
+SHODH_ZENOH_ENABLED=true                # Enable Zenoh transport
+SHODH_ZENOH_MODE=peer                   # peer | client | router
+SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447    # Listen endpoints
+SHODH_ZENOH_CONNECT=tcp/1.2.3.4:7447   # Connect endpoints
+SHODH_ZENOH_PREFIX=shodh               # Key expression prefix
+
+# Auto-subscribe to ROS2 topics (via zenoh-bridge-ros2dds)
+SHODH_ZENOH_AUTO_TOPICS='[
+  {"key_expr": "rt/spot1/status", "user_id": "spot-1", "mode": "sensor"},
+  {"key_expr": "rt/nav/events", "user_id": "spot-1", "mode": "event"}
+]'
+```
+</details>
+
+Works with ROS2 Kilted (rmw_zenoh), PX4 drones, Boston Dynamics Spot, humanoids — anything that speaks Zenoh or ROS2 DDS.
 
 ## Platform Support
 

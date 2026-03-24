@@ -3,12 +3,12 @@ name = "shodh-memory"
 version = "0.1.91"
 edition = "2021"
 authors = ["Shodh Team <29.varuns@gmail.com>"]
-description = "Persistent memory for AI agents and edge devices - 3-tier memory, Hebbian learning, knowledge graph. Single binary, runs offline."
+description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
 license = "Apache-2.0"
 repository = "https://github.com/varun29ankuS/shodh-memory"
 homepage = "https://github.com/varun29ankuS/shodh-memory"
 readme = "README-rust.md"
-keywords = ["memory", "ai", "llm", "embedding", "cognitive"]
+keywords = ["memory", "ai", "robotics", "zenoh", "cognitive"]
 categories = ["science", "database", "embedded"]
 exclude = [
     "mcp-server/",
