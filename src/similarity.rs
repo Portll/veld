@@ -20,7 +20,15 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
 
-    dot / (norm_a * norm_b)
+    let result = dot / (norm_a * norm_b);
+
+    // Guard against NaN/Inf from corrupt embeddings (e.g. NaN in stored vectors).
+    // NaN comparisons are always false, so norm_a/norm_b checks above won't catch NaN inputs.
+    if result.is_finite() {
+        result
+    } else {
+        0.0
+    }
 }
 
 /// Find top-k most similar vectors
@@ -78,6 +86,22 @@ mod tests {
         let vec3 = vec![1.0, 2.0, 3.0];
         assert_eq!(cosine_similarity(&zero, &vec3), 0.0);
         assert_eq!(cosine_similarity(&vec3, &zero), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_nan_inf_guard() {
+        // NaN in embeddings should return 0.0, not propagate NaN
+        let nan_vec = vec![f32::NAN, 1.0, 0.0];
+        let normal = vec![1.0, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&nan_vec, &normal), 0.0);
+        assert_eq!(cosine_similarity(&normal, &nan_vec), 0.0);
+
+        // Inf in embeddings should return 0.0
+        let inf_vec = vec![f32::INFINITY, 1.0, 0.0];
+        assert_eq!(cosine_similarity(&inf_vec, &normal), 0.0);
+
+        // NaN in both should return 0.0
+        assert_eq!(cosine_similarity(&nan_vec, &nan_vec), 0.0);
     }
 
     #[test]

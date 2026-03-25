@@ -205,7 +205,7 @@ pub fn compute_mapper(store: &SlowStore, config: &MapperConfig) -> Result<Mapper
     }
 
     // Step 4: Build nodes
-    let mut nodes: Vec<MapperNode> = all_clusters
+    let nodes: Vec<MapperNode> = all_clusters
         .iter()
         .enumerate()
         .map(|(id, (interval_idx, members))| {

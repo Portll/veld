@@ -290,7 +290,9 @@ fn compute_sparse_distances(
         for j in (i + 1)..n {
             let sim = cosine_similarity(&entities[i].2, &entities[j].2);
             let dist = 1.0 - sim;
-            if dist <= max_radius {
+            // Skip non-finite distances (from corrupt embeddings) — cosine_similarity
+            // returns 0.0 for NaN inputs, so dist would be 1.0, but guard anyway.
+            if dist.is_finite() && dist <= max_radius {
                 distances.insert((i, j), dist);
             }
         }
