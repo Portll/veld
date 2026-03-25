@@ -616,57 +616,22 @@ struct LineageStatsResponse {
 #[derive(Serialize)]
 struct GapAnalyzeRequest {
     user_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct GapAnalyzeResponse {
-    thoughts: Vec<GapThought>,
-    stats: GapStats,
-}
-
-#[derive(Deserialize)]
-struct GapThought {
-    id: String,
-    kind: String,
-    confidence: f32,
-    description: String,
-    hypothesis: Option<String>,
-    impact_score: f32,
-    entity_names: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct GapStats {
-    gaps_detected: usize,
-    golden_features_generated: usize,
-    thoughts_generated: usize,
-    fractal_patterns_found: usize,
+    gaps: Vec<GapSummaryMcp>,
+    type_counts: std::collections::HashMap<String, usize>,
     duration_ms: u64,
 }
 
-#[derive(Serialize)]
-struct GapThoughtsRequest {
-    user_id: String,
-    limit: usize,
-}
-
 #[derive(Deserialize)]
-struct GapThoughtsResponse {
-    thoughts: Vec<GapThought>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GapAnalyzeParams {
-    #[schemars(description = "Scope of analysis: 'content' (knowledge), 'codebase' (code structure), or 'schema' (database)")]
-    scope: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GapThoughtsParams {
-    #[schemars(description = "Maximum number of thoughts to return")]
-    limit: Option<usize>,
+struct GapSummaryMcp {
+    id: String,
+    gap_type: String,
+    confidence: f32,
+    impact_score: f32,
+    entity_names: Vec<String>,
 }
 
 // =============================================================================
@@ -1078,19 +1043,15 @@ impl ShodhMcpServer {
     }
 
     #[tool(
-        description = "Analyze gaps in the knowledge graph. Detects missing connections (U-shapes), structural weaknesses (diamonds, stars), knowledge silos (orbit gaps), voids (empty regions), and Planet X (implied unseen concepts). Returns actionable thoughts about what's missing."
+        description = "Detect structural gaps in the knowledge graph. Finds missing connections (open triads), parallel paths not reconciled (diamonds), hub-spoke disconnects (stars), and cluster silos (orbits). Returns raw structural data."
     )]
-    async fn gap_analyze(
-        &self,
-        Parameters(params): Parameters<GapAnalyzeParams>,
-    ) -> Result<CallToolResult, McpError> {
+    async fn gap_analyze(&self) -> Result<CallToolResult, McpError> {
         let result: Result<GapAnalyzeResponse> = self
             .client
             .post(
                 "/api/gap/analyze",
                 &GapAnalyzeRequest {
                     user_id: self.client.user_id.clone(),
-                    scope: params.scope,
                 },
             )
             .await;
@@ -1098,83 +1059,31 @@ impl ShodhMcpServer {
         match result {
             Ok(resp) => {
                 let mut output = format!(
-                    "**Gap Analysis** ({} gaps -> {} features -> {} thoughts, {}ms)\n\n",
-                    resp.stats.gaps_detected,
-                    resp.stats.golden_features_generated,
-                    resp.stats.thoughts_generated,
-                    resp.stats.duration_ms
+                    "**Structural Gap Analysis** ({} gaps, {}ms)\n\n",
+                    resp.gaps.len(),
+                    resp.duration_ms
                 );
 
-                if resp.stats.fractal_patterns_found > 0 {
+                for (gap_type, count) in &resp.type_counts {
+                    output.push_str(&format!("- {}: {}\n", gap_type, count));
+                }
+                output.push('\n');
+
+                for gap in &resp.gaps {
                     output.push_str(&format!(
-                        "**{} fractal patterns detected** (systematic blindness)\n\n",
-                        resp.stats.fractal_patterns_found
+                        "### [{}] {} (confidence: {:.0}%, impact: {:.0}%)\n  Entities: {}\n\n",
+                        gap.gap_type,
+                        gap.id,
+                        gap.confidence * 100.0,
+                        gap.impact_score * 100.0,
+                        gap.entity_names.join(", ")
                     ));
                 }
 
-                for thought in &resp.thoughts {
-                    output.push_str(&format!(
-                        "### [{}] {} (confidence: {:.0}%, impact: {:.0}%)\n{}\n",
-                        thought.kind,
-                        thought.entity_names.join(", "),
-                        thought.confidence * 100.0,
-                        thought.impact_score * 100.0,
-                        thought.description
-                    ));
-                    if let Some(ref hyp) = thought.hypothesis {
-                        output.push_str(&format!("**Hypothesis:** {}\n", hyp));
-                    }
-                    output.push('\n');
+                if resp.gaps.is_empty() {
+                    output.push_str("No structural gaps detected.\n");
                 }
 
-                if resp.thoughts.is_empty() {
-                    output.push_str("No significant gaps detected in the knowledge graph.\n");
-                }
-
-                Ok(CallToolResult::success(vec![Content::text(output)]))
-            }
-            Err(e) => Err(McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: Cow::from(e.to_string()),
-                data: None,
-            }),
-        }
-    }
-
-    #[tool(
-        description = "Get previously generated thoughts about knowledge graph gaps. These are insights about missing connections, structural weaknesses, and unexplored regions."
-    )]
-    async fn gap_thoughts(
-        &self,
-        Parameters(params): Parameters<GapThoughtsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let result: Result<GapThoughtsResponse> = self
-            .client
-            .post(
-                "/api/gap/thoughts",
-                &GapThoughtsRequest {
-                    user_id: self.client.user_id.clone(),
-                    limit: params.limit.unwrap_or(10),
-                },
-            )
-            .await;
-
-        match result {
-            Ok(resp) => {
-                let mut output = format!("**Active Thoughts** ({})\n\n", resp.thoughts.len());
-                for thought in &resp.thoughts {
-                    output.push_str(&format!(
-                        "- **[{}]** {}\n  {}\n",
-                        thought.kind, thought.description,
-                        thought
-                            .hypothesis
-                            .as_deref()
-                            .unwrap_or("No hypothesis yet")
-                    ));
-                }
-                if resp.thoughts.is_empty() {
-                    output.push_str("No active thoughts. Run `gap_analyze` first.\n");
-                }
                 Ok(CallToolResult::success(vec![Content::text(output)]))
             }
             Err(e) => Err(McpError {

@@ -1,20 +1,18 @@
-//! Gap Analysis and Thought Surfacing Handlers
+//! Structural Graph Analysis Handlers
 //!
-//! REST API endpoints for gap topology detection, golden feature generation,
-//! and thought surfacing. These enable the knowledge graph to reason about
-//! its own structural gaps — what it doesn't know and what shape the missing
-//! information has.
+//! REST API endpoints exposing structural analysis primitives on the knowledge graph:
+//! gap detection, Voronoi cell analysis, persistent homology, and Mapper topology.
+//! These return raw structural data — interpretation is left to consumers.
 
 use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::gap_topology::{GapDetectionConfig, GapScope};
+use crate::memory::gap_topology::{GapDetectionConfig, GapDetector};
 use crate::memory::mapper::{compute_mapper, MapperConfig, MapperFilter};
 use crate::memory::persistence::{self, PersistenceConfig};
 use crate::memory::slow_store::SlowStore;
-use crate::memory::thoughts::{ThoughtEngine, ThoughtReport};
 use crate::memory::voronoi::{VoronoiAnalyzer, VoronoiConfig};
 use crate::validation;
 
@@ -49,23 +47,18 @@ fn validate_range_usize(value: usize, max: usize, _name: &str) -> Result<usize, 
 }
 
 // =============================================================================
-// REQUEST / RESPONSE TYPES
+// GAP DETECTION
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct GapAnalysisRequest {
     pub user_id: String,
-    #[serde(default = "default_scope")]
-    pub scope: String,
     #[serde(default = "default_min_strength")]
     pub min_edge_strength: f32,
     #[serde(default = "default_max_gaps")]
     pub max_gaps_per_type: usize,
 }
 
-fn default_scope() -> String {
-    "content".to_string()
-}
 fn default_min_strength() -> f32 {
     0.2
 }
@@ -75,57 +68,93 @@ fn default_max_gaps() -> usize {
 
 #[derive(Debug, Serialize)]
 pub struct GapAnalysisResponse {
-    pub thoughts: Vec<ThoughtSummary>,
-    pub stats: ThoughtStatsResponse,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ThoughtSummary {
-    pub id: String,
-    pub kind: String,
-    pub scope: String,
-    pub confidence: f32,
-    pub description: String,
-    pub hypothesis: Option<String>,
-    pub impact_score: f32,
-    pub entity_names: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ThoughtStatsResponse {
-    pub gaps_detected: usize,
-    pub golden_features_generated: usize,
-    pub thoughts_generated: usize,
-    pub fractal_patterns_found: usize,
+    pub gaps: Vec<GapSummary>,
+    pub type_counts: std::collections::HashMap<String, usize>,
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GetThoughtsRequest {
-    pub user_id: String,
-    #[serde(default = "default_thought_limit")]
-    pub limit: usize,
-}
-
-fn default_thought_limit() -> usize {
-    10
+#[derive(Debug, Serialize)]
+pub struct GapSummary {
+    pub id: String,
+    pub gap_type: String,
+    pub confidence: f32,
+    pub embedding_similarity: Option<f32>,
+    pub impact_score: f32,
+    pub entity_names: Vec<String>,
+    pub shape: ShapeSummary,
 }
 
 #[derive(Debug, Serialize)]
-pub struct GetThoughtsResponse {
-    pub thoughts: Vec<ThoughtSummary>,
+pub struct ShapeSummary {
+    pub node_count: usize,
+    pub existing_edges: usize,
+    pub missing_edges: usize,
+    pub sparsity: f32,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DismissThoughtRequest {
-    pub user_id: String,
-    pub thought_id: String,
+/// Detect structural gaps in the knowledge graph.
+///
+/// POST /api/gap/analyze
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+pub async fn analyze_gaps(
+    State(state): State<AppState>,
+    Json(req): Json<GapAnalysisRequest>,
+) -> Result<Json<GapAnalysisResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let min_strength = validate_range_f32(req.min_edge_strength, 0.0, 1.0, "min_edge_strength")?;
+    let max_gaps =
+        validate_range_usize(req.max_gaps_per_type, MAX_GAPS_PER_TYPE, "max_gaps_per_type")?;
+
+    let user_id = req.user_id.clone();
+    let state_clone = state.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<GapAnalysisResponse, anyhow::Error> {
+        let store = get_or_create_slow_store(&state_clone, &user_id)?;
+        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+
+        let config = GapDetectionConfig {
+            min_edge_strength: min_strength,
+            max_gaps_per_type: max_gaps,
+            ..Default::default()
+        };
+
+        let result = GapDetector::detect(&store, &config)?;
+
+        let gaps: Vec<GapSummary> = result
+            .gaps
+            .iter()
+            .map(|g| GapSummary {
+                id: g.id.clone(),
+                gap_type: g.gap_type.as_str().to_string(),
+                confidence: g.confidence,
+                embedding_similarity: g.embedding_similarity,
+                impact_score: g.impact_score,
+                entity_names: g.entities.iter().map(|e| e.name.clone()).collect(),
+                shape: ShapeSummary {
+                    node_count: g.shape.node_count,
+                    existing_edges: g.shape.existing_edges,
+                    missing_edges: g.shape.missing_edges,
+                    sparsity: g.shape.sparsity,
+                },
+            })
+            .collect();
+
+        Ok(GapAnalysisResponse {
+            gaps,
+            type_counts: result.type_counts,
+            duration_ms: result.duration_ms,
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Gap analysis task failed: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(result))
 }
 
-#[derive(Debug, Serialize)]
-pub struct DismissThoughtResponse {
-    pub dismissed: bool,
-}
+// =============================================================================
+// VORONOI ANALYSIS
+// =============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct VoronoiAnalysisRequest {
@@ -142,11 +171,9 @@ fn default_k() -> usize {
 pub struct VoronoiAnalysisResponse {
     pub entity_count: usize,
     pub voids_found: usize,
-    pub planet_x_found: usize,
     pub avg_anisotropy: f32,
     pub most_isolated: Vec<IsolatedEntity>,
     pub voids: Vec<VoidSummary>,
-    pub planet_x: Vec<PlanetXSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,215 +188,9 @@ pub struct VoidSummary {
     pub boundary_entities: Vec<String>,
     pub radius: f32,
     pub confidence: f32,
-    pub implied_topic: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct PlanetXSummary {
-    pub evidence_entities: Vec<String>,
-    pub convergence_count: usize,
-    pub confidence: f32,
-    pub description: String,
-}
-
-// =============================================================================
-// MAPPER
-// =============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct MapperRequest {
-    pub user_id: String,
-    #[serde(default = "default_mapper_filter")]
-    pub filter: String,
-    #[serde(default = "default_num_intervals")]
-    pub num_intervals: usize,
-    #[serde(default = "default_overlap")]
-    pub overlap: f32,
-}
-
-fn default_mapper_filter() -> String {
-    "centroid_distance".to_string()
-}
-fn default_num_intervals() -> usize {
-    10
-}
-fn default_overlap() -> f32 {
-    0.3
-}
-
-#[derive(Debug, Serialize)]
-pub struct MapperResponse {
-    pub nodes: Vec<MapperNodeSummary>,
-    pub edges: Vec<MapperEdgeSummary>,
-    pub num_components: usize,
-    pub num_loops: usize,
-    pub flare_count: usize,
-    pub branch_count: usize,
-    pub filter: String,
-    pub stats: MapperStatsSummary,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MapperNodeSummary {
-    pub id: usize,
-    pub member_names: Vec<String>,
-    pub size: usize,
-    pub avg_filter_value: f32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MapperEdgeSummary {
-    pub from: usize,
-    pub to: usize,
-    pub weight: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MapperStatsSummary {
-    pub entity_count: usize,
-    pub interval_count: usize,
-    pub cluster_count: usize,
-    pub edge_count: usize,
-    pub duration_ms: u64,
-}
-
-// =============================================================================
-// HANDLERS
-// =============================================================================
-
-/// Run full gap analysis: sync graph → detect gaps → generate thoughts.
-///
-/// POST /api/gap/analyze
-#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
-pub async fn analyze_gaps(
-    State(state): State<AppState>,
-    Json(req): Json<GapAnalysisRequest>,
-) -> Result<Json<GapAnalysisResponse>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    let min_strength = validate_range_f32(req.min_edge_strength, 0.0, 1.0, "min_edge_strength")?;
-    let max_gaps = validate_range_usize(req.max_gaps_per_type, MAX_GAPS_PER_TYPE, "max_gaps_per_type")?;
-
-    let user_id = req.user_id.clone();
-    let scope = match req.scope.as_str() {
-        "codebase" => GapScope::Codebase,
-        "schema" => GapScope::Schema,
-        _ => GapScope::Content,
-    };
-    let state_clone = state.clone();
-
-    let result = tokio::task::spawn_blocking(move || -> Result<ThoughtReport, anyhow::Error> {
-        // Get or create slow store
-        let store = get_or_create_slow_store(&state_clone, &user_id)?;
-
-        // Sync graph data into SQLite
-        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
-
-        // Run gap detection + thought generation
-        let config = GapDetectionConfig {
-            min_edge_strength: min_strength,
-            max_gaps_per_type: max_gaps,
-            scope,
-            ..Default::default()
-        };
-
-        ThoughtEngine::generate(&store, &config)
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Gap analysis task failed: {e}")))?
-    .map_err(AppError::Internal)?;
-
-    let thoughts: Vec<ThoughtSummary> = result
-        .thoughts
-        .iter()
-        .map(|t| ThoughtSummary {
-            id: t.id.clone(),
-            kind: t.kind.as_str().to_string(),
-            scope: t.scope.as_str().to_string(),
-            confidence: t.confidence,
-            description: t.description.clone(),
-            hypothesis: t.hypothesis.clone(),
-            impact_score: t.impact_score,
-            entity_names: t.entities.iter().map(|(_, name)| name.clone()).collect(),
-        })
-        .collect();
-
-    Ok(Json(GapAnalysisResponse {
-        thoughts,
-        stats: ThoughtStatsResponse {
-            gaps_detected: result.stats.gaps_detected,
-            golden_features_generated: result.stats.golden_features_generated,
-            thoughts_generated: result.stats.thoughts_generated,
-            fractal_patterns_found: result.stats.fractal_patterns_found,
-            duration_ms: result.stats.duration_ms,
-        },
-    }))
-}
-
-/// Get previously generated thoughts.
-///
-/// POST /api/gap/thoughts
-#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
-pub async fn get_thoughts(
-    State(state): State<AppState>,
-    Json(req): Json<GetThoughtsRequest>,
-) -> Result<Json<GetThoughtsResponse>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-
-    let user_id = req.user_id.clone();
-    let limit = req.limit;
-    let state_clone = state.clone();
-
-    let thoughts = tokio::task::spawn_blocking(move || -> Result<Vec<ThoughtSummary>, anyhow::Error> {
-        let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        let active = ThoughtEngine::get_active_thoughts(&store, limit)?;
-
-        Ok(active
-            .into_iter()
-            .map(|t| ThoughtSummary {
-                id: t.id,
-                kind: t.kind.as_str().to_string(),
-                scope: t.scope.as_str().to_string(),
-                confidence: t.confidence,
-                description: t.description,
-                hypothesis: t.hypothesis,
-                impact_score: t.impact_score,
-                entity_names: t.entities.into_iter().map(|(_, name)| name).collect(),
-            })
-            .collect())
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Get thoughts task failed: {e}")))?
-    .map_err(AppError::Internal)?;
-
-    Ok(Json(GetThoughtsResponse { thoughts }))
-}
-
-/// Dismiss a thought (mark as not useful).
-///
-/// POST /api/gap/dismiss
-#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
-pub async fn dismiss_thought(
-    State(state): State<AppState>,
-    Json(req): Json<DismissThoughtRequest>,
-) -> Result<Json<DismissThoughtResponse>, AppError> {
-    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-
-    let user_id = req.user_id.clone();
-    let thought_id = req.thought_id.clone();
-    let state_clone = state.clone();
-
-    tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-        let store = get_or_create_slow_store(&state_clone, &user_id)?;
-        store.dismiss_thought(&thought_id)
-    })
-    .await
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Dismiss task failed: {e}")))?
-    .map_err(AppError::Internal)?;
-
-    Ok(Json(DismissThoughtResponse { dismissed: true }))
-}
-
-/// Run Voronoi analysis on the knowledge graph embedding space.
+/// Run Voronoi cell analysis on the knowledge graph embedding space.
 ///
 /// POST /api/gap/voronoi
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
@@ -393,7 +214,6 @@ pub async fn voronoi_analysis(
         };
         let analysis = VoronoiAnalyzer::analyze(&store, &config)?;
 
-        // Build response
         let mut most_isolated: Vec<IsolatedEntity> = analysis
             .cells
             .iter()
@@ -417,29 +237,15 @@ pub async fn voronoi_analysis(
                 boundary_entities: v.boundary_entities.iter().map(|(_, n)| n.clone()).collect(),
                 radius: v.radius,
                 confidence: v.confidence,
-                implied_topic: v.implied_topic.clone(),
-            })
-            .collect();
-
-        let planet_x: Vec<PlanetXSummary> = analysis
-            .planet_x_candidates
-            .iter()
-            .map(|px| PlanetXSummary {
-                evidence_entities: px.evidence_entities.iter().map(|(_, n)| n.clone()).collect(),
-                convergence_count: px.convergence_count,
-                confidence: px.confidence,
-                description: px.predicted_description.clone(),
             })
             .collect();
 
         Ok(VoronoiAnalysisResponse {
             entity_count: analysis.stats.entity_count,
             voids_found: analysis.voids.len(),
-            planet_x_found: analysis.planet_x_candidates.len(),
             avg_anisotropy: analysis.stats.avg_anisotropy,
             most_isolated,
             voids,
-            planet_x,
         })
     })
     .await
@@ -450,7 +256,7 @@ pub async fn voronoi_analysis(
 }
 
 // =============================================================================
-// PERSISTENCE
+// PERSISTENCE (PERSISTENT HOMOLOGY)
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -517,7 +323,8 @@ pub async fn persistence_analysis(
 ) -> Result<Json<PersistenceResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     let step_size = validate_range_f32(req.step_size, MIN_STEP_SIZE, MAX_STEP_SIZE, "step_size")?;
-    let min_persistence = validate_range_f32(req.min_persistence, MIN_PERSISTENCE, MAX_STEP_SIZE, "min_persistence")?;
+    let min_persistence =
+        validate_range_f32(req.min_persistence, MIN_PERSISTENCE, MAX_STEP_SIZE, "min_persistence")?;
 
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
@@ -600,6 +407,67 @@ pub async fn persistence_analysis(
     Ok(Json(result))
 }
 
+// =============================================================================
+// MAPPER
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MapperRequest {
+    pub user_id: String,
+    #[serde(default = "default_mapper_filter")]
+    pub filter: String,
+    #[serde(default = "default_num_intervals")]
+    pub num_intervals: usize,
+    #[serde(default = "default_overlap")]
+    pub overlap: f32,
+}
+
+fn default_mapper_filter() -> String {
+    "centroid_distance".to_string()
+}
+fn default_num_intervals() -> usize {
+    10
+}
+fn default_overlap() -> f32 {
+    0.3
+}
+
+#[derive(Debug, Serialize)]
+pub struct MapperResponse {
+    pub nodes: Vec<MapperNodeSummary>,
+    pub edges: Vec<MapperEdgeSummary>,
+    pub num_components: usize,
+    pub num_loops: usize,
+    pub flare_count: usize,
+    pub branch_count: usize,
+    pub filter: String,
+    pub stats: MapperStatsSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MapperNodeSummary {
+    pub id: usize,
+    pub member_names: Vec<String>,
+    pub size: usize,
+    pub avg_filter_value: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MapperEdgeSummary {
+    pub from: usize,
+    pub to: usize,
+    pub weight: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MapperStatsSummary {
+    pub entity_count: usize,
+    pub interval_count: usize,
+    pub cluster_count: usize,
+    pub edge_count: usize,
+    pub duration_ms: u64,
+}
+
 /// Run Mapper topological analysis on the knowledge graph.
 ///
 /// POST /api/gap/mapper
@@ -609,7 +477,8 @@ pub async fn mapper_analysis(
     Json(req): Json<MapperRequest>,
 ) -> Result<Json<MapperResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
-    let num_intervals = validate_range_usize(req.num_intervals.max(1), MAX_NUM_INTERVALS, "num_intervals")?;
+    let num_intervals =
+        validate_range_usize(req.num_intervals.max(1), MAX_NUM_INTERVALS, "num_intervals")?;
     let overlap = validate_range_f32(req.overlap, MIN_OVERLAP, MAX_OVERLAP, "overlap")?;
 
     let user_id = req.user_id.clone();
@@ -687,8 +556,6 @@ pub async fn mapper_analysis(
 // =============================================================================
 
 /// Get or create a SlowStore for a user.
-///
-/// The slow store lives at `{base_path}/{user_id}/slow_store.db`.
 fn get_or_create_slow_store(
     state: &MultiUserMemoryManager,
     user_id: &str,

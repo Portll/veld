@@ -8,12 +8,10 @@
 
 pub mod compression;
 pub mod context;
-pub mod domain_jump;
 pub mod facts;
 pub mod feedback;
 pub mod files;
 pub mod gap_topology;
-pub mod golden_features;
 pub mod graph_retrieval;
 pub mod hybrid_search;
 pub mod injection;
@@ -32,7 +30,6 @@ pub mod sessions;
 pub mod slow_store;
 pub mod storage;
 pub mod temporal_facts;
-pub mod thoughts;
 pub mod todo_formatter;
 pub mod voronoi;
 pub mod todos;
