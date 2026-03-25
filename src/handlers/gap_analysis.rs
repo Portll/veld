@@ -22,6 +22,33 @@ use crate::validation;
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 
 // =============================================================================
+// PARAMETER BOUNDS (prevent CPU DoS from adversarial inputs)
+// =============================================================================
+
+const MIN_STEP_SIZE: f32 = 0.01;
+const MAX_STEP_SIZE: f32 = 1.0;
+const MAX_GAPS_PER_TYPE: usize = 500;
+const MIN_PERSISTENCE: f32 = 0.001;
+const MAX_K: usize = 100;
+const MAX_NUM_INTERVALS: usize = 200;
+const MIN_OVERLAP: f32 = 0.0;
+const MAX_OVERLAP: f32 = 0.9;
+
+fn validate_range_f32(value: f32, min: f32, max: f32, name: &str) -> Result<f32, AppError> {
+    if !value.is_finite() {
+        return Err(AppError::InvalidInput {
+            field: name.to_string(),
+            reason: format!("{name} must be a finite number"),
+        });
+    }
+    Ok(value.clamp(min, max))
+}
+
+fn validate_range_usize(value: usize, max: usize, _name: &str) -> Result<usize, AppError> {
+    Ok(value.min(max))
+}
+
+// =============================================================================
 // REQUEST / RESPONSE TYPES
 // =============================================================================
 
@@ -219,6 +246,8 @@ pub async fn analyze_gaps(
     Json(req): Json<GapAnalysisRequest>,
 ) -> Result<Json<GapAnalysisResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let min_strength = validate_range_f32(req.min_edge_strength, 0.0, 1.0, "min_edge_strength")?;
+    let max_gaps = validate_range_usize(req.max_gaps_per_type, MAX_GAPS_PER_TYPE, "max_gaps_per_type")?;
 
     let user_id = req.user_id.clone();
     let scope = match req.scope.as_str() {
@@ -226,8 +255,6 @@ pub async fn analyze_gaps(
         "schema" => GapScope::Schema,
         _ => GapScope::Content,
     };
-    let min_strength = req.min_edge_strength;
-    let max_gaps = req.max_gaps_per_type;
     let state_clone = state.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<ThoughtReport, anyhow::Error> {
@@ -351,9 +378,9 @@ pub async fn voronoi_analysis(
     Json(req): Json<VoronoiAnalysisRequest>,
 ) -> Result<Json<VoronoiAnalysisResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let k = validate_range_usize(req.k.max(1), MAX_K, "k")?;
 
     let user_id = req.user_id.clone();
-    let k = req.k;
     let state_clone = state.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<VoronoiAnalysisResponse, anyhow::Error> {
@@ -489,10 +516,10 @@ pub async fn persistence_analysis(
     Json(req): Json<PersistenceRequest>,
 ) -> Result<Json<PersistenceResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let step_size = validate_range_f32(req.step_size, MIN_STEP_SIZE, MAX_STEP_SIZE, "step_size")?;
+    let min_persistence = validate_range_f32(req.min_persistence, MIN_PERSISTENCE, MAX_STEP_SIZE, "min_persistence")?;
 
     let user_id = req.user_id.clone();
-    let step_size = req.step_size;
-    let min_persistence = req.min_persistence;
     let state_clone = state.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<PersistenceResponse, anyhow::Error> {
@@ -582,11 +609,11 @@ pub async fn mapper_analysis(
     Json(req): Json<MapperRequest>,
 ) -> Result<Json<MapperResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    let num_intervals = validate_range_usize(req.num_intervals.max(1), MAX_NUM_INTERVALS, "num_intervals")?;
+    let overlap = validate_range_f32(req.overlap, MIN_OVERLAP, MAX_OVERLAP, "overlap")?;
 
     let user_id = req.user_id.clone();
     let filter_str = req.filter.clone();
-    let num_intervals = req.num_intervals;
-    let overlap = req.overlap;
     let state_clone = state.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<MapperResponse, anyhow::Error> {
