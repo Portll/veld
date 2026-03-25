@@ -290,8 +290,6 @@ fn compute_sparse_distances(
         for j in (i + 1)..n {
             let sim = cosine_similarity(&entities[i].2, &entities[j].2);
             let dist = 1.0 - sim;
-            // Skip non-finite distances (from corrupt embeddings) — cosine_similarity
-            // returns 0.0 for NaN inputs, so dist would be 1.0, but guard anyway.
             if dist.is_finite() && dist <= max_radius {
                 distances.insert((i, j), dist);
             }
@@ -520,6 +518,55 @@ fn compute_persistence_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_empty_simplices() {
+        let pairs = compute_persistence_pairs(&[], 0);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_single_vertex() {
+        let simplices = vec![(0.0, [0].into_iter().collect::<BTreeSet<usize>>())];
+        let pairs = compute_persistence_pairs(&simplices, 1);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].dimension, 0);
+        assert!(pairs[0].death.is_none());
+    }
+
+    #[test]
+    fn test_two_vertices_one_edge() {
+        let mut simplices = Vec::new();
+        simplices.push((0.0, [0].into_iter().collect()));
+        simplices.push((0.0, [1].into_iter().collect()));
+        simplices.push((0.5, [0, 1].into_iter().collect()));
+        let pairs = compute_persistence_pairs(&simplices, 2);
+        let persistent_h0: Vec<_> = pairs.iter().filter(|p| p.dimension == 0 && p.death.is_none()).collect();
+        assert_eq!(persistent_h0.len(), 1, "Should have exactly 1 persistent component");
+    }
+
+    #[test]
+    fn test_sparse_distances_finite() {
+        let entities = vec![
+            ("a".into(), "A".into(), vec![1.0, 0.0, 0.0]),
+            ("b".into(), "B".into(), vec![f32::NAN, 0.0, 0.0]),
+            ("c".into(), "C".into(), vec![0.0, 1.0, 0.0]),
+        ];
+        let distances = compute_sparse_distances(&entities, 1.5);
+        for &dist in distances.values() {
+            assert!(dist.is_finite(), "All distances must be finite, got {dist}");
+        }
+    }
+
+    #[test]
+    fn test_get_dist_symmetry() {
+        let mut distances = HashMap::new();
+        distances.insert((0, 1), 0.5);
+        assert_eq!(get_dist(&distances, 0, 1), Some(0.5));
+        assert_eq!(get_dist(&distances, 1, 0), Some(0.5));
+        assert_eq!(get_dist(&distances, 0, 0), Some(0.0));
+        assert_eq!(get_dist(&distances, 2, 3), None);
+    }
 
     #[test]
     fn test_triangle_homology() {

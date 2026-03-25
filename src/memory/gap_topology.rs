@@ -801,5 +801,58 @@ impl GapDetector {
                 (related_gaps.len() as f32 / total * gaps[i].confidence).clamp(0.0, 1.0);
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gap_type_as_str() {
+        assert_eq!(GapType::OpenTriad.as_str(), "open_triad");
+        assert_eq!(GapType::DiamondGap.as_str(), "diamond_gap");
+        assert_eq!(GapType::StarGap.as_str(), "star_gap");
+        assert_eq!(GapType::OrbitGap.as_str(), "orbit_gap");
+    }
+
+    #[test]
+    fn test_shape_signature_open_triad() {
+        let sig = ShapeSignature::open_triad("bridge");
+        assert_eq!(sig.node_count, 3);
+        assert_eq!(sig.existing_edges, 2);
+        assert_eq!(sig.missing_edges, 1);
+        assert!((sig.sparsity - 1.0 / 3.0).abs() < 0.01);
+        assert!(sig.canonical.contains("bridge"));
+    }
+
+    #[test]
+    fn test_shape_signature_diamond() {
+        let sig = ShapeSignature::diamond();
+        assert_eq!(sig.node_count, 4);
+        assert_eq!(sig.existing_edges, 4);
+        assert_eq!(sig.missing_edges, 1);
+    }
+
+    #[test]
+    fn test_shape_signature_star() {
+        let sig = ShapeSignature::star("hub", 5, 8, 10);
+        assert_eq!(sig.node_count, 6);
+        assert_eq!(sig.missing_edges, 8);
+        assert!((sig.sparsity - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_shape_signature_orbit() {
+        let sig = ShapeSignature::orbit(3, 4, 2);
+        assert_eq!(sig.node_count, 7);
+        assert_eq!(sig.missing_edges, 12);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = GapDetectionConfig::default();
+        assert!(config.min_edge_strength > 0.0);
+        assert!(config.max_gaps_per_type > 0);
+        assert!(config.star_min_spokes >= 2);
+    }
 }

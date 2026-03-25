@@ -543,6 +543,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_cover_empty() {
+        assert!(build_cover(&[], 5, 0.2).is_empty());
+    }
+
+    #[test]
+    fn test_build_cover_zero_intervals() {
+        assert!(build_cover(&[1.0, 2.0], 0, 0.2).is_empty());
+    }
+
+    #[test]
+    fn test_build_cover_single_value() {
+        let intervals = build_cover(&[5.0, 5.0, 5.0], 3, 0.3);
+        assert_eq!(intervals.len(), 1);
+    }
+
+    #[test]
+    fn test_single_linkage_cluster_two_close() {
+        let emb_a = vec![1.0, 0.0];
+        let emb_b = vec![0.9, 0.1];
+        let emb_c = vec![-1.0, 0.0];
+        let embeddings: Vec<&[f32]> = vec![&emb_a, &emb_b, &emb_c];
+        let clusters = single_linkage_cluster(&[0, 1, 2], &embeddings, 0.3);
+        assert_eq!(clusters.len(), 2, "Should form 2 clusters");
+    }
+
+    #[test]
+    fn test_count_components_disconnected() {
+        assert_eq!(count_components(3, &[]), 3);
+    }
+
+    #[test]
+    fn test_count_components_connected() {
+        let edges = vec![
+            MapperEdge { from: 0, to: 1, weight: 1 },
+            MapperEdge { from: 1, to: 2, weight: 1 },
+        ];
+        assert_eq!(count_components(3, &edges), 1);
+    }
+
+    #[test]
     fn test_build_cover_basic() {
         let values = vec![0.0, 0.5, 1.0];
         let intervals = build_cover(&values, 5, 0.2);
