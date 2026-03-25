@@ -1,45 +1,33 @@
-//! Gap Topology Detection Engine
+//! Structural Gap Detection for Knowledge Graphs
 //!
-//! The missing information always has a shape. This module detects the topology
-//! of gaps in the knowledge graph and characterizes them for inference.
+//! Detects structural gaps (missing edges) in the knowledge graph by analyzing
+//! graph topology. Returns raw structural data — interpretation is left to consumers.
 //!
-//! Gap types, from simplest to most complex:
+//! Gap types detected:
 //!
-//! - **Open Triad (U-shape)**: A→B→C, no A↔C. Missing simple inference.
-//! - **Diamond Gap**: A→B, A→C, B→D, C→D, no B↔C. Parallel paths not reconciled.
-//! - **Star Gap**: Hub with N spokes, spokes unconnected. Missing community structure.
-//! - **Orbit Gap**: Two clusters share attractors but no cross-links. Knowledge silos.
-//! - **Void**: Region of embedding space surrounded by entities but empty. Unknown unknowns.
-//! - **Planet X**: Multiple entities' relationships imply an unseen entity. Gravitational inference.
-//! - **Fractal Gap**: Same gap shape repeating at different scales. Systematic blindness.
-//!
-//! The shape of each gap tells us what kind of information should fill it.
+//! - **Open Triad (U-shape)**: A→B→C, no A↔C.
+//! - **Diamond Gap**: A→B, A→C, B→D, C→D, no B↔C.
+//! - **Star Gap**: Hub with N spokes, spokes unconnected.
+//! - **Orbit Gap**: Two clusters share attractors but no cross-links.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use super::slow_store::SlowStore;
-use super::voronoi::{VoronoiAnalyzer, VoronoiConfig};
 use crate::similarity::cosine_similarity;
 
 /// Classification of gap topology
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GapType {
-    /// A→B→C, no A↔C. Simplest gap — a missing inference.
+    /// A→B→C, no A↔C.
     OpenTriad,
-    /// A→B, A→C, B→D, C→D, no B↔C. Parallel paths not reconciled.
+    /// A→B, A→C, B→D, C→D, no B↔C.
     DiamondGap,
-    /// Hub with isolated spokes. Missing community structure.
+    /// Hub with isolated spokes.
     StarGap,
     /// Two clusters share attractors but have no cross-links.
     OrbitGap,
-    /// Region of embedding space surrounded by entities but empty.
-    Void,
-    /// Relationships imply an unseen entity (gravitational inference).
-    PlanetX,
-    /// Same gap pattern repeating at different scales.
-    FractalGap,
 }
 
 impl GapType {
@@ -49,30 +37,6 @@ impl GapType {
             Self::DiamondGap => "diamond_gap",
             Self::StarGap => "star_gap",
             Self::OrbitGap => "orbit_gap",
-            Self::Void => "void",
-            Self::PlanetX => "planet_x",
-            Self::FractalGap => "fractal_gap",
-        }
-    }
-}
-
-/// The scope of what a gap pertains to
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GapScope {
-    /// Gap in code structure (modules, functions, dependencies)
-    Codebase,
-    /// Gap in database schema (tables, relationships, indexes)
-    Schema,
-    /// Gap in information content (knowledge, facts, concepts)
-    Content,
-}
-
-impl GapScope {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Codebase => "codebase",
-            Self::Schema => "schema",
-            Self::Content => "content",
         }
     }
 }
@@ -163,8 +127,6 @@ pub struct GapTopology {
     pub gap_type: GapType,
     /// The topological shape of the gap
     pub shape: ShapeSignature,
-    /// What domain this gap belongs to
-    pub scope: GapScope,
     /// Entities involved in this gap
     pub entities: Vec<GapEntity>,
     /// Missing links that define this gap
@@ -232,8 +194,6 @@ pub struct GapDetectionConfig {
     pub star_max_connectivity: f32,
     /// For orbit detection: minimum cluster size
     pub orbit_min_cluster_size: usize,
-    /// Scope to analyze
-    pub scope: GapScope,
 }
 
 impl Default for GapDetectionConfig {
@@ -245,7 +205,6 @@ impl Default for GapDetectionConfig {
             star_min_spokes: 3,
             star_max_connectivity: 0.2,
             orbit_min_cluster_size: 3,
-            scope: GapScope::Content,
         }
     }
 }
@@ -259,21 +218,6 @@ pub struct GapDetectionResult {
     pub type_counts: HashMap<String, usize>,
     /// How long detection took
     pub duration_ms: u64,
-    /// Fractal patterns: gap shapes that repeat at different scales
-    pub fractal_patterns: Vec<FractalPattern>,
-}
-
-/// A gap pattern that repeats at different scales
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FractalPattern {
-    /// The repeating shape signature
-    pub shape: String,
-    /// Gap IDs at each scale where this pattern appears
-    pub instances: Vec<String>,
-    /// Number of scales at which this pattern repeats
-    pub scale_count: usize,
-    /// What this pattern suggests about systemic blindness
-    pub interpretation: String,
 }
 
 /// The gap topology detection engine.
@@ -308,83 +252,8 @@ impl GapDetector {
         let orbits = Self::detect_orbit_gaps(store, config)?;
         gaps.extend(orbits);
 
-        // Phase 3: Voronoi analysis — voids and Planet X
-        let voronoi_config = VoronoiConfig::default();
-        if let Ok(voronoi) = VoronoiAnalyzer::analyze(store, &voronoi_config) {
-            // Convert voids to gap topologies
-            for void in &voronoi.voids {
-                let entities: Vec<GapEntity> = void
-                    .boundary_entities
-                    .iter()
-                    .map(|(uuid, name)| GapEntity {
-                        uuid: uuid.clone(),
-                        name: name.clone(),
-                        role: GapRole::Endpoint,
-                    })
-                    .collect();
-
-                gaps.push(GapTopology {
-                    id: format!("void:r={:.2}:n={}", void.radius, void.boundary_count),
-                    gap_type: GapType::Void,
-                    shape: ShapeSignature {
-                        node_count: void.boundary_count,
-                        existing_edges: 0,
-                        missing_edges: void.boundary_count,
-                        sparsity: 1.0,
-                        canonical: format!(
-                            "void:boundary={},radius={:.2}",
-                            void.boundary_count, void.radius
-                        ),
-                    },
-                    scope: config.scope.clone(),
-                    entities,
-                    missing_links: Vec::new(), // voids don't have specific missing links
-                    confidence: void.confidence,
-                    embedding_similarity: None,
-                    impact_score: 0.0,
-                });
-            }
-
-            // Convert Planet X candidates to gap topologies
-            for px in &voronoi.planet_x_candidates {
-                let entities: Vec<GapEntity> = px
-                    .evidence_entities
-                    .iter()
-                    .map(|(uuid, name)| GapEntity {
-                        uuid: uuid.clone(),
-                        name: name.clone(),
-                        role: GapRole::Endpoint,
-                    })
-                    .collect();
-
-                gaps.push(GapTopology {
-                    id: format!("planet_x:conv={}", px.convergence_count),
-                    gap_type: GapType::PlanetX,
-                    shape: ShapeSignature {
-                        node_count: px.convergence_count,
-                        existing_edges: 0,
-                        missing_edges: 1, // the missing entity itself
-                        sparsity: 1.0,
-                        canonical: format!(
-                            "planet_x:convergence={}",
-                            px.convergence_count
-                        ),
-                    },
-                    scope: config.scope.clone(),
-                    entities,
-                    missing_links: Vec::new(),
-                    confidence: px.confidence,
-                    embedding_similarity: None,
-                    impact_score: 0.0,
-                });
-            }
-        }
-
-        // Phase 4: Compute impact scores (how interconnected are the gaps?)
+        // Phase 3: Compute impact scores (how interconnected are the gaps?)
         Self::compute_impact_scores(&mut gaps);
-
-        // Phase 5: Detect fractal patterns
-        let fractal_patterns = Self::detect_fractal_patterns(&gaps);
 
         // Sort by impact score (most impactful gaps first)
         gaps.sort_by(|a, b| {
@@ -413,7 +282,6 @@ impl GapDetector {
             gaps,
             type_counts,
             duration_ms,
-            fractal_patterns,
         })
     }
 
@@ -467,7 +335,6 @@ impl GapDetector {
                 id: gap_id,
                 gap_type: GapType::OpenTriad,
                 shape: ShapeSignature::open_triad(&triad.node_b_name),
-                scope: config.scope.clone(),
                 entities: vec![
                     GapEntity {
                         uuid: triad.node_a.clone(),
@@ -552,7 +419,6 @@ impl GapDetector {
                 id: gap_id,
                 gap_type: GapType::DiamondGap,
                 shape: ShapeSignature::diamond(),
-                scope: config.scope.clone(),
                 entities: vec![
                     GapEntity {
                         uuid: diamond.top.clone(),
@@ -658,7 +524,6 @@ impl GapDetector {
                     star.missing_edges,
                     star.possible_edges,
                 ),
-                scope: config.scope.clone(),
                 entities,
                 missing_links,
                 confidence,
@@ -810,8 +675,7 @@ impl GapDetector {
                             members_b.len(),
                             shared_attractors.len(),
                         ),
-                        scope: config.scope.clone(),
-                        entities,
+                                entities,
                         missing_links,
                         confidence,
                         embedding_similarity: None,
@@ -938,63 +802,4 @@ impl GapDetector {
         }
     }
 
-    /// Detect fractal patterns: gap shapes that repeat at different scales.
-    ///
-    /// If the same topological pattern appears as individual U-shapes, as
-    /// diamond-level structures, AND as inter-cluster orbit gaps, that's
-    /// a fractal gap — a systematic blindness that repeats at every level.
-    fn detect_fractal_patterns(gaps: &[GapTopology]) -> Vec<FractalPattern> {
-        // Group gaps by bridge/hub entities
-        // If entity X appears as a bridge in triads AND as part of a star gap AND in an orbit,
-        // the same structural weakness repeats at multiple scales
-        let mut entity_gap_types: HashMap<String, HashSet<String>> = HashMap::new();
-        for gap in gaps {
-            for entity in &gap.entities {
-                entity_gap_types
-                    .entry(entity.uuid.clone())
-                    .or_default()
-                    .insert(gap.gap_type.as_str().to_string());
-            }
-        }
-
-        let mut patterns = Vec::new();
-        for (entity_uuid, gap_types) in &entity_gap_types {
-            if gap_types.len() >= 2 {
-                // This entity participates in gaps at multiple structural scales
-                let instances: Vec<String> = gaps
-                    .iter()
-                    .filter(|g| g.entities.iter().any(|e| &e.uuid == entity_uuid))
-                    .map(|g| g.id.clone())
-                    .collect();
-
-                let entity_name = gaps
-                    .iter()
-                    .flat_map(|g| &g.entities)
-                    .find(|e| &e.uuid == entity_uuid)
-                    .map(|e| e.name.clone())
-                    .unwrap_or_else(|| entity_uuid.clone());
-
-                let types_str: Vec<&str> = gap_types.iter().map(|s| s.as_str()).collect();
-                let interpretation = format!(
-                    "'{}' appears in gaps at {} different structural levels ({}). \
-                     This entity is a recurring weak point in the knowledge graph — \
-                     strengthening connections around it would resolve multiple gap types simultaneously.",
-                    entity_name,
-                    gap_types.len(),
-                    types_str.join(", ")
-                );
-
-                patterns.push(FractalPattern {
-                    shape: format!("multi_scale:{}", types_str.join("+")),
-                    instances,
-                    scale_count: gap_types.len(),
-                    interpretation,
-                });
-            }
-        }
-
-        // Sort by scale count (most fractal first)
-        patterns.sort_by(|a, b| b.scale_count.cmp(&a.scale_count));
-        patterns
-    }
 }
