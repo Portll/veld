@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, compression, consolidation, crud, facts, files, graph, health, integrations,
-    lineage, mif, recall, remember, search, sessions, todos, users, visualization, webhooks,
+    ab_testing, compression, consolidation, crud, facts, files, gap_analysis, graph, health,
+    integrations, lineage, mif, recall, remember, search, sessions, todos, users, visualization,
+    webhooks,
 };
 
 /// Application state type alias
@@ -217,6 +218,15 @@ pub fn build_protected_routes(state: AppState) -> Router {
         )
         .route("/api/graph/traverse", post(graph::traverse_graph))
         .route("/api/graph/episode/get", post(graph::get_episode))
+        // =================================================================
+        // GAP ANALYSIS & THOUGHT SURFACING
+        // =================================================================
+        .route("/api/gap/analyze", post(gap_analysis::analyze_gaps))
+        .route("/api/gap/thoughts", post(gap_analysis::get_thoughts))
+        .route("/api/gap/dismiss", post(gap_analysis::dismiss_thought))
+        .route("/api/gap/voronoi", post(gap_analysis::voronoi_analysis))
+        .route("/api/gap/persistence", post(gap_analysis::persistence_analysis))
+        .route("/api/gap/mapper", post(gap_analysis::mapper_analysis))
         // =================================================================
         // KNOWLEDGE GRAPH (BASIC)
         // =================================================================
