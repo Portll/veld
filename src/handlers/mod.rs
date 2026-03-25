@@ -24,6 +24,7 @@ pub mod lineage;
 pub mod search;
 
 // Knowledge graph
+pub mod gap_analysis;
 pub mod graph;
 pub mod visualization;
 

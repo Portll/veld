@@ -16,6 +16,9 @@ use super::types::{
 };
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
+use crate::memory::gap_topology::{GapDetectionConfig, GapScope};
+use crate::memory::slow_store::SlowStore;
+use crate::memory::thoughts::ThoughtEngine;
 use crate::metrics;
 use crate::validation;
 
@@ -153,6 +156,44 @@ pub async fn consolidate_memories(
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
             let graph_guard = graph.read();
             let _ = graph_guard.flush_pending_maintenance();
+        }
+
+        // Step 4: Gap analysis — sync graph to SQLite, detect gaps, generate thoughts
+        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+            let user_path = state_clone.base_path.join(&user_id);
+            let _ = std::fs::create_dir_all(&user_path);
+            let db_path = user_path.join("slow_store.db");
+
+            if let Ok(store) = SlowStore::open(&db_path) {
+                let graph_guard = graph.read();
+                match (graph_guard.get_all_entities(), graph_guard.get_all_relationships()) {
+                    (Ok(entities), Ok(edges)) => {
+                        if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
+                            let config = GapDetectionConfig {
+                                scope: GapScope::Content,
+                                ..Default::default()
+                            };
+                            match ThoughtEngine::generate(&store, &config) {
+                                Ok(report) => {
+                                    tracing::info!(
+                                        user_id = %user_id,
+                                        gaps = report.stats.gaps_detected,
+                                        thoughts = report.stats.thoughts_generated,
+                                        fractals = report.stats.fractal_patterns_found,
+                                        "Gap analysis complete (post-consolidation)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Gap analysis failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("Could not load graph data for gap analysis");
+                    }
+                }
+            }
         }
 
         let duration = op_start.elapsed().as_secs_f64();

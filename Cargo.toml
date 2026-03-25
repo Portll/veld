@@ -125,6 +125,7 @@ bincode = { version = "2", features = ["serde"] }
 bincode1 = { package = "bincode", version = "1.3" }  # Legacy format support for pre-2.0 memories
 rmp-serde = "1.3"  # MessagePack - binary format that supports serde tagged enums
 lz4 = "1.28"
+rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite slow store for gap topology queries (WAL mode)
 
 # Concurrency
 parking_lot = "0.12"

@@ -610,6 +610,127 @@ struct LineageStatsResponse {
 }
 
 // =============================================================================
+// GAP ANALYSIS TYPES
+// =============================================================================
+
+#[derive(Serialize)]
+struct GapAnalyzeRequest {
+    user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GapAnalyzeResponse {
+    thoughts: Vec<GapThought>,
+    stats: GapStats,
+}
+
+#[derive(Deserialize)]
+struct GapThought {
+    id: String,
+    kind: String,
+    confidence: f32,
+    description: String,
+    hypothesis: Option<String>,
+    impact_score: f32,
+    entity_names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct GapStats {
+    gaps_detected: usize,
+    golden_features_generated: usize,
+    thoughts_generated: usize,
+    fractal_patterns_found: usize,
+    duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct GapThoughtsRequest {
+    user_id: String,
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+struct GapThoughtsResponse {
+    thoughts: Vec<GapThought>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GapAnalyzeParams {
+    #[schemars(description = "Scope of analysis: 'content' (knowledge), 'codebase' (code structure), or 'schema' (database)")]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GapThoughtsParams {
+    #[schemars(description = "Maximum number of thoughts to return")]
+    limit: Option<usize>,
+}
+
+// =============================================================================
+// MAPPER TYPES
+// =============================================================================
+
+#[derive(Serialize)]
+struct GapMapperRequest {
+    user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_intervals: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlap: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct GapMapperResponse {
+    nodes: Vec<GapMapperNode>,
+    edges: Vec<GapMapperEdge>,
+    num_components: usize,
+    num_loops: usize,
+    flare_count: usize,
+    branch_count: usize,
+    filter: String,
+    stats: GapMapperStats,
+}
+
+#[derive(Deserialize)]
+struct GapMapperNode {
+    id: usize,
+    member_names: Vec<String>,
+    size: usize,
+    avg_filter_value: f32,
+}
+
+#[derive(Deserialize)]
+struct GapMapperEdge {
+    from: usize,
+    to: usize,
+    weight: usize,
+}
+
+#[derive(Deserialize)]
+struct GapMapperStats {
+    entity_count: usize,
+    interval_count: usize,
+    cluster_count: usize,
+    edge_count: usize,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GapMapperParams {
+    #[schemars(description = "Filter function: 'centroid_distance' (default), 'density', 'eccentricity', 'neighbor_distance', or 'embedding_pc1'")]
+    filter: Option<String>,
+    #[schemars(description = "Number of intervals in the cover (default 10)")]
+    num_intervals: Option<usize>,
+    #[schemars(description = "Overlap percentage between intervals, 0.0-1.0 (default 0.3)")]
+    overlap: Option<f32>,
+}
+
+// =============================================================================
 // MCP SERVER
 // =============================================================================
 
@@ -944,6 +1065,189 @@ impl ShodhMcpServer {
                     for (relation, count) in relations {
                         output.push_str(&format!("  {}: {}\n", relation, count));
                     }
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Analyze gaps in the knowledge graph. Detects missing connections (U-shapes), structural weaknesses (diamonds, stars), knowledge silos (orbit gaps), voids (empty regions), and Planet X (implied unseen concepts). Returns actionable thoughts about what's missing."
+    )]
+    async fn gap_analyze(
+        &self,
+        Parameters(params): Parameters<GapAnalyzeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<GapAnalyzeResponse> = self
+            .client
+            .post(
+                "/api/gap/analyze",
+                &GapAnalyzeRequest {
+                    user_id: self.client.user_id.clone(),
+                    scope: params.scope,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let mut output = format!(
+                    "**Gap Analysis** ({} gaps -> {} features -> {} thoughts, {}ms)\n\n",
+                    resp.stats.gaps_detected,
+                    resp.stats.golden_features_generated,
+                    resp.stats.thoughts_generated,
+                    resp.stats.duration_ms
+                );
+
+                if resp.stats.fractal_patterns_found > 0 {
+                    output.push_str(&format!(
+                        "**{} fractal patterns detected** (systematic blindness)\n\n",
+                        resp.stats.fractal_patterns_found
+                    ));
+                }
+
+                for thought in &resp.thoughts {
+                    output.push_str(&format!(
+                        "### [{}] {} (confidence: {:.0}%, impact: {:.0}%)\n{}\n",
+                        thought.kind,
+                        thought.entity_names.join(", "),
+                        thought.confidence * 100.0,
+                        thought.impact_score * 100.0,
+                        thought.description
+                    ));
+                    if let Some(ref hyp) = thought.hypothesis {
+                        output.push_str(&format!("**Hypothesis:** {}\n", hyp));
+                    }
+                    output.push('\n');
+                }
+
+                if resp.thoughts.is_empty() {
+                    output.push_str("No significant gaps detected in the knowledge graph.\n");
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Get previously generated thoughts about knowledge graph gaps. These are insights about missing connections, structural weaknesses, and unexplored regions."
+    )]
+    async fn gap_thoughts(
+        &self,
+        Parameters(params): Parameters<GapThoughtsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<GapThoughtsResponse> = self
+            .client
+            .post(
+                "/api/gap/thoughts",
+                &GapThoughtsRequest {
+                    user_id: self.client.user_id.clone(),
+                    limit: params.limit.unwrap_or(10),
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let mut output = format!("**Active Thoughts** ({})\n\n", resp.thoughts.len());
+                for thought in &resp.thoughts {
+                    output.push_str(&format!(
+                        "- **[{}]** {}\n  {}\n",
+                        thought.kind, thought.description,
+                        thought
+                            .hypothesis
+                            .as_deref()
+                            .unwrap_or("No hypothesis yet")
+                    ));
+                }
+                if resp.thoughts.is_empty() {
+                    output.push_str("No active thoughts. Run `gap_analyze` first.\n");
+                }
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Run Mapper topological analysis on the knowledge graph. Produces a simplified graph that reveals branches, loops, flares, and connected components — topological structure invisible to standard clustering. Different filter functions reveal different aspects of the knowledge topology."
+    )]
+    async fn gap_mapper(
+        &self,
+        Parameters(params): Parameters<GapMapperParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<GapMapperResponse> = self
+            .client
+            .post(
+                "/api/gap/mapper",
+                &GapMapperRequest {
+                    user_id: self.client.user_id.clone(),
+                    filter: params.filter,
+                    num_intervals: params.num_intervals,
+                    overlap: params.overlap,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let mut output = format!(
+                    "**Mapper Analysis** (filter: {}, {} entities, {}ms)\n\n",
+                    resp.filter, resp.stats.entity_count, resp.stats.duration_ms
+                );
+
+                output.push_str(&format!(
+                    "**Topology:** {} components, {} loops, {} flares, {} branches\n",
+                    resp.num_components, resp.num_loops, resp.flare_count, resp.branch_count
+                ));
+                output.push_str(&format!(
+                    "**Graph:** {} clusters, {} edges\n\n",
+                    resp.stats.cluster_count, resp.stats.edge_count
+                ));
+
+                if !resp.nodes.is_empty() {
+                    output.push_str("**Clusters:**\n");
+                    for node in &resp.nodes {
+                        let members_preview: Vec<&str> = node
+                            .member_names
+                            .iter()
+                            .take(5)
+                            .map(|s| s.as_str())
+                            .collect();
+                        let suffix = if node.size > 5 {
+                            format!(" +{} more", node.size - 5)
+                        } else {
+                            String::new()
+                        };
+                        output.push_str(&format!(
+                            "  [{}] size={}, filter={:.3}: {}{}\n",
+                            node.id,
+                            node.size,
+                            node.avg_filter_value,
+                            members_preview.join(", "),
+                            suffix
+                        ));
+                    }
+                }
+
+                if resp.nodes.is_empty() {
+                    output.push_str("No clusters found. The knowledge graph may be too sparse for Mapper analysis.\n");
                 }
 
                 Ok(CallToolResult::success(vec![Content::text(output)]))
