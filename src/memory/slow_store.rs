@@ -107,6 +107,7 @@ pub struct EntityCluster {
 pub struct SlowStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    last_sync: Mutex<Option<std::time::Instant>>,
 }
 
 impl SlowStore {
@@ -132,6 +133,7 @@ impl SlowStore {
         let store = Self {
             conn: Mutex::new(conn),
             path: path.to_owned(),
+            last_sync: Mutex::new(None),
         };
         store.create_schema()?;
         Ok(store)
@@ -225,6 +227,16 @@ impl SlowStore {
         Ok(())
     }
 
+    /// Check if sync is needed based on TTL. Returns true if last sync was
+    /// more than `ttl_secs` ago (or never synced).
+    pub fn should_sync(&self, ttl_secs: u64) -> bool {
+        let last = self.last_sync.lock();
+        match *last {
+            Some(instant) => instant.elapsed().as_secs() >= ttl_secs,
+            None => true,
+        }
+    }
+
     /// Sync entity and edge data from GraphMemory into SQLite.
     ///
     /// Uses upsert (INSERT OR REPLACE) for idempotent sync.
@@ -244,6 +256,10 @@ impl SlowStore {
 
         tx.commit()?;
         stats.duration_ms = start.elapsed().as_millis() as u64;
+
+        // Record sync timestamp for TTL-based skip
+        *self.last_sync.lock() = Some(std::time::Instant::now());
+
         tracing::info!(
             "SlowStore sync complete: {} entities, {} edges in {}ms",
             stats.entities_upserted,
@@ -923,5 +939,57 @@ mod tests {
         let store = SlowStore::open(tmp.path()).unwrap();
         assert_eq!(store.entity_count().unwrap(), 0);
         assert_eq!(store.edge_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_store_and_get_thought() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        store.store_thought("t-001", "missing_connection", "content", 0.85,
+            "A and C should connect", Some("B mediates"), "[]", 0.7, "[]").unwrap();
+        let thoughts = store.get_active_thoughts(10).unwrap();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts[0].id, "t-001");
+        assert!((thoughts[0].confidence - 0.85).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_dismiss_thought() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        store.store_thought("t-002", "silo", "content", 0.5, "desc", None, "[]", 0.3, "[]").unwrap();
+        assert_eq!(store.get_active_thoughts(10).unwrap().len(), 1);
+        store.dismiss_thought("t-002").unwrap();
+        assert_eq!(store.get_active_thoughts(10).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_store_and_resolve_gap() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        store.store_gap("g-001", "open_triad", "A-B-C", "[]", "[]", 0.9, Some(0.45), 0.8, "content").unwrap();
+        assert_eq!(store.get_unresolved_gaps("open_triad", 10).unwrap().len(), 1);
+        store.resolve_gap("g-001").unwrap();
+        assert!(store.get_unresolved_gaps("open_triad", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_mark_thought_surfaced() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        store.store_thought("t-003", "golden", "content", 0.6, "desc", None, "[]", 0.5, "[]").unwrap();
+        store.mark_thought_surfaced("t-003").unwrap();
+        store.mark_thought_surfaced("t-003").unwrap();
+        assert_eq!(store.get_active_thoughts(10).unwrap()[0].surfaced_count, 2);
+    }
+
+    #[test]
+    fn test_empty_queries() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+        assert!(store.load_all_embeddings().unwrap().is_empty());
+        assert!(store.get_adjacency_list(0.0).unwrap().is_empty());
+        assert!(store.load_all_edge_pairs().unwrap().is_empty());
+        assert!(store.get_active_thoughts(10).unwrap().is_empty());
     }
 }

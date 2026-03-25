@@ -223,6 +223,9 @@ impl VoronoiAnalyzer {
         k: usize,
     ) -> Vec<Vec<(usize, f32)>> {
         let n = entities.len();
+        if n < 2 {
+            return vec![Vec::new(); n];
+        }
         let k = k.min(n - 1);
 
         let mut knn = Vec::with_capacity(n);
@@ -572,5 +575,48 @@ impl VoronoiAnalyzer {
         voids.truncate(config.max_voids);
         voids
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_knn_ordering() {
+        let entities = vec![
+            ("a".into(), "A".into(), vec![1.0, 0.0, 0.0]),
+            ("b".into(), "B".into(), vec![0.9, 0.1, 0.0]),
+            ("c".into(), "C".into(), vec![0.0, 1.0, 0.0]),
+        ];
+        let knn = VoronoiAnalyzer::compute_knn(&entities, 2);
+        assert_eq!(knn.len(), 3);
+        // A's nearest neighbor should be B (most similar)
+        assert_eq!(knn[0][0].0, 1);
+    }
+
+    #[test]
+    fn test_compute_knn_single_entity() {
+        let entities = vec![("a".into(), "A".into(), vec![1.0, 0.0])];
+        let knn = VoronoiAnalyzer::compute_knn(&entities, 5);
+        assert_eq!(knn.len(), 1);
+        assert!(knn[0].is_empty());
+    }
+
+    #[test]
+    fn test_compute_knn_empty() {
+        let entities: Vec<(String, String, Vec<f32>)> = vec![];
+        let knn = VoronoiAnalyzer::compute_knn(&entities, 5);
+        assert!(knn.is_empty());
+    }
+
+    #[test]
+    fn test_anisotropy_single_neighbor() {
+        let center = vec![0.0, 0.0];
+        let entities = vec![
+            ("a".into(), "A".into(), vec![0.0, 0.0]),
+            ("b".into(), "B".into(), vec![1.0, 0.0]),
+        ];
+        let a = VoronoiAnalyzer::compute_anisotropy(&center, &entities, &[(1, 1.0)], 2);
+        assert_eq!(a, 1.0);
+    }
 }

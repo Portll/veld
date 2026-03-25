@@ -31,6 +31,8 @@ const MAX_K: usize = 100;
 const MAX_NUM_INTERVALS: usize = 200;
 const MIN_OVERLAP: f32 = 0.0;
 const MAX_OVERLAP: f32 = 0.9;
+const MAX_ENTITIES: usize = 5000;
+const SYNC_TTL_SECS: u64 = 30;
 
 fn validate_range_f32(value: f32, min: f32, max: f32, name: &str) -> Result<f32, AppError> {
     if !value.is_finite() {
@@ -57,6 +59,14 @@ pub struct GapAnalysisRequest {
     pub min_edge_strength: f32,
     #[serde(default = "default_max_gaps")]
     pub max_gaps_per_type: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+fn default_limit() -> usize {
+    50
 }
 
 fn default_min_strength() -> f32 {
@@ -69,6 +79,7 @@ fn default_max_gaps() -> usize {
 #[derive(Debug, Serialize)]
 pub struct GapAnalysisResponse {
     pub gaps: Vec<GapSummary>,
+    pub total_count: usize,
     pub type_counts: std::collections::HashMap<String, usize>,
     pub duration_ms: u64,
 }
@@ -108,6 +119,9 @@ pub async fn analyze_gaps(
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
 
+    let offset = req.offset;
+    let limit = validate_range_usize(req.limit.max(1), MAX_GAPS_PER_TYPE, "limit")?;
+
     let result = tokio::task::spawn_blocking(move || -> Result<GapAnalysisResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
         sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
@@ -119,10 +133,13 @@ pub async fn analyze_gaps(
         };
 
         let result = GapDetector::detect(&store, &config)?;
+        let total_count = result.gaps.len();
 
         let gaps: Vec<GapSummary> = result
             .gaps
             .iter()
+            .skip(offset)
+            .take(limit)
             .map(|g| GapSummary {
                 id: g.id.clone(),
                 gap_type: g.gap_type.as_str().to_string(),
@@ -141,6 +158,7 @@ pub async fn analyze_gaps(
 
         Ok(GapAnalysisResponse {
             gaps,
+            total_count,
             type_counts: result.type_counts,
             duration_ms: result.duration_ms,
         })
@@ -336,6 +354,7 @@ pub async fn persistence_analysis(
         let config = PersistenceConfig {
             step_size,
             min_persistence,
+            max_entities: MAX_ENTITIES,
             ..Default::default()
         };
 
@@ -552,6 +571,49 @@ pub async fn mapper_analysis(
 }
 
 // =============================================================================
+// STATS (lightweight — no detection, just counts)
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct GapStatsRequest {
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GapStatsResponse {
+    pub entity_count: usize,
+    pub edge_count: usize,
+}
+
+/// Get lightweight graph stats without running detection.
+///
+/// POST /api/gap/stats
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+pub async fn gap_stats(
+    State(state): State<AppState>,
+    Json(req): Json<GapStatsRequest>,
+) -> Result<Json<GapStatsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let user_id = req.user_id.clone();
+    let state_clone = state.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<GapStatsResponse, anyhow::Error> {
+        let store = get_or_create_slow_store(&state_clone, &user_id)?;
+        sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
+        Ok(GapStatsResponse {
+            entity_count: store.entity_count()?,
+            edge_count: store.edge_count()?,
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Gap stats task failed: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(result))
+}
+
+// =============================================================================
 // HELPERS
 // =============================================================================
 
@@ -567,11 +629,17 @@ fn get_or_create_slow_store(
 }
 
 /// Sync graph data from RocksDB (GraphMemory) into SQLite (SlowStore).
+/// Skips sync if the last sync was less than SYNC_TTL_SECS ago.
 fn sync_graph_to_slow_store(
     state: &MultiUserMemoryManager,
     user_id: &str,
     store: &SlowStore,
 ) -> Result<(), anyhow::Error> {
+    if !store.should_sync(SYNC_TTL_SECS) {
+        tracing::debug!("SlowStore sync skipped (TTL)");
+        return Ok(());
+    }
+
     let graph = state
         .get_user_graph(user_id)
         .map_err(|e| anyhow::anyhow!("Failed to get graph for user {user_id}: {e}"))?;

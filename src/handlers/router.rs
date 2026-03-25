@@ -222,6 +222,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // GAP ANALYSIS & THOUGHT SURFACING
         // =================================================================
         .route("/api/gap/analyze", post(gap_analysis::analyze_gaps))
+        .route("/api/gap/stats", post(gap_analysis::gap_stats))
         .route("/api/gap/voronoi", post(gap_analysis::voronoi_analysis))
         .route("/api/gap/persistence", post(gap_analysis::persistence_analysis))
         .route("/api/gap/mapper", post(gap_analysis::mapper_analysis))
