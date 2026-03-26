@@ -234,6 +234,7 @@ async fn async_main() -> Result<()> {
         .merge(protected_routes)
         .layer(
             ServiceBuilder::new()
+                .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
                 .layer(axum::middleware::from_fn(middleware::security_headers))
                 .layer(axum::middleware::from_fn(middleware::track_metrics))
                 .layer(TimeoutLayer::with_status_code(

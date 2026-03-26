@@ -215,7 +215,33 @@ pub struct ContextStatusRequest {
 pub async fn update_context_status(
     State(state): State<AppState>,
     Json(req): Json<ContextStatusRequest>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Validate session_id length to prevent abuse
+    if req.session_id.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "session_id must be 128 characters or fewer"
+            })),
+        );
+    }
+
+    // Enforce size cap on context_sessions map to prevent memory exhaustion
+    if !state.context_sessions().contains_key(&req.session_id)
+        && state.context_sessions().len() >= 10_000
+    {
+        tracing::warn!(
+            "context_sessions at capacity (10,000), rejecting new session_id={}",
+            &req.session_id
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "too many active context sessions"
+            })),
+        );
+    }
+
     let percent_used = if req.tokens_budget > 0 {
         ((req.tokens_used as f64 / req.tokens_budget as f64) * 100.0) as u8
     } else {
@@ -253,10 +279,13 @@ pub async fn update_context_status(
         results: None,
     });
 
-    Json(serde_json::json!({
-        "success": true,
-        "percent_used": percent_used
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "percent_used": percent_used
+        })),
+    )
 }
 
 /// Get all active context sessions (auto-cleans stale sessions > 5 mins old)
