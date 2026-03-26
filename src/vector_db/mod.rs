@@ -103,7 +103,7 @@ pub enum VectorIndexBackend {
 impl VectorIndexBackend {
     /// Create backend with auto-selection based on expected vector count
     pub fn auto(config: BackendConfig, expected_vectors: usize) -> Result<Self> {
-        let backend_type = config.force_backend.unwrap_or_else(|| {
+        let backend_type = config.force_backend.unwrap_or({
             if expected_vectors >= SPANN_AUTO_THRESHOLD {
                 BackendType::Spann
             } else {

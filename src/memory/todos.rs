@@ -165,7 +165,7 @@ impl TodoStore {
                     for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
                         batch.put_cf(cf, &key, &value);
                         count += 1;
-                        if count % 10_000 == 0 {
+                        if count.is_multiple_of(10_000) {
                             db.write(std::mem::take(&mut batch))?;
                         }
                     }
@@ -802,7 +802,7 @@ impl TodoStore {
 
         // Get all todos with the same status
         let mut same_status_todos: Vec<Todo> = self
-            .list_todos_for_user(user_id, Some(&[todo.status.clone()]))?
+            .list_todos_for_user(user_id, Some(std::slice::from_ref(&todo.status)))?
             .into_iter()
             .collect();
 

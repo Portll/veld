@@ -17,7 +17,6 @@ use super::types::{
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
 use crate::memory::gap_topology::{GapDetectionConfig, GapDetector};
-use crate::memory::slow_store::SlowStore;
 use crate::metrics;
 use crate::validation;
 
@@ -159,11 +158,7 @@ pub async fn consolidate_memories(
 
         // Step 4: Gap analysis — sync graph to SQLite, detect structural gaps
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
-            let user_path = state_clone.base_path.join(&user_id);
-            let _ = std::fs::create_dir_all(&user_path);
-            let db_path = user_path.join("slow_store.db");
-
-            if let Ok(store) = SlowStore::open(&db_path) {
+            if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
                 let graph_guard = graph.read();
                 match (graph_guard.get_all_entities(), graph_guard.get_all_relationships()) {
                     (Ok(entities), Ok(edges)) => {

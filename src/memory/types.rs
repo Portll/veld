@@ -566,9 +566,9 @@ pub enum RelationshipType {
 /// - related_memories: Empty vector
 /// - causal_chain: Empty vector
 /// - outcomes: Empty vector
-/// Structured NER entity record preserving type classification and confidence.
-/// Used to carry NER results from handler through to graph insertion
-/// without losing type information (Person, Organization, Location, Misc).
+///   Structured NER entity record preserving type classification and confidence.
+///   Used to carry NER results from handler through to graph insertion
+///   without losing type information (Person, Organization, Location, Misc).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NerEntityRecord {
     pub text: String,
@@ -882,8 +882,10 @@ pub struct EntityRef {
 
 /// Memory tier in the cognitive hierarchy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum MemoryTier {
     /// Active, immediate context (Cowan's focus of attention)
+    #[default]
     Working,
     /// Current task/session context
     Session,
@@ -893,11 +895,6 @@ pub enum MemoryTier {
     Archive,
 }
 
-impl Default for MemoryTier {
-    fn default() -> Self {
-        MemoryTier::Working
-    }
-}
 
 /// Type of change made to a memory
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2197,11 +2194,10 @@ impl Query {
         }
 
         // Anomalies only filter
-        if self.anomalies_only {
-            if !memory.experience.is_anomaly {
+        if self.anomalies_only
+            && !memory.experience.is_anomaly {
                 return false;
             }
-        }
 
         // Severity filter
         if let Some(severity) = &self.severity {
@@ -2958,8 +2954,10 @@ impl ProspectiveTrigger {
 /// Status of a prospective task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ProspectiveTaskStatus {
     /// Waiting for trigger condition
+    #[default]
     Pending,
     /// Trigger condition met, shown to user
     Triggered,
@@ -2969,11 +2967,6 @@ pub enum ProspectiveTaskStatus {
     Expired,
 }
 
-impl Default for ProspectiveTaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// A prospective memory task (reminder/intention)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3899,8 +3892,10 @@ impl Default for FileType {
 
 /// How we learned about this file
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum LearnedFrom {
     /// User triggered batch indexing
+    #[default]
     ManualIndex,
     /// AI read the file content
     ReadAccess,
@@ -3910,11 +3905,6 @@ pub enum LearnedFrom {
     Mentioned,
 }
 
-impl Default for LearnedFrom {
-    fn default() -> Self {
-        LearnedFrom::ManualIndex
-    }
-}
 
 /// Learned knowledge about a file in a codebase
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4039,12 +4029,7 @@ impl FileMemory {
         self.updated_at = Utc::now();
         // Upgrade the learned_from if more meaningful
         // EditAccess > ReadAccess > Mentioned > ManualIndex
-        let should_upgrade = match (&self.learned_from, &learned_from) {
-            (LearnedFrom::ManualIndex, _) => true,
-            (LearnedFrom::Mentioned, LearnedFrom::ReadAccess | LearnedFrom::EditAccess) => true,
-            (LearnedFrom::ReadAccess, LearnedFrom::EditAccess) => true,
-            _ => false,
-        };
+        let should_upgrade = matches!((&self.learned_from, &learned_from), (LearnedFrom::ManualIndex, _) | (LearnedFrom::Mentioned, LearnedFrom::ReadAccess | LearnedFrom::EditAccess) | (LearnedFrom::ReadAccess, LearnedFrom::EditAccess));
         if should_upgrade {
             self.learned_from = learned_from;
         }

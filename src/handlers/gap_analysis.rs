@@ -670,15 +670,14 @@ pub async fn gap_stats(
 // HELPERS
 // =============================================================================
 
-/// Get or create a SlowStore for a user.
+/// Get the cached SlowStore for a user (creates on first access).
 fn get_or_create_slow_store(
     state: &MultiUserMemoryManager,
     user_id: &str,
-) -> Result<SlowStore, anyhow::Error> {
-    let user_path = state.base_path.join(user_id);
-    std::fs::create_dir_all(&user_path)?;
-    let db_path = user_path.join("slow_store.db");
-    SlowStore::open(&db_path)
+) -> Result<std::sync::Arc<SlowStore>, anyhow::Error> {
+    state
+        .get_user_slow_store(user_id)
+        .map_err(|e| anyhow::anyhow!("Failed to get slow store for user {user_id}: {e}"))
 }
 
 /// Sync graph data from RocksDB (GraphMemory) into SQLite (SlowStore).
