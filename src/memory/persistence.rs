@@ -90,6 +90,9 @@ pub struct PersistenceConfig {
     pub max_radius: f32,
     pub min_persistence: f32,
     pub max_entities: usize,
+    /// Maximum simplices before bailing out of clique expansion.
+    /// Prevents combinatorial explosion in dense graphs.
+    pub max_simplices: usize,
 }
 
 impl Default for PersistenceConfig {
@@ -99,6 +102,7 @@ impl Default for PersistenceConfig {
             max_radius: 1.0,
             min_persistence: 0.15,
             max_entities: 2000,
+            max_simplices: 100_000,
         }
     }
 }
@@ -253,13 +257,22 @@ fn build_rips_complex(
         .collect();
     sorted_edges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Add edges and expand to higher simplices (triangles, tetrahedra)
+    // Add edges and expand to higher simplices (triangles, tetrahedra).
+    // Bail early if simplex count exceeds budget to prevent combinatorial explosion.
     for &(dist, i, j) in &sorted_edges {
         simplices.push((dist, BTreeSet::from([i, j])));
 
-        if MAX_SIMPLEX_DIM >= 2 {
-            expand_cliques(i, j, dist, distances, n, &mut simplices);
+        if MAX_SIMPLEX_DIM >= 2 && simplices.len() < config.max_simplices {
+            expand_cliques(i, j, dist, distances, n, &mut simplices, config.max_simplices);
         }
+    }
+
+    if simplices.len() >= config.max_simplices {
+        tracing::warn!(
+            "Simplex budget exhausted ({} >= {}), clique expansion truncated",
+            simplices.len(),
+            config.max_simplices
+        );
     }
 
     // Sort by (filtration_value, dimension) for the reduction algorithm
@@ -287,6 +300,7 @@ fn expand_cliques(
     distances: &HashMap<(usize, usize), f32>,
     n: usize,
     simplices: &mut Vec<(f32, Simplex)>,
+    max_simplices: usize,
 ) {
     // Find vertices connected to both i and j within distance
     let common: Vec<usize> = (0..n)
@@ -300,6 +314,9 @@ fn expand_cliques(
         .collect();
 
     for &k in &common {
+        if simplices.len() >= max_simplices {
+            return;
+        }
         // Triangle [i, j, k]
         let filt_val = dist
             .max(get_dist(distances, i, k).unwrap_or(dist))
@@ -309,7 +326,7 @@ fn expand_cliques(
         // Tetrahedra [i, j, k, l] for each l > k also in common
         if MAX_SIMPLEX_DIM >= 3 {
             for &l in &common {
-                if l <= k {
+                if l <= k || simplices.len() >= max_simplices {
                     continue;
                 }
                 if let (Some(dkl), Some(dil), Some(djl)) = (

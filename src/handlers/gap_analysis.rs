@@ -32,7 +32,7 @@ const MAX_K: usize = 100;
 const MAX_NUM_INTERVALS: usize = 200;
 const MIN_OVERLAP: f32 = 0.0;
 const MAX_OVERLAP: f32 = 0.9;
-const MAX_ENTITIES: usize = 5000;
+const MAX_ENTITIES: usize = 2000;
 const SYNC_TTL_SECS: u64 = 30;
 
 fn validate_range_f32(value: f32, min: f32, max: f32, name: &str) -> Result<f32, AppError> {

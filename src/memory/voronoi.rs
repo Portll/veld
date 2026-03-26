@@ -82,6 +82,8 @@ pub struct VoronoiConfig {
     pub min_void_boundary: usize,
     /// Maximum number of voids to return
     pub max_voids: usize,
+    /// Maximum entities to process (guards O(n²) k-NN allocation)
+    pub max_entities: usize,
 }
 
 impl Default for VoronoiConfig {
@@ -91,6 +93,7 @@ impl Default for VoronoiConfig {
             void_isolation_threshold: 1.3,
             min_void_boundary: 3,
             max_voids: 20,
+            max_entities: 2000,
         }
     }
 }
@@ -132,8 +135,11 @@ impl VoronoiAnalyzer {
     pub fn analyze(store: &SlowStore, config: &VoronoiConfig) -> Result<VoronoiAnalysis> {
         let start = std::time::Instant::now();
 
-        // Load all embeddings
-        let entities = store.load_all_embeddings()?;
+        // Load embeddings, capped to prevent O(n²) blowup in k-NN
+        let mut entities = store.load_all_embeddings()?;
+        if entities.len() > config.max_entities {
+            entities.truncate(config.max_entities);
+        }
         if entities.len() < 3 {
             return Ok(VoronoiAnalysis {
                 cells: Vec::new(),
