@@ -735,10 +735,13 @@ pub fn spreading_activation_retrieve_with_stats(
                                         .map(|e| e.labels)
                                 });
                             if let Some(labels) = cached_labels {
-                                if !labels
-                                    .iter()
-                                    .any(|l| intent.expected_labels.contains(l))
-                                {
+                                let type_match = labels.iter().any(|l| {
+                                    intent
+                                        .expected_labels
+                                        .iter()
+                                        .any(|exp| l.matches_with_hierarchy(exp))
+                                });
+                                if !type_match {
                                     penalty *= ONTOLOGICAL_ENTITY_PENALTY;
                                 }
                             }
