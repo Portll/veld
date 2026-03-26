@@ -364,15 +364,26 @@ impl ServerConfig {
 
         // Max users in memory
         if let Ok(val) = env::var("SHODH_MAX_USERS") {
-            if let Ok(n) = val.parse() {
-                config.max_users_in_memory = n;
+            if let Ok(n) = val.parse::<usize>() {
+                config.max_users_in_memory = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "SHODH_MAX_USERS=0 is invalid (would evict every user), clamped to 1"
+                    );
+                }
             }
         }
 
         // Audit settings
         if let Ok(val) = env::var("SHODH_AUDIT_MAX_ENTRIES") {
-            if let Ok(n) = val.parse() {
-                config.audit_max_entries_per_user = n;
+            if let Ok(n) = val.parse::<usize>() {
+                config.audit_max_entries_per_user = n.max(100);
+                if n < 100 {
+                    tracing::warn!(
+                        "SHODH_AUDIT_MAX_ENTRIES={} is below minimum, clamped to 100",
+                        n
+                    );
+                }
             }
         }
 
@@ -397,15 +408,25 @@ impl ServerConfig {
 
         // Concurrency
         if let Ok(val) = env::var("SHODH_MAX_CONCURRENT") {
-            if let Ok(n) = val.parse() {
-                config.max_concurrent_requests = n;
+            if let Ok(n) = val.parse::<usize>() {
+                config.max_concurrent_requests = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "SHODH_MAX_CONCURRENT=0 is invalid (would reject all requests), clamped to 1"
+                    );
+                }
             }
         }
 
         // Request timeout
         if let Ok(val) = env::var("SHODH_REQUEST_TIMEOUT") {
-            if let Ok(n) = val.parse() {
-                config.request_timeout_secs = n;
+            if let Ok(n) = val.parse::<u64>() {
+                config.request_timeout_secs = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "SHODH_REQUEST_TIMEOUT=0 is invalid (would instant-timeout all requests), clamped to 1"
+                    );
+                }
             }
         }
 
@@ -414,22 +435,36 @@ impl ServerConfig {
 
         // Memory maintenance settings
         if let Ok(val) = env::var("SHODH_MAINTENANCE_INTERVAL") {
-            if let Ok(n) = val.parse() {
-                config.maintenance_interval_secs = n;
+            if let Ok(n) = val.parse::<u64>() {
+                config.maintenance_interval_secs = n.max(10);
+                if n < 10 {
+                    tracing::warn!(
+                        "SHODH_MAINTENANCE_INTERVAL={} is below minimum (would cause CPU spin-loop), clamped to 10",
+                        n
+                    );
+                }
             }
         }
 
         if let Ok(val) = env::var("SHODH_ACTIVATION_DECAY") {
             if let Ok(n) = val.parse::<f32>() {
-                let clamped = n.clamp(0.5, 0.99);
-                if (clamped - n).abs() > f32::EPSILON {
+                if !n.is_finite() {
                     tracing::warn!(
-                        "SHODH_ACTIVATION_DECAY={} clamped to {} (valid range: 0.5–0.99)",
-                        n,
-                        clamped
+                        "SHODH_ACTIVATION_DECAY={} is not finite, using default {}",
+                        val,
+                        config.activation_decay_factor
                     );
+                } else {
+                    let clamped = n.clamp(0.5, 0.99);
+                    if (clamped - n).abs() > f32::EPSILON {
+                        tracing::warn!(
+                            "SHODH_ACTIVATION_DECAY={} clamped to {} (valid range: 0.5–0.99)",
+                            n,
+                            clamped
+                        );
+                    }
+                    config.activation_decay_factor = clamped;
                 }
-                config.activation_decay_factor = clamped;
             }
         }
 
@@ -446,8 +481,13 @@ impl ServerConfig {
         }
 
         if let Ok(val) = env::var("SHODH_BACKUP_MAX_COUNT") {
-            if let Ok(n) = val.parse() {
-                config.backup_max_count = n;
+            if let Ok(n) = val.parse::<usize>() {
+                config.backup_max_count = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "SHODH_BACKUP_MAX_COUNT=0 is invalid (would keep no backups), clamped to 1"
+                    );
+                }
             }
         }
 

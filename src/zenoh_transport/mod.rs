@@ -167,6 +167,15 @@ pub async fn start(
             );
             continue;
         }
+        if let Err(e) = crate::validation::validate_user_id(&topic.user_id) {
+            warn!(
+                key_expr = %topic.key_expr,
+                user_id = %topic.user_id,
+                error = %e,
+                "Skipping auto-topic with invalid user_id"
+            );
+            continue;
+        }
         register_auto_topic(&session, topic, &manager, shutdown_rx.clone()).await?;
     }
 
