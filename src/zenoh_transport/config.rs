@@ -263,6 +263,13 @@ impl ZenohConfig {
             }
             if topic.user_id.is_empty() {
                 tracing::warn!("Auto-topic [{}] has empty user_id — will be skipped", i);
+            } else if let Err(e) = crate::validation::validate_user_id(&topic.user_id) {
+                tracing::warn!(
+                    "Auto-topic [{}] has invalid user_id '{}': {} — will be skipped",
+                    i,
+                    topic.user_id,
+                    e
+                );
             }
         }
 

@@ -50,6 +50,11 @@ pub async fn linear_webhook(
             });
         }
         (false, _) => {
+            if state.server_config().is_production {
+                return Err(AppError::ServiceUnavailable(
+                    "Webhook secret not configured".to_string(),
+                ));
+            }
             tracing::warn!("No LINEAR_WEBHOOK_SECRET configured, skipping signature verification");
         }
     }
@@ -266,6 +271,11 @@ pub async fn github_webhook(
             });
         }
         (false, _) => {
+            if state.server_config().is_production {
+                return Err(AppError::ServiceUnavailable(
+                    "Webhook secret not configured".to_string(),
+                ));
+            }
             tracing::warn!("No GITHUB_WEBHOOK_SECRET configured, skipping signature verification");
         }
     }
