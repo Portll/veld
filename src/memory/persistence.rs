@@ -621,7 +621,59 @@ mod tests {
         let distances = HashMap::from([((0, 1), 0.3), ((0, 2), 0.4), ((1, 2), 0.5)]);
         let config = PersistenceConfig::default();
         let (simplices, _) = build_rips_complex(3, &distances, &config);
-        // 3 vertices + 3 edges + 1 triangle = 7 simplices
         assert!(simplices.len() >= 7, "Expected ≥7 simplices, got {}", simplices.len());
+    }
+
+    /// Randomised invariant test: any set of embeddings produces a valid diagram.
+    #[test]
+    fn test_invariants_random_embeddings() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        for n in [3, 5, 10, 20] {
+            let entities: Vec<(String, String, Vec<f32>)> = (0..n)
+                .map(|i| {
+                    let emb: Vec<f32> = (0..32).map(|_| rng.gen::<f32>()).collect();
+                    (format!("e{i}"), format!("E{i}"), emb)
+                })
+                .collect();
+
+            let distances = compute_sparse_distances(&entities, 1.0);
+            let config = PersistenceConfig { max_entities: n, ..Default::default() };
+            let (simplices, filt) = build_rips_complex(n, &distances, &config);
+            let pairs = reduce_boundary_matrix(&simplices);
+            let betti = compute_betti_curves(&pairs, &simplices, &filt);
+
+            // Invariant 1: all persistence values are non-negative
+            for p in &pairs {
+                assert!(p.persistence >= 0.0, "Negative persistence: {}", p.persistence);
+            }
+
+            // Invariant 2: birth <= death (when death exists)
+            for p in &pairs {
+                if let Some(d) = p.death {
+                    assert!(p.birth <= d, "birth {} > death {}", p.birth, d);
+                }
+            }
+
+            // Invariant 3: Betti numbers are non-negative (usize guarantees this, but check logic)
+            for b in &betti {
+                assert!(b.simplex_count > 0 || b.epsilon == 0.0);
+            }
+
+            // Invariant 4: at least 1 H₀ feature (there's always at least 1 component)
+            let h0_count = pairs.iter().filter(|p| p.dimension == 0).count();
+            assert!(h0_count >= 1, "No H₀ features for {n} entities");
+
+            // Invariant 5: pairs are sorted by persistence (descending)
+            for w in pairs.windows(2) {
+                assert!(
+                    w[0].persistence >= w[1].persistence || w[0].persistence.is_infinite(),
+                    "Pairs not sorted: {} then {}",
+                    w[0].persistence,
+                    w[1].persistence
+                );
+            }
+        }
     }
 }

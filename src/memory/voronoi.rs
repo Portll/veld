@@ -625,4 +625,30 @@ mod tests {
         let a = VoronoiAnalyzer::compute_anisotropy(&center, &entities, &[(1, 1.0)], 2);
         assert_eq!(a, 1.0);
     }
+
+    /// Randomised invariant: kNN output length always ≤ k, distances non-negative.
+    #[test]
+    fn test_knn_invariants_random() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        let entities: Vec<(String, String, Vec<f32>)> = (0..15)
+            .map(|i| {
+                let emb: Vec<f32> = (0..16).map(|_| rng.gen::<f32>()).collect();
+                (format!("e{i}"), format!("E{i}"), emb)
+            })
+            .collect();
+
+        for k in [1, 3, 5, 20] {
+            let knn = VoronoiAnalyzer::compute_knn(&entities, k);
+            assert_eq!(knn.len(), entities.len());
+            for (i, neighbors) in knn.iter().enumerate() {
+                assert!(neighbors.len() <= k.min(entities.len() - 1));
+                for &(j, dist) in neighbors {
+                    assert_ne!(i, j, "Entity should not be its own neighbor");
+                    assert!(dist >= 0.0, "Negative distance");
+                }
+            }
+        }
+    }
 }
