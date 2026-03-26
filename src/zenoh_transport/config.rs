@@ -23,7 +23,7 @@ use crate::streaming::{ExtractionConfig, StreamMode};
 // =============================================================================
 
 /// Top-level Zenoh transport configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ZenohConfig {
     /// Whether Zenoh transport is enabled at runtime.
     /// Even with the `zenoh` feature compiled in, transport won't start unless this is true.
@@ -169,6 +169,20 @@ impl Default for ZenohConfig {
 // =============================================================================
 // ENVIRONMENT LOADING
 // =============================================================================
+
+impl std::fmt::Debug for ZenohConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZenohConfig")
+            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
+            .field("connect", &self.connect)
+            .field("listen", &self.listen)
+            .field("prefix", &self.prefix)
+            .field("auto_topics", &self.auto_topics)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
 
 impl ZenohConfig {
     /// Load configuration from environment variables.
