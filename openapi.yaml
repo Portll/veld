@@ -22,7 +22,7 @@ info:
     name: Shodh Memory
     url: https://github.com/varun29ankuS/shodh-memory
   license:
-    name: Apache-2.0
+    name: BUSL-1.1
     url: https://opensource.org/licenses/MIT
 
 servers:

@@ -628,7 +628,7 @@ fn handle_version() {
     eprintln!("shodh {}", env!("CARGO_PKG_VERSION"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
-    eprintln!("  License:  Apache-2.0");
+    eprintln!("  License:  BUSL-1.1");
     eprintln!("  Repo:     https://github.com/varun29ankuS/shodh-memory");
 }
 

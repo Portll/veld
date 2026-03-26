@@ -4,7 +4,7 @@ version = "0.1.91"
 edition = "2021"
 description = "Terminal UI for Shodh Memory - real-time visualization"
 authors = ["Shodh"]
-license = "MIT"
+license = "BUSL-1.1"
 
 [[bin]]
 name = "shodh-tui"

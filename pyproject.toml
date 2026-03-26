@@ -7,7 +7,7 @@ name = "shodh-memory"
 version = "0.2.0"
 description = "Local-first AI memory system for robotics, drones, and edge AI - 100% offline capable"
 authors = [{name = "Shodh Team", email = "29.varuns@gmail.com"}]
-license = {text = "Apache-2.0"}
+license = {text = "BUSL-1.1"}
 readme = "README-python.md"
 requires-python = ">=3.8"
 classifiers = [
