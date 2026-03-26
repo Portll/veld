@@ -40,7 +40,7 @@
     "shodh"
   ],
   "author": "Shodh Team <29.varuns@gmail.com>",
-  "license": "Apache-2.0",
+  "license": "BUSL-1.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/varun29ankuS/shodh-memory.git"

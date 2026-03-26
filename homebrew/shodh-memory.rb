@@ -13,7 +13,7 @@ class ShodhMemory < Formula
   desc "Cognitive memory system for AI agents — local, private, neuroscience-inspired"
   homepage "https://github.com/varun29ankuS/shodh-memory"
   version "0.1.91"
-  license "Apache-2.0"
+  license "BUSL-1.1"
 
   on_macos do
     if Hardware::CPU.arm?

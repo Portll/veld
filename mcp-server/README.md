@@ -275,4 +275,4 @@ The backend server runs locally and stores all data on your machine. No cloud de
 
 ## License
 
-Apache-2.0
+BUSL-1.1
