@@ -13,7 +13,7 @@
 //! Architecture: RocksDB (fast store) → periodic sync → SQLite (slow store, gap analysis)
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,15 @@ pub struct EntityCluster {
     pub avg_internal_strength: f32,
 }
 
+/// Statistics from a retention cleanup operation
+#[derive(Debug, Default)]
+pub struct CleanupStats {
+    pub gaps_deleted: usize,
+    pub thoughts_deleted: usize,
+}
+
+const CURRENT_SCHEMA_VERSION: i32 = 1;
+
 /// SQLite-backed slow store for relational queries on the knowledge graph.
 ///
 /// Runs in WAL mode: concurrent reads, single writer, no locking issues.
@@ -136,6 +145,7 @@ impl SlowStore {
             last_sync: Mutex::new(None),
         };
         store.create_schema()?;
+        store.check_schema_version()?;
         Ok(store)
     }
 
@@ -222,9 +232,93 @@ impl SlowStore {
             CREATE INDEX IF NOT EXISTS idx_thoughts_active
                 ON thoughts(dismissed, confidence DESC)
                 WHERE dismissed = 0;
+
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL
+            );
         ",
         )?;
         Ok(())
+    }
+
+    /// Check and apply schema migrations.
+    ///
+    /// On a fresh database, inserts version 1. On an existing database,
+    /// runs any pending migrations up to CURRENT_SCHEMA_VERSION.
+    fn check_schema_version(&self) -> Result<()> {
+        let conn = self.conn.lock();
+
+        let current_version: Option<i32> = conn
+            .query_row(
+                "SELECT MAX(version) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to query schema version")?;
+
+        match current_version {
+            None => {
+                // New database — insert initial version
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+                    params![CURRENT_SCHEMA_VERSION, now],
+                )?;
+                tracing::info!("SlowStore: initialized schema version {}", CURRENT_SCHEMA_VERSION);
+            }
+            Some(v) if v < CURRENT_SCHEMA_VERSION => {
+                // Run migrations from v+1 to CURRENT_SCHEMA_VERSION
+                // No migrations yet — framework is in place for future versions
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+                    params![CURRENT_SCHEMA_VERSION, now],
+                )?;
+                tracing::info!(
+                    "SlowStore: migrated schema from version {} to {}",
+                    v,
+                    CURRENT_SCHEMA_VERSION
+                );
+            }
+            Some(v) => {
+                tracing::info!("SlowStore: schema version {} (current)", v);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete old resolved gaps and dismissed thoughts beyond the retention window.
+    ///
+    /// This prevents the slow store from growing unboundedly with stale data.
+    /// Only removes data that has already been acted on (resolved/dismissed).
+    pub fn cleanup_old_data(&self, max_age_days: u32) -> Result<CleanupStats> {
+        let cutoff = Utc::now() - Duration::days(max_age_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let conn = self.conn.lock();
+
+        let gaps_deleted = conn.execute(
+            "DELETE FROM gap_topologies WHERE resolved_at IS NOT NULL AND detected_at < ?1",
+            params![cutoff_str],
+        )?;
+
+        let thoughts_deleted = conn.execute(
+            "DELETE FROM thoughts WHERE dismissed = 1 AND created_at < ?1",
+            params![cutoff_str],
+        )?;
+
+        tracing::info!(
+            "SlowStore cleanup: {} resolved gaps and {} dismissed thoughts removed (cutoff: {} days)",
+            gaps_deleted,
+            thoughts_deleted,
+            max_age_days
+        );
+
+        Ok(CleanupStats {
+            gaps_deleted,
+            thoughts_deleted,
+        })
     }
 
     /// Check if sync is needed based on TTL. Returns true if last sync was
@@ -991,5 +1085,57 @@ mod tests {
         assert!(store.get_adjacency_list(0.0).unwrap().is_empty());
         assert!(store.load_all_edge_pairs().unwrap().is_empty());
         assert!(store.get_active_thoughts(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_old_data() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        // Create a thought and dismiss it
+        store
+            .store_thought(
+                "t-cleanup",
+                "silo",
+                "content",
+                0.5,
+                "old dismissed thought",
+                None,
+                "[]",
+                0.3,
+                "[]",
+            )
+            .unwrap();
+        store.dismiss_thought("t-cleanup").unwrap();
+
+        // Verify the thought exists (dismissed, so not in active list, but in DB)
+        {
+            let conn = store.conn.lock();
+            let count: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM thoughts WHERE id = 't-cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // Cleanup with 0 days cutoff — everything dismissed before now should be removed
+        let stats = store.cleanup_old_data(0).unwrap();
+        assert_eq!(stats.thoughts_deleted, 1);
+
+        // Verify the thought is gone
+        {
+            let conn = store.conn.lock();
+            let count: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM thoughts WHERE id = 't-cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        }
     }
 }

@@ -173,36 +173,44 @@ pub fn compute_mapper(store: &SlowStore, config: &MapperConfig) -> Result<Mapper
     let embeddings: Vec<&[f32]> = entities.iter().map(|(_, _, emb)| emb.as_slice()).collect();
 
     // Step 1: Compute filter values for each entity
-    let filter_values = compute_filter_values(&embeddings, config.filter);
+    let filter_values = {
+        let _span = tracing::info_span!("mapper.filter").entered();
+        compute_filter_values(&embeddings, config.filter)
+    };
 
     // Step 2: Build overlapping cover of the filter range
     let intervals = build_cover(&filter_values, config.num_intervals, config.overlap);
 
     // Step 3: For each interval, pull back and cluster
-    let mut all_clusters: Vec<(usize, Vec<usize>)> = Vec::new(); // (interval_idx, member indices)
+    let all_clusters: Vec<(usize, Vec<usize>)> = {
+        let _span = tracing::info_span!("mapper.cluster").entered();
+        let mut clusters_acc: Vec<(usize, Vec<usize>)> = Vec::new();
 
-    for (interval_idx, (low, high)) in intervals.iter().enumerate() {
-        // Pull back: find entities whose filter value falls in this interval
-        let pullback: Vec<usize> = filter_values
-            .iter()
-            .enumerate()
-            .filter(|(_, &v)| v >= *low && v <= *high)
-            .map(|(i, _)| i)
-            .collect();
+        for (interval_idx, (low, high)) in intervals.iter().enumerate() {
+            // Pull back: find entities whose filter value falls in this interval
+            let pullback: Vec<usize> = filter_values
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v >= *low && v <= *high)
+                .map(|(i, _)| i)
+                .collect();
 
-        if pullback.is_empty() {
-            continue;
-        }
+            if pullback.is_empty() {
+                continue;
+            }
 
-        // Cluster the pullback using single-linkage at cluster_radius
-        let clusters = single_linkage_cluster(&pullback, &embeddings, config.cluster_radius);
+            // Cluster the pullback using single-linkage at cluster_radius
+            let clusters = single_linkage_cluster(&pullback, &embeddings, config.cluster_radius);
 
-        for cluster in clusters {
-            if !cluster.is_empty() {
-                all_clusters.push((interval_idx, cluster));
+            for cluster in clusters {
+                if !cluster.is_empty() {
+                    clusters_acc.push((interval_idx, cluster));
+                }
             }
         }
-    }
+
+        clusters_acc
+    };
 
     // Step 4: Build nodes
     let nodes: Vec<MapperNode> = all_clusters

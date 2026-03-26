@@ -8,6 +8,7 @@ use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
+use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::gap_topology::{GapDetectionConfig, GapDetector};
 use crate::memory::mapper::{compute_mapper, MapperConfig, MapperFilter};
@@ -117,6 +118,7 @@ pub async fn analyze_gaps(
         validate_range_usize(req.max_gaps_per_type, MAX_GAPS_PER_TYPE, "max_gaps_per_type")?;
 
     let user_id = req.user_id.clone();
+    let user_id_for_event = user_id.clone();
     let state_clone = state.clone();
 
     let offset = req.offset;
@@ -167,6 +169,22 @@ pub async fn analyze_gaps(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Gap analysis task failed: {e}")))?
     .map_err(AppError::Internal)?;
 
+    state.emit_event(MemoryEvent {
+        event_type: "gap_analysis_complete".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: user_id_for_event,
+        memory_id: None,
+        content_preview: None,
+        memory_type: None,
+        importance: None,
+        count: Some(result.total_count),
+        results: Some(serde_json::json!({
+            "type": "gap_analysis_complete",
+            "gap_count": result.total_count,
+            "duration_ms": result.duration_ms,
+        })),
+    });
+
     Ok(Json(result))
 }
 
@@ -179,6 +197,14 @@ pub struct VoronoiAnalysisRequest {
     pub user_id: String,
     #[serde(default = "default_k")]
     pub k: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_voronoi_limit")]
+    pub limit: usize,
+}
+
+fn default_voronoi_limit() -> usize {
+    10
 }
 
 fn default_k() -> usize {
@@ -190,6 +216,7 @@ pub struct VoronoiAnalysisResponse {
     pub entity_count: usize,
     pub voids_found: usize,
     pub avg_anisotropy: f32,
+    pub total_count: usize,
     pub most_isolated: Vec<IsolatedEntity>,
     pub voids: Vec<VoidSummary>,
 }
@@ -221,6 +248,8 @@ pub async fn voronoi_analysis(
 
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
+    let offset = req.offset;
+    let limit = req.limit.max(1);
 
     let result = tokio::task::spawn_blocking(move || -> Result<VoronoiAnalysisResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
@@ -246,7 +275,8 @@ pub async fn voronoi_analysis(
                 .partial_cmp(&a.isolation)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        most_isolated.truncate(10);
+        let total_count = most_isolated.len();
+        most_isolated = most_isolated.into_iter().skip(offset).take(limit).collect();
 
         let voids: Vec<VoidSummary> = analysis
             .voids
@@ -262,6 +292,7 @@ pub async fn voronoi_analysis(
             entity_count: analysis.stats.entity_count,
             voids_found: analysis.voids.len(),
             avg_anisotropy: analysis.stats.avg_anisotropy,
+            total_count,
             most_isolated,
             voids,
         })
@@ -284,6 +315,10 @@ pub struct PersistenceRequest {
     pub step_size: f32,
     #[serde(default = "default_min_persistence")]
     pub min_persistence: f32,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
 }
 
 fn default_persistence_step() -> f32 {
@@ -295,6 +330,7 @@ fn default_min_persistence() -> f32 {
 
 #[derive(Debug, Serialize)]
 pub struct PersistenceResponse {
+    pub total_count: usize,
     pub pairs: Vec<PersistencePairSummary>,
     pub betti_curves: Vec<BettiCurveSummary>,
     pub stats: PersistenceStatsSummary,
@@ -346,6 +382,8 @@ pub async fn persistence_analysis(
 
     let user_id = req.user_id.clone();
     let state_clone = state.clone();
+    let offset = req.offset;
+    let limit = req.limit.max(1);
 
     let result = tokio::task::spawn_blocking(move || -> Result<PersistenceResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
@@ -367,6 +405,7 @@ pub async fn persistence_analysis(
             _ => "higher",
         };
 
+        let total_count = diagram.pairs.len();
         let pairs: Vec<PersistencePairSummary> = diagram
             .pairs
             .iter()
@@ -392,6 +431,8 @@ pub async fn persistence_analysis(
                     sandwich_upper: (p.birth * 2.0).min(1.0),
                 }
             })
+            .skip(offset)
+            .take(limit)
             .collect();
 
         let betti_curves: Vec<BettiCurveSummary> = diagram
@@ -407,6 +448,7 @@ pub async fn persistence_analysis(
             .collect();
 
         Ok(PersistenceResponse {
+            total_count,
             pairs,
             betti_curves,
             stats: PersistenceStatsSummary {
@@ -439,6 +481,10 @@ pub struct MapperRequest {
     pub num_intervals: usize,
     #[serde(default = "default_overlap")]
     pub overlap: f32,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
 }
 
 fn default_mapper_filter() -> String {
@@ -453,6 +499,7 @@ fn default_overlap() -> f32 {
 
 #[derive(Debug, Serialize)]
 pub struct MapperResponse {
+    pub total_count: usize,
     pub nodes: Vec<MapperNodeSummary>,
     pub edges: Vec<MapperEdgeSummary>,
     pub num_components: usize,
@@ -503,6 +550,8 @@ pub async fn mapper_analysis(
     let user_id = req.user_id.clone();
     let filter_str = req.filter.clone();
     let state_clone = state.clone();
+    let offset = req.offset;
+    let limit = req.limit.max(1);
 
     let result = tokio::task::spawn_blocking(move || -> Result<MapperResponse, anyhow::Error> {
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
@@ -525,9 +574,12 @@ pub async fn mapper_analysis(
 
         let graph = compute_mapper(&store, &config)?;
 
+        let total_count = graph.nodes.len();
         let nodes: Vec<MapperNodeSummary> = graph
             .nodes
             .iter()
+            .skip(offset)
+            .take(limit)
             .map(|n| MapperNodeSummary {
                 id: n.id,
                 member_names: n.member_names.clone(),
@@ -547,6 +599,7 @@ pub async fn mapper_analysis(
             .collect();
 
         Ok(MapperResponse {
+            total_count,
             nodes,
             edges,
             num_components: graph.num_components,

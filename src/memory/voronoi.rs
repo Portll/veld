@@ -150,8 +150,11 @@ impl VoronoiAnalyzer {
         }
 
         // Phase 1: Compute k-NN and cell properties
-        let knn = Self::compute_knn(&entities, config.k);
-        let cells = Self::compute_cells(&entities, &knn);
+        let cells = {
+            let _span = tracing::info_span!("voronoi.knn", entities = entities.len()).entered();
+            let knn = Self::compute_knn(&entities, config.k);
+            Self::compute_cells(&entities, &knn)
+        };
 
         // Global average isolation for normalization
         let global_avg_isolation = if cells.is_empty() {
@@ -172,7 +175,10 @@ impl VoronoiAnalyzer {
             .collect();
 
         // Phase 2: Detect voids
-        let voids = Self::detect_voids(&entities, &cells, config);
+        let voids = {
+            let _span = tracing::info_span!("voronoi.voids").entered();
+            Self::detect_voids(&entities, &cells, config)
+        };
 
         // Compute stats
         let max_isolation = cells
