@@ -1336,6 +1336,105 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "update_memory",
+        description: "Update an existing memory's content, tags, importance, or type. Preserves the memory ID, lineage edges, Hebbian graph connections, and learning history.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "The memory ID (full UUID or short prefix like '5581cd02')",
+            },
+            content: {
+              type: "string",
+              description: "New content for the memory",
+            },
+            tags: {
+              type: "array",
+              items: { type: "string" },
+              description: "New tags (replaces existing)",
+            },
+            importance: {
+              type: "number",
+              description: "New importance (0.0 to 1.0)",
+            },
+            memory_type: {
+              type: "string",
+              description: "New memory type (Observation, Decision, Learning, Pattern, Error, Context)",
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "trace_lineage",
+        description: "Trace the causal chain of a memory — find what caused it, what it informed, and how decisions connect across sessions. Requires full UUID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            memory_id: {
+              type: "string",
+              description: "Full UUID of the memory to trace",
+            },
+            direction: {
+              type: "string",
+              enum: ["backward", "forward", "both"],
+              description: "Trace direction (default: both)",
+            },
+            max_depth: {
+              type: "number",
+              description: "Maximum trace depth (default: 5)",
+            },
+          },
+          required: ["memory_id"],
+        },
+      },
+      {
+        name: "search_facts",
+        description: "Search extracted semantic facts (entity-predicate-object triples) across all memories.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search query for facts",
+            },
+            entity: {
+              type: "string",
+              description: "Filter by entity name (optional)",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum results (default: 20)",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "link_lineage",
+        description: "Create a causal link between two memories — record that one memory caused, informed, resolved, or triggered another.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            from_memory_id: {
+              type: "string",
+              description: "Full UUID of the source memory",
+            },
+            to_memory_id: {
+              type: "string",
+              description: "Full UUID of the target memory",
+            },
+            relation: {
+              type: "string",
+              enum: ["Caused", "ResolvedBy", "InformedBy", "SupersededBy", "TriggeredBy", "BranchedFrom", "RelatedTo"],
+              description: "Type of causal relationship",
+            },
+          },
+          required: ["from_memory_id", "to_memory_id", "relation"],
+        },
+      },
+      {
         name: "read_memory",
         description: "Read the FULL content of a specific memory by ID. Use this when you need to see the complete text of a memory that was truncated in search results.",
         inputSchema: {
@@ -3234,6 +3333,157 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: "text", text: result.formatted }],
         };
+      }
+
+      case "update_memory": {
+        const memory_id = (args as any).memory_id;
+        if (!memory_id || typeof memory_id !== 'string' || memory_id.trim().length === 0) {
+          return {
+            content: [{ type: "text", text: "Error: 'memory_id' is required." }],
+            isError: true,
+          };
+        }
+
+        const updateBody: Record<string, unknown> = { user_id: USER_ID };
+        if ((args as any).content) updateBody.content = (args as any).content;
+        if ((args as any).tags) updateBody.tags = (args as any).tags;
+        if ((args as any).importance !== undefined) updateBody.importance = (args as any).importance;
+        if ((args as any).memory_type) updateBody.memory_type = (args as any).memory_type;
+
+        try {
+          await apiCall(`/api/memory/${encodeURIComponent(memory_id)}`, "PUT", updateBody);
+        } catch (e: any) {
+          return {
+            content: [{ type: "text", text: `Failed to update memory ${memory_id}: ${e.message || e}` }],
+            isError: true,
+          };
+        }
+
+        const fields = Object.keys(updateBody).filter(k => k !== 'user_id').join(', ');
+        return {
+          content: [{ type: "text", text: `Memory updated: ${memory_id}\nFields: ${fields}` }],
+        };
+      }
+
+      case "trace_lineage": {
+        const memory_id = (args as any).memory_id;
+        if (!memory_id) {
+          return { content: [{ type: "text", text: "Error: 'memory_id' (full UUID) is required." }], isError: true };
+        }
+
+        const body: Record<string, unknown> = {
+          user_id: USER_ID,
+          memory_id,
+        };
+        if ((args as any).direction) body.direction = (args as any).direction;
+        if ((args as any).max_depth) body.max_depth = (args as any).max_depth;
+
+        interface LineageEdge {
+          from_memory_id: string;
+          to_memory_id: string;
+          relation: string;
+          confidence: number;
+          created_at: string;
+        }
+        interface LineageResult {
+          edges: LineageEdge[];
+          root_memories: string[];
+          leaf_memories: string[];
+        }
+
+        try {
+          const result = await apiCall<LineageResult>("/api/lineage/trace", "POST", body);
+          let response = `Lineage Trace: ${memory_id}\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += `Edges: ${result.edges?.length || 0}\n`;
+          if (result.edges?.length) {
+            for (const e of result.edges) {
+              response += `  ${e.from_memory_id.slice(0, 8)} --[${e.relation}]--> ${e.to_memory_id.slice(0, 8)} (conf: ${(e.confidence * 100).toFixed(0)}%)\n`;
+            }
+          }
+          if (result.root_memories?.length) response += `Roots: ${result.root_memories.map(r => r.slice(0, 8)).join(', ')}\n`;
+          if (result.leaf_memories?.length) response += `Leaves: ${result.leaf_memories.map(l => l.slice(0, 8)).join(', ')}\n`;
+          return { content: [{ type: "text", text: response }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Lineage trace failed: ${e.message || e}` }], isError: true };
+        }
+      }
+
+      case "search_facts": {
+        const query = (args as any).query;
+        if (!query) {
+          return { content: [{ type: "text", text: "Error: 'query' is required." }], isError: true };
+        }
+
+        const body: Record<string, unknown> = {
+          user_id: USER_ID,
+          query,
+          limit: (args as any).limit || 20,
+        };
+
+        // Use entity-specific endpoint if entity filter provided
+        const endpoint = (args as any).entity
+          ? "/api/facts/by-entity"
+          : "/api/facts/search";
+        if ((args as any).entity) body.entity = (args as any).entity;
+
+        interface Fact {
+          subject: string;
+          predicate: string;
+          object: string;
+          confidence: number;
+          source_memory_id?: string;
+        }
+        interface FactsResult {
+          facts: Fact[];
+          total: number;
+        }
+
+        try {
+          const result = await apiCall<FactsResult>(endpoint, "POST", body);
+          let response = `Facts (${result.facts?.length || 0} of ${result.total || 0})\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          if (result.facts?.length) {
+            for (const f of result.facts) {
+              response += `  ${f.subject} → ${f.predicate} → ${f.object}`;
+              if (f.confidence < 1.0) response += ` (${(f.confidence * 100).toFixed(0)}%)`;
+              response += `\n`;
+            }
+          } else {
+            response += `  No facts found for "${query}"\n`;
+          }
+          return { content: [{ type: "text", text: response }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Facts search failed: ${e.message || e}` }], isError: true };
+        }
+      }
+
+      case "link_lineage": {
+        const { from_memory_id, to_memory_id, relation } = args as {
+          from_memory_id: string;
+          to_memory_id: string;
+          relation: string;
+        };
+        if (!from_memory_id || !to_memory_id || !relation) {
+          return {
+            content: [{ type: "text", text: "Error: 'from_memory_id', 'to_memory_id', and 'relation' are all required (full UUIDs)." }],
+            isError: true,
+          };
+        }
+
+        try {
+          await apiCall("/api/lineage/link", "POST", {
+            user_id: USER_ID,
+            from_memory_id,
+            to_memory_id,
+            relation,
+          });
+          return {
+            content: [{ type: "text", text: `Lineage linked: ${from_memory_id.slice(0, 8)} --[${relation}]--> ${to_memory_id.slice(0, 8)}` }],
+          };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Link failed: ${e.message || e}` }], isError: true };
+        }
       }
 
       case "read_memory": {
