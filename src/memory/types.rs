@@ -1077,6 +1077,7 @@ impl Memory {
     }
 
     /// Create a new memory linked to an external system (enables upsert)
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_external_id(
         id: MemoryId,
         experience: Experience,
@@ -3988,6 +3989,7 @@ pub struct FileMemory {
 
 impl FileMemory {
     /// Create a new FileMemory from a file path
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: ProjectId,
         user_id: String,

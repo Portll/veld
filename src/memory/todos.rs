@@ -1197,6 +1197,7 @@ impl TodoStore {
     }
 
     /// Update a project's properties
+    #[allow(clippy::too_many_arguments)]
     pub fn update_project(
         &self,
         user_id: &str,

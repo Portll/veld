@@ -64,6 +64,15 @@ pub struct GapAnalysisRequest {
     pub offset: usize,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Minimum embedding similarity to flag a U-shape (default 0.3)
+    #[serde(default)]
+    pub min_embedding_similarity: Option<f32>,
+    /// Minimum spokes for star gap detection (default 3)
+    #[serde(default)]
+    pub star_min_spokes: Option<usize>,
+    /// Minimum cluster size for orbit detection (default 3)
+    #[serde(default)]
+    pub orbit_min_cluster_size: Option<usize>,
 }
 
 fn default_limit() -> usize {
@@ -108,6 +117,7 @@ pub struct ShapeSummary {
 ///
 /// POST /api/gap/analyze
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+#[allow(clippy::manual_clamp)]
 pub async fn analyze_gaps(
     State(state): State<AppState>,
     Json(req): Json<GapAnalysisRequest>,
@@ -120,6 +130,9 @@ pub async fn analyze_gaps(
     let user_id = req.user_id.clone();
     let user_id_for_event = user_id.clone();
     let state_clone = state.clone();
+    let min_embedding_similarity = req.min_embedding_similarity;
+    let star_min_spokes = req.star_min_spokes;
+    let orbit_min_cluster_size = req.orbit_min_cluster_size;
 
     let offset = req.offset;
     let limit = validate_range_usize(req.limit.max(1), MAX_GAPS_PER_TYPE, "limit")?;
@@ -128,13 +141,16 @@ pub async fn analyze_gaps(
         let store = get_or_create_slow_store(&state_clone, &user_id)?;
         sync_graph_to_slow_store(&state_clone, &user_id, &store)?;
 
-        let config = GapDetectionConfig {
+        let mut config = GapDetectionConfig {
             min_edge_strength: min_strength,
             max_gaps_per_type: max_gaps,
             ..Default::default()
         };
+        if let Some(v) = min_embedding_similarity { config.min_embedding_similarity = v.clamp(0.0, 1.0); }
+        if let Some(v) = star_min_spokes { config.star_min_spokes = v.max(2).min(20); }
+        if let Some(v) = orbit_min_cluster_size { config.orbit_min_cluster_size = v.max(2).min(50); }
 
-        let result = GapDetector::detect(&store, &config)?;
+        let result = GapDetector::detect(store.as_ref(), &config)?;
         let total_count = result.gaps.len();
 
         let gaps: Vec<GapSummary> = result

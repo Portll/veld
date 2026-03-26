@@ -164,7 +164,7 @@ pub async fn consolidate_memories(
                     (Ok(entities), Ok(edges)) => {
                         if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
                             let config = GapDetectionConfig::default();
-                            match GapDetector::detect(&store, &config) {
+                            match GapDetector::detect(store.as_ref(), &config) {
                                 Ok(result) => {
                                     tracing::info!(
                                         user_id = %user_id,

@@ -1773,6 +1773,7 @@ impl MemorySystem {
             query.retrieval_mode,
             RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
         );
+        #[allow(clippy::type_complexity)]
         let (
             graph_results,
             graph_density,

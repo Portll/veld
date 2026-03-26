@@ -1154,6 +1154,7 @@ pub struct GraphMemory {
     /// Maps entity UUID → embedding vector. Loaded on startup, updated on add.
     /// Used when string-based dedup (exact/case/stemmed) fails — catches synonyms
     /// like "authentication" ↔ "auth" via cosine similarity.
+    #[allow(clippy::type_complexity)]
     entity_embedding_cache: Arc<parking_lot::RwLock<Vec<(Uuid, Vec<f32>)>>>,
 
     /// Edges found below prune threshold during lazy-decay reads.

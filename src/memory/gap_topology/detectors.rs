@@ -6,16 +6,16 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
-use crate::memory::slow_store::SlowStore;
+
 use crate::similarity::cosine_similarity;
 
 use super::{
-    GapDetectionConfig, GapEntity, GapRole, GapTopology, GapType, MissingLink, ShapeSignature,
+    GapDetectionConfig, GapEntity, GapRole, GapStore, GapTopology, GapType, MissingLink, ShapeSignature,
 };
 
 /// Detect open triads (U-shapes) and score by embedding similarity.
 pub fn detect_open_triads(
-    store: &SlowStore,
+    store: &dyn GapStore,
     config: &GapDetectionConfig,
 ) -> Result<Vec<GapTopology>> {
     let raw_triads = store.find_open_triads(config.min_edge_strength, config.max_gaps_per_type)?;
@@ -105,7 +105,7 @@ pub fn detect_open_triads(
 
 /// Detect diamond gaps and score them.
 pub fn detect_diamond_gaps(
-    store: &SlowStore,
+    store: &dyn GapStore,
     config: &GapDetectionConfig,
 ) -> Result<Vec<GapTopology>> {
     let raw_diamonds =
@@ -190,7 +190,7 @@ pub fn detect_diamond_gaps(
 
 /// Detect star gaps (hub with disconnected spokes).
 pub fn detect_star_gaps(
-    store: &SlowStore,
+    store: &dyn GapStore,
     config: &GapDetectionConfig,
 ) -> Result<Vec<GapTopology>> {
     let raw_stars = store.find_star_gaps(
@@ -268,7 +268,7 @@ pub fn detect_star_gaps(
 /// Two clusters that share "attractor" entities (common neighbors outside both clusters)
 /// but have no direct cross-links represent knowledge silos that should be connected.
 pub fn detect_orbit_gaps(
-    store: &SlowStore,
+    store: &dyn GapStore,
     config: &GapDetectionConfig,
 ) -> Result<Vec<GapTopology>> {
     let adj = store.get_adjacency_list(config.min_edge_strength)?;
