@@ -475,8 +475,19 @@ pub async fn remember(
 
         tokio::spawn(async move {
             // Task 1: Build episodic graph (entities + episode + relationships)
-            if let Err(e) = state.process_experience_into_graph(&user_id, &experience, &memory_id) {
-                tracing::debug!("Graph processing failed (non-fatal): {}", e);
+            {
+                let state = state.clone();
+                let user_id = user_id.clone();
+                let experience = experience.clone();
+                let mid = memory_id.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    state.process_experience_into_graph(&user_id, &experience, &mid)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Graph task panicked: {e}")))
+                {
+                    tracing::debug!("Graph processing failed (non-fatal): {}", e);
+                }
             }
 
             // Task 2: Set parent_id for hierarchical organization
