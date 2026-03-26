@@ -232,6 +232,7 @@ pub fn compute_mapper(store: &SlowStore, config: &MapperConfig) -> Result<Mapper
 
     // Step 5: Build edges (connect clusters that share entities)
     let mut edges = Vec::new();
+    #[allow(clippy::needless_range_loop)] // indexing parallel arrays by position
     for i in 0..nodes.len() {
         let set_i: HashSet<usize> = nodes[i].members.iter().copied().collect();
         for j in (i + 1)..nodes.len() {
@@ -499,6 +500,7 @@ fn single_linkage_cluster(
 
     // Group by root
     let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+    #[allow(clippy::needless_range_loop)] // indexing into both parent and indices by position
     for i in 0..n {
         let root = find(&mut parent, i);
         clusters.entry(root).or_default().push(indices[i]);

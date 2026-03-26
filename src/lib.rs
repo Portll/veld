@@ -39,6 +39,8 @@ pub mod tracing_setup;
 pub mod validation;
 pub mod vector_db;
 
+pub mod mcp;
+
 // Re-export dependencies to ensure tests/benchmarks use the same version
 pub use chrono;
 pub use parking_lot;
