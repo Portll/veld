@@ -1652,6 +1652,20 @@ impl MultiUserMemoryManager {
                 .retain(|user_id, _| active_users.contains(user_id));
             self.user_graph_init_locks
                 .retain(|user_id, _| active_users.contains(user_id));
+            // Prune SlowStore cache for evicted users to prevent unbounded DashMap growth.
+            // Each SlowStore holds an open SQLite connection with 8MB page cache.
+            let pre_slow = self.slow_stores.len();
+            self.slow_stores
+                .retain(|user_id, _| active_users.contains(user_id));
+            let pruned_slow = pre_slow.saturating_sub(self.slow_stores.len());
+            if pruned_slow > 0 {
+                tracing::info!(
+                    "Pruned SlowStore connections for {} evicted users ({} active)",
+                    pruned_slow,
+                    self.slow_stores.len()
+                );
+            }
+
             // Prune audit logs for evicted users to prevent unbounded DashMap growth.
             // Each user's log can hold up to audit_max_entries_per_user entries (~2-5MB),
             // and without pruning, entries persist long after the user's memory/graph are evicted.
