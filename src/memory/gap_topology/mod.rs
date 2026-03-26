@@ -17,7 +17,17 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::slow_store::SlowStore;
+use super::slow_store::{RawDiamondGap, RawOpenTriad, RawStarGap};
+
+/// Trait abstracting the storage backend for gap detection queries.
+pub trait GapStore: Send + Sync {
+    fn find_open_triads(&self, min_strength: f32, limit: usize) -> Result<Vec<RawOpenTriad>>;
+    fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> Result<Vec<RawDiamondGap>>;
+    fn find_star_gaps(&self, min_spokes: usize, max_connectivity: f32, limit: usize) -> Result<Vec<RawStarGap>>;
+    fn get_adjacency_list(&self, min_strength: f32) -> Result<HashMap<String, Vec<String>>>;
+    fn get_entity_names(&self, uuids: &[&str]) -> Result<HashMap<String, String>>;
+    fn load_embeddings(&self, uuids: &[&str]) -> Result<HashMap<String, Vec<f32>>>;
+}
 
 /// Classification of gap topology
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -237,7 +247,7 @@ impl GapDetector {
     /// 3. Detects orbit gaps via label propagation clustering
     /// 4. Identifies fractal patterns (same gap shape at different scales)
     /// 5. Computes impact scores (how many other gaps would closing this one affect?)
-    pub fn detect(store: &SlowStore, config: &GapDetectionConfig) -> Result<GapDetectionResult> {
+    pub fn detect(store: &dyn GapStore, config: &GapDetectionConfig) -> Result<GapDetectionResult> {
         let start = std::time::Instant::now();
         let mut gaps = Vec::new();
 

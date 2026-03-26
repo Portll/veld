@@ -217,6 +217,7 @@ impl SpannHeader {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         let mut offset = 0;

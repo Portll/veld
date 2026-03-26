@@ -19,6 +19,8 @@ mod storage;
 pub use queries::{EntityCluster, RawDiamondGap, RawOpenTriad, RawStarGap};
 pub use storage::{StoredGap, StoredThought};
 
+use super::gap_topology::GapStore;
+
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
@@ -394,6 +396,29 @@ impl SlowStore {
     /// Database file path
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+
+/// SlowStore implements GapStore for SQL-backed gap detection.
+impl GapStore for SlowStore {
+    fn find_open_triads(&self, min_strength: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawOpenTriad>> {
+        SlowStore::find_open_triads(self, min_strength, limit)
+    }
+    fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawDiamondGap>> {
+        SlowStore::find_diamond_gaps(self, min_strength, limit)
+    }
+    fn find_star_gaps(&self, min_spokes: usize, max_connectivity: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawStarGap>> {
+        SlowStore::find_star_gaps(self, min_spokes, max_connectivity, limit)
+    }
+    fn get_adjacency_list(&self, min_strength: f32) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+        SlowStore::get_adjacency_list(self, min_strength)
+    }
+    fn get_entity_names(&self, uuids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        SlowStore::get_entity_names(self, uuids)
+    }
+    fn load_embeddings(&self, uuids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, Vec<f32>>> {
+        SlowStore::load_embeddings(self, uuids)
     }
 }
 
