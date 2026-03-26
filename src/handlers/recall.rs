@@ -341,11 +341,11 @@ pub async fn recall(
     let user_id_for_recall = req.user_id.clone();
     let query_for_recall = req.query.clone();
 
-    let (memories, triggered_reminders, _prospective_signals) =
+    let (memories, triggered_reminders, _prospective_signals, query_embedding_opt) =
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_for_recall.read();
 
-            // 1. Compute query embedding (reused for prospective + recall)
+            // 1. Compute query embedding (reused for prospective + recall + todo search)
             let query_embedding_opt = memory_guard
                 .compute_embedding(&query_for_recall)
                 .ok();
@@ -420,7 +420,7 @@ pub async fn recall(
 
             let memories = memory_guard.recall(&query).unwrap_or_default();
 
-            (memories, reminders, prospective_signals)
+            (memories, reminders, prospective_signals, query_embedding_opt)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
@@ -459,20 +459,9 @@ pub async fn recall(
         })
         .collect();
 
-    // Search todos semantically if query provided
+    // Search todos semantically using the embedding already computed for recall
     let todos: Vec<RecallTodo> = {
-        // Compute embedding for todo search
-        let query_for_embed = req.query.clone();
-        let memory_for_embed = memory.clone();
-        let embedding: Option<Vec<f32>> = tokio::task::spawn_blocking(move || {
-            let guard = memory_for_embed.read();
-            guard.compute_embedding(&query_for_embed).ok()
-        })
-        .await
-        .ok()
-        .flatten();
-
-        if let Some(emb) = embedding {
+        if let Some(emb) = query_embedding_opt {
             state
                 .todo_store
                 .search_similar(&req.user_id, &emb, 5)
