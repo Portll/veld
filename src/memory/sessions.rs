@@ -621,7 +621,7 @@ impl SessionStore {
             let mut completed = self.completed.write();
             let user_sessions = completed
                 .entry(session.user_id.clone())
-                .or_insert_with(Vec::new);
+                .or_default();
             user_sessions.push(session.clone());
 
             // Trim to max

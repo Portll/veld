@@ -1524,6 +1524,7 @@ pub struct IndexHealth {
 /// When memories are retrieved and used to complete a task, this feedback
 /// tells the system whether they were helpful, enabling adaptive learning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum RetrievalOutcome {
     /// Memory helped complete the task successfully
     /// Triggers: +importance boost, +association strength, +access count
@@ -1533,6 +1534,7 @@ pub enum RetrievalOutcome {
     Misleading,
     /// Memory was retrieved but not actionably useful
     /// Triggers: +access count only (neutral)
+    #[default]
     Neutral,
 }
 
@@ -1727,11 +1729,6 @@ pub struct ReinforcementStats {
     pub persist_failures: usize,
 }
 
-impl Default for RetrievalOutcome {
-    fn default() -> Self {
-        Self::Neutral
-    }
-}
 
 // NOTE: MemoryGraph has been consolidated into GraphMemory (src/graph_memory.rs)
 // which provides persistent storage in RocksDB and proper Hebbian learning.
@@ -1957,11 +1954,7 @@ impl AnticipatoryPrefetch {
         let now = chrono::Utc::now();
 
         // Find similar time window
-        let start_hour = if hour >= PREFETCH_TEMPORAL_WINDOW_HOURS as u32 {
-            hour - PREFETCH_TEMPORAL_WINDOW_HOURS as u32
-        } else {
-            0
-        };
+        let start_hour = hour.saturating_sub(PREFETCH_TEMPORAL_WINDOW_HOURS as u32);
         let end_hour = (hour + PREFETCH_TEMPORAL_WINDOW_HOURS as u32).min(23);
 
         // Calculate time range for today at similar hours
@@ -2027,7 +2020,7 @@ impl AnticipatoryPrefetch {
         // Temporal relevance (same hour of day)
         if let Some(hour) = context.hour_of_day {
             let memory_hour = memory.created_at.hour();
-            if (memory_hour as i32 - hour as i32).abs() <= PREFETCH_TEMPORAL_WINDOW_HOURS as i32 {
+            if (memory_hour as i32 - hour as i32).abs() <= PREFETCH_TEMPORAL_WINDOW_HOURS {
                 score += 0.1;
             }
         }

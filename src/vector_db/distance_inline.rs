@@ -45,7 +45,7 @@ pub fn dot_product_inline(a: &[f32], b: &[f32]) -> f32 {
     {
         #[cfg(target_feature = "neon")]
         unsafe {
-            return dot_product_neon_inline(a, b);
+            dot_product_neon_inline(a, b)
         }
 
         #[cfg(not(target_feature = "neon"))]
@@ -201,7 +201,7 @@ pub fn euclidean_squared_inline(a: &[f32], b: &[f32]) -> f32 {
     {
         #[cfg(target_feature = "neon")]
         unsafe {
-            return euclidean_squared_neon_inline(a, b);
+            euclidean_squared_neon_inline(a, b)
         }
 
         #[cfg(not(target_feature = "neon"))]
@@ -338,7 +338,7 @@ pub fn l2_norm_squared_inline(a: &[f32]) -> f32 {
     {
         #[cfg(target_feature = "neon")]
         unsafe {
-            return l2_norm_squared_neon_inline(a);
+            l2_norm_squared_neon_inline(a)
         }
 
         #[cfg(not(target_feature = "neon"))]
@@ -404,8 +404,8 @@ unsafe fn l2_norm_squared_neon_inline(a: &[f32]) -> f32 {
 
     let mut result = vaddvq_f32(sum);
 
-    for j in simd_len..len {
-        result += a[j] * a[j];
+    for &val in &a[simd_len..len] {
+        result += val * val;
     }
 
     result
@@ -423,8 +423,8 @@ fn l2_norm_squared_scalar_inline(a: &[f32]) -> f32 {
         i += 4;
     }
 
-    for j in unroll_len..len {
-        sum += a[j] * a[j];
+    for &val in &a[unroll_len..len] {
+        sum += val * val;
     }
 
     sum

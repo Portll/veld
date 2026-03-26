@@ -340,4 +340,101 @@ mod tests {
         assert!(config.max_gaps_per_type > 0);
         assert!(config.star_min_spokes >= 2);
     }
+
+    #[test]
+    fn test_gap_detector_finds_open_triad() {
+        use crate::memory::slow_store::SlowStore;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        // Generate deterministic UUIDs for our three entities
+        let uuid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let uuid_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let uuid_c = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+        // Embeddings: 8-dimensional vectors
+        // A and C share a component so cosine similarity exceeds min_embedding_similarity (0.3)
+        let emb_a: Vec<f32> = vec![1.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let emb_b: Vec<f32> = vec![0.7, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let emb_c: Vec<f32> = vec![0.3, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        let encode_emb = |emb: &[f32]| -> Vec<u8> {
+            emb.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()
+        };
+
+        // Insert entities directly via SQL
+        {
+            let conn = store.conn.lock();
+            for (uuid, name, emb) in [
+                (uuid_a, "Rust", &emb_a),
+                (uuid_b, "Memory", &emb_b),
+                (uuid_c, "Graph", &emb_c),
+            ] {
+                conn.execute(
+                    "INSERT INTO entities (uuid, name, labels, salience, mention_count, created_at, last_seen_at, summary, embedding) VALUES (?, ?, '[]', 0.5, 1, datetime('now'), datetime('now'), '', ?)",
+                    rusqlite::params![uuid, name, encode_emb(emb)],
+                )
+                .unwrap();
+            }
+
+            // Insert edges: A→B and B→C (strength 0.8 each)
+            let edge_uuid_ab = "eeeeeee1-eeee-eeee-eeee-eeeeeeeeeeee";
+            let edge_uuid_bc = "eeeeeee2-eeee-eeee-eeee-eeeeeeeeeeee";
+            for (edge_uuid, from, to) in [
+                (edge_uuid_ab, uuid_a, uuid_b),
+                (edge_uuid_bc, uuid_b, uuid_c),
+            ] {
+                conn.execute(
+                    "INSERT INTO edges (uuid, from_entity, to_entity, relation_type, strength, tier, ltp_status, activation_count, created_at, last_activated, context) VALUES (?, ?, ?, 'RELATES_TO', 0.8, 'L1Working', 'None', 1, datetime('now'), datetime('now'), '')",
+                    rusqlite::params![edge_uuid, from, to],
+                )
+                .unwrap();
+            }
+        }
+
+        // Run gap detection with default config
+        let config = GapDetectionConfig::default();
+        let result = GapDetector::detect(&store, &config).unwrap();
+
+        // Verify at least 1 gap is detected
+        assert!(
+            !result.gaps.is_empty(),
+            "Expected at least 1 gap, found none"
+        );
+
+        // Verify at least one gap is an OpenTriad type
+        let has_open_triad = result
+            .gaps
+            .iter()
+            .any(|g| g.gap_type == GapType::OpenTriad);
+        assert!(
+            has_open_triad,
+            "Expected at least one OpenTriad gap, found types: {:?}",
+            result
+                .gaps
+                .iter()
+                .map(|g| g.gap_type.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the entities in the gap include "Rust" and/or "Graph" (the disconnected endpoints)
+        let triad_gaps: Vec<&GapTopology> = result
+            .gaps
+            .iter()
+            .filter(|g| g.gap_type == GapType::OpenTriad)
+            .collect();
+        let entity_names: Vec<&str> = triad_gaps
+            .iter()
+            .flat_map(|g| g.entities.iter().map(|e| e.name.as_str()))
+            .collect();
+        let has_rust_or_graph =
+            entity_names.contains(&"Rust") || entity_names.contains(&"Graph");
+        assert!(
+            has_rust_or_graph,
+            "Expected gap entities to include 'Rust' and/or 'Graph', found: {:?}",
+            entity_names
+        );
+    }
 }
