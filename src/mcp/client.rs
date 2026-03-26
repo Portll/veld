@@ -4,12 +4,22 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// HTTP client for the shodh-memory API (async version for MCP tools)
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct AsyncApiClient {
     client: reqwest::Client,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) user_id: String,
+}
+
+impl std::fmt::Debug for AsyncApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncApiClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"***")
+            .field("user_id", &self.user_id)
+            .finish()
+    }
 }
 
 impl AsyncApiClient {
@@ -48,11 +58,20 @@ impl AsyncApiClient {
 }
 
 /// HTTP client for the shodh-memory API (blocking version for hooks)
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct BlockingApiClient {
     client: reqwest::blocking::Client,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
+}
+
+impl std::fmt::Debug for BlockingApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockingApiClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"***")
+            .finish()
+    }
 }
 
 impl BlockingApiClient {
