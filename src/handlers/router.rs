@@ -40,12 +40,10 @@ pub fn build_public_routes(state: AppState) -> Router {
         // =================================================================
         .route("/metrics", get(health::metrics_endpoint))
         // =================================================================
-        // CONTEXT STATUS (LOCAL SCRIPT - NO AUTH)
+        // CONTEXT STATUS (GET only - status reads remain public)
         // =================================================================
-        .route("/api/context/status", post(health::update_context_status))
         .route("/api/context/status", get(health::get_context_status))
         .route("/api/context_status", get(health::get_context_status)) // TUI GET alias
-        .route("/api/context_status", post(health::update_context_status)) // TUI POST alias
         .route("/api/context/sse", get(webhooks::context_status_sse))
         // =================================================================
         // EXTERNAL WEBHOOKS (SIGNATURE VERIFIED INTERNALLY)
@@ -68,6 +66,11 @@ pub fn build_public_routes(state: AppState) -> Router {
 /// The auth middleware and rate limiter should be applied by the caller.
 pub fn build_protected_routes(state: AppState) -> Router {
     Router::new()
+        // =================================================================
+        // CONTEXT STATUS (POST - requires auth to prevent state flooding)
+        // =================================================================
+        .route("/api/context/status", post(health::update_context_status))
+        .route("/api/context_status", post(health::update_context_status)) // TUI POST alias
         // =================================================================
         // REMEMBER/RECORD ENDPOINTS
         // =================================================================
