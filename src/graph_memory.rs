@@ -2184,12 +2184,26 @@ impl GraphMemory {
         // Increment relationship counter
         self.relationship_count.fetch_add(1, Ordering::Relaxed);
 
-        // Update entity->edges index for both entities
-        self.index_entity_edge(&edge.from_entity, &edge.uuid)?;
-        self.index_entity_edge(&edge.to_entity, &edge.uuid)?;
-
-        // Update entity-pair index for O(1) dedup lookups
-        self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid)?;
+        // Update entity->edges index for both entities.
+        // Rollback the relationship write if indexing fails to prevent ghost edges.
+        if let Err(e) = self
+            .index_entity_edge(&edge.from_entity, &edge.uuid)
+            .and_then(|_| self.index_entity_edge(&edge.to_entity, &edge.uuid))
+            .and_then(|_| {
+                self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid)
+            })
+        {
+            tracing::warn!(
+                "Rolling back relationship {} due to index failure: {}",
+                edge.uuid,
+                e
+            );
+            let _ = self
+                .db
+                .delete_cf(self.relationships_cf(), edge.uuid.as_bytes());
+            self.relationship_count.fetch_sub(1, Ordering::Relaxed);
+            return Err(e);
+        }
 
         // Insert-time degree pruning: cap edges per entity to prevent O(n²) explosion.
         // If either entity exceeds MAX_ENTITY_DEGREE, prune the weakest edges.
