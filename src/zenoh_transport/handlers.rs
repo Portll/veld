@@ -85,13 +85,14 @@ pub fn authenticate_payload(payload: &ZBytes, expected: Option<&str>) -> bool {
 }
 
 /// Constant-time byte comparison to prevent timing side-channels on key validation.
+/// Iterates to max_len and XORs lengths to avoid leaking key length via early return.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max_len = a.len().max(b.len());
+    let mut diff = (a.len() ^ b.len()) as u32;
+    for i in 0..max_len {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
+        diff |= (x ^ y) as u32;
     }
     diff == 0
 }
@@ -618,6 +619,8 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
 /// 4. Reply with RecallResponse JSON
 /// 5. Publish results to `{prefix}/{user_id}/recall/results` for robot subscribers
 pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
+    let _span = tracing::info_span!("zenoh.recall").entered();
+    let op_start = std::time::Instant::now();
     let key = query.key_expr().as_str().to_string();
 
     // The query payload contains the ZenohRecallRequest
@@ -709,6 +712,14 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
             return;
         }
     };
+
+    // Record metrics
+    let duration = op_start.elapsed().as_secs_f64();
+    crate::metrics::MEMORY_RETRIEVE_DURATION.observe(duration);
+    crate::metrics::MEMORY_RETRIEVE_TOTAL
+        .with_label_values(&["success"])
+        .inc();
+    crate::metrics::MEMORY_RETRIEVE_RESULTS.observe(memories.len() as f64);
 
     // Convert to response format
     let total = memories.len();
@@ -928,6 +939,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
 /// Handle a Zenoh DELETE/PUT on `{prefix}/{user_id}/forget`.
 ///
 /// Payload: `{ "memory_id": "uuid-string" }` or `{ "id": "uuid-string" }`
+#[tracing::instrument(skip(sample, manager))]
 pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>) {
     #[derive(serde::Deserialize)]
     struct ForgetRequest {

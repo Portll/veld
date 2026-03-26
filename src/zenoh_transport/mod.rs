@@ -453,8 +453,12 @@ async fn register_recall_queryable(
                 query = queryable.recv_async() => {
                     match query {
                         Ok(query) => {
-                            if let Some(payload) = query.payload() {
-                                if !handlers::authenticate_payload(payload, api_key.as_deref()) {
+                            if api_key.is_some() {
+                                let authed = match query.payload() {
+                                    Some(payload) => handlers::authenticate_payload(payload, api_key.as_deref()),
+                                    None => false, // No payload = no api_key field = reject
+                                };
+                                if !authed {
                                     let err = serde_json::json!({"error": "Unauthorized", "success": false});
                                     if let Ok(bytes) = serde_json::to_vec(&err) {
                                         let _ = query.reply(query.key_expr(), bytes).await;
