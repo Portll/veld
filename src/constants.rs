@@ -599,6 +599,28 @@ pub const DEFAULT_MAX_HEAP_PER_USER_MB: usize = 500;
 pub const DEFAULT_IMPORTANCE_THRESHOLD: f32 = 0.7;
 
 // =============================================================================
+// PROJECT SEEDING CONSTANTS
+// =============================================================================
+
+/// Default maximum files to scan during project seeding
+pub const SEED_DEFAULT_MAX_FILES: usize = 50;
+
+/// Maximum directory depth for seed traversal
+pub const SEED_MAX_DEPTH: usize = 3;
+
+/// Importance for config files (Cargo.toml, package.json, etc.)
+pub const SEED_IMPORTANCE_CONFIG: f32 = 0.85;
+
+/// Importance for README files
+pub const SEED_IMPORTANCE_README: f32 = 0.90;
+
+/// Importance for source code files
+pub const SEED_IMPORTANCE_SOURCE: f32 = 0.50;
+
+/// Maximum characters to extract from README
+pub const SEED_README_MAX_CHARS: usize = 2000;
+
+// =============================================================================
 // COWAN'S MODEL TIER PROMOTION CONSTANTS
 // Based on Cowan (1988) "Evolving conceptions of memory storage"
 // and memory consolidation research (Rasch & Born, 2013)

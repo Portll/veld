@@ -41,6 +41,9 @@ pub mod integrations;
 // Multi-format text ingestion
 pub mod ingest;
 
+// Cold-start project seeding
+pub mod seed;
+
 // Session and user management
 pub mod sessions;
 pub mod users;

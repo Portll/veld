@@ -12,8 +12,8 @@ use std::sync::Arc;
 use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, compression, consolidation, context_blocks, crud, facts, files, gap_analysis,
-    graph, health, ingest, integrations, lineage, mif, recall, remember, search, sessions, todos,
-    users, visualization, webhooks,
+    graph, health, ingest, integrations, lineage, mif, recall, remember, search, seed, sessions,
+    todos, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -83,6 +83,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         .route("/api/ingest", post(ingest::ingest))
         // =================================================================
+        // PROJECT SEEDING
+        // =================================================================
+        .route("/api/seed", post(seed::seed_project))
+        // =================================================================
         // RECALL ENDPOINTS
         // =================================================================
         .route("/api/recall", post(recall::recall))
@@ -111,6 +115,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/memories", get(crud::list_memories_get)) // Cloudflare compat alias
         .route("/api/memories/bulk", post(crud::bulk_delete_memories))
         .route("/api/memories/clear", post(crud::clear_all_memories))
+        // =================================================================
+        // ANCHOR (DECAY RESISTANCE)
+        // =================================================================
+        .route("/api/anchor", post(crud::anchor_memory))
         // =================================================================
         // FORGET OPERATIONS
         // =================================================================
