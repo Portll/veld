@@ -27,9 +27,29 @@ use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
 use tracing::{debug, info};
 
+use rust_stemmers::{Algorithm, Stemmer};
+
 use super::types::MemoryId;
 use crate::embeddings::minilm::MiniLMEmbedder;
 use crate::embeddings::Embedder;
+
+/// Stem text using the English Porter stemmer for BM25 matching.
+/// Enables "choose" to match "chose", "decided" to match "decision", etc.
+fn stem_text(text: &str) -> String {
+    let stemmer = Stemmer::create(Algorithm::English);
+    text.split_whitespace()
+        .map(|word| {
+            let lower = word.to_lowercase();
+            let cleaned: String = lower.chars().filter(|c| c.is_alphanumeric()).collect();
+            if cleaned.len() <= 1 {
+                cleaned
+            } else {
+                stemmer.stem(&cleaned).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Configuration for hybrid search
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +179,7 @@ pub struct BM25Index {
     content_field: Field,
     tags_field: Field,
     entities_field: Field,
+    stemmed_content_field: Field,
 }
 
 impl BM25Index {
@@ -178,6 +199,9 @@ impl BM25Index {
         // Entities (tokenized)
         schema_builder.add_text_field("entities", TEXT);
 
+        // Stemmed content for morphological matching (search-only, not stored)
+        schema_builder.add_text_field("stemmed_content", TEXT);
+
         let schema = schema_builder.build();
 
         // Create or open index
@@ -186,14 +210,23 @@ impl BM25Index {
             .context("Failed to open tantivy directory")?;
 
         let index = if Index::exists(&dir)? {
-            Index::open(dir).context("Failed to open existing BM25 index")?
+            let existing = Index::open(dir).context("Failed to open existing BM25 index")?;
+            // Schema migration: if existing index lacks stemmed_content, rebuild
+            if existing.schema().get_field("stemmed_content").is_err() {
+                tracing::warn!("BM25 schema missing stemmed_content — rebuilding index for stemming support");
+                drop(existing);
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    tracing::warn!("Failed to remove old BM25 index: {e}");
+                }
+                std::fs::create_dir_all(path)?;
+                Index::create_in_dir(path, schema).context("Failed to create BM25 index with stemmed_content")?
+            } else {
+                existing
+            }
         } else {
             Index::create_in_dir(path, schema).context("Failed to create BM25 index")?
         };
 
-        // Resolve field handles from the index's actual schema (which may have
-        // been loaded from disk). Using builder-created handles would be wrong
-        // if the on-disk schema has different field IDs due to schema evolution.
         let actual_schema = index.schema();
         let id_field = actual_schema
             .get_field("id")
@@ -207,6 +240,9 @@ impl BM25Index {
         let entities_field = actual_schema
             .get_field("entities")
             .context("BM25 schema missing 'entities' field")?;
+        let stemmed_content_field = actual_schema
+            .get_field("stemmed_content")
+            .context("BM25 schema missing 'stemmed_content' field")?;
 
         // 15MB writer heap — sufficient for edge workloads
         let writer = index
@@ -229,6 +265,7 @@ impl BM25Index {
             content_field,
             tags_field,
             entities_field,
+            stemmed_content_field,
         })
     }
 
@@ -250,6 +287,7 @@ impl BM25Index {
         let mut doc = TantivyDocument::new();
         doc.add_text(self.id_field, memory_id.0.to_string());
         doc.add_text(self.content_field, content);
+        doc.add_text(self.stemmed_content_field, stem_text(content));
         doc.add_text(self.tags_field, tags.join(" "));
         doc.add_text(self.entities_field, entities.join(" "));
 
@@ -315,18 +353,23 @@ impl BM25Index {
 
         let searcher = self.reader.searcher();
 
-        // Parse query across content, tags, and entities fields
+        // Parse query across content, tags, entities, and stemmed content
         let query_parser = QueryParser::for_index(
             &self.index,
-            vec![self.content_field, self.tags_field, self.entities_field],
+            vec![
+                self.content_field,
+                self.tags_field,
+                self.entities_field,
+                self.stemmed_content_field,
+            ],
         );
 
-        // Build boosted query with term weights
+        // Build boosted query with term weights + stemmed variants
+        let stemmer = Stemmer::create(Algorithm::English);
         let mut query_parts: Vec<String> = Vec::new();
 
         // Add individual terms with IC weights.
-        // Strip ALL non-alphanumeric characters (not just at boundaries) to prevent
-        // Tantivy query syntax injection (+, -, ^, ~, etc. have special meaning).
+        // Also add stemmed variants so "choose" matches "chose", "decided" matches "decision".
         if let Some(weights) = term_weights {
             for word in query.split_whitespace() {
                 let clean_word: String = word
@@ -338,14 +381,22 @@ impl BM25Index {
                     continue;
                 }
                 if let Some(&weight) = weights.get(&clean_word) {
-                    // Apply boost (Tantivy uses ^ for boost, like Lucene)
                     query_parts.push(format!("{}^{:.1}", clean_word, weight));
                 } else {
-                    query_parts.push(clean_word);
+                    query_parts.push(clean_word.clone());
+                }
+                // Add stemmed form if different (searches stemmed_content field)
+                let stemmed = stemmer.stem(&clean_word).to_string();
+                if stemmed != clean_word && stemmed.len() > 1 {
+                    if let Some(&weight) = weights.get(&clean_word) {
+                        query_parts.push(format!("{}^{:.1}", stemmed, weight * 0.8));
+                    } else {
+                        query_parts.push(stemmed);
+                    }
                 }
             }
         } else {
-            // No term weights - add words as-is
+            // No term weights - add words + stemmed variants
             for word in query.split_whitespace() {
                 let clean_word: String = word
                     .chars()
@@ -353,6 +404,10 @@ impl BM25Index {
                     .collect::<String>()
                     .to_lowercase();
                 if !clean_word.is_empty() {
+                    let stemmed = stemmer.stem(&clean_word).to_string();
+                    if stemmed != clean_word && stemmed.len() > 1 {
+                        query_parts.push(stemmed);
+                    }
                     query_parts.push(clean_word);
                 }
             }
