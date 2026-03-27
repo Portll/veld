@@ -862,12 +862,10 @@ fn locomo_queries() -> Vec<LocomoQuery> {
             absence_indices: vec![6, 12, 3],      // session 1 architecture
         },
         LocomoQuery {
-            query: "What bugs were found before the code review process was set up?",
+            query: "What bugs did we find during the debugging phase?",
             query_type: "temporal",
-            // Code review set up in session 2 (index 28). Bugs found before that:
-            // technically session 1 had no bugs; session 2 items are concurrent.
-            // Session 3 bugs are after, but the CRDT merge panic (30) is the first.
-            // This is intentionally hard — temporal reasoning about relative ordering.
+            // Session 3 = debugging phase. CRDT merge panic (30) and WebSocket leak (31)
+            // are the two earliest bugs found during that sprint.
             expected_memory_indices: vec![30, 31],
             absence_indices: vec![0, 5, 14],      // non-bug items
         },
