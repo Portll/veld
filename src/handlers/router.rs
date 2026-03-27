@@ -174,6 +174,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
             post(consolidation::consolidate_memories),
         )
         .route(
+            "/api/consolidation/sleep",
+            post(consolidation::sleep_phase_consolidation),
+        )
+        .route(
             "/api/consolidation/report",
             post(consolidation::get_consolidation_report),
         )
