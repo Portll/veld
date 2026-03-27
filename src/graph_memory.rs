@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -936,6 +936,40 @@ impl RelationshipEdge {
             + strength_score * LTP_READINESS_STRENGTH_WEIGHT
             + tag_bonus
     }
+
+    /// Compute LTP readiness incorporating NPMI as a co-occurrence signal.
+    ///
+    /// When NPMI is available (post cold-start), it replaces the count-based
+    /// component with a normalized co-occurrence measure. This allows edges
+    /// representing genuinely rare but consistent associations to reach LTP
+    /// faster, while penalizing edges between ubiquitous entities.
+    ///
+    /// Formula:
+    ///   npmi_score = (npmi / 0.75).clamp(0.0, 1.5)
+    ///   readiness  = npmi_score * 0.4 + strength_score * 0.4 + tag_bonus * 0.2
+    ///
+    /// Falls back to standard `ltp_readiness()` when npmi is None (cold start).
+    pub fn ltp_readiness_with_npmi(&self, npmi: Option<f32>) -> f32 {
+        // L1 edges can't reach Full LTP
+        if matches!(self.tier, EdgeTier::L1Working) {
+            return 0.0;
+        }
+
+        let npmi = match npmi {
+            Some(n) => n,
+            None => return self.ltp_readiness(), // cold start fallback
+        };
+
+        let floor = self.strength_floor();
+        let strength_score = self.strength / floor;
+
+        let confidence = self.entity_confidence.unwrap_or(0.5);
+        let tag_bonus = confidence * 0.2; // scaled down from 0.3 to fit 0.2 weight budget
+
+        let npmi_score = (npmi / 0.75).clamp(0.0, 1.5);
+
+        npmi_score * 0.4 + strength_score * 0.4 + tag_bonus
+    }
 }
 
 /// Relationship types for ontological edge classification.
@@ -1146,6 +1180,11 @@ pub struct GraphMemory {
     /// Episode count - initialized on startup, updated on add
     episode_count: Arc<AtomicUsize>,
 
+    /// Total activation count across all edges — initialized on startup by summing
+    /// activation_count from all relationships. Incremented on strengthen, decremented
+    /// on edge deletion. Used as N_s denominator in NPMI computation for Hebbian pruning.
+    total_activations: Arc<AtomicU64>,
+
     /// Mutex for serializing synapse updates to prevent race conditions (SHO-64)
     /// Uses parking_lot::Mutex for better performance than std::sync::Mutex
     synapse_update_lock: Arc<parking_lot::Mutex<()>>,
@@ -1289,6 +1328,10 @@ impl GraphMemory {
         let relationship_count = Self::count_cf_entries(&db, relationships_cf);
         let episode_count = Self::count_cf_entries(&db, episodes_cf);
 
+        // Sum total activation_count across all edges (one-time O(n) at startup).
+        // Used as N_s denominator in NPMI computation for Hebbian edge pruning.
+        let total_activations = Self::sum_activation_counts(&db, relationships_cf);
+
         // Load entity embedding cache for concept merging
         // Only entities with pre-computed name_embeddings are cached
         let entities_cf = db.cf_handle(CF_ENTITIES).unwrap();
@@ -1304,6 +1347,7 @@ impl GraphMemory {
             entity_count: Arc::new(AtomicUsize::new(entity_count)),
             relationship_count: Arc::new(AtomicUsize::new(relationship_count)),
             episode_count: Arc::new(AtomicUsize::new(episode_count)),
+            total_activations: Arc::new(AtomicU64::new(total_activations)),
             synapse_update_lock: Arc::new(parking_lot::Mutex::new(())),
             entity_embedding_cache: Arc::new(parking_lot::RwLock::new(entity_embedding_cache)),
             pending_prune: parking_lot::Mutex::new(Vec::new()),
@@ -1312,11 +1356,12 @@ impl GraphMemory {
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
             tracing::info!(
-                "Loaded graph with {} entities ({} with embeddings), {} relationships, {} episodes",
+                "Loaded graph with {} entities ({} with embeddings), {} relationships, {} episodes, {} total activations",
                 entity_count,
                 embedding_cache_size,
                 relationship_count,
-                episode_count
+                episode_count,
+                total_activations
             );
         }
 
@@ -1557,6 +1602,27 @@ impl GraphMemory {
     /// Count entries in a column family (one-time startup cost)
     fn count_cf_entries(db: &DB, cf: &ColumnFamily) -> usize {
         db.iterator_cf(cf, rocksdb::IteratorMode::Start).count()
+    }
+
+    /// Sum activation_count across all relationships (one-time startup cost).
+    ///
+    /// Used to initialize `total_activations` for NPMI computation.
+    /// Follows the same pattern as `count_cf_entries` — O(n) scan at startup,
+    /// then the atomic counter is maintained incrementally.
+    fn sum_activation_counts(db: &DB, cf: &ColumnFamily) -> u64 {
+        let mut total: u64 = 0;
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = db.iterator_cf_opt(cf, read_opts, rocksdb::IteratorMode::Start);
+        for (_, value) in iter.flatten() {
+            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                total += edge.activation_count as u64;
+            }
+        }
+        total
     }
 
     /// Load entity embedding cache from persisted entities.
@@ -2391,6 +2457,7 @@ impl GraphMemory {
         // Phase 3.5: Opportunistic pruning — queue edges that have decayed below
         // their tier's threshold for batch deletion on next maintenance cycle.
         // This replaces the eager full-scan apply_decay() with lazy on-read pruning.
+        // NPMI rescue: edges with high enough NPMI are spared from pruning.
         let mut has_prunable = false;
         for edge in &edges {
             if edge.effective_strength() < edge.tier.prune_threshold()
@@ -2401,6 +2468,9 @@ impl GraphMemory {
             }
         }
         if has_prunable {
+            // Build mention_count cache for NPMI rescue (only for prunable candidates)
+            let mention_counts = self.build_mention_count_cache(&edges);
+
             let mut prune_queue = self.pending_prune.lock();
             let mut orphan_queue = self.pending_orphan_checks.lock();
             // Prevent unbounded growth — these queues are drained by maintenance,
@@ -2419,6 +2489,14 @@ impl GraphMemory {
                 if edge.effective_strength() < edge.tier.prune_threshold()
                     && !edge.ltp_status.is_potentiated()
                 {
+                    // NPMI rescue: check if edge has high enough NPMI to survive
+                    let m_a = mention_counts.get(&edge.from_entity).copied().unwrap_or(0);
+                    let m_b = mention_counts.get(&edge.to_entity).copied().unwrap_or(0);
+                    let npmi = self.compute_npmi(edge, m_a, m_b);
+                    let threshold = Self::npmi_prune_threshold(&edge.tier);
+                    if npmi.is_some_and(|n| n >= threshold) {
+                        return true; // NPMI rescue — keep edge
+                    }
                     prune_queue.push(edge.uuid);
                     orphan_queue.push(edge.from_entity);
                     orphan_queue.push(edge.to_entity);
@@ -2584,6 +2662,16 @@ impl GraphMemory {
         // Delete from main storage
         self.db.delete_cf(self.relationships_cf(), key)?;
         self.relationship_count.fetch_sub(1, Ordering::Relaxed);
+        // Decrement total activations by the edge's count (NPMI denominator)
+        let edge_acts = edge.activation_count as u64;
+        if edge_acts > 0 {
+            // Saturating subtract via fetch_update to avoid underflow
+            let _ = self.total_activations.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(edge_acts)),
+            );
+        }
 
         // Remove from entity_edges index for BOTH entities
         // (add_relationship indexes both from_entity and to_entity)
@@ -2697,6 +2785,7 @@ impl GraphMemory {
         self.entity_count.store(0, Ordering::Relaxed);
         self.relationship_count.store(0, Ordering::Relaxed);
         self.episode_count.store(0, Ordering::Relaxed);
+        self.total_activations.store(0, Ordering::Relaxed);
 
         // Drain pending maintenance queues — they reference now-deleted entities/edges
         let _ = std::mem::take(&mut *self.pending_prune.lock());
@@ -3581,6 +3670,7 @@ impl GraphMemory {
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
             let _ = edge.strengthen();
+            self.total_activations.fetch_add(1, Ordering::Relaxed);
 
             let key = edge.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
@@ -3642,6 +3732,8 @@ impl GraphMemory {
         // Atomic write of all updates
         if strengthened > 0 {
             self.db.write(batch)?;
+            self.total_activations
+                .fetch_add(strengthened as u64, Ordering::Relaxed);
         }
 
         Ok(strengthened)
@@ -3749,6 +3841,8 @@ impl GraphMemory {
 
         if edges_updated > 0 {
             self.db.write(batch)?;
+            self.total_activations
+                .fetch_add(edges_updated as u64, Ordering::Relaxed);
             // Update relationship counter for newly created edges
             if new_edges > 0 {
                 self.relationship_count
@@ -3926,6 +4020,8 @@ impl GraphMemory {
 
         if strengthened > 0 {
             self.db.write(batch)?;
+            self.total_activations
+                .fetch_add(strengthened as u64, Ordering::Relaxed);
 
             // Index new replay edges in entity_edges CF so they're visible to
             // traversal and degree-cap enforcement (GQ-11 fix)
@@ -4083,6 +4179,8 @@ impl GraphMemory {
 
         if strengthened > 0 {
             self.db.write(batch)?;
+            self.total_activations
+                .fetch_add(strengthened as u64, Ordering::Relaxed);
             tracing::debug!(
                 "Strengthened {} entity-entity edges for episode {}",
                 strengthened,
@@ -4248,17 +4346,53 @@ impl GraphMemory {
             .ok_or_else(|| {
                 anyhow::anyhow!("synapse_update_lock timeout in batch_decay_edges_in_place")
             })?;
+
+        // Build entity mention_count cache for NPMI computation.
+        // Collect all unique entity UUIDs referenced by edges, then batch-read
+        // their EntityNode.mention_count to avoid per-edge RocksDB lookups.
+        let mention_counts = self.build_mention_count_cache(edges);
+
         let mut batch = WriteBatch::default();
         let mut to_prune = Vec::new();
 
         for edge in edges.iter_mut() {
             let strength_before = edge.strength;
-            let should_prune = edge.decay();
+            let mut should_prune = edge.decay();
 
-            // Only write back edges whose strength actually changed (or need pruning).
-            // With 300s maintenance intervals, most edges won't have meaningful decay,
-            // so this reduces the WriteBatch from ~12MB (all 34k edges) to ~150KB.
-            if should_prune || (edge.strength - strength_before).abs() > f32::EPSILON {
+            let m_a = mention_counts.get(&edge.from_entity).copied().unwrap_or(0);
+            let m_b = mention_counts.get(&edge.to_entity).copied().unwrap_or(0);
+            let npmi = self.compute_npmi(edge, m_a, m_b);
+
+            // NPMI rescue: if decay says prune, check if NPMI is high enough to rescue.
+            // This preserves statistically rare but meaningful associations that have
+            // decayed in strength but represent genuine co-occurrence patterns.
+            if should_prune {
+                let threshold = Self::npmi_prune_threshold(&edge.tier);
+                // NPMI can rescue: if npmi >= tier threshold, don't prune.
+                // During cold start (npmi = None), fall back to strength-only pruning.
+                if npmi.is_some_and(|n| n >= threshold) {
+                    should_prune = false;
+                }
+            }
+
+            // NPMI-enhanced LTP readiness: upgrade LTP status during maintenance
+            // when NPMI provides enough statistical evidence for promotion.
+            let ltp_before = edge.ltp_status.is_potentiated();
+            if !ltp_before && !matches!(edge.tier, EdgeTier::L1Working) {
+                let readiness = edge.ltp_readiness_with_npmi(npmi);
+                if readiness >= crate::constants::LTP_READINESS_THRESHOLD {
+                    edge.ltp_status = LtpStatus::Full;
+                }
+            }
+            let ltp_changed = edge.ltp_status.is_potentiated() != ltp_before;
+
+            // Only write back edges whose strength actually changed, LTP status
+            // changed, or need pruning. With 300s maintenance intervals, most edges
+            // won't have meaningful decay, so this skips unchanged edges.
+            if should_prune
+                || (edge.strength - strength_before).abs() > f32::EPSILON
+                || ltp_changed
+            {
                 let key = edge.uuid.as_bytes();
                 match bincode::serde::encode_to_vec(&*edge, bincode::config::standard()) {
                     Ok(value) => {
@@ -4412,6 +4546,94 @@ impl GraphMemory {
             relationship_count: self.relationship_count.load(Ordering::Relaxed),
             episode_count: self.episode_count.load(Ordering::Relaxed),
         })
+    }
+
+    /// Compute Normalized Pointwise Mutual Information for an edge.
+    ///
+    /// NPMI measures how much more (or less) often two entities co-occur than
+    /// expected by chance, normalized to [-1, 1]. Used to rescue statistically
+    /// rare but meaningful associations from strength-based pruning.
+    ///
+    /// Returns None during cold start (total_activations < 100) since NPMI
+    /// estimates are unreliable with sparse data.
+    ///
+    /// Formula (with Laplace +1 smoothing):
+    ///   f_ab = edge.activation_count + 1
+    ///   m_a  = max(mention_count_a, activation_count) + 1
+    ///   m_b  = max(mention_count_b, activation_count) + 1
+    ///   N_s  = total_activations + num_edges
+    ///   pmi  = log2(f_ab * N_s / (m_a * m_b))
+    ///   npmi = pmi / log2(N_s / f_ab)
+    fn compute_npmi(
+        &self,
+        edge: &RelationshipEdge,
+        mention_count_a: usize,
+        mention_count_b: usize,
+    ) -> Option<f32> {
+        let total = self.total_activations.load(Ordering::Relaxed);
+        if total < 100 {
+            return None; // Cold start: insufficient data for reliable NPMI
+        }
+
+        let num_edges = self.relationship_count.load(Ordering::Relaxed);
+        let f_ab = edge.activation_count as f64 + 1.0;
+        let m_a = (mention_count_a.max(edge.activation_count as usize) as f64) + 1.0;
+        let m_b = (mention_count_b.max(edge.activation_count as usize) as f64) + 1.0;
+        let n_s = total as f64 + num_edges as f64;
+
+        let pmi = (f_ab * n_s / (m_a * m_b)).log2();
+        let neg_log_p_ab = (n_s / f_ab).log2();
+
+        if neg_log_p_ab < f64::EPSILON {
+            return Some(1.0); // Perfect co-occurrence
+        }
+
+        Some((pmi / neg_log_p_ab).clamp(-1.0, 1.0) as f32)
+    }
+
+    /// Get the NPMI prune threshold for a given edge tier.
+    ///
+    /// Edges with NPMI above this threshold are rescued from strength-based pruning.
+    /// Higher tiers require higher NPMI to reflect their stronger statistical bar.
+    fn npmi_prune_threshold(tier: &EdgeTier) -> f32 {
+        match tier {
+            EdgeTier::L1Working => 0.30,
+            EdgeTier::L2Episodic => 0.40,
+            EdgeTier::L3Semantic => 0.50,
+        }
+    }
+
+    /// Build a HashMap<Uuid, usize> cache of entity mention_counts.
+    ///
+    /// Collects all unique entity UUIDs from edges, batch-reads them from RocksDB,
+    /// and returns their mention_count values. Used to avoid per-edge entity lookups
+    /// during NPMI computation in the maintenance pass.
+    fn build_mention_count_cache(&self, edges: &[RelationshipEdge]) -> HashMap<Uuid, usize> {
+        let mut entity_uuids: HashSet<Uuid> = HashSet::with_capacity(edges.len());
+        for edge in edges {
+            entity_uuids.insert(edge.from_entity);
+            entity_uuids.insert(edge.to_entity);
+        }
+
+        let keys: Vec<[u8; 16]> = entity_uuids.iter().map(|u| *u.as_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let results = self
+            .db
+            .batched_multi_get_cf(self.entities_cf(), &key_refs, false);
+
+        let mut mention_counts = HashMap::with_capacity(entity_uuids.len());
+        let uuid_vec: Vec<Uuid> = entity_uuids.into_iter().collect();
+        for (i, result) in results.into_iter().enumerate() {
+            if let Ok(Some(value)) = result {
+                if let Ok((entity, _)) = bincode::serde::decode_from_slice::<EntityNode, _>(
+                    &value,
+                    bincode::config::standard(),
+                ) {
+                    mention_counts.insert(uuid_vec[i], entity.mention_count);
+                }
+            }
+        }
+        mention_counts
     }
 
     /// Get all entities in the graph
@@ -6896,5 +7118,236 @@ mod tests {
         assert!(strength.is_some());
         let s = strength.unwrap();
         assert!(s > 0.75 && s <= 0.8, "Strength should be ~0.8, got {}", s);
+    }
+
+    #[test]
+    fn test_compute_npmi_cold_start() {
+        // During cold start (total_activations < 100), compute_npmi returns None
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        // total_activations starts at 0 — well below the 100 threshold
+        let edge = create_test_edge_with_tier(0.5, 0, EdgeTier::L2Episodic);
+        let result = graph.compute_npmi(&edge, 10, 10);
+        assert!(
+            result.is_none(),
+            "NPMI should return None during cold start (total_activations < 100)"
+        );
+
+        // Set total_activations to 99 — still below threshold
+        graph.total_activations.store(99, Ordering::Relaxed);
+        let result = graph.compute_npmi(&edge, 10, 10);
+        assert!(
+            result.is_none(),
+            "NPMI should return None when total_activations = 99"
+        );
+
+        // Set to exactly 100 — should now compute
+        graph.total_activations.store(100, Ordering::Relaxed);
+        graph.relationship_count.store(10, Ordering::Relaxed);
+        let result = graph.compute_npmi(&edge, 10, 10);
+        assert!(
+            result.is_some(),
+            "NPMI should return Some when total_activations = 100"
+        );
+    }
+
+    #[test]
+    fn test_compute_npmi_values() {
+        // Verify NPMI produces expected values for known inputs.
+        //
+        // Given:
+        //   activation_count = 5, mention_count_a = 10, mention_count_b = 8
+        //   total_activations = 200, num_edges = 50
+        //
+        // Manual calculation:
+        //   f_ab = 5 + 1 = 6
+        //   m_a  = max(10, 5) + 1 = 11
+        //   m_b  = max(8, 5) + 1 = 9
+        //   N_s  = 200 + 50 = 250
+        //
+        //   pmi  = log2(6 * 250 / (11 * 9)) = log2(1500 / 99) = log2(15.1515...) ≈ 3.9213
+        //   -log2(p_ab) = log2(250 / 6) = log2(41.6667) ≈ 5.3808
+        //   npmi = 3.9213 / 5.3808 ≈ 0.7288
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        graph.total_activations.store(200, Ordering::Relaxed);
+        graph.relationship_count.store(50, Ordering::Relaxed);
+
+        let mut edge = create_test_edge_with_tier(0.5, 0, EdgeTier::L2Episodic);
+        edge.activation_count = 5;
+
+        let npmi = graph.compute_npmi(&edge, 10, 8).unwrap();
+
+        // Expected: ~0.7288
+        assert!(
+            (npmi - 0.7288).abs() < 0.01,
+            "NPMI should be ~0.7288, got {}",
+            npmi
+        );
+
+        // Verify it's in the expected range for L2 promotion gate (>= 0.45) and
+        // below LTP readiness bonus threshold (0.75)
+        assert!(npmi >= 0.45, "NPMI {} should pass L2 promotion gate", npmi);
+        assert!(npmi < 0.75, "NPMI {} should be below LTP bonus threshold", npmi);
+    }
+
+    #[test]
+    fn test_compute_npmi_perfect_cooccurrence() {
+        // When f_ab equals N_s (perfect co-occurrence), NPMI approaches 1.0
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        graph.total_activations.store(100, Ordering::Relaxed);
+        graph.relationship_count.store(1, Ordering::Relaxed);
+
+        // Edge where activation_count is very high relative to total
+        let mut edge = create_test_edge_with_tier(0.5, 0, EdgeTier::L2Episodic);
+        edge.activation_count = 99; // f_ab = 100, N_s = 101, m_a = m_b = 100
+
+        let npmi = graph.compute_npmi(&edge, 1, 1).unwrap();
+
+        // With high co-occurrence, NPMI should be close to 1.0
+        assert!(
+            npmi > 0.9,
+            "High co-occurrence should yield NPMI close to 1.0, got {}",
+            npmi
+        );
+    }
+
+    #[test]
+    fn test_compute_npmi_rare_edge() {
+        // Edge with low activation relative to entity mentions → low NPMI
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        graph.total_activations.store(1000, Ordering::Relaxed);
+        graph.relationship_count.store(100, Ordering::Relaxed);
+
+        let mut edge = create_test_edge_with_tier(0.5, 0, EdgeTier::L1Working);
+        edge.activation_count = 1; // f_ab = 2
+
+        // Both entities mentioned many times but rarely together
+        let npmi = graph.compute_npmi(&edge, 200, 150).unwrap();
+
+        assert!(
+            npmi < 0.30,
+            "Rare co-occurrence between popular entities should yield low NPMI, got {}",
+            npmi
+        );
+    }
+
+    #[test]
+    fn test_ltp_readiness_with_npmi_cold_start_fallback() {
+        // When npmi is None (cold start), should fall back to standard ltp_readiness
+        let mut edge = create_test_edge_with_tier(0.75, 0, EdgeTier::L2Episodic);
+        edge.activation_count = 10;
+        edge.entity_confidence = Some(0.5);
+
+        let standard = edge.ltp_readiness();
+        let with_none = edge.ltp_readiness_with_npmi(None);
+
+        assert!(
+            (standard - with_none).abs() < f32::EPSILON,
+            "NPMI=None should fall back to standard readiness: {} vs {}",
+            standard,
+            with_none
+        );
+    }
+
+    #[test]
+    fn test_ltp_readiness_with_npmi_high_value() {
+        // High NPMI (>= 0.75) should boost readiness significantly
+        let mut edge = create_test_edge_with_tier(0.75, 0, EdgeTier::L2Episodic);
+        edge.activation_count = 5;
+        edge.entity_confidence = Some(0.5);
+
+        // npmi_score = (0.80 / 0.75).clamp(0.0, 1.5) = 1.0667
+        // strength_score = 0.75 / 0.65 = 1.1538
+        // tag_bonus = 0.5 * 0.2 = 0.1
+        // readiness = 1.0667 * 0.4 + 1.1538 * 0.4 + 0.1 = 0.4267 + 0.4615 + 0.1 = 0.9882
+        let readiness = edge.ltp_readiness_with_npmi(Some(0.80));
+        assert!(
+            readiness > 0.9,
+            "High NPMI should produce high readiness, got {}",
+            readiness
+        );
+    }
+
+    #[test]
+    fn test_npmi_prune_thresholds() {
+        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L1Working) - 0.30).abs() < f32::EPSILON);
+        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L2Episodic) - 0.40).abs() < f32::EPSILON);
+        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L3Semantic) - 0.50).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_total_activations_counter() {
+        // Verify total_activations is initialized and updated correctly
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        // Should start at 0 for empty graph
+        assert_eq!(graph.total_activations.load(Ordering::Relaxed), 0);
+
+        // After strengthening a synapse, counter should increment
+        let entity_a = Uuid::new_v4();
+        let entity_b = Uuid::new_v4();
+
+        // Add entities first
+        let node_a = EntityNode {
+            uuid: entity_a,
+            name: "EntityA".to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+        };
+        let node_b = EntityNode {
+            uuid: entity_b,
+            name: "EntityB".to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+        };
+        graph.add_entity(node_a).unwrap();
+        graph.add_entity(node_b).unwrap();
+
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: entity_a,
+            to_entity: entity_b,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.5,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 3,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+        };
+        let edge_uuid = graph.add_relationship(edge).unwrap();
+
+        // Strengthen the edge — should increment total_activations by 1
+        graph.strengthen_synapse(&edge_uuid).unwrap();
+        assert_eq!(graph.total_activations.load(Ordering::Relaxed), 1);
+
+        // Delete the edge — should decrement by activation_count (which is now 4)
+        graph.delete_relationship(&edge_uuid).unwrap();
+        assert_eq!(graph.total_activations.load(Ordering::Relaxed), 0);
     }
 }
