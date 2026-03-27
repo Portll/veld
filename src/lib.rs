@@ -25,6 +25,7 @@ pub mod embeddings;
 pub mod errors;
 pub mod graph_memory;
 pub mod handlers;
+pub mod ingest;
 pub mod integrations;
 pub mod memory;
 pub mod metrics;
