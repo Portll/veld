@@ -20,6 +20,7 @@ pub enum InputFormat {
     Csv,
     Code,
     Html,
+    Pdf,
     Unknown,
 }
 
@@ -33,6 +34,7 @@ impl InputFormat {
             Self::Csv => "csv",
             Self::Code => "code",
             Self::Html => "html",
+            Self::Pdf => "pdf",
             Self::Unknown => "unknown",
         }
     }
@@ -49,6 +51,7 @@ pub fn detect_format(filename: Option<&str>, content: &str) -> InputFormat {
                 "json" | "jsonl" => return InputFormat::Json,
                 "csv" | "tsv" => return InputFormat::Csv,
                 "html" | "htm" => return InputFormat::Html,
+                "pdf" => return InputFormat::Pdf,
                 "txt" | "log" => return InputFormat::PlainText,
                 "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp"
                 | "cc" | "h" | "hpp" | "rb" | "sh" | "bash" | "zsh" | "sql" | "toml" | "yaml"
@@ -63,6 +66,12 @@ pub fn detect_format(filename: Option<&str>, content: &str) -> InputFormat {
     }
 
     // Content sniffing fallback
+
+    // PDF magic bytes (binary content — check before trimming)
+    if content.starts_with("%PDF-") {
+        return InputFormat::Pdf;
+    }
+
     let trimmed = content.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         // Quick JSON plausibility check: must close with matching bracket

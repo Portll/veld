@@ -205,6 +205,9 @@ tar = "0.4"
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.24", optional = true }
 
+# PDF text extraction (optional — pulls in lopdf + unicode-normalization)
+pdf-extract = { version = "0.10", optional = true }
+
 # Zenoh transport for robotics (optional — pure Rust, zero C deps)
 # Enables pub/sub + request/reply integration with ROS2 via rmw_zenoh or zenoh-bridge-ros2dds
 zenoh = { version = "1.1", default-features = false, features = ["transport_tcp", "transport_udp"], optional = true }
@@ -291,6 +294,9 @@ llm-parser = []
 
 # Optional: Zenoh transport for robotics/ROS2 (pure Rust, cross-platform)
 zenoh = ["dep:zenoh"]
+
+# Optional: PDF text extraction for ingest and seed_project
+pdf = ["dep:pdf-extract"]
 
 # Optional: Distributed tracing for cloud/multi-node deployments (~200 extra packages)
 telemetry = [

@@ -15,6 +15,8 @@ use crate::constants::{
     SEED_IMPORTANCE_SOURCE, SEED_MAX_DEPTH, SEED_README_MAX_CHARS,
 };
 use crate::errors::{AppError, ValidationErrorExt};
+#[cfg(feature = "pdf")]
+use crate::ingest;
 use crate::memory::{Experience, ExperienceType};
 use crate::validation;
 
@@ -202,12 +204,16 @@ fn walk_recursive(
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
 
-            // Include source files, config files, and well-known project files
+            // Include source files, config files, PDFs, and well-known project files
             let is_known_file = matches!(
                 file_name.as_str(),
                 "README.md" | "readme.md" | "README" | "Makefile" | "Dockerfile"
             );
-            if SOURCE_EXTENSIONS.contains(&ext) || CONFIG_EXTENSIONS.contains(&ext) || is_known_file
+            let is_pdf = ext == "pdf";
+            if SOURCE_EXTENSIONS.contains(&ext)
+                || CONFIG_EXTENSIONS.contains(&ext)
+                || is_known_file
+                || is_pdf
             {
                 files.push(path);
             }
@@ -370,6 +376,41 @@ fn file_importance(path: &Path, root: &Path) -> f32 {
 }
 
 // =============================================================================
+// PDF FILE EXTRACTION
+// =============================================================================
+
+/// Extract text from a PDF file on disk.
+///
+/// Returns `Some(text)` on success, `None` if extraction fails or the feature
+/// is disabled (the file is silently skipped by the caller).
+#[cfg(feature = "pdf")]
+fn extract_pdf_file_content(path: &Path) -> Option<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!("Cannot read PDF file {}: {e}", path.display());
+            return None;
+        }
+    };
+    match ingest::extractors::extract_pdf_bytes(&bytes) {
+        Ok(extracted) => Some(extracted.text),
+        Err(e) => {
+            tracing::debug!("PDF extraction failed for {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "pdf"))]
+fn extract_pdf_file_content(path: &Path) -> Option<String> {
+    tracing::debug!(
+        "Skipping PDF file {} (compile with --features pdf to enable extraction)",
+        path.display()
+    );
+    None
+}
+
+// =============================================================================
 // HANDLER
 // =============================================================================
 
@@ -486,10 +527,24 @@ pub async fn seed_project(
                 continue;
             }
 
-            // Read file content (skip binary/too-large files)
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(_) => continue, // Binary or unreadable
+            // PDF files are binary — extract text via pdf-extract when available
+            let is_pdf = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "pdf")
+                .unwrap_or(false);
+
+            let content = if is_pdf {
+                match extract_pdf_file_content(file_path) {
+                    Some(text) => text,
+                    None => continue,
+                }
+            } else {
+                // Read file content (skip binary/too-large files)
+                match std::fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(_) => continue, // Binary or unreadable
+                }
             };
 
             // Skip empty or very small files
