@@ -722,6 +722,48 @@ pub async fn recall(
         );
     }
 
+    // ── Reconsolidation: retrieved memories become labile ──────────
+    // Boost importance of recalled memories proportional to their rank score.
+    // Fire-and-forget: this must not delay the response.
+    // Based on Nader et al. (2000): retrieval reopens the consolidation window.
+    if count > 0 {
+        let memory_for_recon = memory.clone();
+        let recon_ids: Vec<(String, f32)> = recall_memories
+            .iter()
+            .take(crate::constants::RECONSOLIDATION_MAX_PER_RECALL)
+            .map(|m| (m.id.clone(), m.score))
+            .collect();
+        tokio::task::spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                let guard = memory_for_recon.read();
+                for (id_str, relevance_score) in &recon_ids {
+                    let Ok(uuid) = uuid::Uuid::parse_str(id_str) else {
+                        continue;
+                    };
+                    let mid = crate::memory::MemoryId(uuid);
+                    let Ok(mem) = guard.get_memory(&mid) else {
+                        continue;
+                    };
+                    // Cooldown: skip if accessed recently
+                    let secs_since = (chrono::Utc::now() - mem.last_accessed())
+                        .num_seconds();
+                    if secs_since < crate::constants::RECONSOLIDATION_COOLDOWN_SECS {
+                        continue;
+                    }
+                    let boost =
+                        crate::constants::RECONSOLIDATION_BOOST * relevance_score;
+                    mem.boost_importance(boost);
+                    let _ = guard.update_memory(&mem);
+                    metrics::RECONSOLIDATION_TOTAL.inc();
+                }
+            })
+            .await
+            {
+                tracing::debug!("Reconsolidation task failed: {e}");
+            }
+        });
+    }
+
     // Build reminder count for response
     let reminder_count = if triggered_reminders.is_empty() {
         None

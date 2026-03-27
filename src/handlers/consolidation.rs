@@ -156,6 +156,165 @@ pub async fn consolidate_memories(
             let _ = graph_guard.flush_pending_maintenance();
         }
 
+        // Step 3.5: Dream replay — random memory pair comparison discovers
+        // latent cross-topic connections (Wilson & McNaughton 1994).
+        // Samples random pairs, computes cosine similarity, creates weak
+        // RelatedTo edges for pairs in the discovery band (0.55-0.85).
+        let mut dream_edges_created: usize = 0;
+        {
+            let memory_clone = memory.clone();
+            let graph_arc = state_clone.get_user_graph(&user_id).ok();
+            let uid = user_id.clone();
+            match tokio::task::spawn_blocking(move || -> usize {
+                use crate::constants::{
+                    DREAM_REPLAY_EDGE_CONFIDENCE, DREAM_REPLAY_PAIR_COUNT,
+                    DREAM_REPLAY_SIMILARITY_CEILING, DREAM_REPLAY_SIMILARITY_THRESHOLD,
+                };
+                use crate::similarity::cosine_similarity;
+
+                let memory_guard = memory_clone.read();
+                let Some(graph_arc) = graph_arc else {
+                    return 0;
+                };
+                let graph = graph_arc.read();
+
+                // Get all memory IDs and sample random pairs
+                let all_ids = match memory_guard.get_long_term_ids() {
+                    Ok(ids) => ids,
+                    Err(_) => return 0,
+                };
+                if all_ids.len() < 10 {
+                    return 0; // Not enough memories for meaningful replay
+                }
+
+                let mut created = 0usize;
+                let mut rng_state = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+
+                // Simple xorshift64 for lightweight randomness (no external dep)
+                let mut next_rand = || -> usize {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+                    rng_state as usize
+                };
+
+                let pair_count = DREAM_REPLAY_PAIR_COUNT.min(all_ids.len() * (all_ids.len() - 1) / 2);
+
+                for _ in 0..pair_count {
+                    let idx_a = next_rand() % all_ids.len();
+                    let mut idx_b = next_rand() % all_ids.len();
+                    if idx_b == idx_a {
+                        idx_b = (idx_a + 1) % all_ids.len();
+                    }
+
+                    let mem_a = match memory_guard.get_memory(&all_ids[idx_a]) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let mem_b = match memory_guard.get_memory(&all_ids[idx_b]) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+
+                    let (Some(emb_a), Some(emb_b)) = (
+                        &mem_a.experience.embeddings,
+                        &mem_b.experience.embeddings,
+                    ) else {
+                        continue;
+                    };
+
+                    let sim = cosine_similarity(emb_a, emb_b);
+                    metrics::DREAM_REPLAY_PAIRS_EVALUATED.inc();
+
+                    // Discovery band: interesting but not already-connected similarity
+                    if sim < DREAM_REPLAY_SIMILARITY_THRESHOLD
+                        || sim > DREAM_REPLAY_SIMILARITY_CEILING
+                    {
+                        continue;
+                    }
+
+                    // Check if entities from both memories have any existing edge
+                    let entities_a: Vec<uuid::Uuid> =
+                        mem_a.entity_refs.iter().map(|e| e.entity_id).collect();
+                    let entities_b: Vec<uuid::Uuid> =
+                        mem_b.entity_refs.iter().map(|e| e.entity_id).collect();
+
+                    if entities_a.is_empty() || entities_b.is_empty() {
+                        continue;
+                    }
+
+                    // Check if any cross-entity edge already exists
+                    let mut already_connected = false;
+                    'outer: for ea in &entities_a {
+                        for eb in &entities_b {
+                            if graph.find_relationship_between(ea, eb).ok().flatten().is_some() {
+                                already_connected = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    if already_connected {
+                        continue;
+                    }
+
+                    // Create a discovery edge between the first entity pair
+                    let now = chrono::Utc::now();
+                    let edge = crate::graph_memory::RelationshipEdge {
+                        uuid: uuid::Uuid::new_v4(),
+                        from_entity: entities_a[0],
+                        to_entity: entities_b[0],
+                        relation_type: crate::graph_memory::RelationType::RelatedTo,
+                        strength: DREAM_REPLAY_EDGE_CONFIDENCE,
+                        created_at: now,
+                        valid_at: now,
+                        invalidated_at: None,
+                        source_episode_id: None,
+                        context: format!(
+                            "dream-replay: cosine={:.3} between memories {}..{}",
+                            sim,
+                            &mem_a.id.0.to_string()[..8],
+                            &mem_b.id.0.to_string()[..8],
+                        ),
+                        last_activated: now,
+                        activation_count: 0,
+                        ltp_status: Default::default(),
+                        tier: Default::default(),
+                        activation_timestamps: None,
+                        entity_confidence: None,
+                    };
+                    match graph.add_relationship(edge) {
+                        Ok(_) => {
+                            created += 1;
+                            metrics::DREAM_REPLAY_EDGES_CREATED.inc();
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Dream replay edge creation failed: {e}"
+                            );
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    user_id = %uid,
+                    pairs_evaluated = pair_count,
+                    edges_created = created,
+                    "Dream replay complete"
+                );
+                created
+            })
+            .await
+            {
+                Ok(count) => dream_edges_created = count,
+                Err(e) => {
+                    tracing::debug!("Dream replay task panicked: {e}");
+                }
+            }
+        }
+
         // Step 4: Gap analysis — sync graph to SQLite, detect structural gaps
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
             if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
@@ -200,6 +359,7 @@ pub async fn consolidate_memories(
             memories_replayed = maintenance_result.replay_memory_ids.len(),
             edges_strengthened,
             entity_edges_strengthened,
+            dream_edges_created,
             memories_decayed = maintenance_result.decayed_count,
             duration_secs = format!("{:.1}", duration),
             "Consolidation complete (background)"

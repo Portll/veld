@@ -1037,6 +1037,89 @@ fn resolve_memory(
 }
 
 /// Parse experience type from string
+// =============================================================================
+// ANCHOR ENDPOINT
+// =============================================================================
+
+/// Request to anchor or unanchor a memory
+#[derive(Debug, Deserialize)]
+pub struct AnchorRequest {
+    pub user_id: String,
+    pub memory_id: String,
+    /// true to anchor, false to unanchor
+    #[serde(default = "default_anchor_true")]
+    pub anchor: bool,
+}
+
+fn default_anchor_true() -> bool {
+    true
+}
+
+/// Response for anchor operations
+#[derive(Debug, Serialize)]
+pub struct AnchorResponse {
+    pub success: bool,
+    pub memory_id: String,
+    pub anchored: bool,
+}
+
+/// POST /api/anchor — Mark a memory as compaction-resistant.
+///
+/// Anchored memories maintain a minimum importance floor (`ANCHOR_IMPORTANCE_FLOOR`)
+/// and are skipped during compression. Use this for critical facts that must persist.
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, memory_id = %req.memory_id))]
+pub async fn anchor_memory(
+    State(state): State<AppState>,
+    Json(req): Json<AnchorRequest>,
+) -> Result<Json<AnchorResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let uuid = uuid::Uuid::parse_str(&req.memory_id).map_err(|_| AppError::InvalidInput {
+        field: "memory_id".to_string(),
+        reason: "Invalid UUID format".to_string(),
+    })?;
+    let memory_id = memory::MemoryId(uuid);
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let anchor_value = req.anchor;
+    let mid = memory_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let guard = memory_sys.read();
+        let mem = guard.get_memory(&mid)?;
+        mem.set_anchored(anchor_value);
+        guard.update_memory(&mem)?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    state.emit_event(MemoryEvent {
+        event_type: if req.anchor {
+            "ANCHOR".to_string()
+        } else {
+            "UNANCHOR".to_string()
+        },
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(req.memory_id.clone()),
+        content_preview: None,
+        memory_type: None,
+        importance: None,
+        count: None,
+        results: None,
+    });
+
+    Ok(Json(AnchorResponse {
+        success: true,
+        memory_id: req.memory_id,
+        anchored: req.anchor,
+    }))
+}
+
 fn parse_experience_type(type_str: &str) -> Result<ExperienceType, AppError> {
     match type_str.to_lowercase().as_str() {
         "observation" => Ok(ExperienceType::Observation),
