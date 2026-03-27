@@ -474,6 +474,30 @@ pub struct ConsolidateResponse {
 }
 
 // =============================================================================
+// SLEEP-PHASE CONSOLIDATION (A7: Survey on AI Memory, CLS + LightMem)
+// =============================================================================
+
+/// Request to trigger sleep-phase consolidation
+///
+/// Heavyweight offline consolidation that composes: large-sample replay,
+/// deduplication, tier promotion sweep, and decay application.
+/// Returns 202 immediately; work runs in background.
+#[derive(Debug, Deserialize)]
+pub struct SleepPhaseRequest {
+    pub user_id: String,
+    /// Multiplier for replay batch size (default: 3x normal)
+    #[serde(default)]
+    pub replay_multiplier: Option<usize>,
+}
+
+/// Response from sleep-phase consolidation
+#[derive(Serialize)]
+pub struct SleepPhaseResponse {
+    pub accepted: bool,
+    pub message: String,
+}
+
+// =============================================================================
 // INDEX MAINTENANCE
 // =============================================================================
 

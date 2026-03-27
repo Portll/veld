@@ -384,6 +384,267 @@ pub async fn consolidate_memories(
 }
 
 // =============================================================================
+// SLEEP-PHASE CONSOLIDATION (A7: CLS dual-structure + LightMem offline)
+// =============================================================================
+
+use super::types::{SleepPhaseRequest, SleepPhaseResponse};
+
+/// Sleep-phase consolidation — heavyweight offline pipeline (A7)
+///
+/// Composes the full CLS-inspired consolidation sequence:
+/// 1. Fact extraction (cortical integration)
+/// 2. Heavy maintenance (replay + tier promotion + decay)
+/// 3. Hebbian edge strengthening from replay results
+/// 4. Entity-entity reinforcement for replayed memories
+/// 5. Opportunistic edge pruning flush
+/// 6. Dream replay with enlarged batch (hippocampal replay)
+/// 7. Gap analysis for structural integrity
+///
+/// Returns 202 immediately. Work runs in background.
+/// Designed to be called during low-activity periods (cron, hooks).
+///
+/// Reference: Bai et al. (2026) §2.1.3 CLS Theory, §4.2.3 LightMem
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+pub async fn sleep_phase_consolidation(
+    State(state): State<AppState>,
+    Json(req): Json<SleepPhaseRequest>,
+) -> Result<Json<SleepPhaseResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let _ = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let replay_multiplier = req.replay_multiplier.unwrap_or(3);
+    let state_clone = state.clone();
+
+    tokio::task::spawn(async move {
+        let op_start = std::time::Instant::now();
+        tracing::info!(user_id = %user_id, replay_multiplier, "Sleep-phase consolidation starting");
+
+        let memory = match state_clone.get_user_memory(&user_id) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(user_id = %user_id, "Sleep-phase: failed to get memory: {e}");
+                return;
+            }
+        };
+
+        // Phase 1: Fact extraction (with heat-score-aware consolidation from A2)
+        {
+            let memory = memory.clone();
+            let uid = user_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                let memory_guard = memory.read();
+                memory_guard.distill_facts(
+                    &uid,
+                    crate::constants::CONSOLIDATION_MIN_SUPPORT,
+                    crate::constants::CONSOLIDATION_MIN_AGE_DAYS,
+                )
+            })
+            .await
+            {
+                Ok(Ok(r)) => {
+                    tracing::info!(
+                        user_id = %user_id,
+                        facts_extracted = r.facts_extracted,
+                        "Sleep-phase: fact extraction complete"
+                    );
+                }
+                Ok(Err(e)) => tracing::warn!(user_id = %user_id, "Sleep-phase fact extraction failed: {e}"),
+                Err(e) => tracing::warn!(user_id = %user_id, "Sleep-phase fact extraction panicked: {e}"),
+            }
+        }
+
+        // Phase 2: Heavy maintenance (replay + tier consolidation + decay)
+        let decay_factor = state_clone.server_config().activation_decay_factor;
+        let maintenance_result = {
+            let memory = memory.clone();
+            let uid = user_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                let memory_guard = memory.read();
+                memory_guard.run_maintenance(decay_factor, &uid, true)
+            })
+            .await
+            {
+                Ok(Ok(r)) => Some(r),
+                Ok(Err(e)) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase maintenance failed: {e}");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user_id, "Sleep-phase maintenance panicked: {e}");
+                    None
+                }
+            }
+        };
+
+        // Phase 3: Edge strengthening from replay
+        if let Some(ref maint) = maintenance_result {
+            if !maint.edge_boosts.is_empty() {
+                if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+                    let graph_guard = graph.read();
+                    match graph_guard.strengthen_memory_edges(&maint.edge_boosts) {
+                        Ok((count, promotion_boosts)) => {
+                            tracing::debug!(user_id = %user_id, count, "Sleep-phase: edges strengthened");
+                            if !promotion_boosts.is_empty() {
+                                let memory_guard = memory.read();
+                                let _ = memory_guard.apply_edge_promotion_boosts(&promotion_boosts);
+                            }
+                        }
+                        Err(e) => tracing::debug!("Sleep-phase edge boost failed: {e}"),
+                    }
+                }
+            }
+
+            // Phase 4: Entity-entity Hebbian reinforcement
+            if !maint.replay_memory_ids.is_empty() {
+                if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+                    let graph_guard = graph.read();
+                    for mem_id_str in &maint.replay_memory_ids {
+                        if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
+                            let _ = graph_guard.strengthen_episode_entity_edges(&uuid);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 5: Flush pending maintenance (opportunistic edge pruning)
+        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+            let graph_guard = graph.read();
+            let _ = graph_guard.flush_pending_maintenance();
+        }
+
+        // Phase 6: Dream replay with enlarged batch
+        {
+            let memory_clone = memory.clone();
+            let graph_arc = state_clone.get_user_graph(&user_id).ok();
+            let uid = user_id.clone();
+            let _ = tokio::task::spawn_blocking(move || -> usize {
+                use crate::constants::{
+                    DREAM_REPLAY_EDGE_CONFIDENCE, DREAM_REPLAY_PAIR_COUNT,
+                    DREAM_REPLAY_SIMILARITY_CEILING, DREAM_REPLAY_SIMILARITY_THRESHOLD,
+                };
+                use crate::similarity::cosine_similarity;
+
+                let memory_guard = memory_clone.read();
+                let Some(graph_arc) = graph_arc else { return 0 };
+                let graph = graph_arc.read();
+
+                let all_ids = match memory_guard.get_long_term_ids() {
+                    Ok(ids) => ids,
+                    Err(_) => return 0,
+                };
+                if all_ids.len() < 10 { return 0; }
+
+                let mut created = 0usize;
+                let mut rng_state = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let mut next_rand = || -> usize {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+                    rng_state as usize
+                };
+
+                // Sleep-phase uses enlarged batch (multiplier × normal count)
+                let pair_count = (DREAM_REPLAY_PAIR_COUNT * replay_multiplier)
+                    .min(all_ids.len() * (all_ids.len() - 1) / 2);
+
+                for _ in 0..pair_count {
+                    let idx_a = next_rand() % all_ids.len();
+                    let mut idx_b = next_rand() % all_ids.len();
+                    if idx_b == idx_a { idx_b = (idx_a + 1) % all_ids.len(); }
+
+                    let mem_a = match memory_guard.get_memory(&all_ids[idx_a]) { Ok(m) => m, Err(_) => continue };
+                    let mem_b = match memory_guard.get_memory(&all_ids[idx_b]) { Ok(m) => m, Err(_) => continue };
+
+                    let (Some(emb_a), Some(emb_b)) = (&mem_a.experience.embeddings, &mem_b.experience.embeddings) else { continue };
+
+                    let sim = cosine_similarity(emb_a, emb_b);
+                    if sim < DREAM_REPLAY_SIMILARITY_THRESHOLD || sim > DREAM_REPLAY_SIMILARITY_CEILING { continue; }
+
+                    let entities_a: Vec<uuid::Uuid> = mem_a.entity_refs.iter().map(|e| e.entity_id).collect();
+                    let entities_b: Vec<uuid::Uuid> = mem_b.entity_refs.iter().map(|e| e.entity_id).collect();
+                    if entities_a.is_empty() || entities_b.is_empty() { continue; }
+
+                    let mut already_connected = false;
+                    'outer: for ea in &entities_a {
+                        for eb in &entities_b {
+                            if graph.find_relationship_between(ea, eb).ok().flatten().is_some() {
+                                already_connected = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    if already_connected { continue; }
+
+                    let now = chrono::Utc::now();
+                    let edge = crate::graph_memory::RelationshipEdge {
+                        uuid: uuid::Uuid::new_v4(),
+                        from_entity: entities_a[0],
+                        to_entity: entities_b[0],
+                        relation_type: crate::graph_memory::RelationType::RelatedTo,
+                        strength: DREAM_REPLAY_EDGE_CONFIDENCE,
+                        created_at: now,
+                        valid_at: now,
+                        invalidated_at: None,
+                        source_episode_id: None,
+                        context: format!("sleep-replay: cosine={:.3}", sim),
+                        last_activated: now,
+                        activation_count: 0,
+                        ltp_status: Default::default(),
+                        tier: Default::default(),
+                        activation_timestamps: None,
+                        entity_confidence: None,
+                    };
+                    if graph.add_relationship(edge).is_ok() { created += 1; }
+                }
+
+                tracing::info!(user_id = %uid, pairs_evaluated = pair_count, edges_created = created, "Sleep-phase dream replay complete");
+                created
+            }).await;
+        }
+
+        // Phase 7: Gap analysis
+        if let Ok(graph) = state_clone.get_user_graph(&user_id) {
+            if let Ok(store) = state_clone.get_user_slow_store(&user_id) {
+                let graph_guard = graph.read();
+                if let (Ok(entities), Ok(edges)) = (graph_guard.get_all_entities(), graph_guard.get_all_relationships()) {
+                    if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
+                        let config = GapDetectionConfig::default();
+                        if let Ok(result) = GapDetector::detect(store.as_ref(), &config) {
+                            tracing::info!(user_id = %user_id, gaps = result.gaps.len(), "Sleep-phase gap detection complete");
+                        }
+                    }
+                }
+            }
+        }
+
+        let duration = op_start.elapsed().as_secs_f64();
+        metrics::CONSOLIDATE_DURATION.observe(duration);
+        metrics::CONSOLIDATE_TOTAL
+            .with_label_values(&["sleep_phase"])
+            .inc();
+
+        tracing::info!(
+            user_id = %user_id,
+            duration_secs = format!("{:.1}", duration),
+            "Sleep-phase consolidation complete"
+        );
+    });
+
+    Ok(Json(SleepPhaseResponse {
+        accepted: true,
+        message: "Sleep-phase consolidation started in background. Check /api/consolidation/report for results.".to_string(),
+    }))
+}
+
+// =============================================================================
 // INDEX MAINTENANCE
 // =============================================================================
 
