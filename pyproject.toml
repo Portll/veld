@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "shodh-memory"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-first AI memory system for robotics, drones, and edge AI - 100% offline capable"
 authors = [{name = "Shodh Team", email = "29.varuns@gmail.com"}]
 license = {text = "BUSL-1.1"}
