@@ -1297,6 +1297,49 @@ impl Memory {
         self.metadata.lock().access_count
     }
 
+    /// Count populated context sub-fields (A2: heat-score context richness)
+    ///
+    /// Returns 0-10 based on how many context dimensions have non-default values.
+    /// Used by the heat-score consolidation trigger to identify information-dense memories.
+    pub fn context_richness(&self) -> u32 {
+        let ctx = match &self.experience.context {
+            Some(c) => c,
+            None => return 0,
+        };
+        let mut count = 0u32;
+        if ctx.conversation.topic.is_some() {
+            count += 1;
+        }
+        if ctx.user.user_id.is_some() || ctx.user.name.is_some() {
+            count += 1;
+        }
+        if ctx.project.project_id.is_some() || ctx.project.name.is_some() {
+            count += 1;
+        }
+        if ctx.temporal.time_of_day.is_some() || ctx.temporal.session_duration_minutes.is_some() {
+            count += 1;
+        }
+        if !ctx.semantic.concepts.is_empty() {
+            count += 1;
+        }
+        if ctx.code.current_file.is_some() || ctx.code.current_scope.is_some() {
+            count += 1;
+        }
+        if ctx.document.document_id.is_some() {
+            count += 1;
+        }
+        if ctx.environment.os.is_some() {
+            count += 1;
+        }
+        if ctx.emotional.valence != 0.0 || ctx.emotional.arousal != 0.0 {
+            count += 1;
+        }
+        if !self.entity_refs.is_empty() {
+            count += 1;
+        }
+        count
+    }
+
     /// Get last accessed time (thread-safe)
     pub fn last_accessed(&self) -> DateTime<Utc> {
         self.metadata.lock().last_accessed

@@ -436,12 +436,34 @@ pub const IMPORTANCE_RECENCY_DAYS: f64 = 7.0;
 /// - Higher values (3-5) for more confidence but slower learning
 pub const CONSOLIDATION_MIN_SUPPORT: usize = 2;
 
-/// Minimum age in days before consolidation
+/// Minimum age in days before consolidation (legacy gate, still used as fallback)
 ///
 /// Justification:
 /// - 7 days allows patterns to emerge through repeated use
 /// - Matches weekly work cycles
 pub const CONSOLIDATION_MIN_AGE_DAYS: i64 = 7;
+
+/// Heat-score consolidation trigger (A2: Survey on AI Memory, MemoryOS)
+///
+/// Memories between HEAT_SCORE_MIN_AGE_DAYS and CONSOLIDATION_MIN_AGE_DAYS
+/// can be fast-tracked for consolidation if their heat score exceeds this threshold.
+///
+/// Heat formula: access_count × ln(1 + context_richness) × recency_factor
+/// where recency_factor = 1.0 / (1.0 + age_days × 0.1)
+///
+/// Examples at threshold 3.0:
+/// - 5 accesses, richness 4, age 3d → 5 × 1.61 × 0.77 = 6.19 → ELIGIBLE
+/// - 1 access, richness 2, age 5d → 1 × 1.10 × 0.67 = 0.73 → NOT eligible
+/// - 3 accesses, richness 1, age 4d → 3 × 0.69 × 0.71 = 1.47 → NOT eligible
+///
+/// Reference: Bai et al. (2026) §4.2.3 "Heat Score" in MemoryOS
+pub const HEAT_SCORE_THRESHOLD: f32 = 3.0;
+
+/// Minimum age in days before heat-score consolidation can fire (safety floor)
+///
+/// Prevents consolidation of memories less than 3 days old, even with high heat.
+/// Ensures episodic details aren't prematurely abstracted into facts.
+pub const HEAT_SCORE_MIN_AGE_DAYS: i64 = 3;
 
 /// Jaccard similarity threshold for grouping consolidation patterns
 ///
