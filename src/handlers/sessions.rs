@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{Session, SessionId, SessionStatus, SessionStoreStats, SessionSummary};
+use crate::memory::{
+    Session, SessionEvent, SessionId, SessionStatus, SessionStoreStats, SessionSummary,
+};
 use crate::validation;
 use std::sync::Arc;
 
@@ -129,6 +131,12 @@ pub async fn end_session(
 
     if let Some(summary) = active_session {
         let session = state.session_store.end_session(&summary.id, &req.reason);
+
+        // Auto-populate session_summary context block from the ended session
+        if let Some(ref ended) = session {
+            populate_session_summary_block(&state, &req.user_id, ended);
+        }
+
         Ok(Json(EndSessionResponse {
             success: session.is_some(),
             session,
@@ -138,6 +146,122 @@ pub async fn end_session(
             success: false,
             session: None,
         }))
+    }
+}
+
+/// Build and write a `session_summary` context block from a completed session.
+///
+/// Collects key entities mentioned, memory types created, and aggregate stats
+/// from the session timeline, then writes a compact summary (max 500 chars)
+/// to the user's `session_summary` context block.
+fn populate_session_summary_block(
+    state: &AppState,
+    user_id: &str,
+    session: &Session,
+) {
+    use std::collections::{BTreeSet, HashSet};
+
+    // Collect entities and topics from timeline events
+    let mut entities: BTreeSet<String> = BTreeSet::new();
+    let mut memory_types: HashSet<String> = HashSet::new();
+
+    for event in &session.timeline {
+        if let SessionEvent::MemoryCreated {
+            entities: ents,
+            memory_type,
+            ..
+        } = event
+        {
+            for e in ents {
+                entities.insert(e.clone());
+            }
+            memory_types.insert(memory_type.clone());
+        }
+    }
+
+    let stats = &session.stats;
+    let duration_mins = session.duration().num_minutes();
+
+    // Build summary parts
+    let mut parts: Vec<String> = Vec::new();
+
+    // Duration and date
+    parts.push(format!(
+        "Session ended ({} min, {})",
+        duration_mins,
+        session.temporal.short_label()
+    ));
+
+    // Memory stats
+    if stats.memories_created > 0 {
+        let types_str = if memory_types.is_empty() {
+            String::new()
+        } else {
+            let types_vec: Vec<&str> = memory_types.iter().map(|s| s.as_str()).collect();
+            format!(" [{}]", types_vec.join(", "))
+        };
+        parts.push(format!(
+            "{} memories created{}",
+            stats.memories_created, types_str
+        ));
+    }
+
+    if stats.memories_surfaced > 0 {
+        parts.push(format!(
+            "{} surfaced, {} used (hit rate {:.0}%)",
+            stats.memories_surfaced,
+            stats.memories_used,
+            stats.memory_hit_rate * 100.0
+        ));
+    }
+
+    // Todo stats
+    if stats.todos_created > 0 || stats.todos_completed > 0 {
+        parts.push(format!(
+            "todos: {} created, {} completed",
+            stats.todos_created, stats.todos_completed
+        ));
+    }
+
+    // Key entities (top 10 to keep summary compact)
+    if !entities.is_empty() {
+        let entity_list: Vec<&str> = entities.iter().map(|s| s.as_str()).take(10).collect();
+        let suffix = if entities.len() > 10 {
+            format!(" (+{} more)", entities.len() - 10)
+        } else {
+            String::new()
+        };
+        parts.push(format!("entities: {}{}", entity_list.join(", "), suffix));
+    }
+
+    // Query volume
+    if stats.queries_count > 0 {
+        parts.push(format!("{} queries", stats.queries_count));
+    }
+
+    let mut summary = parts.join(". ");
+
+    // Enforce 500-char max
+    if summary.len() > 500 {
+        summary.truncate(497);
+        summary.push_str("...");
+    }
+
+    if let Err(e) = state
+        .context_block_store
+        .set(user_id, "session_summary", &summary, None)
+    {
+        tracing::warn!(
+            user_id = user_id,
+            error = %e,
+            "Failed to write session_summary context block"
+        );
+    } else {
+        tracing::debug!(
+            user_id = user_id,
+            summary_len = summary.len(),
+            "Session summary context block updated"
+        );
     }
 }
 

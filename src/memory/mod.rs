@@ -115,7 +115,9 @@ pub use crate::memory::sessions::{
     SessionSummary, TemporalContext, TimeOfDay,
 };
 pub use crate::memory::context_blocks::{ContextBlock, ContextBlockStore};
-pub use crate::memory::temporal_facts::{EventType, ResolvedTime, TemporalFact, TemporalFactStore};
+pub use crate::memory::temporal_facts::{
+    ContradictionType, EventType, ResolvedTime, TemporalFact, TemporalFactStore,
+};
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
 
@@ -1071,7 +1073,7 @@ impl MemorySystem {
             self.stats.write().vector_index_count += 1;
         }
 
-        // Interference detection (retroactive + proactive)
+        // Write gate + interference detection (retroactive + proactive)
         if let Some(embedding) = &memory_arc.experience.embeddings {
             if let Ok(similar_ids) =
                 self.retriever
@@ -1093,6 +1095,65 @@ impl MemorySystem {
                         })
                         .collect();
 
+                    // ── Write gate: absorption ──────────────────────────────
+                    // If nearest neighbor exceeds absorption threshold AND we
+                    // have enough memories to trust the index, absorb this
+                    // memory into the existing one rather than keeping both.
+                    let total_memories = self.stats.read().total_memories;
+                    if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
+                        if let Some((best_id, best_sim, _, _, _)) = similar_memories
+                            .iter()
+                            .max_by(|a, b| {
+                                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                        {
+                            if *best_sim >= crate::constants::WRITE_GATE_ABSORPTION_THRESHOLD {
+                                // Boost existing memory's importance
+                                if let Ok(best_uuid) = uuid::Uuid::parse_str(best_id) {
+                                    if let Ok(existing) =
+                                        self.long_term_memory.get(&MemoryId(best_uuid))
+                                    {
+                                        existing.boost_importance(
+                                            crate::constants::WRITE_GATE_ABSORPTION_BOOST,
+                                        );
+                                        let _ = self.long_term_memory.update(&existing);
+                                    }
+                                }
+                                // Remove the redundant new memory
+                                let _ = self.long_term_memory.delete(memory_id);
+                                self.retriever.remove_memory(memory_id);
+                                self.record_consolidation_event(
+                                    ConsolidationEvent::MemoryWeakened {
+                                        memory_id: memory_id.0.to_string(),
+                                        content_preview: memory_arc
+                                            .experience
+                                            .content
+                                            .chars()
+                                            .take(50)
+                                            .collect(),
+                                        activation_before: importance,
+                                        activation_after: 0.0,
+                                        interfering_memory_id: best_id.clone(),
+                                        interference_type: InterferenceType::Retroactive,
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                );
+                                crate::metrics::WRITE_GATE_ABSORBED.inc();
+                                tracing::info!(
+                                    memory_id = %memory_id.0,
+                                    absorbed_by = %best_id,
+                                    similarity = %best_sim,
+                                    "Write gate: absorbed redundant memory"
+                                );
+                                let elapsed = start.elapsed();
+                                crate::metrics::EMBED_BACKGROUND_DURATION
+                                    .observe(elapsed.as_secs_f64());
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    // ── Standard interference detection ─────────────────────
                     if !similar_memories.is_empty() {
                         let interference_result =
                             self.interference_detector.write().check_interference(
@@ -1102,7 +1163,6 @@ impl MemorySystem {
                                 &similar_memories,
                             );
 
-                        // Apply retroactive interference (weaken old similar memories)
                         for (old_id, _similarity, decay_amount) in
                             &interference_result.retroactive_targets
                         {
@@ -1116,28 +1176,24 @@ impl MemorySystem {
                             }
                         }
 
-                        // Apply proactive interference (reduce new memory importance)
                         if interference_result.proactive_decay > 0.0 {
                             memory_arc.decay_importance(interference_result.proactive_decay);
                             let _ = self.long_term_memory.update(&memory_arc);
                         }
 
-                        // Record interference events for introspection
                         for event in &interference_result.events {
                             self.record_consolidation_event(event.clone());
                         }
 
-                        // Suppress near-duplicates
                         if interference_result.is_duplicate {
                             tracing::info!(
                                 memory_id = %memory_arc.id.0,
-                                "Near-duplicate detected (≥0.95 cosine), suppressing importance"
+                                "Near-duplicate detected (>=0.95 cosine), suppressing importance"
                             );
                             memory_arc.decay_importance(0.99);
                             let _ = self.long_term_memory.update(&memory_arc);
                         }
 
-                        // Persist interference records
                         {
                             let detector = self.interference_detector.read();
                             let affected_ids = detector.get_affected_ids_from_check(
@@ -4590,7 +4646,7 @@ impl MemorySystem {
     }
 
     /// Forget memories matching ANY of the specified tags
-    fn forget_by_tags(&self, tags: &[String]) -> Result<usize> {
+    pub fn forget_by_tags(&self, tags: &[String]) -> Result<usize> {
         let mut count = 0;
         let mut working_removed = 0;
         let mut session_removed = 0;
@@ -5045,6 +5101,14 @@ impl MemorySystem {
     /// Get memory by ID from long-term storage
     pub fn get_memory(&self, id: &MemoryId) -> Result<Memory> {
         self.long_term_memory.get(id)
+    }
+
+    /// Get all memory IDs from long-term storage.
+    ///
+    /// Used by dream replay and other bulk operations that need to sample
+    /// random memories without loading their full content.
+    pub fn get_long_term_ids(&self) -> Result<Vec<MemoryId>> {
+        self.long_term_memory.get_all_ids()
     }
 
     /// Update a memory in storage with full re-indexing

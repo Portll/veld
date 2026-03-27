@@ -117,12 +117,141 @@ impl ResolvedTime {
     }
 }
 
+/// How a temporal fact was invalidated
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContradictionType {
+    /// Same entity + event_type + stem overlap; newer fact replaces older
+    Superseded,
+    /// Semantic opposition detected between source texts
+    Contradicted,
+}
+
 /// Returns `true` if the fact has been invalidated (valid_until is set and in the past).
 fn is_expired(fact: &TemporalFact) -> bool {
     match fact.valid_until {
         Some(until) => until < Utc::now(),
         None => false,
     }
+}
+
+/// Compute word-overlap cosine similarity between two texts.
+///
+/// Tokenizes both texts into lowercased words, builds term-frequency vectors,
+/// and returns the cosine similarity (0.0..1.0). Words shorter than 2 chars
+/// are excluded as noise.
+fn text_similarity(a: &str, b: &str) -> f32 {
+    use std::collections::HashMap;
+
+    fn term_freq(text: &str) -> HashMap<String, f32> {
+        let mut freq = HashMap::new();
+        for word in text.split(|c: char| !c.is_alphanumeric()) {
+            let w = word.to_lowercase();
+            if w.len() >= 2 {
+                *freq.entry(w).or_insert(0.0) += 1.0;
+            }
+        }
+        freq
+    }
+
+    let tf_a = term_freq(a);
+    let tf_b = term_freq(b);
+
+    if tf_a.is_empty() || tf_b.is_empty() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+
+    for (word, &count_a) in &tf_a {
+        norm_a += count_a * count_a;
+        if let Some(&count_b) = tf_b.get(word) {
+            dot += count_a * count_b;
+        }
+    }
+    for &count_b in tf_b.values() {
+        norm_b += count_b * count_b;
+    }
+
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
+/// Detect semantic opposition between two text fragments using heuristics.
+///
+/// Checks for:
+/// 1. Negation inversion: one text says "X is Y" and the other says "X is not Y"
+///    (or "isn't", "doesn't", "won't", "can't", etc.)
+/// 2. Keyword opposition: one text contains a term and the other contains its antonym
+///    from a curated set of common binary oppositions.
+fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
+    let a_lower = text_a.to_lowercase();
+    let b_lower = text_b.to_lowercase();
+
+    // Strategy 1: Negation asymmetry.
+    // If one sentence contains a negation marker and the other does not,
+    // and they share significant vocabulary (caller already verified similarity > 0.85),
+    // that's a strong signal of contradiction.
+    let negation_markers = [
+        "not ", "n't ", "no ", "never ", "doesn't ", "don't ", "didn't ",
+        "isn't ", "aren't ", "wasn't ", "weren't ", "won't ", "wouldn't ",
+        "can't ", "cannot ", "couldn't ", "shouldn't ", "hasn't ", "haven't ",
+        "hadn't ",
+    ];
+
+    let a_negated = negation_markers.iter().any(|m| a_lower.contains(m));
+    let b_negated = negation_markers.iter().any(|m| b_lower.contains(m));
+
+    if a_negated != b_negated {
+        return true;
+    }
+
+    // Strategy 2: Keyword opposition pairs.
+    // If text A contains one side of a binary pair and text B contains the other,
+    // that indicates a factual flip.
+    let opposition_pairs: &[(&str, &str)] = &[
+        ("yes", "no"),
+        ("true", "false"),
+        ("enabled", "disabled"),
+        ("active", "inactive"),
+        ("uses", "doesn't use"),
+        ("supports", "doesn't support"),
+        ("likes", "dislikes"),
+        ("allow", "disallow"),
+        ("accept", "reject"),
+        ("include", "exclude"),
+        ("open", "closed"),
+        ("start", "stop"),
+        ("enable", "disable"),
+        ("connect", "disconnect"),
+        ("agree", "disagree"),
+        ("available", "unavailable"),
+        ("valid", "invalid"),
+        ("correct", "incorrect"),
+        ("possible", "impossible"),
+        ("complete", "incomplete"),
+    ];
+
+    for &(pos, neg) in opposition_pairs {
+        let a_has_pos = a_lower.contains(pos);
+        let a_has_neg = a_lower.contains(neg);
+        let b_has_pos = b_lower.contains(pos);
+        let b_has_neg = b_lower.contains(neg);
+
+        // One text has the positive form while the other has the negative form
+        if (a_has_pos && b_has_neg && !a_has_neg && !b_has_pos)
+            || (a_has_neg && b_has_pos && !a_has_pos && !b_has_neg)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Storage for temporal facts
@@ -188,7 +317,12 @@ impl TemporalFactStore {
     /// If so, set `valid_until` on the old fact to the new fact's `valid_from` timestamp,
     /// effectively invalidating the superseded fact.
     ///
-    /// Returns the IDs of facts that were invalidated.
+    /// Two detection passes:
+    /// 1. **Superseded** — same entity + event_type + stem overlap, content differs
+    /// 2. **Contradicted** — same entity (any event_type), high text similarity but
+    ///    opposing semantic content detected via negation/opposition heuristics
+    ///
+    /// Returns the IDs and contradiction types of facts that were invalidated.
     pub fn detect_and_resolve_contradictions(
         &self,
         user_id: &str,
@@ -198,25 +332,19 @@ impl TemporalFactStore {
         let existing = self.find_by_entity_filtered(user_id, &new_fact.entity, 500, false)?;
 
         let mut invalidated_ids = Vec::new();
+        let mut already_invalidated = HashSet::new();
         let now = new_fact.valid_from.unwrap_or_else(Utc::now);
 
+        // Pass 1: Superseded — same entity + event_type + stem overlap
         for old_fact in &existing {
-            // Skip if already expired
-            if old_fact.valid_until.is_some() {
+            if old_fact.valid_until.is_some() || old_fact.id == new_fact.id {
                 continue;
             }
 
-            // Skip self-comparison
-            if old_fact.id == new_fact.id {
-                continue;
-            }
-
-            // Must be the same event type to contradict
             if old_fact.event_type != new_fact.event_type {
                 continue;
             }
 
-            // Check for overlapping event stems (same topic)
             let has_stem_overlap = old_fact
                 .event_stems
                 .iter()
@@ -226,20 +354,12 @@ impl TemporalFactStore {
                 continue;
             }
 
-            // Different content/resolved time indicates the fact has changed
             let content_differs = old_fact.source_text != new_fact.source_text
                 || old_fact.resolved_time.to_sortable_string()
                     != new_fact.resolved_time.to_sortable_string();
 
             if content_differs {
-                // Invalidate the old fact by setting valid_until
-                let mut updated = old_fact.clone();
-                updated.valid_until = Some(now);
-
-                let key = format!("temporal_facts:{}:{}", user_id, updated.id);
-                let value =
-                    bincode::serde::encode_to_vec(&updated, bincode::config::standard())?;
-                self.db.put(key.as_bytes(), &value)?;
+                self.invalidate_fact(user_id, old_fact, now, ContradictionType::Superseded)?;
 
                 tracing::info!(
                     user_id = user_id,
@@ -247,7 +367,41 @@ impl TemporalFactStore {
                     new_fact_id = %new_fact.id,
                     entity = %new_fact.entity,
                     event_type = ?new_fact.event_type,
-                    "Temporal fact contradiction detected — old fact invalidated"
+                    contradiction_type = "superseded",
+                    "Temporal fact superseded — old fact invalidated"
+                );
+
+                already_invalidated.insert(old_fact.id.clone());
+                invalidated_ids.push(old_fact.id.clone());
+            }
+        }
+
+        // Pass 2: Contradicted — same entity, different event_type, semantic opposition
+        for old_fact in &existing {
+            if old_fact.valid_until.is_some()
+                || old_fact.id == new_fact.id
+                || already_invalidated.contains(&old_fact.id)
+            {
+                continue;
+            }
+
+            // Require high text similarity (shared vocabulary) before checking opposition
+            let similarity = text_similarity(&old_fact.source_text, &new_fact.source_text);
+            if similarity < 0.85 {
+                continue;
+            }
+
+            if detect_semantic_opposition(&old_fact.source_text, &new_fact.source_text) {
+                self.invalidate_fact(user_id, old_fact, now, ContradictionType::Contradicted)?;
+
+                tracing::info!(
+                    user_id = user_id,
+                    old_fact_id = %old_fact.id,
+                    new_fact_id = %new_fact.id,
+                    entity = %new_fact.entity,
+                    similarity = similarity,
+                    contradiction_type = "contradicted",
+                    "Semantic contradiction detected — old fact invalidated"
                 );
 
                 invalidated_ids.push(old_fact.id.clone());
@@ -255,6 +409,23 @@ impl TemporalFactStore {
         }
 
         Ok(invalidated_ids)
+    }
+
+    /// Invalidate a single fact by setting valid_until and persisting.
+    fn invalidate_fact(
+        &self,
+        user_id: &str,
+        old_fact: &TemporalFact,
+        valid_until: DateTime<Utc>,
+        _contradiction_type: ContradictionType,
+    ) -> Result<()> {
+        let mut updated = old_fact.clone();
+        updated.valid_until = Some(valid_until);
+
+        let key = format!("temporal_facts:{}:{}", user_id, updated.id);
+        let value = bincode::serde::encode_to_vec(&updated, bincode::config::standard())?;
+        self.db.put(key.as_bytes(), &value)?;
+        Ok(())
     }
 
     /// Find facts by entity, with expired-fact filtering.

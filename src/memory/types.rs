@@ -1271,6 +1271,12 @@ impl Memory {
         self.score
     }
 
+    /// Set the anchored flag on this memory's metadata.
+    /// Anchored memories resist decay — importance cannot fall below ANCHOR_IMPORTANCE_FLOOR.
+    pub fn set_anchored(&self, anchored: bool) {
+        self.metadata.lock().anchored = anchored;
+    }
+
     /// Demote to previous tier (for decay)
     pub fn demote(&mut self) {
         self.tier = match self.tier {
@@ -1375,6 +1381,11 @@ impl Memory {
     pub fn decay_importance(&self, decay: f32) {
         let mut meta = self.metadata.lock();
         meta.importance = (meta.importance * (1.0 - decay)).max(IMPORTANCE_FLOOR);
+    }
+
+    /// Check if this memory is anchored.
+    pub fn is_anchored(&self) -> bool {
+        self.metadata.lock().anchored
     }
 
     /// Get all metadata snapshot (for debugging/stats)
@@ -1594,6 +1605,9 @@ struct MemoryFlat {
     // Hierarchy
     #[serde(default)]
     parent_id: Option<MemoryId>,
+    // Anchor (resists decay)
+    #[serde(default)]
+    anchored: bool,
 }
 
 impl Serialize for Memory {
@@ -1630,6 +1644,8 @@ impl Serialize for Memory {
             related_todo_ids: self.related_todo_ids.clone(),
             // Hierarchy
             parent_id: self.parent_id.clone(),
+            // Anchor
+            anchored: meta.anchored,
         };
         flat.serialize(serializer)
     }
@@ -1651,7 +1667,7 @@ impl<'de> Deserialize<'de> for Memory {
                 last_accessed: flat.last_accessed,
                 temporal_relevance: flat.temporal_relevance,
                 activation: flat.activation,
-                anchored: false,
+                anchored: flat.anchored,
             })),
             created_at: flat.created_at,
             compressed: flat.compressed,
