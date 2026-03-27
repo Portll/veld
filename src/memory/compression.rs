@@ -636,6 +636,20 @@ impl Default for SemanticConsolidator {
     }
 }
 
+/// Compute heat score for a memory (A2: MemoryOS-inspired consolidation trigger)
+///
+/// Heat = access_count × ln(1 + context_richness) × recency_factor
+///
+/// - access_count: how often retrieved (proxy for engagement)
+/// - context_richness: count of populated context sub-fields (proxy for information density)
+/// - recency_factor: decaying boost so recent hot memories consolidate sooner
+fn compute_heat_score(memory: &Memory, age_days: i64) -> f32 {
+    let access_count = memory.access_count() as f32;
+    let context_richness = memory.context_richness() as f32;
+    let recency_factor = 1.0 / (1.0 + age_days as f32 * 0.1);
+    access_count * (1.0 + context_richness).ln() * recency_factor
+}
+
 impl SemanticConsolidator {
     pub fn new() -> Self {
         Self {
@@ -676,7 +690,19 @@ impl SemanticConsolidator {
         let now = chrono::Utc::now();
         let eligible: Vec<&Memory> = memories
             .iter()
-            .filter(|m| (now - m.created_at).num_days() >= self.min_age_days)
+            .filter(|m| {
+                let age_days = (now - m.created_at).num_days();
+                // Hard floor: never consolidate memories younger than HEAT_SCORE_MIN_AGE_DAYS
+                if age_days < crate::constants::HEAT_SCORE_MIN_AGE_DAYS {
+                    return false;
+                }
+                // Legacy gate: always consolidate memories older than min_age_days
+                if age_days >= self.min_age_days {
+                    return true;
+                }
+                // Heat-score fast-track for memories between floor and legacy gate
+                compute_heat_score(m, age_days) >= crate::constants::HEAT_SCORE_THRESHOLD
+            })
             .collect();
 
         if eligible.is_empty() {
