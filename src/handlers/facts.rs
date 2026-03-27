@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{self, SemanticFact};
+use crate::memory::{self, SemanticFact, TemporalFact};
 use crate::validation;
 use std::sync::Arc;
 
@@ -156,4 +156,176 @@ pub async fn get_facts_stats(
     .map_err(AppError::Internal)?;
 
     Ok(Json(stats))
+}
+
+// =============================================================================
+// TEMPORAL FACTS
+// =============================================================================
+
+/// Request for listing/filtering temporal facts
+#[derive(Debug, Deserialize)]
+pub struct TemporalFactsRequest {
+    pub user_id: String,
+    pub entity: Option<String>,
+    pub event: Option<String>,
+    #[serde(default = "facts_default_limit")]
+    pub limit: usize,
+}
+
+/// Request for searching temporal facts
+#[derive(Debug, Deserialize)]
+pub struct TemporalFactsSearchRequest {
+    pub user_id: String,
+    pub query: String,
+    #[serde(default = "facts_default_limit")]
+    pub limit: usize,
+}
+
+/// A single temporal fact in the API response
+#[derive(Debug, Serialize)]
+pub struct TemporalFactEntry {
+    pub entity: String,
+    pub event: String,
+    pub event_type: String,
+    pub timestamp: String,
+    pub source_memory_id: String,
+    pub confidence: f32,
+    pub source_text: String,
+}
+
+/// Response containing temporal facts
+#[derive(Debug, Serialize)]
+pub struct TemporalFactsResponse {
+    pub facts: Vec<TemporalFactEntry>,
+    pub total: usize,
+}
+
+fn temporal_fact_to_entry(fact: &TemporalFact) -> TemporalFactEntry {
+    TemporalFactEntry {
+        entity: fact.entity.clone(),
+        event: fact.event.clone(),
+        event_type: format!("{:?}", fact.event_type),
+        timestamp: fact.resolved_time.to_sortable_string(),
+        source_memory_id: fact.source_memory_id.0.to_string(),
+        confidence: fact.confidence,
+        source_text: fact.source_text.clone(),
+    }
+}
+
+/// POST /api/facts/temporal - List temporal facts with optional entity/event filters
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+pub async fn list_temporal_facts(
+    State(state): State<AppState>,
+    Json(req): Json<TemporalFactsRequest>,
+) -> Result<Json<TemporalFactsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let entity = req.entity.clone();
+    let event = req.event.clone();
+    let limit = req.limit;
+
+    let facts = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        match (entity.as_deref(), event.as_deref()) {
+            (Some(entity), Some(event)) => {
+                let keywords: Vec<&str> = event.split_whitespace().collect();
+                memory_guard.find_temporal_facts(&user_id, entity, &keywords, None)
+            }
+            (Some(entity), None) => {
+                memory_guard.find_temporal_facts_by_entity(&user_id, entity, limit)
+            }
+            (None, Some(event)) => {
+                memory_guard.find_temporal_facts_by_event(&user_id, event, limit)
+            }
+            (None, None) => memory_guard.list_temporal_facts(&user_id, limit),
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let entries: Vec<TemporalFactEntry> = facts.iter().map(temporal_fact_to_entry).collect();
+    let total = entries.len();
+    Ok(Json(TemporalFactsResponse {
+        facts: entries,
+        total,
+    }))
+}
+
+/// POST /api/facts/temporal/search - Semantic search across temporal facts
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, query = %req.query))]
+pub async fn search_temporal_facts(
+    State(state): State<AppState>,
+    Json(req): Json<TemporalFactsSearchRequest>,
+) -> Result<Json<TemporalFactsResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let query = req.query.clone();
+    let limit = req.limit;
+
+    let facts = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        // List all temporal facts then filter by query relevance
+        let all_facts = memory_guard.list_temporal_facts(&user_id, 1000)?;
+        let query_lower = query.to_lowercase();
+        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut matched: Vec<memory::TemporalFact> = all_facts
+            .into_iter()
+            .filter(|fact| {
+                let entity_lower = fact.entity.to_lowercase();
+                let event_lower = fact.event.to_lowercase();
+                let source_lower = fact.source_text.to_lowercase();
+                let time_str = fact.resolved_time.to_sortable_string().to_lowercase();
+
+                // Match if any keyword appears in entity, event, source text, or timestamp
+                keywords.iter().any(|kw| {
+                    entity_lower.contains(kw)
+                        || event_lower.contains(kw)
+                        || source_lower.contains(kw)
+                        || time_str.contains(kw)
+                })
+            })
+            .collect();
+
+        // Sort by relevance: count keyword hits
+        matched.sort_by(|a, b| {
+            let score = |fact: &memory::TemporalFact| -> usize {
+                let combined = format!(
+                    "{} {} {}",
+                    fact.entity.to_lowercase(),
+                    fact.event.to_lowercase(),
+                    fact.source_text.to_lowercase()
+                );
+                keywords
+                    .iter()
+                    .filter(|kw| combined.contains(*kw))
+                    .count()
+            };
+            score(b).cmp(&score(a))
+        });
+
+        matched.truncate(limit);
+        Ok(matched)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let entries: Vec<TemporalFactEntry> = facts.iter().map(temporal_fact_to_entry).collect();
+    let total = entries.len();
+    Ok(Json(TemporalFactsResponse {
+        facts: entries,
+        total,
+    }))
 }

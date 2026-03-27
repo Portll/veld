@@ -2950,6 +2950,26 @@ impl MemorySystem {
         self.temporal_fact_store.list(user_id, limit)
     }
 
+    /// Find temporal facts by entity name only
+    pub fn find_temporal_facts_by_entity(
+        &self,
+        user_id: &str,
+        entity: &str,
+        limit: usize,
+    ) -> Result<Vec<temporal_facts::TemporalFact>> {
+        self.temporal_fact_store.find_by_entity(user_id, entity, limit)
+    }
+
+    /// Find temporal facts by event keyword only
+    pub fn find_temporal_facts_by_event(
+        &self,
+        user_id: &str,
+        event: &str,
+        limit: usize,
+    ) -> Result<Vec<temporal_facts::TemporalFact>> {
+        self.temporal_fact_store.find_by_event(user_id, event, limit)
+    }
+
     /// Calculate linguistic boost based on focal entity matches
     fn linguistic_boost(content: &str, analysis: &query_parser::QueryAnalysis) -> f32 {
         let content_lower = content.to_lowercase();

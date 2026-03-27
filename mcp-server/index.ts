@@ -1412,6 +1412,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "list_temporal_facts",
+        description: "List temporal facts extracted from memories — when things happened, were planned, or occurred. Filter by entity name and/or event keyword.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            entity: {
+              type: "string",
+              description: "Filter by entity name (e.g., person, place)",
+            },
+            event: {
+              type: "string",
+              description: "Filter by event keyword (e.g., 'camping', 'race')",
+            },
+            limit: {
+              type: "number",
+              description: "Maximum results (default: 50)",
+            },
+          },
+        },
+      },
+      {
         name: "link_lineage",
         description: "Create a causal link between two memories — record that one memory caused, informed, resolved, or triggered another.",
         inputSchema: {
@@ -3455,6 +3476,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: response }] };
         } catch (e: any) {
           return { content: [{ type: "text", text: `Facts search failed: ${e.message || e}` }], isError: true };
+        }
+      }
+
+      case "list_temporal_facts": {
+        const body: Record<string, unknown> = {
+          user_id: USER_ID,
+          limit: (args as any).limit || 50,
+        };
+        if ((args as any).entity) body.entity = (args as any).entity;
+        if ((args as any).event) body.event = (args as any).event;
+
+        interface TemporalFactEntry {
+          entity: string;
+          event: string;
+          event_type: string;
+          timestamp: string;
+          source_memory_id: string;
+          confidence: number;
+          source_text: string;
+        }
+        interface TemporalFactsResult {
+          facts: TemporalFactEntry[];
+          total: number;
+        }
+
+        try {
+          const result = await apiCall<TemporalFactsResult>("/api/facts/temporal", "POST", body);
+          let response = `Temporal Facts (${result.facts?.length || 0} of ${result.total || 0})\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          if (result.facts?.length) {
+            for (const f of result.facts) {
+              response += `  [${f.event_type}] ${f.entity}: ${f.event}`;
+              response += ` @ ${f.timestamp}`;
+              if (f.confidence < 1.0) response += ` (${(f.confidence * 100).toFixed(0)}%)`;
+              response += `\n`;
+              response += `    source: ${f.source_memory_id}\n`;
+            }
+          } else {
+            const filters = [];
+            if ((args as any).entity) filters.push(`entity="${(args as any).entity}"`);
+            if ((args as any).event) filters.push(`event="${(args as any).event}"`);
+            const filterStr = filters.length ? ` matching ${filters.join(", ")}` : "";
+            response += `  No temporal facts found${filterStr}\n`;
+          }
+          return { content: [{ type: "text", text: response }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Temporal facts query failed: ${e.message || e}` }], isError: true };
         }
       }
 
