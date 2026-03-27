@@ -720,6 +720,7 @@ pub async fn cleanup_corrupted(
             memory_type: None,
             importance: None,
             count: Some(deleted_count),
+            entities: None,
             results: None,
         });
     }
@@ -760,6 +761,7 @@ pub async fn migrate_legacy(
             memory_type: None,
             importance: None,
             count: Some(migrated),
+            entities: None,
             results: None,
         });
     }

@@ -1829,6 +1829,7 @@ impl MultiUserMemoryManager {
                 memory_type: Some("reminder".to_string()),
                 importance: Some(task.priority as f32 / 5.0),
                 count: None,
+                entities: None,
                 results: None,
             });
 

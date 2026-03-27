@@ -2435,7 +2435,9 @@ impl MemorySystem {
             //
             // The density weights directly control the balance - no extra multipliers.
             // This follows ACT-R's additive activation model.
-            const K: f32 = 30.0;
+            // K=20 sharpens top-rank discrimination: rank-1 vs rank-5 gap is 19%
+            // (vs 12% at K=30), letting confident top results separate from noise.
+            const K: f32 = 20.0;
             let mut fused: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
             let mut heb: std::collections::HashMap<MemoryId, f32> =
@@ -2821,6 +2823,11 @@ impl MemorySystem {
         let mut storage_fetches = 0;
         let mut filtered_out = 0;
 
+        // Fetch up to rerank_pool candidates so Layer 5.5 cross-encoder can rerank
+        // before truncating to max_results. Without this, the early break at max_results
+        // would prevent the cross-encoder from ever firing (max_results == max_results).
+        let rerank_pool = 20_usize.max(query.max_results);
+
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // Recency decay: recent memories get boost, old memories decay
         // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
@@ -2982,7 +2989,7 @@ impl MemorySystem {
                 }
             }
 
-            if memories.len() >= query.max_results {
+            if memories.len() >= rerank_pool {
                 break;
             }
         }
@@ -3020,11 +3027,21 @@ impl MemorySystem {
         // not a true cross-encoder (joint encoding), but still improves precision
         // by re-scoring against the actual query rather than relying on rank fusion.
         //
-        // Blend: 70% unified score (preserves multi-signal fusion) + 30% cosine
-        // similarity (precision boost). Then truncate to max_results.
+        // Blend: base_weight% unified score + cosine_weight% cosine similarity.
+        // Query-type-aware: temporal/ordering queries get lower cosine weight because
+        // embeddings don't capture time well — BM25 keywords matter more.
+        // Single-hop/attribute queries get higher cosine weight for direct semantic match.
         if memories.len() > query.max_results {
             let rerank_start = std::time::Instant::now();
             let candidate_count = memories.len();
+
+            // Query-type-aware cosine blend weight
+            let cosine_weight = match &query_type {
+                crate::memory::query_parser::QueryType::Temporal => 0.15,
+                crate::memory::query_parser::QueryType::Attribute(_) => 0.40,
+                crate::memory::query_parser::QueryType::Exploratory => 0.30,
+            };
+            let base_weight = 1.0 - cosine_weight;
 
             // Batch-encode all candidate contents in one ONNX call (~50-80ms for 20 texts
             // vs ~400ms for 20 individual encodes). This is the critical latency optimization.
@@ -3041,7 +3058,8 @@ impl MemorySystem {
                         doc_emb,
                     );
                     let base = mem.score.unwrap_or(0.0);
-                    let blended = base * 0.70 + cosine_sim * 0.30 * base.max(0.01);
+                    let blended =
+                        base * base_weight + cosine_sim * cosine_weight * base.max(0.01);
                     let mut cloned: Memory = mem.as_ref().clone();
                     cloned.set_score(blended);
                     *mem = Arc::new(cloned);
@@ -3058,6 +3076,7 @@ impl MemorySystem {
             let rerank_elapsed = rerank_start.elapsed();
             tracing::info!(
                 candidate_count,
+                cosine_weight,
                 rerank_ms = format!("{:.2}", rerank_elapsed.as_secs_f64() * 1000.0),
                 final_count = memories.len(),
                 "recall [layer:5.5] cross-encoder reranking (batch)"
