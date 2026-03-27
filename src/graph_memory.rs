@@ -1278,7 +1278,6 @@ impl GraphMemory {
 
         // Shared block cache for multi-tenant, small local for standalone/tests.
         use rocksdb::{BlockBasedOptions, Cache};
-        let mut block_opts = BlockBasedOptions::default();
         let local_cache;
         let cache = match shared_cache {
             Some(c) => c,
@@ -1287,14 +1286,39 @@ impl GraphMemory {
                 &local_cache
             }
         };
-        block_opts.set_block_cache(cache);
-        block_opts.set_cache_index_and_filter_blocks(true);
-        opts.set_block_based_table_factory(&block_opts);
 
-        // Build column family descriptors — all CFs share the same options
+        // Base block options (no bloom filter) for CFs that primarily do prefix scans
+        let mut base_block_opts = BlockBasedOptions::default();
+        base_block_opts.set_block_cache(cache);
+        base_block_opts.set_cache_index_and_filter_blocks(true);
+        opts.set_block_based_table_factory(&base_block_opts);
+
+        // Bloom-filtered options for frequently point-queried CFs.
+        // 10 bits/key gives ~1% false positive rate, reducing disk reads
+        // on entity/relationship lookups by avoiding unnecessary SST scans.
+        let bloom_cf_set: &[&str] = &[
+            CF_ENTITIES,
+            CF_RELATIONSHIPS,
+            CF_ENTITY_EDGES,
+            CF_ENTITY_PAIR_INDEX,
+        ];
+        let mut bloom_opts = opts.clone();
+        let mut bloom_block_opts = BlockBasedOptions::default();
+        bloom_block_opts.set_bloom_filter(10.0, false);
+        bloom_block_opts.set_block_cache(cache);
+        bloom_block_opts.set_cache_index_and_filter_blocks(true);
+        bloom_opts.set_block_based_table_factory(&bloom_block_opts);
+
+        // Build column family descriptors — hot CFs get bloom filters, others use base opts
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = GRAPH_CF_NAMES
             .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, opts.clone()))
+            .map(|name| {
+                if bloom_cf_set.contains(name) {
+                    ColumnFamilyDescriptor::new(*name, bloom_opts.clone())
+                } else {
+                    ColumnFamilyDescriptor::new(*name, opts.clone())
+                }
+            })
             .collect();
 
         let db = Arc::new(DB::open_cf_descriptors(&opts, &graph_path, cf_descriptors)?);

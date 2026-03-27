@@ -131,14 +131,43 @@ pub fn apply_query_type_weights(
         }
     }
 
-    // Clamp to [0.05, 0.90] to prevent any channel from being fully zeroed out
-    semantic_w = semantic_w.clamp(0.05, 0.90);
-    graph_w = graph_w.clamp(0.05, 0.90);
-    linguistic_w = linguistic_w.clamp(0.05, 0.90);
+    // Normalize to sum to 1.0, then enforce a minimum floor of 5% per channel.
+    // If any channel is below floor after normalization, steal from the largest.
+    const FLOOR: f32 = 0.05;
+    semantic_w = semantic_w.max(0.0);
+    graph_w = graph_w.max(0.0);
+    linguistic_w = linguistic_w.max(0.0);
 
-    // Renormalize to sum to 1.0
     let total = semantic_w + graph_w + linguistic_w;
-    (semantic_w / total, graph_w / total, linguistic_w / total)
+    if total > 0.0 {
+        semantic_w /= total;
+        graph_w /= total;
+        linguistic_w /= total;
+    }
+
+    // Enforce floor: redistribute deficit from the largest channel
+    let mut weights = [semantic_w, graph_w, linguistic_w];
+    for _ in 0..3 {
+        let mut deficit = 0.0_f32;
+        for w in weights.iter_mut() {
+            if *w < FLOOR {
+                deficit += FLOOR - *w;
+                *w = FLOOR;
+            }
+        }
+        if deficit > 0.0 {
+            // Find largest channel and subtract deficit
+            let max_idx = weights
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            weights[max_idx] = (weights[max_idx] - deficit).max(FLOOR);
+        }
+    }
+
+    (weights[0], weights[1], weights[2])
 }
 
 /// Calculate importance-weighted decay for spreading activation (SHO-26)
