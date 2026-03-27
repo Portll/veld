@@ -3803,6 +3803,182 @@ pub fn infer_ontological_intent(query_text: &str, analysis: &QueryAnalysis) -> O
     }
 }
 
+// ============================================================================
+// QUERY DECOMPOSITION
+// ============================================================================
+// Splits compound/multi-entity queries into sub-queries for independent
+// vector retrieval. BM25 and graph traversal handle compound queries well
+// naturally, so decomposition only applies to the vector search path.
+//
+// Reference: Khattab et al. (2021) "Baleen: Robust Multi-Hop Reasoning"
+// Key insight: A single embedding of "When did we switch from PostgreSQL to
+// MongoDB?" dilutes signal for both PostgreSQL and MongoDB. Decomposing into
+// per-entity sub-queries recovers the individual signals.
+
+/// Decompose compound queries into sub-queries for independent retrieval.
+///
+/// Returns a vec containing only the original query if no decomposition is
+/// needed (simple/single-entity queries). When decomposition fires, the
+/// original query is always included as the first element.
+///
+/// Decomposition rules (applied in priority order):
+/// 1. Conjunction split: "X AND Y" or "X and also Y" or "X as well as Y"
+/// 2. Multi-entity relationship: 2+ focal entities with relationship verbs
+/// 3. Compound temporal: temporal reference + entity in the same query
+///
+/// Sub-queries are capped at [`QUERY_DECOMPOSITION_MAX_SUBQUERIES`].
+pub fn decompose_query(query: &str, analysis: &QueryAnalysis) -> Vec<String> {
+    use crate::constants::QUERY_DECOMPOSITION_MAX_SUBQUERIES;
+
+    let query_trimmed = query.trim();
+    if query_trimmed.is_empty() {
+        return vec![query_trimmed.to_string()];
+    }
+
+    // Rule 1: Conjunction split
+    // "Why did we change the database AND what was the impact on the timeline?"
+    // → ["Why did we change the database?", "What was the impact on the timeline?"]
+    if let Some(parts) = split_on_conjunction(query_trimmed) {
+        let mut sub_queries = vec![query_trimmed.to_string()];
+        for part in parts {
+            let cleaned = clean_sub_query(&part);
+            if !cleaned.is_empty() && cleaned.len() >= 5 {
+                sub_queries.push(cleaned);
+            }
+        }
+        if sub_queries.len() > 1 {
+            sub_queries.truncate(1 + QUERY_DECOMPOSITION_MAX_SUBQUERIES);
+            tracing::debug!(
+                "Query decomposition [conjunction]: {} → {} sub-queries",
+                query_trimmed,
+                sub_queries.len() - 1
+            );
+            return sub_queries;
+        }
+    }
+
+    // Rule 2: Multi-entity relationship queries
+    // "When did we switch from PostgreSQL to MongoDB?"
+    // → ["PostgreSQL", "MongoDB", "When did we switch from PostgreSQL to MongoDB?"]
+    if analysis.focal_entities.len() >= 2 && has_relationship_signal(query_trimmed) {
+        let mut sub_queries = vec![query_trimmed.to_string()];
+        for entity in &analysis.focal_entities {
+            // Skip stop-word-like short entities that aren't meaningful on their own
+            if entity.text.len() < 3 {
+                continue;
+            }
+            sub_queries.push(entity.text.clone());
+        }
+        if sub_queries.len() > 1 {
+            sub_queries.truncate(1 + QUERY_DECOMPOSITION_MAX_SUBQUERIES);
+            tracing::debug!(
+                "Query decomposition [multi-entity]: {} → {} sub-queries",
+                query_trimmed,
+                sub_queries.len() - 1
+            );
+            return sub_queries;
+        }
+    }
+
+    // Rule 3: Compound temporal — query has both a temporal reference AND focal entities
+    // "What did Melanie do last Tuesday?" → ["Melanie", "What did Melanie do last Tuesday?"]
+    // Only fires when there are distinct entity + temporal signals worth separating.
+    let temporal_intent = detect_temporal_intent(query_trimmed);
+    let has_temporal = !matches!(temporal_intent, TemporalIntent::None);
+    if has_temporal && !analysis.focal_entities.is_empty() {
+        // Build an entity-only sub-query from all focal entities
+        let entity_names: Vec<&str> = analysis
+            .focal_entities
+            .iter()
+            .filter(|e| e.text.len() >= 3)
+            .map(|e| e.text.as_str())
+            .collect();
+
+        if !entity_names.is_empty() {
+            let entity_sub = entity_names.join(" ");
+            // Only decompose if entity sub-query is meaningfully different from original
+            if entity_sub.len() < query_trimmed.len() / 2 {
+                let mut sub_queries = vec![query_trimmed.to_string(), entity_sub];
+                sub_queries.truncate(1 + QUERY_DECOMPOSITION_MAX_SUBQUERIES);
+                tracing::debug!(
+                    "Query decomposition [temporal+entity]: {} → {} sub-queries",
+                    query_trimmed,
+                    sub_queries.len() - 1
+                );
+                return sub_queries;
+            }
+        }
+    }
+
+    // No decomposition needed
+    vec![query_trimmed.to_string()]
+}
+
+/// Split a query on conjunction markers (" AND ", " and also ", " as well as ").
+/// Returns None if no conjunction is found, or the split parts otherwise.
+fn split_on_conjunction(query: &str) -> Option<Vec<String>> {
+    // Order matters: try longer patterns first to avoid partial matches
+    let conjunctions = [" and also ", " as well as ", " AND "];
+
+    for conj in &conjunctions {
+        // Case-insensitive search for "and also" and "as well as"
+        let query_lower = query.to_lowercase();
+        if let Some(pos) = query_lower.find(&conj.to_lowercase()) {
+            let left = query[..pos].trim().to_string();
+            let right = query[pos + conj.len()..].trim().to_string();
+            if !left.is_empty() && !right.is_empty() {
+                return Some(vec![left, right]);
+            }
+        }
+    }
+
+    None
+}
+
+/// Detect relationship signals in a query that indicate multi-entity comparison/transition.
+/// These patterns suggest the query is asking about the relationship between entities,
+/// not just mentioning them independently.
+fn has_relationship_signal(query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+
+    let relationship_patterns = [
+        "from ", " to ",   // "switch from X to Y"
+        "between ",        // "between X and Y"
+        "switch",          // "switch from X to Y"
+        "change",          // "changed from X to Y"
+        "compare",         // "compare X and Y"
+        "replace",         // "replaced X with Y"
+        "migrat",          // "migrate/migration from X to Y"
+        "convert",         // "converted from X to Y"
+        "transition",      // "transition from X to Y"
+        "moved from",      // "moved from X to Y"
+        "versus", " vs ",  // "X versus Y"
+        "differ",          // "difference between X and Y"
+    ];
+
+    // Require at least one relationship pattern
+    relationship_patterns
+        .iter()
+        .any(|p| query_lower.contains(p))
+}
+
+/// Clean a sub-query part: trim whitespace, remove trailing punctuation,
+/// ensure it reads as a complete question/phrase.
+fn clean_sub_query(part: &str) -> String {
+    let trimmed = part.trim();
+    // Remove leading/trailing question marks and periods
+    let cleaned = trimmed
+        .trim_end_matches('?')
+        .trim_end_matches('.')
+        .trim_end_matches(',')
+        .trim_start_matches(',')
+        .trim();
+
+    // If the part starts with a lowercase word and looks like a continuation,
+    // keep it as-is — the vector search embedding handles fragments well.
+    cleaned.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4066,5 +4242,74 @@ mod tests {
             "Should detect 'support group' as phrase. Found: {:?}",
             phrases
         );
+    }
+
+    // =====================================================================
+    // QUERY DECOMPOSITION TESTS
+    // =====================================================================
+
+    #[test]
+    fn test_decompose_conjunction_and() {
+        let query = "Why did we change the database AND what was the impact on the timeline?";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        assert!(subs.len() >= 3, "Should produce original + 2 parts, got {:?}", subs);
+        assert_eq!(subs[0], query); // original always first
+    }
+
+    #[test]
+    fn test_decompose_conjunction_and_also() {
+        let query = "What framework did we pick and also what ORM are we using?";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        assert!(subs.len() >= 3, "Should split on 'and also', got {:?}", subs);
+    }
+
+    #[test]
+    fn test_decompose_multi_entity_switch() {
+        let query = "When did we switch from PostgreSQL to MongoDB?";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        // Should produce original + entity sub-queries
+        assert!(subs.len() >= 2, "Should decompose multi-entity query, got {:?}", subs);
+        assert_eq!(subs[0], query);
+    }
+
+    #[test]
+    fn test_decompose_simple_no_split() {
+        let query = "What programming language did we choose?";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        assert_eq!(subs.len(), 1, "Simple query should not decompose: {:?}", subs);
+        assert_eq!(subs[0], query);
+    }
+
+    #[test]
+    fn test_decompose_cap_max_subqueries() {
+        // Even with many conjunctions, should cap at MAX_SUBQUERIES + 1 (original)
+        let query = "A AND B AND C AND D AND E AND F";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        assert!(
+            subs.len() <= crate::constants::QUERY_DECOMPOSITION_MAX_SUBQUERIES + 1,
+            "Should cap at max sub-queries + 1, got {}",
+            subs.len()
+        );
+    }
+
+    #[test]
+    fn test_decompose_empty_query() {
+        let query = "";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[test]
+    fn test_decompose_multi_entity_compare() {
+        let query = "Compare the performance of React versus Vue";
+        let analysis = analyze_query(query);
+        let subs = decompose_query(query, &analysis);
+        assert!(subs.len() >= 2, "Should decompose comparison query, got {:?}", subs);
     }
 }
