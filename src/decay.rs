@@ -48,7 +48,8 @@
 //! - Anderson & Schooler (1991) "Reflections of the Environment in Memory"
 
 use crate::constants::{
-    DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION, POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
+    ANCHOR_IMPORTANCE_FLOOR, DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION, POWERLAW_BETA,
+    POWERLAW_BETA_POTENTIATED,
 };
 
 /// Calculates the hybrid decay factor for a given elapsed time.
@@ -240,6 +241,27 @@ pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, ltp_decay_factor: f32) ->
     (decay_factor.max(0.001), should_prune)
 }
 
+/// Apply hybrid decay to an importance value, respecting anchor status.
+///
+/// Anchored memories cannot decay below `ANCHOR_IMPORTANCE_FLOOR`.
+/// This provides a floor that prevents critical user-marked facts from
+/// fading into irrelevance while still allowing normal ranking dynamics.
+#[inline]
+pub fn apply_decay_with_anchor(
+    current_importance: f32,
+    days_elapsed: f64,
+    potentiated: bool,
+    anchored: bool,
+) -> f32 {
+    let decay_factor = hybrid_decay_factor(days_elapsed, potentiated);
+    let decayed = current_importance * decay_factor;
+    if anchored {
+        decayed.max(ANCHOR_IMPORTANCE_FLOOR)
+    } else {
+        decayed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +384,24 @@ mod tests {
         let (invalid_tier, _) = tier_decay_factor(24.0, 9, 1.0);
         let (l3, _) = tier_decay_factor(24.0, 2, 1.0);
         assert_eq!(invalid_tier, l3);
+    }
+
+    #[test]
+    fn test_anchored_memory_floor() {
+        // Anchored memory should not decay below ANCHOR_IMPORTANCE_FLOOR
+        let result = apply_decay_with_anchor(0.8, 365.0, false, true);
+        assert!(result >= ANCHOR_IMPORTANCE_FLOOR);
+
+        // Non-anchored memory can decay freely
+        let result_unanchored = apply_decay_with_anchor(0.8, 365.0, false, false);
+        assert!(result_unanchored < ANCHOR_IMPORTANCE_FLOOR);
+    }
+
+    #[test]
+    fn test_anchored_memory_still_decays_above_floor() {
+        // Anchored memory should still decay when above the floor
+        let result = apply_decay_with_anchor(0.9, 7.0, false, true);
+        assert!(result < 0.9); // Some decay happened
+        assert!(result >= ANCHOR_IMPORTANCE_FLOOR); // But floored
     }
 }

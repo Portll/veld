@@ -453,16 +453,32 @@ pub async fn remember(
 
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
+            // Fast path: persist + BM25 only (~10ms), embedding deferred to background
             if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent(exp_clone, created_at, agent_id, run_id)
+                memory_guard.remember_with_agent_deferred(
+                    exp_clone, created_at, agent_id, run_id,
+                )
             } else {
-                memory_guard.remember(exp_clone, created_at)
+                memory_guard.remember_deferred(exp_clone, created_at)
             }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         .map_err(AppError::Internal)?
     };
+
+    // Background: complete embedding + vector indexing.
+    // The memory is already searchable via BM25; vector search follows in ~150ms.
+    {
+        let memory_for_bg = memory.clone();
+        let mid = memory_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = memory_for_bg.read();
+            if let Err(e) = guard.embed_and_index(&mid) {
+                tracing::warn!(memory_id = %mid.0, "Background embed_and_index failed: {e}");
+            }
+        });
+    }
 
     // Record metrics + session + broadcast BEFORE returning response (fast, <1ms)
     let duration = op_start.elapsed().as_secs_f64();

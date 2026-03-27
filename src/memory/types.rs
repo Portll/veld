@@ -858,6 +858,11 @@ pub struct MemoryMetadata {
     /// Decays over time, boosted by access and co-activation
     /// Range: 0.0 (dormant) to 1.0 (highly active)
     pub activation: f32,
+    /// Anchored memories resist decay — importance cannot fall below ANCHOR_IMPORTANCE_FLOOR.
+    /// Set via the `/api/anchor` endpoint or `anchor` MCP tool.
+    /// Anchored memories also skip compression.
+    #[serde(default)]
+    pub anchored: bool,
 }
 
 impl MemoryMetadata {
@@ -1053,6 +1058,7 @@ impl Memory {
                 last_accessed: now,
                 temporal_relevance: 1.0,
                 activation: 1.0, // Start fully activated (just created)
+                anchored: false,
             })),
             created_at: now,
             compressed: false,
@@ -1129,6 +1135,7 @@ impl Memory {
                 last_accessed,
                 temporal_relevance,
                 activation,
+                anchored: false,
             })),
             created_at,
             compressed,
@@ -1644,6 +1651,7 @@ impl<'de> Deserialize<'de> for Memory {
                 last_accessed: flat.last_accessed,
                 temporal_relevance: flat.temporal_relevance,
                 activation: flat.activation,
+                anchored: false,
             })),
             created_at: flat.created_at,
             compressed: flat.compressed,

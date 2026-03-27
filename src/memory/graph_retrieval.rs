@@ -98,6 +98,49 @@ pub fn calculate_density_weights(graph_density: f32) -> (f32, f32, f32) {
     (semantic_weight, graph_weight, linguistic_weight)
 }
 
+/// Apply query-type modulation to density-based RRF weights (Plan 001 §2.2)
+///
+/// Rationale: different query types benefit from different retrieval channels.
+/// - Temporal queries: BM25/linguistic weight↑ (keywords like "week"/"yesterday" are strong signals)
+/// - Attribute queries: graph weight↑ (entity traversal finds attribute-bearing memories)
+/// - Exploratory queries: keep density-based defaults (semantic similarity works best)
+///
+/// The shift is additive (±0.10) and renormalized to sum to 1.0, preserving the
+/// density-based baseline while tilting toward the query-relevant channel.
+pub fn apply_query_type_weights(
+    base: (f32, f32, f32),
+    query_type: &crate::memory::query_parser::QueryType,
+) -> (f32, f32, f32) {
+    let (mut semantic_w, mut graph_w, mut linguistic_w) = base;
+
+    match query_type {
+        crate::memory::query_parser::QueryType::Temporal => {
+            // Temporal queries: boost linguistic (BM25 catches temporal keywords),
+            // slight semantic boost (temporal embeddings are weak but non-zero)
+            linguistic_w += 0.10;
+            semantic_w += 0.02;
+            graph_w -= 0.12;
+        }
+        crate::memory::query_parser::QueryType::Attribute(_) => {
+            // Attribute queries: boost graph (entity traversal finds attribute memories)
+            graph_w += 0.10;
+            semantic_w -= 0.10;
+        }
+        crate::memory::query_parser::QueryType::Exploratory => {
+            // Exploratory: density-based defaults are already semantic-favoring, no shift
+        }
+    }
+
+    // Clamp to [0.05, 0.90] to prevent any channel from being fully zeroed out
+    semantic_w = semantic_w.clamp(0.05, 0.90);
+    graph_w = graph_w.clamp(0.05, 0.90);
+    linguistic_w = linguistic_w.clamp(0.05, 0.90);
+
+    // Renormalize to sum to 1.0
+    let total = semantic_w + graph_w + linguistic_w;
+    (semantic_w / total, graph_w / total, linguistic_w / total)
+}
+
 /// Calculate importance-weighted decay for spreading activation (SHO-26)
 ///
 /// Important memories (decisions, learnings) decay slower to preserve signal.
@@ -1416,5 +1459,65 @@ mod tests {
         // Should be less than typical initial activation
         // (IC_NOUN * (1 + SALIENCE_BOOST_FACTOR) = 2.3 * 2 = 4.6 max)
         assert!(min_threshold < 1.0);
+    }
+
+    // =========================================================================
+    // Query-type weight modulation tests (Plan 001 §2.2)
+    // =========================================================================
+
+    #[test]
+    fn test_query_type_weights_temporal_boosts_linguistic() {
+        let base = (0.5, 0.35, 0.15); // semantic, graph, linguistic
+        let (s, g, l) =
+            apply_query_type_weights(base, &crate::memory::query_parser::QueryType::Temporal);
+        // Linguistic should increase, graph should decrease
+        assert!(l > 0.15, "Temporal should boost linguistic: got {l}");
+        assert!(g < 0.35, "Temporal should reduce graph: got {g}");
+        // Weights must sum to 1.0
+        assert!(((s + g + l) - 1.0).abs() < 0.001, "Weights must sum to 1.0");
+    }
+
+    #[test]
+    fn test_query_type_weights_attribute_boosts_graph() {
+        let base = (0.5, 0.35, 0.15);
+        let attr = crate::memory::query_parser::AttributeQuery {
+            entity: "Alice".to_string(),
+            attribute: "age".to_string(),
+            attribute_synonyms: vec![],
+            original_query: "How old is Alice?".to_string(),
+        };
+        let (s, g, l) = apply_query_type_weights(
+            base,
+            &crate::memory::query_parser::QueryType::Attribute(attr),
+        );
+        // Graph should increase, semantic should decrease
+        assert!(g > 0.35, "Attribute should boost graph: got {g}");
+        assert!(s < 0.5, "Attribute should reduce semantic: got {s}");
+        assert!(((s + g + l) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_query_type_weights_exploratory_unchanged() {
+        let base = (0.5, 0.35, 0.15);
+        let (s, g, l) =
+            apply_query_type_weights(base, &crate::memory::query_parser::QueryType::Exploratory);
+        // Should be unchanged after renormalization
+        assert!(((s + g + l) - 1.0).abs() < 0.001);
+        // Proportions should be preserved (no shift applied)
+        assert!((s - 0.5).abs() < 0.01);
+        assert!((g - 0.35).abs() < 0.01);
+        assert!((l - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_query_type_weights_no_channel_zeroed() {
+        // Even with extreme base weights, no channel should go below 0.05
+        let extreme = (0.9, 0.05, 0.05);
+        let (s, g, l) =
+            apply_query_type_weights(extreme, &crate::memory::query_parser::QueryType::Temporal);
+        assert!(s >= 0.05, "Semantic should not go below floor: got {s}");
+        assert!(g >= 0.05, "Graph should not go below floor: got {g}");
+        assert!(l >= 0.05, "Linguistic should not go below floor: got {l}");
+        assert!(((s + g + l) - 1.0).abs() < 0.001);
     }
 }
