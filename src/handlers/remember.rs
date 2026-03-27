@@ -62,6 +62,11 @@ pub struct RememberRequest {
     /// Use this to create memory trees (e.g., "71-research" -> "algebraic" -> "21×27≡-1")
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Optional filename for format detection (e.g. "notes.md", "data.json").
+    /// When provided, the content is run through the ingest text-extraction
+    /// pipeline before storage.
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// Remember response
@@ -300,14 +305,41 @@ pub async fn remember(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.content, false).map_validation_err("content")?;
 
+    // ── Ingest pipeline: extract clean text from structured formats ──────
+    let (processed_content, ingest_tags) = if req.filename.is_some() || {
+        // Auto-detect non-plaintext content even without filename
+        let fmt = crate::ingest::detect_format(None, &req.content);
+        fmt != crate::ingest::InputFormat::PlainText
+    } {
+        let format =
+            crate::ingest::detect_format(req.filename.as_deref(), &req.content);
+        if format != crate::ingest::InputFormat::PlainText {
+            match crate::ingest::extract_text(&req.content, format) {
+                Ok(extracted) => {
+                    let mut tags = extracted.metadata.entities_hint;
+                    tags.push(format!("format:{}", extracted.metadata.format));
+                    (extracted.text, tags)
+                }
+                Err(e) => {
+                    tracing::debug!("Ingest extraction failed, using raw content: {}", e);
+                    (req.content.clone(), vec![])
+                }
+            }
+        } else {
+            (req.content.clone(), vec![])
+        }
+    } else {
+        (req.content.clone(), vec![])
+    };
+
     let experience_type = parse_experience_type(req.memory_type.as_ref());
 
     // PERF: Run NER and YAKE extraction in parallel using spawn_blocking
     // Both are CPU-bound and independent - parallelization reduces latency by ~40%
     let ner = state.get_neural_ner();
     let yake = state.get_keyword_extractor();
-    let content_for_ner = req.content.clone();
-    let content_for_yake = req.content.clone();
+    let content_for_ner = processed_content.clone();
+    let content_for_yake = processed_content.clone();
 
     let (ner_result, yake_result) = tokio::join!(
         // NER extraction (named entities: Person, Org, Location, Misc)
@@ -360,6 +392,12 @@ pub async fn remember(
 
     let mut merged_entities: Vec<String> = req.tags.clone();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
+    // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
+    for tag in &ingest_tags {
+        if seen.insert(tag.to_lowercase()) {
+            merged_entities.push(tag.clone());
+        }
+    }
     for record in &ner_entities {
         if seen.insert(record.text.to_lowercase()) {
             merged_entities.push(record.text.clone());
@@ -393,7 +431,7 @@ pub async fn remember(
     );
 
     let experience = Experience {
-        content: req.content.clone(),
+        content: processed_content.clone(),
         experience_type,
         entities: merged_entities.clone(),
         tags: merged_entities,
