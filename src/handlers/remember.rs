@@ -684,6 +684,23 @@ pub async fn remember(
                     tracing::debug!("Lineage inference panicked (non-fatal): {e}");
                 }
             }
+
+            // Task 5: Conflict detection — detect contradictions with existing memories (A3)
+            {
+                let state = state.clone();
+                let memory_arc = memory.clone();
+                let uid = user_id.clone();
+                let mid = memory_id.clone();
+
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    detect_and_resolve_conflicts(&state, &memory_arc, &uid, &mid)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Conflict detection panicked: {e}")))
+                {
+                    tracing::debug!("Conflict detection failed (non-fatal): {}", e);
+                }
+            }
         });
     }
 
@@ -691,6 +708,158 @@ pub async fn remember(
         id: response_id,
         success: true,
     }))
+}
+
+/// Detect and resolve contradictions between a new memory and existing memories (A3)
+///
+/// For each focal entity in the new memory, queries the graph for other memories
+/// sharing that entity. If a candidate has high cosine similarity AND contains
+/// a semantic contradiction, creates a SupersededBy edge and decays the old
+/// memory's importance.
+///
+/// Reference: Bai et al. (2026) §4.2.3 — H-MEM weight regulation, WISE side-memory
+fn detect_and_resolve_conflicts(
+    state: &AppState,
+    memory_arc: &std::sync::Arc<parking_lot::RwLock<crate::memory::MemorySystem>>,
+    user_id: &str,
+    new_memory_id: &crate::memory::MemoryId,
+) -> anyhow::Result<()> {
+    use crate::constants::{
+        CONFLICT_COSINE_THRESHOLD, CONFLICT_IMPORTANCE_DECAY, CONFLICT_MAX_CANDIDATES,
+        CONFLICT_MAX_FOCAL_ENTITIES,
+    };
+    use crate::memory::temporal_facts::{detect_semantic_opposition, text_similarity};
+    use crate::similarity::cosine_similarity;
+
+    let memory_guard = memory_arc.read();
+    let new_memory = memory_guard.get_memory(new_memory_id)?;
+
+    let new_embedding = match &new_memory.experience.embeddings {
+        Some(emb) => emb.clone(),
+        None => return Ok(()), // No embedding yet — skip conflict detection
+    };
+
+    let graph_arc = match state.get_user_graph(user_id) {
+        Ok(g) => g,
+        Err(_) => return Ok(()),
+    };
+    let graph = graph_arc.read();
+
+    // Get entity UUIDs from the new memory's entity_refs
+    let focal_entities: Vec<uuid::Uuid> = new_memory
+        .entity_refs
+        .iter()
+        .take(CONFLICT_MAX_FOCAL_ENTITIES)
+        .map(|e| e.entity_id)
+        .collect();
+
+    if focal_entities.is_empty() {
+        return Ok(());
+    }
+
+    // Collect candidate memory IDs from graph episodes sharing focal entities
+    let mut candidate_ids = std::collections::HashSet::new();
+    for entity_uuid in &focal_entities {
+        if let Ok(episodes) = graph.get_episodes_by_entity(entity_uuid) {
+            for ep in episodes.iter().take(CONFLICT_MAX_CANDIDATES) {
+                let mid = crate::memory::MemoryId(ep.uuid);
+                if mid != *new_memory_id {
+                    candidate_ids.insert(mid);
+                }
+            }
+        }
+    }
+
+    if candidate_ids.is_empty() {
+        return Ok(());
+    }
+
+    let new_content = &new_memory.experience.content;
+    let mut conflicts_resolved = 0usize;
+
+    for candidate_id in candidate_ids.iter().take(CONFLICT_MAX_CANDIDATES) {
+        let candidate = match memory_guard.get_memory(candidate_id) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Check cosine similarity — only high-overlap memories can contradict
+        let candidate_embedding = match &candidate.experience.embeddings {
+            Some(emb) => emb,
+            None => continue,
+        };
+
+        let sim = cosine_similarity(&new_embedding, candidate_embedding);
+        if sim < CONFLICT_COSINE_THRESHOLD {
+            continue;
+        }
+
+        // Check for text-level similarity + semantic opposition
+        let text_sim = text_similarity(new_content, &candidate.experience.content);
+        if text_sim < 0.5 {
+            continue; // Not similar enough at text level to be contradictory
+        }
+
+        if !detect_semantic_opposition(new_content, &candidate.experience.content) {
+            continue;
+        }
+
+        // Contradiction detected — create SupersededBy edge and decay old importance
+        tracing::info!(
+            user_id = %user_id,
+            new_memory = %new_memory_id.0,
+            old_memory = %candidate_id.0,
+            cosine = format!("{:.3}", sim),
+            "Conflict detected: creating SupersededBy edge"
+        );
+
+        // Decay old memory importance and persist
+        let old_importance = candidate.importance();
+        candidate.set_importance(old_importance * CONFLICT_IMPORTANCE_DECAY);
+        memory_guard.update_memory(&candidate)?;
+
+        // Create SupersededBy edge in graph
+        let now = chrono::Utc::now();
+        // Find entity pairs to link
+        let old_entities: Vec<uuid::Uuid> = candidate.entity_refs.iter().map(|e| e.entity_id).collect();
+        if let (Some(&new_ent), Some(&old_ent)) = (focal_entities.first(), old_entities.first()) {
+            let edge = crate::graph_memory::RelationshipEdge {
+                uuid: uuid::Uuid::new_v4(),
+                from_entity: new_ent,
+                to_entity: old_ent,
+                relation_type: crate::graph_memory::RelationType::SupersededBy,
+                strength: sim, // Use similarity as edge strength
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: Some(new_memory_id.0),
+                context: format!(
+                    "conflict-resolution: cosine={:.3}, text_sim={:.3}",
+                    sim, text_sim
+                ),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: Default::default(),
+                tier: Default::default(),
+                activation_timestamps: None,
+                entity_confidence: None,
+            };
+            let _ = graph.add_relationship(edge);
+        }
+
+        conflicts_resolved += 1;
+    }
+
+    if conflicts_resolved > 0 {
+        tracing::info!(
+            user_id = %user_id,
+            memory_id = %new_memory_id.0,
+            conflicts_resolved,
+            "Conflict detection complete"
+        );
+    }
+
+    Ok(())
 }
 
 /// Batch remember - store multiple memories at once

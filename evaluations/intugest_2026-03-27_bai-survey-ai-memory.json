@@ -1,0 +1,304 @@
+{
+  "meta": {
+    "type": "intugest",
+    "date": "2026-03-27",
+    "source_url": "https://github.com/BAI-LAB/Survey-on-AI-Memory",
+    "source_title": "Survey on AI Memory: Theories, Taxonomies, Evaluations, and Emerging Trends",
+    "authors": "Bai et al. (Baijia AI, BUPT, Huawei)",
+    "pages": 44,
+    "references": 202,
+    "target_project": "shodh-memory"
+  },
+  "extracted_concepts": [
+    {
+      "id": "C1",
+      "name": "4W Memory Taxonomy",
+      "section": "§3",
+      "description": "Classify memory on 4 orthogonal axes: When (lifecycle: transient/session/persistent), What (type: procedural/declarative/metacognitive/personalized), How (storage: implicit/explicit), Which (modality: single/multimodal)"
+    },
+    {
+      "id": "C2",
+      "name": "CLS Dual-Structure Consolidation",
+      "section": "§2.1.3",
+      "description": "Complementary Learning Systems: hippocampus (fast episodic capture) + neocortex (slow semantic consolidation) with sleep-phase replay bridging them. Key insight: separate rapid acquisition from gradual integration."
+    },
+    {
+      "id": "C3",
+      "name": "Metacognitive Memory Type",
+      "section": "§3.2.3",
+      "description": "Distinct memory category for self-reflection, capability assessment, strategy feedback. Systems: Reflexion (task feedback summaries), Memento (auto-analyze behaviors, extract improvement suggestions), LightSearcher (self-cognitive experience module)."
+    },
+    {
+      "id": "C4",
+      "name": "Heat-Score Consolidation Trigger",
+      "section": "§4.2.3",
+      "description": "MemoryOS Heat Score: composite of access_frequency × interaction_depth × time_decay. When score exceeds threshold, system invokes LLM to extract user traits and factual knowledge, promoting to Long-Term Personal Memory."
+    },
+    {
+      "id": "C5",
+      "name": "Hierarchical Abstract-to-Detail Routing",
+      "section": "§4.2.2",
+      "description": "H-MEM: 4-level semantic abstraction with index-based routing. Locate macro intent at abstract level first, then drill down to detailed memories. Avoids exhaustive similarity computation across entire store."
+    },
+    {
+      "id": "C6",
+      "name": "Goal-Aware Retrieval",
+      "section": "§8.2.2",
+      "description": "Transform retrieval from fixed similarity lookups to dynamic evaluation that prioritizes memories which best reduce task uncertainty. Frame memory maintenance as a sequential decision problem, not pattern matching."
+    },
+    {
+      "id": "C7",
+      "name": "Corrective Memory Updates / Conflict Detection",
+      "section": "§4.2.3",
+      "description": "H-MEM: dynamic weight regulation combining forgetting curves with user feedback. WISE: dual-parametric side-memory scheme isolating corrections from pre-trained knowledge. Detect contradictions, update rather than accumulate."
+    },
+    {
+      "id": "C8",
+      "name": "Predict-Calibrate Cycle",
+      "section": "§4.1.3",
+      "description": "Nemori: proactively evolve knowledge base by predicting outcomes from internal forecasts, comparing with actual interactions, and distilling insights from discrepancies. Converts passive storage into active hypothesis testing."
+    },
+    {
+      "id": "C9",
+      "name": "MemoryField Gravitational Fusion",
+      "section": "§4.2.3",
+      "description": "Treat memories as dynamic nodes in a gravitational field. Semantically similar and spatially close nodes merge via fusion mechanism, reducing redundancy. Higher-density representations replace clusters of overlapping memories."
+    },
+    {
+      "id": "C10",
+      "name": "Sleep-Time Offline Consolidation",
+      "section": "§4.2.3",
+      "description": "LightMem: cognition-inspired sleep-time consolidation. Scheduled offline phase: reorganize, deduplicate, and abstract long-term memory entries without impacting online query performance."
+    },
+    {
+      "id": "C11",
+      "name": "Dynamic Evaluation Metrics",
+      "section": "§6.3.3",
+      "description": "Current benchmarks evaluate at discrete time points. Need metrics tracking evolutionary trajectory of memory states — how retrieval quality, consolidation effectiveness, and knowledge coverage change over time. Analogous to clinical vital-sign tracking."
+    },
+    {
+      "id": "C12",
+      "name": "Personalized Memory as Distinct Type",
+      "section": "§3.2.4",
+      "description": "User models, preference drift, relationship tracking as a first-class memory category. Mem0 maintains preferences; MemoryBank adapts to evolving user profiles. Requires balancing personalization with privacy."
+    },
+    {
+      "id": "C13",
+      "name": "PBFT-Backed Semantic Voting",
+      "section": "§8.2.3",
+      "description": "Multi-agent consensus protocol for collaborative forgetting. Agents vote (adapted PBFT) to prune low-utility data from collective store. Ensures shared memory remains accurate and compact through autonomous optimization layer."
+    },
+    {
+      "id": "C14",
+      "name": "Experience Distillation to Executable Templates",
+      "section": "§4.3.1",
+      "description": "Voyager: builds expanding executable skill library from episodic traces. LightSearcher: distills successful reasoning trajectories into reusable patterns. Transform raw episodes into structured, replayable action sequences."
+    },
+    {
+      "id": "C15",
+      "name": "Kendall's τ for Temporal Perception",
+      "section": "§6.1.3",
+      "description": "Rank correlation metric between predicted and ground-truth event timelines. Used to evaluate temporal reasoning quality — can the system reconstruct event sequences and track state changes from unstructured text?"
+    }
+  ],
+  "bifocal_pass": {
+    "edge_walk": [
+      {
+        "edge": "Query Parser → Retrieval Scoring",
+        "concept": "C6",
+        "current_boundary": "query_parser.rs::analyze_query() → QueryAnalysis with IC weights + OntologicalIntent → graph_retrieval.rs scoring",
+        "gap": "No task-goal signal. System treats information-seeking and decision-support queries identically.",
+        "data_crossing": "Session context (task type, tool invocations) → goal classification → retrieval weight modulation",
+        "failure_mode": "Mis-inferred goals suppress correct results; needs confidence threshold + fallback"
+      },
+      {
+        "edge": "Memory Ingestion → Memory Store",
+        "concept": "C7",
+        "current_boundary": "handlers/crud.rs::remember() → storage.rs::upsert() directly",
+        "gap": "No contradiction check between new and existing entity-scoped memories",
+        "data_crossing": "New memory embedding + entities → entity-scoped search → contradiction classifier → supersession link",
+        "failure_mode": "False-positive contradiction on compatible but nuanced statements"
+      },
+      {
+        "edge": "Consolidation ← Access Patterns",
+        "concept": "C4",
+        "current_boundary": "consolidation.rs::consolidate_memories() gated by CONSOLIDATION_MIN_AGE_DAYS=7",
+        "gap": "No continuous heat scoring. Frequently-accessed young memories cannot be fast-tracked.",
+        "data_crossing": "access_count + context richness + recency → heat_score → auto-trigger threshold",
+        "failure_mode": "Aggressive heat-triggered consolidation over-abstracts useful episodic details"
+      },
+      {
+        "edge": "Recall Results → System Self-Model",
+        "concept": "C3 + C8",
+        "current_boundary": "feedback.rs::process_implicit_feedback() adjusts per-memory importance only",
+        "gap": "No system-level capability assessment. No tracking of what query types struggle.",
+        "data_crossing": "Per-query quality signals → aggregated quality-by-domain → gap detection → consolidation priorities",
+        "failure_mode": "Noisy quality signals waste consolidation cycles on already-good areas"
+      }
+    ],
+    "fractal_analysis": {
+      "consistent_patterns": [
+        {
+          "pattern": "Tiered Promotion",
+          "scales": ["Memory (L1→L2→L3→L4)", "Edge (Working→Episodic→Semantic)", "LTP (None→Burst→Weekly→Full)"],
+          "status": "well-formed"
+        }
+      ],
+      "fractal_breaks": [
+        {
+          "name": "ExperienceType is flat, survey demands hierarchy",
+          "description": "14 ExperienceType variants treated as flat set. Survey's 4W 'What' dimension groups into Procedural/Declarative/Metacognitive/Personalized. Compression.rs applies same pipeline to CodeEdit (procedural) and Conversation (declarative). Consolidation strategy should bifurcate by content category.",
+          "severity": "high"
+        },
+        {
+          "name": "No self-monitoring at any granularity",
+          "description": "Coordinated fractal absence: no tracking of memory usefulness (memory level), no retrieval failure patterns (graph level), no quality evolution metrics (system level). System cannot observe its own performance at any scale.",
+          "severity": "critical"
+        }
+      ]
+    }
+  },
+  "overlook_pass": {
+    "dimension_shifts": [
+      {"dimension": "Session Novelty", "index": 2, "before": 0.30, "after": 0.85, "delta": 0.55},
+      {"dimension": "Paradigm Stability", "index": 3, "before": 0.75, "after": 0.60, "delta": -0.15},
+      {"dimension": "Architecture Coverage", "index": 5, "before": 0.80, "after": 0.70, "delta": -0.10},
+      {"dimension": "Retrieval Quality", "index": 7, "before": 0.85, "after": 0.80, "delta": -0.05},
+      {"dimension": "Temporal Awareness", "index": 8, "before": 0.65, "after": 0.55, "delta": -0.10},
+      {"dimension": "Consolidation Depth", "index": 9, "before": 0.70, "after": 0.60, "delta": -0.10},
+      {"dimension": "Evaluation Maturity", "index": 12, "before": 0.50, "after": 0.40, "delta": -0.10},
+      {"dimension": "Self-Evolution", "index": 14, "before": 0.45, "after": 0.35, "delta": -0.10},
+      {"dimension": "Memory Type Coverage", "index": 17, "before": 0.70, "after": 0.55, "delta": -0.15},
+      {"dimension": "Conflict Resolution", "index": 22, "before": 0.40, "after": 0.30, "delta": -0.10}
+    ],
+    "spike_triggers": [
+      {
+        "type": "new_paradigm",
+        "description": "Metacognitive memory as a distinct architectural layer — a feedback channel from retrieval outcomes back into memory governance"
+      },
+      {
+        "type": "cross_cluster_signal",
+        "description": "Goal-aware retrieval connects query_parser.rs → sessions.rs → graph_retrieval.rs in a way not currently wired"
+      }
+    ],
+    "improvement_surface_ranked": [
+      {"priority": 1, "surface": "Metacognitive memory layer", "total_delta": 0.35},
+      {"priority": 2, "surface": "Heat-scored consolidation", "total_delta": 0.15},
+      {"priority": 3, "surface": "Conflict detection on remember", "total_delta": 0.15},
+      {"priority": 4, "surface": "Goal-aware retrieval weighting", "total_delta": 0.10},
+      {"priority": 5, "surface": "Type-specific consolidation paths", "total_delta": 0.10}
+    ]
+  },
+  "application_map": [
+    {
+      "id": "A1",
+      "concept": "C3",
+      "name": "Metacognitive Memory — Retrieval Quality Tracker",
+      "file": "src/memory/feedback.rs",
+      "function": "process_implicit_feedback()",
+      "change": "Extend to aggregate quality signals into RetrievalQualityTracker tracking success/failure rates by entity cluster, query type, and time window",
+      "overlook_dimensions": ["Self-Evolution", "Evaluation Maturity"],
+      "estimated_delta": {"Self-Evolution": "+0.05", "Evaluation Maturity": "+0.05"},
+      "effort": "medium"
+    },
+    {
+      "id": "A2",
+      "concept": "C4",
+      "name": "Heat-Score Consolidation Trigger",
+      "file": "src/handlers/consolidation.rs",
+      "function": "consolidate_memories() at line 36",
+      "change": "Replace CONSOLIDATION_MIN_AGE_DAYS gate with heat_score = access_count × log(1 + context_richness) × recency_factor. Fire when heat exceeds threshold AND age > 3 days.",
+      "overlook_dimensions": ["Consolidation Depth", "Architecture Coverage"],
+      "estimated_delta": {"Consolidation Depth": "+0.10", "Architecture Coverage": "+0.05"},
+      "effort": "low"
+    },
+    {
+      "id": "A3",
+      "concept": "C7",
+      "name": "Conflict Detection on Remember",
+      "file": "src/handlers/crud.rs",
+      "function": "remember() handler",
+      "change": "After entity extraction, query existing memories sharing ≥1 focal entity with cosine > 0.7. If temporal contradiction detected, create supersedes relation and decay old memory importance by 50%.",
+      "overlook_dimensions": ["Conflict Resolution", "Architecture Coverage"],
+      "estimated_delta": {"Conflict Resolution": "+0.10", "Architecture Coverage": "+0.05"},
+      "effort": "medium"
+    },
+    {
+      "id": "A4",
+      "concept": "C6",
+      "name": "Goal-Aware Retrieval Weighting",
+      "file": "src/memory/query_parser.rs + src/memory/graph_retrieval.rs",
+      "function": "classify_query() + scoring block at ~line 900",
+      "change": "Extend QueryType with DecisionSupport/InformationSeeking/TemporalOrdering/PatternRecognition. Modulate w_sem/w_graph/w_ling by goal type.",
+      "overlook_dimensions": ["Retrieval Quality", "Paradigm Stability"],
+      "estimated_delta": {"Retrieval Quality": "+0.05", "Paradigm Stability": "+0.05"},
+      "effort": "medium"
+    },
+    {
+      "id": "A5",
+      "concept": "C1 + C14",
+      "name": "Type-Specific Consolidation Paths",
+      "file": "src/memory/compression.rs",
+      "function": "consolidate() / distill_facts()",
+      "change": "Add consolidation_strategy() on ExperienceType returning ExtractFacts/ExtractPatterns/ExtractReflections/ExtractPreferences. Route through type-appropriate extractor pipelines.",
+      "overlook_dimensions": ["Consolidation Depth", "Memory Type Coverage"],
+      "estimated_delta": {"Consolidation Depth": "+0.05", "Memory Type Coverage": "+0.05"},
+      "effort": "medium"
+    },
+    {
+      "id": "A6",
+      "concept": "C9",
+      "name": "Gravitational Deduplication in Consolidation",
+      "file": "src/memory/replay.rs",
+      "function": "sample_pairs() in discovery band (0.55-0.85)",
+      "change": "For pairs with cosine > 0.85: merge entity sets, take higher importance, concatenate content with dedup, tombstone lower-importance original.",
+      "overlook_dimensions": ["Consolidation Depth"],
+      "estimated_delta": {"Consolidation Depth": "+0.03"},
+      "effort": "low-medium"
+    },
+    {
+      "id": "A7",
+      "concept": "C2 + C10",
+      "name": "Scheduled Sleep-Phase Consolidation",
+      "file": "src/handlers/consolidation.rs",
+      "function": "New sleep_consolidate() endpoint",
+      "change": "New handler composing: large-sample replay cycle, gravitational dedup, tier promotion sweep, decay application. Decouples heavy work from online path.",
+      "overlook_dimensions": ["Consolidation Depth", "Paradigm Stability"],
+      "estimated_delta": {"Consolidation Depth": "+0.05", "Paradigm Stability": "+0.03"},
+      "effort": "low"
+    },
+    {
+      "id": "A8",
+      "concept": "C8",
+      "name": "Predict-Calibrate Loop for Proactive Context",
+      "file": "src/handlers/recall.rs",
+      "function": "proactive_context()",
+      "change": "Record prediction of relevant memories before query, compare with actual retrieval, score accuracy, feed low-accuracy patterns into consolidation priority queue.",
+      "overlook_dimensions": ["Self-Evolution", "Temporal Awareness"],
+      "estimated_delta": {"Self-Evolution": "+0.05", "Temporal Awareness": "+0.03"},
+      "effort": "high"
+    },
+    {
+      "id": "A9",
+      "concept": "C15",
+      "name": "Kendall's τ Temporal Benchmark",
+      "file": "tests/temporal_perception.rs (new benchmark)",
+      "function": "Extends existing LOCOMO-style test infrastructure",
+      "change": "Store N events with known temporal ordering, query with temporal questions, measure Kendall's τ rank correlation. Validates temporal_facts.rs + temporal_fact_boost pathway.",
+      "overlook_dimensions": ["Temporal Awareness", "Evaluation Maturity"],
+      "estimated_delta": {"Temporal Awareness": "+0.07", "Evaluation Maturity": "+0.05"},
+      "effort": "low"
+    },
+    {
+      "id": "A10",
+      "concept": "C11",
+      "name": "Dynamic Retrieval Quality Metrics",
+      "file": "src/memory/learning_history.rs",
+      "function": "record_event() / get_velocity()",
+      "change": "Record per-query retrieval quality scores (top-1 relevance, NDCG@5) over time. Add get_quality_trajectory(time_window) returning quality trend + worst-performing entity clusters. Surface in consolidation_report.",
+      "overlook_dimensions": ["Evaluation Maturity", "Self-Evolution"],
+      "estimated_delta": {"Evaluation Maturity": "+0.08", "Self-Evolution": "+0.03"},
+      "effort": "medium"
+    }
+  ]
+}

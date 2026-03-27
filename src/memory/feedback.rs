@@ -5,7 +5,7 @@
 //! determine memory usefulness. Implements momentum-based updates with
 //! type-dependent inertia to prevent noise from destabilizing useful memories.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1259,11 +1259,182 @@ pub struct PreviousContext {
     pub surfaced_memory_ids: Vec<MemoryId>,
 }
 
+// =============================================================================
+// METACOGNITIVE MEMORY: RETRIEVAL QUALITY TRACKER (A1)
+// Reference: Bai et al. (2026) §3.2.3 — Reflexion, Memento, LightSearcher
+// =============================================================================
+
+/// Aggregated retrieval quality tracker (A1: Metacognitive Memory)
+///
+/// Tracks success/failure rates by entity cluster and query type,
+/// enabling the system to observe its own retrieval performance and
+/// identify areas where consolidation should be prioritized.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RetrievalQualityTracker {
+    /// Per-entity retrieval quality: entity_name → stats
+    pub entity_stats: HashMap<String, EntityRetrievalStats>,
+    /// Per-query-type retrieval quality: type_name → stats
+    pub query_type_stats: HashMap<String, QueryTypeRetrievalStats>,
+    /// Time-windowed quality (hourly buckets, last 7 days)
+    pub time_windows: VecDeque<TimeWindowStats>,
+    /// Overall counters
+    pub total_retrievals: u64,
+    pub total_successful: u64,
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// Per-entity retrieval quality statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityRetrievalStats {
+    pub retrieval_count: u32,
+    pub success_count: u32,
+    pub avg_signal: f32,
+    pub last_retrieval: DateTime<Utc>,
+}
+
+/// Per-query-type retrieval quality statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryTypeRetrievalStats {
+    pub retrieval_count: u32,
+    pub success_count: u32,
+    pub avg_confidence: f32,
+}
+
+/// Hourly time window for quality tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeWindowStats {
+    pub window_start: DateTime<Utc>,
+    pub retrieval_count: u32,
+    pub success_count: u32,
+}
+
+/// Maximum hourly windows to retain (7 days × 24 hours)
+const QUALITY_TRACKER_MAX_WINDOWS: usize = 168;
+
+impl RetrievalQualityTracker {
+    /// Record a retrieval outcome for quality tracking
+    pub fn record_retrieval(
+        &mut self,
+        entity_names: &[String],
+        query_type: Option<&str>,
+        signal_value: f32,
+        confidence: f32,
+    ) {
+        let now = chrono::Utc::now();
+        let is_success = signal_value > 0.0;
+
+        self.total_retrievals += 1;
+        if is_success {
+            self.total_successful += 1;
+        }
+        self.last_updated = Some(now);
+
+        // Update per-entity stats
+        for entity in entity_names {
+            let stats = self
+                .entity_stats
+                .entry(entity.clone())
+                .or_insert_with(|| EntityRetrievalStats {
+                    retrieval_count: 0,
+                    success_count: 0,
+                    avg_signal: 0.0,
+                    last_retrieval: now,
+                });
+            stats.retrieval_count += 1;
+            if is_success {
+                stats.success_count += 1;
+            }
+            // Exponential moving average of signal value
+            let alpha = 0.2;
+            stats.avg_signal = stats.avg_signal * (1.0 - alpha) + signal_value * alpha;
+            stats.last_retrieval = now;
+        }
+
+        // Update per-query-type stats
+        if let Some(qt) = query_type {
+            let stats = self
+                .query_type_stats
+                .entry(qt.to_string())
+                .or_insert_with(|| QueryTypeRetrievalStats {
+                    retrieval_count: 0,
+                    success_count: 0,
+                    avg_confidence: 0.0,
+                });
+            stats.retrieval_count += 1;
+            if is_success {
+                stats.success_count += 1;
+            }
+            let alpha = 0.2;
+            stats.avg_confidence = stats.avg_confidence * (1.0 - alpha) + confidence * alpha;
+        }
+
+        // Update time window
+        let window_start = now
+            .date_naive()
+            .and_hms_opt(now.hour(), 0, 0)
+            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+            .unwrap_or(now);
+
+        if let Some(last) = self.time_windows.back_mut() {
+            if last.window_start == window_start {
+                last.retrieval_count += 1;
+                if is_success {
+                    last.success_count += 1;
+                }
+            } else {
+                self.time_windows.push_back(TimeWindowStats {
+                    window_start,
+                    retrieval_count: 1,
+                    success_count: if is_success { 1 } else { 0 },
+                });
+            }
+        } else {
+            self.time_windows.push_back(TimeWindowStats {
+                window_start,
+                retrieval_count: 1,
+                success_count: if is_success { 1 } else { 0 },
+            });
+        }
+
+        // Prune old windows
+        while self.time_windows.len() > QUALITY_TRACKER_MAX_WINDOWS {
+            self.time_windows.pop_front();
+        }
+    }
+
+    /// Get overall success rate
+    pub fn success_rate(&self) -> f32 {
+        if self.total_retrievals == 0 {
+            return 0.0;
+        }
+        self.total_successful as f32 / self.total_retrievals as f32
+    }
+
+    /// Get entities with lowest success rates (weak areas needing consolidation)
+    pub fn weakest_entities(&self, top_n: usize) -> Vec<(String, f32)> {
+        let mut entity_rates: Vec<(String, f32)> = self
+            .entity_stats
+            .iter()
+            .filter(|(_, s)| s.retrieval_count >= 3) // Minimum retrievals for significance
+            .map(|(name, s)| {
+                let rate = s.success_count as f32 / s.retrieval_count as f32;
+                (name.clone(), rate)
+            })
+            .collect();
+        entity_rates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        entity_rates.truncate(top_n);
+        entity_rates
+    }
+}
+
 /// Persistent store for feedback momentum with in-memory cache
 #[derive(Default)]
 pub struct FeedbackStore {
     /// In-memory cache: memory_id -> FeedbackMomentum
     pub momentum: HashMap<MemoryId, FeedbackMomentum>,
+
+    /// Metacognitive quality tracker (A1: aggregated retrieval quality signals)
+    pub quality_tracker: RetrievalQualityTracker,
 
     /// Pending feedback per user: user_id -> PendingFeedback (in-memory only)
     pending: HashMap<String, PendingFeedback>,
@@ -1368,6 +1539,7 @@ impl FeedbackStore {
 
         Ok(Self {
             momentum,
+            quality_tracker: RetrievalQualityTracker::default(),
             pending,
             previous_context,
             db: Some(db),
@@ -1498,6 +1670,7 @@ impl FeedbackStore {
 
         Ok(Self {
             momentum,
+            quality_tracker: RetrievalQualityTracker::default(),
             pending,
             previous_context,
             db: Some(db),
