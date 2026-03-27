@@ -59,6 +59,7 @@ fn create_neural_ner() -> NeuralNer {
 // ==================== Neural NER Tests ====================
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_download_and_init() {
     let ner = create_neural_ner();
     assert!(
@@ -69,6 +70,7 @@ fn test_neural_download_and_init() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_person_extraction() {
     let ner = create_neural_ner();
 
@@ -89,6 +91,7 @@ fn test_neural_person_extraction() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_org_extraction() {
     let ner = create_neural_ner();
 
@@ -113,6 +116,7 @@ fn test_neural_org_extraction() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_location_extraction() {
     let ner = create_neural_ner();
 
@@ -137,6 +141,7 @@ fn test_neural_location_extraction() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_mixed_entities() {
     let ner = create_neural_ner();
 
@@ -173,6 +178,7 @@ fn test_neural_mixed_entities() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_indian_entities() {
     let ner = create_neural_ner();
 
@@ -192,6 +198,7 @@ fn test_neural_indian_entities() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_latency() {
     let ner = create_neural_ner();
 
@@ -222,6 +229,7 @@ fn test_neural_latency() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_vs_fallback_comparison() {
     let neural_ner = create_neural_ner();
     let fallback_ner = {
@@ -256,6 +264,7 @@ fn test_neural_vs_fallback_comparison() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_long_text() {
     let ner = create_neural_ner();
 
@@ -282,6 +291,7 @@ fn test_neural_long_text() {
 }
 
 #[test]
+#[ignore] // requires network + NER model download (~17MB)
 fn test_neural_edge_cases() {
     let ner = create_neural_ner();
 

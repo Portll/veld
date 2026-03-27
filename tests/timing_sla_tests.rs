@@ -138,6 +138,7 @@ where
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_record_p50_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -172,6 +173,7 @@ fn test_sla_record_p50_latency() {
 }
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_record_p99_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -210,6 +212,7 @@ fn test_sla_record_p99_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_retrieve_p50_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -265,6 +268,7 @@ fn test_sla_retrieve_p50_latency() {
 }
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_retrieve_p99_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -308,6 +312,7 @@ fn test_sla_retrieve_p99_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_batch_100_records() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -335,6 +340,7 @@ fn test_sla_batch_100_records() {
 }
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_throughput_sustained() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -372,6 +378,7 @@ fn test_sla_throughput_sustained() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_stats_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -409,6 +416,7 @@ fn test_sla_stats_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_cold_start_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -449,6 +457,7 @@ fn test_sla_cold_start_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_flush_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -480,6 +489,7 @@ fn test_sla_flush_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_concurrent_access_latency() {
     use std::sync::Arc;
     use std::thread;
@@ -539,6 +549,7 @@ fn test_sla_concurrent_access_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_geo_filter_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -593,6 +604,7 @@ fn test_sla_geo_filter_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_sla_maintenance_latency() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -630,6 +642,7 @@ fn test_sla_maintenance_latency() {
 // ============================================================================
 
 #[test]
+#[ignore] // SLA timing test: requires --test-threads=1 for accuracy, run with --ignored
 fn test_performance_summary() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);

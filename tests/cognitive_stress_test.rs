@@ -176,6 +176,7 @@ fn create_experience(content: &str, ner: &NeuralNer, exp_type: ExperienceType) -
 // =============================================================================
 
 #[test]
+#[ignore] // stress test: 40-120s, run with --ignored
 fn test_cognitive_layer_at_scale() {
     println!("\n{}", "═".repeat(80));
     println!("  SHODH-MEMORY COGNITIVE LAYER STRESS TEST");
@@ -665,6 +666,7 @@ fn test_cognitive_layer_at_scale() {
 // =============================================================================
 
 #[test]
+#[ignore] // stress test: 40-120s, run with --ignored
 fn test_cross_domain_retrieval() {
     println!("\n{}", "═".repeat(60));
     println!("  CROSS-DOMAIN RETRIEVAL TEST");
@@ -710,6 +712,7 @@ fn test_cross_domain_retrieval() {
 }
 
 #[test]
+#[ignore] // stress test: 40-120s, run with --ignored
 fn test_importance_decay_resistance() {
     println!("\n{}", "═".repeat(60));
     println!("  IMPORTANCE DECAY RESISTANCE TEST");
