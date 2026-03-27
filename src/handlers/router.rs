@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, compression, consolidation, crud, facts, files, gap_analysis, graph, health,
-    integrations, lineage, mif, recall, remember, search, sessions, todos, users, visualization,
-    webhooks,
+    ab_testing, compression, consolidation, context_blocks, crud, facts, files, gap_analysis,
+    graph, health, ingest, integrations, lineage, mif, recall, remember, search, sessions, todos,
+    users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -78,6 +78,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/remember/batch", post(remember::batch_remember))
         .route("/api/batch_remember", post(remember::batch_remember))
         .route("/api/upsert", post(remember::upsert_memory))
+        // =================================================================
+        // INGEST (multi-format text extraction + remember)
+        // =================================================================
+        .route("/api/ingest", post(ingest::ingest))
         // =================================================================
         // RECALL ENDPOINTS
         // =================================================================
@@ -190,6 +194,25 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route(
             "/api/facts/temporal/search",
             post(facts::search_temporal_facts),
+        )
+        // =================================================================
+        // CONTEXT BLOCKS (LETTA-STYLE MUTABLE AGENT STATE)
+        // =================================================================
+        .route(
+            "/api/context/blocks",
+            get(context_blocks::list_context_blocks),
+        )
+        .route(
+            "/api/context/blocks/{key}",
+            get(context_blocks::get_context_block),
+        )
+        .route(
+            "/api/context/blocks/{key}",
+            put(context_blocks::set_context_block),
+        )
+        .route(
+            "/api/context/blocks/{key}",
+            delete(context_blocks::delete_context_block),
         )
         // =================================================================
         // LINEAGE
