@@ -1432,32 +1432,33 @@ impl MemorySystem {
 
         // Compute graph density for ontological gating (consistent with Layer 2 in graph_retrieval.rs).
         // Dense/young graphs have too many noisy L1 edges for type filtering to help.
-        let graph_density_for_rerank: Option<f32> = if let Some(graph) = self.graph_memory.as_ref()
-        {
-            let g = graph.read();
-            let seed_uuids: Vec<uuid::Uuid> = query_analysis
-                .focal_entities
-                .iter()
-                .filter_map(|e| {
-                    g.find_entity_by_name(&e.text)
-                        .ok()
-                        .flatten()
-                        .map(|n| n.uuid)
-                })
-                .collect();
-            if seed_uuids.is_empty() {
-                None
+        // Short-circuit: skip the RocksDB density lookups entirely when confidence is too low.
+        let (graph_density_for_rerank, use_ontology_rerank) =
+            if onto_intent.confidence < crate::constants::ONTOLOGICAL_MIN_CONFIDENCE {
+                (None, false)
+            } else if let Some(graph) = self.graph_memory.as_ref() {
+                let g = graph.read();
+                let seed_uuids: Vec<uuid::Uuid> = query_analysis
+                    .focal_entities
+                    .iter()
+                    .filter_map(|e| {
+                        g.find_entity_by_name(&e.text)
+                            .ok()
+                            .flatten()
+                            .map(|n| n.uuid)
+                    })
+                    .collect();
+                let density = if seed_uuids.is_empty() {
+                    None
+                } else {
+                    g.entities_average_density(&seed_uuids).ok().flatten()
+                };
+                let use_rerank = !density
+                    .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD);
+                (density, use_rerank)
             } else {
-                g.entities_average_density(&seed_uuids).ok().flatten()
-            }
-        } else {
-            None
-        };
-
-        let use_ontology_rerank = onto_intent.confidence
-            >= crate::constants::ONTOLOGICAL_MIN_CONFIDENCE
-            && !graph_density_for_rerank
-                .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD);
+                (None, false)
+            };
 
         // Ontology telemetry
         crate::metrics::ONTOLOGICAL_INTENT_CONFIDENCE.observe(onto_intent.confidence as f64);
@@ -1959,39 +1960,6 @@ impl MemorySystem {
                     }
                 }
 
-                // Fallback: if ontology-filtered traversal returned too few results, retry unfiltered
-                if use_onto_filter && ids.len() < 3 {
-                    tracing::debug!(
-                        "Layer 2: Ontology-filtered traversal returned {} results, falling back to unfiltered",
-                        ids.len()
-                    );
-                    for entity_uuid in &query_entities {
-                        if let Ok(t) =
-                            g.traverse_weighted(entity_uuid, weighted_depth, None, weighted_min_str)
-                        {
-                            for tr in &t.entities {
-                                if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                    eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                    eps.truncate(50);
-                                    for ep in eps {
-                                        let mid = MemoryId(ep.uuid);
-                                        if episode_candidates
-                                            .as_ref()
-                                            .map_or(true, |c| c.contains(&mid))
-                                        {
-                                            ids.push((
-                                                mid,
-                                                tr.entity.salience * tr.decay_factor,
-                                                tr.decay_factor,
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 let mut seen: std::collections::HashMap<MemoryId, (f32, f32)> =
                     std::collections::HashMap::new();
                 for (id, act, heb) in ids {
@@ -2404,11 +2372,18 @@ impl MemorySystem {
             // sufficient confidence.
             //
             // Reference: Collins & Quillian (1969) — type-plausible paths retrieved faster
+            // Pre-sort and limit candidates before expensive re-ranking.
+            // Only look up graph entities for the top 2x max_results candidates,
+            // not all fused results (avoids 100s of RocksDB reads).
+            let mut res: Vec<_> = fused.into_iter().collect();
+            res.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let rerank_budget = query.max_results * 2;
+
             if use_ontology_rerank && !onto_intent.expected_labels.is_empty() {
                 if let Some(graph) = self.graph_memory.as_ref() {
                     let g = graph.read();
                     let mut boosted_count = 0usize;
-                    for (_mem_id, fused_score) in fused.iter_mut() {
+                    for (_mem_id, fused_score) in res.iter_mut().take(rerank_budget) {
                         if let Ok(Some(episode)) = g.get_episode(&_mem_id.0) {
                             let type_matches = episode
                                 .entity_refs
@@ -2441,16 +2416,17 @@ impl MemorySystem {
                     }
                     if boosted_count > 0 {
                         tracing::debug!(
-                            "Layer 4.9: Ontological re-rank boosted {} memories (labels={:?})",
+                            "Layer 4.9: Ontological re-rank boosted {} of {} candidates (labels={:?})",
                             boosted_count,
+                            rerank_budget.min(res.len()),
                             onto_intent.expected_labels
                         );
                     }
+                    // Re-sort after boosting since ranks may have changed
+                    res.sort_by(|a, b| b.1.total_cmp(&a.1));
                 }
             }
 
-            let mut res: Vec<_> = fused.into_iter().collect();
-            res.sort_by(|a, b| b.1.total_cmp(&a.1));
             res.truncate(query.max_results);
             tracing::debug!("Layer 4: {} fused results", res.len());
             (res, heb)
