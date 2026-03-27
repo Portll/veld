@@ -89,6 +89,7 @@ fn create_experience(content: &str, entities: Vec<&str>) -> Experience {
 
 /// Hammer the system with concurrent writes from multiple threads
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_concurrent_writes() {
     let (system, _temp_dir) = create_test_system();
     let system = Arc::new(system); // No external lock - internally thread-safe
@@ -145,6 +146,7 @@ fn test_brutal_concurrent_writes() {
 
 /// Concurrent reads and writes interleaved
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_concurrent_read_write() {
     let (system, _temp_dir) = create_test_system();
     let system = system;
@@ -224,6 +226,7 @@ fn test_brutal_concurrent_read_write() {
 
 /// Concurrent reinforcement on same memories - race condition test
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_concurrent_reinforcement_race() {
     let (system, _temp_dir) = create_test_system();
     let system = system;
@@ -276,6 +279,7 @@ fn test_brutal_concurrent_reinforcement_race() {
 
 /// Multiple restart cycles - verify no data loss
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_multiple_restart_cycles() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -331,6 +335,7 @@ fn test_brutal_multiple_restart_cycles() {
 
 /// Crash simulation - kill during write
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_partial_write_recovery() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_test_config(&temp_dir);
@@ -395,6 +400,7 @@ fn test_brutal_partial_write_recovery() {
 
 /// Push beyond working memory capacity
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_exceed_working_memory() {
     let temp_dir = TempDir::new().expect("Failed");
     let config = MemoryConfig {
@@ -430,6 +436,7 @@ fn test_brutal_exceed_working_memory() {
 
 /// Large content stress test
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_large_content() {
     let (system, _temp_dir) = create_test_system();
 
@@ -459,6 +466,7 @@ fn test_brutal_large_content() {
 
 /// Many entities stress test
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_many_entities() {
     let (system, _temp_dir) = create_test_system();
 
@@ -489,6 +497,7 @@ fn test_brutal_many_entities() {
 
 /// Push importance to extreme values repeatedly
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_importance_boundary_cycling() {
     let (system, _temp_dir) = create_test_system();
 
@@ -529,6 +538,7 @@ fn test_brutal_importance_boundary_cycling() {
 
 /// Verify importance never goes outside [0.05, 1.0]
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_importance_bounds_invariant() {
     let (system, _temp_dir) = create_test_system();
 
@@ -578,6 +588,7 @@ fn test_brutal_importance_bounds_invariant() {
 
 /// Verify no ID collisions with many memories
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_no_id_collisions() {
     let (system, _temp_dir) = create_test_system();
 
@@ -604,6 +615,7 @@ fn test_brutal_no_id_collisions() {
 
 /// Create dense graph with many associations
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_dense_graph() {
     let (system, _temp_dir) = create_test_system_with_graph();
 
@@ -634,6 +646,7 @@ fn test_brutal_dense_graph() {
 
 /// Repeated graph maintenance cycles
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_graph_maintenance_cycles() {
     let (system, _temp_dir) = create_test_system_with_graph();
 
@@ -669,6 +682,7 @@ fn test_brutal_graph_maintenance_cycles() {
 /// Note: This measures embedding generation + storage + indexing per record
 /// Embedding dominates at ~200-300ms per call, with batching potential
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_timing_record() {
     let (system, _temp_dir) = create_test_system();
 
@@ -692,6 +706,7 @@ fn test_brutal_timing_record() {
 
 /// Verify retrieval timing under load
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_timing_retrieval() {
     let (system, _temp_dir) = create_test_system();
 
@@ -726,6 +741,7 @@ fn test_brutal_timing_retrieval() {
 
 /// Empty query handling
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_empty_queries() {
     let (system, _temp_dir) = create_test_system();
 
@@ -749,6 +765,7 @@ fn test_brutal_empty_queries() {
 
 /// Unicode and special characters
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_unicode_content() {
     let (system, _temp_dir) = create_test_system();
 
@@ -770,6 +787,7 @@ fn test_brutal_unicode_content() {
 
 /// Null bytes and control characters
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_special_characters() {
     let (system, _temp_dir) = create_test_system();
 
@@ -787,6 +805,7 @@ fn test_brutal_special_characters() {
 
 /// Very long entity names
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_long_entity_names() {
     let (system, _temp_dir) = create_test_system();
 
@@ -815,6 +834,7 @@ fn test_brutal_long_entity_names() {
 
 /// Verify data integrity after many operations
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_data_integrity() {
     let temp_dir = TempDir::new().expect("Failed");
     let config = create_test_config(&temp_dir);
@@ -851,6 +871,7 @@ fn test_brutal_data_integrity() {
 
 /// Test that read operations don't block each other (reader parallelism)
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_reader_parallelism() {
     let (system, _temp_dir) = create_test_system();
 
@@ -903,6 +924,7 @@ fn test_brutal_reader_parallelism() {
 /// Test that writes interleaved with reads don't deadlock
 /// Now uses internal thread-safety (no external Mutex) - operations run truly in parallel
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_no_deadlock_mixed_operations() {
     let (system, _temp_dir) = create_test_system();
     let system = Arc::new(system); // No external lock needed - MemorySystem is internally thread-safe
@@ -977,6 +999,7 @@ fn test_brutal_no_deadlock_mixed_operations() {
 
 /// Test lock ordering - ensure no AB-BA deadlock patterns
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_lock_order_safety() {
     let temp_dir = TempDir::new().expect("Failed");
     let config = create_test_config(&temp_dir);
@@ -1015,6 +1038,7 @@ fn test_brutal_lock_order_safety() {
 
 /// Test cache eviction under pressure doesn't corrupt state
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_cache_eviction_integrity() {
     let temp_dir = TempDir::new().expect("Failed");
     let config = MemoryConfig {
@@ -1058,6 +1082,7 @@ fn test_brutal_cache_eviction_integrity() {
 
 /// Test that reinforcement doesn't corrupt during high frequency updates
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_reinforcement_race() {
     let (system, _temp_dir) = create_test_system();
 
@@ -1112,6 +1137,7 @@ fn test_brutal_reinforcement_race() {
 
 /// Test storage layer isolation - operations on one system don't affect another
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_storage_isolation() {
     let temp_dir1 = TempDir::new().expect("Failed");
     let temp_dir2 = TempDir::new().expect("Failed");
@@ -1173,6 +1199,7 @@ fn test_brutal_storage_isolation() {
 
 /// Test that the full pipeline (record -> retrieve -> reinforce) works under load
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_full_pipeline_stress() {
     let (system, _temp_dir) = create_test_system();
     let system = Arc::new(system); // No external lock - internally thread-safe
@@ -1229,6 +1256,7 @@ fn test_brutal_full_pipeline_stress() {
 
 /// Test memory graph consistency under concurrent modifications
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_graph_consistency() {
     let (system, _temp_dir) = create_test_system();
 
@@ -1277,6 +1305,7 @@ fn test_brutal_graph_consistency() {
 
 /// Test rapid creation and deletion simulation (via importance decay)
 #[test]
+#[ignore] // stress test: 5s+ per test, run with --ignored
 fn test_brutal_lifecycle_churn() {
     let (system, _temp_dir) = create_test_system();
     let mut ids = Vec::new();
