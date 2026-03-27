@@ -184,6 +184,14 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/facts/by-entity", post(facts::facts_by_entity))
         .route("/api/facts/stats", post(facts::get_facts_stats))
         // =================================================================
+        // TEMPORAL FACTS
+        // =================================================================
+        .route("/api/facts/temporal", post(facts::list_temporal_facts))
+        .route(
+            "/api/facts/temporal/search",
+            post(facts::search_temporal_facts),
+        )
+        // =================================================================
         // LINEAGE
         // =================================================================
         .route("/api/lineage/trace", post(lineage::lineage_trace))
