@@ -209,6 +209,9 @@ pub struct MultiUserMemoryManager {
     /// GTD-style todo store
     pub todo_store: Arc<TodoStore>,
 
+    /// Agent context block store (Letta-style mutable key-value blocks)
+    pub context_block_store: Arc<crate::memory::ContextBlockStore>,
+
     /// File memory store for codebase integration
     pub file_store: Arc<FileMemoryStore>,
 
@@ -449,6 +452,7 @@ impl MultiUserMemoryManager {
             cfs.extend(TodoStore::cf_descriptors());
             cfs.extend(ProspectiveStore::column_family_descriptors());
             cfs.extend(FileMemoryStore::cf_descriptors());
+            cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
             // Feedback CF
             cfs.push(ColumnFamilyDescriptor::new(
                 crate::memory::feedback::CF_FEEDBACK,
@@ -487,6 +491,9 @@ impl MultiUserMemoryManager {
 
         let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), &base_path)?);
         info!("File memory store initialized");
+
+        let context_block_store = Arc::new(crate::memory::ContextBlockStore::new(shared_db.clone()));
+        info!("Context block store initialized");
 
         let feedback_store = Arc::new(parking_lot::RwLock::new(
             FeedbackStore::with_shared_db(shared_db.clone(), &base_path).unwrap_or_else(|e| {
@@ -538,6 +545,7 @@ impl MultiUserMemoryManager {
             streaming_extractor,
             prospective_store,
             todo_store,
+            context_block_store,
             file_store,
             feedback_store,
             backup_engine,
@@ -982,7 +990,7 @@ impl MultiUserMemoryManager {
         let prefix_bytes = prefix.as_bytes();
 
         // Shared CF names that use `{user_id}:` as key prefix
-        let cf_names = ["todos", "projects", "prospective"];
+        let cf_names = ["todos", "projects", "prospective", "context_blocks"];
         for name in &cf_names {
             if let Some(cf) = self.shared_db.cf_handle(name) {
                 let n = Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);

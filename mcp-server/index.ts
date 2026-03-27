@@ -620,6 +620,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Parent memory ID for hierarchical organization. Creates memory trees (e.g., '71-research' -> 'algebraic' -> '21×27≡-1')",
             },
+            filename: {
+              type: "string",
+              description: "Optional filename for format detection (e.g., 'notes.md', 'data.json', 'main.rs'). When provided, content is run through the text extraction pipeline before storage: Markdown syntax is stripped, JSON is flattened, CSV is parsed, code symbols are extracted.",
+            },
           },
           required: ["content"],
         },
@@ -1413,7 +1417,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "list_temporal_facts",
-        description: "List temporal facts extracted from memories — when things happened, were planned, or occurred. Filter by entity name and/or event keyword.",
+        description: "List temporal facts extracted from memories — when things happened, were planned, or occurred. Filter by entity name and/or event keyword. Facts that have been superseded by newer contradicting facts are hidden by default.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1429,7 +1433,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Maximum results (default: 50)",
             },
+            include_expired: {
+              type: "boolean",
+              description: "Include facts that have been invalidated by newer contradicting facts (default: false)",
+            },
           },
+        },
+      },
+      {
+        name: "get_context_block",
+        description: "Read a named context block — persistent mutable state that stays in working context across sessions. Use for persona, user profile, project state, etc.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            key: {
+              type: "string",
+              description: "Block key name (e.g., 'persona', 'user_profile', 'project_state')",
+            },
+          },
+          required: ["key"],
+        },
+      },
+      {
+        name: "set_context_block",
+        description: "Write a named context block — overwrite persistent mutable state. Content persists across sessions and can be freely edited.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            key: {
+              type: "string",
+              description: "Block key name (e.g., 'persona', 'user_profile', 'project_state')",
+            },
+            content: {
+              type: "string",
+              description: "The block content to store",
+            },
+            max_tokens: {
+              type: "number",
+              description: "Maximum token budget for this block (default: 2000)",
+            },
+          },
+          required: ["key", "content"],
+        },
+      },
+      {
+        name: "list_context_blocks",
+        description: "List all context block keys and their sizes — see what persistent state blocks exist.",
+        inputSchema: {
+          type: "object",
+          properties: {},
         },
       },
       {
@@ -1543,6 +1595,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           preceding_memory_id,
           // Hierarchy
           parent_id,
+          // Ingest
+          filename,
         } = args as {
           content: string;
           type?: string;
@@ -1557,6 +1611,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sequence_number?: number;
           preceding_memory_id?: string;
           parent_id?: string;
+          filename?: string;
         };
 
         if (!content || content.length === 0) {
@@ -1583,6 +1638,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ...(preceding_memory_id && { preceding_memory_id }),
           // Hierarchy
           ...(parent_id && { parent_id }),
+          // Ingest
+          ...(filename && { filename }),
         });
 
         // Format response with branded display
@@ -3486,6 +3543,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         if ((args as any).entity) body.entity = (args as any).entity;
         if ((args as any).event) body.event = (args as any).event;
+        if ((args as any).include_expired) body.include_expired = true;
 
         interface TemporalFactEntry {
           entity: string;
@@ -3495,6 +3553,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           source_memory_id: string;
           confidence: number;
           source_text: string;
+          valid_from: string | null;
+          valid_until: string | null;
+          is_valid: boolean;
         }
         interface TemporalFactsResult {
           facts: TemporalFactEntry[];
@@ -3507,11 +3568,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
           if (result.facts?.length) {
             for (const f of result.facts) {
+              const validityTag = f.is_valid ? "" : " [EXPIRED]";
               response += `  [${f.event_type}] ${f.entity}: ${f.event}`;
               response += ` @ ${f.timestamp}`;
               if (f.confidence < 1.0) response += ` (${(f.confidence * 100).toFixed(0)}%)`;
+              response += `${validityTag}\n`;
+              response += `    source: ${f.source_memory_id}`;
+              if (f.valid_until) response += ` | superseded: ${f.valid_until}`;
               response += `\n`;
-              response += `    source: ${f.source_memory_id}\n`;
             }
           } else {
             const filters = [];
@@ -3551,6 +3615,115 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         } catch (e: any) {
           return { content: [{ type: "text", text: `Link failed: ${e.message || e}` }], isError: true };
+        }
+      }
+
+      case "get_context_block": {
+        const key = (args as any).key;
+        if (!key || typeof key !== "string") {
+          return {
+            content: [{ type: "text", text: "Error: 'key' is required." }],
+            isError: true,
+          };
+        }
+
+        interface ContextBlockResult {
+          key: string;
+          content: string;
+          max_tokens: number;
+          updated_at: string;
+          version: number;
+        }
+
+        try {
+          const result = await apiCall<ContextBlockResult>(
+            `/api/context/blocks/${encodeURIComponent(key)}?user_id=${encodeURIComponent(USER_ID)}`,
+            "GET"
+          );
+          let response = `Context Block: ${result.key} (v${result.version})\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          response += result.content;
+          response += `\n\n[max_tokens: ${result.max_tokens} | updated: ${result.updated_at}]`;
+          return { content: [{ type: "text", text: response }] };
+        } catch (e: any) {
+          if (e.message?.includes("not found") || e.message?.includes("404")) {
+            return { content: [{ type: "text", text: `Context block '${key}' does not exist yet. Use set_context_block to create it.` }] };
+          }
+          return { content: [{ type: "text", text: `Failed to get context block: ${e.message || e}` }], isError: true };
+        }
+      }
+
+      case "set_context_block": {
+        const { key, content, max_tokens } = args as {
+          key: string;
+          content: string;
+          max_tokens?: number;
+        };
+        if (!key || !content) {
+          return {
+            content: [{ type: "text", text: "Error: 'key' and 'content' are required." }],
+            isError: true,
+          };
+        }
+
+        interface ContextBlockResult {
+          key: string;
+          content: string;
+          max_tokens: number;
+          updated_at: string;
+          version: number;
+        }
+
+        const body: Record<string, unknown> = {
+          user_id: USER_ID,
+          content,
+        };
+        if (max_tokens) body.max_tokens = max_tokens;
+
+        try {
+          const result = await apiCall<ContextBlockResult>(
+            `/api/context/blocks/${encodeURIComponent(key)}`,
+            "PUT",
+            body
+          );
+          return {
+            content: [{ type: "text", text: `Context block '${result.key}' updated (v${result.version}, ${result.content.length} chars)` }],
+          };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Failed to set context block: ${e.message || e}` }], isError: true };
+        }
+      }
+
+      case "list_context_blocks": {
+        interface ContextBlockEntry {
+          key: string;
+          content: string;
+          max_tokens: number;
+          updated_at: string;
+          version: number;
+        }
+        interface ContextBlockListResult {
+          blocks: ContextBlockEntry[];
+          total: number;
+        }
+
+        try {
+          const result = await apiCall<ContextBlockListResult>(
+            `/api/context/blocks?user_id=${encodeURIComponent(USER_ID)}`,
+            "GET"
+          );
+          let response = `Context Blocks (${result.total})\n`;
+          response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          if (result.blocks?.length) {
+            for (const b of result.blocks) {
+              response += `  ${b.key} — v${b.version}, ${b.content.length} chars (max: ${b.max_tokens})\n`;
+            }
+          } else {
+            response += `  No context blocks defined yet.\n`;
+          }
+          return { content: [{ type: "text", text: response }] };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Failed to list context blocks: ${e.message || e}` }], isError: true };
         }
       }
 

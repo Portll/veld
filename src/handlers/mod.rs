@@ -38,6 +38,9 @@ pub mod webhooks;
 // External integrations
 pub mod integrations;
 
+// Multi-format text ingestion
+pub mod ingest;
+
 // Session and user management
 pub mod sessions;
 pub mod users;
@@ -47,6 +50,9 @@ pub mod files;
 
 // Background processing
 pub mod consolidation;
+
+// Context blocks (Letta-style mutable agent state)
+pub mod context_blocks;
 
 // A/B testing
 pub mod ab_testing;

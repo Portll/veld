@@ -61,6 +61,7 @@ pub enum AppError {
     UserNotFound(String),
     TodoNotFound(String),
     ProjectNotFound(String),
+    ContextBlockNotFound(String),
 
     // Conflict Errors (409)
     MemoryAlreadyExists(String),
@@ -119,6 +120,7 @@ impl AppError {
             Self::UserNotFound(_) => "USER_NOT_FOUND",
             Self::TodoNotFound(_) => "TODO_NOT_FOUND",
             Self::ProjectNotFound(_) => "PROJECT_NOT_FOUND",
+            Self::ContextBlockNotFound(_) => "CONTEXT_BLOCK_NOT_FOUND",
             Self::MemoryAlreadyExists(_) => "MEMORY_ALREADY_EXISTS",
             Self::StorageError(_) => "STORAGE_ERROR",
             Self::DatabaseError(_) => "DATABASE_ERROR",
@@ -146,7 +148,8 @@ impl AppError {
             Self::MemoryNotFound(_)
             | Self::UserNotFound(_)
             | Self::TodoNotFound(_)
-            | Self::ProjectNotFound(_) => StatusCode::NOT_FOUND,
+            | Self::ProjectNotFound(_)
+            | Self::ContextBlockNotFound(_) => StatusCode::NOT_FOUND,
 
             Self::MemoryAlreadyExists(_) => StatusCode::CONFLICT,
 
@@ -188,6 +191,7 @@ impl AppError {
             Self::UserNotFound(id) => format!("User not found: {id}"),
             Self::TodoNotFound(id) => format!("Todo not found: {id}"),
             Self::ProjectNotFound(id) => format!("Project not found: {id}"),
+            Self::ContextBlockNotFound(key) => format!("Context block not found: {key}"),
             Self::MemoryAlreadyExists(id) => format!("Memory already exists: {id}"),
             Self::StorageError(msg) => format!("Storage error: {msg}"),
             Self::DatabaseError(msg) => format!("Database error: {msg}"),

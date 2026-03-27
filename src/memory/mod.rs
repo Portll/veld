@@ -8,6 +8,7 @@
 
 pub mod compression;
 pub mod context;
+pub mod context_blocks;
 pub mod facts;
 pub mod feedback;
 pub mod files;
@@ -113,6 +114,7 @@ pub use crate::memory::sessions::{
     Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore, SessionStoreStats,
     SessionSummary, TemporalContext, TimeOfDay,
 };
+pub use crate::memory::context_blocks::{ContextBlock, ContextBlockStore};
 pub use crate::memory::temporal_facts::{EventType, ResolvedTime, TemporalFact, TemporalFactStore};
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
@@ -2910,12 +2912,33 @@ impl MemorySystem {
             return Ok(0);
         }
 
+        // Run contradiction detection before storing each new fact.
+        // This invalidates old facts that the new fact supersedes.
+        let mut total_invalidated = 0usize;
+        for fact in &facts {
+            match self
+                .temporal_fact_store
+                .detect_and_resolve_contradictions(user_id, fact)
+            {
+                Ok(ids) => total_invalidated += ids.len(),
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = user_id,
+                        fact_id = %fact.id,
+                        error = %e,
+                        "Contradiction detection failed for temporal fact"
+                    );
+                }
+            }
+        }
+
         let stored = self.temporal_fact_store.store_batch(user_id, &facts)?;
         if stored > 0 {
             tracing::debug!(
                 user_id = user_id,
                 memory_id = %memory_id.0,
                 facts_stored = stored,
+                facts_invalidated = total_invalidated,
                 "Stored temporal facts for memory"
             );
         }
@@ -2941,6 +2964,24 @@ impl MemorySystem {
         )
     }
 
+    /// Find temporal facts by entity and event keywords, optionally including expired facts.
+    pub fn find_temporal_facts_filtered(
+        &self,
+        user_id: &str,
+        entity: &str,
+        event_keywords: &[&str],
+        event_type: Option<temporal_facts::EventType>,
+        include_expired: bool,
+    ) -> Result<Vec<temporal_facts::TemporalFact>> {
+        self.temporal_fact_store.find_by_entity_and_event_filtered(
+            user_id,
+            entity,
+            event_keywords,
+            event_type,
+            include_expired,
+        )
+    }
+
     /// List all temporal facts for a user
     pub fn list_temporal_facts(
         &self,
@@ -2948,6 +2989,17 @@ impl MemorySystem {
         limit: usize,
     ) -> Result<Vec<temporal_facts::TemporalFact>> {
         self.temporal_fact_store.list(user_id, limit)
+    }
+
+    /// List all temporal facts for a user, optionally including expired facts.
+    pub fn list_temporal_facts_filtered(
+        &self,
+        user_id: &str,
+        limit: usize,
+        include_expired: bool,
+    ) -> Result<Vec<temporal_facts::TemporalFact>> {
+        self.temporal_fact_store
+            .list_filtered(user_id, limit, include_expired)
     }
 
     /// Find temporal facts by entity name only
@@ -2960,6 +3012,18 @@ impl MemorySystem {
         self.temporal_fact_store.find_by_entity(user_id, entity, limit)
     }
 
+    /// Find temporal facts by entity name, optionally including expired facts.
+    pub fn find_temporal_facts_by_entity_filtered(
+        &self,
+        user_id: &str,
+        entity: &str,
+        limit: usize,
+        include_expired: bool,
+    ) -> Result<Vec<temporal_facts::TemporalFact>> {
+        self.temporal_fact_store
+            .find_by_entity_filtered(user_id, entity, limit, include_expired)
+    }
+
     /// Find temporal facts by event keyword only
     pub fn find_temporal_facts_by_event(
         &self,
@@ -2968,6 +3032,18 @@ impl MemorySystem {
         limit: usize,
     ) -> Result<Vec<temporal_facts::TemporalFact>> {
         self.temporal_fact_store.find_by_event(user_id, event, limit)
+    }
+
+    /// Find temporal facts by event keyword, optionally including expired facts.
+    pub fn find_temporal_facts_by_event_filtered(
+        &self,
+        user_id: &str,
+        event: &str,
+        limit: usize,
+        include_expired: bool,
+    ) -> Result<Vec<temporal_facts::TemporalFact>> {
+        self.temporal_fact_store
+            .find_by_event_filtered(user_id, event, limit, include_expired)
     }
 
     /// Calculate linguistic boost based on focal entity matches
