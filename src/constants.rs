@@ -597,6 +597,16 @@ pub const FACT_NEGATION_MARKERS: &[&str] = &[
 ];
 
 // =============================================================================
+// COLD-START ENTITY EXTRACTION
+// =============================================================================
+
+/// Graph entity count below which aggressive extraction activates
+pub const ENTITY_COLD_START_THRESHOLD: usize = 50;
+
+/// Multiplier that doubles YAKE keyword budget during cold start
+pub const ENTITY_COLD_START_YAKE_BOOST: f32 = 0.5;
+
+// =============================================================================
 // DEFAULT CONFIGURATION VALUES
 // =============================================================================
 

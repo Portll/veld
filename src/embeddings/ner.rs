@@ -1418,3 +1418,102 @@ mod tests {
         }
     }
 }
+
+// =============================================================================
+// COLD-START ENTITY EXTRACTION
+// =============================================================================
+
+/// Aggressive entity extraction for cold-start graphs (< ENTITY_COLD_START_THRESHOLD entities).
+/// Uses heuristic patterns to find entities that NER+YAKE miss:
+/// - Mid-sentence proper nouns (capitalized words not at sentence start)
+/// - Email addresses, URLs, file paths
+/// - Version numbers (v1.2.3)
+/// - CamelCase tech names (PostgreSQL, FastAPI)
+/// - Uppercase acronyms (API, AWS, CI)
+pub fn cold_start_extract_entities(
+    text: &str,
+    existing_entities: &[String],
+) -> Vec<NerEntity> {
+    let existing_lower: std::collections::HashSet<String> =
+        existing_entities.iter().map(|e| e.to_lowercase()).collect();
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '@' && c != '/' && c != '-' && c != '_');
+        if clean.is_empty() || clean.len() < 2 {
+            continue;
+        }
+
+        // Skip if already known
+        if existing_lower.contains(&clean.to_lowercase()) || seen.contains(&clean.to_lowercase()) {
+            continue;
+        }
+
+        let entity_type = if clean.contains('@') && clean.contains('.') {
+            Some(NerEntityType::Misc) // email
+        } else if clean.starts_with("http://") || clean.starts_with("https://") {
+            Some(NerEntityType::Misc) // URL
+        } else if clean.contains('/') && clean.contains('.') && !clean.contains(' ') {
+            Some(NerEntityType::Misc) // file path
+        } else if is_version_number(clean) {
+            Some(NerEntityType::Misc)
+        } else if is_camel_case(clean) {
+            Some(NerEntityType::Organization) // tech name
+        } else if is_acronym(clean) {
+            Some(NerEntityType::Organization)
+        } else if clean.chars().next().map_or(false, |c| c.is_uppercase())
+            && clean.len() >= 3
+            && clean.chars().skip(1).any(|c| c.is_lowercase())
+        {
+            // Proper noun heuristic — but skip common English words
+            let lower = clean.to_lowercase();
+            let common = ["the", "this", "that", "with", "from", "into", "when", "what",
+                "where", "which", "while", "after", "before", "should", "could", "would",
+                "their", "there", "these", "those", "about", "above", "below", "between"];
+            if common.contains(&lower.as_str()) {
+                None
+            } else {
+                Some(NerEntityType::Misc)
+            }
+        } else {
+            None
+        };
+
+        if let Some(etype) = entity_type {
+            seen.insert(clean.to_lowercase());
+            results.push(NerEntity {
+                text: clean.to_string(),
+                entity_type: etype,
+                confidence: 0.5,
+                start: 0,
+                end: clean.len(),
+            });
+        }
+    }
+
+    results
+}
+
+fn is_camel_case(s: &str) -> bool {
+    if s.len() < 4 { return false; }
+    let has_upper = s.chars().any(|c| c.is_uppercase());
+    let has_lower = s.chars().any(|c| c.is_lowercase());
+    let starts_upper = s.chars().next().map_or(false, |c| c.is_uppercase());
+    // Must have both cases and internal uppercase (not just first letter)
+    has_upper && has_lower && starts_upper && s.chars().skip(1).any(|c| c.is_uppercase())
+}
+
+fn is_acronym(s: &str) -> bool {
+    s.len() >= 2 && s.len() <= 6 && s.chars().all(|c| c.is_uppercase() || c.is_numeric())
+        && s.chars().any(|c| c.is_alphabetic())
+}
+
+fn is_version_number(s: &str) -> bool {
+    let s = s.strip_prefix('v').unwrap_or(s);
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() >= 2 && parts.iter().all(|p| {
+        let base = p.split('-').next().unwrap_or(p);
+        !base.is_empty() && base.chars().all(|c| c.is_numeric())
+    })
+}
