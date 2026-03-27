@@ -1561,6 +1561,138 @@ pub const REPLAY_BATCH_SIZE: usize = 50;
 pub const REPLAY_MIN_CONNECTIONS: usize = 0;
 
 // =============================================================================
+// WRITE GATE CONSTANTS (Predictive Coding / Novelty Filter)
+// Based on Rao & Ballard (1999): "Predictive coding in the visual cortex"
+// Only store information that violates expectations (exceeds novelty threshold)
+// =============================================================================
+
+/// Similarity threshold above which a new memory is considered redundant.
+///
+/// When a new memory's cosine similarity to its nearest neighbor exceeds this,
+/// the memory is absorbed into the existing one (importance boost) rather than
+/// stored as a separate entry.
+///
+/// Justification:
+/// - 0.90 is stricter than INTERFERENCE_SEVERE_THRESHOLD (0.95) which merely
+///   suppresses importance. The write gate catches semantically-equivalent
+///   memories that differ in phrasing but carry no new information.
+/// - Below 0.90, memories are distinct enough to warrant separate storage.
+/// - Works in concert with exact-hash dedup (catches identical content)
+///   and interference detection (handles the 0.85-0.95 band).
+pub const WRITE_GATE_ABSORPTION_THRESHOLD: f32 = 0.90;
+
+/// Minimum memory count before the write gate activates.
+///
+/// During cold-start (< this many memories), all content is novel by definition.
+/// The gate only makes sense when there's enough prior knowledge to compare against.
+///
+/// Justification:
+/// - 30 memories provides enough vector index density for meaningful similarity
+/// - Below this, false positives dominate (small index → high similarity scores)
+pub const WRITE_GATE_COLD_START_BYPASS: usize = 30;
+
+/// Importance boost given to the existing memory when a redundant write is absorbed.
+///
+/// Justification:
+/// - 0.03 (3%) per absorbed write signals "this concept keeps coming up"
+/// - Matches Hebbian boost rate for consistency
+/// - Capped at 1.0 by the boost_importance logic
+pub const WRITE_GATE_ABSORPTION_BOOST: f32 = 0.03;
+
+// =============================================================================
+// DREAM REPLAY CONSTANTS
+// Based on hippocampal replay during sleep (Wilson & McNaughton, 1994)
+// Random memory pair comparison discovers latent cross-topic connections
+// =============================================================================
+
+/// Number of random memory pairs to compare during dream replay.
+///
+/// Justification:
+/// - 50 pairs is sufficient to discover connections without excessive compute
+/// - Each pair requires one cosine similarity computation (~1µs)
+/// - Total phase cost: ~50µs + edge creation overhead
+pub const DREAM_REPLAY_PAIR_COUNT: usize = 50;
+
+/// Cosine similarity threshold for creating a discovery edge.
+///
+/// When two random memories exceed this similarity but have no existing
+/// graph edge, a weak RelatedTo edge is created for Hebbian learning to evaluate.
+///
+/// Justification:
+/// - 0.55 catches meaningful semantic connections without noise
+/// - Lower than retrieval thresholds because these are DISCOVERY edges
+///   with low initial confidence — Hebbian learning will strengthen or prune
+/// - Higher than random baseline (~0.3 for MiniLM on diverse content)
+pub const DREAM_REPLAY_SIMILARITY_THRESHOLD: f32 = 0.55;
+
+/// Maximum similarity for dream replay edges.
+///
+/// Pairs above this similarity are already well-connected (or would be caught
+/// by interference detection). Dream replay targets the UNEXPECTED connections.
+///
+/// Justification:
+/// - 0.85 matches INTERFERENCE_SIMILARITY_THRESHOLD — above this, the
+///   interference system already manages the relationship
+pub const DREAM_REPLAY_SIMILARITY_CEILING: f32 = 0.85;
+
+/// Initial confidence for dream-discovered edges.
+///
+/// Justification:
+/// - 0.2 is deliberately low — these are hypotheses, not confirmed relationships
+/// - Hebbian learning will boost to 0.5+ if co-activated, or decay to 0 if not
+/// - Matches the "weak synapse" model in neuroscience
+pub const DREAM_REPLAY_EDGE_CONFIDENCE: f32 = 0.2;
+
+// =============================================================================
+// RECONSOLIDATION CONSTANTS
+// Based on Nader et al. (2000): "Fear memories require protein synthesis
+// in the amygdala for reconsolidation after retrieval"
+// Retrieved memories become labile and update based on current context
+// =============================================================================
+
+/// Importance boost per retrieval, scaled by relevance score.
+///
+/// Applied as: importance += RECONSOLIDATION_BOOST * relevance_score
+///
+/// Justification:
+/// - 0.02 (2%) per retrieval is conservative
+/// - Scaled by relevance so highly-relevant retrievals strengthen more
+/// - Over 10 retrievals at score 0.8: +16% cumulative (significant but not dominant)
+pub const RECONSOLIDATION_BOOST: f32 = 0.02;
+
+/// Minimum seconds between reconsolidation events for the same memory.
+///
+/// Prevents runaway feedback loops where retrieval → boost → higher ranking → more retrieval.
+///
+/// Justification:
+/// - 3600s (1 hour) matches the biological reconsolidation window
+/// - Within a single session, a memory is typically retrieved once or twice
+/// - Cross-session retrieval respects this naturally
+pub const RECONSOLIDATION_COOLDOWN_SECS: i64 = 3600;
+
+/// Maximum number of memories to reconsolidate per recall operation.
+///
+/// Justification:
+/// - 5 matches the typical top-k returned to the user
+/// - Reconsolidating more would update memories the user never saw
+pub const RECONSOLIDATION_MAX_PER_RECALL: usize = 5;
+
+// =============================================================================
+// MEMORY ANCHORING CONSTANTS
+// User-initiated decay resistance for critical facts
+// =============================================================================
+
+/// Minimum importance floor for anchored memories.
+///
+/// Anchored memories cannot decay below this importance level.
+///
+/// Justification:
+/// - 0.5 keeps anchored memories in the "notable" range (above median)
+/// - Still allows them to be ranked below truly hot memories (0.8+)
+/// - Prevents total decay while not artificially inflating rankings
+pub const ANCHOR_IMPORTANCE_FLOOR: f32 = 0.5;
+
+// =============================================================================
 // MEMORY INTERFERENCE CONSTANTS (SHO-106)
 // Based on interference theory: similar memories compete and can disrupt each other
 // =============================================================================

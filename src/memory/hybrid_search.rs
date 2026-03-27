@@ -554,6 +554,11 @@ impl CrossEncoderReranker {
     }
 }
 
+/// Public alias for cross-encoder reranking in recall pipeline (Plan 001 §2.1)
+pub fn cosine_similarity_pub(a: &[f32], b: &[f32]) -> f32 {
+    cosine_similarity(a, b)
+}
+
 /// Compute cosine similarity between two vectors
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {

@@ -631,13 +631,42 @@ impl MemorySystem {
         Ok(memory_id)
     }
 
-    /// Store a new memory (takes ownership to avoid clones)
-    /// Thread-safe: uses interior mutability for all internal state
-    /// If `created_at` is None, uses current time (Utc::now())
+    /// Store a new memory (full synchronous path: embedding + vector indexing + interference).
+    /// Thread-safe: uses interior mutability for all internal state.
+    /// If `created_at` is None, uses current time (Utc::now()).
     pub fn remember(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<MemoryId> {
+        self.remember_impl(experience, created_at, false)
+    }
+
+    /// Store a new memory WITHOUT embedding generation or vector indexing (fast path).
+    ///
+    /// Returns in ~10ms instead of 150-250ms. The memory is immediately searchable
+    /// via BM25 keyword search. Call `embed_and_index()` afterward (e.g. from a
+    /// background task) to generate the embedding, update the vector index, and run
+    /// interference detection.
+    pub fn remember_deferred(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<MemoryId> {
+        self.remember_impl(experience, created_at, true)
+    }
+
+    /// Internal implementation shared by `remember()` and `remember_deferred()`.
+    ///
+    /// When `defer_embedding` is true, skips:
+    /// - ONNX embedding generation (80-150ms)
+    /// - Vector index insertion (depends on embedding + additional ONNX for chunks)
+    /// - Interference detection (depends on embedding)
+    fn remember_impl(
         &self,
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
+        defer_embedding: bool,
     ) -> Result<MemoryId> {
         // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
         // If identical content already exists, return the existing MemoryId instead of
@@ -660,8 +689,9 @@ impl MemorySystem {
         let importance = self.calculate_importance(&experience);
 
         // PERFORMANCE: Content embedding cache (80ms → <1μs for repeated content)
-        // If experience doesn't have embeddings, check cache or generate
-        if experience.embeddings.is_none() {
+        // If experience doesn't have embeddings, check cache or generate.
+        // Skipped when defer_embedding=true — handled by embed_and_index() later.
+        if !defer_embedding && experience.embeddings.is_none() {
             // SHA256 hash for stable cache keys (survives restarts, unlike DefaultHasher)
             let content_hash = Self::sha256_hash(&experience.content);
 
@@ -722,14 +752,18 @@ impl MemorySystem {
             .write()
             .add_shared(Arc::clone(&memory))?;
 
-        // CRITICAL: Index memory immediately for semantic search (don't wait for long-term promotion)
-        // This ensures new memories are searchable right away, not only after consolidation
-        let indexed = if let Err(e) = self.retriever.index_memory(&memory) {
-            tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
-            // Don't fail the record operation if indexing fails - memory is still stored
-            false
+        // Index memory for semantic search (vector DB).
+        // When defer_embedding=true, this is skipped — embed_and_index() handles it later.
+        // BM25 keyword search (below) provides immediate searchability regardless.
+        let indexed = if !defer_embedding {
+            if let Err(e) = self.retriever.index_memory(&memory) {
+                tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+                false
+            } else {
+                true
+            }
         } else {
-            true
+            false
         };
 
         // NOTE: Graph processing (entities + co-occurrence edges) is handled by
@@ -824,7 +858,9 @@ impl MemorySystem {
         }
 
         // SHO-106: Check for interference with existing memories
-        // Find similar memories and apply retroactive/proactive interference
+        // Find similar memories and apply retroactive/proactive interference.
+        // Skipped when defer_embedding=true — embed_and_index() runs this later.
+        if !defer_embedding {
         if let Some(embedding) = &memory.experience.embeddings {
             // Search for similar memories (excluding the new one)
             if let Ok(similar_ids) =
@@ -931,6 +967,7 @@ impl MemorySystem {
                 }
             }
         }
+        } // end if !defer_embedding (interference)
 
         // If important enough, prepare for session storage
         let added_to_session = if importance > self.config.importance_threshold {
@@ -974,16 +1011,197 @@ impl MemorySystem {
         Ok(memory_id)
     }
 
+    /// Complete the deferred embedding + vector indexing for a previously stored memory.
+    ///
+    /// Call this after `remember_deferred()` to generate the ONNX embedding, persist it,
+    /// index the memory in the vector DB, and run interference detection.
+    ///
+    /// Safe to call from a background thread (e.g. `tokio::task::spawn_blocking`).
+    /// All errors are non-fatal — the memory remains searchable via BM25 regardless.
+    pub fn embed_and_index(&self, memory_id: &MemoryId) -> Result<()> {
+        let _span = tracing::info_span!("embed_and_index", memory_id = %memory_id.0).entered();
+        let start = std::time::Instant::now();
+
+        // Load fresh from storage (owned Memory, so we can mutate experience.embeddings)
+        let mut memory = self
+            .long_term_memory
+            .get(memory_id)
+            .context("Failed to load memory for background indexing")?;
+
+        let importance = memory.importance();
+
+        // Generate embedding if not already present
+        if memory.experience.embeddings.is_none() {
+            let content_hash = Self::sha256_hash(&memory.experience.content);
+
+            if let Some(cached) = self.content_cache.get(&content_hash) {
+                memory.experience.embeddings = Some(cached.clone());
+                EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
+            } else {
+                EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
+                match self.embedder.encode(&memory.experience.content) {
+                    Ok(embedding) => {
+                        self.content_cache.insert(content_hash, embedding.clone());
+                        EMBEDDING_CACHE_CONTENT_SIZE
+                            .set(self.content_cache.entry_count() as i64);
+                        memory.experience.embeddings = Some(embedding);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Background embedding generation failed: {e}");
+                        // Non-fatal: memory is still searchable via BM25
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Persist embedding to storage so restarts don't re-embed
+            if let Err(e) = self.long_term_memory.update(&memory) {
+                tracing::warn!("Failed to persist background embedding: {e}");
+            }
+        }
+
+        // Vector index (uses pre-computed embedding for short content, re-embeds chunks)
+        let memory_arc = Arc::new(memory);
+        if let Err(e) = self.retriever.index_memory(&memory_arc) {
+            tracing::warn!(
+                "Background vector indexing failed for {}: {e}",
+                memory_id.0
+            );
+        } else {
+            self.stats.write().vector_index_count += 1;
+        }
+
+        // Interference detection (retroactive + proactive)
+        if let Some(embedding) = &memory_arc.experience.embeddings {
+            if let Ok(similar_ids) =
+                self.retriever
+                    .search_by_embedding(embedding, 5, Some(&memory_arc.id))
+            {
+                if !similar_ids.is_empty() {
+                    let similar_memories: Vec<_> = similar_ids
+                        .iter()
+                        .filter_map(|(id, similarity)| {
+                            self.retriever.get_from_storage(id).ok().map(|m| {
+                                (
+                                    id.0.to_string(),
+                                    *similarity,
+                                    m.importance(),
+                                    m.created_at,
+                                    m.experience.content.chars().take(50).collect::<String>(),
+                                )
+                            })
+                        })
+                        .collect();
+
+                    if !similar_memories.is_empty() {
+                        let interference_result =
+                            self.interference_detector.write().check_interference(
+                                &memory_arc.id.0.to_string(),
+                                importance,
+                                memory_arc.created_at,
+                                &similar_memories,
+                            );
+
+                        // Apply retroactive interference (weaken old similar memories)
+                        for (old_id, _similarity, decay_amount) in
+                            &interference_result.retroactive_targets
+                        {
+                            if let Ok(old_uuid) = uuid::Uuid::parse_str(old_id) {
+                                if let Ok(old_memory) =
+                                    self.long_term_memory.get(&MemoryId(old_uuid))
+                                {
+                                    old_memory.decay_importance(*decay_amount);
+                                    let _ = self.long_term_memory.update(&old_memory);
+                                }
+                            }
+                        }
+
+                        // Apply proactive interference (reduce new memory importance)
+                        if interference_result.proactive_decay > 0.0 {
+                            memory_arc.decay_importance(interference_result.proactive_decay);
+                            let _ = self.long_term_memory.update(&memory_arc);
+                        }
+
+                        // Record interference events for introspection
+                        for event in &interference_result.events {
+                            self.record_consolidation_event(event.clone());
+                        }
+
+                        // Suppress near-duplicates
+                        if interference_result.is_duplicate {
+                            tracing::info!(
+                                memory_id = %memory_arc.id.0,
+                                "Near-duplicate detected (≥0.95 cosine), suppressing importance"
+                            );
+                            memory_arc.decay_importance(0.99);
+                            let _ = self.long_term_memory.update(&memory_arc);
+                        }
+
+                        // Persist interference records
+                        {
+                            let detector = self.interference_detector.read();
+                            let affected_ids = detector.get_affected_ids_from_check(
+                                &memory_arc.id.0.to_string(),
+                                &interference_result,
+                            );
+                            for (id, records) in detector.get_records_for_ids(&affected_ids) {
+                                let _ =
+                                    self.long_term_memory.save_interference_records(id, records);
+                            }
+                            let (total_events, _) = detector.stats();
+                            let _ = self
+                                .long_term_memory
+                                .save_interference_event_count(total_events);
+                        }
+                    }
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        tracing::debug!(
+            memory_id = %memory_id.0,
+            elapsed_ms = elapsed.as_millis(),
+            "Background embed_and_index complete"
+        );
+        crate::metrics::EMBED_BACKGROUND_DURATION.observe(elapsed.as_secs_f64());
+
+        Ok(())
+    }
+
     /// Remember with agent context for multi-agent systems
     ///
     /// Same as `remember` but tracks which agent created the memory,
     /// enabling agent-specific retrieval and hierarchical memory tracking.
     pub fn remember_with_agent(
         &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<MemoryId> {
+        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, false)
+    }
+
+    /// Fast-path variant of `remember_with_agent` — skips content embedding,
+    /// entity batch encoding, and vector indexing. Call `embed_and_index()` afterward.
+    pub fn remember_with_agent_deferred(
+        &self,
+        experience: Experience,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<MemoryId> {
+        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, true)
+    }
+
+    fn remember_with_agent_impl(
+        &self,
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<String>,
         run_id: Option<String>,
+        defer_embedding: bool,
     ) -> Result<MemoryId> {
         // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
         if let Some(existing_id) = self
@@ -1003,7 +1221,8 @@ impl MemorySystem {
         let importance = self.calculate_importance(&experience);
 
         // PERFORMANCE: Content embedding cache
-        if experience.embeddings.is_none() {
+        // Skipped when defer_embedding=true — handled by embed_and_index() later.
+        if !defer_embedding && experience.embeddings.is_none() {
             let content_hash = Self::sha256_hash(&experience.content);
             if let Some(cached_embedding) = self.content_cache.get(&content_hash) {
                 experience.embeddings = Some(cached_embedding.clone());
@@ -1046,9 +1265,11 @@ impl MemorySystem {
             .write()
             .add_shared(Arc::clone(&memory))?;
 
-        // Index for semantic search
-        if let Err(e) = self.retriever.index_memory(&memory) {
-            tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+        // Index for semantic search (skipped when deferred — embed_and_index handles it)
+        if !defer_embedding {
+            if let Err(e) = self.retriever.index_memory(&memory) {
+                tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
+            }
         }
 
         // Add entities to knowledge graph with co-occurrence edges
@@ -1061,6 +1282,8 @@ impl MemorySystem {
             let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
 
             // Batch-encode entity names for concept-level dedup
+            // When defer_embedding=true, skip ONNX batch encoding — graph still works,
+            // entities are created without embeddings (semantic edge weighting falls back to 1.0)
             let entity_names: Vec<&str> = memory
                 .experience
                 .entities
@@ -1069,6 +1292,8 @@ impl MemorySystem {
                 .collect();
             let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
                 Vec::new()
+            } else if defer_embedding {
+                vec![None; entity_names.len()]
             } else {
                 match self.embedder.encode_batch(&entity_names) {
                     Ok(embs) => embs.into_iter().map(Some).collect(),
@@ -1408,9 +1633,14 @@ impl MemorySystem {
         // Extract temporal constraints from query and use them to boost/filter results.
         let query_temporal = query_parser::extract_temporal_refs(query_text);
         let has_temporal_query = query_parser::requires_temporal_filtering(query_text);
+        // Broader temporal intent detection: includes WhenQuestion, SpecificTime,
+        // Duration, Ordering — any query with temporal semantics should boost
+        // temporal fact source memories in RRF fusion.
+        let temporal_intent = query_parser::detect_temporal_intent(query_text);
+        let has_any_temporal_intent =
+            !matches!(temporal_intent, query_parser::TemporalIntent::None);
 
         if has_temporal_query {
-            let temporal_intent = query_parser::detect_temporal_intent(query_text);
             tracing::debug!(
                 "Temporal query detected: intent={:?}, refs={:?}",
                 temporal_intent,
@@ -1564,8 +1794,10 @@ impl MemorySystem {
         // 2. Extract entity (Melanie) and event keywords (paint, sunrise, camping)
         // 3. Look up temporal facts matching these
         // 4. Boost the source memories of matching facts
-        // Temporal fact lookup - boost source memories of matching facts in Layer 4.5
-        let temporal_fact_boost_ids: HashSet<MemoryId> = if has_temporal_query {
+        // Temporal fact lookup - boost source memories of matching facts in Layer 4.55
+        // Uses broader temporal intent (including WhenQuestion) to surface fact sources
+        // even when the query asks FOR a date rather than filtering BY a date.
+        let temporal_fact_boost_ids: HashSet<MemoryId> = if has_any_temporal_intent {
             if let Some(user_id) = &query.user_id {
                 // Get entity name (first focal entity)
                 let entity = query_analysis
@@ -1901,7 +2133,7 @@ impl MemorySystem {
                                         // Keep most recent episodes — recency correlates
                                         // with relevance for graph-surfaced candidates.
                                         eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                        eps.truncate(50);
+                                        eps.truncate(20);
                                         for ep in eps {
                                             let mid = MemoryId(ep.uuid);
                                             if episode_candidates
@@ -1909,13 +2141,17 @@ impl MemorySystem {
                                                 .is_none_or(|c| c.contains(&mid))
                                             {
                                                 let path_boost = 1.5;
-                                                ids.push((
-                                                    mid,
-                                                    tr.entity.salience
-                                                        * tr.decay_factor
-                                                        * path_boost,
-                                                    tr.decay_factor,
-                                                ));
+                                                let activation = tr.entity.salience
+                                                    * tr.decay_factor
+                                                    * path_boost;
+                                                // Relevance floor: skip low-activation candidates
+                                                if activation >= 0.1 {
+                                                    ids.push((
+                                                        mid,
+                                                        activation,
+                                                        tr.decay_factor,
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
@@ -1949,18 +2185,23 @@ impl MemorySystem {
                         for tr in &t.entities {
                             if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
                                 eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                eps.truncate(50);
+                                eps.truncate(20);
                                 for ep in eps {
                                     let mid = MemoryId(ep.uuid);
                                     if episode_candidates
                                         .as_ref()
                                         .is_none_or(|c| c.contains(&mid))
                                     {
-                                        ids.push((
-                                            mid,
-                                            tr.entity.salience * tr.decay_factor,
-                                            tr.decay_factor,
-                                        ));
+                                        let activation =
+                                            tr.entity.salience * tr.decay_factor;
+                                        // Relevance floor: skip low-activation candidates
+                                        if activation >= 0.1 {
+                                            ids.push((
+                                                mid,
+                                                activation,
+                                                tr.decay_factor,
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -2021,7 +2262,7 @@ impl MemorySystem {
         let vector_query = Query {
             user_id: query.user_id.clone(),
             query_text: None, // Don't re-generate embedding
-            query_embedding: Some(query_embedding),
+            query_embedding: Some(query_embedding.clone()),
             time_range: query.time_range,
             experience_types: query.experience_types.clone(),
             importance_threshold: query.importance_threshold,
@@ -2147,9 +2388,17 @@ impl MemorySystem {
             // Density-based weights (already tuned in calculate_density_weights)
             // Sparse (≤0.5): graph_w=0.5, semantic_w=0.4, linguistic_w=0.1
             // Dense (≥2.0):  graph_w=0.1, semantic_w=0.7, linguistic_w=0.2
-            let (semantic_w, graph_w, linguistic_w) = graph_density
+            let density_weights = graph_density
                 .map(calculate_density_weights)
                 .unwrap_or((0.6, 0.3, 0.1));
+
+            // Phase 2.2: Modulate weights by query type (Plan 001 §2.2)
+            // Temporal → BM25↑, Attribute → Graph↑, Exploratory → density defaults
+            let (semantic_w, graph_w, linguistic_w) =
+                crate::memory::graph_retrieval::apply_query_type_weights(
+                    density_weights,
+                    &query_type,
+                );
 
             // Hybrid weight = semantic + linguistic (BM25 + vector combined)
             let hybrid_w = semantic_w + linguistic_w;
@@ -2210,11 +2459,11 @@ impl MemorySystem {
             // ===========================================================================
             // LAYER 4.55: TEMPORAL FACT BOOST
             // ===========================================================================
-            // Source memories of matching temporal facts get a moderate boost.
-            // This ensures "When did Melanie paint a sunrise?" boosts the memory that
-            // recorded the event, not just memories with temporal_refs.
+            // Source memories of matching temporal facts get a precision-tuned boost.
+            // Fires for all temporal intents (including WhenQuestion) to surface
+            // fact-sourced memories. Conservative boost avoids overriding semantic rank.
             if !temporal_fact_boost_ids.is_empty() {
-                const TEMPORAL_FACT_BOOST: f32 = 0.4;
+                const TEMPORAL_FACT_BOOST: f32 = 0.15;
                 let mut boosted_count = 0;
                 for id in &temporal_fact_boost_ids {
                     if fused.contains_key(id) {
@@ -2435,8 +2684,68 @@ impl MemorySystem {
                 }
             }
 
-            res.truncate(query.max_results);
-            tracing::debug!("Layer 4: {} fused results", res.len());
+            // ===========================================================================
+            // LAYER 4.95: NEAR-DUPLICATE REMOVAL
+            // ===========================================================================
+            // Remove near-duplicate results by comparing content prefixes (first 200 chars).
+            // When two results share identical content prefixes, keep only the higher-scored
+            // one. This prevents redundant results from consuming top-k slots.
+            {
+                let pre_dedup = res.len();
+                // Collect content prefixes for the top candidates (2x max to allow fills)
+                let dedup_budget = (query.max_results * 2).min(res.len());
+                let prefixes: Vec<Option<String>> = res
+                    .iter()
+                    .take(dedup_budget)
+                    .map(|(id, _)| {
+                        get_content(id).map(|c| {
+                            c.chars().take(200).collect::<String>().to_lowercase()
+                        })
+                    })
+                    .collect();
+
+                let mut remove_indices: Vec<bool> = vec![false; res.len()];
+                for i in 0..prefixes.len() {
+                    if remove_indices[i] {
+                        continue;
+                    }
+                    if let Some(ref pi) = prefixes[i] {
+                        for j in (i + 1)..prefixes.len() {
+                            if remove_indices[j] {
+                                continue;
+                            }
+                            if let Some(ref pj) = prefixes[j] {
+                                if pi == pj {
+                                    // Results are sorted by score desc; j has lower score
+                                    remove_indices[j] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut idx = 0;
+                res.retain(|_| {
+                    let keep = !remove_indices.get(idx).copied().unwrap_or(false);
+                    idx += 1;
+                    keep
+                });
+
+                let removed = pre_dedup - res.len();
+                if removed > 0 {
+                    tracing::debug!(
+                        "Layer 4.95: Removed {} near-duplicate results from {} candidates",
+                        removed,
+                        pre_dedup
+                    );
+                }
+            }
+
+            // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
+            // Rerank top-20 after memory fetch, then truncate to max_results.
+            let rerank_budget = 20_usize.max(query.max_results);
+            res.truncate(rerank_budget);
+            tracing::debug!("Layer 4: {} fused results (rerank budget={})", res.len(), rerank_budget);
             (res, heb)
         };
 
@@ -2646,6 +2955,58 @@ impl MemorySystem {
             filtered_out,
             "recall [layer:5] memory fetch + unified scoring"
         );
+
+        // =====================================================================
+        // LAYER 5.5: CROSS-ENCODER RERANKING (Plan 001 §2.1)
+        // =====================================================================
+        // Rerank the wider candidate pool using query-document cosine similarity.
+        // This is a bi-encoder approximation (separate query/doc embeddings) —
+        // not a true cross-encoder (joint encoding), but still improves precision
+        // by re-scoring against the actual query rather than relying on rank fusion.
+        //
+        // Blend: 70% unified score (preserves multi-signal fusion) + 30% cosine
+        // similarity (precision boost). Then truncate to max_results.
+        if memories.len() > query.max_results {
+            let rerank_start = std::time::Instant::now();
+            let candidate_count = memories.len();
+
+            // Batch-encode all candidate contents in one ONNX call (~50-80ms for 20 texts
+            // vs ~400ms for 20 individual encodes). This is the critical latency optimization.
+            let texts: Vec<String> = memories
+                .iter()
+                .map(|m| m.experience.content.clone())
+                .collect();
+            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+            if let Ok(doc_embeddings) = self.embedder.encode_batch(&text_refs) {
+                for (mem, doc_emb) in memories.iter_mut().zip(doc_embeddings.iter()) {
+                    let cosine_sim = crate::memory::hybrid_search::cosine_similarity_pub(
+                        &query_embedding,
+                        doc_emb,
+                    );
+                    let base = mem.score.unwrap_or(0.0);
+                    let blended = base * 0.70 + cosine_sim * 0.30 * base.max(0.01);
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(blended);
+                    *mem = Arc::new(cloned);
+                }
+
+                memories.sort_by(|a, b| {
+                    b.score
+                        .unwrap_or(0.0)
+                        .total_cmp(&a.score.unwrap_or(0.0))
+                });
+            }
+
+            memories.truncate(query.max_results);
+            let rerank_elapsed = rerank_start.elapsed();
+            tracing::info!(
+                candidate_count,
+                rerank_ms = format!("{:.2}", rerank_elapsed.as_secs_f64() * 1000.0),
+                final_count = memories.len(),
+                "recall [layer:5.5] cross-encoder reranking (batch)"
+            );
+        }
 
         // Linguistic analysis: additive boost (5% of IC weight), not a full re-sort
         if !query_analysis.focal_entities.is_empty() {

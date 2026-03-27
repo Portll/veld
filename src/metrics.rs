@@ -215,6 +215,18 @@ pub static EMBEDDING_GENERATE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|
     .expect("EMBEDDING_GENERATE_DURATION metric must be valid at compile time")
 });
 
+/// Background embed_and_index duration (deferred embedding path)
+pub static EMBED_BACKGROUND_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "shodh_embed_background_duration_seconds",
+            "Background embed_and_index operation duration",
+        )
+        .buckets(vec![0.01, 0.05, 0.1, 0.15, 0.25, 0.5, 1.0]),
+    )
+    .expect("EMBED_BACKGROUND_DURATION metric must be valid at compile time")
+});
+
 /// Embedding timeout count
 pub static EMBEDDING_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -467,6 +479,54 @@ pub static BATCH_STORE_SIZE: LazyLock<Histogram> = LazyLock::new(|| {
 });
 
 // ============================================================================
+// Write Gate Metrics (Predictive Coding)
+// ============================================================================
+
+/// Memories absorbed by the write gate (redundant content detected)
+pub static WRITE_GATE_ABSORBED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_write_gate_absorbed_total",
+        "Memories absorbed by write gate due to semantic redundancy",
+    )
+    .expect("WRITE_GATE_ABSORBED metric must be valid at compile time")
+});
+
+// ============================================================================
+// Dream Replay Metrics (Consolidation Discovery)
+// ============================================================================
+
+/// Edges discovered during dream replay phase
+pub static DREAM_REPLAY_EDGES_CREATED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_dream_replay_edges_created_total",
+        "Graph edges discovered during dream replay consolidation",
+    )
+    .expect("DREAM_REPLAY_EDGES_CREATED metric must be valid at compile time")
+});
+
+/// Memory pairs evaluated during dream replay
+pub static DREAM_REPLAY_PAIRS_EVALUATED: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_dream_replay_pairs_evaluated_total",
+        "Memory pairs compared during dream replay",
+    )
+    .expect("DREAM_REPLAY_PAIRS_EVALUATED metric must be valid at compile time")
+});
+
+// ============================================================================
+// Reconsolidation Metrics
+// ============================================================================
+
+/// Memories reconsolidated (importance boosted on retrieval)
+pub static RECONSOLIDATION_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_reconsolidation_total",
+        "Memories reconsolidated (importance updated on retrieval)",
+    )
+    .expect("RECONSOLIDATION_TOTAL metric must be valid at compile time")
+});
+
+// ============================================================================
 // Embedding Cache Metrics (SHO-68)
 // ============================================================================
 
@@ -575,6 +635,7 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(EMBEDDING_GENERATE_TOTAL, "EMBEDDING_GENERATE_TOTAL");
     register!(EMBEDDING_GENERATE_DURATION, "EMBEDDING_GENERATE_DURATION");
     register!(EMBEDDING_TIMEOUT_TOTAL, "EMBEDDING_TIMEOUT_TOTAL");
+    register!(EMBED_BACKGROUND_DURATION, "EMBED_BACKGROUND_DURATION");
     register!(NER_LOCK_TIMEOUT_TOTAL, "NER_LOCK_TIMEOUT_TOTAL");
 
     // Memory usage metrics (aggregate)
@@ -611,6 +672,16 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     // Batch operation metrics
     register!(BATCH_STORE_DURATION, "BATCH_STORE_DURATION");
     register!(BATCH_STORE_SIZE, "BATCH_STORE_SIZE");
+
+    // Write gate metrics
+    register!(WRITE_GATE_ABSORBED, "WRITE_GATE_ABSORBED");
+
+    // Dream replay metrics
+    register!(DREAM_REPLAY_EDGES_CREATED, "DREAM_REPLAY_EDGES_CREATED");
+    register!(DREAM_REPLAY_PAIRS_EVALUATED, "DREAM_REPLAY_PAIRS_EVALUATED");
+
+    // Reconsolidation metrics
+    register!(RECONSOLIDATION_TOTAL, "RECONSOLIDATION_TOTAL");
 
     // Embedding cache metrics (SHO-68)
     register!(EMBEDDING_CACHE_QUERY, "EMBEDDING_CACHE_QUERY");
