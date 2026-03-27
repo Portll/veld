@@ -949,6 +949,42 @@ pub const ONTOLOGICAL_RERANK_BOOST: f32 = 0.08;
 pub const ONTOLOGICAL_RERANK_MAX: f32 = 0.25;
 
 // =============================================================================
+// QUERY DECOMPOSITION CONSTANTS
+// =============================================================================
+// Multi-hop and multi-entity queries dilute vector search signal when embedded
+// as a single vector. Decomposition splits compound queries into sub-queries,
+// runs independent vector searches, and merges via weighted RRF.
+//
+// Reference: Khattab et al. (2021) "Baleen: Robust Multi-Hop Reasoning"
+// Key insight: Decomposed retrieval improves recall for multi-entity questions
+// by 15-25% over single-vector search.
+// =============================================================================
+
+/// RRF weight for sub-query vector search results
+///
+/// Sub-queries receive lower weight than the original query to prevent
+/// partial matches from dominating the fused ranking. The original query
+/// always gets weight 1.0; sub-queries get this weight.
+///
+/// Justification:
+/// - 0.6 balances recall improvement with precision preservation
+/// - Sub-queries capture individual entities/aspects but lack full context
+/// - Original query still dominates when it finds the right answer directly
+/// - At 0.6, a sub-query rank-1 result contributes 60% of what original rank-1 does
+pub const QUERY_DECOMPOSITION_SUB_WEIGHT: f32 = 0.6;
+
+/// Maximum sub-queries produced by decomposition
+///
+/// Caps the number of sub-queries to prevent latency explosion from
+/// highly compound queries. Each sub-query requires an embedding + vector search.
+///
+/// Justification:
+/// - 4 sub-queries × ~15ms embedding + ~5ms search = ~80ms overhead max
+/// - Most compound queries decompose into 2-3 sub-queries
+/// - Beyond 4, sub-queries become too narrow and add noise
+pub const QUERY_DECOMPOSITION_MAX_SUBQUERIES: usize = 4;
+
+// =============================================================================
 // EDGE-TIER TRUST WEIGHTS FOR SPREADING ACTIVATION
 // Based on hippocampal-cortical consolidation: edges that survive decay are
 // more reliable for graph traversal. Dense graphs (L1) are noisy for search,
@@ -1908,6 +1944,14 @@ pub const SEMANTIC_CLUSTER_THRESHOLD: f32 = 0.75;
 /// - Longer windows would merge unrelated sessions
 pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 
+/// Additive RRF boost for memories whose IDs appear in temporal fact matches.
+///
+/// Applied in Layer 4.55 when the query has temporal intent and
+/// TemporalFactStore returns facts whose `source_memory_id` matches a
+/// candidate.  0.20 is calibrated to lift temporal-source memories by ~2
+/// RRF positions without overriding strong semantic matches.
+pub const TEMPORAL_RECALL_BOOST: f32 = 0.20;
+
 /// Minimum memories required for temporal cluster trigger
 ///
 /// Justification:
@@ -2220,5 +2264,11 @@ pub const TIER_LTP_THRESHOLD: f32 = 0.8;
 // | ONTOLOGICAL_MIN_CONFIDENCE    | memory/mod.rs             | semantic_retrieve() density gating  |
 // | ONTOLOGICAL_RERANK_BOOST      | memory/mod.rs             | semantic_retrieve() Layer 4.9       |
 // | ONTOLOGICAL_RERANK_MAX        | memory/mod.rs             | semantic_retrieve() Layer 4.9       |
+//
+// ## Query Decomposition Constants (Khattab et al. 2021)
+// | Constant                              | File                    | Function/Context                        |
+// |----------------------------------------|-------------------------|-----------------------------------------|
+// | QUERY_DECOMPOSITION_SUB_WEIGHT         | memory/mod.rs           | semantic_retrieve() decomposed RRF      |
+// | QUERY_DECOMPOSITION_MAX_SUBQUERIES     | memory/query_parser.rs  | decompose_query() cap                   |
 //
 // =============================================================================
