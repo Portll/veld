@@ -170,6 +170,10 @@ pub struct TemporalFactsRequest {
     pub event: Option<String>,
     #[serde(default = "facts_default_limit")]
     pub limit: usize,
+    /// When true, include facts that have been invalidated by contradiction detection.
+    /// Default: false (only return currently-valid facts).
+    #[serde(default)]
+    pub include_expired: bool,
 }
 
 /// Request for searching temporal facts
@@ -179,6 +183,9 @@ pub struct TemporalFactsSearchRequest {
     pub query: String,
     #[serde(default = "facts_default_limit")]
     pub limit: usize,
+    /// When true, include facts that have been invalidated by contradiction detection.
+    #[serde(default)]
+    pub include_expired: bool,
 }
 
 /// A single temporal fact in the API response
@@ -191,6 +198,12 @@ pub struct TemporalFactEntry {
     pub source_memory_id: String,
     pub confidence: f32,
     pub source_text: String,
+    /// When this fact became true (ISO 8601)
+    pub valid_from: Option<String>,
+    /// When this fact was invalidated (ISO 8601). None means still valid.
+    pub valid_until: Option<String>,
+    /// Whether this fact is currently valid
+    pub is_valid: bool,
 }
 
 /// Response containing temporal facts
@@ -201,6 +214,8 @@ pub struct TemporalFactsResponse {
 }
 
 fn temporal_fact_to_entry(fact: &TemporalFact) -> TemporalFactEntry {
+    let is_valid = fact.valid_until.is_none()
+        || fact.valid_until.is_some_and(|until| until >= chrono::Utc::now());
     TemporalFactEntry {
         entity: fact.entity.clone(),
         event: fact.event.clone(),
@@ -209,6 +224,9 @@ fn temporal_fact_to_entry(fact: &TemporalFact) -> TemporalFactEntry {
         source_memory_id: fact.source_memory_id.0.to_string(),
         confidence: fact.confidence,
         source_text: fact.source_text.clone(),
+        valid_from: fact.valid_from.map(|t| t.to_rfc3339()),
+        valid_until: fact.valid_until.map(|t| t.to_rfc3339()),
+        is_valid,
     }
 }
 
@@ -228,21 +246,36 @@ pub async fn list_temporal_facts(
     let entity = req.entity.clone();
     let event = req.event.clone();
     let limit = req.limit;
+    let include_expired = req.include_expired;
 
     let facts = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
         match (entity.as_deref(), event.as_deref()) {
             (Some(entity), Some(event)) => {
                 let keywords: Vec<&str> = event.split_whitespace().collect();
-                memory_guard.find_temporal_facts(&user_id, entity, &keywords, None)
+                memory_guard.find_temporal_facts_filtered(
+                    &user_id,
+                    entity,
+                    &keywords,
+                    None,
+                    include_expired,
+                )
             }
-            (Some(entity), None) => {
-                memory_guard.find_temporal_facts_by_entity(&user_id, entity, limit)
+            (Some(entity), None) => memory_guard.find_temporal_facts_by_entity_filtered(
+                &user_id,
+                entity,
+                limit,
+                include_expired,
+            ),
+            (None, Some(event)) => memory_guard.find_temporal_facts_by_event_filtered(
+                &user_id,
+                event,
+                limit,
+                include_expired,
+            ),
+            (None, None) => {
+                memory_guard.list_temporal_facts_filtered(&user_id, limit, include_expired)
             }
-            (None, Some(event)) => {
-                memory_guard.find_temporal_facts_by_event(&user_id, event, limit)
-            }
-            (None, None) => memory_guard.list_temporal_facts(&user_id, limit),
         }
     })
     .await
@@ -272,11 +305,13 @@ pub async fn search_temporal_facts(
     let user_id = req.user_id.clone();
     let query = req.query.clone();
     let limit = req.limit;
+    let include_expired = req.include_expired;
 
     let facts = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
         // List all temporal facts then filter by query relevance
-        let all_facts = memory_guard.list_temporal_facts(&user_id, 1000)?;
+        let all_facts =
+            memory_guard.list_temporal_facts_filtered(&user_id, 1000, include_expired)?;
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
 

@@ -59,6 +59,13 @@ pub struct TemporalFact {
     pub confidence: f32,
     /// Original sentence fragment
     pub source_text: String,
+    /// When this fact became true (defaults to conversation_date if not set)
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// When this fact stopped being true (None = still valid).
+    /// Set automatically by contradiction detection when a newer fact supersedes this one.
+    #[serde(default)]
+    pub valid_until: Option<DateTime<Utc>>,
 }
 
 /// Resolved time representation
@@ -107,6 +114,14 @@ impl ResolvedTime {
             ResolvedTime::Year(y) => query_lower.contains(&y.to_string()),
             _ => false,
         }
+    }
+}
+
+/// Returns `true` if the fact has been invalidated (valid_until is set and in the past).
+fn is_expired(fact: &TemporalFact) -> bool {
+    match fact.valid_until {
+        Some(until) => until < Utc::now(),
+        None => false,
     }
 }
 
@@ -169,28 +184,123 @@ impl TemporalFactStore {
         }
     }
 
-    /// Find facts by entity
+    /// Check if a new fact contradicts existing facts about the same entity and event type.
+    /// If so, set `valid_until` on the old fact to the new fact's `valid_from` timestamp,
+    /// effectively invalidating the superseded fact.
+    ///
+    /// Returns the IDs of facts that were invalidated.
+    pub fn detect_and_resolve_contradictions(
+        &self,
+        user_id: &str,
+        new_fact: &TemporalFact,
+    ) -> Result<Vec<String>> {
+        // Find existing valid facts for the same entity
+        let existing = self.find_by_entity_filtered(user_id, &new_fact.entity, 500, false)?;
+
+        let mut invalidated_ids = Vec::new();
+        let now = new_fact.valid_from.unwrap_or_else(Utc::now);
+
+        for old_fact in &existing {
+            // Skip if already expired
+            if old_fact.valid_until.is_some() {
+                continue;
+            }
+
+            // Skip self-comparison
+            if old_fact.id == new_fact.id {
+                continue;
+            }
+
+            // Must be the same event type to contradict
+            if old_fact.event_type != new_fact.event_type {
+                continue;
+            }
+
+            // Check for overlapping event stems (same topic)
+            let has_stem_overlap = old_fact
+                .event_stems
+                .iter()
+                .any(|s| new_fact.event_stems.contains(s));
+
+            if !has_stem_overlap {
+                continue;
+            }
+
+            // Different content/resolved time indicates the fact has changed
+            let content_differs = old_fact.source_text != new_fact.source_text
+                || old_fact.resolved_time.to_sortable_string()
+                    != new_fact.resolved_time.to_sortable_string();
+
+            if content_differs {
+                // Invalidate the old fact by setting valid_until
+                let mut updated = old_fact.clone();
+                updated.valid_until = Some(now);
+
+                let key = format!("temporal_facts:{}:{}", user_id, updated.id);
+                let value =
+                    bincode::serde::encode_to_vec(&updated, bincode::config::standard())?;
+                self.db.put(key.as_bytes(), &value)?;
+
+                tracing::info!(
+                    user_id = user_id,
+                    old_fact_id = %old_fact.id,
+                    new_fact_id = %new_fact.id,
+                    entity = %new_fact.entity,
+                    event_type = ?new_fact.event_type,
+                    "Temporal fact contradiction detected — old fact invalidated"
+                );
+
+                invalidated_ids.push(old_fact.id.clone());
+            }
+        }
+
+        Ok(invalidated_ids)
+    }
+
+    /// Find facts by entity, with expired-fact filtering.
     pub fn find_by_entity(
         &self,
         user_id: &str,
         entity: &str,
         limit: usize,
     ) -> Result<Vec<TemporalFact>> {
-        let prefix = format!("temporal_by_entity:{}:{}:", user_id, entity.to_lowercase());
-        self.find_by_prefix(&prefix, user_id, limit)
+        self.find_by_entity_filtered(user_id, entity, limit, false)
     }
 
-    /// Find facts by event keyword
+    /// Find facts by entity, optionally including expired facts.
+    pub fn find_by_entity_filtered(
+        &self,
+        user_id: &str,
+        entity: &str,
+        limit: usize,
+        include_expired: bool,
+    ) -> Result<Vec<TemporalFact>> {
+        let prefix = format!("temporal_by_entity:{}:{}:", user_id, entity.to_lowercase());
+        self.find_by_prefix(&prefix, user_id, limit, include_expired)
+    }
+
+    /// Find facts by event keyword, with expired-fact filtering.
     pub fn find_by_event(
         &self,
         user_id: &str,
         event: &str,
         limit: usize,
     ) -> Result<Vec<TemporalFact>> {
+        self.find_by_event_filtered(user_id, event, limit, false)
+    }
+
+    /// Find facts by event keyword, optionally including expired facts.
+    pub fn find_by_event_filtered(
+        &self,
+        user_id: &str,
+        event: &str,
+        limit: usize,
+        include_expired: bool,
+    ) -> Result<Vec<TemporalFact>> {
         let stemmer = Stemmer::create(Algorithm::English);
         let stem = stemmer.stem(&event.to_lowercase()).to_string();
         let prefix = format!("temporal_by_event:{}:{}:", user_id, stem);
-        self.find_by_prefix(&prefix, user_id, limit)
+        self.find_by_prefix(&prefix, user_id, limit, include_expired)
     }
 
     /// Find facts matching entity AND event
@@ -201,8 +311,21 @@ impl TemporalFactStore {
         event_keywords: &[&str],
         event_type: Option<EventType>,
     ) -> Result<Vec<TemporalFact>> {
-        // Get facts by entity
-        let entity_facts = self.find_by_entity(user_id, entity, 100)?;
+        self.find_by_entity_and_event_filtered(user_id, entity, event_keywords, event_type, false)
+    }
+
+    /// Find facts matching entity AND event, optionally including expired facts.
+    pub fn find_by_entity_and_event_filtered(
+        &self,
+        user_id: &str,
+        entity: &str,
+        event_keywords: &[&str],
+        event_type: Option<EventType>,
+        include_expired: bool,
+    ) -> Result<Vec<TemporalFact>> {
+        // Get facts by entity (already filtered by include_expired)
+        let entity_facts =
+            self.find_by_entity_filtered(user_id, entity, 100, include_expired)?;
 
         // Filter by event keywords
         let stemmer = Stemmer::create(Algorithm::English);
@@ -233,6 +356,7 @@ impl TemporalFactStore {
         prefix: &str,
         user_id: &str,
         limit: usize,
+        include_expired: bool,
     ) -> Result<Vec<TemporalFact>> {
         let mut facts = Vec::new();
         let mut seen_ids = HashSet::new();
@@ -253,9 +377,11 @@ impl TemporalFactStore {
             let fact_id = String::from_utf8_lossy(&value);
             if seen_ids.insert(fact_id.to_string()) {
                 if let Some(fact) = self.get(user_id, &fact_id)? {
-                    facts.push(fact);
-                    if facts.len() >= limit {
-                        break;
+                    if include_expired || !is_expired(&fact) {
+                        facts.push(fact);
+                        if facts.len() >= limit {
+                            break;
+                        }
                     }
                 }
             }
@@ -264,8 +390,18 @@ impl TemporalFactStore {
         Ok(facts)
     }
 
-    /// List all temporal facts for a user
+    /// List all temporal facts for a user, with expired-fact filtering.
     pub fn list(&self, user_id: &str, limit: usize) -> Result<Vec<TemporalFact>> {
+        self.list_filtered(user_id, limit, false)
+    }
+
+    /// List all temporal facts for a user, optionally including expired facts.
+    pub fn list_filtered(
+        &self,
+        user_id: &str,
+        limit: usize,
+        include_expired: bool,
+    ) -> Result<Vec<TemporalFact>> {
         let prefix = format!("temporal_facts:{}:", user_id);
         let mut facts = Vec::new();
 
@@ -286,9 +422,11 @@ impl TemporalFactStore {
                 &value,
                 bincode::config::standard(),
             ) {
-                facts.push(fact);
-                if facts.len() >= limit {
-                    break;
+                if include_expired || !is_expired(&fact) {
+                    facts.push(fact);
+                    if facts.len() >= limit {
+                        break;
+                    }
                 }
             }
         }
@@ -411,6 +549,8 @@ fn extract_planning_fact(
         conversation_date,
         confidence: 0.8,
         source_text: sentence.to_string(),
+        valid_from: Some(conversation_date),
+        valid_until: None,
     })
 }
 
@@ -488,6 +628,8 @@ fn extract_occurred_fact(
         conversation_date,
         confidence: 0.75,
         source_text: sentence.to_string(),
+        valid_from: Some(conversation_date),
+        valid_until: None,
     })
 }
 
@@ -535,6 +677,8 @@ fn extract_historical_fact(
         conversation_date,
         confidence: 0.85,
         source_text: sentence.to_string(),
+        valid_from: Some(conversation_date),
+        valid_until: None,
     })
 }
 
