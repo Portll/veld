@@ -2350,7 +2350,7 @@ impl MemorySystem {
         // ===========================================================================
         let vr = self
             .retriever
-            .search_ids(&vector_query, query.max_results * 3)?;
+            .search_ids(&vector_query, query.max_results * 4)?;
         let vector_results: Vec<(MemoryId, f32)> = if let Some(ref c) = episode_candidates {
             vr.into_iter().filter(|(id, _)| c.contains(id)).collect()
         } else {
@@ -2801,7 +2801,7 @@ impl MemorySystem {
 
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
             // Rerank top-20 after memory fetch, then truncate to max_results.
-            let rerank_budget = 20_usize.max(query.max_results);
+            let rerank_budget = 30_usize.max(query.max_results);
             res.truncate(rerank_budget);
             tracing::debug!("Layer 4: {} fused results (rerank budget={})", res.len(), rerank_budget);
             (res, heb)
