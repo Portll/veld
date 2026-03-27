@@ -408,6 +408,33 @@ pub async fn remember(
             merged_entities.push(keyword);
         }
     }
+
+    // Cold-start entity extraction: when the graph is sparse and NER found few entities,
+    // use aggressive heuristics (proper nouns, CamelCase, acronyms, file paths, versions)
+    let graph_entity_count = state
+        .get_user_graph(&req.user_id)
+        .ok()
+        .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
+        .unwrap_or(0);
+    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD
+        && ner_entities.len() < 2
+    {
+        let cold_entities =
+            crate::embeddings::ner::cold_start_extract_entities(&req.content, &merged_entities);
+        if !cold_entities.is_empty() {
+            tracing::debug!(
+                "Cold-start extraction found {} additional entities (graph has {})",
+                cold_entities.len(),
+                graph_entity_count
+            );
+            for e in cold_entities {
+                if seen.insert(e.text.to_lowercase()) {
+                    merged_entities.push(e.text);
+                }
+            }
+        }
+    }
+
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         tracing::debug!(
             count = merged_entities.len(),
