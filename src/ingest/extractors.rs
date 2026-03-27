@@ -7,6 +7,7 @@
 //! All parsing is done with stdlib + `regex` — no external crates.
 
 use anyhow::Result;
+use base64::Engine as _;
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -25,7 +26,68 @@ pub fn extract(content: &str, format: InputFormat) -> Result<ExtractedContent> {
         InputFormat::Csv => extract_csv(content),
         InputFormat::Code => extract_code(content),
         InputFormat::Html => extract_html(content),
+        InputFormat::Pdf => extract_pdf_from_string(content),
     }
+}
+
+// =============================================================================
+// PDF (via `pdf-extract` crate, behind the `pdf` feature flag)
+// =============================================================================
+
+/// Extract text from PDF content passed as a string.
+///
+/// The ingest endpoint receives content as a JSON string field. For PDF,
+/// the caller must base64-encode the raw PDF bytes and pass them in the
+/// `content` field. We decode here and delegate to `extract_pdf_bytes`.
+fn extract_pdf_from_string(content: &str) -> Result<ExtractedContent> {
+    // If the content starts with the PDF magic bytes, the caller sent raw
+    // bytes that happened to be valid UTF-8-ish. Try decoding directly.
+    if content.starts_with("%PDF-") {
+        return extract_pdf_bytes(content.as_bytes());
+    }
+
+    // Otherwise, expect base64-encoded PDF data (with optional data-URI prefix).
+    let b64 = content
+        .strip_prefix("data:application/pdf;base64,")
+        .unwrap_or(content);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| anyhow::anyhow!("PDF content is neither raw nor valid base64: {e}"))?;
+    extract_pdf_bytes(&bytes)
+}
+
+/// Core PDF extraction from raw bytes. Gated on `cfg(feature = "pdf")`.
+#[cfg(feature = "pdf")]
+pub fn extract_pdf_bytes(data: &[u8]) -> Result<ExtractedContent> {
+    let text = pdf_extract::extract_text_from_mem(data)
+        .map_err(|e| anyhow::anyhow!("PDF extraction failed: {e}"))?;
+
+    // Normalise whitespace runs but keep paragraph breaks
+    let cleaned: String = text
+        .lines()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(ExtractedContent {
+        metadata: ContentMetadata {
+            format: InputFormat::Pdf.as_str().to_string(),
+            title: None,
+            headings: vec![],
+            entities_hint: vec![],
+            line_count: count_lines(&cleaned),
+            word_count: count_words(&cleaned),
+        },
+        text: cleaned,
+    })
+}
+
+/// Fallback when the `pdf` feature is not enabled.
+#[cfg(not(feature = "pdf"))]
+pub fn extract_pdf_bytes(_data: &[u8]) -> Result<ExtractedContent> {
+    Err(anyhow::anyhow!(
+        "PDF extraction is not available: compile with `--features pdf` to enable it"
+    ))
 }
 
 // =============================================================================
