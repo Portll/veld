@@ -482,6 +482,32 @@ pub const CONSOLIDATION_JACCARD_THRESHOLD: f32 = 0.45;
 /// - Prevents one verbose memory from dominating the candidate pool
 pub const CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY: usize = 5;
 
+// =============================================================================
+// CONFLICT DETECTION ON REMEMBER (A3: Survey on AI Memory, H-MEM + WISE)
+// Detects contradictions between new and existing memories sharing entities.
+// Reference: Bai et al. (2026) §4.2.3 Corrective Updates
+// =============================================================================
+
+/// Cosine similarity threshold between new and existing memory to trigger conflict check
+///
+/// Only memories with high semantic overlap are candidates for contradiction.
+/// 0.7 catches topically-related memories without false-positiving on tangential ones.
+pub const CONFLICT_COSINE_THRESHOLD: f32 = 0.7;
+
+/// Maximum candidate memories to check per entity during conflict detection
+pub const CONFLICT_MAX_CANDIDATES: usize = 20;
+
+/// Importance decay multiplier applied to superseded memories
+///
+/// When a newer memory contradicts an older one, the older memory's importance
+/// is multiplied by this factor. 0.5 = halved, still retrievable but deprioritized.
+pub const CONFLICT_IMPORTANCE_DECAY: f32 = 0.5;
+
+/// Maximum focal entities to query during conflict detection
+///
+/// Limits graph lookups to prevent slow remember() for entity-rich memories.
+pub const CONFLICT_MAX_FOCAL_ENTITIES: usize = 5;
+
 /// Grace period before any fact decay begins (days)
 ///
 /// Facts are immune to decay for this period after last reinforcement.

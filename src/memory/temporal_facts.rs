@@ -139,7 +139,7 @@ fn is_expired(fact: &TemporalFact) -> bool {
 /// Tokenizes both texts into lowercased words, builds term-frequency vectors,
 /// and returns the cosine similarity (0.0..1.0). Words shorter than 2 chars
 /// are excluded as noise.
-fn text_similarity(a: &str, b: &str) -> f32 {
+pub fn text_similarity(a: &str, b: &str) -> f32 {
     use std::collections::HashMap;
 
     fn term_freq(text: &str) -> HashMap<String, f32> {
@@ -189,7 +189,7 @@ fn text_similarity(a: &str, b: &str) -> f32 {
 ///    (or "isn't", "doesn't", "won't", "can't", etc.)
 /// 2. Keyword opposition: one text contains a term and the other contains its antonym
 ///    from a curated set of common binary oppositions.
-fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
+pub fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
     let a_lower = text_a.to_lowercase();
     let b_lower = text_b.to_lowercase();
 
