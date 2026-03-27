@@ -246,6 +246,7 @@ pub async fn ingest(
         memory_type: Some(experience_type_str),
         importance: req.importance,
         count: None,
+        entities: Some(req.tags.clone()),
         results: None,
     });
 

@@ -547,12 +547,18 @@ pub fn detect_temporal_intent(query: &str) -> TemporalIntent {
         return TemporalIntent::Duration;
     }
 
-    // Ordering questions
+    // Ordering questions — compound comparisons AND standalone relative ordering
+    // "before X" and "after X" imply temporal ordering even without a comparison pair
     if query_lower.contains("before or after")
         || query_lower.contains("first or")
         || query_lower.contains("earlier or later")
         || query_lower.contains("which came first")
         || query_lower.contains("in what order")
+        || query_lower.contains(" before the ")
+        || query_lower.contains(" before we ")
+        || query_lower.contains(" after the ")
+        || query_lower.contains(" after we ")
+        || query_lower.contains(" prior to ")
     {
         return TemporalIntent::Ordering;
     }
@@ -567,6 +573,18 @@ pub fn detect_temporal_intent(query: &str) -> TemporalIntent {
         "this week",
         "this month",
         "this year",
+        "most recent",
+        "latest",
+        "earliest",
+        "recently",
+        "first meeting",
+        "second meeting",
+        "third meeting",
+        "fourth meeting",
+        "first session",
+        "second session",
+        "third session",
+        "fourth session",
         "in january",
         "in february",
         "in march",

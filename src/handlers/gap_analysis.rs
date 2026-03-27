@@ -194,6 +194,7 @@ pub async fn analyze_gaps(
         memory_type: None,
         importance: None,
         count: Some(result.total_count),
+        entities: None,
         results: Some(serde_json::json!({
             "type": "gap_analysis_complete",
             "gap_count": result.total_count,

@@ -230,10 +230,11 @@ pub const ESTIMATED_BYTES_PER_MEMORY: usize = 20 * 1024;
 /// then filter down to N.
 ///
 /// Justification:
-/// - 2x accounts for ~50% filter rejection rate in typical queries
-/// - Higher values waste compute; lower values may miss results
-/// - Adaptive systems should tune this based on observed filter selectivity
-pub const VECTOR_SEARCH_CANDIDATE_MULTIPLIER: usize = 2;
+/// - 3x provides wider candidate pool for multi-hop queries needing memories
+///   from different corpus regions with moderate but not top-10 vector similarity
+/// - Marginal latency cost (~2-3ms extra Vamana search) offset by precision gains
+/// - Dedup and filtering remain unchanged downstream
+pub const VECTOR_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
 // =============================================================================
 // SALIENCE SCORING WEIGHTS
