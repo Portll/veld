@@ -1,6 +1,6 @@
 {
   "name": "@shodh/memory-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "mcpName": "io.github.varun29ankuS/shodh-memory",
   "description": "MCP server for persistent AI memory - store and recall context across sessions",
   "type": "module",
