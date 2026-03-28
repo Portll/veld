@@ -49,6 +49,7 @@ struct PerQueryResult {
     query_type: String,
     mrr: f32,
     recall_at_5: f32,
+    recall_at_10: f32,
     precision_at_5: f32,
     absence_violations: usize,
     latency_ms: u64,
@@ -60,6 +61,7 @@ struct TypeSummary {
     query_type: String,
     mrr: f32,
     recall_at_5: f32,
+    recall_at_10: f32,
     precision_at_5: f32,
     absence_violations: usize,
     query_count: usize,
@@ -1016,6 +1018,7 @@ fn aggregate_by_type(results: &[PerQueryResult]) -> Vec<TypeSummary> {
                     query_type: qt.to_string(),
                     mrr: 0.0,
                     recall_at_5: 0.0,
+                    recall_at_10: 0.0,
                     precision_at_5: 0.0,
                     absence_violations: 0,
                     query_count: 0,
@@ -1027,6 +1030,7 @@ fn aggregate_by_type(results: &[PerQueryResult]) -> Vec<TypeSummary> {
                 query_type: qt.to_string(),
                 mrr: matching.iter().map(|r| r.mrr).sum::<f32>() / nf,
                 recall_at_5: matching.iter().map(|r| r.recall_at_5).sum::<f32>() / nf,
+                recall_at_10: matching.iter().map(|r| r.recall_at_10).sum::<f32>() / nf,
                 precision_at_5: matching.iter().map(|r| r.precision_at_5).sum::<f32>() / nf,
                 absence_violations: matching.iter().map(|r| r.absence_violations).sum(),
                 query_count: n,
@@ -1042,6 +1046,7 @@ fn print_report(
     type_summaries: &[TypeSummary],
     overall_mrr: f32,
     overall_recall: f32,
+    overall_recall_10: f32,
     overall_precision: f32,
     total_absence_violations: usize,
     total_absence_checks: usize,
@@ -1067,8 +1072,8 @@ fn print_report(
             String::new()
         };
         println!(
-            "  [{:<10}] [{}] MRR={:.2}  R@5={:.2}  P@5={:.2}  {}ms{}",
-            r.query_type, hit, r.mrr, r.recall_at_5, r.precision_at_5, r.latency_ms, absence_note
+            "  [{:<10}] [{}] MRR={:.2}  R@5={:.2}  R@10={:.2}  P@5={:.2}  {}ms{}",
+            r.query_type, hit, r.mrr, r.recall_at_5, r.recall_at_10, r.precision_at_5, r.latency_ms, absence_note
         );
         let display_query = if r.query_text.len() > 72 {
             format!("{}...", &r.query_text[..69])
@@ -1085,29 +1090,31 @@ fn print_report(
 
     // --- Summary table ---
     println!(
-        "{:<14} {:>6} {:>8} {:>8} {:>8} {:>10} {:>8}",
-        "Query Type", "N", "MRR", "R@5", "P@5", "Abs.Viol", "Lat(ms)"
+        "{:<14} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10} {:>8}",
+        "Query Type", "N", "MRR", "R@5", "R@10", "P@5", "Abs.Viol", "Lat(ms)"
     );
     println!("{}", "\u{2501}".repeat(78));
     for s in type_summaries {
         println!(
-            "{:<14} {:>6} {:>8.3} {:>8.3} {:>8.3} {:>10} {:>8}",
+            "{:<14} {:>6} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>10} {:>8}",
             s.query_type,
             s.query_count,
             s.mrr,
             s.recall_at_5,
+            s.recall_at_10,
             s.precision_at_5,
             s.absence_violations,
             s.avg_latency_ms
         );
     }
-    println!("{}", "\u{2501}".repeat(78));
+    println!("{}", "\u{2501}".repeat(88));
     println!(
-        "{:<14} {:>6} {:>8.3} {:>8.3} {:>8.3} {:>10} {:>8}",
+        "{:<14} {:>6} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>10} {:>8}",
         "OVERALL",
         per_query.len(),
         overall_mrr,
         overall_recall,
+        overall_recall_10,
         overall_precision,
         format!("{}/{}", total_absence_violations, total_absence_checks),
         avg_latency_ms
@@ -1123,12 +1130,13 @@ fn print_report(
         1.0
     };
     let composite =
-        0.40 * overall_mrr + 0.30 * overall_recall + 0.20 * overall_precision + 0.10 * absence_compliance;
+        0.30 * overall_mrr + 0.20 * overall_recall + 0.15 * overall_recall_10 + 0.20 * overall_precision + 0.15 * absence_compliance;
     println!(
-        "Composite Score: {:.1}%  (MRR={:.1}% R@5={:.1}% P@5={:.1}% AbsCompl={:.1}%)",
+        "Composite Score: {:.1}%  (MRR={:.1}% R@5={:.1}% R@10={:.1}% P@5={:.1}% AbsCompl={:.1}%)",
         composite * 100.0,
         overall_mrr * 100.0,
         overall_recall * 100.0,
+        overall_recall_10 * 100.0,
         overall_precision * 100.0,
         absence_compliance * 100.0,
     );
@@ -1213,7 +1221,7 @@ fn locomo_benchmark() {
     for bq in &queries {
         let query = Query {
             query_text: Some(bq.query.to_string()),
-            max_results: 5,
+            max_results: 10,
             ..Default::default()
         };
 
@@ -1225,6 +1233,7 @@ fn locomo_benchmark() {
 
         let mrr = reciprocal_rank(&retrieved_indices, &bq.expected_memory_indices);
         let r5 = recall_at_k(&retrieved_indices, &bq.expected_memory_indices, 5);
+        let r10 = recall_at_k(&retrieved_indices, &bq.expected_memory_indices, 10);
         let p5 = precision_at_k(&retrieved_indices, &bq.expected_memory_indices, 5);
         let abs_v = count_absence_violations(&retrieved_indices, &bq.absence_indices);
 
@@ -1233,6 +1242,7 @@ fn locomo_benchmark() {
             query_type: bq.query_type.to_string(),
             mrr,
             recall_at_5: r5,
+            recall_at_10: r10,
             precision_at_5: p5,
             absence_violations: abs_v,
             latency_ms: latency.as_millis() as u64,
@@ -1247,6 +1257,7 @@ fn locomo_benchmark() {
     let n = per_query_results.len() as f32;
     let overall_mrr = per_query_results.iter().map(|r| r.mrr).sum::<f32>() / n;
     let overall_recall = per_query_results.iter().map(|r| r.recall_at_5).sum::<f32>() / n;
+    let overall_recall_10 = per_query_results.iter().map(|r| r.recall_at_10).sum::<f32>() / n;
     let overall_precision = per_query_results.iter().map(|r| r.precision_at_5).sum::<f32>() / n;
     let total_absence_violations: usize =
         per_query_results.iter().map(|r| r.absence_violations).sum();
@@ -1260,6 +1271,7 @@ fn locomo_benchmark() {
         &type_summaries,
         overall_mrr,
         overall_recall,
+        overall_recall_10,
         overall_precision,
         total_absence_violations,
         total_absence_checks,
