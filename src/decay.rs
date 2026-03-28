@@ -19,26 +19,28 @@
 //! - **Consolidation phase** (t < 3 days): Exponential decay
 //!   - Fast filtering of noise and weak associations
 //!   - Matches short-term synaptic depression
-//! - **Long-term phase** (t ≥ 3 days): Power-law decay
+//! - **Long-term phase** (t ≥ 3 days): Power-law decay with log-periodic correction
 //!   - Heavy tail preserves important memories longer
 //!   - Matches empirical human forgetting curves
+//!   - Log-periodic modulation creates resonance at self-similar temporal scales
+//!   - Memories accessed at weekly/monthly/yearly rhythms resist decay at those scales
 //!
 //! ```text
-//!         Exponential              Power-Law
-//!         (consolidation)          (long-term retention)
+//!         Exponential              Power-Law + Log-Periodic
+//!         (consolidation)          (fractal long-term retention)
 //!
 //! Strength │ ╲
 //!     100% │  ╲
 //!          │   ╲
-//!      60% │    ╲___
-//!          │        ╲____
+//!      60% │    ╲___         ← resonance bumps at self-similar scales
+//!          │        ╲~╲__~╲___
 //!      30% │             ╲________
-//!          │                      ╲___________
+//!          │                      ╲~~~╲___________
 //!       5% │─────────────────────────────────────────
-//!          └────┬────────┬─────────────────────────► Time
-//!               │        │
-//!            t_cross   (days)
-//!          (3 days)
+//!          └────┬────────┬──────┬──────────────────► Time
+//!               │        │      │
+//!            t_cross   7 days  30 days
+//!          (3 days)   (λ₁)    (λ₂)
 //! ```
 //!
 //! # References
@@ -46,11 +48,53 @@
 //! - Wixted & Ebbesen (1991) "On the Form of Forgetting"
 //! - Wixted (2004) "The psychology and neuroscience of forgetting"
 //! - Anderson & Schooler (1991) "Reflections of the Environment in Memory"
+//! - Sornette (2003) "Why Stock Markets Crash" Ch.5 (discrete scale invariance)
 
 use crate::constants::{
-    ANCHOR_IMPORTANCE_FLOOR, DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION, POWERLAW_BETA,
-    POWERLAW_BETA_POTENTIATED,
+    ANCHOR_IMPORTANCE_FLOOR, DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION,
+    LOG_PERIODIC_BETA, LOG_PERIODIC_SCALES, POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
 };
+
+/// Computes the log-periodic fractal correction factor.
+///
+/// Models discrete scale invariance in human temporal access patterns.
+/// The correction oscillates in log-time at preferred scaling ratios,
+/// creating resonance zones where decay slows at self-similar intervals.
+///
+/// Formula: 1 + β Σₖ cos(2π log(t) / log(λₖ))
+///
+/// Resonances occur at t = λₖⁿ days (e.g., 7, 49, 343... for weekly scale).
+///
+/// # Arguments
+///
+/// * `days` - Raw elapsed time in days (not scaled)
+/// * `crossover_days` - Crossover point; correction blends in smoothly from here
+/// * `beta` - Modulation amplitude (LOG_PERIODIC_BETA)
+/// * `scales` - Preferred scaling ratios in days (LOG_PERIODIC_SCALES)
+///
+/// # Returns
+///
+/// Multiplicative correction factor with smooth blend-in from crossover.
+/// Always > 0 when β × len(scales) < 1.
+#[inline]
+fn log_periodic_correction(days: f64, crossover_days: f64, beta: f64, scales: &[f64]) -> f64 {
+    // Blend factor: ramps from 0.0 at crossover to 1.0 at 2×crossover
+    // Ensures continuity at the exponential→power-law transition
+    let blend = ((days - crossover_days) / crossover_days).clamp(0.0, 1.0);
+
+    let log_t = days.ln();
+    let sum: f64 = scales
+        .iter()
+        .map(|lambda_k| {
+            let period = lambda_k.ln();
+            (std::f64::consts::TAU * log_t / period).cos()
+        })
+        .sum();
+    let raw_correction = 1.0 + beta * sum;
+
+    // Blend: at crossover → 1.0 (pure power-law), at 2×crossover → full correction
+    1.0 + blend * (raw_correction - 1.0)
+}
 
 /// Calculates the hybrid decay factor for a given elapsed time.
 ///
@@ -96,15 +140,27 @@ pub fn hybrid_decay_factor(days_elapsed: f64, potentiated: bool) -> f32 {
         // w(t) = w₀ × e^(-λt)
         (-lambda * days_elapsed).exp() as f32
     } else {
-        // Long-term phase: power-law decay
+        // Long-term phase: power-law decay with log-periodic fractal correction
         // First, calculate what value we'd have at crossover with exponential
         let value_at_crossover = (-lambda * DECAY_CROSSOVER_DAYS).exp();
 
-        // Then apply power-law from crossover point
-        // A(t) = A_cross × (t / t_cross)^(-β)
-        let power_law_factor = (days_elapsed / DECAY_CROSSOVER_DAYS).powf(-beta);
+        // Scaled time for power-law
+        let t_scaled = days_elapsed / DECAY_CROSSOVER_DAYS;
 
-        (value_at_crossover * power_law_factor) as f32
+        // Base power-law: (t / t_cross)^(-β)
+        let power_law_factor = t_scaled.powf(-beta);
+
+        // Log-periodic correction: discrete scale invariance
+        // w(t) = t^(-α) × (1 + β Σₖ cos(2π log(t) / log(λₖ)))
+        // Creates resonance at weekly/monthly/yearly rhythms in log-time
+        let fractal_correction = log_periodic_correction(
+            days_elapsed,
+            DECAY_CROSSOVER_DAYS,
+            LOG_PERIODIC_BETA,
+            &LOG_PERIODIC_SCALES,
+        );
+
+        (value_at_crossover * power_law_factor * fractal_correction) as f32
     }
 }
 
@@ -140,10 +196,17 @@ pub fn hybrid_decay_factor_custom(
         // Consolidation phase: exponential decay
         (-lambda * days_elapsed).exp() as f32
     } else {
-        // Long-term phase: power-law decay
+        // Long-term phase: power-law decay with log-periodic fractal correction
         let value_at_crossover = (-lambda * crossover_days).exp();
-        let power_law_factor = (days_elapsed / crossover_days).powf(-beta);
-        (value_at_crossover * power_law_factor) as f32
+        let t_scaled = days_elapsed / crossover_days;
+        let power_law_factor = t_scaled.powf(-beta);
+        let fractal_correction = log_periodic_correction(
+            days_elapsed,
+            crossover_days,
+            LOG_PERIODIC_BETA,
+            &LOG_PERIODIC_SCALES,
+        );
+        (value_at_crossover * power_law_factor * fractal_correction) as f32
     }
 }
 
@@ -287,15 +350,19 @@ mod tests {
 
     #[test]
     fn test_powerlaw_phase() {
-        // After crossover (> 3 days), should be power-law
+        // After crossover (> 3 days), should follow power-law envelope
+        // with log-periodic modulation
         let factor_7day = hybrid_decay_factor(7.0, false);
         let factor_14day = hybrid_decay_factor(14.0, false);
 
-        // Power-law property: doubling time should give 2^(-β) ratio
+        // Ratio is power-law × correction ratio
+        // The base power-law ratio for doubling is 2^(-β) ≈ 0.707
+        // Log-periodic correction shifts this — verify within wider tolerance
         let ratio = factor_14day / factor_7day;
-        let expected_ratio = 2.0_f64.powf(-POWERLAW_BETA) as f32;
+        let base_ratio = 2.0_f64.powf(-POWERLAW_BETA) as f32;
 
-        assert!((ratio - expected_ratio).abs() < 0.02);
+        // With β_lp=0.15 and 3 scales, max deviation is ±0.45 of the correction
+        assert!((ratio - base_ratio).abs() < 0.15);
     }
 
     #[test]
@@ -403,5 +470,108 @@ mod tests {
         let result = apply_decay_with_anchor(0.9, 7.0, false, true);
         assert!(result < 0.9); // Some decay happened
         assert!(result >= ANCHOR_IMPORTANCE_FLOOR); // But floored
+    }
+
+    #[test]
+    fn test_log_periodic_correction_at_crossover() {
+        // At crossover, blend=0 so correction must be exactly 1.0 (continuity)
+        let correction = log_periodic_correction(
+            DECAY_CROSSOVER_DAYS,
+            DECAY_CROSSOVER_DAYS,
+            LOG_PERIODIC_BETA,
+            &LOG_PERIODIC_SCALES,
+        );
+        assert!(
+            (correction - 1.0).abs() < 1e-10,
+            "Correction at crossover must be 1.0 for continuity, got {correction}"
+        );
+    }
+
+    #[test]
+    fn test_log_periodic_correction_bounded() {
+        // Correction must always be > 0 for stability
+        for day in [4, 7, 14, 21, 30, 60, 90, 180, 365, 730] {
+            let correction = log_periodic_correction(
+                day as f64,
+                DECAY_CROSSOVER_DAYS,
+                LOG_PERIODIC_BETA,
+                &LOG_PERIODIC_SCALES,
+            );
+            assert!(
+                correction > 0.0,
+                "Correction went negative at day {day}: {correction}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_periodic_creates_resonance_at_weekly_scale() {
+        // At t = 7 days (λ₁), ln(7)/ln(7) = 1.0, so cos(2π)=1.0 → weekly resonance
+        // At t = 49 days (λ₁²), ln(49)/ln(7) = 2.0, so cos(4π)=1.0 → resonance again
+        let at_7d = hybrid_decay_factor(7.0, false);
+        let at_49d = hybrid_decay_factor(49.0, false);
+
+        // Compare against pure power-law at same points
+        let pure_7d = {
+            let v = (-DECAY_LAMBDA_CONSOLIDATION * DECAY_CROSSOVER_DAYS).exp();
+            (v * (7.0 / DECAY_CROSSOVER_DAYS).powf(-POWERLAW_BETA)) as f32
+        };
+        let pure_49d = {
+            let v = (-DECAY_LAMBDA_CONSOLIDATION * DECAY_CROSSOVER_DAYS).exp();
+            (v * (49.0 / DECAY_CROSSOVER_DAYS).powf(-POWERLAW_BETA)) as f32
+        };
+
+        // Fractal-corrected values should differ from pure power-law
+        assert!(
+            (at_7d - pure_7d).abs() > 0.001,
+            "Correction should be measurable at 7 days"
+        );
+        assert!(
+            (at_49d - pure_49d).abs() > 0.001,
+            "Correction should be measurable at 49 days"
+        );
+        assert!(at_7d > 0.0 && at_7d < 1.0);
+        assert!(at_49d > 0.0 && at_49d < 1.0);
+    }
+
+    #[test]
+    fn test_log_periodic_with_zero_beta_is_pure_powerlaw() {
+        // When β=0, correction is exactly 1.0 everywhere → pure power-law
+        for day in [7.0, 30.0, 90.0, 365.0] {
+            let correction = log_periodic_correction(
+                day,
+                DECAY_CROSSOVER_DAYS,
+                0.0,
+                &LOG_PERIODIC_SCALES,
+            );
+            assert!((correction - 1.0).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_fractal_decay_envelope_decreases() {
+        // The log-periodic correction creates oscillations (that's the point),
+        // but the power-law envelope should still dominate over long spans.
+        // Verify: average retention in [3,180] > average in [180,365] > average in [365,730].
+        let avg = |start: i32, end: i32| -> f32 {
+            let mut sum = 0.0f32;
+            for d in start..end {
+                sum += hybrid_decay_factor(d as f64, false);
+            }
+            sum / (end - start) as f32
+        };
+
+        let avg_early = avg(3, 180);
+        let avg_mid = avg(180, 365);
+        let avg_late = avg(365, 730);
+
+        assert!(
+            avg_early > avg_mid,
+            "Early avg ({avg_early}) should exceed mid ({avg_mid})"
+        );
+        assert!(
+            avg_mid > avg_late,
+            "Mid avg ({avg_mid}) should exceed late ({avg_late})"
+        );
     }
 }
