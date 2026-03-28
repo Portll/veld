@@ -30,6 +30,7 @@ pub mod segmentation;
 pub mod sessions;
 pub mod slow_store;
 pub mod storage;
+pub mod wavelet_sessions;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod voronoi;
@@ -255,6 +256,10 @@ pub struct MemorySystem {
     /// re-process the entire memory store. Initialized from the latest fact's
     /// created_at or 0 if no facts exist.
     fact_extraction_watermark: std::sync::atomic::AtomicI64,
+
+    /// Cached wavelet-detected session map.
+    /// Invalidated when fact_extraction_needed is set (any new remember call).
+    session_map_cache: parking_lot::Mutex<Option<wavelet_sessions::SessionMap>>,
 }
 
 /// Resolve an entity name to a graph label and salience using pre-extracted NER data.
@@ -544,6 +549,8 @@ impl MemorySystem {
             // Watermark for incremental fact extraction — initialized to 0 (sentinel).
             // On first maintenance call, loaded from RocksDB or derived from latest fact timestamp.
             fact_extraction_watermark: std::sync::atomic::AtomicI64::new(0),
+            // Wavelet session detection cache — recomputed when new memories arrive
+            session_map_cache: parking_lot::Mutex::new(None),
         })
     }
 
@@ -3650,6 +3657,65 @@ impl MemorySystem {
             });
         }
 
+        // Layer 5.9: Ordinal session resolution via wavelet-detected sessions
+        {
+            let ql = query_text.to_lowercase();
+            if let Some((ordinal, _noun)) =
+                wavelet_sessions::extract_ordinal_session_ref(&ql)
+            {
+                match self.get_or_compute_session_map() {
+                    Ok(session_map) if ordinal <= session_map.sessions.len() => {
+                        let target = &session_map.sessions[ordinal - 1];
+                        let session_ids: std::collections::HashSet<MemoryId> =
+                            target.memory_ids.iter().cloned().collect();
+
+                        for mem in memories.iter_mut() {
+                            if session_ids.contains(&mem.id) {
+                                let base = mem.score.unwrap_or(0.0);
+                                let mut cloned: Memory = mem.as_ref().clone();
+                                cloned.set_score(
+                                    base + crate::constants::ORDINAL_SESSION_BOOST,
+                                );
+                                *mem = Arc::new(cloned);
+                            }
+                        }
+                        memories.sort_by(|a, b| {
+                            b.score
+                                .unwrap_or(0.0)
+                                .total_cmp(&a.score.unwrap_or(0.0))
+                        });
+                        tracing::info!(
+                            "Layer 5.9: Ordinal '{}' resolved to session {} ({} memories)",
+                            ordinal,
+                            ordinal,
+                            target.count
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::info!(
+                            "Layer 5.9: Ordinal {} out of range — demoting",
+                            ordinal
+                        );
+                        for mem in memories.iter_mut() {
+                            let base = mem.score.unwrap_or(0.0);
+                            let mut cloned: Memory = mem.as_ref().clone();
+                            cloned.set_score(base * 0.50);
+                            *mem = Arc::new(cloned);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Layer 5.9: Session detection failed: {}", e);
+                        for mem in memories.iter_mut() {
+                            let base = mem.score.unwrap_or(0.0);
+                            let mut cloned: Memory = mem.as_ref().clone();
+                            cloned.set_score(base * 0.50);
+                            *mem = Arc::new(cloned);
+                        }
+                    }
+                }
+            }
+        }
+
         self.logger
             .read()
             .log_retrieved(query_text, memories.len(), &sources);
@@ -4380,6 +4446,38 @@ impl MemorySystem {
         }
 
         Ok(all_memories)
+    }
+
+    /// Retrieve or recompute the wavelet-detected session map.
+    ///
+    /// The session map is cached and only recomputed when new memories have been
+    /// stored (indicated by `fact_extraction_needed`). This keeps repeated
+    /// ordinal-resolution lookups within a single retrieval pipeline free of
+    /// redundant full-store scans.
+    fn get_or_compute_session_map(&self) -> anyhow::Result<wavelet_sessions::SessionMap> {
+        // Check cache
+        {
+            let cache = self.session_map_cache.lock();
+            if let Some(ref map) = *cache {
+                if !self
+                    .fact_extraction_needed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Ok(map.clone());
+                }
+            }
+        }
+
+        // Recompute from all memories
+        let all = self.get_all_memories()?;
+        let timestamps: Vec<(MemoryId, chrono::DateTime<chrono::Utc>)> =
+            all.iter().map(|m| (m.id.clone(), m.created_at)).collect();
+
+        let map = wavelet_sessions::detect_sessions(&timestamps);
+
+        // Cache
+        *self.session_map_cache.lock() = Some(map.clone());
+        Ok(map)
     }
 
     /// Find a memory by UUID prefix across all tiers.
