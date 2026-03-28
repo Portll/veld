@@ -64,6 +64,11 @@ impl Default for WriteMode {
 
 const STORAGE_MAGIC: &[u8; 3] = b"SHO";
 
+/// Maximum allocation during bincode deserialization (64 MB).
+/// Prevents OOM from corrupt varint length fields — a corrupt value like
+/// 7957695011165131522 (7.9 exabytes) would be rejected before allocation.
+const BINCODE_ALLOC_LIMIT: usize = 64 * 1024 * 1024;
+
 use std::collections::HashMap;
 
 /// Default experience type for legacy deserialization
@@ -483,6 +488,7 @@ impl LegacyExperienceV1 {
             temporal_refs: Vec::new(),
             ner_entities: Vec::new(),
             cooccurrence_pairs: Vec::new(),
+            embedding_degraded: false,
         }
     }
 }
@@ -734,7 +740,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
 
     // Try current format first (bincode 2.x with current Memory/Experience)
     // This is the hot path — avoid any allocations before this check.
-    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
+    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
         Ok((memory, _)) => {
             Ok((memory, false))
         } // Current format, no migration needed
@@ -766,7 +772,7 @@ fn deserialize_legacy_fallback(
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
-    match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard()) {
+    match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
         Ok((minimal, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x minimal format");
             record_branch("bincode2_minimal");
@@ -779,7 +785,7 @@ fn deserialize_legacy_fallback(
     // Matches entries with 2 extra bytes before content (byte 16=unknown, byte 17=exp_type)
     match bincode::serde::decode_from_slice::<MemoryWithTypePrefix, _>(
         data,
-        bincode::config::standard(),
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
         Ok((typed, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x with type prefix");
@@ -792,7 +798,7 @@ fn deserialize_legacy_fallback(
     // Try bincode 2.x with OLD Experience (before multimodal fields were added)
     match bincode::serde::decode_from_slice::<LegacyMemoryFlatV2, _>(
         data,
-        bincode::config::standard(),
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
         Ok((legacy, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x pre-multimodal format");
@@ -928,7 +934,7 @@ fn deserialize_legacy_fallback(
     // Hex analysis shows content starts at byte 19 (byte 18 is 0xa4, not valid UTF-8 start)
     match bincode::serde::decode_from_slice::<MemoryWith3ByteHeader, _>(
         data,
-        bincode::config::standard(),
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
         Ok((mem, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x with 3-byte header");
@@ -2702,7 +2708,7 @@ impl MemoryStorage {
             // Try current format first (quick check)
             let is_current = bincode::serde::decode_from_slice::<Memory, _>(
                 &value,
-                bincode::config::standard(),
+                bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
             )
             .is_ok();
 
@@ -3121,7 +3127,7 @@ impl MemoryStorage {
         match self.db.get(mapping_key.as_bytes())? {
             Some(data) => {
                 let (entry, _): (VectorMappingEntry, _) =
-                    bincode::serde::decode_from_slice(&data, bincode::config::standard())
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>())
                         .context("Failed to deserialize vector mapping")?;
                 Ok(Some(entry))
             }
@@ -3155,7 +3161,7 @@ impl MemoryStorage {
                             if let Ok((entry, _)) =
                                 bincode::serde::decode_from_slice::<VectorMappingEntry, _>(
                                     &value,
-                                    bincode::config::standard(),
+                                    bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
                                 )
                             {
                                 mappings.push((MemoryId(uuid), entry));

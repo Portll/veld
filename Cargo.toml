@@ -1,6 +1,6 @@
 [package]
 name = "shodh-memory"
-version = "0.5.0"
+version = "0.5.1-1"
 edition = "2021"
 authors = ["Shodh Team <29.varuns@gmail.com>"]
 description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
@@ -156,6 +156,9 @@ tracing-opentelemetry = { version = "0.28", optional = true }
 opentelemetry = { version = "0.27", features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"], optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"], optional = true }
+
+# FFT for spectral analysis of access patterns (learned decay scales)
+rustfft = "6"
 
 # Vector operations (lightweight)
 ordered-float = "5.0"
