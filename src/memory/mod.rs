@@ -2900,6 +2900,25 @@ impl MemorySystem {
                             if let Some(score) = fused.get_mut(id) {
                                 *score += boost;
                             }
+                        } else if overlap == 0 && !has_any_temporal_intent {
+                            // Content-fallback: when no entity/tag overlap, check
+                            // if query stems appear in memory content. Smaller boost
+                            // (+0.05/match, cap 0.20) to keep below tag-match priority.
+                            // Gated: skip for temporal queries where content overlap
+                            // would boost wrong-session memories indiscriminately.
+                            if let Some(content) = get_content(id) {
+                                let content_lower = content.to_lowercase();
+                                let content_overlap = query_stems
+                                    .iter()
+                                    .filter(|qs| content_lower.contains(qs.as_str()))
+                                    .count();
+                                if content_overlap >= 2 {
+                                    let boost = (0.05 * content_overlap as f32).min(0.20);
+                                    if let Some(score) = fused.get_mut(id) {
+                                        *score += boost;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2940,6 +2959,130 @@ impl MemorySystem {
                             }
                         }
                     }
+                }
+            }
+
+            // ===========================================================================
+            // LAYER 4.535: LIGHT POLLUTION FILTER (Entity Concentration Ratio)
+            // ===========================================================================
+            // Light pollution: broad overview memories mention many topics and
+            // rank well on BM25/entity-overlap for ANY query, drowning out
+            // specific memories that ARE ABOUT the query topic.
+            //
+            // Entity concentration C = |query_stems ∩ entity_stems| / |entity_stems|
+            //   C < 0.20 → memory is a broad overview mentioning the topic
+            //              among many others (light polluter) → 0.85× penalty
+            //   C > 0.50 → memory is focused on query topic → 1.10× boost
+            //   0.20 ≤ C ≤ 0.50 → neutral (no adjustment)
+            //
+            // Example: M16 has entities [database, migrations, sqlx] (3 entities).
+            // Query "What database?" matches 1/3 = 0.33 concentration → neutral.
+            // M3 has entities [postgresql, database] (2 entities).
+            // Query matches 1/2 = 0.50 concentration → 1.10× boost.
+            //
+            // This is the "belt" in belt-and-braces against light pollution.
+            // The "braces" is Layer 4.54 (temporal topic dedup).
+            {
+                use rust_stemmers::{Algorithm, Stemmer};
+                let stem = Stemmer::create(Algorithm::English);
+
+                let q_stems: std::collections::HashSet<String> = query_text
+                    .to_lowercase()
+                    .split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .map(|w| {
+                        let cleaned: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        stem.stem(&cleaned).to_string()
+                    })
+                    .filter(|s| s.len() > 1)
+                    .collect();
+
+                if q_stems.len() >= 2 {
+                    let get_ents = |id: &MemoryId| -> Vec<String> {
+                        self.working_memory.read().get(id).map(|m| m.experience.entities.clone())
+                            .or_else(|| self.session_memory.read().get(id).map(|m| m.experience.entities.clone()))
+                            .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.experience.entities.clone()))
+                            .unwrap_or_default()
+                    };
+
+                    let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                    for id in &ids {
+                        let entities = get_ents(id);
+                        if entities.len() >= 2 {
+                            let ent_stems: Vec<String> = entities
+                                .iter()
+                                .map(|e| stem.stem(&e.to_lowercase()).to_string())
+                                .collect();
+                            let matching = q_stems
+                                .iter()
+                                .filter(|qs| ent_stems.iter().any(|es| es.contains(qs.as_str())))
+                                .count();
+                            let concentration = matching as f32 / ent_stems.len() as f32;
+
+                            if let Some(score) = fused.get_mut(id) {
+                                if concentration < 0.20 {
+                                    *score *= 0.85;
+                                } else if concentration > 0.50 {
+                                    *score *= 1.10;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ===========================================================================
+            // LAYER 4.54: TEMPORAL TOPIC DEDUPLICATION (Recency Tiebreaker)
+            // ===========================================================================
+            // When two memories cover the same topic (high entity overlap) and the
+            // query has recency intent, demote the older memory. Belt & braces
+            // against light pollution from old-but-topical memories.
+            if has_any_temporal_intent || has_temporal_keywords {
+                let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                let get_created_at = |id: &MemoryId| -> Option<chrono::DateTime<chrono::Utc>> {
+                    self.working_memory.read().get(id).map(|m| m.created_at)
+                        .or_else(|| self.session_memory.read().get(id).map(|m| m.created_at))
+                        .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.created_at))
+                };
+                let get_ents = |id: &MemoryId| -> std::collections::HashSet<String> {
+                    self.working_memory.read().get(id).map(|m| m.experience.entities.clone())
+                        .or_else(|| self.session_memory.read().get(id).map(|m| m.experience.entities.clone()))
+                        .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.experience.entities.clone()))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|e| e.to_lowercase())
+                        .collect()
+                };
+
+                let entity_sets: Vec<(MemoryId, std::collections::HashSet<String>)> = ids
+                    .iter()
+                    .map(|id| (id.clone(), get_ents(id)))
+                    .collect();
+
+                let mut demoted = 0usize;
+                for i in 0..entity_sets.len() {
+                    for j in (i + 1)..entity_sets.len() {
+                        let (id_a, set_a) = &entity_sets[i];
+                        let (id_b, set_b) = &entity_sets[j];
+                        if set_a.is_empty() || set_b.is_empty() { continue; }
+
+                        let intersection = set_a.intersection(set_b).count();
+                        let union = set_a.union(set_b).count();
+                        let jaccard = intersection as f32 / union.max(1) as f32;
+
+                        if jaccard > 0.40 {
+                            if let (Some(ts_a), Some(ts_b)) = (get_created_at(id_a), get_created_at(id_b)) {
+                                let older_id = if ts_a < ts_b { id_a } else { id_b };
+                                if let Some(score) = fused.get_mut(older_id) {
+                                    *score *= 0.85;
+                                    demoted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if demoted > 0 {
+                    tracing::debug!("Layer 4.54: Temporal dedup demoted {} older same-topic memories", demoted);
                 }
             }
 
@@ -3247,7 +3390,19 @@ impl MemorySystem {
             let base_score = score + hebbian_boost * 0.1;
 
             // Helper to apply unified scoring (recency + arousal + credibility + temporal)
-            let recency_scale = query.recency_weight.unwrap_or(0.1);
+            // Amplify recency when query explicitly asks for recent items
+            let query_lower_recency = query_text.to_lowercase();
+            let wants_recent = query_lower_recency.contains("last week")
+                || query_lower_recency.contains("most recent")
+                || query_lower_recency.contains("recent")
+                || query_lower_recency.contains("latest")
+                || query_lower_recency.contains("yesterday")
+                || query_lower_recency.contains("today");
+            let recency_scale = if wants_recent {
+                0.5 // 5x amplification for explicit recency queries
+            } else {
+                query.recency_weight.unwrap_or(0.1)
+            };
             let with_unified_score = |mem: &SharedMemory, base: f32| -> SharedMemory {
                 // Recency decay: exponential decay based on age
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
@@ -3610,38 +3765,136 @@ impl MemorySystem {
                 memories.insert(0, earliest);
                 tracing::debug!("Layer 5.9: Ordinal 'first' — pinned earliest memory at rank 1");
             } else if wants_last && !memories.is_empty() {
-                // Sort by created_at descending — most recent first
-                memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                let latest = memories[0].clone();
-                memories.sort_by(|a, b| {
-                    b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
-                });
-                if let Some(pos) = memories.iter().position(|m| m.id == latest.id) {
-                    memories.remove(pos);
+                // Strategy C: Gated pinning — only pin latest if it's already
+                // in the top half by score (content-relevant). Otherwise, boost
+                // the top-3 most recent memories from the relevant set by
+                // re-scoring with a recency bonus proportional to their recency rank.
+                let score_sorted: Vec<f32> = {
+                    let mut s: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
+                    s.sort_by(|a, b| b.total_cmp(a));
+                    s
+                };
+                let p50 = score_sorted[score_sorted.len() / 2];
+
+                // Find the most recent memory
+                let mut by_time = memories.clone();
+                by_time.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                let latest = &by_time[0];
+
+                if latest.score.unwrap_or(0.0) >= p50 {
+                    // Latest IS content-relevant → pin it
+                    let latest_id = latest.id.clone();
+                    if let Some(pos) = memories.iter().position(|m| m.id == latest_id) {
+                        let pinned = memories.remove(pos);
+                        memories.insert(0, pinned);
+                    }
+                    tracing::debug!("Layer 5.9: Gated pin — latest memory is content-relevant, pinned");
+                } else {
+                    // Latest is NOT relevant → apply graduated recency boost to
+                    // top-3 most recent among the relevant set (above p50).
+                    // This lifts recent+relevant memories without polluting rank 1.
+                    let relevant_recent: Vec<MemoryId> = by_time.iter()
+                        .filter(|m| m.score.unwrap_or(0.0) >= p50)
+                        .take(3)
+                        .map(|m| m.id.clone())
+                        .collect();
+                    let boosts = [0.08_f32, 0.05, 0.03]; // Graduated: most recent gets most
+                    for (mid, &boost) in relevant_recent.iter().zip(boosts.iter()) {
+                        if let Some(mem) = memories.iter_mut().find(|m| m.id == *mid) {
+                            let base = mem.score.unwrap_or(0.0);
+                            let mut cloned: Memory = mem.as_ref().clone();
+                            cloned.set_score(base + boost);
+                            *mem = Arc::new(cloned);
+                        }
+                    }
+                    memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+                    tracing::debug!(
+                        "Layer 5.9: Gated pin — latest not relevant, boosted {} recent-relevant memories",
+                        relevant_recent.len()
+                    );
                 }
-                memories.insert(0, latest);
-                tracing::debug!("Layer 5.9: Ordinal 'most recent/last' — pinned latest memory at rank 1");
             }
 
-            // Category error detection: ordinal references to unnamed sessions
-            // "second meeting", "third sprint" — these require external metadata
-            // that doesn't exist. Flag as low confidence.
+            // Category error detection + ordinal session resolution:
+            // Try ordinal resolution FIRST. Only apply category error demotion
+            // if resolution fails or is unavailable.
             let ordinal_session_ref = (ql.contains("second ") || ql.contains("third ")
                 || ql.contains("fourth "))
                 && (ql.contains("meeting") || ql.contains("sprint") || ql.contains("session"));
 
+            let mut ordinal_resolved = false;
+
             if ordinal_session_ref {
-                tracing::info!(
-                    "Layer 5.9: Category error detected — ordinal session reference '{}' \
-                     cannot be resolved without meeting-to-session mapping",
-                    query_text
-                );
-                // Demote all results by 50% — signals low confidence to caller
-                for mem in memories.iter_mut() {
-                    let base = mem.score.unwrap_or(0.0);
-                    let mut cloned: Memory = mem.as_ref().clone();
-                    cloned.set_score(base * 0.50);
-                    *mem = Arc::new(cloned);
+                if let Some((ordinal, _noun)) =
+                    wavelet_sessions::extract_ordinal_session_ref(&ql)
+                {
+                    match self.get_or_compute_session_map() {
+                        Ok(session_map) if ordinal <= session_map.sessions.len() => {
+                            let target = &session_map.sessions[ordinal - 1];
+                            let session_ids: std::collections::HashSet<MemoryId> =
+                                target.memory_ids.iter().cloned().collect();
+
+                            // Inject session members not already in candidates
+                            let existing_ids: std::collections::HashSet<MemoryId> =
+                                memories.iter().map(|m| m.id.clone()).collect();
+                            let mut injected = 0usize;
+                            for sid in &target.memory_ids {
+                                if !existing_ids.contains(sid) && injected < 5 {
+                                    if let Ok(mem) = self.get_memory(sid) {
+                                        memories.push(Arc::new(mem));
+                                        injected += 1;
+                                    }
+                                }
+                            }
+
+                            for mem in memories.iter_mut() {
+                                if session_ids.contains(&mem.id) {
+                                    let base = mem.score.unwrap_or(0.0);
+                                    let mut cloned: Memory = mem.as_ref().clone();
+                                    cloned.set_score(
+                                        base + crate::constants::ORDINAL_SESSION_BOOST,
+                                    );
+                                    *mem = Arc::new(cloned);
+                                }
+                            }
+                            memories.sort_by(|a, b| {
+                                b.score
+                                    .unwrap_or(0.0)
+                                    .total_cmp(&a.score.unwrap_or(0.0))
+                            });
+                            ordinal_resolved = true;
+                            tracing::info!(
+                                "Layer 5.9: Ordinal '{}' resolved to session {} ({} memories, {} injected)",
+                                ordinal,
+                                ordinal,
+                                target.count,
+                                injected
+                            );
+                        }
+                        Ok(_) => {
+                            tracing::info!(
+                                "Layer 5.9: Ordinal {} out of range — demoting",
+                                ordinal
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!("Layer 5.9: Session detection failed: {}", e);
+                        }
+                    }
+                }
+
+                // Category error demotion: only if ordinal resolution failed
+                if !ordinal_resolved {
+                    tracing::info!(
+                        "Layer 5.9: Category error — ordinal session reference '{}' unresolved",
+                        query_text
+                    );
+                    for mem in memories.iter_mut() {
+                        let base = mem.score.unwrap_or(0.0);
+                        let mut cloned: Memory = mem.as_ref().clone();
+                        cloned.set_score(base * 0.50);
+                        *mem = Arc::new(cloned);
+                    }
                 }
             }
         }
@@ -3655,65 +3908,6 @@ impl MemorySystem {
                     + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
                 score_b.total_cmp(&score_a)
             });
-        }
-
-        // Layer 5.9: Ordinal session resolution via wavelet-detected sessions
-        {
-            let ql = query_text.to_lowercase();
-            if let Some((ordinal, _noun)) =
-                wavelet_sessions::extract_ordinal_session_ref(&ql)
-            {
-                match self.get_or_compute_session_map() {
-                    Ok(session_map) if ordinal <= session_map.sessions.len() => {
-                        let target = &session_map.sessions[ordinal - 1];
-                        let session_ids: std::collections::HashSet<MemoryId> =
-                            target.memory_ids.iter().cloned().collect();
-
-                        for mem in memories.iter_mut() {
-                            if session_ids.contains(&mem.id) {
-                                let base = mem.score.unwrap_or(0.0);
-                                let mut cloned: Memory = mem.as_ref().clone();
-                                cloned.set_score(
-                                    base + crate::constants::ORDINAL_SESSION_BOOST,
-                                );
-                                *mem = Arc::new(cloned);
-                            }
-                        }
-                        memories.sort_by(|a, b| {
-                            b.score
-                                .unwrap_or(0.0)
-                                .total_cmp(&a.score.unwrap_or(0.0))
-                        });
-                        tracing::info!(
-                            "Layer 5.9: Ordinal '{}' resolved to session {} ({} memories)",
-                            ordinal,
-                            ordinal,
-                            target.count
-                        );
-                    }
-                    Ok(_) => {
-                        tracing::info!(
-                            "Layer 5.9: Ordinal {} out of range — demoting",
-                            ordinal
-                        );
-                        for mem in memories.iter_mut() {
-                            let base = mem.score.unwrap_or(0.0);
-                            let mut cloned: Memory = mem.as_ref().clone();
-                            cloned.set_score(base * 0.50);
-                            *mem = Arc::new(cloned);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Layer 5.9: Session detection failed: {}", e);
-                        for mem in memories.iter_mut() {
-                            let base = mem.score.unwrap_or(0.0);
-                            let mut cloned: Memory = mem.as_ref().clone();
-                            cloned.set_score(base * 0.50);
-                            *mem = Arc::new(cloned);
-                        }
-                    }
-                }
-            }
         }
 
         self.logger
