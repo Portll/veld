@@ -326,12 +326,14 @@ def ingest_question(client: ShodhMemoryClient, entry: dict,
             # Each memory = one user turn with its preceding/following assistant
             # response, giving the LLM full dialogue context at retrieval.
             user_turn_counter = 0
+            session_user_texts = []  # Collect for session summary
             for t_idx, turn in enumerate(session_turns):
                 role = turn.get("role", "human")
                 content = turn.get("content", "")
                 if not content.strip():
                     continue
                 if role in ("human", "user"):
+                    session_user_texts.append(content)
                     # Include the assistant response that follows (if any)
                     parts = [f"User: {content}"]
                     if t_idx + 1 < len(session_turns):
@@ -356,6 +358,24 @@ def ingest_question(client: ShodhMemoryClient, entry: dict,
                     corpus_id_map[len(memories)] = corpus_id
                     memories.append(mem)
                     user_turn_counter += 1
+
+            # Session-level summary: concatenated user messages as one memory.
+            # Helps counting/aggregation queries find all mentions in one hit.
+            if session_user_texts:
+                summary = f"[{date_str}] Session summary: " + " | ".join(
+                    t[:200] for t in session_user_texts
+                )
+                if len(summary) > 2000:
+                    summary = summary[:2000] + "..."
+                mem = {
+                    "content": summary,
+                    "memory_type": "Context",
+                    "tags": [sid, "session_summary"],
+                }
+                if created_at:
+                    mem["created_at"] = created_at
+                corpus_id_map[len(memories)] = sid  # Maps to session level
+                memories.append(mem)
         elif granularity == "session":
             # Concatenate full dialogue (both roles) for session-level retrieval
             all_turns = []
@@ -458,16 +478,46 @@ def compute_retrieval_metrics(retrieved_corpus_ids: list,
 # ANSWER GENERATION
 # =============================================================================
 
-ANSWER_PROMPT = (
+ANSWER_PROMPT_FACTUAL = (
     "I will give you several history chats between you and a user. "
     "Please answer the question based on the relevant chat history.\n\n"
     "Important: Pay close attention to the question word.\n"
     "- 'Where' questions need a specific PLACE, STORE, or LOCATION name.\n"
     "- 'When' questions need a specific DATE, TIME, or DAY.\n"
     "- 'Who' questions need a specific PERSON name.\n"
-    "- 'How long/much/many' questions need a specific NUMBER or QUANTITY.\n\n"
+    "- 'How long/much/many' questions need a specific NUMBER or QUANTITY.\n"
+    "- 'How many' questions: search ALL the provided history carefully. "
+    "Count every distinct instance mentioned across ALL sessions. "
+    "List each one, then give the total count.\n\n"
     "Extract the most specific, concrete answer from the chat history. "
     "If multiple pieces of context are relevant, combine them.\n\n"
+    "History Chats:\n\n{history}\n\n"
+    "Current Date: {question_date}\n"
+    "Question: {question}\n"
+    "Answer:"
+)
+
+ANSWER_PROMPT_PREFERENCE = (
+    "I will give you several history chats between you and a user. "
+    "The user is now asking for a personalized recommendation or advice.\n\n"
+    "Your task: Use the user's personal information, interests, hobbies, "
+    "preferences, and past experiences from the chat history to give a "
+    "PERSONALIZED response. Reference specific details the user has shared "
+    "(their favorite things, past activities, lifestyle, etc.).\n\n"
+    "Even if the question seems like a general request, you MUST ground "
+    "your answer in what you know about this specific user from the history.\n\n"
+    "History Chats:\n\n{history}\n\n"
+    "Current Date: {question_date}\n"
+    "Question: {question}\n"
+    "Personalized Answer (reference the user's specific preferences and history):"
+)
+
+ANSWER_PROMPT_ABSTENTION = (
+    "I will give you several history chats between you and a user. "
+    "Please answer the question based on the relevant chat history.\n\n"
+    "IMPORTANT: If the chat history does NOT contain enough information "
+    "to answer the question, say so clearly. Do not guess or make up "
+    "information.\n\n"
     "History Chats:\n\n{history}\n\n"
     "Current Date: {question_date}\n"
     "Question: {question}\n"
@@ -525,9 +575,19 @@ def format_retrieved_context(memories: list, max_tokens: int = 12000) -> str:
 
 def generate_answer(provider: str, model: str, question: str,
                     question_date: str, memories: list,
+                    question_type: str = "", abstention: bool = False,
                     api_key: str = None, api_base: str = None) -> str:
     context = format_retrieved_context(memories)
-    prompt = ANSWER_PROMPT.format(
+
+    # Select prompt by question type
+    if abstention:
+        template = ANSWER_PROMPT_ABSTENTION
+    elif question_type == "single-session-preference":
+        template = ANSWER_PROMPT_PREFERENCE
+    else:
+        template = ANSWER_PROMPT_FACTUAL
+
+    prompt = template.format(
         history=context,
         question_date=question_date,
         question=question,
@@ -725,6 +785,7 @@ def run_evaluation(args):
             hypothesis = generate_answer(
                 args.answer_provider, args.answer_model,
                 question, question_date, memories,
+                question_type=question_type, abstention=abstention,
                 api_key=args.answer_api_key, api_base=args.answer_api_base)
         except Exception as e:
             print(f"  Answer generation failed for {qid}: {e}")
@@ -927,7 +988,7 @@ def main():
     parser.add_argument("--granularity", default="turn",
                         choices=["turn", "session"],
                         help="Ingestion granularity")
-    parser.add_argument("--retrieval-limit", type=int, default=50,
+    parser.add_argument("--retrieval-limit", type=int, default=100,
                         help="Number of memories to retrieve per query")
 
     parser.add_argument("--answer-provider", default="openai",
