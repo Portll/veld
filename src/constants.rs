@@ -1483,6 +1483,40 @@ pub const POWERLAW_BETA_POTENTIATED: f64 = 0.3;
 /// - After 3 days at this rate: ~12.5% retention → power-law takes over
 pub const DECAY_LAMBDA_CONSOLIDATION: f64 = 0.693; // ln(2) / 1.0 day
 
+/// Log-periodic modulation amplitude (β) for fractal decay correction
+///
+/// Controls the strength of scale-invariant oscillations in power-law decay.
+/// The correction modulates retention so memories accessed at self-similar
+/// intervals (weekly, monthly, yearly rhythms) resist decay at those scales.
+///
+/// Formula: w(t) = t^(-α) × (1 + β Σₖ cos(2π log(t) / log(λₖ)))
+///
+/// Justification:
+/// - 0.15 keeps correction bounded: worst-case floor = 1 - 0.15×3 = 0.55 > 0
+/// - Empirical bursty access patterns show H ≈ 0.6–0.8 (persistent Hurst exponent)
+/// - Log-periodic oscillations capture discrete scale invariance in behavioral data
+///
+/// Reference: Sornette (2003) "Why Stock Markets Crash" Ch.5 (log-periodicity theory)
+pub const LOG_PERIODIC_BETA: f64 = 0.15;
+
+/// Preferred scaling ratios (λₖ) for log-periodic fractal decay
+///
+/// These represent the dominant temporal rhythms in human behavioral patterns.
+/// Extracted from known circaseptan, monthly, and circannual periodicities.
+///
+/// The log-periodic formula oscillates at these scales in log-time:
+///   cos(2π log(t) / log(λₖ))
+///
+/// At t = λₖ^n (integer multiples in log-space), the cosine peaks → decay slows.
+/// This creates resonance zones where memories accessed at self-similar intervals
+/// experience reduced forgetting.
+///
+/// Values:
+/// - 7.0: Weekly rhythm (circaseptan cycle)
+/// - 30.0: Monthly rhythm (work/life cycles)
+/// - 365.0: Yearly rhythm (seasonal/annual patterns)
+pub const LOG_PERIODIC_SCALES: [f64; 3] = [7.0, 30.0, 365.0];
+
 // =============================================================================
 // INFORMATION CONTENT (IC) WEIGHTS
 // Based on linguistic analysis for query parsing
