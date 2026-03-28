@@ -2818,23 +2818,41 @@ impl MemorySystem {
             }
 
             // ===========================================================================
-            // LAYER 4.525: ENTITY-QUERY OVERLAP BOOST
+            // LAYER 4.525: ENTITY-QUERY OVERLAP BOOST (stemmed + filtered)
             // ===========================================================================
-            // Boost memories whose entities/tags directly match query terms.
-            // This is a precision signal: Memory[2] with tags ["backend", "rust",
-            // "language", "decision"] should outrank Memory[46] with tags
-            // ["architecture-change", "mongodb", "postgresql", "reversed"]
-            // for the query "What programming language did we choose for the backend?".
+            // Boost memories whose entities/tags match stemmed query terms.
+            // Porter stemming resolves morphological mismatches: "bugs"->"bug",
+            // "risks"->"risk", "testing"->"test". Stop word filtering prevents
+            // false positives from "the" matching inside "prometheus" etc.
+            // Linear 0.10 per match, capped at 0.40.
             {
-                let query_terms: std::collections::HashSet<String> = query_text
+                use rust_stemmers::{Algorithm, Stemmer};
+                let stemmer = Stemmer::create(Algorithm::English);
+
+                const STOP_WORDS: &[&str] = &[
+                    "the", "and", "for", "are", "but", "not", "you", "all", "can",
+                    "had", "was", "one", "our", "out", "has", "how", "its", "who",
+                    "did", "get", "got", "let", "say", "she", "too", "use", "what",
+                    "when", "where", "which", "with", "will", "would", "could",
+                    "should", "about", "after", "before", "from", "have", "been",
+                    "were", "being", "their", "there", "these", "those", "this",
+                    "that", "than", "into", "some", "such", "them", "then", "very",
+                    "just", "also", "most", "over", "only", "other", "during",
+                ];
+
+                let query_stems: std::collections::HashSet<String> = query_text
                     .to_lowercase()
                     .split_whitespace()
                     .filter(|w| w.len() > 2)
-                    .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
-                    .filter(|w| !w.is_empty())
+                    .map(|w| {
+                        let cleaned: String =
+                            w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        stemmer.stem(&cleaned).to_string()
+                    })
+                    .filter(|s| !s.is_empty() && s.len() > 1 && !STOP_WORDS.contains(&s.as_str()))
                     .collect();
 
-                if query_terms.len() >= 2 {
+                if !query_stems.is_empty() {
                     let get_entities = |id: &MemoryId| -> Vec<String> {
                         self.working_memory
                             .read()
@@ -2858,21 +2876,20 @@ impl MemorySystem {
                     let ids: Vec<MemoryId> = fused.keys().cloned().collect();
                     for id in &ids {
                         let entities = get_entities(id);
-                        let entity_lower: Vec<String> =
-                            entities.iter().map(|e| e.to_lowercase()).collect();
-                        let overlap = query_terms
+                        let entity_stems: Vec<String> = entities
                             .iter()
-                            .filter(|qt| entity_lower.iter().any(|e| e.contains(qt.as_str())))
+                            .map(|e| stemmer.stem(&e.to_lowercase()).to_string())
+                            .collect();
+                        let overlap = query_stems
+                            .iter()
+                            .filter(|qs| {
+                                entity_stems
+                                    .iter()
+                                    .any(|es| es.contains(qs.as_str()))
+                            })
                             .count();
                         if overlap >= 1 {
-                            // Graduated entity overlap boost:
-                            // 1 match: +0.05 (modest — prevents noise)
-                            // 2+ matches: +0.10 per match (strong signal)
-                            let boost = if overlap == 1 {
-                                0.05
-                            } else {
-                                0.10 * overlap as f32
-                            };
+                            let boost = (0.10 * overlap as f32).min(0.40);
                             if let Some(score) = fused.get_mut(id) {
                                 *score += boost;
                             }

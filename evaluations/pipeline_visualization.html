@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>shodh-memory Retrieval Pipeline — 3D Gate Chain</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a12; overflow: hidden; font-family: 'SF Mono', 'Fira Code', monospace; }
+  canvas { display: block; }
+  #info {
+    position: absolute; top: 16px; left: 16px; color: #8899aa;
+    font-size: 12px; pointer-events: none; line-height: 1.6;
+  }
+  #info h1 { font-size: 14px; color: #cde; margin-bottom: 4px; }
+  #legend {
+    position: absolute; bottom: 16px; left: 16px; color: #8899aa;
+    font-size: 11px; pointer-events: none; line-height: 1.8;
+  }
+  .swatch {
+    display: inline-block; width: 12px; height: 12px;
+    border-radius: 2px; vertical-align: middle; margin-right: 6px;
+  }
+</style>
+</head>
+<body>
+<div id="info">
+  <h1>shodh-memory retrieval pipeline</h1>
+  score transformations on S &isin; R<sup>n</sup> &mdash; orbit with mouse
+</div>
+<div id="legend">
+  <span class="swatch" style="background:#1a2744"></span>low utility (fusion)<br>
+  <span class="swatch" style="background:#4a90d9"></span>decision paths<br>
+  <span class="swatch" style="background:#e8f0ff"></span>chokepoints<br>
+  <span class="swatch" style="background:#111"></span>stage breaks
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+
+// =========================================================================
+// Pipeline layer definitions
+// =========================================================================
+// pressure: 0 = dark blue (low utility), 0.5 = sky blue, 1.0 = white (chokepoint)
+// diameter: relative tube width (candidates surviving)
+// isBreak: black band stage separator
+const LAYERS = [
+  // Layer 4: RRF Fusion
+  { id: '4.0',   label: 'competitive-activation-synthesis',   math: 'S = \u03A3 w/(K+r)',          pressure: 0.05, diameter: 1.0,  height: 1.6, isBreak: false },
+  { id: '',      label: '',                                    math: '',                              pressure: 0,    diameter: 1.0,  height: 0.15, isBreak: true },
+  // Additive gate chain
+  { id: '4.5',   label: 'schema-driven-recognition',          math: 'S += 0.5\u00B71\u2090',       pressure: 0.25, diameter: 0.95, height: 0.7,  isBreak: false },
+  { id: '4.55',  label: 'chronological-context-priming',      math: 'S += 0.2\u00B71\u209C',       pressure: 0.30, diameter: 0.93, height: 0.7,  isBreak: false },
+  { id: '4.52',  label: 'categorical-type-matching',          math: 'S += 0.15\u00B71\u1D48',      pressure: 0.35, diameter: 0.90, height: 0.7,  isBreak: false },
+  { id: '4.525', label: 'associative-name-binding',           math: 'S += 0.10\u00B7overlap',      pressure: 0.55, diameter: 0.88, height: 0.9,  isBreak: false },
+  { id: '',      label: '',                                    math: '',                              pressure: 0,    diameter: 0.88, height: 0.12, isBreak: true },
+  // Multiplicative gates
+  { id: '4.53',  label: 'breadth-inhibition-control',         math: 'S \u00D7= penalty(l/\u03BC)', pressure: 0.45, diameter: 0.82, height: 0.8,  isBreak: false },
+  { id: '4.6',   label: 'retrieval-induced-forgetting',       math: 'S \u00D7= f(act,hist)',       pressure: 0.40, diameter: 0.78, height: 0.8,  isBreak: false },
+  { id: '',      label: '',                                    math: '',                              pressure: 0,    diameter: 0.78, height: 0.12, isBreak: true },
+  // Late additive gates
+  { id: '4.7',   label: 'intention-driven-recall',            math: 'S += \u221Am\u00B70.15',      pressure: 0.35, diameter: 0.75, height: 0.7,  isBreak: false },
+  { id: '4.8',   label: 'consolidation-source-trust',         math: 'S += fact_boost',              pressure: 0.30, diameter: 0.72, height: 0.6,  isBreak: false },
+  { id: '4.9',   label: 'semantic-category-spreading',        math: 'S += type\u00B70.08',         pressure: 0.40, diameter: 0.70, height: 0.7,  isBreak: false },
+  { id: '',      label: '',                                    math: '',                              pressure: 0,    diameter: 0.70, height: 0.2,  isBreak: true },
+  // SORT chokepoint
+  { id: 'SORT',  label: 'threshold-consciousness-gate',       math: 'truncate(sort(S))',            pressure: 0.95, diameter: 0.35, height: 0.5,  isBreak: false },
+  { id: '',      label: '',                                    math: '',                              pressure: 0,    diameter: 0.35, height: 0.15, isBreak: true },
+  // Layer 5: Unified scoring
+  { id: '5.0',   label: 'episodic-context-integration',       math: 'S += recency+arousal',         pressure: 0.50, diameter: 0.40, height: 0.8,  isBreak: false },
+  { id: '5.5',   label: 'deliberative-similarity-judgment',   math: 'S = b\u00B7w + cos\u00B7w\u00B7b', pressure: 0.65, diameter: 0.38, height: 0.9,  isBreak: false },
+  { id: '',      label: '',                                    math: '',                              pressure: 0,    diameter: 0.38, height: 0.12, isBreak: true },
+  // Final gates
+  { id: '5.7',   label: 'access-consciousness-threshold',     math: 'S if > \u03B8',               pressure: 0.90, diameter: 0.20, height: 0.4,  isBreak: false },
+  { id: '5.8',   label: 'relevance-salience-filtering',       math: 'S \u00D7= 0.85\u00B71\u209C', pressure: 0.60, diameter: 0.18, height: 0.5,  isBreak: false },
+];
+
+// =========================================================================
+// Color mapping: pressure -> dark blue / sky blue / white
+// =========================================================================
+function pressureColor(p) {
+  // 0.0 = #1a2744 (dark blue), 0.5 = #4a90d9 (sky blue), 1.0 = #e8f0ff (white)
+  const darkBlue  = new THREE.Color(0x1a2744);
+  const skyBlue   = new THREE.Color(0x4a90d9);
+  const white     = new THREE.Color(0xe8f0ff);
+  if (p <= 0.5) {
+    return darkBlue.clone().lerp(skyBlue, p / 0.5);
+  }
+  return skyBlue.clone().lerp(white, (p - 0.5) / 0.5);
+}
+
+// =========================================================================
+// Scene setup
+// =========================================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a12);
+scene.fog = new THREE.FogExp2(0x0a0a12, 0.04);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(6, -4, 6);
+camera.lookAt(0, -6, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, -6, 0);
+controls.update();
+
+// Lighting
+const ambient = new THREE.AmbientLight(0x334466, 0.6);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xeef4ff, 0.8);
+dirLight.position.set(5, 5, 5);
+scene.add(dirLight);
+const rimLight = new THREE.DirectionalLight(0x4488cc, 0.3);
+rimLight.position.set(-3, -2, -4);
+scene.add(rimLight);
+
+// =========================================================================
+// Build pipeline geometry
+// =========================================================================
+const pipeGroup = new THREE.Group();
+let yOffset = 0;
+const BASE_RADIUS = 1.2;
+const RADIAL_SEGMENTS = 48;
+
+for (const layer of LAYERS) {
+  const r = BASE_RADIUS * layer.diameter;
+  const h = layer.height;
+
+  if (layer.isBreak) {
+    // Black band — thin dark ring
+    const geo = new THREE.CylinderGeometry(r * 1.02, r * 1.02, h, RADIAL_SEGMENTS, 1, false);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x111111,
+      roughness: 0.9,
+      metalness: 0.1,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.y = -yOffset - h / 2;
+    pipeGroup.add(mesh);
+    yOffset += h;
+    continue;
+  }
+
+  // Main pipe section
+  const color = pressureColor(layer.pressure);
+  const geo = new THREE.CylinderGeometry(r, r, h, RADIAL_SEGMENTS, 1, false);
+  const mat = new THREE.MeshStandardMaterial({
+    color: color,
+    roughness: 0.4,
+    metalness: 0.15,
+    transparent: true,
+    opacity: 0.85,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.y = -yOffset - h / 2;
+  pipeGroup.add(mesh);
+
+  // Inner glow tube (slightly smaller, emissive)
+  const innerGeo = new THREE.CylinderGeometry(r * 0.7, r * 0.7, h, RADIAL_SEGMENTS, 1, false);
+  const innerMat = new THREE.MeshStandardMaterial({
+    color: color,
+    emissive: color,
+    emissiveIntensity: 0.15 + layer.pressure * 0.3,
+    roughness: 0.6,
+    transparent: true,
+    opacity: 0.3,
+  });
+  const innerMesh = new THREE.Mesh(innerGeo, innerMat);
+  innerMesh.position.y = -yOffset - h / 2;
+  pipeGroup.add(innerMesh);
+
+  // Edge ring at top of section
+  const ringGeo = new THREE.TorusGeometry(r, 0.015, 8, RADIAL_SEGMENTS);
+  const ringMat = new THREE.MeshStandardMaterial({
+    color: 0x667788,
+    roughness: 0.3,
+    metalness: 0.5,
+  });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.rotation.x = Math.PI / 2;
+  ring.position.y = -yOffset;
+  pipeGroup.add(ring);
+
+  // Label (sprite-based for clean 3D text)
+  if (layer.label) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 1024;
+    canvas.height = 128;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Layer ID
+    ctx.font = 'bold 28px SF Mono, Fira Code, monospace';
+    ctx.fillStyle = '#8899bb';
+    ctx.fillText(layer.id, 10, 35);
+
+    // Psychology label
+    ctx.font = '24px SF Mono, Fira Code, monospace';
+    ctx.fillStyle = '#c8d8e8';
+    ctx.fillText(layer.label, 10, 70);
+
+    // Math expression
+    ctx.font = 'italic 20px SF Mono, Fira Code, monospace';
+    ctx.fillStyle = '#667788';
+    ctx.fillText(layer.math, 10, 105);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    const spriteMat = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(4.5, 0.56, 1);
+    sprite.position.set(r + 2.5, -yOffset - h / 2, 0);
+    pipeGroup.add(sprite);
+  }
+
+  yOffset += h;
+}
+
+scene.add(pipeGroup);
+
+// =========================================================================
+// Flow particles — information flowing down the pipe
+// =========================================================================
+const PARTICLE_COUNT = 120;
+const particleGeo = new THREE.BufferGeometry();
+const positions = new Float32Array(PARTICLE_COUNT * 3);
+const colors = new Float32Array(PARTICLE_COUNT * 3);
+const velocities = new Float32Array(PARTICLE_COUNT);
+const totalHeight = yOffset;
+
+function initParticle(i) {
+  const angle = Math.random() * Math.PI * 2;
+  const radius = Math.random() * 0.6;
+  positions[i * 3]     = Math.cos(angle) * radius;
+  positions[i * 3 + 1] = Math.random() * 2; // start near top
+  positions[i * 3 + 2] = Math.sin(angle) * radius;
+  velocities[i] = 0.02 + Math.random() * 0.04;
+
+  // Color: slight variation of sky blue
+  const c = pressureColor(0.3 + Math.random() * 0.4);
+  colors[i * 3]     = c.r;
+  colors[i * 3 + 1] = c.g;
+  colors[i * 3 + 2] = c.b;
+}
+
+for (let i = 0; i < PARTICLE_COUNT; i++) {
+  initParticle(i);
+  positions[i * 3 + 1] = -Math.random() * totalHeight; // spread initially
+}
+
+particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+particleGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+const particleMat = new THREE.PointsMaterial({
+  size: 0.06,
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.7,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+});
+
+const particles = new THREE.Points(particleGeo, particleMat);
+scene.add(particles);
+
+// =========================================================================
+// Animate
+// =========================================================================
+function animate() {
+  requestAnimationFrame(animate);
+
+  // Update particles
+  const pos = particles.geometry.attributes.position.array;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    pos[i * 3 + 1] -= velocities[i];
+
+    // Find which layer this particle is in to adjust radius
+    let cumH = 0;
+    let currentDiameter = 1.0;
+    for (const layer of LAYERS) {
+      cumH += layer.height;
+      if (-pos[i * 3 + 1] <= cumH) {
+        currentDiameter = layer.diameter;
+        break;
+      }
+    }
+
+    // Constrict particles as pipe narrows
+    const maxR = BASE_RADIUS * currentDiameter * 0.6;
+    const angle = Math.atan2(pos[i * 3 + 2], pos[i * 3]);
+    const r = Math.sqrt(pos[i * 3] ** 2 + pos[i * 3 + 2] ** 2);
+    if (r > maxR) {
+      pos[i * 3]     = Math.cos(angle) * maxR;
+      pos[i * 3 + 2] = Math.sin(angle) * maxR;
+    }
+
+    // Reset at bottom
+    if (pos[i * 3 + 1] < -totalHeight - 1) {
+      initParticle(i);
+    }
+  }
+  particles.geometry.attributes.position.needsUpdate = true;
+
+  // Gentle rotation
+  pipeGroup.rotation.y += 0.001;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// Resize handler
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
