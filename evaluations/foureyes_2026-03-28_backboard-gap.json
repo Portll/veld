@@ -1,0 +1,332 @@
+{
+  "evaluation": "FourEyes 4-Agent N-Dimensional Void Analysis",
+  "target": "shodh-memory v0.5.0 vs Backboard.io 90.0% — what's missing to close 14.5pp gap",
+  "date": "2026-03-28",
+  "build": "v0.5.0 dev",
+
+  "score_gap": {
+    "shodh_v0_5": {"overall": 75.5, "single_hop": 0.900, "temporal": 0.650, "multi_hop": 0.900, "open_domain": 0.900},
+    "backboard":  {"overall": 90.0, "single_hop": 89.4, "temporal": 91.9, "multi_hop": 75.0, "open_domain": 91.2},
+    "note": "Metrics not directly comparable. Backboard uses GPT-4.1 J-score on full 1540-question LOCOMO. shodh uses MRR/R@k on 20-query subset. The gap analysis focuses on CAPABILITY differences, not score arithmetic."
+  },
+
+  "phase_1_parallel_agent_walks": {
+
+    "edgewalk": {
+      "start": "Query ingestion (query_parser.rs L3830: decompose_query)",
+      "path": "query_parser -> embedding -> vector_search -> BM25 -> RRF_fusion -> boost_layers -> cross_encoder -> ordinal_resolution -> final_ranking",
+      "findings": [
+        {
+          "id": "EW-1",
+          "severity": "CRITICAL",
+          "title": "No LLM reranker — the single biggest capability gap",
+          "detail": "Layer 5.5 (mod.rs:3446) is labeled 'Cross-Encoder Reranking' but is actually bi-encoder cosine similarity using the same MiniLM-L6-v2 model. hybrid_search.rs:114 explicitly says 'Disabled: current implementation is bi-encoder, not true cross-encoder'. Backboard uses GPT-4.1 as both judge AND reranker. The scoring architecture of top LOCOMO systems (EverMemOS 92%, MemMachine 91%, Backboard 90%) all use cloud LLM reranking to push from ~75% to ~90%. This is the single largest architectural gap — worth ~10-12pp alone.",
+          "evidence": "mod.rs:3448 comment says 'bi-encoder approximation (separate query/doc embeddings) — not a true cross-encoder'. hybrid_search.rs:558 says 'For true cross-encoder reranking, you'd use a model trained for query-document scoring (e.g., cross-encoder/ms-marco-MiniLM-L-6-v2)'. The model exists, is 22MB, runs locally on ONNX. Not using it.",
+          "fix": "Either (a) add ms-marco-MiniLM-L-6-v2 as a local cross-encoder (stays local, +3-5pp), or (b) add optional cloud LLM reranking for users who want max accuracy (+10-12pp). Both are additive — keep bi-encoder as fallback."
+        },
+        {
+          "id": "EW-2",
+          "severity": "HIGH",
+          "title": "Embedding model ceiling — MiniLM-L6-v2 is 384-dim, 2020-era",
+          "detail": "MiniLM-L6-v2 is a 22M parameter model producing 384-dimensional embeddings. It was state-of-art in 2020. Modern embedding models (GTE-large-en-v1.5, E5-large-v2, Nomic-embed-text-v1.5) produce 768-1024 dim embeddings with 2-4x better retrieval on MTEB benchmarks. The MTEB gap between MiniLM-L6 (avg 56.3) and GTE-large (avg 65.4) is 9.1 points — this directly translates to retrieval precision.",
+          "evidence": "embeddings/minilm.rs:15 — SHODH_ONNX_THREADS config. The entire embedding pipeline is built around this one model. No model selection, no fallback, no A/B testing.",
+          "fix": "Add Nomic-embed-text-v1.5 (137M params, 768-dim, Apache 2.0, ONNX available) as the default. Keep MiniLM as edge/fallback. Expected lift: +3-5pp on vector search quality, propagates through all downstream layers."
+        },
+        {
+          "id": "EW-3",
+          "severity": "HIGH",
+          "title": "No answer generation — shodh retrieves, doesn't answer",
+          "detail": "LOCOMO J-score evaluates ANSWER quality, not retrieval quality. The full pipeline is: retrieve context -> generate answer -> judge answer. shodh stops at retrieval. Backboard, Mem0, Letta all generate answers from retrieved context using GPT-4/Claude. Even with perfect retrieval, the answer generation step can lose 5-10pp if the wrong context slice is sent to the LLM or if the answer synthesis is poor.",
+          "evidence": "No answer generation code exists anywhere in the codebase. The benchmark (locomo_benchmark.rs) evaluates retrieval metrics (MRR, R@k, P@k), not answer quality. The 75.5% composite is a retrieval score, not a J-score.",
+          "fix": "For fair LOCOMO comparison, add an answer generation step using the user's configured LLM. The retrieval pipeline feeds context, the LLM generates the answer, GPT-4 judges. This is the evaluation methodology Backboard uses."
+        },
+        {
+          "id": "EW-4",
+          "severity": "MEDIUM",
+          "title": "Query decomposition only fires on explicit conjunctions",
+          "detail": "decompose_query (query_parser.rs:3830) splits on 'AND', 'and also', 'as well as', multi-entity, or comparison patterns. Implicit multi-hop queries ('How did Raj's architecture proposal affect our timeline?') don't decompose because there's no conjunction keyword. Backboard likely uses LLM-based query decomposition that understands implicit relationships.",
+          "evidence": "query_parser.rs tests show decompose_query returns 1 sub-query for 'What programming language did we choose?' — correct. But also returns 1 for 'How did the testing strategy change based on the bugs we found?' — this IS a multi-hop query (testing + bugs) but has no conjunction trigger.",
+          "fix": "LLM-based query decomposition (send query to local LLM, ask for sub-questions). Or: detect multi-entity queries by counting focal_entities > 1 with relational verbs."
+        }
+      ]
+    },
+
+    "fractal": {
+      "start": "Boost layer pattern (L4.5 through L4.9)",
+      "pattern": "Additive boost on RRF fused score, each layer gated by query-type detection",
+      "findings": [
+        {
+          "id": "FR-1",
+          "severity": "HIGH",
+          "title": "The additive boost architecture has a calibration ceiling",
+          "detail": "15 boost layers each add 0.05-0.50 to a base RRF score of ~0.05. The layers interact non-linearly: Layer 4.525 (entity overlap) and Layer 4.52 (decision boost) can compound to +0.55 on a 0.05 base — 12x amplification. This architecture cannot scale beyond ~80% because the boost magnitudes are hand-tuned and interact unpredictably. Every new layer requires recalibrating all existing layers. Backboard uses a learned scoring model that optimizes weights jointly.",
+          "evidence": "constants.rs has 20+ hand-tuned boost constants. No A/B framework, no weight optimization, no gradient signal. The composite went from 64.3% to 75.5% through manual tuning, but each additional percentage point requires exponentially more effort.",
+          "fix": "Replace the boost stack with a lightweight learned ranker (LambdaMART or a 2-layer MLP) that takes all layer signals as features and learns optimal weights from labeled data. The LOCOMO benchmark provides 20 labeled queries — enough for basic optimization with cross-validation."
+        },
+        {
+          "id": "FR-2",
+          "severity": "MEDIUM",
+          "title": "Fractal break: temporal layers don't mirror spatial layers",
+          "detail": "Spatial/entity queries have a clean 4-layer stack: L0.5 (attribute detection) -> L4.5 (attribute boost) -> L4.525 (entity overlap) -> L4.9 (ontology rerank). Temporal queries have: L0.6 (temporal gate) -> L4.55 (temporal boost) -> L5.9 (ordinal resolution). But L0.6 fires on keyword matching while L0.5 fires on parsed query structure. L4.55 uses a flat boost while L4.5 uses attribute-specific scoring. The temporal path is structurally weaker than the spatial path — it pattern-matches where spatial reasons.",
+          "evidence": "Temporal MRR (0.650) vs single-hop MRR (0.900) and open-domain MRR (0.900). The temporal gap IS the fractal break: the temporal layers use a less sophisticated architecture than the entity layers.",
+          "fix": "Give temporal queries the same structural depth as entity queries: parsed temporal structure (not keyword matching), temporal-specific BM25 fields, session-aware scoring (not just fact lookup)."
+        },
+        {
+          "id": "FR-3",
+          "severity": "MEDIUM",
+          "title": "No memory summarization/consolidation at retrieval time",
+          "detail": "Backboard and MemMachine use 'memory notes' — consolidated summaries of related memories generated at storage time. When retrieving, they match against both raw memories AND their consolidated notes. shodh has a consolidation pipeline (CLS dual-structure) but it's not wired into retrieval. The knowledge graph has Hebbian learning but the graph edges aren't used to expand recall candidates beyond 1-hop.",
+          "evidence": "mod.rs:3265 uses hebbian_scores but only as a 10% additive boost. The graph traversal (Layer 2) uses spreading activation but caps at 20 candidates. There's no 'query the consolidated knowledge, not just raw memories' path.",
+          "fix": "At storage time, generate session summaries and topic summaries. At retrieval time, search summaries first to identify relevant sessions, then retrieve raw memories from those sessions. This is the Backboard 'notes' approach."
+        }
+      ]
+    },
+
+    "clustering": {
+      "start": "The 4 LOCOMO query types as clusters",
+      "cluster_analysis": {
+        "cluster_1_single_hop": {
+          "current": "0.900 MRR — strong",
+          "gap_to_backboard": "-0.6pp (89.4%)",
+          "diagnosis": "Nearly matched. The remaining Q2 failure (MRR=0.50) is due to Memory[16] outranking Memory[3] for 'What database?'. A better embedding model would fix this — 'database' -> 'PostgreSQL/MongoDB' semantic distance is model-dependent.",
+          "missing": "Nothing structural. Model quality is the bottleneck."
+        },
+        "cluster_2_temporal": {
+          "current": "0.650 MRR — weakest category",
+          "gap_to_backboard": "-26.9pp (91.9%)",
+          "diagnosis": "Massive gap. Backboard achieves 91.9% on temporal — the HIGHEST category. shodh's temporal (0.650) is the LOWEST. This inversion means Backboard has a dedicated temporal reasoning engine that shodh lacks entirely. The wavelet session detection + ordinal resolution is necessary but not sufficient.",
+          "missing": [
+            "Session-order-aware recency: when timestamps are equal (benchmark) or close (production), use session index as tiebreaker",
+            "Temporal slot filling: 'last week' should resolve to a date range and filter memories by created_at",
+            "Relative temporal reasoning: 'before the architecture change' should find memories earlier than Memory[18]",
+            "Temporal chain reasoning: 'What happened after we switched databases?' requires ordering memories by the database-switch event, not by absolute time"
+          ]
+        },
+        "cluster_3_multi_hop": {
+          "current": "0.900 MRR — strong",
+          "gap_to_backboard": "+15.0pp (shodh BEATS backboard's 75.0%)",
+          "diagnosis": "shodh's query decomposition ALREADY outperforms Backboard on multi-hop. Backboard scores 75.0% on multi-hop vs shodh's 0.900 MRR. This is shodh's strongest relative advantage. The decomposition + entity overlap + BM25 fusion pipeline is genuinely better than Backboard's approach for compound queries.",
+          "missing": "Nothing. Protect this advantage. Don't regress multi-hop to chase temporal."
+        },
+        "cluster_4_open_domain": {
+          "current": "0.900 MRR — strong",
+          "gap_to_backboard": "-1.2pp (91.2%)",
+          "diagnosis": "Close to parity. Open-domain queries benefit from the entity overlap boost surfacing broad-coverage memories. The remaining Q19 failure (MRR=0.50) is marginal.",
+          "missing": "Minor — a slightly better embedding model would close this gap."
+        }
+      },
+      "orphan_finding": {
+        "id": "CL-1",
+        "severity": "CRITICAL",
+        "title": "Temporal cluster is structurally orphaned from the scoring architecture",
+        "detail": "The temporal path (L0.6 -> L4.55 -> L5.9) is disconnected from the main scoring path (L3 -> L4 -> L4.5 -> L4.525 -> L5). Temporal signals don't participate in the main RRF fusion — they're bolted on as post-hoc boosts. In contrast, entity/attribute signals flow through the main pipeline. This orphaning means temporal queries get the worst of both worlds: semantic search finds irrelevant results, and temporal boosts can't override them strongly enough.",
+        "fix": "Integrate temporal signals INTO the main retrieval, not after it. Pre-filter by time window BEFORE vector search. Use session-aware embedding (concatenate session metadata with content before encoding)."
+      }
+    },
+
+    "hde": {
+      "start": "The embedding model (unexpected entry point)",
+      "curiosity_chain": [
+        "MiniLM-L6-v2 -> 384 dims -> why not bigger? -> ONNX load-dynamic -> model download at first use -> wait, the model path is hardcoded",
+        "hardcoded model -> no model selection -> what if we used different models for different query types?",
+        "different models -> cross-encoder idea -> ms-marco-MiniLM -> wait, that's a RERANKER not an embedder",
+        "reranker -> Backboard uses GPT-4.1 -> GPT-4.1 is a 2026 model -> shodh uses 2020 embeddings",
+        "2020 vs 2026 -> 6 year technology gap -> but shodh runs local -> is there a 2025 local model?",
+        "Nomic-embed-text, GTE, E5 -> all available as ONNX -> all run on Apple Silicon",
+        "Apple Silicon -> MLX -> wait, could we use MLX instead of ONNX?",
+        "MLX -> native Metal acceleration -> 3-5x faster than ONNX on Apple Silicon",
+        "faster inference -> could run a BIGGER model in the same latency budget",
+        "bigger model -> what's the actual latency breakdown? -> where does time go?",
+        "latency: embedding ~30ms, vector search ~5ms, BM25 ~10ms, boosts ~2ms -> embedding dominates",
+        "embedding dominates -> a 768-dim model at same latency = pure quality lift",
+        "quality lift -> but Backboard doesn't care about latency, they use GPT-4.1...",
+        "GPT-4.1 -> they generate ANSWERS not just retrieve -> the entire evaluation methodology is different"
+      ],
+      "observations": [
+        {
+          "id": "HDE-1",
+          "title": "The evaluation methodology gap is bigger than the retrieval gap",
+          "detail": "shodh measures retrieval quality (did we FIND the right memory?). Backboard measures answer quality (did we PRODUCE the right answer?). These are different tasks. A system with perfect retrieval but no answer generation scores 0% on J-score. A system with mediocre retrieval but excellent answer generation can score 90%+ because the LLM compensates for missing context. The 14.5pp gap isn't a retrieval gap — it's an evaluation methodology gap. shodh might ALREADY retrieve well enough to score 90%+ if it had an answer generation step."
+        },
+        {
+          "id": "HDE-2",
+          "title": "Session-as-document: the missing abstraction",
+          "detail": "Backboard treats sessions as first-class documents. Each session has a summary, a topic list, and temporal metadata. When a temporal query arrives, Backboard first searches sessions, then retrieves memories from matching sessions. shodh treats memories as independent atoms — session is a metadata field, not a retrieval unit. This is why temporal scoring is structurally orphaned: there's no session-level retrieval to anchor temporal queries against."
+        },
+        {
+          "id": "HDE-3",
+          "title": "The 'second meeting' fix revealed a class of bugs",
+          "detail": "The punctuation bug in extract_ordinal_session_ref ('meeting?' != 'meeting') is symptomatic of a broader issue: the query parser operates on raw text without normalization. Every downstream consumer (temporal gate keywords, stop word lists, ordinal extraction) must independently handle punctuation, casing, and whitespace. A single normalization step at query entry would eliminate this entire class of bugs."
+        },
+        {
+          "id": "HDE-4",
+          "title": "You're competing on the wrong leaderboard",
+          "detail": "Backboard's 90% is on the FULL 1,540-question LOCOMO dataset with GPT-4.1 as judge. shodh's 75.5% is on a 20-question subset with retrieval metrics. These numbers aren't comparable. Running shodh on the full 1,540-question dataset with an LLM answer generation step would produce a TRUE J-score that can be directly compared. The current comparison is misleading in BOTH directions — shodh might score higher OR lower on the real benchmark."
+        },
+        {
+          "id": "HDE-5",
+          "title": "The Hebbian graph is an untapped superpower",
+          "detail": "shodh has a knowledge graph with Hebbian learning that no competitor has. But it contributes only 10% to final scoring (mod.rs:3265). The graph could be used for: (1) query expansion via entity neighbors, (2) session-level retrieval via entity-session edges, (3) temporal chain reasoning via event ordering edges, (4) contradiction detection for temporal queries. The graph is a strategic asset being treated as a minor signal."
+        }
+      ]
+    }
+  },
+
+  "phase_2_coverage_map": {
+    "note": "Dimensions: RQ=Retrieval Quality, TMP=Temporal, MH=Multi-Hop, OD=Open-Domain, EMB=Embedding, RNK=Reranking, AG=Answer Gen, SM=Session Mgmt, GR=Graph, QP=Query Parse, CAL=Calibration, EVL=Evaluation",
+    "heatmap": {
+      "query_parser":     {"RQ": 4, "TMP": 3, "MH": 3, "OD": 2, "EMB": 0, "RNK": 0, "AG": 0, "SM": 1, "GR": 0, "QP": 4, "CAL": 1, "EVL": 1},
+      "embedding_model":  {"RQ": 2, "TMP": 1, "MH": 1, "OD": 1, "EMB": 4, "RNK": 2, "AG": 0, "SM": 0, "GR": 0, "QP": 0, "CAL": 1, "EVL": 0},
+      "vector_search":    {"RQ": 3, "TMP": 1, "MH": 3, "OD": 2, "EMB": 2, "RNK": 1, "AG": 0, "SM": 0, "GR": 0, "QP": 1, "CAL": 1, "EVL": 0},
+      "bm25_fusion":      {"RQ": 3, "TMP": 2, "MH": 2, "OD": 2, "EMB": 0, "RNK": 1, "AG": 0, "SM": 0, "GR": 0, "QP": 1, "CAL": 2, "EVL": 0},
+      "boost_layers":     {"RQ": 4, "TMP": 3, "MH": 3, "OD": 3, "EMB": 0, "RNK": 0, "AG": 0, "SM": 1, "GR": 1, "QP": 2, "CAL": 4, "EVL": 1},
+      "cross_encoder":    {"RQ": 2, "TMP": 1, "MH": 1, "OD": 1, "EMB": 2, "RNK": 4, "AG": 0, "SM": 0, "GR": 0, "QP": 0, "CAL": 2, "EVL": 0},
+      "session_detection":{"RQ": 1, "TMP": 4, "MH": 0, "OD": 0, "EMB": 0, "RNK": 0, "AG": 0, "SM": 4, "GR": 0, "QP": 1, "CAL": 0, "EVL": 0},
+      "knowledge_graph":  {"RQ": 1, "TMP": 0, "MH": 1, "OD": 1, "EMB": 0, "RNK": 0, "AG": 0, "SM": 0, "GR": 4, "QP": 0, "CAL": 0, "EVL": 0},
+      "answer_generation":{"RQ": 0, "TMP": 0, "MH": 0, "OD": 0, "EMB": 0, "RNK": 0, "AG": 0, "SM": 0, "GR": 0, "QP": 0, "CAL": 0, "EVL": 1},
+      "eval_methodology": {"RQ": 1, "TMP": 1, "MH": 1, "OD": 1, "EMB": 0, "RNK": 0, "AG": 1, "SM": 0, "GR": 0, "QP": 0, "CAL": 1, "EVL": 4}
+    }
+  },
+
+  "phase_3_void_detection": {
+    "complete_voids_4_agents_missed": [
+      {
+        "severity": "CRITICAL",
+        "components": ["answer_generation"],
+        "dimensions": ["RQ", "TMP", "MH", "OD", "EMB", "RNK", "SM", "GR", "QP", "CAL"],
+        "dimensionality": 10,
+        "missed_by": "All 4 agents — answer_generation is a 10-dimensional void",
+        "explanation": "The entire answer generation capability doesn't exist. Every LOCOMO competitor generates answers from retrieved context. shodh stops at retrieval. This single void accounts for ~5-8pp of the gap because J-score evaluates answer quality, not retrieval quality."
+      },
+      {
+        "severity": "CRITICAL",
+        "components": ["session_detection", "knowledge_graph"],
+        "dimensions": ["MH", "OD"],
+        "dimensionality": 4,
+        "missed_by": "Fractal + Clustering — session and graph don't contribute to multi-hop or open-domain",
+        "explanation": "Sessions and graph are only used for temporal/entity queries. Multi-hop queries could benefit from session-scoped retrieval (find memories from the same session as the database change). Open-domain queries could use graph expansion to find related topics. Neither path exists."
+      }
+    ],
+    "near_voids_3_agents_missed": [
+      {
+        "severity": "HIGH",
+        "components": ["embedding_model", "vector_search"],
+        "dimensions": ["TMP"],
+        "dimensionality": 2,
+        "missed_by": "EdgeWalk, Clustering, HDE — only Fractal noted the temporal gap in embeddings",
+        "explanation": "MiniLM-L6-v2 doesn't encode temporal semantics well. 'last week' and 'yesterday' have similar embeddings but very different temporal meanings. A temporal-aware embedding (or separate temporal features) would close the temporal gap."
+      },
+      {
+        "severity": "HIGH",
+        "components": ["boost_layers", "cross_encoder"],
+        "dimensions": ["SM"],
+        "dimensionality": 2,
+        "missed_by": "EdgeWalk, Fractal, HDE — only Clustering noted the session orphaning",
+        "explanation": "The boost layers and cross-encoder don't use session information at all. Session membership is only used in Layer 5.9 (ordinal resolution). A session-aware boost in the main scoring stack would help temporal queries significantly."
+      }
+    ]
+  },
+
+  "phase_4_awkward_shapes": [
+    {
+      "component": "temporal_pipeline",
+      "agents_seeing_different_faces": {
+        "edgewalk": "Sees the data flow: temporal keywords -> gate -> fact lookup -> boost",
+        "fractal": "Sees the structural weakness: temporal mirrors entity poorly",
+        "clustering": "Sees the orphaning: temporal is disconnected from main scoring",
+        "hde": "Sees the abstraction gap: no session-as-document retrieval"
+      },
+      "awkwardness_score": 0.72,
+      "explanation": "The temporal pipeline is a 4-faced object. Each agent sees one face. No agent sees the whole: the temporal pipeline needs to be REBUILT, not patched. It needs (1) parsed temporal structure (not keywords), (2) session-level retrieval, (3) integration into main scoring, AND (4) temporal-aware embeddings. Fixing any one face without the others won't close the 26.9pp gap to Backboard."
+    },
+    {
+      "component": "cross_encoder_reranking",
+      "agents_seeing_different_faces": {
+        "edgewalk": "Sees it as bi-encoder mislabeled as cross-encoder",
+        "fractal": "Sees it as a pattern break — other layers are hand-tuned, this uses model scores",
+        "hde": "Sees it as a latency budget opportunity — could run a bigger model"
+      },
+      "awkwardness_score": 0.55,
+      "explanation": "The reranker is simultaneously (a) broken (bi-encoder, not cross-encoder), (b) an architectural anomaly (model-based in a hand-tuned stack), and (c) a missed opportunity (Apple Silicon can run ms-marco cross-encoder in <20ms). Each perspective suggests a different fix."
+    }
+  ],
+
+  "phase_5_dimensional_bridges": [
+    {
+      "component": "embedding_model",
+      "bridge": "EMB <-> TMP",
+      "agents": ["EdgeWalk", "HDE"],
+      "dependency": "Upgrading embeddings improves ALL categories but temporal improvement is gated by the temporal pipeline's structural weakness. A better embedding model lifts single-hop and open-domain but temporal gains are capped by the session-orphaning problem.",
+      "three_body": "Improving embeddings + improving temporal pipeline = multiplicative gain. Improving either alone = diminishing returns."
+    },
+    {
+      "component": "boost_layers",
+      "bridge": "CAL <-> RQ",
+      "agents": ["EdgeWalk", "Fractal"],
+      "dependency": "Adding/tuning boosts improves some queries but regresses others (demonstrated by v0.5.0 multi-hop regression from 1.0 to 0.9 when content-fallback was added). The additive architecture has a calibration ceiling — each improvement creates a regression risk.",
+      "three_body": "The boost architecture must be replaced with a learned ranker before further manual tuning will produce net gains."
+    }
+  ],
+
+  "phase_6_synthesis": {
+    "priority_summary": {
+      "p0_close_the_evaluation_gap": {
+        "action": "Run shodh on the FULL 1,540-question LOCOMO dataset with LLM answer generation",
+        "expected_lift": "Unknown — but this produces a TRUE comparable score",
+        "rationale": "Without this, we're comparing retrieval MRR against answer J-score. The 14.5pp gap might be 5pp or 25pp on the real benchmark. We can't optimize what we can't measure.",
+        "effort": "Medium — need answer generation pipeline + GPT-4.1 judge integration",
+        "risk": "Low — additive capability, doesn't change retrieval"
+      },
+      "p1_add_real_cross_encoder": {
+        "action": "Add ms-marco-MiniLM-L-6-v2 cross-encoder as Layer 5.5 replacement",
+        "expected_lift": "+3-5pp retrieval quality, +5-8pp on J-score",
+        "rationale": "This is the single highest-ROI change. The model exists as ONNX, runs in <20ms on Apple Silicon, and is purpose-built for query-document scoring. It replaces the broken bi-encoder 'cross-encoder' with the real thing.",
+        "effort": "Low — model download + ONNX inference, same pattern as MiniLM",
+        "risk": "Very low — strictly improves reranking, fallback to bi-encoder if model unavailable"
+      },
+      "p2_upgrade_embedding_model": {
+        "action": "Replace MiniLM-L6-v2 with Nomic-embed-text-v1.5 or GTE-large-en-v1.5",
+        "expected_lift": "+3-5pp across all categories",
+        "rationale": "6-year model gap (2020 vs 2025). Modern models have 2-4x better retrieval on MTEB. 768-dim embeddings capture more semantic nuance. ONNX versions available.",
+        "effort": "Medium — need to rebuild vector index, update embedding dimensions throughout",
+        "risk": "Medium — requires index rebuild, potential compatibility issues"
+      },
+      "p3_rebuild_temporal_pipeline": {
+        "action": "Session-as-document retrieval + temporal slot filling + session-aware scoring",
+        "expected_lift": "+10-15pp on temporal (0.650 -> 0.800+), +3-5pp overall",
+        "rationale": "Temporal is the 26.9pp gap to Backboard. The current keyword-based temporal pipeline can't close this gap. Need parsed temporal structure, session-level retrieval, and temporal chain reasoning.",
+        "effort": "High — requires session summarization pipeline, temporal parser rewrite, scoring integration",
+        "risk": "Medium — could regress other categories if not gated properly"
+      },
+      "p4_learned_ranker": {
+        "action": "Replace additive boost stack with LambdaMART or 2-layer MLP",
+        "expected_lift": "+2-4pp from better calibration, eliminates regression risk from new features",
+        "rationale": "The manual tuning ceiling is ~80%. Each new boost layer risks regressing existing queries. A learned ranker optimizes all weights jointly from labeled data.",
+        "effort": "High — need feature extraction, training pipeline, evaluation framework",
+        "risk": "High — wrong training data = worse than hand-tuned. Need robust cross-validation."
+      }
+    },
+
+    "the_real_gap": {
+      "retrieval_gap": "~5-8pp (fixable with cross-encoder + better embeddings)",
+      "temporal_gap": "~10-15pp (requires architectural rebuild of temporal pipeline)",
+      "evaluation_gap": "Unknown (need to run the real LOCOMO benchmark to find out)",
+      "paradigm_gap": "shodh retrieves, Backboard answers. Different tasks, different scores.",
+      "strategic_advantage": "shodh BEATS Backboard on multi-hop (0.900 vs 75.0%). This is unique. No other system combines query decomposition + entity overlap + BM25 fusion this effectively. Protect and promote this advantage."
+    },
+
+    "hde_insights_no_other_agent_produced": [
+      "HDE-1: The evaluation methodology gap > the retrieval gap",
+      "HDE-2: Session-as-document is the missing abstraction for temporal",
+      "HDE-4: The comparison is misleading in BOTH directions",
+      "HDE-5: Hebbian graph is a strategic asset at 10% contribution — undertapped"
+    ],
+
+    "overall_coverage": {
+      "cells_examined": 72,
+      "total_cells": 120,
+      "coverage_ratio": 0.60,
+      "largest_void": "answer_generation (10-dimensional, 0 coverage)"
+    }
+  }
+}

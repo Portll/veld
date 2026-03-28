@@ -173,8 +173,10 @@ pub fn extract_ordinal_session_ref(query: &str) -> Option<(usize, String)> {
 
     for pair in words.windows(2) {
         if let Some(ordinal) = parse_ordinal(pair[0]) {
+            // Strip trailing punctuation from the noun candidate
+            let noun_candidate = pair[1].trim_end_matches(|c: char| !c.is_alphanumeric());
             for noun in SESSION_NOUNS {
-                if pair[1] == *noun {
+                if noun_candidate == *noun {
                     return Some((ordinal, noun.to_string()));
                 }
             }
