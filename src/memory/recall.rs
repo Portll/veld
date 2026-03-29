@@ -117,8 +117,27 @@ impl super::MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
-                    tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                match graph.read().record_memory_coactivation(&memory_uuids) {
+                    Ok(result) => {
+                        // BRIDGE-4: Consume edge tier promotions — boost memory importance
+                        for promo in &result.promotions {
+                            let boost = if promo.new_tier.contains("L3") { 0.15 } else { 0.10 };
+                            for mem in &memories {
+                                if mem.id.0 == promo.from_entity || mem.id.0 == promo.to_entity {
+                                    mem.boost_importance(boost);
+                                }
+                            }
+                        }
+                        if !result.promotions.is_empty() {
+                            tracing::debug!(
+                                "BRIDGE-4: {} edge promotions → boosted associated memory importance",
+                                result.promotions.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                    }
                 }
             }
         }
@@ -990,7 +1009,7 @@ impl super::MemorySystem {
         let sub_queries = query_parser::decompose_query(query_text, &query_analysis);
         let decomposed = sub_queries.len() > 1;
 
-        let vector_results: Vec<(MemoryId, f32)> = if decomposed {
+        let mut vector_results: Vec<(MemoryId, f32)> = if decomposed {
             // --- Decomposed path: weighted RRF merge of sub-query vector results ---
             use crate::constants::QUERY_DECOMPOSITION_SUB_WEIGHT;
             const DECOMP_RRF_K: f32 = 20.0;
@@ -1119,6 +1138,75 @@ impl super::MemorySystem {
         );
 
         // ===========================================================================
+        // LAYER 3.5: WORKING + SESSION TIER BRUTE-FORCE COSINE SCAN
+        // ===========================================================================
+        // Vamana indexes only long-term storage. Working-tier and Session-tier
+        // memories (current session, last few hours) are NOT in the vector index.
+        // This is the root cause of temporal MRR 0.767: the most recent memories
+        // are invisible to vector search.
+        //
+        // Fix: brute-force cosine similarity over the small in-memory tiers
+        // (typically <100 memories combined), merge results with Vamana output.
+        // Cost: O(n) where n = working + session count. At <100 memories and
+        // 384-dim vectors, this is <0.1ms — negligible vs Vamana's ~2-5ms.
+        {
+            let mut tier_hits = 0usize;
+            let vamana_ids: std::collections::HashSet<MemoryId> = vector_results
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            // Scan Working tier
+            for mem in self.working_memory.read().all_memories() {
+                if vamana_ids.contains(&mem.id) {
+                    continue; // already found by Vamana
+                }
+                if let Some(ref emb) = mem.experience.embeddings {
+                    if !emb.is_empty() {
+                        let sim = crate::memory::hybrid_search::cosine_similarity_pub(
+                            &query_embedding,
+                            emb,
+                        );
+                        if sim > 0.1 {
+                            vector_results.push((mem.id.clone(), sim));
+                            tier_hits += 1;
+                        }
+                    }
+                }
+            }
+
+            // Scan Session tier
+            for mem in self.session_memory.read().all_memories() {
+                if vamana_ids.contains(&mem.id) {
+                    continue;
+                }
+                if let Some(ref emb) = mem.experience.embeddings {
+                    if !emb.is_empty() {
+                        let sim = crate::memory::hybrid_search::cosine_similarity_pub(
+                            &query_embedding,
+                            emb,
+                        );
+                        if sim > 0.1 {
+                            vector_results.push((mem.id.clone(), sim));
+                            tier_hits += 1;
+                        }
+                    }
+                }
+            }
+
+            if tier_hits > 0 {
+                // Re-sort merged results by similarity descending
+                vector_results.sort_by(|a, b| b.1.total_cmp(&a.1));
+                vector_results.truncate(query.max_results * 8);
+                tracing::info!(
+                    tier_hits,
+                    total = vector_results.len(),
+                    "recall [layer:3.5] Working+Session brute-force cosine scan"
+                );
+            }
+        }
+
+        // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
         // ===========================================================================
         let (memory_ids, hebbian_scores): (
@@ -1170,6 +1258,7 @@ impl super::MemorySystem {
                     term_weights,
                     phrases,
                     disc_opt,
+                    query.rerank_count, // FIX-11: per-query rerank count override
                 )
                 .map(|r| {
                     r.into_iter()
@@ -2103,9 +2192,56 @@ impl super::MemorySystem {
                     1.0 // No feedback store configured
                 };
 
-                let final_score =
-                    (base + recency_boost + arousal_boost + credibility_boost + temporal_boost)
-                        * feedback_multiplier;
+                // SESSION CONTINUITY BOOST: memories from the current session
+                // (created within the last 2 hours) get a small additive boost.
+                // This compensates for the fact that very recent memories haven't
+                // had time to accumulate Hebbian co-activation, BM25 term frequency,
+                // or graph edges — they're signal-poor despite being contextually prime.
+                let session_boost = {
+                    let age_hours = (now - mem.created_at).num_hours();
+                    if age_hours <= 2 {
+                        0.03 // within current session window
+                    } else {
+                        0.0
+                    }
+                };
+
+                // BRIDGE-1: Proven signals from relevance.rs (validated at 14%+13% weight)
+                // access_count: log-scaled frequency signal (proven 14% weight in proactive)
+                let access_boost = ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * 0.07;
+                // graph_strength: Hebbian edge weight for this memory (proven 13% weight)
+                // Reuses hebbian_scores already computed in Layer 2 — zero new locks.
+                let graph_boost = hebbian_scores
+                    .get(&mem.id)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0)
+                    * 0.08;
+
+                // BRIDGE-3: Calibrated confidence (Bayesian alpha/beta)
+                // Only active when observation count > 5 (avoids penalizing new memories).
+                // Range: 0.85-1.0 multiplier — trusted memories rank higher, untested neutral.
+                let confidence_gate = {
+                    let obs = mem.confidence_observations();
+                    let total_obs = (obs - 2.0).max(0.0); // subtract priors
+                    if total_obs >= 5.0 {
+                        let bayesian = mem.calibrated_confidence();
+                        0.85 + 0.15 * bayesian // range: 0.85 (distrusted) to 1.0 (trusted)
+                    } else {
+                        1.0 // insufficient observations — neutral
+                    }
+                };
+
+                let final_score = (base
+                    + recency_boost
+                    + arousal_boost
+                    + credibility_boost
+                    + temporal_boost
+                    + session_boost
+                    + access_boost
+                    + graph_boost)
+                    * feedback_multiplier
+                    * confidence_gate;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);
@@ -2212,68 +2348,71 @@ impl super::MemorySystem {
         }
 
         // =====================================================================
-        // LAYER 5.5: CROSS-ENCODER RERANKING (Plan 001 §2.1)
+        // LAYER 5.3: CROSS-ENCODER RERANKING (BRIDGE-2)
         // =====================================================================
-        // Rerank the wider candidate pool using query-document cosine similarity.
-        // This is a bi-encoder approximation (separate query/doc embeddings) —
-        // not a true cross-encoder (joint encoding), but still improves precision
-        // by re-scoring against the actual query rather than relying on rank fusion.
+        // Wire the existing CrossEncoderReranker (built in hybrid_search.rs)
+        // into the main retrieval path. This uses joint query-document attention
+        // (70% cross-encoder + 30% bi-encoder blend) to re-score the top
+        // candidates. The cross-encoder score is blended with the existing
+        // unified score at 12% weight — enough to promote/demote by 1-3 positions
+        // without overriding the multi-signal pipeline.
         //
-        // Blend: base_weight% unified score + cosine_weight% cosine similarity.
-        // Query-type-aware: temporal/ordering queries get lower cosine weight because
-        // embeddings don't capture time well — BM25 keywords matter more.
-        // Single-hop/attribute queries get higher cosine weight for direct semantic match.
-        if memories.len() > query.max_results {
-            let rerank_start = std::time::Instant::now();
-            let candidate_count = memories.len();
+        // Only runs on the top `rerank_budget` candidates to keep latency bounded.
+        if memories.len() > 1 {
+            if let Some(reranker) = self.hybrid_search.reranker() {
+                let rerank_budget = memories.len().min(query.max_results * 2).min(20);
+                let candidates: Vec<(MemoryId, String, f32)> = memories
+                    .iter()
+                    .take(rerank_budget)
+                    .map(|m| {
+                        (
+                            m.id.clone(),
+                            m.experience.content.clone(),
+                            m.score.unwrap_or(0.0),
+                        )
+                    })
+                    .collect();
 
-            // Query-type-aware cosine blend weight
-            let cosine_weight = match &query_type {
-                crate::memory::query_parser::QueryType::Temporal => 0.15,
-                crate::memory::query_parser::QueryType::Attribute(_) => 0.40,
-                crate::memory::query_parser::QueryType::Exploratory => 0.30,
-            };
-            let base_weight = 1.0 - cosine_weight;
+                match reranker.rerank(query_text, candidates) {
+                    Ok(reranked) => {
+                        // Build score lookup from cross-encoder results
+                        let ce_scores: std::collections::HashMap<MemoryId, f32> = reranked
+                            .into_iter()
+                            .collect();
 
-            // Batch-encode all candidate contents in one ONNX call (~50-80ms for 20 texts
-            // vs ~400ms for 20 individual encodes). This is the critical latency optimization.
-            let texts: Vec<String> = memories
-                .iter()
-                .map(|m| m.experience.content.clone())
-                .collect();
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                        // Blend: 88% unified score + 12% cross-encoder score
+                        for mem in memories.iter_mut().take(rerank_budget) {
+                            if let Some(&ce_score) = ce_scores.get(&mem.id) {
+                                let base = mem.score.unwrap_or(0.0);
+                                let blended = base * 0.88 + ce_score * 0.12;
+                                let mut cloned: Memory = mem.as_ref().clone();
+                                cloned.set_score(blended);
+                                *mem = Arc::new(cloned);
+                            }
+                        }
 
-            if let Ok(doc_embeddings) = self.embedder.encode_batch(&text_refs) {
-                for (mem, doc_emb) in memories.iter_mut().zip(doc_embeddings.iter()) {
-                    let cosine_sim = crate::memory::hybrid_search::cosine_similarity_pub(
-                        &query_embedding,
-                        doc_emb,
-                    );
-                    let base = mem.score.unwrap_or(0.0);
-                    let blended =
-                        base * base_weight + cosine_sim * cosine_weight * base.max(0.01);
-                    let mut cloned: Memory = mem.as_ref().clone();
-                    cloned.set_score(blended);
-                    *mem = Arc::new(cloned);
+                        // Re-sort after blending
+                        memories.sort_by(|a, b| {
+                            b.score
+                                .unwrap_or(0.0)
+                                .total_cmp(&a.score.unwrap_or(0.0))
+                        });
+
+                        tracing::info!(
+                            reranked = rerank_budget,
+                            "recall [layer:5.3] cross-encoder reranking"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Layer 5.3: Cross-encoder reranking failed, proceeding without: {e}"
+                        );
+                    }
                 }
-
-                memories.sort_by(|a, b| {
-                    b.score
-                        .unwrap_or(0.0)
-                        .total_cmp(&a.score.unwrap_or(0.0))
-                });
             }
-
-            memories.truncate(query.max_results);
-            let rerank_elapsed = rerank_start.elapsed();
-            tracing::info!(
-                candidate_count,
-                cosine_weight,
-                rerank_ms = format!("{:.2}", rerank_elapsed.as_secs_f64() * 1000.0),
-                final_count = memories.len(),
-                "recall [layer:5.5] cross-encoder reranking (batch)"
-            );
         }
+
+        memories.truncate(query.max_results);
 
         // =====================================================================
         // LAYER 5.7: CONFIDENCE GATING + SCORE-GAP PRUNING
@@ -2650,7 +2789,7 @@ impl super::MemorySystem {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 match graph.read().record_memory_coactivation(&memory_uuids) {
-                    Ok(edges_updated) if edges_updated > 0 => {
+                    Ok(ref result) if result.edges_updated > 0 => {
                         // Record consolidation events for coactivation visibility
                         for i in 0..memories.len().min(5) {
                             for j in (i + 1)..memories.len().min(5) {
@@ -2985,8 +3124,24 @@ impl super::MemorySystem {
                 let memory_uuids: Vec<uuid::Uuid> = memory_ids.iter().map(|id| id.0).collect();
                 if memory_uuids.len() >= 2 {
                     match graph.read().record_memory_coactivation(&memory_uuids) {
-                        Ok(count) => {
-                            stats.associations_strengthened = count;
+                        Ok(result) => {
+                            stats.associations_strengthened = result.edges_updated;
+                            // BRIDGE-4: Boost importance for memories linked by promoted edges
+                            for promo in &result.promotions {
+                                let boost = if promo.new_tier.contains("L3") { 0.15 } else { 0.10 };
+                                for mid in memory_ids {
+                                    if mid.0 == promo.from_entity || mid.0 == promo.to_entity {
+                                        // Apply boost through all tiers
+                                        if let Some(mem) = self.working_memory.read().get(mid) {
+                                            mem.boost_importance(boost);
+                                        } else if let Some(mem) = self.session_memory.read().get(mid) {
+                                            mem.boost_importance(boost);
+                                        } else if let Ok(mem) = self.long_term_memory.get(mid) {
+                                            mem.boost_importance(boost);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to record memory coactivation");

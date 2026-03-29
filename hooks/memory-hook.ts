@@ -234,6 +234,11 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
     entity_match_weight: 0.3,
     recency_weight: 0.2,
     auto_ingest: autoIngest,
+    // FIX-05: Propagate episode + emotional context to auto-ingested memories
+    episode_id: sessionEpisodeId,
+    sequence_number: episodeSequenceNumber,
+    emotional_valence: 0.0,
+    emotional_arousal: 0.15,
     ...(toolActions.length > 0 ? { tool_actions: toolActions } : {}),
     ...feedbackPayload,
   })) as ProactiveContextResponse | null;

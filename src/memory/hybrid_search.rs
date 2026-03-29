@@ -942,6 +942,12 @@ impl HybridSearchEngine {
         self.learned_weights.read().clone()
     }
 
+    /// Access the cross-encoder reranker (if configured).
+    /// Used by recall.rs Layer 5.3 to inject cross-encoder scores into unified scoring.
+    pub fn reranker(&self) -> Option<&CrossEncoderReranker> {
+        self.reranker.as_ref()
+    }
+
     /// Perform hybrid search combining BM25 and vector results
     ///
     /// # Arguments
@@ -1015,6 +1021,7 @@ impl HybridSearchEngine {
             term_weights,
             phrase_boosts,
             None,
+            None,
         )
     }
 
@@ -1031,6 +1038,7 @@ impl HybridSearchEngine {
     /// - discriminativeness 0.0-0.4: use default weights (BM25=0.4, Vector=0.6)
     /// - discriminativeness 0.5-0.7: boost BM25 (BM25=0.55, Vector=0.45)
     /// - discriminativeness 0.8-1.0: strong BM25 (BM25=0.7, Vector=0.3)
+    #[allow(clippy::too_many_arguments)]
     pub fn search_with_dynamic_weights<F>(
         &self,
         query: &str,
@@ -1039,6 +1047,7 @@ impl HybridSearchEngine {
         term_weights: Option<&HashMap<String, f32>>,
         phrase_boosts: Option<&[(String, f32)]>,
         keyword_discriminativeness: Option<f32>,
+        rerank_count_override: Option<usize>,
     ) -> Result<Vec<HybridSearchResult>>
     where
         F: Fn(&MemoryId) -> Option<String>,
@@ -1118,11 +1127,12 @@ impl HybridSearchEngine {
             .collect();
 
         // 3. Optional cross-encoder reranking
+        let effective_rerank_count = rerank_count_override.unwrap_or(self.config.rerank_count);
         let final_results = if let Some(ref reranker) = self.reranker {
-            // Take top-k for reranking
+            // Take top-k for reranking (FIX-11: dynamic per-query override)
             let to_rerank: Vec<_> = fused
                 .iter()
-                .take(self.config.rerank_count)
+                .take(effective_rerank_count)
                 .filter_map(|(id, _score)| {
                     get_content(id).map(|content| (id.clone(), content, *_score))
                 })
