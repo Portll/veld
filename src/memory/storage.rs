@@ -489,6 +489,7 @@ impl LegacyExperienceV1 {
             ner_entities: Vec::new(),
             cooccurrence_pairs: Vec::new(),
             embedding_degraded: false,
+            embeddings_secondary: None,
         }
     }
 }
