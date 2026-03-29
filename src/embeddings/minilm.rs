@@ -294,12 +294,18 @@ impl MiniLMEmbedder {
 
         // Common locations to check for bundled library
         let candidates = [
-            // Relative to current executable (for standalone binary)
+            // Adjacent to current executable (common deployment layout)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join(dll_name))),
+            // In lib/ subdir relative to executable
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.join("lib").join(dll_name))),
             // Relative to working directory
             Some(PathBuf::from("lib").join(dll_name)),
+            // In working directory directly
+            Some(PathBuf::from(dll_name)),
             // Python site-packages layout: shodh_memory/lib/onnxruntime.dll
             dirs::data_dir().map(|p| {
                 p.join("Python")
