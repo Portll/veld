@@ -18,6 +18,7 @@ pub mod circuit_breaker;
 pub mod competitive;
 pub mod cross_encoder;
 pub mod downloader;
+pub mod http_embedder;
 pub mod keywords;
 pub mod minilm;
 pub mod ner;
