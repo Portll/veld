@@ -1,0 +1,279 @@
+{
+  "evaluation": "Supernova Bridge Plan",
+  "date": "2026-03-29",
+  "target": "Bridge 14 captured-but-forgotten signals into the ranking hot path",
+  "token_cost_estimate": "~165K (3 focused lenses ~50K each + synthesis inline)",
+
+  "phase_1_cross_pollination": {
+    "AxB": [
+      {
+        "id": "AxB-1",
+        "finding": "Lens A found calibrated_confidence is tracked (Bayesian alpha/beta) but only used for abstention filtering. Lens B found it's available as metadata.calibrated_confidence but absent from Layer 5 final_score. Cross-product: a battle-tested quality signal (observations-weighted Bayesian estimate) is 3 lines from the hot path.",
+        "rpn": 168,
+        "severity": 7, "probability": 8, "detectability": 3
+      },
+      {
+        "id": "AxB-2",
+        "finding": "Lens A found CrossEncoderReranker exists at hybrid_search.rs:672 but is orphaned from recall.rs. Lens B found it IS called inside hybrid_search.execute() but semantic_retrieve() reimplements RRF without calling it. Cross-product: the best signal in the system (joint query-doc attention) is wired but bypassed by the primary code path.",
+        "rpn": 252,
+        "severity": 9, "probability": 10, "detectability": 3
+      },
+      {
+        "id": "AxB-3",
+        "finding": "Lens A found access_count and graph_strength are unused in recall.rs. Lens B found both are proven signals in relevance.rs (14% and 13% learned weights respectively). Cross-product: two validated, high-weight signals are 7 lines from the hot path.",
+        "rpn": 196,
+        "severity": 7, "probability": 10, "detectability": 3
+      }
+    ],
+    "AxC": [
+      {
+        "id": "AxC-1",
+        "finding": "Lens A mapped the boundary where Layer 5 computes final_score with 7 static signals. Lens C mapped that relevance.rs has 7 LEARNED signals in a separate cluster. Cross-product: two clusters compute different scores for the same memory because they never share weights or signals.",
+        "rpn": 210,
+        "severity": 7, "probability": 10, "detectability": 3
+      },
+      {
+        "id": "AxC-2",
+        "finding": "Lens A found edge tier promotions (L1->L2->L3) return signals that are discarded. Lens C found strengthen() returns promotion metadata that record_memory_coactivation drops at line 3834. Cross-product: the graph learns edge maturity but never tells the memory system about it.",
+        "rpn": 150,
+        "severity": 6, "probability": 10, "detectability": 3
+      }
+    ],
+    "BxC": [
+      {
+        "id": "BxC-1",
+        "finding": "Lens B found feedback entity_contributed and tag_contributed are NEVER set to true (dead feedback dimensions). Lens C found three separate LearnedWeights systems (recall: 0 weights, relevance: 7 weights, hybrid_search: 3 weights) that don't coordinate. Cross-product: the learning system can't learn because attribution is broken AND weight systems are fragmented.",
+        "rpn": 180,
+        "severity": 6, "probability": 10, "detectability": 3
+      },
+      {
+        "id": "BxC-2",
+        "finding": "Lens B found reinforce_recall strengthens edges but doesn't trace WHICH edges contributed. Lens C found edge feedback path goes recall->coactivation->strengthen->promotion->DROPPED. Cross-product: the feedback loop is open at both ends — we don't know which edges helped, and we don't use the result when edges improve.",
+        "rpn": 192,
+        "severity": 8, "probability": 8, "detectability": 3
+      }
+    ]
+  },
+
+  "phase_2_triple_resonance": [
+    {
+      "id": "TR-1",
+      "name": "Dual Scoring System Divergence",
+      "lenses": ["A (boundary: Layer 5 vs relevance.rs)", "B (tangent: two systems, different scores for same memory)", "C (topology: two clusters, no mediator)"],
+      "products": ["AxB-3", "AxC-1", "BxC-1"],
+      "classification": "tension",
+      "dimensionality": 4,
+      "dimensions_spanned": ["correctness", "maintainability", "adaptability", "performance"],
+      "three_body": "recall weights (static) vs relevance weights (learned) vs hybrid weights (learned) — three weight systems pulling the same memories in different directions",
+      "description": "The system has two independent scoring pipelines that compute different rankings for the same memory. recall.rs uses 7 hardcoded signals, relevance.rs uses 7 learned signals. Two proven signals (access_count 14%, graph_strength 13%) exist in relevance but not in recall. The weight learning that makes relevance adaptive is completely absent from the primary recall path."
+    },
+    {
+      "id": "TR-2",
+      "name": "Cross-Encoder Bypass",
+      "lenses": ["A (boundary: CrossEncoder orphaned from recall.rs)", "B (tangent: it IS wired in hybrid_search but recall reimplements)", "C (topology: cross-cluster bridge exists but unused)"],
+      "products": ["AxB-2"],
+      "classification": "void",
+      "dimensionality": 2,
+      "dimensions_spanned": ["correctness", "performance"],
+      "three_body": "no — single fix point",
+      "description": "CrossEncoderReranker is fully implemented and called inside hybrid_search.execute(). But semantic_retrieve() reimplements its own RRF fusion (Layer 4) without calling hybrid_search.execute(), so the cross-encoder is bypassed. The most powerful signal (joint query-document attention) never reaches the primary retrieval path."
+    },
+    {
+      "id": "TR-3",
+      "name": "Open Feedback Loop (edges)",
+      "lenses": ["A (boundary: edge tier promotions discarded)", "B (tangent: no edge path tracing in retrieval)", "C (topology: strengthen() return value dropped)"],
+      "products": ["AxC-2", "BxC-2"],
+      "classification": "void",
+      "dimensionality": 3,
+      "dimensions_spanned": ["adaptability", "correctness", "data_integrity"],
+      "three_body": "no — linear chain: retrieval -> feedback -> edge -> promotion -> DROPPED",
+      "description": "The graph edge feedback loop is open at both ends. Retrieval doesn't trace which edges contributed (input end). Edge promotions generate signals that nobody consumes (output end). Edges can only learn from blind symmetric coactivation, not from targeted retrieval success."
+    }
+  ],
+
+  "phase_3_adversarial_collapse": [
+    {
+      "id": "TR-1",
+      "challenge": "The dual scoring system is intentional — proactive surfacing needs different weights than pull-based recall. Merging them would over-tune recall for proactive patterns.",
+      "adversary_score": 5,
+      "defender_score": 8,
+      "verdict": "SURVIVES. The adversary is right that different USE CASES need different weights. But the defender wins because: (1) recall.rs uses ZERO learned weights while relevance.rs uses 7 — this isn't different tuning, it's absence of tuning. (2) Two proven signals (access_count, graph_strength) are available and validated but simply not called. (3) The fix isn't merging the systems — it's adding the missing signals to recall.",
+      "evidence": "relevance.rs:852 (access_count at 14% weight), relevance.rs:834 (graph_strength at 13% weight), recall.rs:2189 (neither present)"
+    },
+    {
+      "id": "TR-2",
+      "challenge": "semantic_retrieve() intentionally reimplements RRF to have fine-grained control over 11+ layers of boosting. Calling hybrid_search.execute() would lose all the temporal, ontological, and entity-overlap layers.",
+      "adversary_score": 7,
+      "defender_score": 8,
+      "verdict": "SURVIVES (modified). The adversary correctly identifies that semantic_retrieve's Layer 4-5 pipeline is more sophisticated than hybrid_search. The fix should NOT replace semantic_retrieve with hybrid_search.execute(). Instead: extract cross-encoder scores from hybrid_search and inject them as an ADDITIONAL signal in Layer 5 unified scoring. This preserves all 11 layers while adding the cross-encoder signal.",
+      "evidence": "recall.rs has 11 layers of post-RRF boosting that hybrid_search.execute() doesn't have"
+    },
+    {
+      "id": "TR-3",
+      "challenge": "Edge path tracing adds O(k*d) overhead to every retrieval (k=candidates, d=graph depth). This latency penalty outweighs the feedback quality improvement.",
+      "adversary_score": 4,
+      "defender_score": 7,
+      "verdict": "SURVIVES. The first fix (consuming edge tier promotion signals) is zero-latency — the data is already computed and discarded at line 3834. The second fix (path tracing) can be sampled at 10% of queries to amortize cost. And the current blind coactivation already does O(k^2) edge operations.",
+      "evidence": "graph_memory.rs:3834 (promotion signal discarded), graph_memory.rs:3824 (O(k^2) coactivation already exists)"
+    }
+  ],
+
+  "phase_4_overloop_convergence": {
+    "fix_1_proven_signals": {
+      "iteration_1": "Add access_count and graph_strength to recall.rs Layer 5 unified_score (7 lines). Risk: graph_strength requires graph_memory read lock.",
+      "iteration_2": "Use Hebbian scores already computed in Layer 2 (hebbian_scores HashMap at line 2079) instead of re-reading graph. access_count available via mem.access_count(). Zero new locks needed.",
+      "iteration_3": "Validated: hebbian_scores is populated at Layer 2 (line 834-843), persists through Layer 5. access_count() is a lock-free atomic read. No regression possible.",
+      "convergence": "CONVERGED at iteration 2. 7 lines, zero new dependencies."
+    },
+    "fix_2_cross_encoder": {
+      "iteration_1": "Call hybrid_search.execute() from semantic_retrieve() to get cross-encoder scores. Problem: loses 11 layers of post-RRF boosting.",
+      "iteration_2": "Instead: run cross-encoder scoring as Layer 5.3 (post-memory-fetch, pre-final-sort). Batch-encode query+content pairs, get scores, add as signal to final_score.",
+      "iteration_3": "Check: CrossEncoderReranker.rerank() at hybrid_search.rs:709 takes query text + candidate texts. Can be called standalone. Need to expose it from HybridSearcher. ~25 lines.",
+      "convergence": "CONVERGED at iteration 3. 25 lines, requires pub access to reranker field."
+    },
+    "fix_3_edge_feedback": {
+      "iteration_1": "Capture strengthen() return value in record_memory_coactivation, boost memory importance on promotion.",
+      "iteration_2": "record_memory_coactivation returns usize (count). Need to modify to also return Vec<(Uuid, OldTier, NewTier)> for promotions. Then reinforce_recall can apply importance boost.",
+      "iteration_3": "Simpler: add a separate method promote_and_boost() that handles both in one pass. 30 lines in graph_memory.rs, 10 lines in recall.rs.",
+      "convergence": "CONVERGED at iteration 3. 40 lines total."
+    },
+    "fix_4_calibrated_confidence": {
+      "iteration_1": "Add calibrated_confidence as multiplicative gate (0.7-1.0) on final_score.",
+      "iteration_2": "Problem: new memories (alpha=1, beta=1) get 0.85 multiplier = 15% penalty. Gate only when observations > 5.",
+      "iteration_3": "Use observation-weighted blend: weight = min(1.0, (alpha+beta-2)/8). Below 2 observations, confidence = 1.0 (neutral). Above 10 observations, fully Bayesian.",
+      "convergence": "CONVERGED at iteration 3. 8 lines."
+    }
+  },
+
+  "phase_5_resolution": {
+    "actions": [
+      {
+        "priority": "P0",
+        "id": "BRIDGE-1",
+        "name": "Add proven signals (access_count + graph_strength) to recall.rs Layer 5",
+        "resonance": "TR-1 (3-lens)",
+        "effort_lines": 7,
+        "effort_hours": 0.5,
+        "mrr_impact": "+2-3%",
+        "risk": "none",
+        "files": ["src/memory/recall.rs"],
+        "description": "Add access_count (log-scaled, 7% contribution) and graph_strength (from existing hebbian_scores HashMap, 8% contribution) to the final_score calculation in with_unified_score closure. These signals are already validated at 14% and 13% weight in relevance.rs."
+      },
+      {
+        "priority": "P0",
+        "id": "BRIDGE-2",
+        "name": "Wire CrossEncoderReranker into semantic_retrieve as Layer 5.3",
+        "resonance": "TR-2 (3-lens)",
+        "effort_lines": 25,
+        "effort_hours": 2,
+        "mrr_impact": "+3-5%",
+        "risk": "low",
+        "files": ["src/memory/recall.rs", "src/memory/hybrid_search.rs"],
+        "description": "Expose hybrid_search.reranker as pub. In recall.rs after Layer 5 memory fetch, batch-score top candidates via CrossEncoderReranker.rerank(). Add cross-encoder score as 12% signal in final_score. Preserves all 11 existing layers."
+      },
+      {
+        "priority": "P0",
+        "id": "BRIDGE-3",
+        "name": "Add calibrated_confidence to Layer 5 scoring",
+        "resonance": "AxB-1 (2-lens)",
+        "effort_lines": 8,
+        "effort_hours": 0.5,
+        "mrr_impact": "+1-2%",
+        "risk": "low",
+        "files": ["src/memory/recall.rs"],
+        "description": "Read calibrated_confidence from metadata. Apply as multiplicative gate only when observation count > 5. Blend: (0.8 + 0.2 * bayesian_estimate) so range is 0.8-1.0. New memories unaffected."
+      },
+      {
+        "priority": "P1",
+        "id": "BRIDGE-4",
+        "name": "Close edge feedback loop (consume tier promotions)",
+        "resonance": "TR-3 (3-lens)",
+        "effort_lines": 40,
+        "effort_hours": 3,
+        "mrr_impact": "+1-2% (long-term compounding)",
+        "risk": "low",
+        "files": ["src/graph_memory.rs", "src/memory/recall.rs"],
+        "description": "Modify record_memory_coactivation to return promotion events. In reinforce_recall, when edge promotes (L1->L2 or L2->L3), boost associated memory importance by 0.10/0.15 respectively."
+      },
+      {
+        "priority": "P1",
+        "id": "BRIDGE-5",
+        "name": "Unify signal extraction into shared ScoringSignals struct",
+        "resonance": "BxC-1 (2-lens)",
+        "effort_lines": 40,
+        "effort_hours": 3,
+        "mrr_impact": "+0% (enables future improvements)",
+        "risk": "medium",
+        "files": ["src/memory/recall.rs", "src/relevance.rs"],
+        "description": "Extract the 7 signals computed in relevance.rs into a ScoringSignals struct. Use same struct in recall.rs Layer 5. Both pipelines extract signals identically but may apply different weights."
+      },
+      {
+        "priority": "P2",
+        "id": "BRIDGE-6",
+        "name": "Add episode_id scoring boost to Layer 5",
+        "effort_lines": 10,
+        "effort_hours": 0.5,
+        "mrr_impact": "+1% when episode context available",
+        "risk": "none",
+        "files": ["src/memory/recall.rs"]
+      },
+      {
+        "priority": "P2",
+        "id": "BRIDGE-7",
+        "name": "Add source_type multiplier to credibility boost",
+        "effort_lines": 12,
+        "effort_hours": 0.5,
+        "mrr_impact": "+0.5-1%",
+        "risk": "low",
+        "files": ["src/memory/recall.rs"]
+      },
+      {
+        "priority": "P2",
+        "id": "BRIDGE-8",
+        "name": "Fix feedback attribution (entity_contributed, tag_contributed always false)",
+        "effort_lines": 30,
+        "effort_hours": 4,
+        "mrr_impact": "enables adaptive weight learning",
+        "risk": "medium",
+        "files": ["src/memory/recall.rs", "src/relevance.rs"]
+      },
+      {
+        "priority": "P3",
+        "id": "BRIDGE-9",
+        "name": "Add emotional_valence as absolute-intensity signal",
+        "effort_lines": 5,
+        "effort_hours": 0.25,
+        "mrr_impact": "<0.5%",
+        "risk": "none",
+        "files": ["src/memory/recall.rs"]
+      },
+      {
+        "priority": "P3",
+        "id": "BRIDGE-10",
+        "name": "Add sequence_number proximity scoring",
+        "effort_lines": 8,
+        "effort_hours": 0.5,
+        "mrr_impact": "<0.5%",
+        "risk": "none",
+        "files": ["src/memory/recall.rs"]
+      }
+    ],
+
+    "execution_order": "BRIDGE-1 (30m) -> BRIDGE-3 (30m) -> BRIDGE-2 (2h) -> BRIDGE-4 (3h) -> BRIDGE-5 (3h) -> P2/P3 as time allows",
+    "total_effort_p0": "3 hours, 40 lines",
+    "total_effort_p0_p1": "9 hours, 120 lines",
+    "estimated_cumulative_mrr": "0.88 -> 0.94-0.96",
+
+    "metrics": {
+      "coverage_ratio": 0.82,
+      "orthogonality_score": 0.78,
+      "resonance_count": 3,
+      "convergence_map": {
+        "BRIDGE-1": "converged_iteration_2",
+        "BRIDGE-2": "converged_iteration_3",
+        "BRIDGE-3": "converged_iteration_3",
+        "BRIDGE-4": "converged_iteration_3"
+      }
+    }
+  }
+}

@@ -1,0 +1,724 @@
+{
+  "feature": "Contradiction/Interference Detection at Query Time",
+  "date": "2026-03-29",
+  "codebase_snapshot": {
+    "branch": "dev",
+    "head_commit": "5b5767b",
+    "files_analyzed": [
+      "src/memory/hybrid_search.rs",
+      "src/memory/mod.rs",
+      "src/memory/types.rs",
+      "src/memory/introspection.rs",
+      "src/memory/replay.rs",
+      "src/memory/temporal_facts.rs",
+      "src/memory/retrieval.rs",
+      "src/graph_memory.rs",
+      "src/handlers/remember.rs",
+      "src/constants.rs"
+    ]
+  },
+
+  "bifocal": {
+    "evaluation_type": "bifocal_plus",
+    "phases_completed": ["P0_risk_triage", "P1_edge_walk_fractal", "P2_fractal_atam", "P2.5_adversarial", "P3_scoring"],
+
+    "phase_0_risk_triage": {
+      "tier_1_full": [
+        "Pairwise contradiction scoring in hot path — O(k^2) on top-K results, directly impacts p99 latency",
+        "Entity-value divergence detection — no existing structured entity-value extraction; current entities are name-only (EntityNode.name, EntityRef.entity_id)"
+      ],
+      "tier_2_standard": [
+        "Contradiction edge creation in knowledge graph — RelationType::SupersededBy already exists, proven pattern",
+        "Recency-based boosting for contradictions — existing importance decay (CONFLICT_IMPORTANCE_DECAY=0.5) is a template",
+        "ConsolidationEvent integration — InterferenceDetected variant already exists, just needs new trigger source"
+      ],
+      "tier_3_monitor": [
+        "Metadata annotation on HybridSearchResult — additive field, no breaking change",
+        "LLM consumer flagging — downstream concern, shodh-memory API already returns metadata"
+      ]
+    },
+
+    "phase_1_edge_walk_fractal": {
+      "interface_analysis": [
+        {
+          "boundary": "HybridSearchEngine::search_with_dynamic_weights -> post-RRF contradiction check",
+          "insertion_point": "After line ~1059 (RRF fusion), before cross-encoder reranking",
+          "risk": "medium",
+          "detail": "Post-RRF is correct insertion because RRF has already combined BM25+Vector+Graph signals. Contradiction detection operates on the fused candidate set. However, inserting BEFORE cross-encoder reranking means contradiction-demoted results won't get expensive reranking — this is actually desirable (saves compute). Alternative: post-reranking is too late since reranking already committed to the top-k ordering.",
+          "recommendation": "Insert between RRF fusion output and cross-encoder reranker input. Filter/annotate contradicted pairs before reranking."
+        },
+        {
+          "boundary": "Memory struct entities -> entity-value extraction",
+          "insertion_point": "src/memory/types.rs EntityRef struct, src/memory/feedback.rs extract_entities_simple()",
+          "risk": "high",
+          "detail": "Current entity extraction produces entity NAMES only (EntityRef has entity_id: Uuid, entity_name: String, role: Option<String>). There is NO entity-value binding — 'meeting at 3pm' extracts entity 'meeting' but NOT value '3pm'. The feature description assumes entity-value pairs exist. They do not. TemporalFact comes closest (entity + event + resolved_time) but is limited to temporal expressions and runs at ingest time, not query time.",
+          "recommendation": "This is the critical gap. Either: (A) extend entity extraction to produce entity-attribute-value triples at ingest time and store in graph, or (B) use detect_semantic_opposition() heuristic (negation markers + antonym pairs) which already works for text-level contradiction without needing structured values."
+        },
+        {
+          "boundary": "InterferenceDetector (replay.rs) -> query-time interference",
+          "insertion_point": "replay.rs InterferenceDetector::check_interference()",
+          "risk": "low",
+          "detail": "InterferenceDetector already computes similarity-based interference at consolidation time. The check_interference() method (line ~280) takes a new_memory_id and compares against tracked similar memories. Reusing this at query time requires: (1) operating on candidate pairs rather than new-vs-existing, (2) skipping the activation decay side-effects that are consolidation-specific.",
+          "recommendation": "Extract the similarity comparison logic into a shared utility. Do NOT reuse InterferenceDetector directly — its state tracking (InterferenceRecord history) is designed for consolidation lifecycle, not ephemeral query-time checks."
+        },
+        {
+          "boundary": "detect_and_resolve_conflicts() in handlers/remember.rs -> query-time mirror",
+          "insertion_point": "This function already implements ingest-time contradiction detection",
+          "risk": "low",
+          "detail": "detect_and_resolve_conflicts() at remember.rs:753 already does exactly what the feature proposes — cosine > CONFLICT_COSINE_THRESHOLD (0.7), text_similarity > 0.5, detect_semantic_opposition(). It creates SupersededBy edges and decays importance. The gap is that this only runs at INGEST time. Memories that were ingested before conflict detection was added, or where the contradicting memory arrived in a different session, may not have been caught.",
+          "recommendation": "Query-time detection is the safety net for ingest-time misses. Reuse the same detection pipeline (cosine + text_sim + semantic_opposition) but with lighter side-effects (annotation only, no importance mutation during read path)."
+        },
+        {
+          "boundary": "HybridSearchResult struct -> contradiction metadata",
+          "insertion_point": "src/memory/hybrid_search.rs HybridSearchResult",
+          "risk": "low",
+          "detail": "HybridSearchResult already has bm25_score, vector_score, graph_score, rrf_score, rerank_score. Adding contradiction_flag: Option<ContradictionInfo> is additive and non-breaking. Serialization is not used externally (this is an internal Rust struct)."
+        }
+      ],
+
+      "fractal_decomposition": {
+        "level_0_system": "Contradiction detection at query time in shodh-memory retrieval pipeline",
+        "level_1_subsystems": [
+          "L1.1: Pairwise similarity computation on top-K candidates",
+          "L1.2: Contradiction signal detection (text-level or entity-value-level)",
+          "L1.3: Result annotation and re-scoring",
+          "L1.4: Graph edge persistence for detected contradictions",
+          "L1.5: Introspection event emission"
+        ],
+        "level_2_components": {
+          "L1.1": [
+            "L2.1.1: Embedding cache lookup for candidate pairs (content_cache already exists)",
+            "L2.1.2: Cosine similarity computation (cosine_similarity() exists in hybrid_search.rs)",
+            "L2.1.3: High-similarity pair filtering (threshold: CONFLICT_COSINE_THRESHOLD=0.7)"
+          ],
+          "L1.2": [
+            "L2.2.1: detect_semantic_opposition() reuse from temporal_facts.rs (negation + antonym)",
+            "L2.2.2: text_similarity() reuse for text-level overlap check",
+            "L2.2.3: [MISSING] entity-attribute-value divergence detection — requires new extraction"
+          ],
+          "L1.3": [
+            "L2.3.1: Recency comparison (Memory.experience.timestamp)",
+            "L2.3.2: Score penalty for older contradicted memory",
+            "L2.3.3: ContradictionInfo annotation on HybridSearchResult"
+          ]
+        }
+      }
+    },
+
+    "phase_2_fractal_atam": {
+      "pattern_consistency": {
+        "aligns_with": [
+          "Existing ingest-time conflict detection (handlers/remember.rs:753-880) — same detection logic, different trigger point",
+          "InterferenceDetected consolidation events (introspection.rs:161) — same event type for query-time detection",
+          "SupersededBy graph edges (graph_memory.rs RelationType) — reuses existing edge type",
+          "TemporalFact contradiction detection (temporal_facts.rs:340-410) — same semantic_opposition approach"
+        ],
+        "breaks_patterns": [
+          "All existing query-time code is pure (no side-effects). Adding graph edge creation in the read path breaks read/write separation.",
+          "HybridSearchEngine currently has no access to GraphMemory or MemoryStorage — it only receives pre-computed vector results and a content-fetching closure. Injecting contradiction detection requires either widening the interface or implementing it at a higher level (semantic_retrieve in mod.rs)."
+        ]
+      },
+
+      "tradeoff_analysis": [
+        {
+          "quality_attribute": "Performance (latency)",
+          "tradeoff": "O(k^2/2) pairwise comparisons on top-K candidates. For K=20 (rerank_count), that's 190 pairs. Each pair needs cosine_similarity (fast, ~1us with cached embeddings) + detect_semantic_opposition (string ops, ~10us). Total: ~2ms overhead on the ~50ms retrieval path. Acceptable.",
+          "sensitivity": "If K increases to 50 (candidate_count=100), pairs jump to 1225. Still under 15ms. Linear in similarity computation, so SIMD-friendly.",
+          "decision": "ACCEPT: 2-15ms overhead on a path that already takes 50-200ms (embedding + BM25 + vector + reranking)"
+        },
+        {
+          "quality_attribute": "Accuracy (false positive contradictions)",
+          "tradeoff": "detect_semantic_opposition uses heuristic negation detection and curated antonym pairs. It will miss: value divergence without negation ('meeting at 3pm' vs 'meeting at 4pm'), implicit contradictions ('likes React' vs 'switched to Vue'), and context-dependent contradictions.",
+          "sensitivity": "High. False positives (incorrectly marking non-contradictions) will suppress valid memories. False negatives (missing real contradictions) maintain status quo — no regression.",
+          "decision": "ACCEPT WITH CAUTION: Start with high-precision detect_semantic_opposition. Do NOT implement entity-value extraction in v1 — it requires NLP parsing infrastructure that doesn't exist. Add it as v2 enhancement."
+        },
+        {
+          "quality_attribute": "Architectural purity (read/write separation)",
+          "tradeoff": "Creating graph edges during query-time violates the current read-only retrieval path. However, detect_and_resolve_conflicts() already mutates during ingest (a write path), so the precedent exists.",
+          "sensitivity": "Medium. Query-time writes could cause lock contention under high QPS.",
+          "decision": "MITIGATE: Emit contradiction events to the ConsolidationEventBuffer (already in-memory, lock-free append). Let the background consolidation loop pick up events and persist graph edges. Query path stays read-only."
+        },
+        {
+          "quality_attribute": "Complexity budget",
+          "tradeoff": "Feature adds a new post-RRF layer to an already 11-layer retrieval pipeline. Each layer adds debugging surface area.",
+          "sensitivity": "Low if implemented as a clean, isolated function with clear metrics (contradiction_detected counter).",
+          "decision": "ACCEPT: The layer is self-contained and can be toggled via config flag."
+        }
+      ]
+    },
+
+    "phase_2_5_adversarial": {
+      "challenges": [
+        {
+          "attack": "Contradiction cascade — a single memory contradicts 5+ other memories, cascading score penalties suppress valid cluster",
+          "score": 7.5,
+          "mitigation": "Cap contradiction penalties per query: max 2 contradictions processed per memory. If a memory contradicts 3+ results, it's the outlier — penalize IT, not the majority.",
+          "residual_risk": "medium"
+        },
+        {
+          "attack": "False contradiction on paraphrases — 'I enjoy hiking' vs 'I love hiking' triggers negation-free antonym path if 'enjoy/love' not in synonym list",
+          "score": 7.0,
+          "mitigation": "detect_semantic_opposition requires BOTH negation asymmetry AND antonym match. Pure paraphrases without negation markers will not trigger. Risk is in the antonym pair list containing near-synonyms.",
+          "residual_risk": "low"
+        },
+        {
+          "attack": "Temporal context ignored — 'I use React' (2024) vs 'I use Vue' (2026) are both valid at their respective times, not contradictions",
+          "score": 8.0,
+          "mitigation": "Check valid_from/valid_until fields on Memory and TemporalFact. If both memories have non-overlapping temporal validity, they are NOT contradictions. Requires temporal awareness in the contradiction check.",
+          "residual_risk": "high — valid_from/valid_until are sparsely populated"
+        },
+        {
+          "attack": "Latency spike under adversarial query — attacker crafts query that matches 100 highly-similar memories, forcing 4950 pairwise comparisons",
+          "score": 7.0,
+          "mitigation": "Pairwise check runs on post-RRF top-K only, K is bounded by rerank_count (default 20). Even with candidate_count=100, the pairwise check sees at most 20 results. Additionally, short-circuit: only check pairs where cosine > 0.7 (most pairs will be below).",
+          "residual_risk": "low"
+        },
+        {
+          "attack": "Entity-value extraction hallucination — if v2 adds NLP-based value extraction, parsing errors create phantom contradictions",
+          "score": 7.5,
+          "mitigation": "v1 avoids this entirely by using text-level heuristics only. v2 should require confidence thresholds on extracted values and human-in-the-loop verification for high-stakes contradictions.",
+          "residual_risk": "deferred to v2"
+        }
+      ]
+    },
+
+    "phase_3_scoring": {
+      "dimensions": [
+        {
+          "dimension": "Correctness",
+          "score": 7.0,
+          "evidence_for": "detect_semantic_opposition is proven in production (temporal_facts.rs, handlers/remember.rs). Handles negation markers + curated antonyms reliably.",
+          "evidence_against": "Cannot detect value-divergence contradictions ('3pm' vs '4pm'). Cannot handle implicit contradictions without negation markers. Temporal context (valid_from/valid_until) not checked."
+        },
+        {
+          "dimension": "Completeness",
+          "score": 5.5,
+          "evidence_for": "Covers negation-based contradictions and explicit antonyms. Post-RRF insertion is architecturally correct.",
+          "evidence_against": "Missing: entity-value extraction, temporal validity checking, multi-hop contradiction chains (A contradicts B, B reinforces C => A weakly contradicts C)."
+        },
+        {
+          "dimension": "Performance",
+          "score": 8.5,
+          "evidence_for": "2-15ms overhead on 50-200ms path. Embeddings are cached (content_cache). Pairwise count bounded by rerank_count=20.",
+          "evidence_against": "Cross-encoder reranking (70ms) dominates latency budget. Adding 15ms is 20% increase on reranking alone."
+        },
+        {
+          "dimension": "Maintainability",
+          "score": 8.0,
+          "evidence_for": "Reuses existing functions (detect_semantic_opposition, text_similarity, cosine_similarity). Single insertion point. Config-gated.",
+          "evidence_against": "Adds 12th layer to retrieval pipeline. Debugging surface area increases."
+        },
+        {
+          "dimension": "Testability",
+          "score": 8.5,
+          "evidence_for": "Pure function: takes two memories, returns contradiction score. Easy to unit test with known contradictory/non-contradictory pairs. LOCOMO benchmark can validate with multi-session temporal queries.",
+          "evidence_against": "Integration testing requires memories with contradictions — need synthetic test data."
+        },
+        {
+          "dimension": "Security",
+          "score": 9.0,
+          "evidence_for": "No new external inputs. No new network calls. No new serialization surfaces. Read-only in query path (events buffered, not persisted).",
+          "evidence_against": "Theoretical: adversarial memory injection to trigger false contradictions and suppress valid memories."
+        },
+        {
+          "dimension": "Consistency",
+          "score": 9.0,
+          "evidence_for": "Follows established patterns: same detection logic as ingest-time (handlers/remember.rs), same event types (InterferenceDetected), same graph edges (SupersededBy).",
+          "evidence_against": "Minor: ingest-time detection mutates importance, query-time detection only annotates. Different side-effect profiles for same detection."
+        },
+        {
+          "dimension": "Scalability",
+          "score": 7.5,
+          "evidence_for": "O(k^2) where k is bounded (default 20). Memory count doesn't affect pairwise computation.",
+          "evidence_against": "If rerank_count increases for accuracy, pairwise cost grows quadratically. At k=50, 1225 pairs."
+        },
+        {
+          "dimension": "Reversibility",
+          "score": 9.5,
+          "evidence_for": "Config flag to disable. No schema changes required. Annotation is additive metadata on existing struct. Event emission is append-only.",
+          "evidence_against": "If graph edges are persisted from query-time detection, those are harder to reverse."
+        },
+        {
+          "dimension": "Observability",
+          "score": 9.0,
+          "evidence_for": "InterferenceDetected events already exist in ConsolidationEventBuffer. ConsolidationReport already aggregates interference_events. Learning history already tracks InterferenceDetected type.",
+          "evidence_against": "No existing dashboard visualization for query-time vs consolidation-time interference."
+        },
+        {
+          "dimension": "User Impact",
+          "score": 7.0,
+          "evidence_for": "When contradictions ARE detected, the LLM consumer gets cleaner context — no conflicting information requiring reconciliation. Reduces hallucination from contradictory retrieved context.",
+          "evidence_against": "For the common case (no contradictions in top-K), this is zero visible impact. For the uncommon case, impact depends on downstream LLM's handling of contradiction annotations."
+        },
+        {
+          "dimension": "Effort-to-Value Ratio",
+          "score": 6.5,
+          "evidence_for": "v1 (text heuristics only) is ~8-12 hours of work reusing existing functions. Moderate value for edge cases.",
+          "evidence_against": "Ingest-time detection (already shipping) catches most contradictions. Query-time is a safety net for misses. Value is proportional to ingest-time miss rate, which is unknown."
+        }
+      ],
+      "aggregate_score": 7.9,
+      "score_note": "Weighted: Correctness and Completeness at 1.5x, Performance at 1.2x, others at 1.0x"
+    }
+  },
+
+  "overlook": {
+    "evaluation_type": "overlook_27d",
+    "cluster_analysis": {
+      "intent_cluster": {
+        "D1_stated_goal": {
+          "score": 8,
+          "note": "Clear: detect contradictions at query time. Well-defined insertion point (post-RRF). Concrete outcome (annotated results)."
+        },
+        "D2_unstated_assumptions": {
+          "score": 6,
+          "note": "Assumes entity-value pairs exist (they don't — only entity names). Assumes contradictions are binary (they can be partial/contextual). Assumes LLM consumer will use contradiction annotations (no protocol for this).",
+          "critical_gap": "Entity-value extraction is the load-bearing assumption that fails on inspection."
+        },
+        "D3_success_criteria": {
+          "score": 5,
+          "note": "No defined metrics for success. What contradiction recall/precision is acceptable? How to measure impact on downstream LLM quality? LOCOMO benchmark doesn't test for contradiction handling.",
+          "critical_gap": "Need a contradiction-specific evaluation dataset. Neither LOCOMO nor LongMemEval tests contradictory memory retrieval."
+        },
+        "D4_failure_modes": {
+          "score": 7,
+          "note": "Feature description covers basic failure (contradictions missed). Does NOT cover: false positive suppression of valid memories, temporal validity, cascade effects."
+        },
+        "D5_scope_boundaries": {
+          "score": 8,
+          "note": "Well-scoped to post-RRF query path. Does not attempt to fix entity extraction, NLP parsing, or LLM integration. Clean boundary."
+        }
+      },
+      "observation_cluster": {
+        "D6_existing_code_patterns": {
+          "score": 9,
+          "note": "Correctly identifies all relevant code: hybrid_search.rs, introspection.rs, replay.rs, temporal_facts.rs, remember.rs. Misses: feedback.rs extract_entities_simple() which is the actual entity extractor."
+        },
+        "D7_data_flow": {
+          "score": 8,
+          "note": "Query -> BM25+Vector -> RRF fusion -> [contradiction check] -> cross-encoder -> cognitive boost. Correct flow. Missing: how embeddings are passed to contradiction checker (need content_cache access)."
+        },
+        "D8_type_system_impact": {
+          "score": 9,
+          "note": "HybridSearchResult is internal Rust struct, not serialized over wire. Adding Optional field is non-breaking. Memory struct untouched."
+        },
+        "D9_concurrency_model": {
+          "score": 7,
+          "note": "Read path is concurrent-safe. Event emission to ConsolidationEventBuffer uses RwLock (write lock for append). Under high QPS, event buffer writes could contend. Consider lock-free channel.",
+          "concern": "ConsolidationEventBuffer is bounded (MAX_EVENT_BUFFER_SIZE=1000). High-frequency contradiction detection could evict important consolidation events."
+        },
+        "D10_error_handling": {
+          "score": 8,
+          "note": "Contradiction detection is best-effort — if it fails, return unmodified results. No new error variants needed. Existing anyhow::Result propagation is sufficient."
+        },
+        "D11_dependency_graph": {
+          "score": 9,
+          "note": "No new dependencies. Reuses: cosine_similarity (hybrid_search.rs), detect_semantic_opposition (temporal_facts.rs), text_similarity (temporal_facts.rs). All are pure functions."
+        },
+        "D12_configuration_surface": {
+          "score": 8,
+          "note": "Needs: enable_query_time_contradiction: bool, contradiction_cosine_threshold: f32, max_contradiction_pairs: usize. All with sensible defaults. Fits HybridSearchConfig pattern."
+        },
+        "D13_migration_path": {
+          "score": 9,
+          "note": "No storage schema changes. No index rebuilds. Feature is purely additive runtime logic. Can be deployed with config flag off and enabled per-user."
+        },
+        "D14_test_coverage": {
+          "score": 6,
+          "note": "Existing tests: replay.rs has interference tests, temporal_facts.rs has contradiction tests, remember.rs has conflict detection tests. But: no query-time contradiction test exists. Need to add to tests/locomo_benchmark.rs with synthetic contradictory memories.",
+          "concern": "LOCOMO dataset may not have contradictory memory pairs. Need synthetic augmentation."
+        }
+      },
+      "pattern_cluster": {
+        "D15_architectural_alignment": {
+          "score": 8,
+          "note": "Follows the layer-addition pattern of the retrieval pipeline (11 layers already). Each layer is a composable transformation. Contradiction detection fits as Layer 4.6 (after RRF=4.0, before reranking=5.0)."
+        },
+        "D16_cognitive_model_fit": {
+          "score": 9,
+          "note": "Biologically grounded: Anderson & Neely (1996) retrieval competition is already the theoretical basis for SHO-106. Query-time interference detection is the retrieval-time analog of consolidation-time interference — exactly what the neuroscience predicts."
+        },
+        "D17_api_contract": {
+          "score": 8,
+          "note": "recall() API returns Vec<Memory>. Contradiction metadata would need to be surfaced via a new field or sidecar. MCP server (mcp-server/) would need updating to pass contradiction info to Claude. Currently a gap.",
+          "concern": "MCP recall tool response format is fixed. Adding contradiction info requires MCP server changes."
+        },
+        "D18_similar_feature_precedent": {
+          "score": 9,
+          "note": "Direct precedent: detect_and_resolve_conflicts() (ingest-time), InterferenceDetector (consolidation-time), TemporalFact contradiction detection. Three existing implementations of the same core idea at different lifecycle stages."
+        },
+        "D19_refactoring_debt": {
+          "score": 7,
+          "note": "detect_semantic_opposition and text_similarity are in temporal_facts.rs but used by handlers/remember.rs. Should be extracted to a shared contradiction_utils module. Current cross-module import (handlers importing from memory::temporal_facts) is a code smell."
+        }
+      },
+      "risk_cluster": {
+        "D20_regression_risk": {
+          "score": 3,
+          "note": "LOW regression risk. Feature is additive, config-gated. Worst case: disable flag restores exact previous behavior. No existing test should break.",
+          "inverted_scale": true
+        },
+        "D21_operational_risk": {
+          "score": 4,
+          "note": "LOW-MEDIUM operational risk. 2-15ms latency increase is within noise for most queries. ConsolidationEventBuffer saturation under high contradiction rate is the main operational concern.",
+          "inverted_scale": true
+        },
+        "D22_security_risk": {
+          "score": 2,
+          "note": "MINIMAL security risk. No new inputs, no new serialization, no new network calls. Memory suppression via adversarial contradiction injection is theoretical.",
+          "inverted_scale": true
+        }
+      },
+      "learning_cluster": {
+        "D23_knowledge_gaps": {
+          "score": 6,
+          "note": "Unknown: false positive rate of detect_semantic_opposition on real user data. Unknown: fraction of contradictions that exist in the wild but are missed at ingest time. Unknown: LLM consumer behavior when receiving contradiction annotations."
+        },
+        "D24_experiment_design": {
+          "score": 5,
+          "note": "No A/B test framework exists. Recommend: run with flag off (control) and flag on (treatment) for same user across sessions. Measure: downstream task accuracy delta, user correction rate, memory suppression rate.",
+          "critical_gap": "No contradiction-specific benchmark. Need to create synthetic contradictory memory pairs and measure detection recall/precision."
+        },
+        "D25_reversibility": {
+          "score": 9,
+          "note": "Config flag off = complete revert. No persistent side-effects if graph edge creation is deferred to consolidation."
+        },
+        "D26_cross_pollination": {
+          "score": 7,
+          "note": "Pattern applies to: bifocal evaluation (detecting contradictory evidence in evaluations), overlook analysis (detecting contradictory dimensions), fact store (detect_and_resolve_conflicts already exists). Could inform a generalized contradiction detection library."
+        },
+        "D27_meta_learning": {
+          "score": 8,
+          "note": "Validates the design pattern: detect at ingest (primary), detect at consolidation (secondary), detect at query time (safety net). Three-stage defense in depth for information quality."
+        }
+      }
+    },
+
+    "spikes_and_propagation": {
+      "spike_1": {
+        "dimension": "D2_unstated_assumptions",
+        "severity": "high",
+        "propagation": ["D3_success_criteria", "D23_knowledge_gaps", "D24_experiment_design"],
+        "explanation": "The entity-value extraction assumption failure propagates to success criteria (can't measure what you can't detect) and experiment design (can't test value-divergence cases). This constrains v1 to text-heuristic-only detection."
+      },
+      "spike_2": {
+        "dimension": "D3_success_criteria",
+        "severity": "high",
+        "propagation": ["D24_experiment_design", "D12_configuration_surface"],
+        "explanation": "Without success metrics, config thresholds are arbitrary. How do we know CONFLICT_COSINE_THRESHOLD=0.7 is right for query-time vs the 0.85 used at consolidation-time?"
+      },
+      "spike_3": {
+        "dimension": "D17_api_contract",
+        "severity": "medium",
+        "propagation": ["D5_scope_boundaries"],
+        "explanation": "MCP server changes are out of scope but necessary for end-to-end value. Detection without surfacing is instrumentation, not a feature."
+      }
+    },
+
+    "cognitive_distortions": {
+      "CD1_anchoring": {
+        "detected": true,
+        "detail": "Feature description anchors on 'cosine > 0.8 with entity-value divergence' as the detection method. This anchors thinking toward structured extraction when the proven method (detect_semantic_opposition heuristic) is simpler and already shipping."
+      },
+      "CD3_survivorship_bias": {
+        "detected": true,
+        "detail": "Feature motivated by cases where contradictions WERE noticed (anecdotal). Unknown: how many contradictions exist undetected. Without base rate data, effort may target a rare phenomenon."
+      },
+      "CD7_complexity_bias": {
+        "detected": true,
+        "detail": "Proposal includes entity-value extraction, graph edge creation, and LLM flagging. The minimum viable version is simpler: detect_semantic_opposition on high-similarity pairs, annotate result, emit event. Three of four proposed steps are unnecessary for v1."
+      },
+      "CD9_planning_fallacy": {
+        "detected": false,
+        "detail": "Implementation sketch is appropriately scoped. Using existing functions keeps effort bounded."
+      }
+    }
+  },
+
+  "overloop": {
+    "evaluation_type": "overloop_3iter",
+
+    "iteration_1": {
+      "title": "Initial Implementation Plan",
+      "plan": {
+        "step_1": {
+          "description": "Add ContradictionInfo struct and config to HybridSearchConfig",
+          "file": "src/memory/hybrid_search.rs",
+          "changes": [
+            "Add enable_query_contradiction: bool field to HybridSearchConfig (default: false)",
+            "Add contradiction_cosine_threshold: f32 (default: 0.7)",
+            "Add max_contradiction_checks: usize (default: 20)",
+            "Add ContradictionInfo struct: { contradicts_memory_id: MemoryId, cosine_similarity: f32, contradiction_type: String, recency_winner: MemoryId }",
+            "Add contradiction: Option<ContradictionInfo> field to HybridSearchResult"
+          ]
+        },
+        "step_2": {
+          "description": "Implement detect_query_time_contradictions() function",
+          "file": "src/memory/hybrid_search.rs",
+          "changes": [
+            "New function: detect_query_time_contradictions(candidates: &mut [HybridSearchResult], get_content: &F, get_timestamp: &G) where F: Fn(MemoryId) -> Option<String>, G: Fn(MemoryId) -> Option<DateTime<Utc>>",
+            "For each pair (i, j) where i < j in candidates:",
+            "  - Compute cosine similarity using cached embeddings",
+            "  - If cosine > threshold, compute text_similarity and detect_semantic_opposition",
+            "  - If contradiction detected, annotate both results, penalize older memory score by 0.5x"
+          ]
+        },
+        "step_3": {
+          "description": "Insert into search_with_dynamic_weights()",
+          "file": "src/memory/hybrid_search.rs",
+          "changes": [
+            "After RRF fusion, before cross-encoder reranking",
+            "If config.enable_query_contradiction: call detect_query_time_contradictions()",
+            "Pass results through to reranker with modified scores"
+          ]
+        },
+        "step_4": {
+          "description": "Emit ConsolidationEvent::InterferenceDetected for detected contradictions",
+          "file": "src/memory/hybrid_search.rs",
+          "changes": [
+            "Accept optional Arc<RwLock<ConsolidationEventBuffer>> in HybridSearchEngine",
+            "On contradiction detection, emit InterferenceDetected event"
+          ]
+        }
+      }
+    },
+
+    "critique_1": {
+      "breaks": [
+        {
+          "issue": "HybridSearchEngine::search_with_dynamic_weights doesn't have access to embeddings or timestamps",
+          "detail": "The function receives vector_results (already computed) but not the raw embeddings. It has a get_content closure but no get_embedding or get_timestamp closure. Pairwise cosine requires embeddings, not content strings.",
+          "severity": "blocking"
+        },
+        {
+          "issue": "detect_semantic_opposition and text_similarity are in temporal_facts.rs, which is a different module with different concerns",
+          "detail": "Importing temporal fact utilities into hybrid search creates a coupling between the temporal fact system and the retrieval pipeline. These should be extracted.",
+          "severity": "design_smell"
+        },
+        {
+          "issue": "Score penalty (0.5x) is applied pre-reranking but the cross-encoder will independently re-score",
+          "detail": "Cross-encoder reranking computes fresh scores from (query, document) pairs. It doesn't use the incoming RRF scores. So penalizing before reranking has no effect on the reranked order.",
+          "severity": "critical_logic_error"
+        },
+        {
+          "issue": "ConsolidationEventBuffer in HybridSearchEngine breaks single-responsibility",
+          "detail": "HybridSearchEngine is a search engine, not an event emitter. Injecting the event buffer adds a consolidation concern to a retrieval component.",
+          "severity": "design_smell"
+        }
+      ],
+      "missing": [
+        "Temporal validity check — memories with non-overlapping valid_from/valid_until are not contradictions",
+        "Short-circuit optimization — most candidate pairs will have cosine < threshold, but we're computing all pairs",
+        "Metrics/counters — no way to observe contradiction detection rate in production"
+      ]
+    },
+
+    "iteration_2": {
+      "title": "Revised Plan Addressing Critique",
+      "changes_from_iteration_1": [
+        "Move contradiction detection to AFTER cross-encoder reranking (not before)",
+        "Extract detect_semantic_opposition and text_similarity to src/memory/contradiction.rs shared module",
+        "Pass embedding getter closure to contradiction checker",
+        "Return contradiction annotations as sidecar (not score modification)",
+        "Emit events at the caller level (semantic_retrieve in mod.rs), not inside HybridSearchEngine"
+      ],
+      "plan": {
+        "step_1": {
+          "description": "Create src/memory/contradiction.rs shared module",
+          "file": "src/memory/contradiction.rs (new)",
+          "changes": [
+            "Move detect_semantic_opposition() from temporal_facts.rs (re-export for backward compat)",
+            "Move text_similarity() from temporal_facts.rs (re-export for backward compat)",
+            "Add ContradictionInfo struct",
+            "Add detect_pairwise_contradictions() function: takes Vec<(MemoryId, content, embedding, timestamp)>, returns Vec<(MemoryId, MemoryId, ContradictionInfo)>",
+            "Internal: skip pairs where cosine < threshold (short-circuit on embedding distance)",
+            "Internal: check temporal validity — skip if valid_from/valid_until non-overlapping",
+            "Internal: run text_similarity then detect_semantic_opposition for high-cosine pairs"
+          ]
+        },
+        "step_2": {
+          "description": "Add contradiction_annotations to HybridSearchResult",
+          "file": "src/memory/hybrid_search.rs",
+          "changes": [
+            "Add contradictions: Vec<ContradictionInfo> field to HybridSearchResult (empty by default)",
+            "This is ANNOTATION ONLY — scores are NOT modified by contradiction detection",
+            "Consumer (semantic_retrieve or MCP layer) decides what to do with annotations"
+          ]
+        },
+        "step_3": {
+          "description": "Integrate in semantic_retrieve (mod.rs) AFTER hybrid search returns",
+          "file": "src/memory/mod.rs",
+          "changes": [
+            "After hybrid_search returns results and AFTER cross-encoder reranking completes:",
+            "If config flag enabled, call detect_pairwise_contradictions() on top-K results",
+            "Annotate HybridSearchResult with contradiction info",
+            "For the older memory in each contradiction pair: apply score penalty (0.7x) POST-reranking",
+            "Emit InterferenceDetected events to consolidation buffer",
+            "Emit tracing::info! for observability"
+          ]
+        },
+        "step_4": {
+          "description": "Add config flag and constants",
+          "file": "src/constants.rs",
+          "changes": [
+            "QUERY_CONTRADICTION_ENABLED: bool = false (off by default, opt-in)",
+            "QUERY_CONTRADICTION_COSINE_THRESHOLD: f32 = 0.7 (matches CONFLICT_COSINE_THRESHOLD)",
+            "QUERY_CONTRADICTION_TEXT_SIM_THRESHOLD: f32 = 0.5 (matches remember.rs logic)",
+            "QUERY_CONTRADICTION_SCORE_PENALTY: f32 = 0.7 (reduce older memory score by 30%)",
+            "QUERY_CONTRADICTION_MAX_CHECKS: usize = 20 (cap pairwise comparisons)"
+          ]
+        },
+        "step_5": {
+          "description": "Add unit tests",
+          "file": "src/memory/contradiction.rs",
+          "changes": [
+            "Test: two memories with negation opposition detected",
+            "Test: two memories with antonym opposition detected",
+            "Test: high-similarity non-contradictory memories NOT flagged",
+            "Test: temporal non-overlap skips contradiction check",
+            "Test: max_checks cap respected"
+          ]
+        }
+      }
+    },
+
+    "critique_2": {
+      "remaining_gaps": [
+        {
+          "gap": "Embedding access in semantic_retrieve",
+          "detail": "semantic_retrieve in mod.rs has access to the embedding cache (content_cache) and MemoryStorage. It CAN fetch embeddings for candidates. However, the current flow returns HybridSearchResult which only has memory_id and scores — not embeddings. Need to either: (a) cache embeddings during vector search and pass them through, or (b) re-compute from content (content_cache makes this <1ms per memory).",
+          "resolution": "Option (b): re-embed from content using content_cache. The cache hit rate will be ~100% since these memories were just retrieved via vector search (their embeddings are already cached). Cost: ~0.1ms per memory for cache lookup."
+        },
+        {
+          "gap": "MCP server surfacing",
+          "detail": "Even with annotations on HybridSearchResult, the MCP server's recall tool returns formatted text, not structured data. Contradiction annotations will be invisible to Claude unless the recall response format is updated.",
+          "resolution": "Phase 2 concern. For v1, log contradictions for observability. For v2, add [CONTRADICTION: newer memory X supersedes this] prefix to recalled memory text."
+        },
+        {
+          "gap": "No contradiction-specific benchmark",
+          "detail": "Cannot measure recall/precision of contradiction detection without test data containing known contradictions.",
+          "resolution": "Create synthetic contradiction pairs in tests/: original memory + contradicting update. Measure detection rate. Add to locomo_benchmark.rs as supplementary test."
+        },
+        {
+          "gap": "Re-export backward compatibility",
+          "detail": "Moving detect_semantic_opposition from temporal_facts.rs to contradiction.rs will break the import in handlers/remember.rs (line 763).",
+          "resolution": "Keep functions in temporal_facts.rs, re-export from contradiction.rs. Or: keep in temporal_facts.rs and import into contradiction.rs. The latter is simpler."
+        }
+      ],
+      "strengths": [
+        "Post-reranking placement avoids the score-ignored-by-cross-encoder bug",
+        "Annotation-only approach preserves architectural purity — consumer decides policy",
+        "Config flag provides clean rollback path",
+        "Event emission at mod.rs layer (not inside search engine) respects separation of concerns"
+      ]
+    },
+
+    "iteration_3": {
+      "title": "Final Concrete Plan",
+      "confidence": "high",
+      "estimated_hours": 10,
+      "file_changes": [
+        {
+          "file": "src/memory/contradiction.rs",
+          "action": "create",
+          "description": "Shared contradiction detection module",
+          "key_functions": [
+            "pub struct ContradictionInfo { pub contradicts_id: MemoryId, pub cosine_sim: f32, pub text_sim: f32, pub contradiction_signal: String, pub older_id: MemoryId, pub newer_id: MemoryId }",
+            "pub fn detect_pairwise_contradictions(candidates: &[(MemoryId, &str, &[f32], DateTime<Utc>)], cosine_threshold: f32, text_sim_threshold: f32, max_checks: usize) -> Vec<ContradictionInfo>",
+            "Internal: uses cosine_similarity from hybrid_search.rs, detect_semantic_opposition from temporal_facts.rs, text_similarity from temporal_facts.rs"
+          ]
+        },
+        {
+          "file": "src/memory/mod.rs",
+          "action": "modify",
+          "description": "Add contradiction module, integrate into semantic_retrieve",
+          "changes": [
+            "Add 'pub mod contradiction;' to module list",
+            "In semantic_retrieve, after hybrid search + reranking completes, add contradiction detection step",
+            "Gated by QUERY_CONTRADICTION_ENABLED constant",
+            "Apply QUERY_CONTRADICTION_SCORE_PENALTY to older memory in each detected pair",
+            "Emit InterferenceDetected event to consolidation_events buffer",
+            "Log at tracing::info level for production observability"
+          ]
+        },
+        {
+          "file": "src/memory/hybrid_search.rs",
+          "action": "modify",
+          "description": "Add contradiction annotation field to HybridSearchResult",
+          "changes": [
+            "Add 'pub contradictions: Vec<contradiction::ContradictionInfo>' field to HybridSearchResult (default empty vec)",
+            "Export cosine_similarity as pub for use in contradiction module (or use existing cosine_similarity_pub alias)"
+          ]
+        },
+        {
+          "file": "src/constants.rs",
+          "action": "modify",
+          "description": "Add query-time contradiction constants",
+          "changes": [
+            "QUERY_CONTRADICTION_ENABLED: bool = false",
+            "QUERY_CONTRADICTION_COSINE_THRESHOLD: f32 = 0.7",
+            "QUERY_CONTRADICTION_TEXT_SIM_THRESHOLD: f32 = 0.5",
+            "QUERY_CONTRADICTION_SCORE_PENALTY: f32 = 0.7",
+            "QUERY_CONTRADICTION_MAX_CHECKS: usize = 20"
+          ]
+        },
+        {
+          "file": "src/memory/temporal_facts.rs",
+          "action": "no_change",
+          "description": "Keep detect_semantic_opposition and text_similarity in place. Import from contradiction.rs rather than moving — avoids breaking handlers/remember.rs imports."
+        },
+        {
+          "file": "tests/contradiction_detection.rs",
+          "action": "create",
+          "description": "Unit and integration tests for query-time contradiction detection",
+          "test_cases": [
+            "test_negation_contradiction_detected: 'I use React' vs 'I don't use React'",
+            "test_antonym_contradiction_detected: 'Project is active' vs 'Project is inactive'",
+            "test_paraphrase_not_contradicted: 'I enjoy hiking' vs 'I love hiking'",
+            "test_temporal_non_overlap_skipped: valid_from/valid_until don't overlap",
+            "test_low_cosine_skipped: similar topic but cosine < threshold",
+            "test_max_checks_respected: more than max_checks pairs, only max checked",
+            "test_score_penalty_applied: older memory gets 0.7x score",
+            "test_event_emitted: InterferenceDetected event in consolidation buffer"
+          ]
+        }
+      ],
+      "implementation_order": [
+        "1. src/constants.rs — add constants (15 min)",
+        "2. src/memory/contradiction.rs — create module with detection logic (3 hours)",
+        "3. src/memory/hybrid_search.rs — add ContradictionInfo to result struct (30 min)",
+        "4. src/memory/mod.rs — integrate into semantic_retrieve (2 hours)",
+        "5. tests/contradiction_detection.rs — write tests (2 hours)",
+        "6. cargo check + cargo clippy — verify compilation (30 min)",
+        "7. Run LOCOMO benchmark — verify no regression (1 hour)",
+        "8. Manual testing with synthetic contradictions (1 hour)"
+      ],
+      "deferred_to_v2": [
+        "Entity-attribute-value extraction for value-divergence detection",
+        "MCP server recall response format update to surface contradictions",
+        "Contradiction-specific benchmark dataset creation",
+        "Dashboard visualization of query-time vs consolidation-time interference",
+        "Multi-hop contradiction chains (A contradicts B, B reinforces C)"
+      ]
+    }
+  },
+
+  "verdict": {
+    "implement": true,
+    "priority": "P2",
+    "effort_hours": 10,
+    "risk": "low",
+    "rationale": "Feature has strong architectural alignment (3 existing precedents), low regression risk (config-gated, additive), and moderate value (safety net for ingest-time contradiction misses). However, it is P2 not P1 because: (1) ingest-time detection already catches most contradictions, (2) no benchmark exists to measure query-time value, and (3) the MRR improvement strategy (current P1) has higher measured impact on retrieval quality.",
+    "prerequisites": [
+      "Complete P1 reranker improvements (current MRR push from 0.88 to 0.93+)",
+      "Create contradiction-specific test dataset (3 hours additional)",
+      "Measure ingest-time contradiction miss rate to validate query-time value"
+    ],
+    "v1_scope": "Text-heuristic contradiction detection (detect_semantic_opposition + text_similarity) with annotation-only approach. No entity-value extraction. No MCP surfacing. Config flag off by default.",
+    "key_insight": "The critical finding is that entity-value extraction — the feature's stated detection mechanism — does not exist in the codebase. EntityRef stores entity_id and entity_name only, not attribute-value bindings. v1 must use the proven text-level heuristic (detect_semantic_opposition) which handles negation and antonym cases. Entity-value extraction is a separate, larger effort (P3+) that should be evaluated independently.",
+    "bifocal_score": 7.9,
+    "overlook_spikes": ["D2_unstated_assumptions", "D3_success_criteria", "D17_api_contract"],
+    "overloop_iterations": 3,
+    "overloop_final_confidence": "high"
+  }
+}

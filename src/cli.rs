@@ -625,7 +625,7 @@ fn handle_doctor() -> Result<()> {
 }
 
 fn handle_version() {
-    eprintln!("shodh {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("shodh {}", env!("SHODH_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
     eprintln!("  License:  BUSL-1.1");
