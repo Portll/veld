@@ -60,6 +60,9 @@ pub mod context_blocks;
 // A/B testing
 pub mod ab_testing;
 
+// Pinky dimension push (graph topological health)
+pub mod pinky;
+
 // Test utilities (compiled only in test builds)
 #[cfg(test)]
 pub mod test_helpers;

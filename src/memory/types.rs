@@ -98,6 +98,34 @@ impl PinkyDimensionScores {
     }
 }
 
+/// Signal attribution for a retrieved memory.
+///
+/// Records WHICH scoring signals contributed to a memory's ranking during
+/// retrieval. This enables adaptive weight learning — by comparing attribution
+/// profiles of helpful vs. unhelpful results, future retrievals can bias toward
+/// signals that historically predicted relevance.
+///
+/// Populated during Layer 4 (RRF fusion) from `HybridSearchResult` component
+/// scores and graph activation data. Additional fields are set during Layer 5
+/// (unified scoring) for cross-encoder and recency contributions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SignalAttribution {
+    /// BM25 keyword match score (from Tantivy full-text search)
+    pub bm25_contribution: f32,
+    /// Vector embedding cosine similarity score
+    pub vector_contribution: f32,
+    /// Graph spreading activation score (Hebbian edge weights)
+    pub graph_contribution: f32,
+    /// Cross-encoder reranking score (joint query-document attention)
+    pub cross_encoder_contribution: f32,
+    /// Recency decay contribution (exponential age-based boost)
+    pub recency_contribution: f32,
+    /// Whether a temporal reference match contributed to scoring
+    pub temporal_match: bool,
+    /// Whether entity overlap boosted this memory's score
+    pub entity_overlap: bool,
+}
+
 impl ScoringSignals {
     /// Extract signals from a memory. Requires no external state — all data
     /// comes from the memory itself. External signals (graph_strength,
