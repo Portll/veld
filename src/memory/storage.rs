@@ -645,6 +645,16 @@ impl LegacyMemoryV2 {
 /// Returns (Memory, needs_migration) where needs_migration=true means the data
 /// was in a legacy format and should be re-written for future performance.
 fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
+    // Reject obviously corrupt entries before any deserialization attempt.
+    // A single memory should never exceed 64MB — corrupt varint length fields
+    // in bincode1 can request 7.9 exabytes and OOM-kill the process.
+    if data.len() > BINCODE_ALLOC_LIMIT {
+        return Err(anyhow!(
+            "Memory data too large: {} bytes (limit: {} bytes). Likely corrupt.",
+            data.len(), BINCODE_ALLOC_LIMIT
+        ));
+    }
+
     // Check for versioned format: SHO + version byte + payload + 4-byte CRC32
     if data.len() >= 8 && &data[0..3] == STORAGE_MAGIC {
         let version = data[3];
@@ -761,6 +771,15 @@ fn deserialize_legacy_fallback(
     first_error: bincode::error::DecodeError,
     record_branch: fn(&str),
 ) -> Result<(Memory, bool)> {
+    // Guard: reject data larger than 64MB before attempting any deserialization.
+    // This catches corrupt entries before bincode1 (which lacks with_limit) tries
+    // to allocate based on a corrupt varint length field.
+    if data.len() > BINCODE_ALLOC_LIMIT {
+        return Err(anyhow!(
+            "Data too large for memory deserialization: {} bytes (limit: {} bytes)",
+            data.len(), BINCODE_ALLOC_LIMIT
+        ));
+    }
     // Log detailed errors for first entry only to help debug format issues
     static DEBUG_ENTRY_LOGGED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
