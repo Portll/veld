@@ -284,6 +284,22 @@ panic = "abort"
 opt-level = 3
 lto = "thin"  # Faster build than full LTO for benchmarks
 
+# =============================================================================
+# FORTRESS PROFILE — Fractal obfuscation for distribution binaries
+# =============================================================================
+# Build: cargo build --profile fortress --features fortress
+# Result: stripped, monomorphized, no debug, no unwind, no readable strings
+[profile.fortress]
+inherits = "release"
+opt-level = 3           # Maximum optimization (destroys source structure)
+lto = "fat"             # Full cross-crate LTO (monomorphizes everything)
+codegen-units = 1       # Single codegen unit (LLVM sees entire program)
+strip = "symbols"       # Strip symbol table + debug info
+panic = "abort"         # Remove unwind tables (huge source of reverse info)
+overflow-checks = false # Remove overflow check branches (dead code elimination)
+debug = 0               # Zero debug info
+debug-assertions = false
+incremental = false     # Full rebuild every time (no incremental artifacts)
 
 [features]
 # Default: minimal dependencies for edge devices (Raspberry Pi, drones, robotics)
@@ -300,6 +316,11 @@ zenoh = ["dep:zenoh"]
 
 # Optional: PDF text extraction for ingest and seed_project
 pdf = ["dep:pdf-extract"]
+
+# Fortress: fractal binary obfuscation for distribution
+# Eliminates ALL tracing, replaces error messages with codes,
+# custom panic handler, anti-debug, integrity checks.
+fortress = []
 
 # Optional: Distributed tracing for cloud/multi-node deployments (~200 extra packages)
 telemetry = [

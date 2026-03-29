@@ -222,6 +222,9 @@ enum HookType {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "fortress")]
+    shodh_memory::fortress::init();
+
     let cli = Cli::parse();
 
     match cli.command {

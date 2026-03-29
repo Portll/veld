@@ -50,6 +50,13 @@ fn main() {
     println!("cargo:rustc-env=SHODH_BUILD_TIMESTAMP={}", ts);
     println!("cargo:rustc-env=SHODH_VERSION_FULL={}", full_version);
 
+    // Fortress: generate per-build random encryption seed
+    // The seed is derived from build number + timestamp, ensuring every build
+    // produces different encrypted byte patterns (prevents known-plaintext attacks).
+    // This is NOT cryptographic security — it's obfuscation against `strings`.
+    let fortress_seed = format!("{}:{}", next, secs);
+    println!("cargo:rustc-env=SHODH_FORTRESS_SEED={}", fortress_seed);
+
     // Only re-run when the build file changes (not on every source change)
     // This is a compromise: the number increments on every build invocation
     // because Cargo always runs build.rs, but we don't trigger unnecessary
