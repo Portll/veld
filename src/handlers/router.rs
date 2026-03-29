@@ -164,6 +164,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
             post(consolidation::repair_vector_index),
         )
         .route("/api/index/rebuild", post(consolidation::rebuild_index))
+        .route("/api/index/reembed", post(consolidation::reembed_all))
         .route(
             "/api/storage/cleanup",
             post(consolidation::cleanup_corrupted),

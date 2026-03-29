@@ -3371,6 +3371,131 @@ impl super::MemorySystem {
             }
         }
 
+        // =====================================================================
+        // LAYER 5.95: CONTENT SUFFICIENCY SIGNAL
+        // =====================================================================
+        // "Finding the right memory ≠ returning sufficient information."
+        // A memory might be the correct match (right entity, right timeframe)
+        // but contain insufficient detail to answer the query. Detect this by
+        // measuring focal entity coverage in the memory content. Memories that
+        // mention fewer query entities get a soft demotion; memories that cover
+        // more entities get a boost. If a top memory is thin, check the fact
+        // store for supplementary facts from the same entity cluster and inject
+        // fact-source memories into the result set.
+        if !query_analysis.focal_entities.is_empty() && memories.len() >= 2 {
+            let query_entities: Vec<String> = query_analysis
+                .focal_entities
+                .iter()
+                .map(|e| e.text.to_lowercase())
+                .collect();
+            let entity_count = query_entities.len() as f32;
+
+            for mem in memories.iter_mut() {
+                let content_lower = mem.experience.content.to_lowercase();
+                let covered = query_entities
+                    .iter()
+                    .filter(|e| content_lower.contains(e.as_str()))
+                    .count() as f32;
+                let coverage_ratio = covered / entity_count;
+
+                // Only adjust if there's meaningful entity divergence
+                if coverage_ratio < 0.5 {
+                    // Thin memory: covers less than half the query entities
+                    let penalty = 0.90 + 0.10 * coverage_ratio; // 0.90-0.95
+                    let base = mem.score.unwrap_or(0.0);
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(base * penalty);
+                    *mem = Arc::new(cloned);
+                } else if coverage_ratio > 0.8 && entity_count >= 2.0 {
+                    // Rich memory: covers most query entities
+                    let boost = 1.0 + 0.05 * (coverage_ratio - 0.8); // 1.00-1.01
+                    let base = mem.score.unwrap_or(0.0);
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(base * boost);
+                    *mem = Arc::new(cloned);
+                }
+            }
+
+            // Re-sort after sufficiency adjustments
+            memories.sort_by(|a, b| {
+                b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
+            });
+
+            // If the top result has low entity coverage, try to supplement from fact store.
+            // Facts are distilled knowledge — they're often more complete than thin episodic
+            // memories for the same entity.
+            if let Some(top) = memories.first() {
+                let top_content_lower = top.experience.content.to_lowercase();
+                let top_score = top.score.unwrap_or(0.0);
+                let top_coverage = query_entities
+                    .iter()
+                    .filter(|e| top_content_lower.contains(e.as_str()))
+                    .count() as f32
+                    / entity_count;
+
+                if top_coverage < 0.5 {
+                    if let Some(user_id) = &query.user_id {
+                        if let Ok(facts) =
+                            self.get_facts_for_graph_entities(user_id, &query_entities, 3)
+                        {
+                            // Inject fact-source memories that aren't already in results
+                            let existing_ids: HashSet<_> =
+                                memories.iter().map(|m| m.id.clone()).collect();
+
+                            let mut injected = 0;
+                            for fact in &facts {
+                                if fact.confidence < 0.6 || fact.support_count < 2 {
+                                    continue;
+                                }
+                                for src_id in &fact.source_memories {
+                                    if existing_ids.contains(src_id) {
+                                        continue;
+                                    }
+                                    // Load and score the fact-source memory
+                                    if let Some(src_mem) =
+                                        self.working_memory.read().get(src_id)
+                                    {
+                                        memories.push(src_mem);
+                                        injected += 1;
+                                    } else if let Some(src_mem) =
+                                        self.session_memory.read().get(src_id)
+                                    {
+                                        memories.push(src_mem);
+                                        injected += 1;
+                                    } else if let Ok(src_mem) = self.long_term_memory.get(src_id) {
+                                        let mut scored = src_mem;
+                                        // Score slightly below top result to avoid displacing
+                                        // the original match entirely
+                                        scored.set_score(top_score * 0.85 * fact.confidence);
+                                        memories.push(Arc::new(scored));
+                                        injected += 1;
+                                    }
+                                    if injected >= 2 {
+                                        break;
+                                    }
+                                }
+                                if injected >= 2 {
+                                    break;
+                                }
+                            }
+
+                            if injected > 0 {
+                                // Re-sort and truncate
+                                memories.sort_by(|a, b| {
+                                    b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
+                                });
+                                memories.truncate(query.max_results);
+                                tracing::debug!(
+                                    injected,
+                                    "Layer 5.95: Supplemented thin top result with fact-source memories"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Update access counts with instrumentation for consolidation events
         // (only for memories that survived competition)
         for memory in &memories {
