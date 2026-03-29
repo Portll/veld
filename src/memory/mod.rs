@@ -457,24 +457,38 @@ impl MemorySystem {
                 .context("Failed to initialize MiniLM embedder (ONNX model)")?,
         );
 
-        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> =
-            if crate::embeddings::are_nomic_models_downloaded() {
+        // Secondary embedder: try HTTP API first (LM Studio/Ollama), then local ONNX
+        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = {
+            // Option 1: HTTP-backed Nomic via LM Studio / Ollama / vLLM
+            let http_config = crate::embeddings::http_embedder::HttpEmbedderConfig::from_env();
+            let http_embedder = crate::embeddings::http_embedder::HttpEmbedder::new(http_config);
+            if http_embedder.is_available() {
+                tracing::info!(
+                    "Nomic via HTTP API at {} — dual-embedder active",
+                    std::env::var("SHODH_EMBEDDING_API_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:1234".into())
+                );
+                Some(Arc::new(http_embedder))
+            }
+            // Option 2: Local ONNX Nomic model
+            else if crate::embeddings::are_nomic_models_downloaded() {
                 match crate::embeddings::nomic::NomicEmbedder::new(
                     crate::embeddings::nomic::NomicConfig::from_env(),
                 ) {
                     Ok(nomic) => {
-                        tracing::info!("Nomic-embed-text-v1.5 loaded (768d) — dual-embedder active");
+                        tracing::info!("Nomic-embed-text-v1.5 ONNX loaded (768d) — dual-embedder active");
                         Some(Arc::new(nomic))
                     }
                     Err(e) => {
-                        tracing::warn!("Nomic embedder init failed, MiniLM only: {e}");
+                        tracing::warn!("Nomic ONNX init failed, MiniLM only: {e}");
                         None
                     }
                 }
             } else {
-                tracing::info!("Nomic model not downloaded — MiniLM only (384d)");
+                tracing::info!("No secondary embedder available — MiniLM only (384d)");
                 None
-            };
+            }
+        };
 
         let embedder = Arc::new(
             crate::embeddings::competitive::CompetitiveEmbedder::new(primary, secondary),
