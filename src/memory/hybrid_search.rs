@@ -30,7 +30,6 @@ use tracing::{debug, info};
 use rust_stemmers::{Algorithm, Stemmer};
 
 use super::types::MemoryId;
-use crate::embeddings::minilm::MiniLMEmbedder;
 use crate::embeddings::Embedder;
 
 /// Stem text using the English Porter stemmer for BM25 matching.
@@ -670,7 +669,7 @@ impl RRFusion {
 ///
 /// Blending: 70% cross-encoder + 30% bi-encoder (proven ratio from literature).
 pub struct CrossEncoderReranker {
-    embedder: Arc<MiniLMEmbedder>,
+    embedder: Arc<dyn Embedder>,
     cross_encoder: Arc<crate::embeddings::cross_encoder::CrossEncoder>,
 }
 
@@ -681,7 +680,7 @@ const BI_ENCODER_BLEND_WEIGHT: f32 = 0.30;
 
 impl CrossEncoderReranker {
     /// Create reranker with shared embedder and cross-encoder model
-    pub fn new(embedder: Arc<MiniLMEmbedder>) -> Self {
+    pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         Self {
             embedder,
             cross_encoder: Arc::new(
@@ -692,7 +691,7 @@ impl CrossEncoderReranker {
 
     /// Create reranker with an existing cross-encoder instance
     pub fn with_cross_encoder(
-        embedder: Arc<MiniLMEmbedder>,
+        embedder: Arc<dyn Embedder>,
         cross_encoder: Arc<crate::embeddings::cross_encoder::CrossEncoder>,
     ) -> Self {
         Self {
@@ -804,7 +803,7 @@ impl HybridSearchEngine {
     /// Create hybrid search engine
     pub fn new(
         bm25_path: &Path,
-        embedder: Arc<MiniLMEmbedder>,
+        embedder: Arc<dyn Embedder>,
         config: HybridSearchConfig,
     ) -> Result<Self> {
         let bm25_index = BM25Index::new(bm25_path)?;
