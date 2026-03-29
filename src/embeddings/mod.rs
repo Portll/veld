@@ -15,11 +15,13 @@
 
 pub mod chunking;
 pub mod circuit_breaker;
+pub mod competitive;
 pub mod cross_encoder;
 pub mod downloader;
 pub mod keywords;
 pub mod minilm;
 pub mod ner;
+pub mod nomic;
 
 // Re-export chunking types
 pub use chunking::{chunk_text, ChunkConfig, ChunkResult};
@@ -28,9 +30,10 @@ use anyhow::Result;
 
 // Re-export downloader functions for convenience
 pub use downloader::{
-    are_models_downloaded, are_ner_models_downloaded, download_ner_models, ensure_downloaded,
-    get_cache_dir, get_models_dir, get_ner_models_dir, get_onnx_runtime_path,
-    is_onnx_runtime_downloaded, print_status,
+    are_models_downloaded, are_ner_models_downloaded, are_nomic_models_downloaded,
+    download_ner_models, download_nomic_models, ensure_downloaded, get_cache_dir, get_models_dir,
+    get_ner_models_dir, get_nomic_models_dir, get_onnx_runtime_path, is_onnx_runtime_downloaded,
+    print_status,
 };
 
 // Re-export NER types
@@ -43,6 +46,9 @@ pub use keywords::{Keyword, KeywordConfig, KeywordExtractor};
 pub use circuit_breaker::{
     CircuitBreakerConfig, CircuitBreakerMetrics, CircuitState, ResilientEmbedder,
 };
+
+// Re-export competitive embedder
+pub use competitive::CompetitiveEmbedder;
 
 /// Trait for embedding generation
 pub trait Embedder: Send + Sync {

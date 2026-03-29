@@ -40,6 +40,16 @@ const NER_MODEL_URL: &str =
 const NER_TOKENIZER_URL: &str =
     "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/9b03777d9832105fbe419f258127fb2ec3eb09d7/tokenizer.json";
 
+/// URLs for Nomic-embed-text-v1.5 model files (768-dimensional, Matryoshka)
+/// Source: nomic-ai/nomic-embed-text-v1.5
+/// Full model ~274MB, quantized ~65MB
+const NOMIC_MODEL_ONNX_URL: &str =
+    "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx";
+const NOMIC_MODEL_QUANTIZED_URL: &str =
+    "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model_quantized.onnx";
+const NOMIC_TOKENIZER_URL: &str =
+    "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json";
+
 /// SHA-256 checksums for model integrity verification
 /// Verified against pinned commit hashes above — these will not drift
 struct ModelChecksums;
@@ -69,6 +79,18 @@ impl ModelChecksums {
     /// Pinned: onnx-community/TinyBERT-finetuned-NER-ONNX @ 9b03777d
     const NER_TOKENIZER: Option<&'static str> =
         Some("d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66");
+
+    /// Nomic quantized model checksum (model_quantized.onnx)
+    /// Will be populated after first verified download
+    const NOMIC_QUANTIZED_MODEL: Option<&'static str> = None;
+
+    /// Nomic full model checksum (model.onnx)
+    /// Will be populated after first verified download
+    const NOMIC_FULL_MODEL: Option<&'static str> = None;
+
+    /// Nomic tokenizer checksum (tokenizer.json)
+    /// Will be populated after first verified download
+    const NOMIC_TOKENIZER: Option<&'static str> = None;
 }
 
 /// ONNX Runtime download URLs by platform (v1.23.2 required by ort 2.0.0-rc.11)
@@ -103,6 +125,11 @@ pub fn get_models_dir() -> PathBuf {
 /// Get the models directory for NER (bert-tiny-ner)
 pub fn get_ner_models_dir() -> PathBuf {
     get_cache_dir().join("models").join("bert-tiny-ner")
+}
+
+/// Get the models directory for Nomic-embed-text-v1.5
+pub fn get_nomic_models_dir() -> PathBuf {
+    get_cache_dir().join("models").join("nomic-embed-v1.5")
 }
 
 /// Get the ONNX Runtime directory
@@ -166,6 +193,39 @@ pub fn are_ner_models_downloaded() -> bool {
         if let Ok(valid) = verify_checksum(&tokenizer_path, expected) {
             if !valid {
                 tracing::warn!("NER tokenizer file checksum mismatch — will re-download");
+                let _ = fs::remove_file(&tokenizer_path);
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Check if Nomic embedding model files are downloaded and valid
+pub fn are_nomic_models_downloaded() -> bool {
+    let models_dir = get_nomic_models_dir();
+    let model_path = models_dir.join("model_quantized.onnx");
+    let tokenizer_path = models_dir.join("tokenizer.json");
+
+    if !model_path.exists() || !tokenizer_path.exists() {
+        return false;
+    }
+
+    // Verify checksums if available
+    if let Some(expected) = ModelChecksums::NOMIC_QUANTIZED_MODEL {
+        if let Ok(valid) = verify_checksum(&model_path, expected) {
+            if !valid {
+                tracing::warn!("Nomic model file checksum mismatch — will re-download");
+                let _ = fs::remove_file(&model_path);
+                return false;
+            }
+        }
+    }
+    if let Some(expected) = ModelChecksums::NOMIC_TOKENIZER {
+        if let Ok(valid) = verify_checksum(&tokenizer_path, expected) {
+            if !valid {
+                tracing::warn!("Nomic tokenizer file checksum mismatch — will re-download");
                 let _ = fs::remove_file(&tokenizer_path);
                 return false;
             }
@@ -464,6 +524,79 @@ pub fn download_ner_models(progress: Option<ProgressCallback>) -> Result<PathBuf
     Ok(models_dir)
 }
 
+/// Download Nomic-embed-text-v1.5 model files
+/// Downloads quantized model (~65MB) by default for edge devices
+/// Set use_full_model=true for the larger 274MB model via download_nomic_models_internal
+pub fn download_nomic_models(progress: Option<ProgressCallback>) -> Result<PathBuf> {
+    download_nomic_models_internal(progress, true)
+}
+
+/// Download Nomic model files with option for full or quantized model
+pub fn download_nomic_models_internal(
+    progress: Option<ProgressCallback>,
+    use_quantized: bool,
+) -> Result<PathBuf> {
+    let models_dir = get_nomic_models_dir();
+
+    if are_nomic_models_downloaded() {
+        tracing::info!("Nomic models already downloaded at {:?}", models_dir);
+        return Ok(models_dir);
+    }
+
+    tracing::info!(
+        "Downloading Nomic-embed-text-v1.5 model to {:?}",
+        models_dir
+    );
+
+    // Download model (quantized ~65MB or full ~274MB)
+    let (model_url, model_filename, model_checksum) = if use_quantized {
+        (
+            NOMIC_MODEL_QUANTIZED_URL,
+            "model_quantized.onnx",
+            ModelChecksums::NOMIC_QUANTIZED_MODEL,
+        )
+    } else {
+        (
+            NOMIC_MODEL_ONNX_URL,
+            "model.onnx",
+            ModelChecksums::NOMIC_FULL_MODEL,
+        )
+    };
+
+    let model_path = models_dir.join(model_filename);
+    tracing::info!(
+        "Downloading Nomic model from {} (~{}MB)",
+        if use_quantized {
+            "HuggingFace (quantized)"
+        } else {
+            "HuggingFace (full)"
+        },
+        if use_quantized { 65 } else { 274 }
+    );
+    download_file_with_checksum(
+        model_url,
+        &model_path,
+        progress.as_ref().map(|p| p.as_ref()),
+        model_checksum,
+    )?;
+
+    // Download tokenizer (~700KB)
+    let tokenizer_path = models_dir.join("tokenizer.json");
+    tracing::info!("Downloading Nomic tokenizer.json");
+    download_file_with_checksum(
+        NOMIC_TOKENIZER_URL,
+        &tokenizer_path,
+        progress.as_ref().map(|p| p.as_ref()),
+        ModelChecksums::NOMIC_TOKENIZER,
+    )?;
+
+    tracing::info!(
+        "Nomic-embed-text-v1.5 model downloaded successfully to {:?}",
+        models_dir
+    );
+    Ok(models_dir)
+}
+
 /// Download ONNX Runtime
 pub fn download_onnx_runtime(progress: Option<ProgressCallback>) -> Result<PathBuf> {
     let onnx_dir = get_onnx_runtime_dir();
@@ -627,17 +760,24 @@ pub fn print_status() {
     let cache_dir = get_cache_dir();
     let models_downloaded = are_models_downloaded();
     let ner_models_downloaded = are_ner_models_downloaded();
+    let nomic_models_downloaded = are_nomic_models_downloaded();
     let onnx_downloaded = is_onnx_runtime_downloaded();
 
     println!("Shodh-Memory Cache Status:");
     println!("  Cache directory: {cache_dir:?}");
-    println!("  Embedding models downloaded: {models_downloaded}");
+    println!("  MiniLM embedding models downloaded: {models_downloaded}");
+    println!("  Nomic embedding models downloaded: {nomic_models_downloaded}");
     println!("  NER models downloaded: {ner_models_downloaded}");
     println!("  ONNX Runtime downloaded: {onnx_downloaded}");
 
     if models_downloaded {
         let models_dir = get_models_dir();
-        println!("  Embedding model path: {models_dir:?}");
+        println!("  MiniLM model path: {models_dir:?}");
+    }
+
+    if nomic_models_downloaded {
+        let nomic_dir = get_nomic_models_dir();
+        println!("  Nomic model path: {nomic_dir:?}");
     }
 
     if ner_models_downloaded {
@@ -666,5 +806,11 @@ mod tests {
     fn test_models_dir() {
         let models_dir = get_models_dir();
         assert!(models_dir.to_string_lossy().contains("minilm-l6"));
+    }
+
+    #[test]
+    fn test_nomic_models_dir() {
+        let models_dir = get_nomic_models_dir();
+        assert!(models_dir.to_string_lossy().contains("nomic-embed-v1.5"));
     }
 }
