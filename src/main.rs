@@ -94,6 +94,11 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    // Fortress: install anti-debug + custom panic handler BEFORE anything else.
+    // Must be the first code to execute — debugger attachment at startup is caught.
+    #[cfg(feature = "fortress")]
+    shodh_memory::fortress::init();
+
     let cli = Cli::parse();
 
     shodh_memory::server::run(shodh_memory::server::ServerRunConfig {
