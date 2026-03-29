@@ -97,6 +97,9 @@ temp_*/
 nul
 .vercel
 
+# Build number (auto-incremented per machine, see build.rs)
+.build_number
+
 # Local/temp files
 graph_temp.json
 pitch-deck-stata.md

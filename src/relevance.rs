@@ -429,6 +429,7 @@ impl LearnedWeights {
         semantic_contributed: bool,
         entity_contributed: bool,
         tag_contributed: bool,
+        graph_contributed: bool,
         helpful: bool,
     ) {
         let direction = if helpful { 1.0 } else { -1.0 };
@@ -444,20 +445,31 @@ impl LearnedWeights {
         if tag_contributed {
             self.tag = (self.tag + delta).max(MIN_WEIGHT);
         }
+        // Signal 15: graph_contributed — explicit feedback for graph weight
+        if graph_contributed {
+            self.graph_strength = (self.graph_strength + delta).max(MIN_WEIGHT);
+        }
 
         // Importance is always a factor, so adjust inversely to others
-        if helpful && !semantic_contributed && !entity_contributed && !tag_contributed {
+        if helpful
+            && !semantic_contributed
+            && !entity_contributed
+            && !tag_contributed
+            && !graph_contributed
+        {
             // Memory was helpful but no clear signal - boost importance
             self.importance = (self.importance + delta).max(MIN_WEIGHT);
         }
 
-        // Also adjust momentum, access_count, and graph_strength dimensions.
-        // These are implicit signals: helpful memories get a small boost across
-        // all auxiliary dimensions so they contribute to future fused scores.
+        // Also adjust momentum and access_count dimensions.
+        // graph_strength now gets explicit feedback above, so only blanket-adjust
+        // when it DIDN'T get explicit feedback (avoid double-counting).
         let aux_delta = WEIGHT_LEARNING_RATE * direction * 0.5;
         self.momentum = (self.momentum + aux_delta).max(MIN_WEIGHT);
         self.access_count = (self.access_count + aux_delta).max(MIN_WEIGHT);
-        self.graph_strength = (self.graph_strength + aux_delta).max(MIN_WEIGHT);
+        if !graph_contributed {
+            self.graph_strength = (self.graph_strength + aux_delta).max(MIN_WEIGHT);
+        }
 
         self.normalize();
         self.update_count += 1;
@@ -666,12 +678,14 @@ impl RelevanceEngine {
         semantic_contributed: bool,
         entity_contributed: bool,
         tag_contributed: bool,
+        graph_contributed: bool,
         helpful: bool,
     ) {
         self.learned_weights.write().apply_feedback(
             semantic_contributed,
             entity_contributed,
             tag_contributed,
+            graph_contributed,
             helpful,
         );
     }
@@ -1892,7 +1906,7 @@ mod tests {
         let initial_entity = weights.entity;
 
         // Positive feedback on semantic and entity
-        weights.apply_feedback(true, true, false, true);
+        weights.apply_feedback(true, true, false, false, true);
 
         // Semantic and entity should increase (relative to tag/importance)
         // After normalization, they may not be strictly higher, but update_count should increase
@@ -1920,7 +1934,7 @@ mod tests {
         let mut weights = LearnedWeights::default();
 
         // Negative feedback - semantic was the main signal
-        weights.apply_feedback(true, false, false, false);
+        weights.apply_feedback(true, false, false, false, false);
 
         // Weights should still sum to 1.0 (includes momentum, access_count, and graph_strength)
         let sum = weights.semantic
@@ -2008,7 +2022,7 @@ mod tests {
         };
 
         // Apply negative feedback on entity (already near minimum)
-        weights.apply_feedback(false, true, false, false);
+        weights.apply_feedback(false, true, false, false, false);
 
         // Entity should not go below MIN_WEIGHT after feedback + normalization
         // Before normalize: entity = 0.05 (clamped), sum = 0.85

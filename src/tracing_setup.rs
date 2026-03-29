@@ -51,7 +51,7 @@ pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     // Build resource with service metadata
     let resource = Resource::new(vec![
         KeyValue::new("service.name", service_name.clone()),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.version", env!("SHODH_VERSION_FULL")),
     ]);
 
     // Build tracer provider using the new builder API
