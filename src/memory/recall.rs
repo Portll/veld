@@ -2034,7 +2034,7 @@ impl super::MemorySystem {
                             };
                             // Penalty proportional to similarity: higher sim = more
                             // confident this is a true contradiction, not coincidence
-                            let penalty = sim * 0.15;
+                            let penalty = sim * 0.20;
                             demote_indices.push((older_idx, penalty));
                         }
                     }
@@ -2275,7 +2275,10 @@ impl super::MemorySystem {
                 // =================================================================
 
                 // BRIDGE-1: access_count (signal 5, proven 14% in proactive)
-                let access_boost = ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * 0.07;
+                // Query-intent-dependent: exploratory queries reduce access advantage
+                // to surface novel/unfamiliar memories (bifocal novelty evaluation)
+                let access_weight = if matches!(query_type, crate::memory::query_parser::QueryType::Exploratory) { 0.02 } else { 0.07 };
+                let access_boost = ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * access_weight;
 
                 // BRIDGE-1: graph_strength (signal 3+, proven 13% in proactive)
                 let graph_boost = hebbian_scores
@@ -2575,7 +2578,7 @@ impl super::MemorySystem {
                                     .or_default()
                                     .cross_encoder_contribution = ce_score;
                                 let base = mem.score.unwrap_or(0.0);
-                                let blended = base * 0.88 + ce_score * 0.12;
+                                let blended = base * 0.82 + ce_score * 0.18;
                                 let mut cloned: Memory = mem.as_ref().clone();
                                 cloned.set_score(blended);
                                 *mem = Arc::new(cloned);
