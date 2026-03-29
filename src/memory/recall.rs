@@ -2773,6 +2773,118 @@ impl super::MemorySystem {
         }
 
         // =====================================================================
+        // LAYER 5.87: TEMPORAL RANGE DEMOTION
+        // =====================================================================
+        // For temporal range queries ("last week", "last month", "recently"),
+        // apply graduated demotion to memories outside the implied time window.
+        // This makes recency the PRIMARY signal for these queries rather than
+        // a weak additive boost that BM25 easily overcomes.
+        //
+        // Guard: only fires if 3+ candidates exist within the window to avoid
+        // over-filtering when few recent memories match.
+        {
+            let ql = query_text.to_lowercase();
+            // Calendar-aware temporal windows with graduated penalties:
+            // "last week" = Monday-before-last through last Sunday
+            //   - memories within last 7 days: moderate penalty (0.85x) — "this week", not "last week"
+            //   - memories 7-14 days ago: full score (1.0x) — "last week" sweet spot
+            //   - memories 14+ days ago (before Monday of last week): steep penalty (0.3x)
+            // Other temporal ranges use simpler hour-based windows.
+            enum TemporalRange {
+                LastWeek,
+                Window { hours: f64 },
+            }
+            let temporal_range = if ql.contains("last week") {
+                Some(TemporalRange::LastWeek)
+            } else if ql.contains("last month") {
+                Some(TemporalRange::Window { hours: 35.0 * 24.0 })
+            } else if ql.contains("yesterday") {
+                Some(TemporalRange::Window { hours: 48.0 })
+            } else if ql.contains("today") {
+                Some(TemporalRange::Window { hours: 24.0 })
+            } else if ql.contains("recently") || ql.contains("recent ") {
+                Some(TemporalRange::Window { hours: 14.0 * 24.0 })
+            } else {
+                None
+            };
+
+            if let Some(range) = temporal_range {
+                let now = chrono::Utc::now();
+                let mut demoted = 0;
+
+                match range {
+                    TemporalRange::LastWeek => {
+                        // Calendar-aware: "last week" means the 7-day period
+                        // ending last Sunday. Memories from "this week" (0-7 days)
+                        // get moderate penalty, memories older than 14 days get steep penalty.
+                        let in_sweet_spot = memories
+                            .iter()
+                            .filter(|m| {
+                                let days = (now - m.created_at).num_days();
+                                days >= 7 && days <= 14
+                            })
+                            .count();
+
+                        if in_sweet_spot >= 2 {
+                            for mem in memories.iter_mut() {
+                                let days = (now - mem.created_at).num_days();
+                                let demotion = if days < 7 {
+                                    0.80 // "this week" — moderate penalty
+                                } else if days <= 14 {
+                                    1.0 // "last week" sweet spot — no penalty
+                                } else if days <= 21 {
+                                    0.40 // week before last — steep penalty
+                                } else {
+                                    0.30 // older — very steep
+                                };
+                                if demotion < 1.0 {
+                                    let base = mem.score.unwrap_or(0.0);
+                                    let mut cloned: Memory = mem.as_ref().clone();
+                                    cloned.set_score(base * demotion);
+                                    *mem = Arc::new(cloned);
+                                    demoted += 1;
+                                }
+                            }
+                        }
+                    }
+                    TemporalRange::Window { hours: window_hours } => {
+                        let in_window = memories
+                            .iter()
+                            .filter(|m| {
+                                (now - m.created_at).num_hours() as f64 <= window_hours
+                            })
+                            .count();
+
+                        if in_window >= 3 {
+                            for mem in memories.iter_mut() {
+                                let age_hours = (now - mem.created_at).num_hours() as f64;
+                                if age_hours > window_hours {
+                                    let overshoot = age_hours / window_hours;
+                                    let demotion = (1.0 / overshoot as f32).clamp(0.3, 0.5);
+                                    let base = mem.score.unwrap_or(0.0);
+                                    let mut cloned: Memory = mem.as_ref().clone();
+                                    cloned.set_score(base * demotion);
+                                    *mem = Arc::new(cloned);
+                                    demoted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if demoted > 0 {
+                    memories.sort_by(|a, b| {
+                        b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
+                    });
+                    tracing::info!(
+                        demoted,
+                        "recall [layer:5.87] temporal range demotion"
+                    );
+                }
+            }
+        }
+
+        // =====================================================================
         // LAYER 5.9: ORDINAL RESOLUTION + CATEGORY ERROR DETECTION
         // =====================================================================
         // Post-retrieval filter for ordinal queries ("first", "last", "most recent")
@@ -2812,42 +2924,69 @@ impl super::MemorySystem {
                 memories.insert(0, earliest);
                 tracing::debug!("Layer 5.9: Ordinal 'first' — pinned earliest memory at rank 1");
             } else if wants_last && !memories.is_empty() {
-                // Strategy D: Content-gated recency pin.
-                // Find the most recent memory that is ALSO content-relevant (above
-                // median score). This prevents pinning a recent-but-off-topic memory
-                // when the query asks for "most recent X" — we want the most recent
-                // memory about X, not just the most recent memory.
-                let score_sorted: Vec<f32> = {
-                    let mut s: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
-                    s.sort_by(|a, b| b.total_cmp(a));
-                    s
-                };
-                let p50 = score_sorted[score_sorted.len() / 2];
+                // Strategy E: Focal-entity recency scan with tag fallback.
+                //
+                // For "most recent X" queries, scan candidates by recency and check
+                // BOTH content AND tags for focal entity stems. This catches memories
+                // like memory 46 where "architecture-change" is in tags but not in content.
+                // Prefer action types (Decision, Error, Task) over observations.
+                let focal_stems: Vec<String> = query_analysis
+                    .focal_entities
+                    .iter()
+                    .map(|e| e.stem.clone())
+                    .collect();
 
-                // Find the most recent RELEVANT memory (score >= p50)
                 let mut by_time = memories.clone();
                 by_time.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                let latest_relevant = by_time.iter()
-                    .find(|m| m.score.unwrap_or(0.0) >= p50);
 
-                if let Some(latest) = latest_relevant {
-                    // Pin the most recent relevant memory at rank 1
-                    let latest_id = latest.id.clone();
-                    if let Some(pos) = memories.iter().position(|m| m.id == latest_id) {
+                // Scan by recency: find the first memory whose content OR tags
+                // contain a focal entity stem
+                let latest_focal = if !focal_stems.is_empty() {
+                    by_time.iter().find(|m| {
+                        let content_lower = m.experience.content.to_lowercase();
+                        let tags_lower: String = m.experience.tags.join(" ").to_lowercase();
+                        focal_stems.iter().any(|stem| {
+                            content_lower.contains(stem) || tags_lower.contains(stem)
+                        })
+                    })
+                } else {
+                    None
+                };
+
+                if let Some(found) = latest_focal {
+                    let found_id = found.id.clone();
+                    if let Some(pos) = memories.iter().position(|m| m.id == found_id) {
                         let pinned = memories.remove(pos);
                         memories.insert(0, pinned);
                     }
-                    tracing::debug!("Layer 5.9: Gated pin — latest relevant memory pinned");
+                    tracing::debug!(
+                        "Layer 5.9: Focal-entity recency scan pinned memory (stems={:?})",
+                        focal_stems
+                    );
                 } else {
-                    // Latest is NOT relevant → apply graduated recency boost to
-                    // top-3 most recent among the relevant set (above p50).
-                    // This lifts recent+relevant memories without polluting rank 1.
+                    // Fallback: p50-gated pin (original strategy)
+                    let score_sorted: Vec<f32> = {
+                        let mut s: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
+                        s.sort_by(|a, b| b.total_cmp(a));
+                        s
+                    };
+                    let p50 = score_sorted[score_sorted.len() / 2];
+                    let latest_relevant = by_time.iter()
+                        .find(|m| m.score.unwrap_or(0.0) >= p50);
+                    if let Some(latest) = latest_relevant {
+                        let latest_id = latest.id.clone();
+                        if let Some(pos) = memories.iter().position(|m| m.id == latest_id) {
+                            let pinned = memories.remove(pos);
+                            memories.insert(0, pinned);
+                        }
+                    }
+                    // Graduated boost for top-3 recent relevant
                     let relevant_recent: Vec<MemoryId> = by_time.iter()
                         .filter(|m| m.score.unwrap_or(0.0) >= p50)
                         .take(3)
                         .map(|m| m.id.clone())
                         .collect();
-                    let boosts = [0.08_f32, 0.05, 0.03]; // Graduated: most recent gets most
+                    let boosts = [0.08_f32, 0.05, 0.03];
                     for (mid, &boost) in relevant_recent.iter().zip(boosts.iter()) {
                         if let Some(mem) = memories.iter_mut().find(|m| m.id == *mid) {
                             let base = mem.score.unwrap_or(0.0);
