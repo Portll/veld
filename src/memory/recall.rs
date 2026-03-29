@@ -2290,6 +2290,25 @@ impl super::MemorySystem {
                 // are more structurally connected (proxy for graph salience)
                 let entity_density = (mem.entity_refs.len() as f32 / 5.0).min(1.0) * 0.02;
 
+                // Signal 20 (FIX-R2): Elaboration quality — well-contextualized C-rep
+                // memories are more reliable than bare S-rep fragments.
+                // Reference: Ehlers & Clark (2000) — elaborated memories produce
+                // functional recalls, unelaborated ones produce pathological intrusions.
+                let elaboration_boost = mem.elaboration_score() * 0.03;
+
+                // Signal 21 (FIX-R1): Access burstiness — bursty access patterns
+                // indicate working memory (currently active topic). Steady patterns
+                // indicate long-term storage. Bursty memories get a small recency-
+                // independent boost because they're likely contextually relevant.
+                // Reference: Berntsen (2021) — involuntary memories favor recent,
+                // actively-processed content.
+                let burstiness = mem.access_burstiness();
+                let burstiness_boost = if burstiness > 1.5 {
+                    0.02 // bursty = working memory, small boost
+                } else {
+                    0.0
+                };
+
                 // BRIDGE-3: Calibrated confidence gate (Bayesian alpha/beta)
                 let confidence_gate = {
                     let obs = mem.confidence_observations();
@@ -2316,7 +2335,9 @@ impl super::MemorySystem {
                     + richness_boost
                     + activation_boost
                     + temporal_density
-                    + entity_density)
+                    + entity_density
+                    + elaboration_boost
+                    + burstiness_boost)
                     * feedback_multiplier
                     * confidence_gate
                     * pinky_multiplier;

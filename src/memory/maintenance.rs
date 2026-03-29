@@ -200,40 +200,64 @@ impl super::MemorySystem {
     fn graph_adjusted_threshold(&self, memory: &Memory, base_threshold: f32) -> f32 {
         use crate::constants::*;
 
-        let graph = match &self.graph_memory {
-            Some(g) => g,
-            None => return base_threshold,
-        };
+        let mut threshold = base_threshold;
 
-        if memory.entity_refs.is_empty() {
-            return base_threshold;
-        }
+        // 1. Graph health adjustment (existing)
+        if let Some(graph) = &self.graph_memory {
+            if !memory.entity_refs.is_empty() {
+                let graph_guard = graph.read();
+                let mut l2_plus_count = 0usize;
 
-        let graph_guard = graph.read();
-        let mut l2_plus_count = 0usize;
-
-        for entity_ref in &memory.entity_refs {
-            if let Ok(edges) = graph_guard.get_entity_relationships(&entity_ref.entity_id) {
-                for edge in &edges {
-                    if matches!(
-                        edge.tier,
-                        crate::graph_memory::EdgeTier::L2Episodic
-                            | crate::graph_memory::EdgeTier::L3Semantic
-                    ) {
-                        l2_plus_count += 1;
+                for entity_ref in &memory.entity_refs {
+                    if let Ok(edges) =
+                        graph_guard.get_entity_relationships(&entity_ref.entity_id)
+                    {
+                        for edge in &edges {
+                            if matches!(
+                                edge.tier,
+                                crate::graph_memory::EdgeTier::L2Episodic
+                                    | crate::graph_memory::EdgeTier::L3Semantic
+                            ) {
+                                l2_plus_count += 1;
+                            }
+                        }
                     }
+                }
+
+                if l2_plus_count == 0 {
+                    // Memory has entities but no strong edges — penalize
+                    threshold *= 1.0 + GRAPH_HEALTH_NO_EDGES_PENALTY as f32;
+                } else {
+                    // Discount proportional to edge count, capped at saturation
+                    let ratio =
+                        (l2_plus_count as f64 / GRAPH_HEALTH_EDGE_SATURATION).min(1.0);
+                    threshold *= 1.0 - (GRAPH_HEALTH_PROMOTION_DISCOUNT * ratio) as f32;
                 }
             }
         }
 
-        if l2_plus_count == 0 {
-            // Memory has entities but no strong edges — penalize
-            base_threshold * (1.0 + GRAPH_HEALTH_NO_EDGES_PENALTY as f32)
-        } else {
-            // Discount proportional to edge count, capped at saturation
-            let ratio = (l2_plus_count as f64 / GRAPH_HEALTH_EDGE_SATURATION).min(1.0);
-            base_threshold * (1.0 - (GRAPH_HEALTH_PROMOTION_DISCOUNT * ratio) as f32)
+        // 2. Feedback momentum adjustment (P2b — Berntsen functional constraints)
+        // Memories with consistently positive feedback should promote faster
+        // (lower threshold). Memories with negative momentum resist promotion
+        // (higher threshold). This prevents "undead" memories — memories that
+        // achieve high importance through access frequency alone but are
+        // consistently unhelpful in retrieval.
+        //
+        // Adjustment range: ±15% of threshold
+        // Positive momentum (proven helpful): threshold reduced by up to 15%
+        // Negative momentum (frequently ignored): threshold increased by up to 15%
+        if let Some(ref fb_store) = self.feedback_store {
+            if let Some(fm) = fb_store.read().get_momentum(&memory.id) {
+                let momentum = fm.ema_with_decay();
+                // Clamp to ±1.0, then scale to ±15% adjustment
+                let adjustment = momentum.clamp(-1.0, 1.0) * 0.15;
+                // Negative momentum → positive adjustment (higher threshold)
+                // Positive momentum → negative adjustment (lower threshold)
+                threshold *= 1.0 - adjustment;
+            }
         }
+
+        threshold
     }
 
     /// Apply importance boosts to memories whose edges were promoted (Direction 1).
