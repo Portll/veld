@@ -1098,8 +1098,21 @@ pub async fn get_memory_health(
     let created_at = mem.created_at.to_rfc3339();
     let last_accessed = Some(mem.last_accessed().to_rfc3339());
 
-    // Calculate health status
-    let health_status = if importance >= 0.5 {
+    // FIX-02 wiring: Look up feedback momentum from FeedbackStore
+    let memory_id_typed = crate::memory::types::MemoryId(
+        uuid::Uuid::parse_str(&memory_id_str)
+            .map_err(|_| AppError::InvalidMemoryId(memory_id_str.clone()))?,
+    );
+    let (feedback_momentum, feedback_signal_count) = {
+        let store = state.feedback_store.read();
+        match store.get_momentum(&memory_id_typed) {
+            Some(momentum) => (Some(momentum.ema), Some(momentum.signal_count)),
+            None => (None, None),
+        }
+    };
+
+    // Calculate health status (incorporate feedback momentum)
+    let health_status = if importance >= 0.5 && feedback_momentum.unwrap_or(0.0) >= -0.2 {
         "healthy"
     } else if importance >= 0.2 {
         "at_risk"
@@ -1110,8 +1123,6 @@ pub async fn get_memory_health(
 
     // Estimate days to decay below retrieval threshold (importance 0.05)
     let estimated_days = if importance > 0.05 {
-        // Rough estimate using power-law decay: importance * t^(-0.5) = 0.05
-        // t = (importance / 0.05)^(1/0.5) days
         let ratio = importance / 0.05;
         Some(ratio.powf(2.0))
     } else {
@@ -1125,8 +1136,8 @@ pub async fn get_memory_health(
         access_count,
         created_at,
         last_accessed,
-        feedback_momentum: None, // TODO: wire up FeedbackStore lookup
-        feedback_signal_count: None,
+        feedback_momentum,
+        feedback_signal_count,
         edge_count: mem.entity_refs.len(),
         health_status,
         estimated_days_to_decay: estimated_days,

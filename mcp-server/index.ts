@@ -687,6 +687,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Parent memory ID for hierarchical organization. Creates memory trees (e.g., '71-research' -> 'algebraic' -> '21×27≡-1')",
             },
+            intent_tags: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Semantic intent tags that boost importance: 'architectural-decision', 'security-fix', 'performance-optimization', 'bug-fix', 'design-tradeoff'. Stored as 'intent:' prefixed entity tags.",
+            },
           },
           required: ["content"],
         },
@@ -1591,6 +1597,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           preceding_memory_id,
           // Hierarchy
           parent_id,
+          // FIX-10: Semantic intent tags
+          intent_tags = [],
         } = args as {
           content: string;
           type?: string;
@@ -1605,6 +1613,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sequence_number?: number;
           preceding_memory_id?: string;
           parent_id?: string;
+          intent_tags?: string[];
         };
 
         if (!content || content.length === 0) {
@@ -1647,6 +1656,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ...(preceding_memory_id && { preceding_memory_id }),
           // Hierarchy
           ...(parent_id && { parent_id }),
+          // FIX-10: Semantic intent tags
+          ...(intent_tags.length > 0 && { intent_tags }),
         });
 
         // Format response with branded display
