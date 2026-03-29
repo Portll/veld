@@ -1138,6 +1138,79 @@ impl super::MemorySystem {
         );
 
         // ===========================================================================
+        // LAYER 3.1: MULTI-QUERY EMBEDDING FUSION
+        // ===========================================================================
+        // When decomposition produced sub-queries, the single verbatim embedding
+        // dilutes compound topics (e.g., "database change AND timeline impact" embeds
+        // halfway between both, matching neither well). Fuse sub-query embeddings by
+        // averaging to give equal weight to each sub-topic. The fused embedding
+        // propagates to Layer 3.5 (brute-force cosine scan) and the vector component
+        // of Layer 4 (hybrid search). The decomposed RRF path (Layer 3) already used
+        // individual sub-query embeddings, so this is complementary.
+        let query_embedding = if decomposed && sub_queries.len() > 1 {
+            // Embed each sub-query (skip idx=0 which is the original compound query —
+            // including it would re-introduce the dilution we're trying to fix)
+            let mut sub_embeddings: Vec<Vec<f32>> = Vec::with_capacity(sub_queries.len() - 1);
+            for sub_q in sub_queries.iter().skip(1) {
+                let sub_hash = Self::sha256_hash(sub_q);
+                let emb = if let Some(cached) = self.query_cache.get(&sub_hash) {
+                    cached.clone()
+                } else {
+                    match self.embedder.as_ref().encode(sub_q) {
+                        Ok(e) => {
+                            self.query_cache.insert(sub_hash, e.clone());
+                            e
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Layer 3.1: Failed to embed sub-query '{}': {}",
+                                sub_q,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                };
+                sub_embeddings.push(emb);
+            }
+
+            if sub_embeddings.is_empty() {
+                // All sub-query embeddings failed — keep original
+                query_embedding
+            } else {
+                let dim = sub_embeddings[0].len();
+                let n = sub_embeddings.len() as f32;
+                let mut fused = vec![0.0f32; dim];
+                for emb in &sub_embeddings {
+                    for (i, &v) in emb.iter().enumerate() {
+                        fused[i] += v;
+                    }
+                }
+                // Element-wise average
+                for v in &mut fused {
+                    *v /= n;
+                }
+                // L2-normalize: MiniLM embeddings are unit-normalized, averaging
+                // de-normalizes them. Without re-normalization cosine similarities
+                // are distorted.
+                let norm: f32 = fused.iter().map(|v| v * v).sum::<f32>().sqrt();
+                if norm > 1e-8 {
+                    for v in &mut fused {
+                        *v /= norm;
+                    }
+                }
+                tracing::info!(
+                    sub_query_count = sub_embeddings.len(),
+                    "recall [layer:3.1] Multi-query embedding fusion (averaged {} sub-query embeddings)",
+                    sub_embeddings.len()
+                );
+                fused
+            }
+        } else {
+            query_embedding
+        };
+
+        // ===========================================================================
         // LAYER 3.5: WORKING + SESSION TIER BRUTE-FORCE COSINE SCAN
         // ===========================================================================
         // Vamana indexes only long-term storage. Working-tier and Session-tier
@@ -1256,10 +1329,21 @@ impl super::MemorySystem {
             let mut attr: std::collections::HashMap<MemoryId, SignalAttribution> =
                 std::collections::HashMap::new();
 
+            // ---------------------------------------------------------------
+            // BM25 CONCEPT EXPANSION: Expand abstract/meta-reasoning query
+            // terms with concrete synonyms so BM25 can match memories that
+            // describe specific instances of abstract concepts.
+            // e.g., "patterns" → also search "decisions choices recurring"
+            // Expansion terms use low boost (^0.3) to act as tiebreakers.
+            // ---------------------------------------------------------------
+            let bm25_query_text =
+                query_parser::expand_abstract_terms_for_bm25(query_text);
+            let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
+
             let hybrid_ids = self
                 .hybrid_search
                 .search_with_dynamic_weights(
-                    query_text,
+                    bm25_query_ref,
                     vector_results.clone(),
                     get_content,
                     term_weights,
