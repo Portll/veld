@@ -2727,16 +2727,13 @@ impl super::MemorySystem {
                     s.sort_by(|a, b| b.total_cmp(a));
                     s
                 };
-                // Use p75 (top quartile) as relevance gate — stricter than p50
-                // to avoid pinning peripherally-relevant recent memories
-                let p75_idx = score_sorted.len() / 4;
-                let p75 = score_sorted[p75_idx.min(score_sorted.len() - 1)];
+                let p50 = score_sorted[score_sorted.len() / 2];
 
-                // Find the most recent RELEVANT memory (score >= p75)
+                // Find the most recent RELEVANT memory (score >= p50)
                 let mut by_time = memories.clone();
                 by_time.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 let latest_relevant = by_time.iter()
-                    .find(|m| m.score.unwrap_or(0.0) >= p75);
+                    .find(|m| m.score.unwrap_or(0.0) >= p50);
 
                 if let Some(latest) = latest_relevant {
                     // Pin the most recent relevant memory at rank 1
