@@ -1040,7 +1040,99 @@ fn resolve_memory(
         .ok_or_else(|| AppError::MemoryNotFound(memory_id_str.to_string()))
 }
 
-/// Parse experience type from string
+// =============================================================================
+// MEMORY HEALTH ENDPOINT (FIX-02)
+// =============================================================================
+
+/// Memory health response — exposes internal state Claude can't normally see
+#[derive(Debug, Serialize)]
+pub struct MemoryHealthResponse {
+    pub memory_id: String,
+    pub importance: f32,
+    pub tier: String,
+    pub access_count: u32,
+    pub created_at: String,
+    pub last_accessed: Option<String>,
+    /// Feedback momentum EMA (-1.0 to +1.0)
+    pub feedback_momentum: Option<f32>,
+    /// Number of feedback signals received
+    pub feedback_signal_count: Option<u32>,
+    /// Edge count from this memory's entities
+    pub edge_count: usize,
+    /// Health classification: "healthy", "at_risk", "degraded"
+    pub health_status: String,
+    /// Estimated days until memory falls below retrieval threshold
+    pub estimated_days_to_decay: Option<f32>,
+}
+
+/// GET /api/memory/{memory_id}/health — Expose memory health metrics
+///
+/// Returns importance, tier, feedback momentum, edge count, and decay estimate.
+/// FIX-02: Breaks the one-way teaching relationship by giving Claude visibility
+/// into which memories are fragile, consolidated, or degraded.
+pub async fn get_memory_health(
+    State(state): State<AppState>,
+    Path(memory_id_str): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<MemoryHealthResponse>, AppError> {
+    let user_id = params
+        .get("user_id")
+        .ok_or_else(|| AppError::InvalidInput {
+            field: "user_id".to_string(),
+            reason: "user_id query parameter required".to_string(),
+        })?;
+    validation::validate_user_id(user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(user_id)
+        .map_err(AppError::Internal)?;
+
+    let mem = {
+        let guard = memory.read();
+        resolve_memory(&guard, &memory_id_str)?
+    };
+
+    let importance = mem.importance();
+    let tier = format!("{:?}", mem.tier);
+    let access_count = mem.access_count();
+    let created_at = mem.created_at.to_rfc3339();
+    let last_accessed = Some(mem.last_accessed().to_rfc3339());
+
+    // Calculate health status
+    let health_status = if importance >= 0.5 {
+        "healthy"
+    } else if importance >= 0.2 {
+        "at_risk"
+    } else {
+        "degraded"
+    }
+    .to_string();
+
+    // Estimate days to decay below retrieval threshold (importance 0.05)
+    let estimated_days = if importance > 0.05 {
+        // Rough estimate using power-law decay: importance * t^(-0.5) = 0.05
+        // t = (importance / 0.05)^(1/0.5) days
+        let ratio = importance / 0.05;
+        Some(ratio.powf(2.0))
+    } else {
+        None
+    };
+
+    Ok(Json(MemoryHealthResponse {
+        memory_id: memory_id_str,
+        importance,
+        tier,
+        access_count,
+        created_at,
+        last_accessed,
+        feedback_momentum: None, // TODO: wire up FeedbackStore lookup
+        feedback_signal_count: None,
+        edge_count: mem.entity_refs.len(),
+        health_status,
+        estimated_days_to_decay: estimated_days,
+    }))
+}
+
 // =============================================================================
 // ANCHOR ENDPOINT
 // =============================================================================

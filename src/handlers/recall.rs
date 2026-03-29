@@ -133,6 +133,27 @@ pub struct ProactiveContextRequest {
     /// Robotics: constructed from action-outcome Experience fields.
     #[serde(default)]
     pub tool_actions: Vec<crate::memory::feedback::ToolAction>,
+    /// RRF k parameter for reciprocal rank fusion (default: 20.0)
+    /// Higher k = more equal weighting; lower k = sharper top-rank discrimination
+    #[serde(default)]
+    pub rrf_k: Option<f32>,
+    /// IDs of memories surfaced in the previous proactive_context call.
+    /// Used for explicit feedback: which surfaced memories were actually relevant.
+    #[serde(default)]
+    pub surfaced_memory_ids: Vec<String>,
+    /// Episode ID for auto-ingested memories (FIX-05: quality parity)
+    /// When set, auto-ingested memories inherit this episode context
+    #[serde(default)]
+    pub episode_id: Option<String>,
+    /// Sequence number for auto-ingested memories (FIX-05)
+    #[serde(default)]
+    pub sequence_number: Option<u32>,
+    /// Emotional valence for auto-ingested memories (FIX-05)
+    #[serde(default)]
+    pub emotional_valence: Option<f32>,
+    /// Emotional arousal for auto-ingested memories (FIX-05)
+    #[serde(default)]
+    pub emotional_arousal: Option<f32>,
 }
 
 fn default_proactive_max_results() -> usize {
@@ -332,6 +353,7 @@ pub async fn recall(
     let limit = req.limit;
     let mode = req.mode.clone();
     let retrieval_mode_for_recall = parse_retrieval_mode(&mode);
+    let rrf_k_for_recall = req.rrf_k.map(|k| k.clamp(1.0, 200.0));
 
     // PROSPECTIVE MEMORY + RECALL: Run inside a single spawn_blocking to share
     // the computed query embedding between prospective semantic matching and recall.
@@ -415,6 +437,7 @@ pub async fn recall(
                 max_results: limit,
                 retrieval_mode: retrieval_mode_for_recall,
                 prospective_signals: prospective_signals.clone(),
+                rrf_k: rrf_k_for_recall,
                 ..Default::default()
             };
 
@@ -1346,6 +1369,7 @@ pub async fn proactive_context(
     let entity_match_weight = req.entity_match_weight;
     let recency_weight = req.recency_weight;
     let semantic_threshold = req.semantic_threshold;
+    let rrf_k_for_context = req.rrf_k.map(|k| k.clamp(1.0, 200.0));
     let embedding_for_query = context_embedding.clone();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
@@ -1372,6 +1396,7 @@ pub async fn proactive_context(
                 },
                 max_results,
                 recency_weight: Some(recency_weight),
+                rrf_k: rrf_k_for_context,
                 prospective_signals,
                 ..Default::default()
             };
@@ -1683,6 +1708,11 @@ pub async fn proactive_context(
     let ingested_memory_id = if should_ingest {
         let context = clean_context;
         let memory = memory_system.clone();
+        // FIX-05: Capture episode/emotional context for auto-ingested memories
+        let ingest_episode_id = req.episode_id.clone();
+        let ingest_seq = req.sequence_number;
+        let ingest_valence = req.emotional_valence;
+        let ingest_arousal = req.emotional_arousal;
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -1691,11 +1721,23 @@ pub async fn proactive_context(
                 let segments = segmenter.segment(&context, InputSource::AutoIngest);
                 let mut first_id = None;
                 for segment in segments {
+                    // FIX-05: Build rich context with episode + emotional data if provided
+                    let context = super::remember::build_rich_context(
+                        ingest_valence,
+                        ingest_arousal,
+                        None, // emotion label
+                        None, // source_type
+                        None, // credibility
+                        ingest_episode_id.clone(),
+                        ingest_seq,
+                        None, // preceding_memory_id
+                    );
                     let experience = Experience {
                         content: segment.content,
                         experience_type: segment.experience_type,
                         entities: segment.entities,
                         tags: vec!["auto-captured".to_string()],
+                        context,
                         ..Default::default()
                     };
                     if let Ok(id) = memory_guard.remember(experience, None) {

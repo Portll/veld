@@ -446,6 +446,13 @@ pub struct RelationshipEdge {
     /// Based on synaptic tagging: behaviorally relevant synapses consolidate faster.
     #[serde(default)]
     pub entity_confidence: Option<f32>,
+
+    /// Creation source for this edge (FIX-06: dream replay tagging)
+    /// Tracks whether this edge was created from direct co-occurrence,
+    /// dream replay, Hebbian coactivation, or explicit user input.
+    /// Enables retrieval to distinguish speculative from empirical associations.
+    #[serde(default)]
+    pub created_by: EdgeSource,
 }
 
 fn default_last_activated() -> DateTime<Utc> {
@@ -970,6 +977,25 @@ impl RelationshipEdge {
 
         npmi_score * 0.4 + strength_score * 0.4 + tag_bonus
     }
+}
+
+/// Creation source for relationship edges (FIX-06: dream replay tagging)
+///
+/// Tracks how an edge was created so retrieval can distinguish empirically
+/// observed associations from speculative/replay-discovered connections.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EdgeSource {
+    /// Created from entity co-occurrence in user-stored memories
+    #[default]
+    CoOccurrence,
+    /// Created by waking dream replay (maintenance consolidation)
+    DreamReplay,
+    /// Created by sleep-phase replay (deep consolidation)
+    SleepReplay,
+    /// Created by Hebbian coactivation during retrieval
+    Coactivation,
+    /// Created from MIF import or explicit user input
+    Explicit,
 }
 
 /// Relationship types for ontological edge classification.
@@ -3834,6 +3860,7 @@ impl GraphMemory {
                         tier: EdgeTier::L1Working,
                         // PIPE-5: Memory-to-memory edges use default confidence
                         entity_confidence: None,
+                        created_by: EdgeSource::CoOccurrence,
                     };
 
                     let key = edge.uuid.as_bytes();
@@ -4016,6 +4043,7 @@ impl GraphMemory {
                     tier: EdgeTier::L2Episodic,
                     // PIPE-5: Replay edges use default confidence
                     entity_confidence: None,
+                    created_by: EdgeSource::Coactivation,
                 };
 
                 let key = edge.uuid.as_bytes();

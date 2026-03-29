@@ -9,7 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
+    EdgeSource, EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType,
+    RelationshipEdge,
 };
 use crate::memory::types::{
     Experience, ExperienceType, MemoryId, ProspectiveTask, ProspectiveTaskId,
@@ -335,6 +336,7 @@ pub fn import_graph_relationships(
             tier,
             activation_timestamps: None,
             entity_confidence: rel.confidence,
+            created_by: EdgeSource::Explicit,
         };
 
         match graph.add_relationship(edge) {
