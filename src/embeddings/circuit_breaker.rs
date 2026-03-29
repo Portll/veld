@@ -270,34 +270,45 @@ impl ResilientEmbedder {
     }
 }
 
-impl Embedder for ResilientEmbedder {
-    fn encode(&self, text: &str) -> Result<Vec<f32>> {
+impl ResilientEmbedder {
+    /// Encode text and report whether the result is a degraded fallback embedding.
+    /// Returns (embedding, is_degraded). Degraded embeddings are hash-based and have
+    /// no semantic quality — memories using them should be re-embedded when the model recovers.
+    pub fn encode_with_status(&self, text: &str) -> Result<(Vec<f32>, bool)> {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
 
         if text.is_empty() {
-            return Ok(vec![0.0; self.inner.dimension()]);
+            return Ok((vec![0.0; self.inner.dimension()], false));
         }
 
-        // Check circuit state
         if !self.should_allow_request() {
             self.total_rejections.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("Circuit breaker open, using fallback embedding");
-            return Ok(self.generate_fallback(text));
+            return Ok((self.generate_fallback(text), true));
         }
 
-        // Try the actual embedding
         match self.inner.encode(text) {
             Ok(embedding) => {
                 self.record_success();
-                Ok(embedding)
+                Ok((embedding, false))
             }
             Err(e) => {
                 self.record_failure();
                 tracing::warn!("Embedding failed (circuit breaker tracking): {}", e);
-                // Return fallback instead of error to maintain availability
-                Ok(self.generate_fallback(text))
+                Ok((self.generate_fallback(text), true))
             }
         }
+    }
+
+    /// Check if the circuit breaker is currently healthy (closed state).
+    pub fn is_healthy(&self) -> bool {
+        matches!(self.state.lock().state, CircuitState::Closed)
+    }
+}
+
+impl Embedder for ResilientEmbedder {
+    fn encode(&self, text: &str) -> Result<Vec<f32>> {
+        self.encode_with_status(text).map(|(embedding, _)| embedding)
     }
 
     fn dimension(&self) -> usize {

@@ -1007,6 +1007,10 @@ pub struct MemoryStorage {
     storage_path: PathBuf,
     /// Write mode (sync vs async) - affects latency vs durability tradeoff
     write_mode: WriteMode,
+    /// Optional field-level encryptor for memory content (AES-256-GCM).
+    /// When present, Experience.content is encrypted before storage and decrypted on read.
+    /// Sourced from SHODH_ENCRYPTION_KEY env var; None means plaintext (backward compatible).
+    encryptor: Option<crate::encryption::FieldEncryptor>,
 }
 
 impl MemoryStorage {
@@ -1105,11 +1109,84 @@ impl MemoryStorage {
             }
         );
 
+        // Initialize field-level encryption from env var (None = plaintext, backward compatible)
+        let encryptor = crate::encryption::FieldEncryptor::from_env()
+            .context("Failed to initialize field-level encryption")?;
+
         Ok(Self {
             db,
             storage_path: path.to_path_buf(),
             write_mode,
+            encryptor,
         })
+    }
+
+    // ========================================================================
+    // FIELD-LEVEL ENCRYPTION HELPERS
+    // Centralized encrypt-before-serialize / decrypt-after-deserialize logic.
+    // All serialization and deserialization of Memory structs should use these
+    // helpers instead of calling bincode directly.
+    // ========================================================================
+
+    /// Serialize a memory to bytes, encrypting the content field if an encryptor is configured.
+    ///
+    /// When encryption is enabled, clones the memory, replaces `experience.content` with its
+    /// encrypted form (stored as lossy UTF-8 of the encrypted bytes — using a dedicated sentinel
+    /// prefix so we know to decrypt on read), then serializes normally.
+    fn serialize_memory(&self, memory: &Memory) -> Result<Vec<u8>> {
+        match &self.encryptor {
+            Some(enc) => {
+                let encrypted_bytes = enc
+                    .encrypt_content(&memory.experience.content)
+                    .context("Failed to encrypt memory content")?;
+                // Store encrypted bytes as base64 in the content field so it survives
+                // bincode string serialization without data loss (raw bytes aren't valid UTF-8).
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes);
+                let mut encrypted_memory = memory.clone();
+                encrypted_memory.experience.content = encoded;
+                bincode::serde::encode_to_vec(&encrypted_memory, bincode::config::standard())
+                    .context("Failed to serialize encrypted memory")
+            }
+            None => bincode::serde::encode_to_vec(memory, bincode::config::standard())
+                .context("Failed to serialize memory"),
+        }
+    }
+
+    /// Decrypt the content field of a memory in-place if it was encrypted.
+    ///
+    /// Checks whether the content looks like base64-encoded encrypted data (by decoding
+    /// and checking for the ENC\0 marker). If not encrypted, leaves content unchanged
+    /// (backward compatible with plaintext data written before encryption was enabled).
+    fn decrypt_memory_content(&self, memory: &mut Memory) {
+        let enc = match &self.encryptor {
+            Some(enc) => enc,
+            None => return,
+        };
+
+        // Try to decode the content as base64 and check for the encrypted marker
+        use base64::Engine;
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
+            Ok(bytes) => bytes,
+            Err(_) => return, // Not base64 — plaintext content, leave unchanged
+        };
+
+        if !crate::encryption::FieldEncryptor::is_encrypted(&decoded) {
+            return; // No encryption marker — plaintext content that happens to be valid base64
+        }
+
+        match enc.decrypt_content(&decoded) {
+            Ok(plaintext) => {
+                memory.experience.content = plaintext;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to decrypt content for memory {} (leaving encrypted): {}",
+                    memory.id.0,
+                    e
+                );
+            }
+        }
     }
 
     /// Open a RocksDB database with column families, automatically repairing if corruption is detected.
@@ -1278,8 +1355,9 @@ impl MemoryStorage {
     pub fn store(&self, memory: &Memory) -> Result<()> {
         let key = memory.id.0.as_bytes();
 
-        // Serialize memory
-        let value = bincode::serde::encode_to_vec(memory, bincode::config::standard())
+        // Serialize memory (encrypts content field if encryptor is configured)
+        let value = self
+            .serialize_memory(memory)
             .context(format!("Failed to serialize memory {}", memory.id.0))?;
 
         // Use write mode based on configuration
@@ -1485,13 +1563,16 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (memory, needs_migration) = deserialize_memory(&value).with_context(|| {
+                let (mut memory, needs_migration) = deserialize_memory(&value).with_context(|| {
                     format!(
                         "Failed to deserialize memory {} ({} bytes)",
                         id.0,
                         value.len()
                     )
                 })?;
+
+                // Decrypt content field if encrypted
+                self.decrypt_memory_content(&mut memory);
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
@@ -1510,7 +1591,8 @@ impl MemoryStorage {
     /// Re-write a memory in current format (lazy migration helper)
     fn migrate_memory_format(&self, memory: &Memory) -> Result<()> {
         let key = memory.id.0.as_bytes();
-        let value = bincode::serde::encode_to_vec(memory, bincode::config::standard())
+        let value = self
+            .serialize_memory(memory)
             .context("Failed to serialize for migration")?;
 
         let mut write_opts = WriteOptions::default();
@@ -2339,7 +2421,8 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                self.decrypt_memory_content(&mut memory);
                 if !memory.is_forgotten() {
                     memories.push(memory);
                 }
@@ -2359,7 +2442,8 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                self.decrypt_memory_content(&mut memory);
                 if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                     memories.push(memory);
                 }
@@ -2383,6 +2467,7 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                self.decrypt_memory_content(&mut memory);
                 if memory.is_forgotten() {
                     continue;
                 }
@@ -2397,8 +2482,7 @@ impl MemoryStorage {
                         .metadata
                         .insert("forgotten_at".to_string(), now.clone());
 
-                    let updated_value =
-                        bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
+                    let updated_value = self.serialize_memory(&memory)?;
                     batch.put(&key, updated_value);
                 }
             }
@@ -2427,6 +2511,7 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                self.decrypt_memory_content(&mut memory);
                 if memory.is_forgotten() {
                     continue;
                 }
@@ -2441,8 +2526,7 @@ impl MemoryStorage {
                         .metadata
                         .insert("forgotten_at".to_string(), now.clone());
 
-                    let updated_value =
-                        bincode::serde::encode_to_vec(&memory, bincode::config::standard())?;
+                    let updated_value = self.serialize_memory(&memory)?;
                     batch.put(&key, updated_value);
                 }
             }
@@ -2468,7 +2552,8 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((mut memory, _)) = deserialize_memory(&value) {
+                self.decrypt_memory_content(&mut memory);
                 if regex.is_match(&memory.experience.content) {
                     to_delete.push(memory.id);
                     count += 1;
@@ -2740,7 +2825,7 @@ impl MemoryStorage {
             write_opts.set_sync(self.write_mode == WriteMode::Sync);
 
             for (key, memory) in to_migrate {
-                match bincode::serde::encode_to_vec(&memory, bincode::config::standard()) {
+                match self.serialize_memory(&memory) {
                     Ok(serialized) => {
                         if let Err(e) = self.db.put_opt(&key, &serialized, &write_opts) {
                             tracing::warn!("Failed to migrate memory: {e}");
@@ -3086,9 +3171,10 @@ impl MemoryStorage {
     ) -> Result<()> {
         let mut batch = WriteBatch::default();
 
-        // 1. Serialize memory
+        // 1. Serialize memory (encrypts content field if encryptor is configured)
         let memory_key = memory.id.0.as_bytes();
-        let memory_value = bincode::serde::encode_to_vec(memory, bincode::config::standard())
+        let memory_value = self
+            .serialize_memory(memory)
             .context(format!("Failed to serialize memory {}", memory.id.0))?;
         batch.put(memory_key, &memory_value);
 

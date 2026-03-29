@@ -9,6 +9,8 @@ pub struct PiiPatterns {
     ssn: regex::Regex,
     api_key: regex::Regex,
     credit_card: regex::Regex,
+    iban: regex::Regex,
+    intl_phone: regex::Regex,
 }
 
 impl Default for PiiPatterns {
@@ -28,6 +30,10 @@ impl PiiPatterns {
             )
             .unwrap(),
             credit_card: regex::Regex::new(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b").unwrap(),
+            // IBAN: 2-letter country code + 2 check digits + up to 30 alphanumeric
+            iban: regex::Regex::new(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b").unwrap(),
+            // International phone: +country code then 7-14 digits with optional separators
+            intl_phone: regex::Regex::new(r"\+\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{1,4}[\s.-]?\d{1,9}").unwrap(),
         }
     }
 
@@ -41,8 +47,10 @@ impl PiiPatterns {
 
         let patterns: &[(&regex::Regex, &str, &str)] = &[
             (&self.email, "email", "[REDACTED:email]"),
-            (&self.phone, "phone", "[REDACTED:phone]"),
+            (&self.intl_phone, "phone", "[REDACTED:phone]"),   // international first (more specific)
+            (&self.phone, "phone", "[REDACTED:phone]"),         // then US format
             (&self.ssn, "ssn", "[REDACTED:ssn]"),
+            (&self.iban, "iban", "[REDACTED:iban]"),
             (&self.api_key, "api_key", "[REDACTED:api_key]"),
             (&self.credit_card, "credit_card", "[REDACTED:credit_card]"),
         ];
