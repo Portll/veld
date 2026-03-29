@@ -50,10 +50,31 @@
 //! - Anderson & Schooler (1991) "Reflections of the Environment in Memory"
 //! - Sornette (2003) "Why Stock Markets Crash" Ch.5 (discrete scale invariance)
 
+use std::sync::OnceLock;
+
 use crate::constants::{
     ANCHOR_IMPORTANCE_FLOOR, DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION,
     LOG_PERIODIC_BETA, LOG_PERIODIC_SCALES, POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
 };
+
+/// Runtime-configurable log-periodic scales.
+/// Initialized from `ServerConfig` at startup; falls back to `LOG_PERIODIC_SCALES` const.
+static RUNTIME_SCALES: OnceLock<Vec<f64>> = OnceLock::new();
+
+/// Initialize runtime log-periodic scales from config.
+/// Call once at startup. Subsequent calls are no-ops.
+pub fn init_runtime_scales(scales: &[f64]) {
+    let _ = RUNTIME_SCALES.set(scales.to_vec());
+}
+
+/// Get the active log-periodic scales (runtime override or compile-time default).
+#[inline]
+fn active_scales() -> &'static [f64] {
+    RUNTIME_SCALES
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or(&LOG_PERIODIC_SCALES)
+}
 
 /// Computes the log-periodic fractal correction factor.
 ///
@@ -157,7 +178,7 @@ pub fn hybrid_decay_factor(days_elapsed: f64, potentiated: bool) -> f32 {
             days_elapsed,
             DECAY_CROSSOVER_DAYS,
             LOG_PERIODIC_BETA,
-            &LOG_PERIODIC_SCALES,
+            active_scales(),
         );
 
         (value_at_crossover * power_law_factor * fractal_correction) as f32
@@ -204,7 +225,7 @@ pub fn hybrid_decay_factor_custom(
             days_elapsed,
             crossover_days,
             LOG_PERIODIC_BETA,
-            &LOG_PERIODIC_SCALES,
+            active_scales(),
         );
         (value_at_crossover * power_law_factor * fractal_correction) as f32
     }

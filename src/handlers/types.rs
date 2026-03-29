@@ -120,6 +120,10 @@ pub struct RememberRequest {
     /// Optional preceding memory ID (for temporal chains)
     #[serde(default)]
     pub preceding_memory_id: Option<String>,
+    /// Semantic intent tags from Claude (FIX-10)
+    /// Directly influences importance scoring: architectural-decision, security-fix, etc.
+    #[serde(default)]
+    pub intent_tags: Vec<String>,
 }
 
 /// Simplified remember response
@@ -143,6 +147,13 @@ pub struct RecallRequest {
     /// Retrieval mode: "semantic", "associative", or "hybrid" (default)
     #[serde(default = "default_recall_mode")]
     pub mode: String,
+    /// RRF k parameter for reciprocal rank fusion (default: 20.0)
+    /// Higher k = more equal weighting; lower k = sharper top-rank discrimination
+    #[serde(default)]
+    pub rrf_k: Option<f32>,
+    /// Number of top results to rerank with cross-encoder (FIX-11, default: 20)
+    #[serde(default)]
+    pub rerank_count: Option<usize>,
 }
 
 pub fn default_recall_limit() -> usize {

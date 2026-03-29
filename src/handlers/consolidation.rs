@@ -230,9 +230,7 @@ pub async fn consolidate_memories(
                     metrics::DREAM_REPLAY_PAIRS_EVALUATED.inc();
 
                     // Discovery band: interesting but not already-connected similarity
-                    if sim < DREAM_REPLAY_SIMILARITY_THRESHOLD
-                        || sim > DREAM_REPLAY_SIMILARITY_CEILING
-                    {
+                    if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING).contains(&sim) {
                         continue;
                     }
 
@@ -284,6 +282,7 @@ pub async fn consolidate_memories(
                         tier: Default::default(),
                         activation_timestamps: None,
                         entity_confidence: None,
+                        created_by: crate::graph_memory::EdgeSource::DreamReplay,
                     };
                     match graph.add_relationship(edge) {
                         Ok(_) => {
@@ -566,7 +565,7 @@ pub async fn sleep_phase_consolidation(
                     let (Some(emb_a), Some(emb_b)) = (&mem_a.experience.embeddings, &mem_b.experience.embeddings) else { continue };
 
                     let sim = cosine_similarity(emb_a, emb_b);
-                    if sim < DREAM_REPLAY_SIMILARITY_THRESHOLD || sim > DREAM_REPLAY_SIMILARITY_CEILING { continue; }
+                    if !(DREAM_REPLAY_SIMILARITY_THRESHOLD..=DREAM_REPLAY_SIMILARITY_CEILING).contains(&sim) { continue; }
 
                     let entities_a: Vec<uuid::Uuid> = mem_a.entity_refs.iter().map(|e| e.entity_id).collect();
                     let entities_b: Vec<uuid::Uuid> = mem_b.entity_refs.iter().map(|e| e.entity_id).collect();
@@ -601,6 +600,7 @@ pub async fn sleep_phase_consolidation(
                         tier: Default::default(),
                         activation_timestamps: None,
                         entity_confidence: None,
+                        created_by: crate::graph_memory::EdgeSource::SleepReplay,
                     };
                     if graph.add_relationship(edge).is_ok() { created += 1; }
                 }

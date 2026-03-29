@@ -17,6 +17,7 @@ use crate::memory::types::{
     Experience, ExperienceType, ForgetCriteria, GeoFilter, Memory, MemoryId,
 };
 use crate::memory::{MemoryConfig, MemorySystem, Query, RetrievalMode};
+use crate::validation;
 use chrono::{DateTime, Utc};
 
 // ============================================================================
@@ -397,6 +398,15 @@ impl PyMemorySystem {
         entities: Option<Vec<String>>,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
+        // Input validation — matches HTTP handler pipeline
+        validation::validate_content(&content, false)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        if let Some(ref ents) = entities {
+            validation::validate_entities(ents)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+
         let exp_type = match memory_type.to_lowercase().as_str() {
             "observation" | "context" => ExperienceType::Context,
             "task" => ExperienceType::Task,
@@ -1267,6 +1277,9 @@ impl PyMemorySystem {
     ///
     /// Matches REST /api/forget/importance endpoint.
     fn forget_by_importance(&self, threshold: f32) -> PyResult<usize> {
+        validation::validate_importance_threshold(threshold)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
         self.inner
             .forget(ForgetCriteria::LowImportance(threshold))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by importance: {}", e)))
@@ -1276,6 +1289,10 @@ impl PyMemorySystem {
     ///
     /// Matches REST /api/forget/pattern endpoint.
     fn forget_by_pattern(&self, pattern: &str) -> PyResult<usize> {
+        // Validate pattern length and regex syntax before passing to inner
+        validation::validate_and_compile_pattern(pattern)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
         self.inner
             .forget(ForgetCriteria::Pattern(pattern.to_string()))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by pattern: {}", e)))
@@ -1285,6 +1302,10 @@ impl PyMemorySystem {
     ///
     /// Matches REST /api/forget/tags endpoint.
     fn forget_by_tags(&self, tags: Vec<String>) -> PyResult<usize> {
+        if tags.is_empty() {
+            return Err(PyValueError::new_err("tags list cannot be empty"));
+        }
+
         self.inner
             .forget(ForgetCriteria::ByTags(tags))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to forget by tags: {}", e)))
@@ -2226,7 +2247,7 @@ fn shodh_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEnvironment>()?;
 
     // Version and metadata
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__version__", env!("SHODH_VERSION_FULL"))?;
     m.add(
         "__doc__",
         "Shodh-Memory: AI Memory System for Autonomous Robots & Drones\n\n\

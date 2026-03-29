@@ -47,6 +47,19 @@ pub const HEBBIAN_DECAY_MISLEADING: f32 = 0.10;
 /// - Allows for context-dependent recovery
 pub const IMPORTANCE_FLOOR: f32 = 0.05;
 
+/// Abstention threshold: when importance × calibrated_confidence falls below
+/// this value, the memory is excluded from retrieval results (the system
+/// effectively says "I don't have a reliable answer for this").
+///
+/// Auto-calibrated at the 10th percentile of importance × confidence across
+/// all memories. This static value serves as a hard floor.
+///
+/// Justification:
+/// - 0.1 means a memory with 0.5 importance needs ≥ 0.2 confidence to appear
+/// - Prevents low-quality memories from polluting results
+/// - Can be overridden per-query via QueryOptions
+pub const ABSTENTION_THRESHOLD: f32 = 0.1;
+
 // =============================================================================
 // MEMORY GRAPH EDGE CONSTANTS
 // =============================================================================
@@ -482,6 +495,20 @@ pub const CONSOLIDATION_JACCARD_THRESHOLD: f32 = 0.45;
 /// - 5 is generous: procedure + definition + pattern + preference + salient
 /// - Prevents one verbose memory from dominating the candidate pool
 pub const CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY: usize = 5;
+
+/// Minimum cosine similarity between a consolidated fact's embedding and the
+/// centroid of its source cluster members. Facts below this threshold are
+/// rejected as semantically incoherent with their sources.
+///
+/// Justification:
+/// - Prevents hallucinated or off-topic facts from entering the fact store
+/// - 0.6 balances between catching garbage (lower) and over-rejecting (higher)
+/// - Inspired by agentmemory's consolidation quality gating approach
+pub const CONSOLIDATION_QUALITY_GATE_THRESHOLD: f32 = 0.6;
+
+/// Maximum number of source memories to embed for quality gating during
+/// consolidation. Limits embedding cost while maintaining representative check.
+pub const CONSOLIDATION_QUALITY_GATE_MAX_SOURCES: usize = 5;
 
 // =============================================================================
 // CONFLICT DETECTION ON REMEMBER (A3: Survey on AI Memory, H-MEM + WISE)
@@ -933,8 +960,10 @@ pub const ONTOLOGICAL_MIN_CONFIDENCE: f32 = 0.3;
 pub const ONTOLOGICAL_RELATION_PENALTY: f32 = 0.4;
 
 /// Penalty multiplier for target entities whose EntityLabel doesn't match expected types.
-/// 0.5 = more generous than relation penalty because NER labels are noisier.
-pub const ONTOLOGICAL_ENTITY_PENALTY: f32 = 0.5;
+/// 0.6 = weakened from 0.5 to compensate for stronger Layer 4.9 rerank boost.
+/// Compound effect: Layer 2 (0.6x) × Layer 4.9 penalty (-0.08) is less aggressive
+/// than the old 0.5x × no-penalty path, preventing over-penalization.
+pub const ONTOLOGICAL_ENTITY_PENALTY: f32 = 0.6;
 
 /// Graph density threshold above which ontological filtering is disabled.
 /// Dense/young graphs have too many noisy L1 edges for type filtering to help.
@@ -942,11 +971,24 @@ pub const ONTOLOGICAL_ENTITY_PENALTY: f32 = 0.5;
 pub const ONTOLOGICAL_DENSITY_THRESHOLD: f32 = 8.0;
 
 /// Post-RRF boost per type-matching entity connected to a memory (Layer 4.9).
-/// Additive on fused score. 0.08 per match, max 0.25.
-pub const ONTOLOGICAL_RERANK_BOOST: f32 = 0.08;
+/// Additive on fused score. 0.15 per match, max 0.40.
+/// Increased from 0.08/0.25 to strengthen WH-word gravity signal:
+/// WHERE→Location, WHO→Person, WHEN→Temporal entities get meaningful advantage.
+pub const ONTOLOGICAL_RERANK_BOOST: f32 = 0.15;
 
 /// Maximum ontological re-rank boost per memory.
-pub const ONTOLOGICAL_RERANK_MAX: f32 = 0.25;
+pub const ONTOLOGICAL_RERANK_MAX: f32 = 0.40;
+
+/// Penalty for memories with ZERO type-matching entities (Layer 4.9).
+/// Applied only when ontological intent has expected_labels AND the memory
+/// has entity_refs but none match. Asymmetric gating: penalties require
+/// higher confidence than boosts to avoid punishing entity extraction gaps.
+pub const ONTOLOGICAL_RERANK_PENALTY: f32 = -0.08;
+
+/// Minimum confidence threshold for applying ontological penalties.
+/// Boosts are applied at any confidence; penalties only when intent
+/// confidence exceeds this threshold (asymmetric to reduce false negatives).
+pub const ONTOLOGICAL_PENALTY_MIN_CONFIDENCE: f32 = 0.4;
 
 // =============================================================================
 // QUERY DECOMPOSITION CONSTANTS
@@ -983,6 +1025,49 @@ pub const QUERY_DECOMPOSITION_SUB_WEIGHT: f32 = 0.6;
 /// - Most compound queries decompose into 2-3 sub-queries
 /// - Beyond 4, sub-queries become too narrow and add noise
 pub const QUERY_DECOMPOSITION_MAX_SUBQUERIES: usize = 4;
+
+// =============================================================================
+// ADAPTIVE RETRIEVAL WEIGHT LEARNING (P2.3)
+// EMA-based weight adaptation for RRF fusion weights (BM25, Vector, Graph).
+// Weights shift slowly toward signals that produce helpful retrievals and away
+// from signals that produce misleading ones.
+//
+// Biological basis: Synaptic metaplasticity — connection efficacy adjusts based
+// on past success/failure history, not just raw activation patterns.
+//
+// Reference: Abraham & Bear (1996) "Metaplasticity: the plasticity of synaptic
+// plasticity" — learning rates adapt based on outcome history.
+// =============================================================================
+
+/// EMA learning rate for adaptive weight updates
+///
+/// Justification:
+/// - 0.05 (5%) per feedback event means slow, stable adaptation
+/// - After 20 helpful feedbacks from one signal: weight shifts ~64% toward it
+/// - After 100 feedbacks: system converges to empirically-optimal weights
+/// - Low rate prevents oscillation from noisy/contradictory feedback
+/// - Matches online learning literature: lr ∈ [0.01, 0.1] for non-stationary
+///
+/// Math: weight_new = (1 - lr) * weight_old + lr * signal_contribution
+pub const ADAPTIVE_WEIGHT_LEARNING_RATE: f32 = 0.05;
+
+/// Minimum update count before learned weights begin influencing retrieval
+///
+/// Justification:
+/// - 10 feedback events provides minimal statistical signal
+/// - Below this, static defaults dominate (they're well-tuned from benchmarks)
+/// - Prevents a single lucky/unlucky feedback from skewing weights
+/// - Blend factor = min(1.0, update_count / CONFIDENCE_THRESHOLD)
+pub const ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD: u64 = 10;
+
+/// Maximum blend factor for learned weights (caps influence)
+///
+/// Justification:
+/// - 0.6 means learned weights can contribute at most 60% of effective weights
+/// - Remaining 40% always comes from static defaults (safety floor)
+/// - Prevents pathological convergence to 100% on one signal
+/// - Even after thousands of feedbacks, static priors retain influence
+pub const ADAPTIVE_WEIGHT_MAX_BLEND: f32 = 0.6;
 
 // =============================================================================
 // EDGE-TIER TRUST WEIGHTS FOR SPREADING ACTIVATION

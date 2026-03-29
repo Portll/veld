@@ -123,6 +123,9 @@ async fn async_main() -> Result<()> {
     let server_config = ServerConfig::from_env();
     print_config(&server_config);
 
+    // Initialize runtime-configurable decay scales from config
+    crate::decay::init_runtime_scales(&server_config.log_periodic_scales);
+
     // Create memory manager
     let manager: AppState = Arc::new(MultiUserMemoryManager::new(
         server_config.storage_path.clone(),
@@ -203,7 +206,7 @@ async fn async_main() -> Result<()> {
         axum::routing::get(|| async {
             axum::Json(serde_json::json!({
                 "name": "shodh-memory",
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": env!("SHODH_VERSION_FULL"),
                 "description": "Cognitive Memory for AI Agents",
                 "health": "/health",
                 "api": {
@@ -529,8 +532,8 @@ fn print_banner() {
     eprintln!();
     eprintln!("  ╔═══════════════════════════════════════════════════╗");
     eprintln!(
-        "  ║         🧠 Shodh-Memory Server v{}          ║",
-        env!("CARGO_PKG_VERSION")
+        "  ║         🧠 Shodh-Memory Server v{}",
+        env!("SHODH_VERSION_FULL")
     );
     eprintln!("  ║       Cognitive Memory for AI Agents              ║");
     eprintln!("  ╚═══════════════════════════════════════════════════╝");

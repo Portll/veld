@@ -64,8 +64,77 @@ interface ProactiveContextResponse {
 
 const HOOK_TIMEOUT_MS = 5000;
 
+/** Backend availability tracking for degradation signaling */
+let backendDown = false;
+let lastSuccessfulContext: string | null = null;
+let lastContextTimestamp: number = 0;
+
 /** Tool actions collected since last proactive_context call for feedback attribution */
 const pendingToolActions: { tool_name: string; inputs: Record<string, string>; success: boolean; output_snippet?: string }[] = [];
+
+// =============================================================================
+// EPISODE THREADING (auto-generated per session)
+// =============================================================================
+
+/** Unique episode ID for this session — enables temporal clustering & ordinal boost */
+const sessionEpisodeId = `ep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+/** Monotonic sequence counter for memory ordering within this session */
+let episodeSequenceNumber = 0;
+
+/** ID of the last memory we stored (for preceding_memory_id chains) */
+let lastStoredMemoryId: string | null = null;
+
+// =============================================================================
+// FEEDBACK LOOP (track surfaced memories for relevance signaling)
+// =============================================================================
+
+/** IDs of memories surfaced in the most recent proactive_context call */
+let lastSurfacedMemoryIds: string[] = [];
+
+/** Formatted output from the last proactive_context (for implicit feedback via previous_response) */
+let lastProactiveOutput: string | null = null;
+
+// =============================================================================
+// EMOTIONAL CLASSIFICATION
+// =============================================================================
+
+interface EmotionalSignal {
+  emotional_valence: number;  // -1.0 (negative) to 1.0 (positive)
+  emotional_arousal: number;  // 0.0 (calm) to 1.0 (highly aroused)
+  emotion: string;
+}
+
+/** Classify emotional context from event type and outcome */
+function classifyEmotion(eventType: string, success: boolean, content: string): EmotionalSignal {
+  // Error events: high arousal, negative valence
+  if (eventType === "Error" || (!success && content.includes("error"))) {
+    return { emotional_valence: -0.6, emotional_arousal: 0.8, emotion: "frustration" };
+  }
+
+  // Task/orchestration completions: positive, medium arousal
+  if (eventType === "Task" && success) {
+    return { emotional_valence: 0.5, emotional_arousal: 0.5, emotion: "satisfaction" };
+  }
+
+  // File modifications: neutral, low arousal (routine work)
+  if (eventType === "FileAccess") {
+    return { emotional_valence: 0.1, emotional_arousal: 0.2, emotion: "focus" };
+  }
+
+  // Discovery/learning: positive, medium-high arousal
+  if (eventType === "Discovery" || eventType === "Learning") {
+    return { emotional_valence: 0.6, emotional_arousal: 0.6, emotion: "curiosity" };
+  }
+
+  // Decisions: neutral-positive, medium arousal
+  if (eventType === "Decision") {
+    return { emotional_valence: 0.3, emotional_arousal: 0.4, emotion: "resolve" };
+  }
+
+  // Default: neutral observation
+  return { emotional_valence: 0.0, emotional_arousal: 0.15, emotion: "neutral" };
+}
 
 async function callBrain(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
   try {
@@ -82,9 +151,14 @@ async function callBrain(endpoint: string, body: Record<string, unknown>): Promi
     });
     clearTimeout(timeoutId);
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      backendDown = true;
+      return null;
+    }
+    backendDown = false;
     return await response.json();
   } catch {
+    backendDown = true;
     return null;
   }
 }
@@ -142,6 +216,16 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
   // Drain pending tool actions for feedback attribution
   const toolActions = pendingToolActions.splice(0, pendingToolActions.length);
 
+  // Build feedback payload from previous cycle
+  const feedbackPayload: Record<string, unknown> = {};
+  if (lastProactiveOutput) {
+    feedbackPayload.previous_response = lastProactiveOutput;
+    feedbackPayload.user_followup = context.slice(0, 1000);
+  }
+  if (lastSurfacedMemoryIds.length > 0) {
+    feedbackPayload.surfaced_memory_ids = lastSurfacedMemoryIds;
+  }
+
   const response = (await callBrain("/api/proactive_context", {
     user_id: SHODH_USER_ID,
     context,
@@ -151,9 +235,17 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
     recency_weight: 0.2,
     auto_ingest: autoIngest,
     ...(toolActions.length > 0 ? { tool_actions: toolActions } : {}),
+    ...feedbackPayload,
   })) as ProactiveContextResponse | null;
 
-  if (!response) return null;
+  if (!response) {
+    // Backend unreachable — serve stale cache with age warning
+    if (lastSuccessfulContext && lastContextTimestamp > 0) {
+      const ageMinutes = Math.round((Date.now() - lastContextTimestamp) / 60_000);
+      return `⚠️ Memory offline (${ageMinutes}m stale cache):\n${lastSuccessfulContext}`;
+    }
+    return null;
+  }
 
   const hasMemories = response.memories?.length > 0;
   const hasFacts = response.relevant_facts?.length > 0;
@@ -186,6 +278,15 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
     const allReminders = [...(response.due_reminders || []), ...(response.context_reminders || [])];
     output += `\n⏰ ${allReminders.length} reminder(s) active`;
   }
+
+  // Cache successful context for stale-serve on future failures
+  lastSuccessfulContext = output;
+  lastContextTimestamp = Date.now();
+
+  // Track surfaced memories for feedback loop on next call
+  lastSurfacedMemoryIds = (response.memories || []).map((m) => m.id);
+  lastProactiveOutput = output;
+
   return output;
 }
 
@@ -196,20 +297,23 @@ async function handleSessionStart(): Promise<void> {
   const context = `Starting session in project: ${projectName}`;
   const memoryContext = await surfaceProactiveContext(context, 5);
 
+  const memoryFile = `${projectDir}/.claude/memory-context.md`;
   if (memoryContext) {
     console.error(`[shodh] Session context loaded`);
 
-    // Write to project memory file
-    const memoryFile = `${projectDir}/.claude/memory-context.md`;
     try {
       await Bun.write(memoryFile, `# Shodh Memory Context\n\n${memoryContext}\n`);
     } catch {
       // Directory might not exist
     }
+  } else if (backendDown) {
+    console.error(`[shodh] Memory system unreachable — operating without persistent context`);
+    try {
+      await Bun.write(memoryFile, `# Shodh Memory Context\n\n⚠️ Memory system offline. No persistent context available.\n`);
+    } catch {
+      // Directory might not exist
+    }
   }
-
-  // Session start is tracked implicitly — the proactive_context call above
-  // surfaces relevant memories without creating noise in the activity log.
 }
 
 async function handleUserPrompt(input: HookInput): Promise<void> {
@@ -225,6 +329,16 @@ async function handleUserPrompt(input: HookInput): Promise<void> {
         hookSpecificOutput: {
           hookEventName: "UserPromptSubmit",
           additionalContext: `\n<shodh-memory>\n${memoryContext}\n</shodh-memory>`,
+        },
+      })
+    );
+  } else if (backendDown) {
+    // Inject a single-line degradation warning so the model knows memory is offline
+    console.log(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "UserPromptSubmit",
+          additionalContext: `\n<shodh-warning>Memory system offline. No persistent context for this prompt.</shodh-warning>`,
         },
       })
     );
@@ -290,28 +404,57 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
     return;
   }
 
-  // Store significant tool uses
+  // Store significant tool uses with emotional context + episode threading
   if (toolName === "Edit" || toolName === "Write") {
     const filePath = toolInput?.file_path as string;
     if (filePath) {
-      await callBrain("/api/remember", {
+      // Build descriptive content based on tool type (FIX-01: structured reasoning capture)
+      let content: string;
+      if (toolName === "Edit") {
+        const oldStr = (toolInput?.old_string as string) || "";
+        const newStr = (toolInput?.new_string as string) || "";
+        content = `Edited ${filePath}: replaced ${oldStr.slice(0, 80)} → ${newStr.slice(0, 80)}`;
+      } else {
+        const fileContent = (toolInput?.content as string) || "";
+        content = `Created/wrote ${filePath} (${fileContent.length} chars)`;
+      }
+
+      const emotion = classifyEmotion("FileAccess", true, filePath);
+      const seq = ++episodeSequenceNumber;
+      const resp = await callBrain("/api/remember", {
         user_id: SHODH_USER_ID,
-        content: `Modified file: ${filePath}`,
+        content,
         memory_type: "FileAccess",
         tags: [`tool:${toolName}`, `file:${filePath.split(/[/\\]/).pop()}`],
-      });
+        source_type: "system",
+        credibility: 0.8,
+        episode_id: sessionEpisodeId,
+        sequence_number: seq,
+        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
+        ...emotion,
+      }) as { id?: string } | null;
+      if (resp?.id) lastStoredMemoryId = resp.id;
     }
   } else if (toolName === "Bash" && toolOutput) {
     const command = toolInput?.command as string;
 
     // Store errors/failures for learning
     if (isErrorOutput(toolOutput)) {
-      await callBrain("/api/remember", {
+      const emotion = classifyEmotion("Error", false, toolOutput);
+      const seq = ++episodeSequenceNumber;
+      const resp = await callBrain("/api/remember", {
         user_id: SHODH_USER_ID,
         content: `Command failed: ${command?.slice(0, 100)} → ${toolOutput.slice(0, 200)}`,
         memory_type: "Error",
         tags: ["tool:Bash", "error"],
-      });
+        source_type: "system",
+        credibility: 0.9,
+        episode_id: sessionEpisodeId,
+        sequence_number: seq,
+        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
+        ...emotion,
+      }) as { id?: string } | null;
+      if (resp?.id) lastStoredMemoryId = resp.id;
 
       // Surface past errors for this type of command
       const memoryContext = await surfaceProactiveContext(
@@ -453,12 +596,21 @@ async function handlePostToolUseTask(input: HookInput): Promise<void> {
   if (!tagMatch) {
     // Not an orchestration task — store as generic memory
     if (resultText) {
-      await callBrain("/api/remember", {
+      const emotion = classifyEmotion("Task", true, resultText);
+      const seq = ++episodeSequenceNumber;
+      const resp = await callBrain("/api/remember", {
         user_id: SHODH_USER_ID,
         content: `Task agent completed: ${resultText.slice(0, 300)}`,
         memory_type: "Task",
         tags: ["subagent:task", "source:hook"],
-      });
+        source_type: "system",
+        credibility: 0.7,
+        episode_id: sessionEpisodeId,
+        sequence_number: seq,
+        ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
+        ...emotion,
+      }) as { id?: string } | null;
+      if (resp?.id) lastStoredMemoryId = resp.id;
     }
     return;
   }
@@ -491,13 +643,24 @@ async function handlePostToolUseTask(input: HookInput): Promise<void> {
     }
   }
 
-  // 4. Store memory of orchestration completion
-  await callBrain("/api/remember", {
-    user_id: SHODH_USER_ID,
-    content: `Orchestration task ${todoShortId} completed: ${resultText.slice(0, 200)}`,
-    memory_type: "Task",
-    tags: ["orchestration", `todo:${todoShortId}`, "source:hook"],
-  });
+  // 4. Store memory of orchestration completion with emotional + episode context
+  {
+    const emotion = classifyEmotion("Task", true, resultText);
+    const seq = ++episodeSequenceNumber;
+    const resp = await callBrain("/api/remember", {
+      user_id: SHODH_USER_ID,
+      content: `Orchestration task ${todoShortId} completed: ${resultText.slice(0, 200)}`,
+      memory_type: "Task",
+      tags: ["orchestration", `todo:${todoShortId}`, "source:hook"],
+      source_type: "system",
+      credibility: 0.75,
+      episode_id: sessionEpisodeId,
+      sequence_number: seq,
+      ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
+      ...emotion,
+    }) as { id?: string } | null;
+    if (resp?.id) lastStoredMemoryId = resp.id;
+  }
 
   // 5. Surface orchestration status
   const memoryContext = await surfaceProactiveContext(
@@ -527,12 +690,21 @@ async function handleSubagentStop(input: HookInput): Promise<void> {
     ? `${agentType} agent completed: ${result.slice(0, 300)}`
     : `${agentType} agent (${agentId || "unknown"}) completed`;
 
-  await callBrain("/api/remember", {
+  const emotion = classifyEmotion("Task", true, content);
+  const seq = ++episodeSequenceNumber;
+  const resp = await callBrain("/api/remember", {
     user_id: SHODH_USER_ID,
     content,
     memory_type: "Task",
     tags: [`subagent:${agentType}`, "source:hook"],
-  });
+    source_type: "system",
+    credibility: 0.6,
+    episode_id: sessionEpisodeId,
+    sequence_number: seq,
+    ...(lastStoredMemoryId ? { preceding_memory_id: lastStoredMemoryId } : {}),
+    ...emotion,
+  }) as { id?: string } | null;
+  if (resp?.id) lastStoredMemoryId = resp.id;
 }
 
 async function handleStop(_input: HookInput): Promise<void> {

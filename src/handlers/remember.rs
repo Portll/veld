@@ -67,6 +67,10 @@ pub struct RememberRequest {
     /// pipeline before storage.
     #[serde(default)]
     pub filename: Option<String>,
+    /// Semantic intent tags from Claude (FIX-10)
+    /// Merged into entity tags with "intent:" prefix for importance boost
+    #[serde(default)]
+    pub intent_tags: Vec<String>,
 }
 
 /// Remember response
@@ -214,7 +218,7 @@ pub fn parse_source_type(s: Option<&String>) -> SourceType {
         "inferred" => SourceType::Inferred,
         _ => SourceType::Unknown,
     })
-    .unwrap_or(SourceType::User)
+    .unwrap_or(SourceType::Unknown)
 }
 
 /// Build RichContext from request fields
@@ -391,6 +395,10 @@ pub async fn remember(
     };
 
     let mut merged_entities: Vec<String> = req.tags.clone();
+    // FIX-10: Merge semantic intent tags with "intent:" prefix for importance boost
+    for tag in &req.intent_tags {
+        merged_entities.push(format!("intent:{tag}"));
+    }
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
     for tag in &ingest_tags {
@@ -810,7 +818,7 @@ fn detect_and_resolve_conflicts(
     let mut conflicts_resolved = 0usize;
 
     for candidate_id in candidate_ids.iter().take(CONFLICT_MAX_CANDIDATES) {
-        let candidate = match memory_guard.get_memory(candidate_id) {
+        let mut candidate = match memory_guard.get_memory(candidate_id) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -845,9 +853,10 @@ fn detect_and_resolve_conflicts(
             "Conflict detected: creating SupersededBy edge"
         );
 
-        // Decay old memory importance and persist
+        // Decay old memory importance, set temporal expiry, and persist
         let old_importance = candidate.importance();
         candidate.set_importance(old_importance * CONFLICT_IMPORTANCE_DECAY);
+        candidate.set_valid_until(chrono::Utc::now());
         memory_guard.update_memory(&candidate)?;
 
         // Create SupersededBy edge in graph
@@ -875,6 +884,7 @@ fn detect_and_resolve_conflicts(
                 tier: Default::default(),
                 activation_timestamps: None,
                 entity_confidence: None,
+                created_by: crate::graph_memory::EdgeSource::CoOccurrence,
             };
             let _ = graph.add_relationship(edge);
         }
