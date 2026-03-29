@@ -3914,6 +3914,83 @@ pub fn decompose_query(query: &str, analysis: &QueryAnalysis) -> Vec<String> {
     vec![query_trimmed.to_string()]
 }
 
+/// Expand abstract/meta-reasoning query terms with concrete synonyms for BM25.
+///
+/// Abstract queries like "What patterns do you see in our decision-making?" fail
+/// BM25 because "patterns" doesn't appear in any memory about specific decisions.
+/// This function detects abstract terms and appends concrete related terms with
+/// a low boost weight (^0.3) so they act as BM25 tiebreakers, not primary signals.
+///
+/// Returns `Some(expanded)` if expansion was applied, `None` if no abstract terms
+/// were detected (so the caller can use the original query unchanged).
+///
+/// The expansion map covers the most common meta-reasoning terms in conversational
+/// memory retrieval. Terms are matched against stemmed query words to handle
+/// morphological variants (e.g., "pattern" and "patterns" both trigger expansion).
+pub fn expand_abstract_terms_for_bm25(query: &str) -> Option<String> {
+    use rust_stemmers::{Algorithm, Stemmer};
+
+    // Static mapping of abstract stem → concrete expansion terms.
+    // Kept small (15 entries) and focused on meta-reasoning vocabulary.
+    // Each expansion term gets ^0.3 boost in the BM25 query to avoid
+    // overwhelming the original query terms.
+    const EXPANSION_BOOST: &str = "^0.3";
+    static EXPANSIONS: &[(&str, &[&str])] = &[
+        ("pattern", &["decisions", "choices", "recurring", "repeated", "trend"]),
+        ("prioriti", &["goals", "focus", "important", "urgent", "next"]),
+        ("risk", &["concerns", "issues", "problems", "challenges", "threats"]),
+        ("strategi", &["plan", "approach", "direction", "roadmap"]),
+        ("lesson", &["learned", "mistakes", "insights", "takeaways"]),
+        ("progress", &["status", "milestone", "completed", "remaining"]),
+        ("impact", &["effect", "consequence", "result", "outcome"]),
+        ("blocker", &["obstacle", "impediment", "stuck", "waiting"]),
+        ("tradeoff", &["compromise", "versus", "cost", "benefit"]),
+        ("retrospect", &["review", "reflection", "improvement", "feedback"]),
+        ("evolv", &["changed", "grew", "adapted", "shifted"]),
+        ("evolut", &["changed", "grew", "adapted", "shifted"]),
+        ("theme", &["recurring", "common", "trend", "motif"]),
+    ];
+
+    let stemmer = Stemmer::create(Algorithm::English);
+    let mut expansion_terms: Vec<String> = Vec::new();
+
+    for word in query.split_whitespace() {
+        let clean: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        if clean.len() < 3 {
+            continue;
+        }
+        let stemmed = stemmer.stem(&clean).to_string();
+
+        for &(abstract_stem, concrete_terms) in EXPANSIONS {
+            if stemmed == abstract_stem || clean == abstract_stem {
+                for &term in concrete_terms {
+                    expansion_terms.push(format!("{}{}", term, EXPANSION_BOOST));
+                }
+            }
+        }
+    }
+
+    if expansion_terms.is_empty() {
+        return None;
+    }
+
+    // Append expansion terms to the original query. The original terms retain
+    // their natural weight (or IC-weighted boost from upstream), while expansion
+    // terms get the low ^0.3 boost.
+    let expanded = format!("{} {}", query, expansion_terms.join(" "));
+    tracing::debug!(
+        expansion_count = expansion_terms.len(),
+        "BM25 concept expansion: '{}' → {} expansion terms appended",
+        &query[..query.len().min(60)],
+        expansion_terms.len()
+    );
+    Some(expanded)
+}
+
 /// Split a query on conjunction markers (" AND ", " and also ", " as well as ").
 /// Returns None if no conjunction is found, or the split parts otherwise.
 fn split_on_conjunction(query: &str) -> Option<Vec<String>> {

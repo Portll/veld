@@ -1,0 +1,396 @@
+{
+  "feature": "Structural Centrality as Retrieval Signal",
+  "date": "2026-03-29",
+
+  "bifocal": {
+    "evaluation_type": "bifocal_plus",
+    "target": "Pre-computed structural centrality (degree/betweenness) on MemoryMetadata as additive Layer 5 signal",
+
+    "phase_0_risk_triage": {
+      "tier_1_full": [
+        "Centrality computation during maintenance — O(V*E) for betweenness, O(V+E) for degree; touches get_all_entities + get_all_relationships full scans; performance regression risk on maintenance hot path",
+        "MemoryMetadata schema evolution — new serialized field in bincode format; backward compatibility with existing RocksDB data; zero-value semantics for memories without centrality"
+      ],
+      "tier_2_standard": [
+        "Layer 5 scoring integration — additive signal at 2-3%; couples scoring to maintenance freshness; stale centrality scores after graph mutations",
+        "Memory-to-entity centrality mapping — memories connect to entities via EpisodicNode.entity_refs; centrality lives on entities not memories; mapping function needed"
+      ],
+      "tier_3_light": [
+        "Constant tuning — weight coefficient for centrality boost; interaction with existing 21+ signals; diminishing returns"
+      ]
+    },
+
+    "phase_1_edge_walk_fractal": {
+
+      "boundary_1_centrality_computation": {
+        "edge_analysis": {
+          "data_crossing": "get_all_entities() returns Vec<EntityNode> via full RocksDB scan (fill_cache=false). get_all_relationships() returns Vec<RelationshipEdge> via full scan. Both already used by apply_decay() in maintenance.",
+          "control_flow": "Would run inside run_maintenance() → heavy cycle branch (alongside fact extraction, replay). Gated by is_heavy flag. Output: HashMap<Uuid, f32> entity_uuid→centrality.",
+          "failure_modes": [
+            "O(V * E) betweenness centrality on graphs with 500+ entities and 5000+ edges. With MAX_ENTITY_DEGREE=500, worst case is 250K edge lookups per BFS.",
+            "Full graph materialization: get_all_relationships() already does full scan for apply_decay(). But centrality needs ADJACENCY LIST not flat list — requires O(E) index build.",
+            "Stale centrality: computed during heavy maintenance (every N minutes). Between cycles, new memories get centrality=0.0 (default), creating recency penalty."
+          ]
+        },
+        "fractal_analysis": {
+          "pattern": "Existing maintenance computations: apply_decay() does full edge scan, consolidate_if_needed() does full memory scan, fact extraction does full memory scan. Pattern: heavy cycle = full scan budget.",
+          "mirror_test": "Entity salience (mention_count + proper_noun) is computed at INGESTION (O(1) per entity). Centrality requires GLOBAL view — fundamentally different computation model. Mirror breaks.",
+          "scale_consistency": "At 100 entities, degree centrality is trivial (<1ms). At 10K entities with MAX_ENTITY_DEGREE=500, adjacency build is 5M entries. At 100K entities (production), becomes multi-second."
+        },
+        "hazop": {
+          "MORE": "More entities than expected. Graph growth is unbounded (entities never deleted, only edges pruned). Centrality computation grows superlinearly with graph size.",
+          "LATE": "Centrality computed on heavy cycle. Between heavy cycles (minutes to hours), graph mutations (new edges, pruned edges, new entities) make centrality stale. New memories ingested between cycles have centrality=0.0 default.",
+          "NO": "No graph memory configured. graph_memory is Option<Arc<RwLock<GraphMemory>>>. Must handle None gracefully with neutral centrality.",
+          "LESS": "Fewer entities than edges due to degree cap. With MAX_ENTITY_DEGREE=500, a star topology entity has 500 edges but centrality computation over-weights it. Degree centrality would just reflect the cap."
+        },
+        "fmea": [
+          {
+            "failure_mode": "Maintenance timeout from betweenness centrality on large graph",
+            "S": 7,
+            "P": 6,
+            "D": 4,
+            "RPN": 168,
+            "note": "Betweenness is O(V*E), V=10K E=50K → 500M operations per heavy cycle"
+          },
+          {
+            "failure_mode": "Stale centrality creates systematic bias against recent memories",
+            "S": 6,
+            "P": 8,
+            "D": 5,
+            "RPN": 240,
+            "note": "New memories always start at centrality=0.0 until next heavy cycle computes their entities' centrality"
+          },
+          {
+            "failure_mode": "Memory leak from materialized adjacency list",
+            "S": 5,
+            "P": 3,
+            "D": 3,
+            "RPN": 45,
+            "note": "Adjacency list is transient, freed after computation"
+          }
+        ]
+      },
+
+      "boundary_2_memory_metadata_schema": {
+        "edge_analysis": {
+          "data_crossing": "MemoryMetadata serialized via bincode to RocksDB. New field 'structural_centrality: f32' with #[serde(default)] for backward compat. Old data deserializes with 0.0.",
+          "control_flow": "Written during maintenance cycle (per-memory update). Read during Layer 5 scoring (per-recall read). Write path: load memory → update centrality → persist. Read path: already loaded for scoring.",
+          "failure_modes": [
+            "Bincode backward compatibility: #[serde(default)] handles missing fields. BUT bincode's format is positional, not tagged. Adding a field to the END of the struct is safe; adding in the MIDDLE breaks deserialization of existing data.",
+            "Write amplification: updating centrality for ALL memories during maintenance means rewriting every memory to RocksDB. Currently maintenance only touches working + session memory (in-memory). Long-term memories in RocksDB would need batch update.",
+            "Concurrent access: MemoryMetadata is behind Arc<Memory> with interior mutability for some fields. Centrality update during maintenance while recall reads → race condition."
+          ]
+        },
+        "fractal_analysis": {
+          "pattern": "Existing MemoryMetadata evolution: elaboration_score added with #[serde(default)], fragment_demotion added with custom default. Pattern: append-only with default functions.",
+          "mirror_test": "elaboration_score is computed at ENCODING time (once). calibrated_confidence is updated on RETRIEVAL feedback. centrality would be updated on MAINTENANCE — third update pattern. Consistent with fragment_demotion which is also updated asynchronously.",
+          "scale_consistency": "One f32 per memory. At 100K memories = 400KB storage overhead. Negligible."
+        },
+        "hazop": {
+          "REVERSE": "Centrality stored on memory but computed from entity graph. If entity graph is cleared/rebuilt, stored centrality becomes meaningless. No invalidation path exists.",
+          "PART_OF": "Memory connects to multiple entities. Memory centrality = aggregate of entity centralities. Aggregation function matters: max? mean? weighted mean by edge strength? Each has different semantics.",
+          "OTHER_THAN": "Centrality field could be repurposed by future features (graph health, importance prediction) creating semantic ambiguity. Need clear documentation."
+        },
+        "fmea": [
+          {
+            "failure_mode": "Bincode deserialization failure if field inserted in wrong position",
+            "S": 9,
+            "P": 3,
+            "D": 2,
+            "RPN": 54,
+            "note": "Easily caught by tests but catastrophic if missed — all memories unreadable"
+          },
+          {
+            "failure_mode": "Write amplification: rewriting all long-term memories per heavy cycle",
+            "S": 6,
+            "P": 7,
+            "D": 4,
+            "RPN": 168,
+            "note": "Long-term memories stored in RocksDB, not in-memory. Batch update is expensive."
+          }
+        ]
+      },
+
+      "boundary_3_entity_to_memory_mapping": {
+        "edge_analysis": {
+          "data_crossing": "Centrality is a property of ENTITIES in the graph. Memories connect to entities via EpisodicNode.entity_refs (Vec<Uuid>). Memory.entity_refs (Vec<EntityRef>) mirrors this. Mapping: memory_centrality = f(entity_centralities).",
+          "control_flow": "During maintenance: (1) compute entity centralities, (2) for each memory, look up its entity_refs, (3) aggregate entity centralities into memory centrality. Step 2 requires loading all memories' entity_refs — already done in heavy cycle (all_memories_for_heavy).",
+          "failure_modes": [
+            "Orphan entity refs: memory references entity UUID that was deleted during graph cleanup. Centrality lookup returns None, excluded from average, biasing score.",
+            "Entity deduplication: same real-world concept split across multiple EntityNodes (case-sensitive names, stemming misses). Centrality fragments across duplicates.",
+            "Empty entity_refs: memories with no extracted entities get centrality=0.0. This creates a divide between entity-rich and entity-poor memories independent of actual importance."
+          ]
+        },
+        "fractal_analysis": {
+          "pattern": "Existing entity→memory bridge: get_episodes_by_entity() goes entity→episodes. Hebbian scoring goes memory→entities→edges. This would be entity_centrality→memory_centrality. Same pattern as hebbian scoring.",
+          "mirror_test": "hebbian_scores uses get_memory_hebbian_strength() which looks at INTRA-memory edges (edges between entities that both belong to the same memory). Centrality uses GLOBAL entity position. Different scope, same bridging pattern.",
+          "scale_consistency": "For a memory with 5 entity_refs, 5 lookups in HashMap<Uuid, f32>. O(1) per lookup. Total O(entity_refs.len()) per memory. Fast."
+        },
+        "hazop": {
+          "MORE": "Memory with many entity_refs: centrality = mean(many_values), regression to mean. Gateway memories that reference many diverse entities would get AVERAGE centrality, not HIGH centrality. Counterintuitive.",
+          "LESS": "Memory with 1 entity_ref: centrality = that entity's centrality. Single-entity memories are dominated by their entity's graph position. Over-sensitive to entity extraction quality."
+        }
+      },
+
+      "boundary_4_layer_5_scoring_integration": {
+        "edge_analysis": {
+          "data_crossing": "centrality: f32 read from MemoryMetadata (already loaded in scoring loop). Added as additive term: centrality_boost = mem.centrality() * CENTRALITY_WEIGHT (0.02-0.03).",
+          "control_flow": "Inside with_unified_score closure at recall.rs:2180-2407. One additional field read and multiply-add. Zero additional I/O.",
+          "failure_modes": [
+            "Signal saturation: 21+ signals already. Adding centrality at 2% may be within noise floor. Risk of zero marginal impact after RRF fusion + cross-encoder reranking.",
+            "Correlation with existing signals: entity_density (Signal 19) counts entity_refs. Memories with more entities tend to have higher centrality (more graph connections). Partial collinearity."
+          ]
+        },
+        "fractal_analysis": {
+          "pattern": "Existing additive signals: access_boost (0.07), graph_boost (0.08), entity_density (0.02), elaboration_boost (0.03). All use COEFFICIENT * value.clamp(0,1) pattern. Centrality fits perfectly.",
+          "mirror_test": "graph_boost measures LOCAL quality (intra-memory edge strength). centrality measures GLOBAL position (entity's role in full graph). Complementary dimensions if orthogonal.",
+          "scale_consistency": "At 2% weight, centrality can shift a memory's score by at most 0.02. For MRR, this matters only when two memories are within 0.02 of each other in final score. Narrow impact band."
+        },
+        "hazop": {
+          "MORE": "Centrality weight set too high (e.g., 5%). Gateway memories dominate retrieval regardless of query relevance. 'What is my cat's name?' returns the project summary because it connects to everything.",
+          "LESS": "Weight too low (1%). Below noise floor of 21+ other signals. No measurable impact on any benchmark.",
+          "REVERSE": "High-centrality memories are GENERIC (connect many topics). For specific queries, generic memories are NOISE. Centrality could HURT precision on specific queries while helping open-domain."
+        }
+      }
+    },
+
+    "phase_2_fractal_atam": {
+      "core_pattern": "Hebbian associative learning: memories strengthened by co-activation, edges promoted through tiers, spreading activation discovers relevant subgraphs. All signals are QUERY-DEPENDENT except importance and recency.",
+      "paradigm_assessment": "Structural centrality is QUERY-INDEPENDENT (same for all queries). This is a paradigm shift: introducing a prior that doesn't depend on what the user is asking. Closest existing analogue: importance (also query-independent) and pinky_multiplier (global graph quality, same for all memories in a query).",
+
+      "consistency": {
+        "macro": "TENSION — The retrieval system is built around query-conditioned relevance. Centrality is unconditional. However, importance/recency are also unconditional, so precedent exists.",
+        "meso": "CONSISTENT — MemoryMetadata already stores query-independent fields (importance, access_count, elaboration_score). Centrality fits the schema pattern.",
+        "micro": "CONSISTENT — Additive signal with coefficient follows exact pattern of all other Layer 5 signals."
+      },
+
+      "pattern_breaks": [
+        "COMPUTATION MODEL: Entity salience is O(1) at ingestion. Centrality requires O(V+E) global view during maintenance. Different computational class for a metadata field.",
+        "STALENESS: All other MemoryMetadata fields are updated at the moment they change (access on retrieval, importance on remember, activation on decay). Centrality is updated on a timer, creating temporal lag.",
+        "SCOPE INVERSION: Centrality is computed on ENTITIES but stored on MEMORIES. The mapping (mean/max of entity centralities) loses the entity-level signal that spreading activation already uses directly."
+      ],
+
+      "trade_offs": [
+        {
+          "quality_attribute": "Open-domain recall",
+          "benefit": "Gateway memories (project summaries, key decisions) surface for broad queries like 'summarize project', 'what patterns'",
+          "cost": "Generic memories leak into specific query results. Precision on single-hop factual queries could degrade.",
+          "sensitivity": "Weight coefficient. At 2%, impact is bounded. At 5%+, precision degradation becomes measurable."
+        },
+        {
+          "quality_attribute": "Maintenance performance",
+          "benefit": "Degree centrality is O(V+E), same as existing apply_decay() which already does full edge scan",
+          "cost": "Betweenness centrality is O(V*E), 100-1000x slower than degree centrality for same graph",
+          "sensitivity": "Algorithm choice. Degree centrality is nearly free. Betweenness is a maintenance budget buster."
+        },
+        {
+          "quality_attribute": "Cold start fairness",
+          "benefit": "None — new memories always start with centrality=0.0",
+          "cost": "Systematic disadvantage for new memories until maintenance cycle computes centrality. Interacts with session_boost (0.03) which tries to compensate for signal-poor recent memories.",
+          "sensitivity": "Maintenance interval. Frequent heavy cycles reduce staleness but increase I/O."
+        }
+      ]
+    },
+
+    "phase_2_5_adversarial_challenge": {
+      "methodology": "Challenge all optimistic assumptions with concrete scenarios from the LOCOMO benchmark and architectural evidence.",
+
+      "challenge_1_orthogonality_claim": {
+        "claim": "Centrality is orthogonal to spreading activation because degree normalization suppresses hubs",
+        "challenge": "Degree normalization divides outgoing activation by sqrt(1+degree). This means hub entities spread LESS per edge but still accumulate MORE incoming activation from multiple paths. A hub entity at the intersection of 3 spreading paths gets 3x the activation regardless of degree normalization. The intersection boost in bidirectional spreading (BIDIRECTIONAL_INTERSECTION_BOOST) ALREADY rewards bridge entities. Centrality would be partially redundant with intersection boost.",
+        "evidence": "graph_retrieval.rs line 460-463: intersection entities get (forward + backward) * 1.5x boost. This IS a centrality signal — entities reached from multiple query focal points are structurally central WITH RESPECT TO the query.",
+        "verdict": "PARTIALLY CORRELATED. Spreading activation's intersection boost captures query-conditioned centrality for multi-entity queries. For single-entity queries, no intersection occurs, so pure centrality would be additive. For multi-entity queries, it's partially redundant."
+      },
+
+      "challenge_2_locomo_impact": {
+        "claim": "Open-domain queries Q15-Q19 would benefit from centrality",
+        "challenge": "Q15 (summarize project) already scores MRR=1.00. Q16 (biggest risks) scores 1.00. Q17 (focus next) scores 1.00. Q18 (what went well) scores 1.00. The ONLY failing open-domain query is Q19 (decision patterns, MRR=0.50). For Q19, the expected memories [52, 59] are specific decision-making memories. Would they have high centrality? Memory 52 is a decision, Memory 59 is a decision. They're NOT gateway/hub memories — they're specific episodic events. Centrality would NOT help Q19.",
+        "evidence": "benchmark_v0.5.0_locomo.md: Q15-Q18 all MRR=1.00. Only Q19 fails and its expected memories are episodic, not gateway.",
+        "verdict": "WEAK. 4/5 open-domain queries already succeed. The one failure (Q19) would not benefit from centrality."
+      },
+
+      "challenge_3_marginal_signal_at_2_percent": {
+        "claim": "2-3% additive signal provides meaningful ranking improvement",
+        "challenge": "Layer 5 has 21+ signals. The cross-encoder (Layer 5.3) reranks with full semantic understanding. Confidence gating (Layer 5.7) prunes low-confidence results. MMR diversification (Layer 5.4) reshuffles for diversity. The 0.02-0.03 additive centrality signal is computed BEFORE all of these post-processing layers. It can only affect ranking when two memories are within 0.02 of each other after all other signals — which the cross-encoder will then rerank anyway.",
+        "evidence": "recall.rs lines 2383-2402: final_score is a sum of 15+ additive terms. Then multiplied by feedback_multiplier * confidence_gate * pinky_multiplier. Then Layer 5.3 cross-encoder RERANKS using full pairwise comparison. The 0.02 centrality signal is noise after cross-encoder.",
+        "verdict": "VERY WEAK. Cross-encoder reranking at Layer 5.3 makes small additive pre-cross-encoder signals nearly irrelevant for final ranking."
+      },
+
+      "challenge_4_degree_centrality_vs_entity_density": {
+        "claim": "Centrality captures something entity_density (Signal 19) doesn't",
+        "challenge": "entity_density = (entity_refs.len() / 5.0).min(1.0) * 0.02. If memory_centrality = mean(entity_degree_centralities), and entity_degree_centrality = degree / max_degree, then memories with MORE entity_refs tend to connect to MORE parts of the graph (more diverse entity neighborhoods). entity_density is a rough proxy for the SUM of local centralities. The correlation is not perfect but is positive.",
+        "evidence": "types.rs:2350: entity_density uses entity_refs.len() directly. A memory referencing 5 high-degree entities vs 5 low-degree entities would have identical entity_density but different centrality. So centrality IS more nuanced — but the difference matters only when entity count is equal and degree varies.",
+        "verdict": "MARGINAL ORTHOGONALITY. Centrality adds nuance within the entity_density band but doesn't unlock a new information dimension."
+      },
+
+      "challenge_5_hub_penalty_already_exists": {
+        "claim": "High-centrality memories are unfairly suppressed by degree normalization",
+        "challenge": "Degree normalization (1/sqrt(1+degree)) is on OUTGOING activation from an entity. But entity_density and activation both already capture incoming signal accumulation. The suppression is deliberate (ACT-R fan effect). Adding centrality to UN-suppress hubs fights against the architectural intent of degree normalization.",
+        "evidence": "graph_retrieval.rs line 265-268: SPREADING_DEGREE_NORMALIZATION=true, 1/(1+edges.len()).sqrt(). Constants.rs:168 confirms this is intentionally on. The system DECIDED hub suppression is correct.",
+        "verdict": "ARCHITECTURAL CONFLICT. Centrality boost at Layer 5 fights degree normalization at Layer 2. The system would simultaneously suppress and boost hubs through different mechanisms."
+      }
+    },
+
+    "phase_3_scoring": {
+      "dimensions": {
+        "correctness": {
+          "score": 5.8,
+          "evidence_code": "Implementation is straightforward: degree centrality on entities, aggregate to memories, store in MemoryMetadata. Bincode backward compat with #[serde(default)] follows existing pattern (elaboration_score, fragment_demotion). No semantic errors in the proposed algorithm.",
+          "evidence_structural": "Pattern matches existing metadata evolution. However, the entity-to-memory aggregation function (mean vs max) has no principled basis — it's an arbitrary design choice that affects semantics."
+        },
+        "robustness": {
+          "score": 5.2,
+          "evidence_code": "Staleness between maintenance cycles (centrality=0.0 for new memories). No invalidation when graph mutates. graph_memory is Option — must handle None. All have straightforward mitigations.",
+          "evidence_structural": "Follows heavy-cycle-only pattern (like fact extraction). But fact extraction has dirty flag (fact_extraction_needed atomic bool) for demand-driven triggering. Centrality has no equivalent — always stale by some amount."
+        },
+        "security": {
+          "score": 7.0,
+          "evidence_code": "No auth, PII, or external data involved. Pure numeric computation on internal graph topology. No new attack surface.",
+          "evidence_structural": "Centrality is derived entirely from existing in-process data. No network calls, no user input parsing, no file I/O beyond existing RocksDB access."
+        },
+        "performance": {
+          "score": 5.5,
+          "evidence_code": "DEGREE centrality: O(V+E) — same cost as existing apply_decay() full scan. BETWEENNESS centrality: O(V*E) — 100-1000x more expensive, unacceptable. The proposal says 'degree centrality or betweenness' but only degree is viable.",
+          "evidence_structural": "Heavy cycle already does: full memory scan (all_memories_for_heavy), full edge scan (apply_decay), ONNX inference (fact extraction). Adding degree centrality adds ~10-20% to heavy cycle cost. Betweenness would 10-100x the cycle."
+        },
+        "maintainability": {
+          "score": 6.2,
+          "evidence_code": "New field on MemoryMetadata (1 line), new computation in maintenance (50-100 lines), new signal in Layer 5 (3 lines). Small surface area. Well-contained.",
+          "evidence_structural": "Adds a new computation model (global graph analysis) to a system that currently only does local graph operations (per-entity lookups, per-edge decay). Conceptual complexity increase."
+        },
+        "testability": {
+          "score": 6.5,
+          "evidence_code": "Unit-testable: build small graph, compute centrality, verify scores. Integration-testable: add memories, run maintenance, verify centrality propagates to scoring.",
+          "evidence_structural": "Existing test patterns in graph_memory.rs (test_hebbian_strengthen, etc.) provide templates. LOCOMO benchmark provides end-to-end regression."
+        },
+        "data_integrity": {
+          "score": 5.5,
+          "evidence_code": "Centrality stored in bincode alongside other MemoryMetadata. Same durability guarantees as existing fields. No additional consistency requirements beyond existing RocksDB guarantees.",
+          "evidence_structural": "Staleness is the data integrity concern. Centrality can be stale (computed minutes ago) while graph has changed. No mechanism to mark centrality as 'needs recompute' after graph mutation. Existing pattern (fact_extraction_needed dirty flag) not applied here."
+        },
+        "compliance": {
+          "score": 7.5,
+          "evidence_code": "No PII implications. Centrality is a derived numeric score from graph topology. Does not expose any user data or create new data flows.",
+          "evidence_structural": "No regulatory surface. Pure internal computation metric."
+        },
+        "scalability": {
+          "score": 4.8,
+          "evidence_code": "Degree centrality: O(V+E) viable to ~100K entities. Betweenness: NOT viable beyond 1K entities. For production graphs, degree centrality saturates at MAX_ENTITY_DEGREE=500 (all hub entities report same centrality due to degree cap).",
+          "evidence_structural": "MAX_ENTITY_DEGREE=500 caps entity degree. This means degree centrality has a ceiling — all entities at cap report identical centrality. The signal loses discriminative power as graphs mature and many entities hit the cap."
+        },
+        "observability": {
+          "score": 6.0,
+          "evidence_code": "Can be added to SignalAttribution (existing per-memory signal tracking). ConsolidationEvent variants exist for tracking maintenance changes.",
+          "evidence_structural": "Follows existing observability patterns (tracing::debug for computation, signal attribution for scoring contribution)."
+        },
+        "deployment_safety": {
+          "score": 6.8,
+          "evidence_code": "#[serde(default)] means old data works with new code. New field starts at 0.0 (neutral). No migration needed. Rollback: remove field, old bincode ignores trailing bytes.",
+          "evidence_structural": "Backward and forward compatible via serde defaults. Same deployment pattern as elaboration_score addition."
+        },
+        "documentation_ux": {
+          "score": 5.5,
+          "evidence_code": "Needs documentation of: what centrality means, why it exists, how it's computed, when it's stale, the entity-to-memory mapping function.",
+          "evidence_structural": "Existing signals have inline comments (see 'Signal 17: Activation level', 'Signal 19: Entity confidence'). Pattern established."
+        }
+      },
+      "total_score": 72.3,
+      "max_possible": 120.0,
+      "percentage": "60.3%",
+
+      "blockers": [],
+      "critical_warnings": [
+        "Scalability at 4.8 is close to blocker threshold. MAX_ENTITY_DEGREE=500 caps degree centrality's discriminative range for mature graphs.",
+        "Robustness at 5.2 — staleness between maintenance cycles creates systematic anti-recency bias that conflicts with session_boost."
+      ]
+    },
+
+    "phase_3_matrix": {
+      "quality": {
+        "score": 5.5,
+        "rationale": "Clean implementation pattern following MemoryMetadata evolution precedent. But the entity→memory aggregation is unprincipled and the degree cap undermines discriminative power."
+      },
+      "completeness": {
+        "score": 4.5,
+        "rationale": "Proposal specifies only degree or betweenness — betweenness is infeasible. Degree centrality with MAX_ENTITY_DEGREE=500 cap saturates. Neither eigenvector nor Katz centrality considered. No invalidation mechanism. No dirty flag for recomputation."
+      },
+      "performance": {
+        "score": 6.0,
+        "rationale": "Degree centrality adds ~10-20% to heavy maintenance cycle. Layer 5 cost is one f32 read + multiply-add (negligible). Betweenness is disqualified."
+      },
+      "utility": {
+        "score": 3.5,
+        "rationale": "LOCOMO benchmark shows 4/5 open-domain queries already at MRR=1.00. The one failure (Q19) would not benefit. Temporal failures (Q5, Q8, Q9) are time-based, not structure-based. Multi-hop failures (Q10) need entity co-occurrence, not hub detection. Cross-encoder reranking at Layer 5.3 absorbs small additive signals. Marginal utility is near zero on current benchmarks."
+      },
+      "coherence": {
+        "score": 4.0,
+        "rationale": "ARCHITECTURAL CONFLICT: Layer 2 spreading activation with degree normalization deliberately SUPPRESSES hub influence (ACT-R fan effect). Adding Layer 5 centrality boost that REWARDS hubs creates opposing forces in the same pipeline. The system would simultaneously say 'hubs are noisy, spread less activation' (Layer 2) and 'hubs are important, boost their score' (Layer 5)."
+      },
+      "cohesiveness": {
+        "score": 5.0,
+        "rationale": "Fits MemoryMetadata schema pattern. Fits Layer 5 additive signal pattern. But introduces global computation model (full-graph analysis) into a system of local operations. Conceptual seam."
+      },
+      "elasticity": {
+        "score": 5.5,
+        "rationale": "Weight coefficient is easily tunable. Centrality algorithm swappable (degree → PageRank → etc). But scaling beyond 100K entities requires algorithmic changes."
+      },
+      "function": {
+        "score": 4.0,
+        "rationale": "The stated goal (surface gateway memories for broad queries) is already achieved by existing signals: importance, access_count, entity_density, and cross-encoder semantic matching. The marginal functional contribution over existing signals is minimal."
+      },
+      "ease_of_use": {
+        "score": 7.0,
+        "rationale": "Invisible to users. No API changes. No configuration required. Automatically computed during maintenance. Pure backend enhancement."
+      }
+    },
+
+    "verdict": {
+      "recommendation": "DEFER — do not implement",
+      "confidence": "HIGH",
+
+      "summary": "Structural centrality is a theoretically sound concept that is largely redundant with existing retrieval signals in shodh-memory's architecture. Five specific findings drive this verdict:",
+
+      "key_findings": [
+        {
+          "finding": "Bidirectional intersection boost already captures query-conditioned centrality",
+          "detail": "PIPE-7's bidirectional spreading activation with intersection boost (graph_retrieval.rs:460-463) already rewards entities that are structurally central WITH RESPECT TO the query's focal entities. This is MORE useful than unconditional centrality because it is query-sensitive. Adding unconditional centrality provides marginal signal on top of this.",
+          "files": ["src/memory/graph_retrieval.rs"]
+        },
+        {
+          "finding": "Cross-encoder reranking at Layer 5.3 absorbs small additive signals",
+          "detail": "A 0.02-0.03 additive centrality signal at Layer 5 is computed BEFORE the cross-encoder (Layer 5.3) which does full pairwise semantic comparison. The cross-encoder can easily override a 0.02 difference. For centrality to matter, two memories must be (a) within 0.02 of each other after 21+ signals, (b) not reranked by cross-encoder, and (c) not reshuffled by MMR diversification. This triple-coincidence is extremely rare.",
+          "files": ["src/memory/recall.rs"]
+        },
+        {
+          "finding": "MAX_ENTITY_DEGREE=500 caps degree centrality's discriminative power",
+          "detail": "Degree centrality for mature graphs where many entities hit the degree cap will report identical centrality for all hub entities. The degree cap (MAX_ENTITY_DEGREE=500, enforced by prune_entity_if_over_degree) is the primary graph health mechanism. Centrality becomes less discriminative as the graph matures — exactly when you'd want it most.",
+          "files": ["src/graph_memory.rs", "src/constants.rs"]
+        },
+        {
+          "finding": "LOCOMO benchmark shows near-zero addressable failures",
+          "detail": "Current failing queries: Q5 (temporal), Q8 (temporal), Q9 (temporal), Q10 (multi-hop), Q19 (pattern recognition). None of these failure modes are 'a structurally important memory was ranked too low because the system didn't know it was a hub.' They are temporal resolution failures and entity co-occurrence failures. Centrality addresses a non-existent failure mode in current benchmarks.",
+          "files": ["evaluations/benchmark_v0.5.0_locomo.md"]
+        },
+        {
+          "finding": "Architectural contradiction with degree normalization",
+          "detail": "Spreading activation deliberately suppresses hubs via degree normalization (1/sqrt(1+degree), Anderson & Reder 1999 fan effect). Adding a centrality boost that rewards hubs creates opposing forces. This isn't necessarily wrong (different layers can have different priorities) but it means the net effect is unpredictable and hard to tune.",
+          "files": ["src/memory/graph_retrieval.rs", "src/constants.rs"]
+        }
+      ],
+
+      "when_to_reconsider": [
+        "When LOCOMO or LongMemEval shows a specific failure mode of 'structurally central memory ranked too low for a broad query'",
+        "When the cross-encoder is removed or disabled (currently it absorbs small signals)",
+        "When a user-facing query type 'summarize everything about X' is added that explicitly needs hub detection",
+        "When graph size exceeds 10K entities and traversal-based activation becomes too slow — pre-computed centrality could REPLACE spreading activation rather than supplement it"
+      ],
+
+      "alternative_if_needed": {
+        "approach": "Entity salience enrichment",
+        "detail": "Instead of adding centrality as a new MemoryMetadata field, enrich the existing EntityNode.salience field with degree information. salience currently uses mention_count + is_proper_noun. Adding degree_fraction (entity_degree / MAX_ENTITY_DEGREE) into the salience formula would automatically flow through spreading activation's existing salience-weighted initialization (graph_retrieval.rs line 669: initial_activation = ic_weight * (1 + SALIENCE_BOOST_FACTOR * normalized_salience)). This requires zero new infrastructure — just one formula change in the existing entity salience computation. The signal would be query-conditioned (through spreading activation) rather than unconditional (through Layer 5).",
+        "files": ["src/graph_memory.rs"],
+        "estimated_lines_changed": 5
+      }
+    }
+  }
+}
