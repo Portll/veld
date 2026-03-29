@@ -271,6 +271,14 @@ pub struct MemorySystem {
     /// Reference: Nader et al. (2000) — reconsolidation theory.
     reconsolidation_shadows:
         Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::ReconsolidationShadow>>>,
+
+    /// Signal attribution from the most recent semantic retrieval.
+    /// Records which scoring signals (BM25, vector, graph, cross-encoder, recency,
+    /// temporal match, entity overlap) contributed to each memory's ranking.
+    /// Populated during Layer 4 (RRF fusion) and Layer 5 (unified scoring).
+    /// Used for adaptive weight learning and retrieval diagnostics.
+    last_signal_attributions:
+        Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::SignalAttribution>>>,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -687,6 +695,10 @@ impl MemorySystem {
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            // Signal attribution from most recent semantic retrieval
+            last_signal_attributions: Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -749,6 +761,22 @@ impl MemorySystem {
                 }
             }
         })
+    }
+
+    /// Get signal attributions from the most recent semantic retrieval.
+    ///
+    /// Returns a snapshot of the attribution map. Each entry maps a MemoryId to
+    /// the scoring signals that contributed to its ranking. Useful for retrieval
+    /// diagnostics and adaptive weight learning.
+    pub fn last_signal_attributions(
+        &self,
+    ) -> std::collections::HashMap<MemoryId, types::SignalAttribution> {
+        self.last_signal_attributions.read().clone()
+    }
+
+    /// Get signal attribution for a specific memory from the most recent retrieval.
+    pub fn signal_attribution_for(&self, id: &MemoryId) -> Option<types::SignalAttribution> {
+        self.last_signal_attributions.read().get(id).cloned()
     }
 
     /// Store a new memory with an explicit ID.

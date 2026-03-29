@@ -12,8 +12,8 @@ use std::sync::Arc;
 use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, compression, consolidation, context_blocks, crud, facts, files, gap_analysis,
-    graph, health, ingest, integrations, lineage, mif, recall, remember, search, seed, sessions,
-    todos, users, visualization, webhooks,
+    graph, health, ingest, integrations, lineage, mif, pinky, recall, remember, search, seed,
+    sessions, todos, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -444,6 +444,13 @@ pub fn build_protected_routes(state: AppState) -> Router {
             post(ab_testing::record_ab_feedback),
         )
         .route("/api/ab/summary", get(ab_testing::get_ab_summary))
+        // =================================================================
+        // PINKY DIMENSION PUSH (GRAPH TOPOLOGICAL HEALTH)
+        // =================================================================
+        .route(
+            "/api/pinky/dimensions",
+            post(pinky::push_dimensions),
+        )
         // =================================================================
         // EXTERNAL INTEGRATIONS (BULK SYNC)
         // =================================================================

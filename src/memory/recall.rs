@@ -1209,9 +1209,10 @@ impl super::MemorySystem {
         // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
         // ===========================================================================
-        let (memory_ids, hebbian_scores): (
+        let (memory_ids, hebbian_scores, mut signal_attributions): (
             Vec<(MemoryId, f32)>,
             std::collections::HashMap<MemoryId, f32>,
+            std::collections::HashMap<MemoryId, SignalAttribution>,
         ) = {
             let get_content = |id: &MemoryId| -> Option<String> {
                 self.working_memory
@@ -1249,6 +1250,12 @@ impl super::MemorySystem {
             } else {
                 None
             };
+            // Signal attribution: capture component scores from hybrid search
+            // before reducing to (id, score) pairs. These track which signals
+            // contributed to each memory's ranking for adaptive weight learning.
+            let mut attr: std::collections::HashMap<MemoryId, SignalAttribution> =
+                std::collections::HashMap::new();
+
             let hybrid_ids = self
                 .hybrid_search
                 .search_with_dynamic_weights(
@@ -1262,7 +1269,19 @@ impl super::MemorySystem {
                 )
                 .map(|r| {
                     r.into_iter()
-                        .map(|x| (x.memory_id, x.score))
+                        .map(|x| {
+                            attr.insert(
+                                x.memory_id.clone(),
+                                SignalAttribution {
+                                    bm25_contribution: x.bm25_score.unwrap_or(0.0),
+                                    vector_contribution: x.vector_score.unwrap_or(0.0),
+                                    graph_contribution: x.graph_score.unwrap_or(0.0),
+                                    cross_encoder_contribution: x.rerank_score.unwrap_or(0.0),
+                                    ..Default::default()
+                                },
+                            );
+                            (x.memory_id, x.score)
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or(vector_results);
@@ -1321,6 +1340,12 @@ impl super::MemorySystem {
                 let activation_bonus = graph_w * 0.2 * activation.clamp(0.0, 1.0);
                 *fused.entry(id.clone()).or_insert(0.0) += rrf_score + activation_bonus;
                 heb.insert(id.clone(), *h);
+
+                // Signal attribution: record graph contribution for memories
+                // that came from graph traversal (may not have hybrid search data)
+                attr.entry(id.clone())
+                    .or_default()
+                    .graph_contribution = *activation;
             }
 
             // Hybrid (BM25+vector) results: pure RRF with density weight
@@ -1374,6 +1399,8 @@ impl super::MemorySystem {
                         fused.insert(id.clone(), TEMPORAL_RECALL_BOOST);
                         boosted_count += 1;
                     }
+                    // Signal attribution: mark temporal match
+                    attr.entry(id.clone()).or_default().temporal_match = true;
                 }
                 if boosted_count > 0 {
                     tracing::info!(
@@ -1516,6 +1543,8 @@ impl super::MemorySystem {
                             if let Some(score) = fused.get_mut(id) {
                                 *score += boost;
                             }
+                            // Signal attribution: mark entity overlap
+                            attr.entry(id.clone()).or_default().entity_overlap = true;
                         } else if overlap == 0 && !has_any_temporal_intent {
                             // Content-fallback: when no entity/tag overlap, check
                             // if query stems appear in memory content. Smaller boost
@@ -2060,7 +2089,7 @@ impl super::MemorySystem {
             let rerank_budget = 30_usize.max(query.max_results);
             res.truncate(rerank_budget);
             tracing::debug!("Layer 4: {} fused results (rerank budget={})", res.len(), rerank_budget);
-            (res, heb)
+            (res, heb, attr)
         };
 
         let t_fusion = recall_start.elapsed();
@@ -2433,6 +2462,34 @@ impl super::MemorySystem {
             "recall [layer:5] memory fetch + unified scoring"
         );
 
+        // Signal attribution: record recency contribution for fetched memories.
+        // Computed post-fetch using the same decay formula as the unified scoring
+        // closure so the attribution accurately reflects what was applied.
+        {
+            let recency_scale_attr = if query_text.to_lowercase().contains("last week")
+                || query_text.to_lowercase().contains("most recent")
+                || query_text.to_lowercase().contains("recent")
+                || query_text.to_lowercase().contains("latest")
+                || query_text.to_lowercase().contains("yesterday")
+                || query_text.to_lowercase().contains("today")
+            {
+                0.5_f32
+            } else {
+                query.recency_weight.unwrap_or(0.1)
+            };
+            for mem in &memories {
+                let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
+                let recency_val = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale_attr;
+                let has_temporal_match = !mem.experience.temporal_refs.is_empty()
+                    && has_temporal_query;
+                let entry = signal_attributions.entry(mem.id.clone()).or_default();
+                entry.recency_contribution = recency_val;
+                if has_temporal_match && !entry.temporal_match {
+                    entry.temporal_match = true;
+                }
+            }
+        }
+
         // Layer 5.1: TEMPORAL INVALIDATION FILTER
         // Remove memories whose valid_until timestamp has passed.
         {
@@ -2482,6 +2539,11 @@ impl super::MemorySystem {
                         // Blend: 88% unified score + 12% cross-encoder score
                         for mem in memories.iter_mut().take(rerank_budget) {
                             if let Some(&ce_score) = ce_scores.get(&mem.id) {
+                                // Signal attribution: record cross-encoder contribution
+                                signal_attributions
+                                    .entry(mem.id.clone())
+                                    .or_default()
+                                    .cross_encoder_contribution = ce_score;
                                 let base = mem.score.unwrap_or(0.0);
                                 let blended = base * 0.88 + ce_score * 0.12;
                                 let mut cloned: Memory = mem.as_ref().clone();
@@ -3059,6 +3121,19 @@ impl super::MemorySystem {
             final_count = memories.len(),
             "recall [layer:post] linguistic + competition + coactivation + hierarchy === RECALL COMPLETE ==="
         );
+
+        // Persist signal attributions from this retrieval. Only keep attributions
+        // for memories that survived all filtering/competition stages.
+        {
+            let final_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
+            let mut attr_guard = self.last_signal_attributions.write();
+            attr_guard.clear();
+            for (id, attribution) in signal_attributions {
+                if final_ids.contains(&id) {
+                    attr_guard.insert(id, attribution);
+                }
+            }
+        }
 
         Ok(memories)
     }
