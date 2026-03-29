@@ -1570,6 +1570,36 @@ impl super::MemorySystem {
             }
 
             // ===========================================================================
+            // LAYER 4.527: BM25 SPECIFICITY DISCOUNT
+            // ===========================================================================
+            // When a memory has high BM25 contribution but ZERO entity overlap with
+            // the query, the BM25 match is likely peripheral (the term appears in
+            // content but the memory isn't ABOUT that topic). Apply a small discount
+            // to prevent these peripheral matches from outranking focused memories.
+            {
+                let mut discounted = 0usize;
+                let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                for id in &ids {
+                    let a = attr.get(id);
+                    let has_entity_overlap = a.map(|a| a.entity_overlap).unwrap_or(false);
+                    let bm25 = a.map(|a| a.bm25_contribution).unwrap_or(0.0);
+                    // Very high BM25 (>0.5) but no entity overlap = peripheral mention
+                    if bm25 > 0.5 && !has_entity_overlap {
+                        if let Some(score) = fused.get_mut(id) {
+                            *score *= 0.95; // 5% discount
+                            discounted += 1;
+                        }
+                    }
+                }
+                if discounted > 0 {
+                    tracing::debug!(
+                        "Layer 4.527: BM25 specificity discount applied to {} memories",
+                        discounted
+                    );
+                }
+            }
+
+            // ===========================================================================
             // LAYER 4.53: SPECIFICITY PENALTY
             // ===========================================================================
             // Retrospective/summary memories mention many topics and score well on
