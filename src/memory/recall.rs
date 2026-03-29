@@ -1335,8 +1335,10 @@ impl super::MemorySystem {
                     for id in &ids {
                         if let Some(exp_type) = get_experience_type(id) {
                             if matches!(exp_type, crate::memory::types::ExperienceType::Decision) {
-                                *fused.get_mut(id).unwrap() += DECISION_TYPE_BOOST;
-                                boosted_count += 1;
+                                if let Some(score) = fused.get_mut(id) {
+                                    *score += DECISION_TYPE_BOOST;
+                                    boosted_count += 1;
+                                }
                             }
                         }
                     }
@@ -1708,8 +1710,10 @@ impl super::MemorySystem {
                                     let boost = (PROSPECTIVE_BOOST_PER_MATCH
                                         * (match_count as f32).sqrt())
                                     .min(MAX_PROSPECTIVE_BOOST);
-                                    *fused.get_mut(id).unwrap() += boost;
-                                    boosted_count += 1;
+                                    if let Some(score) = fused.get_mut(id) {
+                                        *score += boost;
+                                        boosted_count += 1;
+                                    }
                                 }
                             }
                         }
