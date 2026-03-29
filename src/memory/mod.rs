@@ -1630,10 +1630,11 @@ impl MemorySystem {
                 .zip(entity_embeddings)
                 .map(|(entity_name, embedding)| {
                     let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
+                    let labels = vec![label];
                     crate::graph_memory::EntityNode {
                         uuid: Uuid::new_v4(),
                         name: entity_name.clone(),
-                        labels: vec![label],
+                        labels: labels.clone(),
                         created_at: now,
                         last_seen_at: now,
                         mention_count: 1,
@@ -1646,6 +1647,7 @@ impl MemorySystem {
                             .next()
                             .map(|c| c.is_uppercase())
                             .unwrap_or(false),
+                        pii_classification: crate::graph_memory::PiiClassification::from_labels(&labels),
                     }
                 })
                 .collect();
@@ -3884,6 +3886,33 @@ impl MemorySystem {
         Ok((storage_count, indexed))
     }
 
+    /// Re-embed all memories with context-prefixed embeddings (v0.7.2 migration).
+    ///
+    /// Clears pre-computed embeddings and re-indexes every memory through the
+    /// new `extract_searchable_text()` path which prepends `[project | topic | type]`.
+    /// Returns (re-embedded count, failed count).
+    pub fn reembed_all(&self) -> Result<(usize, usize)> {
+        tracing::info!("Starting context-prefix re-embedding migration");
+        let result = self.retriever.reembed_all()?;
+
+        // Clear content embedding cache — all entries are now stale
+        self.content_cache.invalidate_all();
+
+        // Update stats
+        {
+            let mut stats = self.stats.write();
+            stats.vector_index_count = self.retriever.len();
+        }
+
+        tracing::info!(
+            reembedded = result.0,
+            failed = result.1,
+            "Re-embedding migration complete"
+        );
+
+        Ok(result)
+    }
+
     /// Save vector index to disk (shutdown persistence)
     /// Uses Vamana persistence format for instant startup on restart
     pub fn save_vector_index(&self, _path: &Path) -> Result<()> {
@@ -4027,10 +4056,11 @@ impl MemorySystem {
         for fact in facts {
             // Ensure all related entities exist as graph nodes
             for entity_name in &fact.related_entities {
+                let labels = vec![crate::graph_memory::EntityLabel::Concept];
                 let entity = crate::graph_memory::EntityNode {
                     uuid: Uuid::new_v4(),
                     name: entity_name.clone(),
-                    labels: vec![crate::graph_memory::EntityLabel::Concept],
+                    labels: labels.clone(),
                     created_at: now,
                     last_seen_at: now,
                     mention_count: 1,
@@ -4043,6 +4073,7 @@ impl MemorySystem {
                         .next()
                         .map(|c| c.is_uppercase())
                         .unwrap_or(false),
+                    pii_classification: crate::graph_memory::PiiClassification::from_labels(&labels),
                 };
                 if graph_guard.add_entity(entity).is_ok() {
                     entities_added += 1;
@@ -4368,10 +4399,11 @@ impl MemorySystem {
                     .zip(entity_embeddings)
                     .map(|(entity_name, embedding)| {
                         let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
+                        let labels = vec![label];
                         crate::graph_memory::EntityNode {
                             uuid: Uuid::new_v4(),
                             name: entity_name.clone(),
-                            labels: vec![label],
+                            labels: labels.clone(),
                             created_at: now,
                             last_seen_at: now,
                             mention_count: 1,
@@ -4384,6 +4416,7 @@ impl MemorySystem {
                                 .next()
                                 .map(|c| c.is_uppercase())
                                 .unwrap_or(false),
+                            pii_classification: crate::graph_memory::PiiClassification::from_labels(&labels),
                         }
                     })
                     .collect();

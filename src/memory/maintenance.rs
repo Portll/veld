@@ -1245,6 +1245,15 @@ impl super::MemorySystem {
             timestamp: now,
         });
 
+        // APP-5: Drift-adaptive abstention threshold calibration.
+        // Sample memories from long-term storage and compute the 5th percentile of
+        // importance × confidence. As the corpus grows, the score distribution shifts;
+        // a static threshold silently over-filters. This recalibrates every maintenance
+        // cycle so the system adapts to its own growth.
+        if is_heavy {
+            self.calibrate_abstention_threshold();
+        }
+
         tracing::debug!(
             "Maintenance complete: {} memories decayed (factor={}), {} at risk, {} replayed, took {}ms",
             decayed_count,
@@ -1263,6 +1272,73 @@ impl super::MemorySystem {
             facts_extracted: facts_extracted_count,
             facts_reinforced: facts_reinforced_count,
         })
+    }
+
+    // =========================================================================
+    // DRIFT-ADAPTIVE ABSTENTION (APP-5)
+    // =========================================================================
+
+    /// Calibrate the abstention threshold from the current corpus distribution.
+    ///
+    /// Samples up to 200 memories from long-term storage, computes importance ×
+    /// calibrated_confidence for each, and sets the threshold at the 5th percentile.
+    /// This ensures the threshold tracks corpus growth: as more memories accumulate
+    /// and the score distribution shifts, the threshold auto-adjusts rather than
+    /// silently over-filtering.
+    fn calibrate_abstention_threshold(&self) {
+        use crate::memory::storage::SearchCriteria;
+
+        // Sample memories across the importance spectrum (most representative of distribution)
+        let sample = match self.long_term_memory.search(SearchCriteria::ByImportance {
+            min: 0.0,
+            max: 1.0,
+        }) {
+            Ok(mems) => mems,
+            Err(e) => {
+                tracing::debug!("Abstention calibration skipped: {e}");
+                return;
+            }
+        };
+
+        if sample.len() < 20 {
+            // Too few memories to calibrate reliably — keep using static threshold
+            return;
+        }
+
+        // Compute importance × confidence for each memory with sufficient observations
+        let mut scores: Vec<f32> = sample
+            .iter()
+            .filter(|m| m.confidence_observations() > 4.0)
+            .map(|m| m.importance() * m.calibrated_confidence())
+            .collect();
+
+        if scores.len() < 10 {
+            // Not enough feedback-observed memories to calibrate
+            return;
+        }
+
+        scores.sort_by(|a, b| a.total_cmp(b));
+
+        // 5th percentile: low enough to avoid over-filtering, high enough to cut noise
+        let p5_idx = (scores.len() as f32 * 0.05).ceil() as usize;
+        let p5_idx = p5_idx.min(scores.len() - 1);
+        let calibrated = scores[p5_idx];
+
+        // Clamp: never go below half the static threshold (safety floor)
+        // and never go above 2× (don't over-filter if distribution is skewed)
+        let static_threshold = crate::constants::ABSTENTION_THRESHOLD;
+        let clamped = calibrated.clamp(static_threshold * 0.5, static_threshold * 2.0);
+
+        self.calibrated_abstention_threshold
+            .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+        tracing::info!(
+            samples = scores.len(),
+            p5 = calibrated,
+            clamped,
+            static_threshold,
+            "APP-5: Calibrated abstention threshold"
+        );
     }
 
     // =========================================================================

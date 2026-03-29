@@ -23,7 +23,7 @@ use crate::constants::{
     PREFETCH_RECENCY_PARTIAL_HOURS, PREFETCH_TEMPORAL_WINDOW_HOURS,
     VECTOR_SEARCH_CANDIDATE_MULTIPLIER,
 };
-use crate::embeddings::{minilm::MiniLMEmbedder, Embedder};
+use crate::embeddings::Embedder;
 use crate::vector_db::vamana::{VamanaConfig, VamanaIndex};
 
 /// Filename for persisted Vamana index (instant startup)
@@ -48,7 +48,7 @@ const VAMANA_INDEX_FILE: &str = "vamana.idx";
 /// which is managed at the API layer (MultiUserMemoryManager.graph_memories)
 pub struct RetrievalEngine {
     storage: Arc<MemoryStorage>,
-    embedder: Arc<MiniLMEmbedder>,
+    embedder: Arc<dyn Embedder>,
     /// Lock order: 1 - Acquire first
     vector_index: Arc<RwLock<VamanaIndex>>,
     /// Lock order: 2
@@ -148,7 +148,7 @@ impl RetrievalEngine {
     /// - Vector mappings are stored atomically with memories in RocksDB
     /// - Vamana index is rebuilt from RocksDB on startup (pure in-memory cache)
     /// - No more file-based IdMapping = no more orphaned memories
-    pub fn new(storage: Arc<MemoryStorage>, embedder: Arc<MiniLMEmbedder>) -> Result<Self> {
+    pub fn new(storage: Arc<MemoryStorage>, embedder: Arc<dyn Embedder>) -> Result<Self> {
         Self::with_event_buffer(storage, embedder, None)
     }
 
@@ -163,7 +163,7 @@ impl RetrievalEngine {
     /// ATOMIC STARTUP: Rebuilds Vamana from RocksDB mappings for crash safety.
     pub fn with_event_buffer(
         storage: Arc<MemoryStorage>,
-        embedder: Arc<MiniLMEmbedder>,
+        embedder: Arc<dyn Embedder>,
         consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
     ) -> Result<Self> {
         let storage_path = storage.path().to_path_buf();
@@ -768,9 +768,59 @@ impl RetrievalEngine {
     }
 
     /// Extract searchable text from memory
-    fn extract_searchable_text(memory: &Memory) -> String {
-        // Start with main content
-        let mut text = memory.experience.content.clone();
+    /// Build searchable text for embedding. Context is PREPENDED so that every
+    /// chunk produced by the chunker carries origin information — "token expiry"
+    /// in an auth project embeds differently from "token expiry" in a cache project.
+    ///
+    /// This is the single source of truth for embedding input. Both the synchronous
+    /// `index_memory()` path and the deferred `embed_and_index()` path must use this.
+    pub fn extract_searchable_text(memory: &Memory) -> String {
+        // Build context prefix: "[project | topic | type] "
+        let mut prefix_parts: Vec<&str> = Vec::new();
+
+        // Collect borrowed references to context fields
+        let mut project_name_storage = None;
+        let mut topic_storage = None;
+
+        if let Some(context) = &memory.experience.context {
+            if let Some(name) = &context.project.name {
+                project_name_storage = Some(name.as_str());
+            }
+            if let Some(topic) = &context.conversation.topic {
+                topic_storage = Some(topic.as_str());
+            }
+        }
+
+        if let Some(name) = project_name_storage {
+            prefix_parts.push(name);
+        }
+        if let Some(topic) = topic_storage {
+            prefix_parts.push(topic);
+        }
+
+        // Experience type as context signal
+        let type_str = format!("{:?}", memory.experience.experience_type);
+
+        if !type_str.is_empty() {
+            prefix_parts.push(&type_str);
+        }
+
+        // Build: "[prefix] content entities outcomes emotion episode"
+        let mut text = if !prefix_parts.is_empty() {
+            let mut t = String::with_capacity(
+                prefix_parts.iter().map(|p| p.len()).sum::<usize>()
+                    + 6 // brackets + separators
+                    + memory.experience.content.len()
+                    + 128, // headroom
+            );
+            t.push('[');
+            t.push_str(&prefix_parts.join(" | "));
+            t.push_str("] ");
+            t.push_str(&memory.experience.content);
+            t
+        } else {
+            memory.experience.content.clone()
+        };
 
         // Add entities
         if !memory.experience.entities.is_empty() {
@@ -778,22 +828,12 @@ impl RetrievalEngine {
             text.push_str(&memory.experience.entities.join(" "));
         }
 
-        // Add rich context if available
+        // Add rich context fields that improve semantic matching
         if let Some(context) = &memory.experience.context {
-            // Add conversation topic
-            if let Some(topic) = &context.conversation.topic {
-                text.push(' ');
-                text.push_str(topic);
-            }
             // Add recent conversation messages
             if !context.conversation.recent_messages.is_empty() {
                 text.push(' ');
                 text.push_str(&context.conversation.recent_messages.join(" "));
-            }
-            // Add project name
-            if let Some(name) = &context.project.name {
-                text.push(' ');
-                text.push_str(name);
             }
 
             // SHO-104: Add emotional context - emotion labels improve semantic matching
@@ -880,7 +920,7 @@ impl RetrievalEngine {
         // - Orthogonal vectors have dot ≈ 0.0, so distance ≈ 0.0
         // Convert: similarity = -distance (so similarity = dot product = cosine similarity)
         let id_mapping = self.id_mapping.read();
-        let mut best_scores: std::collections::HashMap<MemoryId, f32> =
+        let mut all_chunk_scores: std::collections::HashMap<MemoryId, Vec<f32>> =
             std::collections::HashMap::new();
 
         for (vector_id, distance) in results {
@@ -896,20 +936,32 @@ impl RetrievalEngine {
                     }
                 }
 
-                // Keep the highest similarity for each memory (best matching chunk)
-                best_scores
+                // Collect all chunk scores per memory for multi-chunk aggregation
+                all_chunk_scores
                     .entry(memory_id.clone())
-                    .and_modify(|score| {
-                        if similarity > *score {
-                            *score = similarity;
-                        }
-                    })
-                    .or_insert(similarity);
+                    .or_default()
+                    .push(similarity);
             }
         }
 
-        // Convert to vec and sort by similarity descending (highest first)
-        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
+        // Multi-chunk score aggregation: a memory whose answer spans chunks 2-4
+        // but whose best single chunk only scores 0.3 should outrank a memory with
+        // one chunk at 0.35 and nothing else. When a memory has multiple high-scoring
+        // chunks, this is evidence of distributed relevance across the content.
+        let mut memory_ids: Vec<(MemoryId, f32)> = all_chunk_scores
+            .into_iter()
+            .map(|(id, mut scores)| {
+                scores.sort_by(|a, b| b.total_cmp(a));
+                let agg = if scores.len() >= 2 {
+                    // Top-2 weighted average: 60% best + 40% second-best
+                    // Rewards distributed relevance without over-rewarding noise
+                    scores[0] * 0.6 + scores[1] * 0.4
+                } else {
+                    scores[0]
+                };
+                (id, agg)
+            })
+            .collect();
         memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1));
         memory_ids.truncate(limit);
 
@@ -1413,6 +1465,87 @@ impl RetrievalEngine {
         );
 
         Ok(())
+    }
+
+    /// Re-embed all memories with fresh context-prefixed embeddings.
+    ///
+    /// Migration path for APP-1: existing memories have context-free embeddings
+    /// from before v0.7.2. This clears each memory's pre-computed embedding,
+    /// forcing `index_memory()` to re-generate it through `extract_searchable_text()`
+    /// which now prepends `[project | topic | type]` context prefixes.
+    ///
+    /// Uses `reindex_memory()` which soft-deletes old vectors and creates new ones.
+    /// Safe to call while the system is serving queries (reads from stale vectors
+    /// until the new ones are indexed).
+    pub fn reembed_all(&self) -> Result<(usize, usize)> {
+        let all_ids = self.storage.get_all_ids()?;
+        let total = all_ids.len();
+
+        if total == 0 {
+            tracing::info!("No memories to re-embed");
+            return Ok((0, 0));
+        }
+
+        tracing::info!("Starting context-prefix re-embedding migration: {} memories", total);
+        let start_time = std::time::Instant::now();
+        let mut reembedded = 0;
+        let mut failed = 0;
+
+        for (i, memory_id) in all_ids.iter().enumerate() {
+            match self.storage.get(memory_id) {
+                Ok(mut memory) => {
+                    if memory.is_forgotten() {
+                        continue;
+                    }
+
+                    // Clear pre-computed embedding to force re-generation
+                    // through extract_searchable_text() → encode()
+                    memory.experience.embeddings = None;
+
+                    // Persist the cleared embedding so deferred path also re-generates
+                    if let Err(e) = self.storage.update(&memory) {
+                        tracing::warn!("Failed to clear embedding for {}: {e}", memory_id.0);
+                        failed += 1;
+                        continue;
+                    }
+
+                    // Re-index: removes old vectors, creates new ones with context prefix
+                    match self.reindex_memory(&memory) {
+                        Ok(_) => reembedded += 1,
+                        Err(e) => {
+                            tracing::warn!("Failed to re-embed {}: {e}", memory_id.0);
+                            failed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load {}: {e}", memory_id.0);
+                    failed += 1;
+                }
+            }
+
+            if (i + 1) % 500 == 0 || i + 1 == total {
+                let elapsed = start_time.elapsed().as_secs();
+                let rate = if elapsed > 0 {
+                    reembedded as f64 / elapsed as f64
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    "Re-embed progress: {}/{} ({:.1}%), {} done, {} failed, {:.0}/sec",
+                    i + 1, total,
+                    (i + 1) as f64 / total as f64 * 100.0,
+                    reembedded, failed, rate
+                );
+            }
+        }
+
+        tracing::info!(
+            "Re-embed migration complete: {} re-embedded, {} failed (total: {})",
+            reembedded, failed, total
+        );
+
+        Ok((reembedded, failed))
     }
 
     // NOTE: Memory graph functionality has been consolidated into GraphMemory

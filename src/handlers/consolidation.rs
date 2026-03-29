@@ -797,6 +797,30 @@ pub async fn rebuild_index(
     }))
 }
 
+/// Re-embed all memories with context-prefixed embeddings (v0.7.2 migration)
+///
+/// Clears pre-computed embeddings and re-indexes every memory through the new
+/// `extract_searchable_text()` path which prepends [project | topic | type].
+pub async fn reembed_all(
+    State(state): State<AppState>,
+    Json(req): Json<RebuildIndexRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory_sys = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let memory_guard = memory_sys.read();
+    let (reembedded, failed) = memory_guard.reembed_all().map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "reembedded": reembedded,
+        "failed": failed,
+    })))
+}
+
 // =============================================================================
 // BACKUP & RESTORE
 // =============================================================================
