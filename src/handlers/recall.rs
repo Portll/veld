@@ -191,11 +191,31 @@ pub struct ProactiveSurfacedMemory {
     pub created_at: String,
     pub tags: Vec<String>,
     pub tier: String,
-    /// Why this memory was surfaced ("semantic", "entity", "combined")
+    /// Why this memory was surfaced ("semantic", "entity", "combined", "co_activation")
     pub relevance_reason: String,
     /// Entities from this memory that matched the query context
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_entities: Vec<String>,
+    // -----------------------------------------------------------------
+    // FIX-R4: Temporal distance + intrusion score markers
+    // Reference: Ehlers & Clark (2000) — "nowness" explains 43% of
+    // intrusion impact. These fields let Claude distinguish intrusive
+    // (co-activated) from voluntary (genuine semantic match) retrieval.
+    // -----------------------------------------------------------------
+    /// Hours since this memory was first created
+    pub hours_since_created: f32,
+    /// Hours since this memory was last accessed/retrieved
+    pub hours_since_last_accessed: f32,
+    /// Number of times this memory has been retrieved
+    pub access_count: u32,
+    /// Current activation level (0.0 = dormant, 1.0 = labile/active)
+    pub activation_level: f32,
+    /// How this memory was triggered: "semantic" | "entity" | "co_activation" | "combined"
+    pub retrieval_trigger: String,
+    /// Intrusion score: high activation + recent access = likely co-activation intrusion.
+    /// Low activation + old access = genuine semantic match.
+    /// Formula: activation * (1.0 / hours_since_last_accessed.max(0.1))
+    pub intrusion_score: f32,
     /// Embedding for semantic feedback (not serialized to response)
     #[serde(skip)]
     pub embedding: Vec<f32>,
@@ -1532,6 +1552,23 @@ pub async fn proactive_context(
                     }
                     .to_string();
 
+                    // FIX-R4: Compute temporal distance + intrusion markers
+                    let now = chrono::Utc::now();
+                    let hours_since_created =
+                        (now - m.created_at).num_minutes() as f32 / 60.0;
+                    let hours_since_last_accessed =
+                        (now - m.last_accessed()).num_minutes() as f32 / 60.0;
+                    let access_count = m.access_count();
+                    let activation_level = m.activation();
+                    let intrusion_score = activation_level
+                        * (1.0 / hours_since_last_accessed.max(0.1));
+                    // FIX-R1: Detect co-activation via reconsolidation shadow
+                    let retrieval_trigger = if memory_guard.has_active_shadow(&m.id) {
+                        "co_activation".to_string()
+                    } else {
+                        relevance_reason.clone()
+                    };
+
                     ProactiveSurfacedMemory {
                         id: m.id.0.to_string(),
                         content: m.experience.content.clone(),
@@ -1543,6 +1580,12 @@ pub async fn proactive_context(
                         tier: format!("{:?}", m.tier),
                         relevance_reason,
                         matched_entities: matched,
+                        hours_since_created,
+                        hours_since_last_accessed,
+                        access_count,
+                        activation_level,
+                        retrieval_trigger,
+                        intrusion_score,
                         embedding: m.experience.embeddings.clone().unwrap_or_default(),
                     }
                 })

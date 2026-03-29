@@ -2262,6 +2262,71 @@ pub const TIER_RETRIEVAL_SUCCESS_BOOST: f32 = 0.25;
 pub const TIER_LTP_THRESHOLD: f32 = 0.8;
 
 // =============================================================================
+// INTRUSIVE RECOLLECTION ARCHITECTURE (Berntsen functional constraints)
+// Based on: Ehlers & Clark (2000), Berntsen (2021), Nader et al. (2000)
+// =============================================================================
+
+/// Maximum fragment demotion factor (how much a source fragment's score is reduced
+/// when a consolidated fact exists). 0.6 = up to 60% score reduction.
+///
+/// Justification:
+/// - Ehlers & Clark (2000): poorly elaborated S-rep fragments should be demoted
+///   once a contextualized C-rep fact has been consolidated from them
+/// - 60% is aggressive enough to push fragments below facts in ranking
+///   but not so aggressive that provenance browsing is impossible
+pub const FRAGMENT_DEMOTION_MAX_FACTOR: f32 = 0.6;
+
+/// Minimum fragment score multiplier (floor). Fragments are never fully suppressed,
+/// preserving provenance traceability.
+///
+/// Justification:
+/// - Matches IMPORTANCE_FLOOR philosophy: allow recovery if fact is later invalidated
+/// - 0.1 = fragment still retrievable with very targeted queries
+pub const FRAGMENT_DEMOTION_FLOOR: f32 = 0.1;
+
+/// Similarity gate: fact-to-source cosine similarity must exceed this threshold
+/// before the source fragment is demoted. Prevents bad facts from suppressing
+/// good fragments.
+///
+/// Justification:
+/// - Quality gate already uses ~0.7 for fact validation (CONSOLIDATION_QUALITY_GATE_THRESHOLD)
+/// - Consistency: same standard for "fact faithfully represents source"
+pub const FRAGMENT_DEMOTION_SIMILARITY_GATE: f32 = 0.7;
+
+/// MMR lambda for exploratory queries (strong diversity preference).
+/// score_mmr = lambda * relevance - (1-lambda) * max_similarity_to_selected
+///
+/// Justification:
+/// - Berntsen (2021): involuntary memories should emphasize diverse, situation-relevant content
+/// - 0.6 strongly penalizes redundancy while still favoring relevance
+/// - Pattern separation (dentate gyrus analog): prevents similar memories from co-activating
+pub const MMR_LAMBDA_EXPLORATORY: f32 = 0.6;
+
+/// MMR lambda for relationship/temporal queries (moderate diversity).
+///
+/// Justification:
+/// - Relationship queries benefit from diverse connection paths
+/// - 0.7 allows more relevance weight while still preventing near-duplicates
+pub const MMR_LAMBDA_RELATIONSHIP: f32 = 0.7;
+
+/// Duration of the reconsolidation labile window in seconds.
+///
+/// Justification:
+/// - Nader et al. (2000): retrieved memories become transiently labile (~6 hours in rats)
+/// - 300s (5 minutes) is appropriate for session-based AI interaction
+/// - Balances between allowing meaningful context integration and preventing stale windows
+pub const RECONSOLIDATION_LABILE_WINDOW_SECS: i64 = 300;
+
+/// Maximum number of active reconsolidation shadows.
+/// Prevents memory exhaustion from rapid retrieval bursts.
+pub const RECONSOLIDATION_MAX_ACTIVE_SHADOWS: usize = 20;
+
+/// Consecutive retrieval threshold for working memory detection.
+/// If a memory is retrieved this many times consecutively, it stays labile
+/// (working memory behavior — continuously accessed = continuously updatable).
+pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
+
+// =============================================================================
 // CONSTANTS USAGE DOCUMENTATION
 // =============================================================================
 //
