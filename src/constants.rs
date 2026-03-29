@@ -42,10 +42,13 @@ pub const HEBBIAN_DECAY_MISLEADING: f32 = 0.10;
 /// becomes useful again in a different context.
 ///
 /// Justification:
-/// - 5% floor prevents complete forgetting of potentially useful memories
+/// - Must be ≥ ABSTENTION_THRESHOLD to prevent permanent forgetting trap
+///   (floor × max_confidence(1.0) must exceed abstention threshold, otherwise
+///   every memory that decays to floor is permanently hidden from retrieval)
+/// - 12% floor guarantees floor × 1.0 = 0.12 > ABSTENTION_THRESHOLD (0.10)
 /// - Matches "savings" effect in human memory (relearning is faster than learning)
 /// - Allows for context-dependent recovery
-pub const IMPORTANCE_FLOOR: f32 = 0.05;
+pub const IMPORTANCE_FLOOR: f32 = 0.12;
 
 /// Abstention threshold: when importance × calibrated_confidence falls below
 /// this value, the memory is excluded from retrieval results (the system
@@ -1602,6 +1605,14 @@ pub const LOG_PERIODIC_BETA: f64 = 0.15;
 /// - 365.0: Yearly rhythm (seasonal/annual patterns)
 pub const LOG_PERIODIC_SCALES: [f64; 3] = [7.0, 30.0, 365.0];
 
+/// Decay multiplier for edges where at least one endpoint is a Person entity.
+/// 3× faster decay to accelerate PII removal from the graph.
+pub const PERSON_EDGE_DECAY_MULTIPLIER: f64 = 3.0;
+
+/// Decay multiplier for edges where at least one endpoint is an Organization entity.
+/// 1.5× faster decay for organizational PII.
+pub const ORGANIZATION_EDGE_DECAY_MULTIPLIER: f64 = 1.5;
+
 // =============================================================================
 // INFORMATION CONTENT (IC) WEIGHTS
 // Based on linguistic analysis for query parsing
@@ -2301,6 +2312,16 @@ pub const FRAGMENT_DEMOTION_SIMILARITY_GATE: f32 = 0.7;
 /// - 0.6 strongly penalizes redundancy while still favoring relevance
 /// - Pattern separation (dentate gyrus analog): prevents similar memories from co-activating
 pub const MMR_LAMBDA_EXPLORATORY: f32 = 0.6;
+
+/// MMR lambda for abstract/decomposed queries (strongest diversity preference).
+/// score_mmr = lambda * relevance - (1-lambda) * max_similarity_to_selected
+///
+/// Justification:
+/// - Abstract queries ("performance improvements", "key people") need results from
+///   multiple semantic clusters (caching, payments, onboarding are all different neighborhoods)
+/// - 0.5 equally weights relevance and diversity, maximizing coverage across clusters
+/// - Without strong diversity, the top-K fills with the one cluster closest to the query vector
+pub const MMR_LAMBDA_ABSTRACT: f32 = 0.5;
 
 /// MMR lambda for relationship/temporal queries (moderate diversity).
 ///

@@ -30,6 +30,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 // ============================================================================
 // SHALLOW PARSING / CHUNKING MODULE
@@ -701,6 +702,42 @@ pub fn classify_query(query: &str) -> QueryType {
 
     // Default to exploratory
     QueryType::Exploratory
+}
+
+/// Detect whether a query contains lexical identifiers that score poorly on
+/// vector similarity (ticket IDs, version strings, error codes, UUIDs, etc.).
+///
+/// Lexical identifiers are out-of-vocabulary for embedding models and produce
+/// lower cosine similarity than semantically equivalent natural language. The
+/// abstention threshold should be relaxed for such queries to prevent filtering
+/// out correct but low-scoring results.
+///
+/// Detected patterns:
+/// - Ticket/issue IDs: SHO-72, JIRA-123, #456
+/// - Version strings: v1.2.3, 0.7.0
+/// - Error codes: ECONNREFUSED, E0308, HTTP 404
+/// - UUIDs: 550e8400-e29b-41d4-a716-446655440000
+/// - Technical identifiers: bge-small-en-v1.5, ms-marco-MiniLM-L-6-v2
+pub fn has_lexical_identifiers(query: &str) -> bool {
+    static LEXICAL_PATTERNS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+        vec![
+            // Ticket IDs: ABC-123, SHO-72, PIPE-3
+            regex::Regex::new(r"\b[A-Z]{2,10}-\d{1,6}\b").unwrap(),
+            // Version strings: v1.2.3, 0.7.0, v2
+            regex::Regex::new(r"\bv?\d+\.\d+(?:\.\d+)?\b").unwrap(),
+            // Error codes: ECONNREFUSED, E0308 (uppercase + digits, ≥5 chars)
+            regex::Regex::new(r"\b[A-Z][A-Z0-9]{4,}\b").unwrap(),
+            // UUIDs
+            regex::Regex::new(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+                .unwrap(),
+            // Hash-like identifiers (7+ hex chars, e.g. commit SHAs)
+            regex::Regex::new(r"\b[0-9a-f]{7,40}\b").unwrap(),
+            // GitHub issue references: #123
+            regex::Regex::new(r"#\d{1,6}\b").unwrap(),
+        ]
+    });
+
+    LEXICAL_PATTERNS.iter().any(|p| p.is_match(query))
 }
 
 /// Detect and extract attribute query components
@@ -3910,6 +3947,41 @@ pub fn decompose_query(query: &str, analysis: &QueryAnalysis) -> Vec<String> {
         }
     }
 
+    // Rule 4: Abstract/thematic queries — meta-reasoning vocabulary detected but
+    // no conjunction, relationship signal, or temporal signal triggered earlier rules.
+    // Decomposes into focal-entity sub-queries to widen vector search coverage across
+    // semantically distant memory clusters (e.g., "performance improvements" must find
+    // memories about caching, payments, onboarding — all different vector neighborhoods).
+    // Guard: expand_abstract_terms_for_bm25 must recognize abstract vocabulary to avoid
+    // decomposing already-specific queries like "What database did we choose?"
+    if !has_temporal
+        && !analysis.focal_entities.is_empty()
+        && query_trimmed.split_whitespace().count() >= 5
+        && expand_abstract_terms_for_bm25(query_trimmed).is_some()
+    {
+        let mut sub_queries = vec![query_trimmed.to_string()];
+        for entity in &analysis.focal_entities {
+            if entity.text.len() >= 3 {
+                sub_queries.push(entity.text.clone());
+            }
+        }
+        for compound in &analysis.compound_nouns {
+            if compound.len() >= 5 {
+                sub_queries.push(compound.clone());
+            }
+        }
+        sub_queries.dedup();
+        if sub_queries.len() > 1 {
+            sub_queries.truncate(1 + QUERY_DECOMPOSITION_MAX_SUBQUERIES);
+            tracing::debug!(
+                "Query decomposition [abstract-thematic]: {} → {} sub-queries",
+                query_trimmed,
+                sub_queries.len() - 1
+            );
+            return sub_queries;
+        }
+    }
+
     // No decomposition needed
     vec![query_trimmed.to_string()]
 }
@@ -3949,6 +4021,18 @@ pub fn expand_abstract_terms_for_bm25(query: &str) -> Option<String> {
         ("evolv", &["changed", "grew", "adapted", "shifted"]),
         ("evolut", &["changed", "grew", "adapted", "shifted"]),
         ("theme", &["recurring", "common", "trend", "motif"]),
+        // Open-domain / aggregative vocabulary (v0.7.1)
+        ("perform", &["speed", "latency", "throughput", "faster", "optimized"]),
+        ("improv", &["better", "faster", "fixed", "enhanced", "upgraded"]),
+        ("achiev", &["completed", "accomplished", "reached", "delivered"]),
+        ("key", &["important", "critical", "main", "primary", "essential"]),
+        ("peopl", &["team", "member", "responsible", "leading", "working"]),
+        ("person", &["team", "member", "responsible", "leading", "working"]),
+        ("infrastructur", &["deploy", "server", "cloud", "hosting", "kubernetes"]),
+        ("decis", &["chose", "decided", "selected", "picked", "adopted"]),
+        ("deploy", &["infrastructure", "kubernetes", "server", "hosting", "cloud"]),
+        ("moral", &["team", "mood", "happy", "celebrate", "social"]),
+        ("dynamic", &["interaction", "relationship", "team", "collaboration"]),
     ];
 
     let stemmer = Stemmer::create(Algorithm::English);
