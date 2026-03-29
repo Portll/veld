@@ -983,6 +983,17 @@ pub struct MemoryMetadata {
     /// Enables rhythm detection: bursty vs steady access patterns per memory.
     #[serde(default)]
     pub access_history: Vec<DateTime<Utc>>,
+    /// Elaboration quality score (0.0 = bare S-rep content, 1.0 = fully contextualized C-rep).
+    /// Computed at encoding time based on RichContext field count, entity diversity,
+    /// temporal specificity, emotional signal presence, and content density.
+    /// Reference: Ehlers & Clark (2000) — S-rep vs C-rep distinction.
+    #[serde(default)]
+    pub elaboration_score: f32,
+    /// Fragment demotion factor (1.0 = no demotion, FRAGMENT_DEMOTION_FLOOR = heavily demoted).
+    /// Applied when a consolidated fact exists for this source fragment.
+    /// Reference: Berntsen (2021) — functional constraints on involuntary memory.
+    #[serde(default = "default_fragment_demotion")]
+    pub fragment_demotion: f32,
     /// Bayesian-calibrated confidence: tracks retrieval correctness via
     /// alpha (helpful count) / beta (misleading count) Beta distribution.
     /// calibrated_confidence = alpha / (alpha + beta), with Bayesian
@@ -996,6 +1007,34 @@ pub struct MemoryMetadata {
     /// Beta distribution beta parameter (failed retrievals + prior)
     #[serde(default = "default_confidence_beta")]
     pub confidence_beta: f32,
+}
+
+/// Default: no demotion
+fn default_fragment_demotion() -> f32 {
+    1.0
+}
+/// Shadow buffer for reconsolidation updates during the labile window (FIX-R1).
+///
+/// Copy-on-write: accumulates context discovered during retrieval. Atomically
+/// applied to the memory when the labile window closes (at next maintenance cycle).
+/// Concurrent reads see the original memory (consistency guarantee).
+///
+/// Reference: Nader et al. (2000) — retrieved memories become transiently labile
+/// and can be updated, weakened, or strengthened during the reconsolidation window.
+#[derive(Debug, Clone)]
+pub struct ReconsolidationShadow {
+    /// Memory being shadowed
+    pub memory_id: MemoryId,
+    /// When the labile window opened (retrieval time)
+    pub opened_at: DateTime<Utc>,
+    /// When the labile window closes
+    pub expires_at: DateTime<Utc>,
+    /// Context from the retrieval query that triggered lability
+    pub retrieval_context: String,
+    /// Number of consecutive retrievals (for working memory detection)
+    pub consecutive_retrieval_count: u32,
+    /// Last retrieval timestamp (for last-writer-wins)
+    pub last_retrieval_at: DateTime<Utc>,
 }
 
 /// Default: 0.5 (uninformative prior)
@@ -1254,6 +1293,8 @@ impl Memory {
                 calibrated_confidence: default_calibrated_confidence(),
                 confidence_alpha: default_confidence_alpha(),
                 confidence_beta: default_confidence_beta(),
+                elaboration_score: 0.0,
+                fragment_demotion: 1.0,
             })),
             created_at: now,
             compressed: false,
@@ -1337,6 +1378,8 @@ impl Memory {
                 calibrated_confidence: default_calibrated_confidence(),
                 confidence_alpha: default_confidence_alpha(),
                 confidence_beta: default_confidence_beta(),
+                elaboration_score: 0.0,
+                fragment_demotion: 1.0,
             })),
             created_at,
             compressed,
@@ -1564,10 +1607,61 @@ impl Memory {
     /// - Data restoration from backups
     /// - Migration from older data formats
     /// - Testing with specific activation states
+    /// - Reconsolidation lability marking (FIX-R1)
     ///
     /// For normal operation, prefer `activate()` (adds) and `decay_activation()` (multiplies).
     pub fn set_activation(&self, activation: f32) {
         self.metadata.lock().activation = activation.clamp(0.0, 1.0);
+    }
+
+    /// Get elaboration quality score (thread-safe)
+    pub fn elaboration_score(&self) -> f32 {
+        self.metadata.lock().elaboration_score
+    }
+
+    /// Set elaboration quality score (thread-safe, clamped to [0.0, 1.0])
+    pub fn set_elaboration_score(&self, score: f32) {
+        self.metadata.lock().elaboration_score = score.clamp(0.0, 1.0);
+    }
+
+    /// Get fragment demotion factor (thread-safe)
+    /// Returns 1.0 (no demotion) to FRAGMENT_DEMOTION_FLOOR (heavily demoted)
+    pub fn fragment_demotion(&self) -> f32 {
+        self.metadata.lock().fragment_demotion
+    }
+
+    /// Set fragment demotion factor (thread-safe, clamped to [FLOOR, 1.0])
+    pub fn set_fragment_demotion(&self, factor: f32) {
+        self.metadata.lock().fragment_demotion =
+            factor.clamp(crate::constants::FRAGMENT_DEMOTION_FLOOR, 1.0);
+    }
+
+    /// Detect access pattern: bursty (working memory) vs steady (long-term retrieval).
+    /// Returns burstiness coefficient of variation: >1.5 = bursty, <1.0 = steady.
+    /// Reference: Berntsen (2021) — access rhythm distinguishes involuntary from voluntary.
+    pub fn access_burstiness(&self) -> f32 {
+        let meta = self.metadata.lock();
+        if meta.access_history.len() < 3 {
+            return 1.0; // insufficient data
+        }
+        let intervals: Vec<f64> = meta
+            .access_history
+            .windows(2)
+            .map(|w| (w[1] - w[0]).num_seconds() as f64)
+            .filter(|&i| i > 0.0)
+            .collect();
+        if intervals.is_empty() {
+            return 1.0;
+        }
+        let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        let variance = intervals.iter().map(|&i| (i - mean).powi(2)).sum::<f64>()
+            / intervals.len() as f64;
+        let std_dev = variance.sqrt();
+        if mean > 0.0 {
+            (std_dev / mean) as f32
+        } else {
+            1.0
+        }
     }
 
     /// Update access metadata (zero-copy through Arc)
@@ -1901,6 +1995,12 @@ struct MemoryFlat {
     // Access timestamp history for autocorrelation analysis
     #[serde(default)]
     access_history: Option<Vec<DateTime<Utc>>>,
+    // Elaboration quality score (FIX-R2)
+    #[serde(default)]
+    elaboration_score: Option<f32>,
+    // Fragment demotion factor (FIX-R2)
+    #[serde(default)]
+    fragment_demotion: Option<f32>,
 }
 
 impl Serialize for Memory {
@@ -1951,6 +2051,17 @@ impl Serialize for Memory {
             } else {
                 Some(meta.access_history.clone())
             },
+            // Elaboration + fragment demotion (FIX-R2)
+            elaboration_score: if meta.elaboration_score != 0.0 {
+                Some(meta.elaboration_score)
+            } else {
+                None
+            },
+            fragment_demotion: if meta.fragment_demotion < 1.0 {
+                Some(meta.fragment_demotion)
+            } else {
+                None
+            },
         };
         flat.serialize(serializer)
     }
@@ -1977,6 +2088,8 @@ impl<'de> Deserialize<'de> for Memory {
                 calibrated_confidence: flat.calibrated_confidence.unwrap_or_else(default_calibrated_confidence),
                 confidence_alpha: flat.confidence_alpha.unwrap_or_else(default_confidence_alpha),
                 confidence_beta: flat.confidence_beta.unwrap_or_else(default_confidence_beta),
+                elaboration_score: flat.elaboration_score.unwrap_or(0.0),
+                fragment_demotion: flat.fragment_demotion.unwrap_or(1.0),
             })),
             created_at: flat.created_at,
             compressed: flat.compressed,

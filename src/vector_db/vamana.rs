@@ -208,8 +208,22 @@ impl VamanaIndex {
 
         info!("Building Vamana index with {} vectors", n);
 
-        // Step 1: Initialize graph randomly
-        self.initialize_graph(n)?;
+        // Step 1: Initialize graph with deterministic seeding
+        // Hash sample vectors so identical data always produces identical index
+        let seed = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            n.hash(&mut hasher);
+            for &idx in &[0, n / 2, n.saturating_sub(1)] {
+                if let Some(v) = vectors.get(idx) {
+                    for &f in v {
+                        f.to_bits().hash(&mut hasher);
+                    }
+                }
+            }
+            hasher.finish()
+        };
+        self.initialize_graph(n, seed)?;
 
         // Step 2: Store vectors
         self.store_vectors(vectors)?;
@@ -283,10 +297,14 @@ impl VamanaIndex {
         Ok(())
     }
 
-    /// Initialize random graph
-    fn initialize_graph(&mut self, n: usize) -> Result<()> {
+    /// Initialize random graph with deterministic seeding
+    ///
+    /// Uses a content-derived seed so identical vector sets always produce
+    /// identical initial graphs, making index construction fully reproducible.
+    fn initialize_graph(&mut self, n: usize, seed: u64) -> Result<()> {
         use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
         let mut graph = Vec::with_capacity(n);
 
@@ -1101,7 +1119,9 @@ impl VamanaIndex {
         let k = k.min(n - 1);
 
         use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
+        use rand::SeedableRng;
+        // Fixed seed for reproducible recall estimates across runs
+        let mut rng = rand::rngs::StdRng::seed_from_u64(n as u64 ^ 0x517cc1b727220a95);
 
         // Sample random query indices
         let mut indices: Vec<usize> = (0..n).collect();

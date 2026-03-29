@@ -2490,6 +2490,70 @@ impl super::MemorySystem {
             }
         }
 
+        // =====================================================================
+        // LAYER 5.35: FRAGMENT DEMOTION (FIX-R2)
+        // =====================================================================
+        // Demoted fragments (source memories whose facts have been extracted)
+        // have their retrieval score reduced. Temporal queries are exempt —
+        // they benefit from episode-level detail in source fragments.
+        // Reference: Ehlers & Clark (2000) — S-rep fragments should not
+        // compete equally with consolidated C-rep facts.
+        if !has_temporal_query {
+            let mut any_demoted = false;
+            for mem in memories.iter_mut() {
+                let demotion = mem.fragment_demotion();
+                if demotion < 1.0 {
+                    let base = mem.score.unwrap_or(0.0);
+                    let demoted_score = base * demotion;
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(demoted_score);
+                    *mem = Arc::new(cloned);
+                    any_demoted = true;
+                }
+            }
+            if any_demoted {
+                memories.sort_by(|a, b| {
+                    b.score
+                        .unwrap_or(0.0)
+                        .total_cmp(&a.score.unwrap_or(0.0))
+                });
+                tracing::debug!("Layer 5.35: Applied fragment demotion to retrieval scores");
+            }
+        }
+
+        // =====================================================================
+        // LAYER 5.4: MMR DIVERSIFICATION (FIX-R3)
+        // =====================================================================
+        // After cross-encoder reranking and fragment demotion, apply Maximal
+        // Marginal Relevance to eliminate redundant results. Query-type gated:
+        // - Attribute/factual queries: skip MMR (precision > diversity)
+        // - Exploratory queries: lambda=0.6 (strong diversity)
+        // - Temporal queries: lambda=0.7 (moderate diversity)
+        // Reference: Berntsen (2021) — pattern separation prevents similar
+        // memories from co-activating (dentate gyrus analog).
+        {
+            let mmr_lambda = match &query_type {
+                query_parser::QueryType::Attribute(_) => None,
+                query_parser::QueryType::Exploratory => {
+                    Some(crate::constants::MMR_LAMBDA_EXPLORATORY)
+                }
+                query_parser::QueryType::Temporal => {
+                    Some(crate::constants::MMR_LAMBDA_RELATIONSHIP)
+                }
+            };
+            if let Some(lambda) = mmr_lambda {
+                let before_count = memories.len();
+                memories =
+                    Self::apply_mmr(&memories, lambda, query.max_results);
+                tracing::debug!(
+                    lambda = format!("{lambda:.2}"),
+                    before = before_count,
+                    after = memories.len(),
+                    "Layer 5.4: MMR diversification"
+                );
+            }
+        }
+
         memories.truncate(query.max_results);
 
         // =====================================================================
@@ -2856,6 +2920,62 @@ impl super::MemorySystem {
         // (only for memories that survived competition)
         for memory in &memories {
             self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+        }
+
+        // =====================================================================
+        // FIX-R1: RECONSOLIDATION — mark retrieved memories as labile
+        // =====================================================================
+        // Set activation=1.0 (labile state) and create/extend reconsolidation
+        // shadows. During the labile window, the memory can be updated with new
+        // context discovered during the retrieval interaction.
+        // Reference: Nader et al. (2000) — reconsolidation theory.
+        {
+            let now = chrono::Utc::now();
+            let window =
+                chrono::Duration::seconds(crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS);
+            let mut shadows = self.reconsolidation_shadows.write();
+
+            for memory in &memories {
+                // Mark as labile
+                memory.set_activation(1.0);
+
+                if let Some(existing) = shadows.get_mut(&memory.id) {
+                    // Memory already labile — extend window (working memory behavior)
+                    existing.consecutive_retrieval_count += 1;
+                    existing.last_retrieval_at = now;
+                    // Last-writer-wins: reset expiry
+                    existing.expires_at = now + window;
+                } else {
+                    // New labile window
+                    shadows.insert(
+                        memory.id.clone(),
+                        super::types::ReconsolidationShadow {
+                            memory_id: memory.id.clone(),
+                            opened_at: now,
+                            expires_at: now + window,
+                            retrieval_context: query_text.to_string(),
+                            consecutive_retrieval_count: 1,
+                            last_retrieval_at: now,
+                        },
+                    );
+                }
+            }
+
+            // Cap active shadows to prevent accumulation
+            while shadows.len() > crate::constants::RECONSOLIDATION_MAX_ACTIVE_SHADOWS {
+                // Evict the oldest expired first, then oldest opened
+                let evict_key = shadows
+                    .iter()
+                    .filter(|(_, s)| s.expires_at <= now)
+                    .min_by_key(|(_, s)| s.opened_at)
+                    .or_else(|| shadows.iter().min_by_key(|(_, s)| s.opened_at))
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = evict_key {
+                    shadows.remove(&key);
+                } else {
+                    break;
+                }
+            }
         }
 
         // PIPE-10: Hebbian learning AFTER competition - only coactivate winners
@@ -3341,5 +3461,79 @@ impl super::MemorySystem {
         outcome: RetrievalOutcome,
     ) -> Result<ReinforcementStats> {
         self.retriever.reinforce_tracked(tracked, outcome)
+    }
+
+    /// Apply Maximal Marginal Relevance to diversify retrieval results (FIX-R3).
+    ///
+    /// MMR formula: score_mmr(i) = λ * relevance(i) - (1-λ) * max_j∈selected(sim(i,j))
+    ///
+    /// This is the computational analog of dentate gyrus pattern separation:
+    /// similar memories are penalized to prevent co-activation flooding.
+    ///
+    /// Reference: Berntsen (2021) — functional constraints on involuntary memory
+    /// prevent loose associations from dominating retrieval.
+    fn apply_mmr(memories: &[SharedMemory], lambda: f32, k: usize) -> Vec<SharedMemory> {
+        if memories.len() <= 1 || k == 0 {
+            return memories.to_vec();
+        }
+
+        let k = k.min(memories.len());
+        let mut selected: Vec<usize> = Vec::with_capacity(k);
+        let mut remaining: Vec<usize> = (0..memories.len()).collect();
+
+        // Pre-extract embeddings (already computed, just reference)
+        let embeddings: Vec<Option<&[f32]>> = memories
+            .iter()
+            .map(|m| m.experience.embeddings.as_deref())
+            .collect();
+
+        // Normalize scores to [0, 1] for MMR
+        let max_score = memories
+            .iter()
+            .filter_map(|m| m.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_score = memories
+            .iter()
+            .filter_map(|m| m.score)
+            .fold(f32::INFINITY, f32::min);
+        let score_range = (max_score - min_score).max(f32::EPSILON);
+
+        // First pick: highest relevance score (already sorted, index 0)
+        selected.push(remaining.remove(0));
+
+        // Iteratively pick remaining by MMR
+        while selected.len() < k && !remaining.is_empty() {
+            let mut best_idx_in_remaining = 0;
+            let mut best_mmr = f32::NEG_INFINITY;
+
+            for (ri, &cand_idx) in remaining.iter().enumerate() {
+                let relevance =
+                    (memories[cand_idx].score.unwrap_or(0.0) - min_score) / score_range;
+
+                // Max similarity to any already-selected memory
+                let max_sim = if let Some(cand_emb) = embeddings[cand_idx] {
+                    selected
+                        .iter()
+                        .filter_map(|&sel_idx| {
+                            embeddings[sel_idx]
+                                .map(|sel_emb| crate::similarity::cosine_similarity(cand_emb, sel_emb))
+                        })
+                        .fold(0.0_f32, f32::max)
+                } else {
+                    0.0 // No embedding = no diversity penalty
+                };
+
+                let mmr_score = lambda * relevance - (1.0 - lambda) * max_sim;
+                if mmr_score > best_mmr {
+                    best_mmr = mmr_score;
+                    best_idx_in_remaining = ri;
+                }
+            }
+
+            selected.push(remaining.remove(best_idx_in_remaining));
+        }
+
+        // Rebuild result preserving MMR order but keeping original scores
+        selected.iter().map(|&idx| memories[idx].clone()).collect()
     }
 }

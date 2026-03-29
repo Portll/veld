@@ -1636,6 +1636,8 @@ impl RetrievalEngine {
                         // Increment access and apply importance boost
                         memory.record_access();
                         memory.boost_importance(0.05); // +5% importance
+                        // Bayesian confidence calibration
+                        memory.update_confidence(true);
 
                         // PERSIST: Write updated memory back to durable storage
                         if self.storage.update(&memory).is_ok() {
@@ -1650,6 +1652,8 @@ impl RetrievalEngine {
                     if let Ok(memory) = self.storage.get(id) {
                         memory.record_access();
                         memory.decay_importance(0.10); // -10% importance
+                        // Bayesian confidence calibration
+                        memory.update_confidence(false);
 
                         // PERSIST: Write updated memory back to durable storage
                         if self.storage.update(&memory).is_ok() {
