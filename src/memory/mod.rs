@@ -174,7 +174,7 @@ pub struct MemorySystem {
     retriever: RetrievalEngine,
 
     /// Embedder for semantic search
-    embedder: Arc<crate::embeddings::minilm::MiniLMEmbedder>,
+    embedder: Arc<crate::embeddings::competitive::CompetitiveEmbedder>,
 
     /// Query embedding cache - SHA256(query_text) → embedding
     /// Uses SHA256 for stable hashing across restarts (unlike DefaultHasher)
@@ -279,6 +279,12 @@ pub struct MemorySystem {
     /// Used for adaptive weight learning and retrieval diagnostics.
     last_signal_attributions:
         Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::SignalAttribution>>>,
+
+    /// Drift-adaptive abstention threshold (APP-5).
+    /// Calibrated during maintenance by sampling memory importance×confidence scores.
+    /// Stored as f32 bits in AtomicU32 for lock-free reads during retrieval.
+    /// When 0, falls back to the static ABSTENTION_THRESHOLD constant.
+    calibrated_abstention_threshold: std::sync::atomic::AtomicU32,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -444,11 +450,34 @@ impl MemorySystem {
         );
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine
-        // This prevents loading the ONNX model multiple times (50-200ms overhead per load)
+        // Dual-embedder: primary (MiniLM 384d, always) + optional secondary (Nomic 768d)
         let embedding_config = crate::embeddings::minilm::EmbeddingConfig::default();
-        let embedder = Arc::new(
+        let primary = Arc::new(
             crate::embeddings::minilm::MiniLMEmbedder::new(embedding_config)
                 .context("Failed to initialize MiniLM embedder (ONNX model)")?,
+        );
+
+        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> =
+            if crate::embeddings::are_nomic_models_downloaded() {
+                match crate::embeddings::nomic::NomicEmbedder::new(
+                    crate::embeddings::nomic::NomicConfig::from_env(),
+                ) {
+                    Ok(nomic) => {
+                        tracing::info!("Nomic-embed-text-v1.5 loaded (768d) — dual-embedder active");
+                        Some(Arc::new(nomic))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Nomic embedder init failed, MiniLM only: {e}");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("Nomic model not downloaded — MiniLM only (384d)");
+                None
+            };
+
+        let embedder = Arc::new(
+            crate::embeddings::competitive::CompetitiveEmbedder::new(primary, secondary),
         );
 
         // Create consolidation event buffer first so we can share it with retriever
@@ -699,6 +728,8 @@ impl MemorySystem {
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            // Drift-adaptive abstention: 0 = use static constant
+            calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -792,7 +823,7 @@ impl MemorySystem {
     ) -> Result<MemoryId> {
         let importance = self.calculate_importance(&experience);
 
-        // Generate embedding if not provided
+        // Generate embedding if not provided (primary: MiniLM 384d)
         if experience.embeddings.is_none() {
             let content_hash = Self::sha256_hash(&experience.content);
             if let Some(cached) = self.content_cache.get(&content_hash) {
@@ -800,6 +831,13 @@ impl MemorySystem {
             } else if let Ok(embedding) = self.embedder.encode(&experience.content) {
                 self.content_cache.insert(content_hash, embedding.clone());
                 experience.embeddings = Some(embedding);
+            }
+        }
+
+        // Generate secondary embedding if dual-embedder is active (Nomic 768d)
+        if experience.embeddings_secondary.is_none() && self.embedder.has_secondary() {
+            if let Ok(Some(secondary)) = self.embedder.encode_secondary(&experience.content) {
+                experience.embeddings_secondary = Some(secondary);
             }
         }
 
@@ -1233,14 +1271,20 @@ impl MemorySystem {
 
         // Generate embedding if not already present
         if memory.experience.embeddings.is_none() {
-            let content_hash = Self::sha256_hash(&memory.experience.content);
+            // Use enriched searchable text (with context prefix) for consistency
+            // with the synchronous index_memory() path. Without this, deferred
+            // embeddings lack context prefixes and produce different similarity
+            // scores than the Vamana index, breaking Layer 3.5 brute-force cosine.
+            let searchable_text =
+                crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+            let content_hash = Self::sha256_hash(&searchable_text);
 
             if let Some(cached) = self.content_cache.get(&content_hash) {
                 memory.experience.embeddings = Some(cached.clone());
                 EMBEDDING_CACHE_CONTENT.with_label_values(&["hit"]).inc();
             } else {
                 EMBEDDING_CACHE_CONTENT.with_label_values(&["miss"]).inc();
-                match self.embedder.encode(&memory.experience.content) {
+                match self.embedder.encode(&searchable_text) {
                     Ok(embedding) => {
                         self.content_cache.insert(content_hash, embedding.clone());
                         EMBEDDING_CACHE_CONTENT_SIZE

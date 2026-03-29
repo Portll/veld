@@ -677,6 +677,14 @@ impl super::MemorySystem {
                 }
             };
 
+        // Secondary query embedding for dual-index competition (Nomic 768d)
+        let query_embedding_secondary: Option<Vec<f32>> =
+            if self.embedder.has_secondary() {
+                self.embedder.encode_secondary(query_text).ok().flatten()
+            } else {
+                None
+            };
+
         let t_embedding = recall_start.elapsed();
         tracing::info!(
             embedding_ms = format!(
@@ -684,7 +692,8 @@ impl super::MemorySystem {
                 (t_embedding - t_query_analysis).as_secs_f64() * 1000.0
             ),
             cumulative_ms = format!("{:.2}", t_embedding.as_secs_f64() * 1000.0),
-            "recall [layer:embedding] query embedding (cache miss logged above if any)"
+            has_secondary = query_embedding_secondary.is_some(),
+            "recall [layer:embedding] query embedding"
         );
 
         // ===========================================================================
@@ -1008,6 +1017,11 @@ impl super::MemorySystem {
         // they handle compound queries better naturally.
         let sub_queries = query_parser::decompose_query(query_text, &query_analysis);
         let decomposed = sub_queries.len() > 1;
+        // Detect abstract/thematic decomposition (Rule 4): decomposition fired AND
+        // query contains abstract vocabulary. Used to invert RRF weights (sub-queries
+        // are more targeted than the vague original) and gate adaptive scoring.
+        let abstract_decomposed = decomposed
+            && query_parser::expand_abstract_terms_for_bm25(query_text).is_some();
 
         let mut vector_results: Vec<(MemoryId, f32)> = if decomposed {
             // --- Decomposed path: weighted RRF merge of sub-query vector results ---
@@ -1019,7 +1033,13 @@ impl super::MemorySystem {
 
             for (idx, sub_q) in sub_queries.iter().enumerate() {
                 let is_original = idx == 0;
-                let weight = if is_original {
+                // For abstract decomposition, INVERT weights: sub-queries ("performance",
+                // "improvements") are more targeted than the vague original, so they should
+                // contribute more to RRF scoring. For conjunction/entity decomposition,
+                // the original compound query is more informative — keep default weights.
+                let weight = if abstract_decomposed {
+                    if is_original { QUERY_DECOMPOSITION_SUB_WEIGHT } else { 1.0_f32 }
+                } else if is_original {
                     1.0_f32
                 } else {
                     QUERY_DECOMPOSITION_SUB_WEIGHT
@@ -1229,41 +1249,54 @@ impl super::MemorySystem {
                 .map(|(id, _)| id.clone())
                 .collect();
 
-            // Scan Working tier
-            for mem in self.working_memory.read().all_memories() {
-                if vamana_ids.contains(&mem.id) {
-                    continue; // already found by Vamana
-                }
+            // Helper: compute max similarity across primary + secondary embeddings
+            let dual_cosine = |mem: &crate::memory::types::Memory| -> Option<f32> {
+                let mut best: Option<f32> = None;
+
+                // Primary embedding (MiniLM 384d)
                 if let Some(ref emb) = mem.experience.embeddings {
                     if !emb.is_empty() {
                         let sim = crate::memory::hybrid_search::cosine_similarity_pub(
-                            &query_embedding,
-                            emb,
+                            &query_embedding, emb,
                         );
-                        if sim > 0.1 {
-                            vector_results.push((mem.id.clone(), sim));
-                            tier_hits += 1;
-                        }
+                        best = Some(sim);
                     }
+                }
+
+                // Secondary embedding (Nomic 768d) — take max of both
+                if let (Some(ref q_sec), Some(ref m_sec)) =
+                    (&query_embedding_secondary, &mem.experience.embeddings_secondary)
+                {
+                    if !m_sec.is_empty() {
+                        let sim_sec = crate::memory::hybrid_search::cosine_similarity_pub(
+                            q_sec, m_sec,
+                        );
+                        best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
+                    }
+                }
+
+                best.filter(|&s| s > 0.1)
+            };
+
+            // Scan Working tier (dual-embedder max-score)
+            for mem in self.working_memory.read().all_memories() {
+                if vamana_ids.contains(&mem.id) {
+                    continue;
+                }
+                if let Some(sim) = dual_cosine(&mem) {
+                    vector_results.push((mem.id.clone(), sim));
+                    tier_hits += 1;
                 }
             }
 
-            // Scan Session tier
+            // Scan Session tier (dual-embedder max-score)
             for mem in self.session_memory.read().all_memories() {
                 if vamana_ids.contains(&mem.id) {
                     continue;
                 }
-                if let Some(ref emb) = mem.experience.embeddings {
-                    if !emb.is_empty() {
-                        let sim = crate::memory::hybrid_search::cosine_similarity_pub(
-                            &query_embedding,
-                            emb,
-                        );
-                        if sim > 0.1 {
-                            vector_results.push((mem.id.clone(), sim));
-                            tier_hits += 1;
-                        }
-                    }
+                if let Some(sim) = dual_cosine(&mem) {
+                    vector_results.push((mem.id.clone(), sim));
+                    tier_hits += 1;
                 }
             }
 
@@ -1623,7 +1656,12 @@ impl super::MemorySystem {
                             })
                             .count();
                         if overlap >= 1 {
-                            let boost = (0.10 * overlap as f32).min(0.40);
+                            // Dampen entity overlap for abstract/decomposed queries:
+                            // generic stems like "perform" match many memories equally,
+                            // adding noise rather than signal. Reduce from 0.10 to 0.04.
+                            let per_match = if decomposed { 0.04 } else { 0.10 };
+                            let cap = if decomposed { 0.16 } else { 0.40 };
+                            let boost = (per_match * overlap as f32).min(cap);
                             if let Some(score) = fused.get_mut(id) {
                                 *score += boost;
                             }
@@ -2199,8 +2237,9 @@ impl super::MemorySystem {
             }
 
             // Phase 2.1: Keep wider candidate pool for cross-encoder reranking.
-            // Rerank top-20 after memory fetch, then truncate to max_results.
-            let rerank_budget = 30_usize.max(query.max_results);
+            // Decomposed queries produce a wider candidate set — widen the budget
+            // so more candidates survive into the cross-encoder.
+            let rerank_budget = if decomposed { 50_usize } else { 30_usize }.max(query.max_results);
             res.truncate(rerank_budget);
             tracing::debug!("Layer 4: {} fused results (rerank budget={})", res.len(), rerank_budget);
             (res, heb, attr)
@@ -2225,7 +2264,8 @@ impl super::MemorySystem {
         // Fetch up to rerank_pool candidates so Layer 5.5 cross-encoder can rerank
         // before truncating to max_results. Without this, the early break at max_results
         // would prevent the cross-encoder from ever firing (max_results == max_results).
-        let rerank_pool = 20_usize.max(query.max_results);
+        // Decomposed queries benefit from a larger pool — more candidates to rerank.
+        let rerank_pool = if decomposed { 30_usize } else { 20_usize }.max(query.max_results);
 
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
         // Recency decay: recent memories get boost, old memories decay
@@ -2258,6 +2298,13 @@ impl super::MemorySystem {
                 || query_lower_recency.contains("today");
             let recency_scale = if wants_recent {
                 0.5 // 5x amplification for explicit recency queries
+            } else if decomposed {
+                // Abstract/decomposed queries: dampen recency noise. Recency is
+                // informative for "what happened recently?" but noise for "what are
+                // our strategic priorities?" where M20 (most recent) drowns M13 (OKRs).
+                // wants_recent guard above preserves recency for queries with explicit
+                // recency keywords like "recent", "yesterday", "today", "last week".
+                0.03
             } else {
                 query.recency_weight.unwrap_or(0.1)
             };
@@ -2633,7 +2680,10 @@ impl super::MemorySystem {
         // Only runs on the top `rerank_budget` candidates to keep latency bounded.
         if memories.len() > 1 {
             if let Some(reranker) = self.hybrid_search.reranker() {
-                let rerank_budget = memories.len().min(query.max_results * 2).min(20);
+                // Decomposed queries: widen CE budget from 20→30 to exploit the
+                // broader candidate pool from multi-query vector search.
+                let ce_cap = if decomposed { 30 } else { 20 };
+                let rerank_budget = memories.len().min(query.max_results * 2).min(ce_cap);
                 let candidates: Vec<(MemoryId, String, f32)> = memories
                     .iter()
                     .take(rerank_budget)
@@ -2653,7 +2703,15 @@ impl super::MemorySystem {
                             .into_iter()
                             .collect();
 
-                        // Blend: 88% unified score + 12% cross-encoder score
+                        // Adaptive blend: decomposed queries shift weight toward
+                        // cross-encoder (55/45) because the CE can reason about abstract
+                        // membership ("is a Redis fix a performance improvement?") that
+                        // dot-product similarity cannot. Standard queries keep 82/18.
+                        let (base_w, ce_w) = if decomposed {
+                            (0.55, 0.45)
+                        } else {
+                            (0.82, 0.18)
+                        };
                         for mem in memories.iter_mut().take(rerank_budget) {
                             if let Some(&ce_score) = ce_scores.get(&mem.id) {
                                 // Signal attribution: record cross-encoder contribution
@@ -2662,7 +2720,7 @@ impl super::MemorySystem {
                                     .or_default()
                                     .cross_encoder_contribution = ce_score;
                                 let base = mem.score.unwrap_or(0.0);
-                                let blended = base * 0.82 + ce_score * 0.18;
+                                let blended = base * base_w + ce_score * ce_w;
                                 let mut cloned: Memory = mem.as_ref().clone();
                                 cloned.set_score(blended);
                                 *mem = Arc::new(cloned);
@@ -2735,7 +2793,15 @@ impl super::MemorySystem {
             let mmr_lambda = match &query_type {
                 query_parser::QueryType::Attribute(_) => None,
                 query_parser::QueryType::Exploratory => {
-                    Some(crate::constants::MMR_LAMBDA_EXPLORATORY)
+                    // Abstract/decomposed queries need stronger diversity: the answer
+                    // set spans multiple semantic clusters (caching, payments,
+                    // onboarding for "performance improvements"). Lower lambda
+                    // reduces the redundancy penalty threshold.
+                    if decomposed {
+                        Some(crate::constants::MMR_LAMBDA_ABSTRACT)
+                    } else {
+                        Some(crate::constants::MMR_LAMBDA_EXPLORATORY)
+                    }
                 }
                 query_parser::QueryType::Temporal => {
                     Some(crate::constants::MMR_LAMBDA_RELATIONSHIP)
@@ -2905,7 +2971,7 @@ impl super::MemorySystem {
                             .iter()
                             .filter(|m| {
                                 let days = (now - m.created_at).num_days();
-                                days >= 7 && days <= 14
+                                (7..=14).contains(&days)
                             })
                             .count();
 
@@ -3246,14 +3312,55 @@ impl super::MemorySystem {
         // Abstention: filter out memories below confidence threshold
         // importance × calibrated_confidence < ABSTENTION_THRESHOLD → excluded
         // Only applies to memories with enough feedback observations (≥ 2 beyond prior)
+        //
+        // APP-4: Query-type adaptive thresholds — lexical/identifier queries
+        // score lower on vector similarity, so we relax the threshold for them.
+        // APP-6: Graph-connected memory insurance — memories found via graph
+        // traversal with strong activation bypass abstention entirely.
         {
-            let threshold = crate::constants::ABSTENTION_THRESHOLD;
+            // APP-5: Use drift-adaptive threshold if calibrated, else static constant.
+            let calibrated_bits = self
+                .calibrated_abstention_threshold
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let base_threshold = if calibrated_bits != 0 {
+                f32::from_bits(calibrated_bits)
+            } else {
+                crate::constants::ABSTENTION_THRESHOLD
+            };
+
+            // APP-4: Relax threshold for lexical/identifier queries.
+            // Attribute queries targeting specific identifiers (ticket IDs, version
+            // strings, error codes) produce lower vector similarity scores because
+            // identifiers are out-of-vocabulary for the embedding model.
+            let threshold = if query_parser::has_lexical_identifiers(query_text) {
+                let relaxed = base_threshold * 0.5;
+                tracing::debug!(
+                    "Abstention: relaxed threshold {base_threshold} -> {relaxed} (lexical query)"
+                );
+                relaxed
+            } else {
+                base_threshold
+            };
+
             let before = memories.len();
             memories.retain(|m| {
                 // Only abstain when memory has ≥ 2 actual feedback events (beyond prior of 2.0)
                 if m.confidence_observations() <= 4.0 {
                     return true;
                 }
+
+                // APP-6: Graph-connected memory insurance.
+                // If this memory was found via graph traversal with activation > 0.3,
+                // it has strong relational evidence for relevance. Graph connectivity
+                // provides an orthogonal retrieval signal that should not be vetoed
+                // by importance decay — otherwise the graph "knows" about a memory
+                // that retrieval refuses to surface.
+                if let Some(attr) = signal_attributions.get(&m.id) {
+                    if attr.graph_contribution > 0.3 {
+                        return true;
+                    }
+                }
+
                 m.importance() * m.calibrated_confidence() >= threshold
             });
             if memories.len() < before {
