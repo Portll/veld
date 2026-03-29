@@ -591,8 +591,20 @@ impl FeedbackMomentum {
         // Store old EMA for stability calculation
         let old_ema = self.ema;
 
-        // Update EMA
-        self.ema = old_ema * (1.0 - alpha) + signal.value * alpha;
+        // FIX-04: Bidirectional feedback acceleration
+        // When explicit strong negative signal detected (high confidence + strong negative value),
+        // bypass gradual EMA accumulation and apply immediate momentum override.
+        // This cuts unlearning latency from 5-15 cycles to 1-2 cycles for explicit rejections
+        // like "wrong", "not helpful", "that's incorrect" (detected as NegativeKeywords trigger).
+        if signal.confidence > 0.8 && signal.value < -0.3 {
+            // Direct override: jump EMA to signal value (no inertia dampening)
+            self.ema = signal.value;
+            // Crash stability to signal strong contradiction
+            self.stability = (self.stability * 0.3).max(0.0);
+        } else {
+            // Standard EMA update for all other signals
+            self.ema = old_ema * (1.0 - alpha) + signal.value * alpha;
+        }
 
         // Update stability
         let direction_matches =

@@ -856,7 +856,7 @@ impl MultiUserMemoryManager {
             match created {
                 Some(ms) => ms,
                 None => {
-                    return Err(last_err.unwrap()).with_context(|| {
+                    return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
                         format!(
                             "Failed to initialize memory system for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
                             user_id
@@ -1368,7 +1368,7 @@ impl MultiUserMemoryManager {
             match created {
                 Some(gm) => gm,
                 None => {
-                    return Err(last_err.unwrap()).with_context(|| {
+                    return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
                         format!(
                             "Failed to initialize graph memory for user '{}' after 4 attempts (RocksDB lock contention)",
                             user_id
@@ -2304,6 +2304,7 @@ impl MultiUserMemoryManager {
                     tier: EdgeTier::L1Working,
                     activation_timestamps: None,
                     entity_confidence: None,
+                    created_by: crate::graph_memory::EdgeSource::CoOccurrence,
                 };
 
                 if let Err(e) = graph_guard.add_relationship(edge) {

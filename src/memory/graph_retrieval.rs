@@ -638,8 +638,20 @@ pub fn spreading_activation_retrieve_with_stats(
                 entity.ic_weight,
                 entity_node.salience,
             ));
+            // FIX-09: Track entity resolution success
+            stats.entity_resolution.push(crate::memory::types::EntityResolution {
+                name: entity.text.clone(),
+                status: "found".to_string(),
+                resolved_to: Some(entity_node.uuid.to_string()),
+            });
         } else {
             tracing::debug!("  ✗ Entity '{}' not found in graph", entity.text);
+            // FIX-09: Track entity resolution failure
+            stats.entity_resolution.push(crate::memory::types::EntityResolution {
+                name: entity.text.clone(),
+                status: "not_found".to_string(),
+                resolved_to: None,
+            });
         }
     }
 
@@ -1024,6 +1036,24 @@ pub fn spreading_activation_retrieve_with_stats(
     traversed_edges.sort();
     traversed_edges.dedup();
     stats.traversed_edges = traversed_edges;
+
+    // FIX-08: Populate retrieval mode recommendation based on graph state
+    let density = stats.graph_density;
+    let entity_count = stats.entities_activated;
+    if density > 0.0 && density < 1.0 && entity_count >= 2 {
+        stats.recommended_mode = Some("associative".to_string());
+        stats.mode_rationale = Some(format!(
+            "sparse graph (density={density:.2}) + {entity_count} entities: graph edges are high-signal"
+        ));
+    } else if density >= 2.0 || entity_count == 0 {
+        stats.recommended_mode = Some("semantic".to_string());
+        stats.mode_rationale = Some(format!(
+            "dense/no-entity graph (density={density:.2}, entities={entity_count}): trust vector similarity"
+        ));
+    } else {
+        stats.recommended_mode = Some("hybrid".to_string());
+        stats.mode_rationale = Some("balanced density: use combined signals".to_string());
+    }
 
     tracing::info!(
         "🎯 Returning {} memories (top scores: {:?}), {} edges traversed",

@@ -716,6 +716,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 "Retrieval mode: 'semantic' for pure vector similarity, 'associative' for graph-based traversal (follows learned connections), 'hybrid' for density-dependent combination (default)",
               default: "hybrid",
             },
+            rrf_k: {
+              type: "number",
+              description:
+                "RRF (Reciprocal Rank Fusion) k parameter (1.0-200.0, default: 20.0). Higher k = more equal weighting across ranks (democratic). Lower k = sharper discrimination favoring top-ranked results (winner-take-all). Use high k (~60-100) for exploratory queries, low k (~5-15) for precise factual lookups.",
+            },
           },
           required: ["query"],
         },
@@ -934,6 +939,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Automatically store the context as a Conversation memory (default: true). Set to false to only surface memories without storing.",
               default: true,
+            },
+            rrf_k: {
+              type: "number",
+              description:
+                "RRF k parameter (1.0-200.0, default: 20.0). Higher k = democratic ranking, lower k = sharper top-rank discrimination.",
             },
           },
           required: ["context"],
@@ -1660,7 +1670,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           query,
           limit: rawLimit = 5,
           mode = "hybrid",
-        } = args as { query: string; limit?: number; mode?: string };
+          rrf_k,
+        } = args as { query: string; limit?: number; mode?: string; rrf_k?: number };
 
         if (!query || query.length === 0) {
           return {
@@ -1743,6 +1754,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           query,
           limit,
           mode,
+          ...(rrf_k !== undefined && { rrf_k: Math.max(1, Math.min(rrf_k, 200)) }),
         });
 
         const memories = result.memories || [];
@@ -2454,6 +2466,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_results = 5,
           memory_types = [],
           auto_ingest = true,
+          rrf_k,
         } = args as {
           context: string;
           semantic_threshold?: number;
@@ -2462,6 +2475,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           max_results?: number;
           memory_types?: string[];
           auto_ingest?: boolean;
+          rrf_k?: number;
         };
 
         // --- Response types matching ProactiveContextResponse (Rust backend) ---
@@ -2572,6 +2586,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // Implicit feedback: send previous response so backend can evaluate which memories helped
             previous_response: lastProactiveResponse || undefined,
             user_followup: lastProactiveResponse ? cleanedContext : undefined,
+            ...(rrf_k !== undefined && { rrf_k: Math.max(1, Math.min(rrf_k, 200)) }),
           },
         );
 

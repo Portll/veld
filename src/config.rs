@@ -54,7 +54,10 @@ pub struct CorsConfig {
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
-            allowed_origins: Vec::new(), // Empty = allow all origins
+            allowed_origins: vec![
+                "http://localhost:*".to_string(),
+                "http://127.0.0.1:*".to_string(),
+            ], // Default: localhost only. Set SHODH_CORS_ORIGINS for other origins.
             allowed_methods: vec![
                 "GET".to_string(),
                 "POST".to_string(),
@@ -303,6 +306,12 @@ pub struct ServerConfig {
     /// Caps the number of NER/tag/regex entities to prevent O(n²) edge explosion
     /// in the knowledge graph. 10 entities → max 45 co-occurrence edges.
     pub max_entities_per_memory: usize,
+
+    /// Log-periodic fractal decay scales in days (default: [7.0, 30.0, 365.0])
+    /// Controls resonance frequencies in the power-law decay function.
+    /// Weekly/monthly/yearly rhythms by default; override via SHODH_LOG_PERIODIC_SCALES
+    /// env var (comma-separated, e.g. "14.0,60.0,365.0" for biweekly/bimonthly/yearly)
+    pub log_periodic_scales: Vec<f64>,
 }
 
 impl Default for ServerConfig {
@@ -327,6 +336,7 @@ impl Default for ServerConfig {
             backup_max_count: 7,           // Keep 7 backups (1 week of daily backups)
             backup_enabled: false,         // Disabled by default, auto-enabled in production
             max_entities_per_memory: 10,   // Cap entities per memory (10 → max 45 edges)
+            log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
         }
     }
 }
@@ -511,6 +521,27 @@ impl ServerConfig {
                     );
                 }
                 config.max_entities_per_memory = clamped;
+            }
+        }
+
+        // Log-periodic decay scales (comma-separated floats, e.g. "14.0,60.0,365.0")
+        if let Ok(val) = env::var("SHODH_LOG_PERIODIC_SCALES") {
+            let parsed: Vec<f64> = val
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .filter(|&v| (1.0..=730.0).contains(&v))
+                .collect();
+            if parsed.is_empty() {
+                tracing::warn!(
+                    "SHODH_LOG_PERIODIC_SCALES='{}' — no valid scales (need ≥1 float in 1.0–730.0), using defaults",
+                    val
+                );
+            } else {
+                tracing::info!(
+                    "Log-periodic scales overridden: {:?} (default: [7.0, 30.0, 365.0])",
+                    parsed
+                );
+                config.log_periodic_scales = parsed;
             }
         }
 

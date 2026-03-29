@@ -102,7 +102,13 @@ fn default_graph_weight() -> f32 {
     0.25 // Graph spreading activation for associative retrieval (SHO-D4)
 }
 fn default_rrf_k() -> f32 {
-    45.0 // Lower k = more emphasis on top-ranked results
+    // NOTE: This K=45 is for internal BM25+vector fusion in search_with_dynamic_weights().
+    // The main retrieval pipeline (Layer 4 in semantic_retrieve) uses query.rrf_k (default 20.0).
+    // These are DIFFERENT fusion stages:
+    //   K=45 here: merges BM25 keyword scores with vector semantic scores (gentle blend)
+    //   K=20 in Layer 4: merges graph + hybrid + linguistic signals (sharper discrimination)
+    // The higher K here prevents BM25 false positives from dominating vector results.
+    45.0
 }
 fn default_candidate_count() -> usize {
     100 // Increased for better recall; slight latency tradeoff acceptable
@@ -111,7 +117,7 @@ fn default_rerank_count() -> usize {
     20
 }
 fn default_use_reranking() -> bool {
-    false // Disabled: current implementation is bi-encoder, not true cross-encoder
+    true // Enabled: uses ms-marco-MiniLM-L-6-v2 cross-encoder with bi-encoder fallback
 }
 fn default_min_bm25_score() -> f32 {
     0.01 // Lower threshold to capture more keyword matches
@@ -133,6 +139,108 @@ impl Default for HybridSearchConfig {
             min_bm25_score: default_min_bm25_score(),
             min_graph_score: default_min_graph_score(),
         }
+    }
+}
+
+/// Signal contribution scores from a retrieval result
+///
+/// Records which retrieval signal (BM25, vector, graph) contributed most to
+/// finding a particular result. Used as the learning target for adaptive weight
+/// updates: helpful results shift weights toward their dominant signal.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalScores {
+    /// How much BM25 (keyword) matching contributed to this result (0.0-1.0)
+    pub bm25_contribution: f32,
+    /// How much vector (semantic) search contributed to this result (0.0-1.0)
+    pub vector_contribution: f32,
+    /// How much graph (spreading activation) contributed to this result (0.0-1.0)
+    pub graph_contribution: f32,
+}
+
+impl SignalScores {
+    /// Create signal scores from component presence and normalize to sum to 1.0
+    pub fn from_components(bm25: f32, vector: f32, graph: f32) -> Self {
+        let sum = bm25 + vector + graph;
+        if sum <= 0.0 {
+            return Self {
+                bm25_contribution: 1.0 / 3.0,
+                vector_contribution: 1.0 / 3.0,
+                graph_contribution: 1.0 / 3.0,
+            };
+        }
+        Self {
+            bm25_contribution: bm25 / sum,
+            vector_contribution: vector / sum,
+            graph_contribution: graph / sum,
+        }
+    }
+
+    /// Invert contributions for negative feedback (misleading results)
+    ///
+    /// When a result is misleading, we want to shift weights AWAY from the
+    /// signals that produced it. Inversion maps high contributions to low targets.
+    pub fn inverted(&self) -> Self {
+        // Invert: high contribution → low target, low → high
+        let inv_bm25 = 1.0 - self.bm25_contribution;
+        let inv_vector = 1.0 - self.vector_contribution;
+        let inv_graph = 1.0 - self.graph_contribution;
+        Self::from_components(inv_bm25, inv_vector, inv_graph)
+    }
+}
+
+/// Learned retrieval weights from feedback history
+///
+/// Updated via EMA (exponential moving average) when retrieval feedback is received.
+/// Blended with static defaults based on update_count confidence.
+///
+/// The system starts with static defaults (well-tuned from benchmarks) and gradually
+/// shifts toward empirically-observed signal contributions as feedback accumulates.
+#[derive(Debug, Clone)]
+pub struct LearnedWeights {
+    /// Learned BM25 weight (initialized to static default)
+    pub bm25: f32,
+    /// Learned vector weight (initialized to static default)
+    pub vector: f32,
+    /// Learned graph weight (initialized to static default)
+    pub graph: f32,
+    /// Number of feedback updates applied (confidence measure)
+    pub update_count: u64,
+}
+
+impl LearnedWeights {
+    /// Create learned weights initialized to static defaults
+    pub fn from_defaults(config: &HybridSearchConfig) -> Self {
+        Self {
+            bm25: config.bm25_weight,
+            vector: config.vector_weight,
+            graph: config.graph_weight,
+            update_count: 0,
+        }
+    }
+
+    /// Apply an EMA update from feedback signal scores
+    ///
+    /// For helpful outcomes: target = signal scores (shift toward what worked)
+    /// For misleading outcomes: target = inverted scores (shift away from what failed)
+    pub fn apply_update(&mut self, target: &SignalScores, lr: f32) {
+        self.bm25 = (1.0 - lr) * self.bm25 + lr * target.bm25_contribution;
+        self.vector = (1.0 - lr) * self.vector + lr * target.vector_contribution;
+        self.graph = (1.0 - lr) * self.graph + lr * target.graph_contribution;
+
+        // Normalize to sum to 1.0 (maintains weight invariant)
+        let sum = self.bm25 + self.vector + self.graph;
+        if sum > 0.0 {
+            self.bm25 /= sum;
+            self.vector /= sum;
+            self.graph /= sum;
+        } else {
+            // Degenerate case: reset to uniform
+            self.bm25 = 1.0 / 3.0;
+            self.vector = 1.0 / 3.0;
+            self.graph = 1.0 / 3.0;
+        }
+
+        self.update_count += 1;
     }
 }
 
@@ -553,31 +661,51 @@ impl RRFusion {
     }
 }
 
-/// Cross-encoder reranker using the same MiniLM model
+/// Cross-encoder reranker using ms-marco-MiniLM-L-6-v2
 ///
-/// For true cross-encoder reranking, you'd use a model trained for
-/// query-document scoring (e.g., cross-encoder/ms-marco-MiniLM-L-6-v2).
-/// This implementation uses cosine similarity as a proxy, which works
-/// but isn't as accurate as a dedicated cross-encoder.
+/// Uses a true cross-encoder model that jointly encodes (query, document)
+/// pairs for relevance scoring. Significantly more accurate than bi-encoder
+/// cosine similarity for reranking. Falls back to bi-encoder if cross-encoder
+/// model is unavailable.
 ///
-/// Future: Replace with actual cross-encoder model for better accuracy.
+/// Blending: 70% cross-encoder + 30% bi-encoder (proven ratio from literature).
 pub struct CrossEncoderReranker {
     embedder: Arc<MiniLMEmbedder>,
+    cross_encoder: Arc<crate::embeddings::cross_encoder::CrossEncoder>,
 }
 
+/// Weight for cross-encoder score in the blend (0.7 = 70%)
+const CROSS_ENCODER_BLEND_WEIGHT: f32 = 0.70;
+/// Weight for bi-encoder score in the blend (0.3 = 30%)
+const BI_ENCODER_BLEND_WEIGHT: f32 = 0.30;
+
 impl CrossEncoderReranker {
-    /// Create reranker with shared embedder
+    /// Create reranker with shared embedder and cross-encoder model
     pub fn new(embedder: Arc<MiniLMEmbedder>) -> Self {
-        Self { embedder }
+        Self {
+            embedder,
+            cross_encoder: Arc::new(
+                crate::embeddings::cross_encoder::CrossEncoder::new(),
+            ),
+        }
     }
 
-    /// Rerank candidates based on query-document similarity
+    /// Create reranker with an existing cross-encoder instance
+    pub fn with_cross_encoder(
+        embedder: Arc<MiniLMEmbedder>,
+        cross_encoder: Arc<crate::embeddings::cross_encoder::CrossEncoder>,
+    ) -> Self {
+        Self {
+            embedder,
+            cross_encoder,
+        }
+    }
+
+    /// Rerank candidates using true cross-encoder with bi-encoder fallback
     ///
     /// Takes (memory_id, content, current_score) and returns reranked scores.
-    ///
-    /// Note: This uses bi-encoder (separate query/doc embeddings) not true
-    /// cross-encoder (joint query+doc encoding). True cross-encoders are
-    /// more accurate but slower. This is a reasonable approximation.
+    /// Uses 70/30 cross-encoder/bi-encoder blend when cross-encoder is available,
+    /// falls back to pure bi-encoder cosine similarity otherwise.
     pub fn rerank(
         &self,
         query: &str,
@@ -587,24 +715,51 @@ impl CrossEncoderReranker {
             return Ok(Vec::new());
         }
 
-        // Encode query
+        // Always compute bi-encoder scores (fast, used for blending or fallback)
         let query_embedding = self.embedder.encode(query)?;
-
-        let mut results: Vec<(MemoryId, f32)> = Vec::with_capacity(candidates.len());
-
-        for (memory_id, content, _original_score) in candidates {
-            // Encode document
-            let doc_embedding = self.embedder.encode(&content)?;
-
-            // Cosine similarity
-            let similarity = cosine_similarity(&query_embedding, &doc_embedding);
-
-            results.push((memory_id, similarity));
+        let mut bi_scores: Vec<f32> = Vec::with_capacity(candidates.len());
+        for (_, content, _) in &candidates {
+            let doc_embedding = self.embedder.encode(content)?;
+            bi_scores.push(cosine_similarity(&query_embedding, &doc_embedding));
         }
 
-        // Sort by reranked score descending
-        results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Try cross-encoder for blended scoring
+        let use_cross_encoder = self.cross_encoder.is_available();
+        let blended_scores = if use_cross_encoder {
+            let doc_texts: Vec<&str> = candidates.iter().map(|(_, c, _)| c.as_str()).collect();
+            match self.cross_encoder.score_pairs(query, &doc_texts) {
+                Ok(ce_scores) => {
+                    // Normalize cross-encoder logits to [0,1] via sigmoid
+                    let ce_normalized: Vec<f32> = ce_scores
+                        .iter()
+                        .map(|&s| 1.0 / (1.0 + (-s).exp()))
+                        .collect();
 
+                    // Blend: 70% cross-encoder + 30% bi-encoder
+                    bi_scores
+                        .iter()
+                        .zip(ce_normalized.iter())
+                        .map(|(&bi, &ce)| {
+                            BI_ENCODER_BLEND_WEIGHT * bi + CROSS_ENCODER_BLEND_WEIGHT * ce
+                        })
+                        .collect()
+                }
+                Err(e) => {
+                    tracing::debug!("Cross-encoder inference failed, using bi-encoder: {e}");
+                    bi_scores.clone()
+                }
+            }
+        } else {
+            bi_scores.clone()
+        };
+
+        let mut results: Vec<(MemoryId, f32)> = candidates
+            .into_iter()
+            .zip(blended_scores)
+            .map(|((id, _, _), score)| (id, score))
+            .collect();
+
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(results)
     }
 }
@@ -633,11 +788,16 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Unified hybrid search engine
 ///
-/// Combines BM25 + Vector + RRF + Cross-encoder + Cognitive signals
+/// Combines BM25 + Vector + RRF + Cross-encoder + Cognitive signals.
+/// Includes adaptive weight learning from retrieval feedback (P2.3).
 pub struct HybridSearchEngine {
     bm25_index: BM25Index,
     config: HybridSearchConfig,
     reranker: Option<CrossEncoderReranker>,
+    /// Learned weights from retrieval feedback (EMA-adapted)
+    /// Protected by RwLock for concurrent read access during search
+    /// and exclusive write access during feedback updates
+    learned_weights: RwLock<LearnedWeights>,
 }
 
 impl HybridSearchEngine {
@@ -655,10 +815,13 @@ impl HybridSearchEngine {
             None
         };
 
+        let learned_weights = RwLock::new(LearnedWeights::from_defaults(&config));
+
         Ok(Self {
             bm25_index,
             config,
             reranker,
+            learned_weights,
         })
     }
 
@@ -697,6 +860,86 @@ impl HybridSearchEngine {
     /// Get BM25 index reference for direct searches
     pub fn bm25_index(&self) -> &BM25Index {
         &self.bm25_index
+    }
+
+    /// Update learned weights from retrieval feedback
+    ///
+    /// Called after `reinforce_recall` processes a Helpful or Misleading outcome.
+    /// Uses EMA to shift weights toward (helpful) or away from (misleading) the
+    /// signal contributions that produced the retrieval result.
+    ///
+    /// Thread-safe: takes write lock on learned_weights only for the update.
+    pub fn update_weights_from_feedback(&self, signal_scores: &SignalScores, helpful: bool) {
+        use crate::constants::ADAPTIVE_WEIGHT_LEARNING_RATE;
+
+        let target = if helpful {
+            *signal_scores
+        } else {
+            signal_scores.inverted()
+        };
+
+        let mut weights = self.learned_weights.write();
+        weights.apply_update(&target, ADAPTIVE_WEIGHT_LEARNING_RATE);
+
+        tracing::debug!(
+            "Adaptive weights updated ({}): bm25={:.3}, vector={:.3}, graph={:.3}, updates={}",
+            if helpful { "helpful" } else { "misleading" },
+            weights.bm25,
+            weights.vector,
+            weights.graph,
+            weights.update_count,
+        );
+    }
+
+    /// Get effective weights blending static defaults with learned weights
+    ///
+    /// The blend factor increases with update_count:
+    /// - 0 updates: 100% static defaults
+    /// - CONFIDENCE_THRESHOLD updates: MAX_BLEND% learned, (1-MAX_BLEND)% static
+    /// - Beyond threshold: capped at MAX_BLEND% learned
+    ///
+    /// Returns (bm25_weight, vector_weight, graph_weight) normalized to sum to 1.0
+    pub fn effective_weights(&self) -> (f32, f32, f32) {
+        use crate::constants::{
+            ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND,
+        };
+
+        let learned = self.learned_weights.read();
+
+        if learned.update_count == 0 {
+            return (
+                self.config.bm25_weight,
+                self.config.vector_weight,
+                self.config.graph_weight,
+            );
+        }
+
+        // Confidence ramp: linearly increase blend factor with update count
+        let confidence = (learned.update_count as f32
+            / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32)
+            .min(1.0);
+        let blend = confidence * ADAPTIVE_WEIGHT_MAX_BLEND;
+
+        let bm25 = (1.0 - blend) * self.config.bm25_weight + blend * learned.bm25;
+        let vector = (1.0 - blend) * self.config.vector_weight + blend * learned.vector;
+        let graph = (1.0 - blend) * self.config.graph_weight + blend * learned.graph;
+
+        // Normalize to sum to 1.0
+        let sum = bm25 + vector + graph;
+        if sum > 0.0 {
+            (bm25 / sum, vector / sum, graph / sum)
+        } else {
+            (
+                self.config.bm25_weight,
+                self.config.vector_weight,
+                self.config.graph_weight,
+            )
+        }
+    }
+
+    /// Get the current learned weight state (for diagnostics/introspection)
+    pub fn learned_weight_state(&self) -> LearnedWeights {
+        self.learned_weights.read().clone()
     }
 
     /// Perform hybrid search combining BM25 and vector results
@@ -817,6 +1060,10 @@ impl HybridSearchEngine {
         // Calculate dynamic weights based on keyword discriminativeness
         // When YAKE identifies discriminative keywords, trust BM25 more
         // YAKE importance = 1/(1+score), so 0.9+ means very discriminative keywords
+        //
+        // Base weights come from effective_weights() which blends static defaults
+        // with learned weights from retrieval feedback (P2.3 adaptive learning)
+        let (eff_bm25, eff_vector, _eff_graph) = self.effective_weights();
         let (bm25_weight, vector_weight) = if let Some(disc) = keyword_discriminativeness {
             if disc >= 0.8 {
                 // Highly discriminative keywords - strong BM25 preference
@@ -825,11 +1072,11 @@ impl HybridSearchEngine {
                 // Moderately discriminative - BM25 dominant
                 (0.6, 0.4)
             } else {
-                // Low discriminativeness - use default weights
-                (self.config.bm25_weight, self.config.vector_weight)
+                // Low discriminativeness - use adaptive learned weights
+                (eff_bm25, eff_vector)
             }
         } else {
-            (self.config.bm25_weight, self.config.vector_weight)
+            (eff_bm25, eff_vector)
         };
 
         // Log counts and weights for debugging
@@ -1124,7 +1371,7 @@ mod tests {
         assert_eq!(config.rrf_k, 45.0); // Lower k for top-rank emphasis
         assert_eq!(config.candidate_count, 100); // Increased for better recall
         assert_eq!(config.rerank_count, 20);
-        assert!(!config.use_reranking); // Disabled: bi-encoder, not cross-encoder
+        assert!(config.use_reranking); // Enabled: true cross-encoder with bi-encoder fallback
         assert_eq!(config.min_graph_score, 0.01); // Graph score threshold (SHO-D4)
     }
 
@@ -1294,5 +1541,97 @@ mod tests {
             id2_relative_high >= id2_relative_low - 0.01,
             "High k should be more forgiving of rank variation"
         );
+    }
+
+    #[test]
+    fn test_signal_scores_normalization() {
+        let scores = SignalScores::from_components(0.5, 0.3, 0.2);
+        let sum = scores.bm25_contribution + scores.vector_contribution + scores.graph_contribution;
+        assert!((sum - 1.0).abs() < 0.001, "Signal scores should sum to 1.0");
+        assert!((scores.bm25_contribution - 0.5).abs() < 0.001);
+        assert!((scores.vector_contribution - 0.3).abs() < 0.001);
+        assert!((scores.graph_contribution - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_signal_scores_zero_input() {
+        let scores = SignalScores::from_components(0.0, 0.0, 0.0);
+        let sum = scores.bm25_contribution + scores.vector_contribution + scores.graph_contribution;
+        assert!((sum - 1.0).abs() < 0.001, "Zero input should produce uniform weights");
+        assert!((scores.bm25_contribution - 1.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_signal_scores_inversion() {
+        let scores = SignalScores::from_components(0.8, 0.1, 0.1);
+        let inverted = scores.inverted();
+        // High BM25 contribution should become low after inversion
+        assert!(inverted.bm25_contribution < inverted.vector_contribution);
+        assert!(inverted.bm25_contribution < inverted.graph_contribution);
+        let sum = inverted.bm25_contribution + inverted.vector_contribution + inverted.graph_contribution;
+        assert!((sum - 1.0).abs() < 0.001, "Inverted scores should sum to 1.0");
+    }
+
+    #[test]
+    fn test_learned_weights_ema_update() {
+        let config = HybridSearchConfig::default();
+        let mut weights = LearnedWeights::from_defaults(&config);
+
+        assert_eq!(weights.update_count, 0);
+        assert!((weights.bm25 - config.bm25_weight).abs() < 0.001);
+
+        // Apply a strong BM25 signal
+        let target = SignalScores::from_components(1.0, 0.0, 0.0);
+        weights.apply_update(&target, 0.1);
+
+        assert_eq!(weights.update_count, 1);
+        // BM25 weight should have increased
+        assert!(weights.bm25 > config.bm25_weight);
+        // Vector weight should have decreased
+        assert!(weights.vector < config.vector_weight);
+        // Should still sum to 1.0
+        let sum = weights.bm25 + weights.vector + weights.graph;
+        assert!((sum - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_learned_weights_convergence() {
+        let config = HybridSearchConfig::default();
+        let mut weights = LearnedWeights::from_defaults(&config);
+
+        // Apply many updates pushing toward vector dominance
+        let target = SignalScores::from_components(0.1, 0.8, 0.1);
+        for _ in 0..100 {
+            weights.apply_update(&target, 0.05);
+        }
+
+        // After 100 updates at lr=0.05, weights should be close to target
+        assert!(weights.vector > 0.6, "Vector should dominate after many updates: {}", weights.vector);
+        assert!(weights.bm25 < 0.2, "BM25 should be low: {}", weights.bm25);
+        assert!(weights.graph < 0.2, "Graph should be low: {}", weights.graph);
+    }
+
+    #[test]
+    fn test_learned_weights_normalization_invariant() {
+        let config = HybridSearchConfig::default();
+        let mut weights = LearnedWeights::from_defaults(&config);
+
+        // Apply various updates and check normalization
+        let targets = vec![
+            SignalScores::from_components(1.0, 0.0, 0.0),
+            SignalScores::from_components(0.0, 1.0, 0.0),
+            SignalScores::from_components(0.0, 0.0, 1.0),
+            SignalScores::from_components(0.33, 0.33, 0.34),
+        ];
+
+        for target in &targets {
+            weights.apply_update(target, 0.1);
+            let sum = weights.bm25 + weights.vector + weights.graph;
+            assert!(
+                (sum - 1.0).abs() < 0.001,
+                "Weights should sum to 1.0 after every update, got {}",
+                sum
+            );
+        }
     }
 }

@@ -479,6 +479,7 @@ pub async fn add_relationship(
         tier: graph_memory::EdgeTier::L1Working,
         activation_timestamps: None,
         entity_confidence,
+        created_by: graph_memory::EdgeSource::Explicit,
     };
 
     graph_guard

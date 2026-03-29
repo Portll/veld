@@ -1450,19 +1450,16 @@ pub fn cold_start_extract_entities(
             continue;
         }
 
-        let entity_type = if clean.contains('@') && clean.contains('.') {
-            Some(NerEntityType::Misc) // email
-        } else if clean.starts_with("http://") || clean.starts_with("https://") {
-            Some(NerEntityType::Misc) // URL
-        } else if clean.contains('/') && clean.contains('.') && !clean.contains(' ') {
-            Some(NerEntityType::Misc) // file path
-        } else if is_version_number(clean) {
-            Some(NerEntityType::Misc)
-        } else if is_camel_case(clean) {
-            Some(NerEntityType::Organization) // tech name
-        } else if is_acronym(clean) {
-            Some(NerEntityType::Organization)
-        } else if clean.chars().next().map_or(false, |c| c.is_uppercase())
+        let entity_type = if (clean.contains('@') && clean.contains('.'))
+            || clean.starts_with("http://")
+            || clean.starts_with("https://")
+            || (clean.contains('/') && clean.contains('.') && !clean.contains(' '))
+            || is_version_number(clean)
+        {
+            Some(NerEntityType::Misc) // email, URL, file path, or version
+        } else if is_camel_case(clean) || is_acronym(clean) {
+            Some(NerEntityType::Organization) // tech name or acronym
+        } else if clean.chars().next().is_some_and(|c| c.is_uppercase())
             && clean.len() >= 3
             && clean.chars().skip(1).any(|c| c.is_lowercase())
         {
@@ -1499,7 +1496,7 @@ fn is_camel_case(s: &str) -> bool {
     if s.len() < 4 { return false; }
     let has_upper = s.chars().any(|c| c.is_uppercase());
     let has_lower = s.chars().any(|c| c.is_lowercase());
-    let starts_upper = s.chars().next().map_or(false, |c| c.is_uppercase());
+    let starts_upper = s.chars().next().is_some_and(|c| c.is_uppercase());
     // Must have both cases and internal uppercase (not just first letter)
     has_upper && has_lower && starts_upper && s.chars().skip(1).any(|c| c.is_uppercase())
 }

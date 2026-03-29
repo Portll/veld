@@ -44,12 +44,8 @@ pub fn build_public_routes(state: AppState) -> Router {
         // =================================================================
         .route("/api/context/status", get(health::get_context_status))
         .route("/api/context_status", get(health::get_context_status)) // TUI GET alias
-        .route("/api/context/sse", get(webhooks::context_status_sse))
-        // =================================================================
-        // EXTERNAL WEBHOOKS (SIGNATURE VERIFIED INTERNALLY)
-        // =================================================================
-        .route("/webhook/linear", post(integrations::linear_webhook))
-        .route("/webhook/github", post(integrations::github_webhook))
+        // SSE moved to protected routes (was leaking session/token/task info without auth)
+        // Webhooks moved to protected routes (rate limiting required)
         // =================================================================
         // GRAPH VISUALIZATION (PUBLIC - HTML VIEWER ONLY)
         // =================================================================
@@ -67,10 +63,16 @@ pub fn build_public_routes(state: AppState) -> Router {
 pub fn build_protected_routes(state: AppState) -> Router {
     Router::new()
         // =================================================================
-        // CONTEXT STATUS (POST - requires auth to prevent state flooding)
+        // CONTEXT SSE + STATUS (auth required — SSE leaks session/token/task info)
         // =================================================================
+        .route("/api/context/sse", get(webhooks::context_status_sse))
         .route("/api/context/status", post(health::update_context_status))
         .route("/api/context_status", post(health::update_context_status)) // TUI POST alias
+        // =================================================================
+        // EXTERNAL WEBHOOKS (auth + rate limited — prevents unauthenticated memory injection)
+        // =================================================================
+        .route("/webhook/linear", post(integrations::linear_webhook))
+        .route("/webhook/github", post(integrations::github_webhook))
         // =================================================================
         // REMEMBER/RECORD ENDPOINTS
         // =================================================================
@@ -107,6 +109,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         .route("/api/memory/{memory_id}", get(crud::get_memory))
         .route("/api/memories/{memory_id}", get(crud::get_memory)) // Cloudflare compat alias
+        .route("/api/memory/{memory_id}/health", get(crud::get_memory_health)) // FIX-02: observability
         .route("/api/memory/{memory_id}", put(crud::update_memory))
         .route("/api/memory/{memory_id}", delete(crud::delete_memory))
         .route("/api/forget/{memory_id}", delete(crud::delete_memory)) // OpenAPI alias
