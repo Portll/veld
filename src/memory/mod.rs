@@ -262,6 +262,15 @@ pub struct MemorySystem {
     /// Cached wavelet-detected session map.
     /// Invalidated when fact_extraction_needed is set (any new remember call).
     session_map_cache: parking_lot::Mutex<Option<wavelet_sessions::SessionMap>>,
+
+    /// Active reconsolidation shadows (FIX-R1): memories currently in the labile window.
+    /// Key: MemoryId, Value: ReconsolidationShadow
+    /// When a memory is retrieved, it becomes labile (activation=1.0) and a shadow
+    /// is created. The shadow accumulates retrieval context until the window expires,
+    /// at which point maintenance atomically applies updates.
+    /// Reference: Nader et al. (2000) — reconsolidation theory.
+    reconsolidation_shadows:
+        Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::ReconsolidationShadow>>>,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -674,6 +683,10 @@ impl MemorySystem {
             fact_extraction_watermark: std::sync::atomic::AtomicI64::new(0),
             // Wavelet session detection cache — recomputed when new memories arrive
             session_map_cache: parking_lot::Mutex::new(None),
+            // FIX-R1: Reconsolidation shadow map — tracks labile memories
+            reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -894,6 +907,11 @@ impl MemorySystem {
             None,       // actor_id
             created_at, // Use provided timestamp or Utc::now() if None
         ));
+
+        // FIX-R2: Compute elaboration score at encoding time.
+        // Measures how contextualized this memory is (S-rep=0.0 vs C-rep=1.0).
+        // Reference: Ehlers & Clark (2000) — poor elaboration → pathological intrusions.
+        memory.set_elaboration_score(Self::compute_elaboration_score(&memory));
 
         // CRITICAL: Persist to RocksDB storage FIRST (before indexing/in-memory tiers)
         // This ensures retrieval can always fetch the memory from persistent storage
@@ -1464,6 +1482,9 @@ impl MemorySystem {
             None, // actor_id
             created_at,
         ));
+
+        // FIX-R2: Compute elaboration score at encoding time
+        memory.set_elaboration_score(Self::compute_elaboration_score(&memory));
 
         // Persist to RocksDB storage
         self.long_term_memory.store(&memory)?;
@@ -2145,6 +2166,13 @@ impl MemorySystem {
 
     /// Get all memories across all tiers for graph-aware retrieval
     /// Deduplicates by memory ID, preferring working > session > long-term
+    /// Check if a memory has an active reconsolidation shadow (FIX-R1).
+    /// Returns true if the memory was recently retrieved and is currently labile.
+    /// Used to set retrieval_trigger = "co_activation" in proactive context.
+    pub fn has_active_shadow(&self, memory_id: &MemoryId) -> bool {
+        self.reconsolidation_shadows.read().contains_key(memory_id)
+    }
+
     pub fn get_all_memories(&self) -> Result<Vec<SharedMemory>> {
         use std::collections::HashSet;
         let mut seen_ids: HashSet<MemoryId> = HashSet::new();
@@ -2238,6 +2266,64 @@ impl MemorySystem {
     pub fn get_longterm_memories(&self, limit: usize) -> Result<Vec<Memory>> {
         let all = self.long_term_memory.get_all()?;
         Ok(all.into_iter().take(limit).collect())
+    }
+
+    /// Compute elaboration quality score for a memory (FIX-R2).
+    ///
+    /// Measures how well-contextualized a memory is on a 0.0-1.0 scale:
+    /// - 0.0 = bare S-rep (raw content, no context, no entities, no threading)
+    /// - 1.0 = fully elaborated C-rep (rich context, diverse entities, temporal binding)
+    ///
+    /// Reference: Ehlers & Clark (2000) — poor elaboration/contextualization at encoding
+    /// produces fragmented memories that intrude without temporal grounding.
+    fn compute_elaboration_score(memory: &Memory) -> f32 {
+        let max_dimensions = 7.0_f32;
+        let mut score = 0.0_f32;
+
+        // 1. Context richness (0 or 1): reuse existing context_richness() / 10
+        let ctx_richness = memory.context_richness() as f32 / 10.0;
+        score += ctx_richness.min(1.0);
+
+        // 2. Entity diversity (0 or 1): more unique entities = better elaboration
+        let entity_count = memory.experience.entities.len();
+        score += (entity_count as f32 / 5.0).min(1.0);
+
+        // 3. Emotional signals present (0 or 1)
+        let has_emotion = memory.experience.context.as_ref().is_some_and(|ctx| {
+            ctx.emotional.valence != 0.0 || ctx.emotional.arousal != 0.0
+        });
+        if has_emotion {
+            score += 1.0;
+        }
+
+        // 4. Episode threading (0 or 1): linked to preceding memory
+        let has_threading = memory.experience.context.as_ref().is_some_and(|ctx| {
+            ctx.episode.preceding_memory_id.is_some()
+        });
+        if has_threading {
+            score += 1.0;
+        }
+
+        // 5. Temporal references (0 or 1): has extractable dates/times
+        if !memory.experience.temporal_refs.is_empty() {
+            score += 1.0;
+        }
+
+        // 6. Tags present (0 or 1): intentional classification
+        if !memory.experience.tags.is_empty() {
+            score += 1.0;
+        }
+
+        // 7. Content density (0 or 1): information per word (entities/words ratio)
+        let word_count = memory.experience.content.split_whitespace().count();
+        let density = if word_count > 0 {
+            entity_count as f32 / word_count as f32
+        } else {
+            0.0
+        };
+        score += (density * 10.0).min(1.0);
+
+        (score / max_dimensions).clamp(0.0, 1.0)
     }
 
     /// Calculate importance of an experience using multi-factor analysis

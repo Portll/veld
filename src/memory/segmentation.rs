@@ -10,9 +10,11 @@
 //! 4. Entity-aware splitting - split if entities have no semantic relation
 //! 5. Deduplication - prevent duplicate edges in knowledge graph
 
-use crate::memory::types::ExperienceType;
+use crate::memory::types::{ExperienceType, MemoryId};
 use regex::Regex;
+use rust_stemmers::{Algorithm, Stemmer};
 use std::collections::HashSet;
+use uuid::Uuid;
 
 /// Result of segmenting input text
 #[derive(Debug, Clone)]
@@ -27,6 +29,44 @@ pub struct AtomicMemory {
     pub type_confidence: f32,
     /// Source indicator (which part of input this came from)
     pub source_offset: usize,
+}
+
+/// A single turn in a conversation (role + content)
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    /// Speaker role (e.g., "User", "Assistant", "System") or name
+    pub role: String,
+    /// Content of this turn
+    pub content: String,
+}
+
+/// Result of conversation-aware segmentation
+///
+/// Extends AtomicMemory with conversation-level structure:
+/// parent_id linking for Q&A pairs, speaker entity refs, and topic tags.
+#[derive(Debug, Clone)]
+pub struct ConversationMemory {
+    /// The underlying atomic memory
+    pub memory: AtomicMemory,
+    /// Unique ID assigned during segmentation (used for parent_id linking)
+    pub id: MemoryId,
+    /// Parent memory ID - links an answer to its question
+    pub parent_id: Option<MemoryId>,
+    /// Speaker identity extracted from the turn role
+    pub speaker: String,
+    /// Entity reference for the speaker (name + relation)
+    pub speaker_entity: SpeakerEntity,
+    /// Topic threading tags shared across related consecutive turns
+    pub topic_tags: Vec<String>,
+}
+
+/// Speaker entity extracted from a conversation turn
+#[derive(Debug, Clone)]
+pub struct SpeakerEntity {
+    /// Normalized speaker name (lowercased, trimmed)
+    pub name: String,
+    /// Relation type for entity ref ("speaker", "questioner", "responder")
+    pub relation: String,
 }
 
 /// Input source for segmentation context
@@ -426,6 +466,224 @@ impl SegmentationEngine {
         result
     }
 
+    /// Segment a conversation into linked ConversationMemory entries
+    ///
+    /// This is the conversation-aware counterpart to `segment()`. It takes structured
+    /// turns (role + content) and produces memories with:
+    /// - Q&A pair linking via parent_id (question -> answer)
+    /// - Speaker attribution as entity references
+    /// - Topic threading via shared tags on consecutive related turns
+    pub fn segment_conversation(
+        &self,
+        turns: &[ConversationTurn],
+        source: InputSource,
+    ) -> Vec<ConversationMemory> {
+        if turns.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 1: Produce one AtomicMemory per turn, stripping role prefixes from content
+        let mut turn_memories: Vec<(AtomicMemory, String)> = Vec::with_capacity(turns.len());
+        for (i, turn) in turns.iter().enumerate() {
+            let cleaned = Self::strip_role_prefix(&turn.content);
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let (exp_type, confidence) = self.detect_type(trimmed, source);
+            let entities = self.extract_simple_entities(trimmed);
+
+            let memory = AtomicMemory {
+                experience_type: exp_type,
+                content: trimmed.to_string(),
+                entities,
+                type_confidence: confidence,
+                source_offset: i,
+            };
+            turn_memories.push((memory, turn.role.clone()));
+        }
+
+        if turn_memories.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 2: Assign IDs to every turn memory
+        let ids: Vec<MemoryId> = (0..turn_memories.len())
+            .map(|_| MemoryId(Uuid::new_v4()))
+            .collect();
+
+        // Phase 3: Detect Q&A pairs and assign parent_id links
+        let parent_ids = self.detect_qa_pairs(&turn_memories);
+
+        // Phase 4: Compute topic threading tags
+        let topic_tags = self.compute_topic_threads(&turn_memories);
+
+        // Phase 5: Assemble ConversationMemory entries
+        let mut results = Vec::with_capacity(turn_memories.len());
+        for (i, (memory, role)) in turn_memories.into_iter().enumerate() {
+            let speaker_name = Self::normalize_speaker(&role);
+            let relation = if parent_ids[i].is_some() {
+                "responder".to_string()
+            } else if self.content_ends_with_question(&memory.content) {
+                "questioner".to_string()
+            } else {
+                "speaker".to_string()
+            };
+
+            results.push(ConversationMemory {
+                memory,
+                id: ids[i].clone(),
+                parent_id: parent_ids[i].as_ref().map(|idx| ids[*idx].clone()),
+                speaker: speaker_name.clone(),
+                speaker_entity: SpeakerEntity {
+                    name: speaker_name,
+                    relation,
+                },
+                topic_tags: topic_tags[i].clone(),
+            });
+        }
+
+        results
+    }
+
+    /// Detect Q&A pairs: if turn[i] ends with `?` and turn[i+1] doesn't, link them.
+    /// Returns a Vec<Option<usize>> where each entry is the index of the parent (question) turn,
+    /// or None if this turn is not an answer.
+    fn detect_qa_pairs(&self, turns: &[(AtomicMemory, String)]) -> Vec<Option<usize>> {
+        let mut parent_ids = vec![None; turns.len()];
+
+        for i in 0..turns.len().saturating_sub(1) {
+            let current_is_question = self.content_ends_with_question(&turns[i].0.content);
+            let next_is_question = self.content_ends_with_question(&turns[i + 1].0.content);
+
+            // Link answer to question: current ends with ?, next doesn't
+            if current_is_question && !next_is_question {
+                parent_ids[i + 1] = Some(i);
+            }
+        }
+
+        parent_ids
+    }
+
+    /// Check if content ends with a question mark (ignoring trailing whitespace)
+    fn content_ends_with_question(&self, content: &str) -> bool {
+        content.trim_end().ends_with('?')
+    }
+
+    /// Compute topic threading tags for consecutive turns.
+    ///
+    /// Two consecutive turns share a topic tag if their stemmed-token Jaccard
+    /// similarity >= 0.3. The tag is formatted as "topic:{stem1}+{stem2}+..." using
+    /// the intersection stems (alphabetically sorted).
+    fn compute_topic_threads(
+        &self,
+        turns: &[(AtomicMemory, String)],
+    ) -> Vec<Vec<String>> {
+        let stemmer = Stemmer::create(Algorithm::English);
+        let mut tags_per_turn: Vec<Vec<String>> = vec![Vec::new(); turns.len()];
+
+        // Pre-compute stemmed token sets for each turn
+        let stem_sets: Vec<HashSet<String>> = turns
+            .iter()
+            .map(|(memory, _)| Self::stemmed_tokens(&stemmer, &memory.content))
+            .collect();
+
+        for i in 0..turns.len().saturating_sub(1) {
+            let jaccard = Self::jaccard_similarity(&stem_sets[i], &stem_sets[i + 1]);
+
+            if jaccard >= 0.3 {
+                // Build a topic tag from intersection stems
+                let intersection: Vec<String> = stem_sets[i]
+                    .intersection(&stem_sets[i + 1])
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut sorted = intersection;
+                sorted.sort();
+                // Limit tag length to avoid pathologically long tags
+                let tag_stems: Vec<&str> = sorted.iter().take(5).map(|s| s.as_str()).collect();
+                let tag = format!("topic:{}", tag_stems.join("+"));
+
+                // Add to both turns (they share this topic)
+                if !tags_per_turn[i].contains(&tag) {
+                    tags_per_turn[i].push(tag.clone());
+                }
+                if !tags_per_turn[i + 1].contains(&tag) {
+                    tags_per_turn[i + 1].push(tag);
+                }
+            }
+        }
+
+        tags_per_turn
+    }
+
+    /// Compute stemmed tokens from content, excluding stopwords
+    fn stemmed_tokens(stemmer: &Stemmer, content: &str) -> HashSet<String> {
+        let stopwords: HashSet<&str> = [
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has",
+            "had", "do", "does", "did", "will", "would", "could", "should", "may", "might",
+            "must", "shall", "can", "need", "to", "of", "in", "for", "on", "with", "at", "by",
+            "from", "as", "into", "through", "during", "before", "after", "above", "below",
+            "between", "under", "again", "further", "then", "once", "here", "there", "when",
+            "where", "why", "how", "all", "each", "few", "more", "most", "other", "some",
+            "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very",
+            "just", "and", "but", "or", "if", "because", "while", "although", "this", "that",
+            "these", "those", "i", "you", "he", "she", "it", "we", "they", "what", "which",
+            "who", "whom", "its", "his", "her", "their", "my", "your", "our",
+        ]
+        .into_iter()
+        .collect();
+
+        content
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2 && !stopwords.contains(w))
+            .map(|w| stemmer.stem(w).to_string())
+            .collect()
+    }
+
+    /// Jaccard similarity between two sets
+    fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
+        if a.is_empty() && b.is_empty() {
+            return 0.0;
+        }
+        let intersection = a.intersection(b).count();
+        let union = a.union(b).count();
+        if union == 0 {
+            0.0
+        } else {
+            intersection as f32 / union as f32
+        }
+    }
+
+    /// Strip common role prefixes from content (e.g., "User: hello" -> "hello")
+    fn strip_role_prefix(content: &str) -> String {
+        // Match patterns like "User:", "Assistant:", "System:", or "Name:" at start of content
+        let trimmed = content.trim_start();
+        if let Some(colon_pos) = trimmed.find(':') {
+            // Only strip if the prefix is short (< 30 chars) and looks like a role
+            if colon_pos < 30 {
+                let prefix = &trimmed[..colon_pos];
+                let is_role = prefix
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ');
+                if is_role && !prefix.is_empty() {
+                    return trimmed[colon_pos + 1..].trim_start().to_string();
+                }
+            }
+        }
+        content.to_string()
+    }
+
+    /// Normalize a speaker name: trim, lowercase, collapse whitespace
+    fn normalize_speaker(role: &str) -> String {
+        role.trim()
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Simple entity extraction (words > 2 chars, excluding stopwords)
     fn extract_simple_entities(&self, content: &str) -> Vec<String> {
         let stopwords: HashSet<&str> = [
@@ -715,5 +973,368 @@ mod tests {
         for segment in &segments {
             assert!(segment.content.len() <= engine.max_segment_length + 50); // Allow some overflow
         }
+    }
+
+    // =========================================================================
+    // Conversation-level segmentation tests
+    // =========================================================================
+
+    #[test]
+    fn test_conversation_qa_pair_detection() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "What database should we use for this project?".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "I recommend RocksDB because it has excellent write performance and embedded key-value storage.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::Cortex);
+
+        assert_eq!(results.len(), 2);
+        // First turn (question) has no parent
+        assert!(results[0].parent_id.is_none());
+        // Second turn (answer) links to the question
+        assert!(results[1].parent_id.is_some());
+        assert_eq!(results[1].parent_id.as_ref().unwrap(), &results[0].id);
+    }
+
+    #[test]
+    fn test_conversation_no_qa_when_both_questions() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "What database should we use?".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "Do you need SQL or NoSQL compatibility?".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::Cortex);
+
+        assert_eq!(results.len(), 2);
+        // Both are questions, no Q&A linking
+        assert!(results[0].parent_id.is_none());
+        assert!(results[1].parent_id.is_none());
+    }
+
+    #[test]
+    fn test_conversation_speaker_attribution() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "Alice".to_string(),
+                content: "I think we should refactor the authentication module.".to_string(),
+            },
+            ConversationTurn {
+                role: "Bob".to_string(),
+                content: "Agreed, the current auth code has too many edge cases.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::UserApi);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].speaker, "alice");
+        assert_eq!(results[1].speaker, "bob");
+        assert_eq!(results[0].speaker_entity.name, "alice");
+        assert_eq!(results[1].speaker_entity.name, "bob");
+        assert_eq!(results[0].speaker_entity.relation, "speaker");
+        assert_eq!(results[1].speaker_entity.relation, "speaker");
+    }
+
+    #[test]
+    fn test_conversation_speaker_questioner_responder() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "How does the Hebbian learning work in shodh-memory?".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "Hebbian learning in shodh-memory strengthens edges between co-activated entities.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::Cortex);
+
+        assert_eq!(results[0].speaker_entity.relation, "questioner");
+        assert_eq!(results[1].speaker_entity.relation, "responder");
+    }
+
+    #[test]
+    fn test_conversation_topic_threading() {
+        let engine = SegmentationEngine::new();
+
+        // Two turns with high stemmed-token overlap (both about Rust memory performance)
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "Rust memory performance looks impressive for our storage system.".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "Rust memory performance benchmarks confirm impressive storage system throughput.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::UserApi);
+
+        assert_eq!(results.len(), 2);
+        // Both should share at least one topic tag
+        assert!(!results[0].topic_tags.is_empty());
+        assert!(!results[1].topic_tags.is_empty());
+        // They should share the same tag
+        let shared: Vec<_> = results[0]
+            .topic_tags
+            .iter()
+            .filter(|t| results[1].topic_tags.contains(t))
+            .collect();
+        assert!(!shared.is_empty());
+        // Topic tags start with "topic:"
+        assert!(shared[0].starts_with("topic:"));
+    }
+
+    #[test]
+    fn test_conversation_no_topic_threading_unrelated() {
+        let engine = SegmentationEngine::new();
+
+        // Two completely unrelated turns
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "The weather forecast says heavy rain tomorrow afternoon.".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "The Rust compiler caught three lifetime errors in the authentication module.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::UserApi);
+
+        assert_eq!(results.len(), 2);
+        // No shared topic tags between unrelated turns
+        let shared: Vec<_> = results[0]
+            .topic_tags
+            .iter()
+            .filter(|t| results[1].topic_tags.contains(t))
+            .collect();
+        assert!(shared.is_empty());
+    }
+
+    #[test]
+    fn test_conversation_role_prefix_stripping() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "User: What is the capital of France?".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "Assistant: The capital of France is Paris.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::Cortex);
+
+        assert_eq!(results.len(), 2);
+        // Content should have role prefix stripped
+        assert!(results[0].memory.content.starts_with("What"));
+        assert!(results[1].memory.content.starts_with("The"));
+    }
+
+    #[test]
+    fn test_conversation_empty_turns() {
+        let engine = SegmentationEngine::new();
+
+        let turns: Vec<ConversationTurn> = Vec::new();
+        let results = engine.segment_conversation(&turns, InputSource::UserApi);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_conversation_single_turn() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![ConversationTurn {
+            role: "User".to_string(),
+            content: "I decided to use RocksDB for the persistent storage layer.".to_string(),
+        }];
+
+        let results = engine.segment_conversation(&turns, InputSource::UserApi);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].parent_id.is_none());
+        assert_eq!(results[0].speaker, "user");
+        assert!(results[0].topic_tags.is_empty()); // No consecutive turn to thread with
+    }
+
+    #[test]
+    fn test_conversation_multi_turn_qa_chain() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "What embedding model should we use?".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "I recommend MiniLM for its balance of quality and speed in our embeddings pipeline.".to_string(),
+            },
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "How many dimensions does MiniLM produce?".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "MiniLM produces 384-dimensional embedding vectors.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::Cortex);
+
+        assert_eq!(results.len(), 4);
+        // Turn 0 (Q) -> no parent
+        assert!(results[0].parent_id.is_none());
+        // Turn 1 (A) -> parent is turn 0
+        assert_eq!(results[1].parent_id.as_ref().unwrap(), &results[0].id);
+        // Turn 2 (Q) -> no parent
+        assert!(results[2].parent_id.is_none());
+        // Turn 3 (A) -> parent is turn 2
+        assert_eq!(results[3].parent_id.as_ref().unwrap(), &results[2].id);
+    }
+
+    #[test]
+    fn test_conversation_blank_content_skipped() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "What is Hebbian learning in the context of memory systems?".to_string(),
+            },
+            ConversationTurn {
+                role: "System".to_string(),
+                content: "   ".to_string(), // Blank content
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "Hebbian learning strengthens connections between neurons that fire together.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::Cortex);
+
+        // Blank turn should be skipped
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_strip_role_prefix() {
+        assert_eq!(
+            SegmentationEngine::strip_role_prefix("User: hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            SegmentationEngine::strip_role_prefix("Assistant: the answer is 42"),
+            "the answer is 42"
+        );
+        // Don't strip if no colon
+        assert_eq!(
+            SegmentationEngine::strip_role_prefix("hello world"),
+            "hello world"
+        );
+        // Don't strip long prefixes (> 30 chars)
+        let long_prefix = format!("{}: content", "a".repeat(35));
+        assert_eq!(
+            SegmentationEngine::strip_role_prefix(&long_prefix),
+            long_prefix
+        );
+    }
+
+    #[test]
+    fn test_normalize_speaker() {
+        assert_eq!(SegmentationEngine::normalize_speaker("User"), "user");
+        assert_eq!(
+            SegmentationEngine::normalize_speaker("  Alice  Bob  "),
+            "alice bob"
+        );
+        assert_eq!(
+            SegmentationEngine::normalize_speaker("ASSISTANT"),
+            "assistant"
+        );
+    }
+
+    #[test]
+    fn test_stemmed_tokens() {
+        let stemmer = Stemmer::create(Algorithm::English);
+        let tokens = SegmentationEngine::stemmed_tokens(&stemmer, "Running performances are impressive");
+        // "running" -> "run", "performances" -> "perform", "impressive" -> "impress"
+        // "are" is a stopword
+        assert!(tokens.contains("run") || tokens.contains("running"));
+        assert!(!tokens.contains("are")); // stopword excluded
+        assert!(tokens.len() >= 2); // at least some non-stopword tokens
+    }
+
+    #[test]
+    fn test_jaccard_similarity() {
+        let a: HashSet<String> = ["rust", "memory", "performance"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let b: HashSet<String> = ["rust", "memory", "safety"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let sim = SegmentationEngine::jaccard_similarity(&a, &b);
+        // 2 intersection / 4 union = 0.5
+        assert!((sim - 0.5).abs() < 0.01);
+
+        // Empty sets
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(SegmentationEngine::jaccard_similarity(&empty, &empty), 0.0);
+    }
+
+    #[test]
+    fn test_conversation_unique_ids() {
+        let engine = SegmentationEngine::new();
+
+        let turns = vec![
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "First message about the Rust programming language.".to_string(),
+            },
+            ConversationTurn {
+                role: "Assistant".to_string(),
+                content: "Second message about memory safety in Rust systems.".to_string(),
+            },
+            ConversationTurn {
+                role: "User".to_string(),
+                content: "Third message about performance benchmarks for the system.".to_string(),
+            },
+        ];
+
+        let results = engine.segment_conversation(&turns, InputSource::UserApi);
+
+        // All IDs should be unique
+        let ids: HashSet<_> = results.iter().map(|r| r.id.0).collect();
+        assert_eq!(ids.len(), results.len());
     }
 }

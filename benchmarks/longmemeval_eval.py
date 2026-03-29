@@ -383,8 +383,6 @@ def ingest_question(client: ShodhMemoryClient, entry: dict,
                 role = "User" if t.get("role") in ("human", "user") else "Assistant"
                 content = t.get("content", "").strip()
                 if content:
-                    if role == "Assistant" and len(content) > 500:
-                        content = content[:500] + "..."
                     all_turns.append(f"{role}: {content}")
             if not all_turns:
                 continue
@@ -483,7 +481,9 @@ ANSWER_PROMPT_FACTUAL = (
     "Please answer the question based on the relevant chat history.\n\n"
     "Important: Pay close attention to the question word.\n"
     "- 'Where' questions need a specific PLACE, STORE, or LOCATION name.\n"
-    "- 'When' questions need a specific DATE, TIME, or DAY.\n"
+    "- 'When' questions need a specific DATE, TIME, or DAY. "
+    "Resolve named dates to calendar dates (Valentine's Day = February 14th, "
+    "Christmas = December 25th, etc.).\n"
     "- 'Who' questions need a specific PERSON name.\n"
     "- 'How long/much/many' questions need a specific NUMBER or QUANTITY.\n"
     "- 'How many' questions: search ALL the provided history carefully. "
@@ -577,7 +577,12 @@ def generate_answer(provider: str, model: str, question: str,
                     question_date: str, memories: list,
                     question_type: str = "", abstention: bool = False,
                     api_key: str = None, api_base: str = None) -> str:
-    context = format_retrieved_context(memories)
+    # For answer generation: use top-50 non-summary memories.
+    # Session summaries help retrieval diversity but lack specifics for QA.
+    # Retrieve 100 for metrics, generate from best 50 turn-level memories.
+    detail_memories = [m for m in memories
+                       if "session_summary" not in str(_get_mem_tags(m))]
+    context = format_retrieved_context(detail_memories[:50])
 
     # Select prompt by question type
     if abstention:

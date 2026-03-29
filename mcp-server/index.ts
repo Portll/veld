@@ -2501,6 +2501,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           tags: string[];
           relevance_reason: string;
           matched_entities: string[];
+          // FIX-R4: Temporal distance + intrusion score markers
+          hours_since_created: number;
+          hours_since_last_accessed: number;
+          access_count: number;
+          activation_level: number;
+          retrieval_trigger: string;
+          intrusion_score: number;
         }
 
         interface ReminderItem {
@@ -2784,7 +2791,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   ? preview.slice(0, sentenceEnd + 1)
                   : preview.slice(0, 200) + "...";
             }
-            return `${i + 1}. ${importanceBar} [${score}%]${timeStr} ${preview}\n   ${m.memory_type}${m.tier ? ` | ${m.tier}` : ""} | ${m.relevance_reason}${entityMatchStr}${tagsStr}`;
+            // FIX-R4: Intrusion/provenance marker — helps Claude distinguish
+            // co-activated intrusions from genuine semantic matches
+            const intrusionTag =
+              m.intrusion_score > 2.0
+                ? " [co-activated]"
+                : m.intrusion_score < 0.5
+                  ? " [deep match]"
+                  : "";
+            return `${i + 1}. ${importanceBar} [${score}%]${timeStr} ${preview}\n   ${m.memory_type}${m.tier ? ` | ${m.tier}` : ""} | ${m.retrieval_trigger || m.relevance_reason}${intrusionTag}${entityMatchStr}${tagsStr}`;
           })
           .join("\n\n");
 

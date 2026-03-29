@@ -549,6 +549,71 @@ impl super::MemorySystem {
             }
         }
 
+        // 2.45 FIX-R1: Process expired reconsolidation shadows
+        // Close labile windows and decay activation back to resting state.
+        // Working memory pattern (bursty access) keeps activation high.
+        // Reference: Nader et al. (2000) — reconsolidation window closure.
+        let mut reconsolidation_applied = 0_u32;
+        {
+            let expired: Vec<types::ReconsolidationShadow> = {
+                let mut shadows = self.reconsolidation_shadows.write();
+                let expired_keys: Vec<types::MemoryId> = shadows
+                    .iter()
+                    .filter(|(_, s)| {
+                        s.expires_at <= now
+                            && s.consecutive_retrieval_count
+                                < crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+
+                expired_keys
+                    .iter()
+                    .filter_map(|k| shadows.remove(k))
+                    .collect()
+            };
+
+            for shadow in &expired {
+                // Find the memory across tiers and decay activation from labile (1.0)
+                // to resting state. Bursty access patterns keep activation higher.
+                let found: Option<SharedMemory> = self
+                    .working_memory
+                    .read()
+                    .get(&shadow.memory_id)
+                    .cloned()
+                    .or_else(|| self.session_memory.read().get(&shadow.memory_id).cloned());
+
+                if let Some(mem) = found {
+                    let burstiness = mem.access_burstiness();
+                    let resting_activation = if burstiness > 1.5 {
+                        0.6 // Bursty = working memory, keep active
+                    } else {
+                        0.3 // Steady = long-term, decay to resting
+                    };
+                    mem.set_activation(resting_activation);
+                    reconsolidation_applied += 1;
+
+                    self.record_consolidation_event(ConsolidationEvent::MemoryStrengthened {
+                        memory_id: shadow.memory_id.0.to_string(),
+                        content_preview: format!(
+                            "reconsolidated ({}x retrievals, burstiness={:.1})",
+                            shadow.consecutive_retrieval_count, burstiness
+                        ),
+                        activation_before: 1.0,
+                        activation_after: resting_activation,
+                        reason: StrengtheningReason::Recalled,
+                        timestamp: now,
+                    });
+                }
+            }
+        }
+        if reconsolidation_applied > 0 {
+            tracing::debug!(
+                applied = reconsolidation_applied,
+                "FIX-R1: Processed expired reconsolidation shadows"
+            );
+        }
+
         // 2.5 Potentiation: boost ALL memories based on access count (Hebbian LTP)
         // This implements "neurons that fire together wire together" - memories
         // that are accessed frequently get importance boosts during maintenance
@@ -897,6 +962,58 @@ impl super::MemorySystem {
 
                         // Connect newly extracted facts to the knowledge graph
                         self.connect_facts_to_graph(&facts_only);
+
+                        // FIX-R2: Fragment demotion — demote source memories when
+                        // a quality-gated fact has been extracted from them.
+                        // Reference: Ehlers & Clark (2000) — S-rep fragments should
+                        // be deprioritized once a C-rep fact is consolidated.
+                        let mut demoted_count = 0_u32;
+                        for (fact, fact_emb) in &truly_new {
+                            for source_id in &fact.source_memories {
+                                let source_mem = memories.iter().find(|m| &m.id == source_id);
+                                if let Some(source) = source_mem {
+                                    // Similarity gate: only demote if fact faithfully
+                                    // represents the source (prevents bad facts from
+                                    // suppressing good fragments)
+                                    let similarity = match (
+                                        fact_emb.as_deref(),
+                                        source.experience.embeddings.as_deref(),
+                                    ) {
+                                        (Some(fe), Some(se)) => {
+                                            crate::similarity::cosine_similarity(fe, se)
+                                        }
+                                        _ => 0.0,
+                                    };
+                                    if similarity
+                                        >= crate::constants::FRAGMENT_DEMOTION_SIMILARITY_GATE
+                                    {
+                                        let elab = source.elaboration_score();
+                                        // Well-elaborated facts strongly demote; poorly-
+                                        // elaborated facts barely demote. Uses fact
+                                        // confidence as quality proxy.
+                                        let quality = fact.confidence.max(elab);
+                                        let demotion = 1.0
+                                            - (quality
+                                                * crate::constants::FRAGMENT_DEMOTION_MAX_FACTOR);
+                                        source.set_fragment_demotion(demotion);
+                                        // Persist the demotion
+                                        if let Ok(mut stored) =
+                                            self.long_term_memory.get(source_id)
+                                        {
+                                            stored.set_fragment_demotion(demotion);
+                                            let _ = self.long_term_memory.update(&stored);
+                                        }
+                                        demoted_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if demoted_count > 0 {
+                            tracing::debug!(
+                                demoted = demoted_count,
+                                "FIX-R2: Demoted source fragments after fact extraction"
+                            );
+                        }
                     }
 
                     if facts_extracted_count > 0 || facts_reinforced_count > 0 {
