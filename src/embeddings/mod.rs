@@ -15,6 +15,7 @@
 
 pub mod chunking;
 pub mod circuit_breaker;
+pub mod cross_encoder;
 pub mod downloader;
 pub mod keywords;
 pub mod minilm;
@@ -50,6 +51,12 @@ pub trait Embedder: Send + Sync {
 
     /// Get embedding dimension
     fn dimension(&self) -> usize;
+
+    /// Encode text and report whether the result is a degraded fallback.
+    /// Returns (embedding, is_degraded). Default: delegates to encode(), reports healthy.
+    fn encode_with_status(&self, text: &str) -> Result<(Vec<f32>, bool)> {
+        self.encode(text).map(|v| (v, false))
+    }
 
     /// Batch encode multiple texts (default: sequential)
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

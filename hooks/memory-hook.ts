@@ -9,7 +9,7 @@
  */
 
 const SHODH_API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
-const SHODH_API_KEY = process.env.SHODH_API_KEY || "sk-shodh-dev-local-testing-key";
+const SHODH_API_KEY = process.env.SHODH_API_KEY || "";
 const SHODH_USER_ID = process.env.SHODH_USER_ID || "claude-code";
 
 interface HookInput {

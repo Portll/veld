@@ -22,6 +22,8 @@ pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub build: String,
+    pub built_at: String,
     pub users_count: usize,
     pub users_in_cache: usize,
     pub user_evictions: usize,
@@ -35,7 +37,9 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
     Json(HealthResponse {
         status: "healthy".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: env!("SHODH_VERSION_FULL").to_string(),
+        build: env!("SHODH_BUILD_NUMBER").to_string(),
+        built_at: env!("SHODH_BUILD_TIMESTAMP").to_string(),
         users_count: state.list_users().len(),
         users_in_cache,
         user_evictions,
@@ -55,16 +59,24 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Readiness probe - indicates if service can handle traffic
-/// Returns 200 OK if service is ready, 503 if not ready
+/// Readiness probe - indicates if service can handle traffic.
+/// Returns 503 if the server cannot initialize a test user's memory system
+/// (proves RocksDB + ONNX + vector index are operational).
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let users_in_cache = state.users_in_cache();
 
+    // Probe: try to acquire the health-check user's memory system.
+    // This exercises RocksDB open + ONNX model load on first call.
+    let ready = state.get_user_memory("__health_probe__").is_ok();
+
+    let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status_str = if ready { "ready" } else { "not_ready" };
+
     (
-        StatusCode::OK,
+        status_code,
         Json(serde_json::json!({
-            "status": "ready",
-            "version": env!("CARGO_PKG_VERSION"),
+            "status": status_str,
+            "version": env!("SHODH_VERSION_FULL"),
             "users_in_cache": users_in_cache,
             "timestamp": chrono::Utc::now().to_rfc3339()
         })),
