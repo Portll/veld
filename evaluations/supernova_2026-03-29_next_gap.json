@@ -1,0 +1,224 @@
+{
+  "analysis": "Supernova Gap Analysis v0.6.0 → 0.93+ MRR",
+  "date": "2026-03-29",
+  "baseline": {
+    "overall_mrr": 0.892,
+    "temporal_mrr": 0.867,
+    "temporal_r5": 0.708,
+    "temporal_r10": 0.875,
+    "absence_violations": "7/55"
+  },
+  "target_mrr": 0.93,
+  "mrr_gap": 0.038,
+  "queries_with_mrr_below_1": [
+    {
+      "query": "What database are we using?",
+      "type": "single_hop",
+      "mrr": 0.500,
+      "expected": [3, 18],
+      "retrieved_top5": [16, 3, 51, 33, 18],
+      "diagnosis": "Memory 16 (sqlx migration strategy) outranks memory 3 (PostgreSQL decision). M16 has high BM25 for 'database' but is about migration tooling, not the database choice itself. M3 is the correct top answer. M16's content mentions 'database' 3 times in a shorter memory, inflating BM25 TF. Entity-overlap boost also fires for M16 (tag 'database') equally with M3.",
+      "root_cause": "BM25 term-frequency inflation for peripheral mentions of 'database' in M16. The experience_type Decision boost (Layer 4.52) fires for both M3 and M16 (both are Decision type). No discriminator exists between 'database decision' and 'database tooling'.",
+      "mrr_delta_if_fixed": 0.025
+    },
+    {
+      "query": "What was the most recent architecture change?",
+      "type": "temporal",
+      "mrr": 0.333,
+      "expected": [46, 48],
+      "retrieved_top5": [18, 59, 46, 52, 29],
+      "diagnosis": "CRITICAL: Memory 18 (session 2, 3 weeks old) outranks memory 46 (session 4, 1 week old) despite the query explicitly asking for 'most recent'. Two compounding bugs: (1) Layer 5.9 gated-pin logic IS triggered by 'most recent' (wants_last=true), but finds memory 59 as the temporally latest in the result set (59 has highest intra-session offset). M59 likely has score >= p50 so gets pinned to rank 1. BUT (2) the linguistic_boost re-sort at line 2818 runs AFTER Layer 5.9, undoing the pin. Memory 18's content literally contains 'Major architecture change' giving it maximum linguistic overlap, pushing it back to rank 1. Memory 48 (microservice revert) is at rank 7+ and missing from top 5 entirely because it doesn't contain 'architecture change' in its text.",
+      "root_cause": "POST-PIN RE-SORT BUG: The linguistic boost sort (line 2818-2826 in recall.rs) runs unconditionally AFTER Layer 5.9 ordinal/recency pinning (line 2658-2814), destroying the pin. This is a logic ordering bug. Additionally, the retrieval competition at line 2837 can further displace pinned memories.",
+      "fix_location": "src/memory/recall.rs:2817-2826",
+      "fix_description": "Move the linguistic_boost re-sort to BEFORE Layer 5.9, or make Layer 5.9's pin immune to subsequent re-sorts by using a flag/sentinel score. The cleanest fix: relocate linguistic boost to Layer 4.6 range (pre-fetch) where it was originally intended as a tie-breaker, not a post-resolution override.",
+      "mrr_delta_if_fixed": 0.033
+    },
+    {
+      "query": "Why did we change the database AND what was the impact on the timeline?",
+      "type": "multi_hop",
+      "mrr": 0.500,
+      "expected": [18, 24],
+      "retrieved_top5": [16, 18, 49, 3, 32],
+      "diagnosis": "Memory 16 (sqlx migrations) again outranks memory 18 (MongoDB switch). Same BM25 inflation as the 'What database?' query. Memory 24 (timeline impact) drops to rank 6 because 'timeline' has low BM25 weight and M24's tags are [timeline, mongodb, impact, delay] which partially overlap but 'impact' and 'timeline' are common words with low discriminativeness.",
+      "root_cause": "Same M16 BM25 inflation. M24 suffers from the AND-query decomposition not producing a strong enough sub-query for 'impact on the timeline' — the keyword 'timeline' is too generic. Query decomposition splits at AND but the sub-query 'what was the impact on the timeline' doesn't surface M24 because M24's content focuses on specific schedule numbers rather than the word 'timeline'.",
+      "mrr_delta_if_fixed": 0.025
+    },
+    {
+      "query": "What patterns do you see in our decision-making?",
+      "type": "open_domain",
+      "mrr": 0.500,
+      "expected": [52, 59],
+      "retrieved_top5": [46, 52, 49, 58, 16],
+      "diagnosis": "Memory 52 (RFC decision process) is at rank 2 (good). Memory 59 (lessons learned) is NOT in top 10 at all. Memory 46 (architecture reversal) outranks 52. The query 'decision-making patterns' is abstract — M59's content about 'avoid technology switches without written evaluation' is the PATTERN but doesn't use the word 'decision' or 'pattern'. Vector similarity fails for abstract reasoning queries. M46 ranks high because it has tags 'reversed' + 'architecture-change' and the decision-type boost fires.",
+      "root_cause": "Semantic gap: abstract meta-reasoning queries ('what patterns') have poor vector similarity to memories that exemplify those patterns but use different vocabulary. M59 uses words like 'lessons', 'invest', 'prototype' instead of 'pattern' or 'decision-making'. BM25 also fails because there's no term overlap. The knowledge graph could help here but M59's entity tags are [lessons, retrospective, growth] which don't connect to 'decision' or 'pattern' nodes.",
+      "mrr_delta_if_fixed": 0.025
+    }
+  ],
+  "temporal_r5_gap": {
+    "symptom": "Temporal R@5=0.708 but R@10=0.875 — correct memories found but ranked 6-10",
+    "affected_queries": [
+      {
+        "query": "What decisions did we make last week?",
+        "r5": 0.667,
+        "r10": 1.000,
+        "expected": [46, 49, 52],
+        "diagnosis": "M49 (timeline revision) is at rank 6. M14 (sprint cadence, session 1) and M3 (PostgreSQL decision, session 1) are at ranks 2-3 despite being from 4 weeks ago, not 'last week'. The recency_scale=0.5 is applied but the recency_decay_rate=0.01 only halves score at ~70 hours. Session 1 memories are ~672 hours old → exp(-0.01*672)*0.5 = 0.0006 boost. Session 4 memories are ~168 hours old → exp(-0.01*168)*0.5 = 0.093 boost. The delta is 0.092 which is small relative to BM25/vector scores in the 0.3-0.8 range. Session 1 'decision' memories rank high because the Decision-type boost (+0.15) and entity overlap boost (+0.10-0.40) dominate the recency signal.",
+        "fix": "When wants_recent=true AND temporal_intent=SpecificTime, apply a time-window HARD FILTER that excludes memories outside the referenced window. 'Last week' should exclude memories > 2 weeks old. Currently this is only a soft boost, not a filter."
+      },
+      {
+        "query": "What bugs did we find during the debugging phase?",
+        "r5": 0.375,
+        "r10": 0.875,
+        "expected": [30, 31, 32, 33, 34, 36, 37, 41],
+        "diagnosis": "8 expected memories, only 3 in top 5 (41, 30, 36). M48 (microservice bugs, session 4) and M35 (Sarah's testing value, session 3) occupy top-5 slots despite M48 not being a session 3 bug. R@5=3/8=0.375. M35 is borderline — it mentions bugs but is an observation about testing. The 8 expected memories are ALL Error-type from session 3 but M48 (also Error-type) is from session 4 and matches because it's about bugs. This query is naturally hard with 8 expected answers and only 5 slots.",
+        "fix": "No single fix — this is a fundamental recall/precision tradeoff with 8 relevant documents in 5 slots. The 'debugging phase' reference should map to session 3 via the wavelet session detector, but the ordinal session reference doesn't fire because there's no ordinal ('third') in the query. Adding phase-to-session mapping could help."
+      }
+    ]
+  },
+  "absence_violations": {
+    "total": "7/55",
+    "breakdown": [
+      {
+        "query": "What decisions did we make last week?",
+        "violations": 2,
+        "absence_indices": [0, 2, 3],
+        "violated": [3, 2],
+        "violated_at_ranks": [4, 7],
+        "diagnosis": "M3 (PostgreSQL decision) and M2 (Rust backend decision) from session 1 appear in results despite being 4 weeks old. These are high-importance Decision-type memories with strong entity overlap for 'decision' queries. The temporal_intent gate blocks the content-fallback entity boost (line 1519) but the primary entity-overlap boost at Layer 4.525 still fires unconditionally.",
+        "fix": "When temporal_intent is SpecificTime and has a concrete time window (last week → past 7-14 days), apply a hard penalty (0.5x) to memories outside that window in Layer 4.54 instead of the current 0.85x soft dedup."
+      },
+      {
+        "query": "What happened during the second meeting?",
+        "violations": 2,
+        "absence_indices": [30, 45, 48],
+        "violated": [45, 48],
+        "violated_at_ranks": [14, 15],
+        "diagnosis": "These are at ranks 14-15 (outside the normal top-10 window). The extended result set from ordinal session injection (line 2756-2763) injects session members but also leaves room for non-session memories to appear. Low severity — only visible because the benchmark measures top-15."
+      },
+      {
+        "query": "What decisions were reversed and why?",
+        "violations": 1,
+        "absence_indices": [0, 5, 14],
+        "violated": [14],
+        "violated_at_rank": 10,
+        "diagnosis": "M14 (sprint cadence) at rank 10, borderline. Contains 'Decision of done' and process-related content that partially matches 'decisions'. Low severity."
+      },
+      {
+        "query": "What should we focus on next?",
+        "violations": 1,
+        "absence_indices": [0, 10],
+        "violated": [0],
+        "violated_at_rank": 7,
+        "diagnosis": "M0 (project kickoff) appears at rank 7. Contains 'Target launch is Q3' which semantically relates to 'what to focus on'. Mild false positive."
+      },
+      {
+        "query": "What patterns do you see in our decision-making?",
+        "violations": 1,
+        "absence_indices": [3, 9],
+        "violated": [3],
+        "violated_at_rank": 6,
+        "diagnosis": "M3 (PostgreSQL decision) at rank 6. Decision-type boost and 'decision-making' query overlap on 'decision' entity tag."
+      }
+    ]
+  },
+  "ranked_action_list": [
+    {
+      "priority": "P0",
+      "id": "FIX-POST-PIN-RESORT",
+      "title": "Move linguistic_boost re-sort before Layer 5.9 ordinal/recency resolution",
+      "file": "src/memory/recall.rs",
+      "lines": "2817-2826",
+      "description": "The linguistic_boost re-sort at line 2818 runs AFTER Layer 5.9's ordinal/recency pinning, undoing pins for 'most recent' and 'first' queries. This directly causes MRR=0.333 on the 'most recent architecture change' query. Move the sort block to immediately after Layer 5.7 confidence pruning (line ~2595) and before Layer 5.9. This is a pure code motion fix — no new logic needed.",
+      "affected_queries": [
+        "What was the most recent architecture change? (MRR 0.333→1.000)",
+        "What was the first bug we encountered? (currently MRR 1.0, prevents future regression)"
+      ],
+      "estimated_mrr_impact": "+0.033 overall MRR (0.892→0.925)",
+      "estimated_temporal_mrr_impact": "+0.133 temporal MRR (0.867→1.000)",
+      "confidence": "HIGH — deterministic code ordering fix",
+      "implementation": "Move lines 2817-2826 to before the Layer 5.9 block at line 2643. Keep the sort logic identical."
+    },
+    {
+      "priority": "P1",
+      "id": "FIX-TEMPORAL-HARD-FILTER",
+      "title": "Hard temporal window filter for SpecificTime queries with concrete time references",
+      "file": "src/memory/recall.rs",
+      "lines": "1650-1703 (Layer 4.54)",
+      "description": "When temporal_intent=SpecificTime and the query references a concrete time window ('last week', 'yesterday', 'this month'), apply a strong penalty (0.5x or hard filter) to memories outside that window. Currently Layer 4.54 only does topic dedup with a 0.85x penalty which is too weak. This would fix absence violations where session-1 memories appear in 'last week' queries, and improve R@5 for temporal queries by preventing old decisions from occupying top ranks.",
+      "affected_queries": [
+        "What decisions did we make last week? (R@5 0.667→1.000, abs 2→0)",
+        "What was the most recent architecture change? (complementary to P0)"
+      ],
+      "estimated_mrr_impact": "+0.000 (MRR is already 1.0 for this query, but R@5 and absence improve)",
+      "estimated_r5_impact": "+0.067 temporal R@5 (0.708→0.775+)",
+      "estimated_absence_impact": "-2 violations (7→5)",
+      "confidence": "HIGH — clear signal: 'last week' = past 7-14 days",
+      "implementation": "In Layer 4.54, when temporal_intent is SpecificTime and query_temporal.refs is non-empty, compute a time window from the refs and apply 0.50x penalty to memories with created_at outside the window (with +-50% grace period). Alternatively, add a new Layer 4.56 specifically for time-window hard filtering."
+    },
+    {
+      "priority": "P2",
+      "id": "FIX-BM25-SPECIFICITY",
+      "title": "BM25 specificity discount for peripheral topic mentions",
+      "file": "src/memory/hybrid_search.rs",
+      "lines": "BM25 scoring function",
+      "description": "Memory 16 (sqlx migration strategy) consistently outranks the actual database decision memory (M3) because it mentions 'database' 3 times in a shorter text, inflating BM25 TF. The fix: when a query term appears in a memory's content but NOT in its entity tags, apply a 0.7x discount on that term's BM25 contribution. This discriminates between 'memory IS ABOUT databases' (M3: tag 'database') vs 'memory MENTIONS databases' (M16: tag 'migrations'). This is a precision improvement, not a recall change.",
+      "affected_queries": [
+        "What database are we using? (MRR 0.500→1.000)",
+        "Why did we change the database AND what was the impact on the timeline? (MRR 0.500→1.000)"
+      ],
+      "estimated_mrr_impact": "+0.050 overall MRR (from fixing 2 queries at +0.5 each, /20)",
+      "confidence": "MEDIUM — requires careful tuning to avoid penalizing legitimate content matches",
+      "implementation": "In the BM25 scoring loop, check if the matched term also appears in the memory's entity list. If not, multiply that term's BM25 contribution by 0.70. Entity lists serve as a curated 'aboutness' signal."
+    },
+    {
+      "priority": "P3",
+      "id": "FIX-ABSTRACT-REASONING-QUERY",
+      "title": "Synonym/concept expansion for abstract meta-reasoning queries",
+      "file": "src/memory/query_parser.rs",
+      "lines": "decompose_query / classify_query",
+      "description": "The query 'What patterns do you see in our decision-making?' fails to retrieve M59 (lessons learned) because the vocabulary mismatch is too large. M59 uses 'lessons', 'invest', 'prototype' — none of which overlap with 'pattern' or 'decision-making'. Fix: detect abstract meta-reasoning queries (patterns, trends, themes, lessons) and expand the vector search with concept synonyms. E.g., 'patterns in decision-making' → also search for 'lessons learned', 'retrospective', 'what went wrong', 'what we learned'.",
+      "affected_queries": [
+        "What patterns do you see in our decision-making? (MRR 0.500→1.000)"
+      ],
+      "estimated_mrr_impact": "+0.025 overall MRR",
+      "confidence": "MEDIUM — concept expansion can introduce noise",
+      "implementation": "In classify_query, detect abstract meta-reasoning patterns (contains 'pattern', 'trend', 'theme', 'lesson', 'insight'). In decompose_query, add synonym sub-queries like 'lessons learned' and 'retrospective'. These get independent vector searches and merge via RRF in Layer 3."
+    },
+    {
+      "priority": "P4",
+      "id": "FIX-PHASE-TO-SESSION-MAPPING",
+      "title": "Map temporal phase references to wavelet sessions",
+      "file": "src/memory/recall.rs",
+      "lines": "2736-2814 (Layer 5.9)",
+      "description": "The query 'What bugs did we find during the debugging phase?' references a temporal phase ('debugging phase') but this doesn't trigger ordinal session resolution because there's no ordinal number. The wavelet session detector knows session 3 is the debugging session (all Error-type memories), but the current code only handles ordinal references ('second meeting'). Add phase keyword → session mapping: detect 'debugging phase/session', 'architecture phase', 'review phase', 'kickoff phase' and map to the session with the highest concentration of matching ExperienceType or tag keywords.",
+      "affected_queries": [
+        "What bugs did we find during the debugging phase? (R@5 0.375→0.625+)"
+      ],
+      "estimated_mrr_impact": "+0.000 (MRR is already 1.0)",
+      "estimated_r5_impact": "+0.050 temporal R@5",
+      "confidence": "MEDIUM — requires heuristic mapping from phase names to session characteristics",
+      "implementation": "In Layer 5.9, after ordinal session detection, add a fallback: if the query contains 'phase' or 'session' without an ordinal, extract the phase keyword (debugging, architecture, review, kickoff), use wavelet_sessions to find all sessions, then pick the session whose memories have the highest ratio of matching ExperienceType (Error for 'debugging') or matching tags."
+    }
+  ],
+  "cumulative_impact_estimate": {
+    "p0_alone": "MRR 0.892 → 0.925 (+0.033)",
+    "p0_p1": "MRR 0.925, temporal R@5 0.775+, absence 5/55",
+    "p0_p2": "MRR 0.925 → 0.975 (+0.050)",
+    "p0_p2_p3": "MRR 0.975 → 1.000 (theoretical ceiling)",
+    "note": "P0+P2 alone should exceed the 0.93 target. P1 improves R@5 and absence compliance. P3+P4 are polish for edge cases."
+  },
+  "non_actionable_observations": [
+    {
+      "observation": "Memory 48 (microservice bugs) is expected for 'most recent architecture change' but has zero tag overlap with 'architecture-change'. Its tags are [microservices, bugs, revert, monolith]. This is a ground-truth labeling concern — the benchmark expects M48 because the microservice revert IS an architecture change, but the memory's metadata doesn't encode this.",
+      "recommendation": "After P0 fix, if M48 still doesn't surface, consider adding 'architecture-change' to M48's tags in the benchmark corpus. OR add causal edge from M47 (microservice proposal) → M48 (microservice revert) which the graph traversal would follow."
+    },
+    {
+      "observation": "The benchmark has 8 expected answers for 'What bugs did we find during the debugging phase?' but only 5 top-k slots. Maximum possible R@5 = 5/8 = 0.625. This is a structural ceiling, not a retrieval bug.",
+      "recommendation": "Consider reporting R@8 for queries with >5 expected answers, or accepting this as a known ceiling."
+    },
+    {
+      "observation": "Absence violations at ranks 14-15 ('second meeting' query) are artifacts of the extended result set from ordinal session injection. These are outside the normal top-10 evaluation window.",
+      "recommendation": "Consider capping absence checks to top-10 results only, matching the evaluation cutoff for other metrics."
+    }
+  ]
+}

@@ -2662,6 +2662,22 @@ impl super::MemorySystem {
         }
 
         // =====================================================================
+        // LAYER 5.85: LINGUISTIC BOOST (moved before 5.9 to avoid undoing pins)
+        // =====================================================================
+        // Additive boost based on focal entity overlap. Must run BEFORE Layer 5.9
+        // ordinal resolution, because 5.9 pins memories to specific ranks and a
+        // post-pin re-sort would destroy those pins.
+        if !query_analysis.focal_entities.is_empty() {
+            memories.sort_by(|a, b| {
+                let score_a = a.score.unwrap_or(0.0)
+                    + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05;
+                let score_b = b.score.unwrap_or(0.0)
+                    + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
+                score_b.total_cmp(&score_a)
+            });
+        }
+
+        // =====================================================================
         // LAYER 5.9: ORDINAL RESOLUTION + CATEGORY ERROR DETECTION
         // =====================================================================
         // Post-retrieval filter for ordinal queries ("first", "last", "most recent")
@@ -2701,30 +2717,35 @@ impl super::MemorySystem {
                 memories.insert(0, earliest);
                 tracing::debug!("Layer 5.9: Ordinal 'first' — pinned earliest memory at rank 1");
             } else if wants_last && !memories.is_empty() {
-                // Strategy C: Gated pinning — only pin latest if it's already
-                // in the top half by score (content-relevant). Otherwise, boost
-                // the top-3 most recent memories from the relevant set by
-                // re-scoring with a recency bonus proportional to their recency rank.
+                // Strategy D: Content-gated recency pin.
+                // Find the most recent memory that is ALSO content-relevant (above
+                // median score). This prevents pinning a recent-but-off-topic memory
+                // when the query asks for "most recent X" — we want the most recent
+                // memory about X, not just the most recent memory.
                 let score_sorted: Vec<f32> = {
                     let mut s: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
                     s.sort_by(|a, b| b.total_cmp(a));
                     s
                 };
-                let p50 = score_sorted[score_sorted.len() / 2];
+                // Use p75 (top quartile) as relevance gate — stricter than p50
+                // to avoid pinning peripherally-relevant recent memories
+                let p75_idx = score_sorted.len() / 4;
+                let p75 = score_sorted[p75_idx.min(score_sorted.len() - 1)];
 
-                // Find the most recent memory
+                // Find the most recent RELEVANT memory (score >= p75)
                 let mut by_time = memories.clone();
                 by_time.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                let latest = &by_time[0];
+                let latest_relevant = by_time.iter()
+                    .find(|m| m.score.unwrap_or(0.0) >= p75);
 
-                if latest.score.unwrap_or(0.0) >= p50 {
-                    // Latest IS content-relevant → pin it
+                if let Some(latest) = latest_relevant {
+                    // Pin the most recent relevant memory at rank 1
                     let latest_id = latest.id.clone();
                     if let Some(pos) = memories.iter().position(|m| m.id == latest_id) {
                         let pinned = memories.remove(pos);
                         memories.insert(0, pinned);
                     }
-                    tracing::debug!("Layer 5.9: Gated pin — latest memory is content-relevant, pinned");
+                    tracing::debug!("Layer 5.9: Gated pin — latest relevant memory pinned");
                 } else {
                     // Latest is NOT relevant → apply graduated recency boost to
                     // top-3 most recent among the relevant set (above p50).
@@ -2835,16 +2856,7 @@ impl super::MemorySystem {
             }
         }
 
-        // Linguistic analysis: additive boost (5% of IC weight), not a full re-sort
-        if !query_analysis.focal_entities.is_empty() {
-            memories.sort_by(|a, b| {
-                let score_a = a.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05;
-                let score_b = b.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
-                score_b.total_cmp(&score_a)
-            });
-        }
+        // (Linguistic boost moved to Layer 5.85, before ordinal resolution)
 
         self.logger
             .read()
