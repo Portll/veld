@@ -1,0 +1,623 @@
+{
+  "feature": "Temporal Autocorrelation for Retrieval",
+  "date": "2026-03-29",
+  "summary": "Per-memory autocorrelation of retrieval timestamps to detect access rhythm patterns (bursty vs steady), proposed as 8th dimension in relevance scoring and resonance signal for decay_scales.rs",
+
+  "bifocal": {
+    "evaluation_type": "bifocal_plus",
+    "target": "Temporal Autocorrelation — per-memory rhythm detection as 8th retrieval dimension + decay resonance",
+
+    "phase_0_risk_triage": {
+      "tier_1_full": [
+        "Autocorrelation computation on per-memory timestamps — cold-start problem: most memories have <5 accesses, R(tau) is statistically meaningless below ~20 data points",
+        "8th dimension weight injection into LearnedWeights — changes weight normalization denominator, redistributes ALL existing weights, regression risk on MRR"
+      ],
+      "tier_2_standard": [
+        "Integration with decay_scales.rs FFT pipeline — decay_scales operates on GLOBAL access patterns, autocorrelation is PER-MEMORY; conceptual mismatch requires careful bridging",
+        "rhythm_match scoring function — mapping autocorrelation lag to a 0.0-1.0 score that's comparable to other dimensions"
+      ],
+      "tier_3_spot_check": [
+        "RocksDB storage for per-memory autocorrelation cache",
+        "Timestamp collection from existing learning_history.rs"
+      ]
+    },
+
+    "phase_1_edge_walk_fractal": {
+      "interfaces_analyzed": [
+        {
+          "interface": "learning_history.rs -> autocorrelation",
+          "boundary_type": "data_source",
+          "analysis": "StoredLearningEvent has event.timestamp() and memory_id. events_for_memory() already retrieves per-memory events with timestamps. HOWEVER: these are learning events (replays, potentiations, promotions), NOT retrieval events. Retrievals happen in handlers/recall.rs and relevance.rs but are NOT persisted to learning_history. The proposal assumes retrieval timestamps exist per-memory; they do not.",
+          "gap_severity": "critical",
+          "gap": "No per-memory retrieval timestamp log exists. MemoryMetadata has access_count (u32) and last_accessed (single DateTime), but no Vec<DateTime> of all access times. The autocorrelation function needs the raw timestamp series."
+        },
+        {
+          "interface": "autocorrelation -> relevance.rs LearnedWeights",
+          "boundary_type": "scoring_fusion",
+          "analysis": "Adding an 8th dimension to LearnedWeights changes normalize() which divides all weights by their sum. Current 7 weights sum to 1.0 with carefully tuned ratios (momentum=0.28 is the anchor signal). Adding rhythm_match at even 0.05 redistributes: momentum drops from 0.28 to 0.267. Every existing weight loses ~5% relative strength. This WILL affect MRR on existing benchmarks.",
+          "gap_severity": "high",
+          "gap": "No mechanism to conditionally activate rhythm_match only when sufficient data exists. Memories with <20 accesses (the vast majority) would contribute noise through this dimension."
+        },
+        {
+          "interface": "autocorrelation -> decay.rs / decay_scales.rs",
+          "boundary_type": "decay_modulation",
+          "analysis": "decay_scales.rs learns GLOBAL scales via FFT on all access timestamps. The proposal wants per-memory resonance at the memory's dominant lag. This means each memory gets its own log-periodic correction, replacing the shared active_scales(). The current OnceLock<Vec<f64>> RUNTIME_SCALES is a single global value. Per-memory scales would require either: (a) passing scales per-memory to hybrid_decay_factor (API change), or (b) a lookup table. Both are feasible but the decay system was designed for global scales.",
+          "gap_severity": "medium",
+          "gap": "hybrid_decay_factor() is a hot path called during every maintenance cycle for every memory. Per-memory scale lookup adds latency. Current design assumes O(1) scale access via static."
+        },
+        {
+          "interface": "autocorrelation computation -> latency budget",
+          "boundary_type": "performance",
+          "analysis": "Autocorrelation R(tau) = sum((x_i - mean)(x_{i+tau} - mean)) / variance is O(N*K) where N=number of timestamps, K=number of lags tested. For the proposal's use case, N<100 typically and K~50 (testing lags from 1 to 50 days). This is ~5000 ops per memory. During retrieval of top-10 candidates, that's 50K ops — trivial. During maintenance across 10K memories, that's 50M ops — still under 100ms. Performance is NOT the bottleneck.",
+          "gap_severity": "low",
+          "gap": "None significant."
+        }
+      ],
+
+      "fractal_self_similarity": {
+        "pattern": "The codebase already has a clear pattern for learning-from-access: decay_scales.rs does FFT on global timestamps to learn global scales. This proposal is the per-memory analog. The fractal structure is: global rhythm (decay_scales) -> per-memory rhythm (autocorrelation) -> per-query rhythm matching (relevance scoring). Each level is self-similar but operates at different granularity.",
+        "consistency": "Consistent with existing architecture philosophy. The system already does per-memory learning velocity in learning_history.rs and global FFT in decay_scales.rs. Autocorrelation fills the per-memory spectral gap."
+      }
+    },
+
+    "phase_2_fractal_atam": {
+      "pattern_consistency": {
+        "score": 7.5,
+        "analysis": "The pattern of 'extract signal from timestamps, compute spectral feature, inject into scoring' is well-established (decay_scales.rs). Autocorrelation follows the same pattern but at per-memory granularity. The ATAM tension is between the feature's theoretical elegance and its practical data requirements."
+      },
+      "tradeoffs": [
+        {
+          "id": "T1",
+          "tradeoff": "Precision vs Cold-Start: Autocorrelation needs ~20+ data points per memory. Most memories in a real system have 1-5 accesses. The feature is only useful for the top ~5% most-accessed memories.",
+          "resolution": "Gated activation: only compute and inject rhythm_match for memories with access_count >= 20. Below that, rhythm_match = 0.5 (neutral). This avoids noise injection."
+        },
+        {
+          "id": "T2",
+          "tradeoff": "MRR Stability vs New Signal: Adding an 8th dimension WILL change rankings. Even at weight 0.05, the redistribution effect through normalize() affects the dominant momentum signal.",
+          "resolution": "Additive scoring rather than redistributive: multiply the base fused score by (1 + rhythm_bonus) where rhythm_bonus is in [-0.05, +0.05], instead of adding a new weight dimension. This preserves existing weight ratios."
+        },
+        {
+          "id": "T3",
+          "tradeoff": "Per-Memory Scales vs Global Scales: decay.rs uses global log-periodic scales. Per-memory scales are more accurate but add complexity and storage.",
+          "resolution": "Hybrid: use global scales as base, but for memories with strong autocorrelation (confidence > 0.7), blend in the per-memory dominant lag as a 4th scale. This extends LOG_PERIODIC_SCALES from 3 to 4 elements conditionally."
+        }
+      ]
+    },
+
+    "phase_2_5_adversarial_challenge": {
+      "challenges": [
+        {
+          "attack": "The feature is solving a problem that doesn't exist. Show me ONE real failure case in LOCOMO or LongMemEval where rhythm detection would have changed the outcome.",
+          "score": 9.2,
+          "response": "VALID CHALLENGE. Reviewing LOCOMO benchmark failures (Q1-Q7 in bifocal_2026-03-28_entity-boost-threshold.json): ALL failures are entity matching, morphological mismatch, or session mapping issues. NONE are temporal pattern failures. LongMemEval: failures are multi-hop reasoning and temporal ordering, not rhythm detection. There is NO empirical evidence that rhythm matters for retrieval quality in any benchmark the project uses. The feature is theoretically interesting but has no demonstrated failure it would fix.",
+          "verdict": "ATTACK SUCCEEDS. No benchmark-driven justification exists."
+        },
+        {
+          "attack": "decay_scales.rs already captures rhythm via FFT on global timestamps. Autocorrelation on per-memory timestamps is redundant — FFT decomposes into the same frequency components that autocorrelation would find.",
+          "score": 7.8,
+          "response": "PARTIALLY VALID. FFT and autocorrelation are related (Wiener-Khinchin theorem: power spectral density is the Fourier transform of the autocorrelation function). However, they operate at different aggregation levels: FFT on global patterns captures the USER's rhythm, autocorrelation per-memory captures EACH MEMORY's rhythm. These can differ — a user accesses daily but a specific memory is bursty. The distinction is real but the MARGINAL value over global FFT is undemonstrated.",
+          "verdict": "ATTACK PARTIALLY SUCCEEDS. Marginal value over existing FFT is unclear."
+        },
+        {
+          "attack": "Adding per-memory timestamp storage bloats RocksDB. Each memory gets a Vec<DateTime<Utc>> that grows unboundedly with usage. For 50K memories over 2 years, that's ~5M timestamps at 8 bytes each = 40MB of additional storage just for this feature.",
+          "score": 7.0,
+          "response": "MANAGEABLE. 40MB is trivial for a RocksDB-backed system. However, the REAL issue is that the timestamps don't exist today — access_count is a u32, not a Vec<DateTime>. Building this infrastructure just for autocorrelation is over-investment for an unproven signal. A lighter approach: piggyback on existing learning_history events_for_memory() which already stores timestamped events per memory.",
+          "verdict": "ATTACK PARTIALLY SUCCEEDS on the infrastructure point, not the storage point."
+        }
+      ]
+    },
+
+    "phase_3_dimensions": {
+      "scoring_note": "Each score requires dual evidence: one supporting, one limiting.",
+      "dimensions": {
+        "correctness": {
+          "score": 8.0,
+          "evidence_for": "Autocorrelation is mathematically well-defined on timestamp series. The R(tau) formula is standard signal processing.",
+          "evidence_against": "Correctness of the INTERPRETATION is questionable: high autocorrelation at lag 14 days doesn't mean the memory SHOULD be surfaced every 14 days. It means it WAS accessed every 14 days. Past rhythm != future need."
+        },
+        "completeness": {
+          "score": 3.5,
+          "evidence_for": "The proposal identifies where it hooks in (learning_history, relevance, decay_scales).",
+          "evidence_against": "Missing: (1) per-memory retrieval timestamp storage, (2) cold-start strategy, (3) cache invalidation policy, (4) weight redistribution analysis, (5) benchmark impact prediction, (6) migration path for existing memories."
+        },
+        "performance": {
+          "score": 7.0,
+          "evidence_for": "O(NK) autocorrelation with N<100, K~50 is fast. Cacheable per-memory with invalidation on access.",
+          "evidence_against": "Per-memory scales in hot path (hybrid_decay_factor) changes from O(1) static lookup to per-memory lookup. Cache misses during maintenance could be non-trivial."
+        },
+        "security": {
+          "score": 9.0,
+          "evidence_for": "No new attack surface. Timestamps are internal system data, not user-controlled.",
+          "evidence_against": "Timing side-channel: autocorrelation reveals access patterns. If exposed via API, an attacker could infer when/how often a memory is used."
+        },
+        "maintainability": {
+          "score": 5.5,
+          "evidence_for": "Follows existing patterns (decay_scales.rs approach). Self-contained computation module.",
+          "evidence_against": "Adds 8th dimension to LearnedWeights — every weight update, normalization, serialization, and A/B test now has one more dimension to manage. Increases cognitive load of the scoring system."
+        },
+        "testability": {
+          "score": 7.0,
+          "evidence_for": "Autocorrelation is a pure function on timestamps — trivially unit-testable. Can generate synthetic access patterns with known periodicities.",
+          "evidence_against": "Integration testing is hard: proving rhythm_match improves MRR requires a benchmark with temporally periodic access patterns. No such benchmark exists in LOCOMO or LongMemEval."
+        },
+        "consistency": {
+          "score": 8.0,
+          "evidence_for": "Follows the exact pattern of decay_scales.rs: collect timestamps -> spectral analysis -> inject into scoring. Architecturally harmonious.",
+          "evidence_against": "Inconsistency: decay_scales.rs has a 50-event minimum with graceful fallback. The proposal doesn't specify a minimum, but most memories have <5 accesses."
+        },
+        "observability": {
+          "score": 6.5,
+          "evidence_for": "Autocorrelation values, dominant lags, and confidence scores are all numeric and loggable. Easy to add to TUI dashboard.",
+          "evidence_against": "Interpreting WHY a specific lag was dominant requires understanding the user's access history. Not human-debuggable without visualization tooling."
+        },
+        "resilience": {
+          "score": 7.5,
+          "evidence_for": "Graceful degradation: with insufficient data, return neutral score (0.5) and skip rhythm contribution. System continues to work without it.",
+          "evidence_against": "If autocorrelation cache becomes stale (not invalidated on access), it would boost memories at wrong rhythms. Silent degradation."
+        },
+        "scalability": {
+          "score": 6.0,
+          "evidence_for": "Per-memory computation is embarrassingly parallel. Can be done lazily (compute on access, cache).",
+          "evidence_against": "Storage growth: O(M*A) where M=memories, A=average accesses per memory. With 100K memories averaging 10 accesses, that's 1M timestamps to store and periodically recompute."
+        },
+        "boundary_safety": {
+          "score": 5.0,
+          "evidence_for": "Internal data flow only. No external API changes required.",
+          "evidence_against": "The boundary between 'has enough data for autocorrelation' and 'does not' is fuzzy. A memory at 19 accesses gets neutral, at 20 gets full autocorrelation. This cliff can cause ranking instability as memories cross the threshold."
+        },
+        "cognitive_load": {
+          "score": 4.0,
+          "evidence_for": "The concept (rhythm detection) is intuitive and well-motivated by analogy to human memory.",
+          "evidence_against": "The scoring system goes from 7 to 8 dimensions. The interaction between rhythm_match and feedback momentum (both temporal signals) is non-obvious. Debugging why a memory was surfaced gets harder."
+        }
+      },
+      "aggregate_score": 6.42,
+      "scoring_method": "arithmetic mean of 12 dimensions"
+    },
+
+    "bifocal_verdict": {
+      "overall": "DEFER — theoretically sound, practically unjustified",
+      "key_findings": [
+        "No benchmark failure exists that this feature would fix",
+        "Critical data infrastructure gap: per-memory retrieval timestamps don't exist (only access_count and last_accessed)",
+        "Adding 8th weight dimension redistributes all existing weights, risking MRR regression on proven benchmarks",
+        "decay_scales.rs FFT already captures global rhythm; marginal value of per-memory rhythm is undemonstrated",
+        "Cold-start problem: ~95% of memories have too few accesses for meaningful autocorrelation"
+      ]
+    }
+  },
+
+  "overlook": {
+    "evaluation_type": "overlook_27d",
+    "target": "Temporal Autocorrelation for Retrieval",
+
+    "cluster_1_intent": {
+      "D1_stated_goal": {
+        "score": 7.0,
+        "observation": "Stated goal is clear: detect access rhythm patterns to improve retrieval. Well-articulated distinction between rhythm, recency, and frequency."
+      },
+      "D2_unstated_goal": {
+        "score": 8.5,
+        "observation": "SPIKE. Unstated goal is architectural completeness — filling the 'per-memory spectral gap' between global FFT (decay_scales.rs) and per-memory scalar (access_count). This is a builder-completion drive, not a user-need drive."
+      },
+      "D3_goal_alignment": {
+        "score": 4.0,
+        "observation": "Misalignment between stated goal (improve retrieval) and actual leverage. No retrieval failure has been traced to missing rhythm data. The feature solves the problem the builder wants to solve, not the problem the system has."
+      },
+      "D4_scope_boundary": {
+        "score": 5.0,
+        "observation": "Scope is bounded (3 integration points) but the ripple zone is wider than stated: LearnedWeights serialization, A/B testing, feedback loops, TUI display all need updates."
+      },
+      "D5_success_criteria": {
+        "score": 3.0,
+        "observation": "No success criterion defined. What MRR improvement justifies the complexity? What benchmark validates rhythm detection? Without criteria, the feature cannot be declared successful or failed."
+      }
+    },
+
+    "cluster_2_observation": {
+      "D6_data_available": {
+        "score": 3.0,
+        "observation": "Per-memory retrieval timestamp series DO NOT EXIST. MemoryMetadata stores access_count (u32) and last_accessed (single timestamp). The fundamental data the feature needs is not collected."
+      },
+      "D7_data_quality": {
+        "score": 4.0,
+        "observation": "Even if timestamps were collected, quality concerns: (1) automated hooks generate spurious accesses, (2) session-start proactive context causes bursty access that's system-driven not user-driven, (3) no way to distinguish user-initiated recalls from system-initiated ones."
+      },
+      "D8_data_gaps": {
+        "score": 2.0,
+        "observation": "CRITICAL GAP. The proposal references 'retrieval timestamps' as if they exist. They do not. learning_history has CONSOLIDATION events, not retrieval events. These are different: consolidation happens during maintenance (system-driven), retrieval happens during user interaction."
+      },
+      "D9_measurement_validity": {
+        "score": 5.0,
+        "observation": "Autocorrelation is a valid statistical measure for rhythm detection. The MEASUREMENT is valid; the DATA it would operate on is the problem."
+      },
+      "D10_confounding_signals": {
+        "score": 7.5,
+        "observation": "SPIKE. Major confound: bursty access patterns may reflect SESSION structure, not memory rhythm. If a user has 3 sessions in one week and then none for 2 weeks, ALL memories accessed in those sessions show weekly burstiness — but that's the user's schedule, not the memory's rhythm. Autocorrelation would attribute session-level patterns to individual memories."
+      },
+      "D11_temporal_validity": {
+        "score": 6.0,
+        "observation": "Autocorrelation assumes stationarity — that the rhythm is stable over time. User patterns change: project phases, job changes, topic shifts. A memory that was weekly-rhythmic 6 months ago may be dormant now."
+      },
+      "D12_edge_cases": {
+        "score": 5.5,
+        "observation": "Identified: single-access memories (most memories), exactly-periodic access (degenerate case), memories accessed exactly once per session for N sessions (appears rhythmic but is just session-correlated)."
+      },
+      "D13_observation_bias": {
+        "score": 6.0,
+        "observation": "Survivorship bias: we only see access patterns for memories that WERE retrieved. Memories that should have been retrieved but weren't (the actual MRR failures) have no access pattern to analyze."
+      },
+      "D14_context_sensitivity": {
+        "score": 5.0,
+        "observation": "Rhythm is context-insensitive. A memory recalled every 2 weeks about 'database migrations' is rhythmic because the team does biweekly deploys, not because the memory itself has temporal structure. The context (deploy schedule) is the cause; the memory access is the effect."
+      }
+    },
+
+    "cluster_3_pattern": {
+      "D15_pattern_strength": {
+        "score": 5.0,
+        "observation": "The signal (per-memory rhythm) exists in theory but is weak in practice. Most memories lack sufficient data points. The strong-rhythm memories (>20 accesses) are already well-served by access_count and momentum signals."
+      },
+      "D16_pattern_generalizability": {
+        "score": 4.0,
+        "observation": "Rhythm patterns are highly user-specific and topic-specific. A pattern learned from one user's access rhythm doesn't transfer to another user. Even within one user, rhythm varies by memory topic."
+      },
+      "D17_competing_explanations": {
+        "score": 8.0,
+        "observation": "SPIKE. Strong competing explanations for bursty access: (1) session clustering (system-driven), (2) project phases (context-driven), (3) entity co-occurrence (topic-driven). Autocorrelation conflates all these with intrinsic memory rhythm."
+      },
+      "D18_pattern_stability": {
+        "score": 4.5,
+        "observation": "Rhythms are non-stationary. User patterns shift with project changes, role changes, and life events. A rhythm detected over the last 3 months may not predict the next month."
+      },
+      "D19_null_hypothesis": {
+        "score": 3.5,
+        "observation": "The null hypothesis — that access rhythm carries no additional predictive value beyond frequency and recency — has not been rejected. No experiment or benchmark demonstrates that rhythm-aware retrieval outperforms the current 7-dimension system."
+      }
+    },
+
+    "cluster_4_risk": {
+      "D20_implementation_risk": {
+        "score": 6.5,
+        "observation": "Medium-high. Requires: (1) new timestamp storage infrastructure, (2) autocorrelation computation module, (3) LearnedWeights extension, (4) decay.rs API modification. Each is individually tractable but the combined surface area is significant."
+      },
+      "D21_regression_risk": {
+        "score": 7.5,
+        "observation": "SPIKE. Adding 8th dimension to LearnedWeights changes normalization. MRR 0.88 could regress. The feedback learning loop will need to re-converge with the new dimension. During convergence, retrieval quality may degrade."
+      },
+      "D22_opportunity_cost": {
+        "score": 8.0,
+        "observation": "SPIKE. Current MRR blockers (entity overlap stemming, session mapping, multi-hop reasoning) are known and unsolved. Implementing rhythm detection instead of fixing known failures is a poor priority allocation. P2 advanced techniques (query decomposition, path-aware attention) have clearer MRR uplift potential."
+      }
+    },
+
+    "cluster_5_learning": {
+      "D23_reversibility": {
+        "score": 7.0,
+        "observation": "Mostly reversible. Can remove rhythm_match dimension and re-normalize weights. Timestamp storage can be retained for other purposes. The main irreversibility is if learned weights converge to a new optimum that depends on rhythm_match."
+      },
+      "D24_incremental_path": {
+        "score": 7.5,
+        "observation": "Clear incremental path: (1) start collecting per-memory timestamps (no scoring impact), (2) compute autocorrelation offline and analyze (no scoring impact), (3) only inject into scoring if analysis shows signal. This is the recommended approach."
+      },
+      "D25_measurement_plan": {
+        "score": 2.0,
+        "observation": "No measurement plan exists. No benchmark tests rhythm. No A/B test is proposed. No MRR target is set. This is the weakest dimension."
+      },
+      "D26_learning_value": {
+        "score": 7.0,
+        "observation": "High learning value even if the feature is not implemented: collecting and analyzing per-memory access patterns would reveal whether rhythm IS a meaningful signal. The analysis itself is valuable."
+      },
+      "D27_meta_awareness": {
+        "score": 8.0,
+        "observation": "The proposal is self-aware about its orthogonality to existing signals. It correctly identifies the gap in the signal space. However, it does not demonstrate that this gap matters for retrieval quality."
+      }
+    },
+
+    "spikes_and_propagation": {
+      "primary_spikes": ["D2 (unstated goal: 8.5)", "D10 (confounding signals: 7.5)", "D17 (competing explanations: 8.0)", "D21 (regression risk: 7.5)", "D22 (opportunity cost: 8.0)"],
+      "cross_cluster_propagation": [
+        {
+          "from": "D2 (unstated goal: architectural completeness)",
+          "to": "D22 (opportunity cost)",
+          "mechanism": "Builder-completion drive pushes toward implementing a feature that fills an architectural gap rather than fixing known user-facing failures. This directly causes opportunity cost."
+        },
+        {
+          "from": "D8 (data gap: no retrieval timestamps)",
+          "to": "D20 (implementation risk)",
+          "mechanism": "The fundamental data gap means implementation requires new infrastructure BEFORE the feature can even be tested. This inflates the effort estimate."
+        },
+        {
+          "from": "D10 (confounding: session structure)",
+          "to": "D19 (null hypothesis)",
+          "mechanism": "Session-level confounds mean that even if autocorrelation detects a pattern, that pattern may be session structure rather than memory rhythm. This makes it harder to reject the null hypothesis."
+        }
+      ]
+    },
+
+    "cognitive_distortions": {
+      "CD1_anchoring": {
+        "detected": true,
+        "description": "Anchored on the theoretical elegance of autocorrelation as a signal-processing technique. The mathematical beauty of R(tau) anchors thinking toward 'this should work' rather than 'does this address a real problem?'"
+      },
+      "CD2_confirmation_bias": {
+        "detected": true,
+        "description": "The proposal cites existing infrastructure (decay_scales.rs FFT) as evidence that autocorrelation fits. This is confirmatory — just because FFT exists doesn't mean per-memory autocorrelation adds value."
+      },
+      "CD5_sunk_cost": {
+        "detected": false,
+        "description": "No sunk cost — the feature hasn't been started."
+      },
+      "CD7_planning_fallacy": {
+        "detected": true,
+        "description": "The proposal underestimates effort by not accounting for: (1) timestamp collection infrastructure, (2) benchmark creation for validation, (3) weight reconvergence period. Estimated effort should be 2-3x the naive estimate."
+      },
+      "CD9_completeness_bias": {
+        "detected": true,
+        "description": "PRIMARY DISTORTION. The drive to fill the 'per-memory spectral gap' is completeness bias — the feeling that the system is incomplete without this signal. The system's incompleteness is in entity matching and session mapping, not temporal rhythm."
+      }
+    },
+
+    "self_coherence_guard": {
+      "internal_consistency": "Consistent. All 5 clusters converge on the same conclusion: theoretically valid, practically unjustified, data infrastructure missing, opportunity cost high.",
+      "blind_spots_checked": [
+        "Checked: Could rhythm detection help with PROACTIVE surfacing (not just retrieval)? Plausible — surfacing a memory because 'you usually need this on Mondays' is a valid use case. But this is a different feature (predictive scheduling), not retrieval improvement.",
+        "Checked: Could per-memory autocorrelation detect memory DECAY patterns (memories that are accessed less and less)? Yes, but this is already captured by the existing learning velocity system in learning_history.rs.",
+        "Checked: Is there a user segment (enterprise, heavy users) where rhythm detection would matter more? Possible for users with >1000 memories and regular workflows. But this should be validated with data first, not assumed."
+      ],
+      "verdict": "Overlook analysis is internally coherent. No cluster contradicts another. The primary insight is: the feature solves an architectural gap, not a user-facing problem."
+    },
+
+    "overlook_verdict": {
+      "overall_awareness_score": 5.7,
+      "scoring_method": "arithmetic mean of 27 dimensions",
+      "key_insight": "Completeness bias (CD9) is the primary driver. The system is 'missing' a per-memory spectral signal, and the proposal fills that gap. But the gap doesn't correspond to any measured retrieval failure. The recommended path is: collect data first, analyze offline, then decide."
+    }
+  },
+
+  "overloop": {
+    "evaluation_type": "overloop_feedback_iterate_critique",
+    "target": "Temporal Autocorrelation for Retrieval",
+
+    "iteration_1": {
+      "plan": {
+        "title": "Direct Implementation: Autocorrelation as 8th Retrieval Dimension",
+        "steps": [
+          "Add Vec<DateTime<Utc>> to MemoryMetadata (access_history field) alongside existing access_count and last_accessed",
+          "Modify update_access() and record_access() in types.rs to push current timestamp to access_history",
+          "Create new module src/autocorrelation.rs with compute_autocorrelation(timestamps) -> AutocorrelationResult (dominant_lag, confidence, is_bursty)",
+          "Add rhythm_match: f32 field to LearnedWeights with DEFAULT_RHYTHM_WEIGHT = 0.05",
+          "Modify fuse_scores_full() to accept rhythm_match score as 8th parameter",
+          "In surface_relevant_inner(), compute autocorrelation for each candidate memory, map dominant lag alignment to 0.0-1.0 score",
+          "Extend hybrid_decay_factor() with optional per-memory scales parameter",
+          "Update FlatMemory serialization to include access_history"
+        ],
+        "estimated_effort": "16 hours",
+        "files_touched": [
+          "src/memory/types.rs",
+          "src/autocorrelation.rs (new)",
+          "src/relevance.rs",
+          "src/decay.rs",
+          "src/memory/storage.rs"
+        ]
+      }
+    },
+
+    "critique_1": {
+      "what_breaks": [
+        {
+          "issue": "Vec<DateTime<Utc>> in MemoryMetadata is behind Arc<parking_lot::Mutex<MemoryMetadata>>. Every access_history push acquires the mutex. Fine for single access, but during bulk maintenance (10K memories), the vector grows unboundedly.",
+          "severity": "medium",
+          "fix": "Ring buffer with fixed capacity (e.g., 200 timestamps). Oldest entries evicted."
+        },
+        {
+          "issue": "FlatMemory serialization includes access_history. Existing RocksDB entries don't have this field. Deserialization of old entries will fail or produce empty Vec. Need migration or #[serde(default)].",
+          "severity": "high",
+          "fix": "#[serde(default)] on access_history field handles backwards compatibility."
+        },
+        {
+          "issue": "LearnedWeights with 8 fields: all existing serialized weights in RocksDB have 7 fields. Deserialization breaks for existing users.",
+          "severity": "high",
+          "fix": "#[serde(default)] on rhythm_match field, same pattern as momentum was added."
+        },
+        {
+          "issue": "Computing autocorrelation inside surface_relevant_inner() adds latency to the hot path. Current latency target is <30ms. With 50+ candidate memories, each needing autocorrelation, this could blow the budget.",
+          "severity": "high",
+          "fix": "Pre-compute and cache autocorrelation in RocksDB. Invalidate on access (lazy recompute after N new accesses)."
+        },
+        {
+          "issue": "Rhythm matching assumes a 'current session timing' to compare against. What IS the current session's temporal position? The proposal says 'boost memories whose rhythm aligns with current session timing' but doesn't define how to compute alignment.",
+          "severity": "critical",
+          "fix": "Define rhythm_match as: if memory's dominant lag is tau_star days, and time since last access is T days, rhythm_match = exp(-(T - tau_star)^2 / (2 * sigma^2)). Gaussian centered on the predicted next access time."
+        }
+      ],
+      "what_is_missing": [
+        "No benchmark exists to validate MRR improvement from rhythm",
+        "No mechanism to detect and exclude system-generated accesses (hooks, proactive context) from the timestamp series",
+        "No analysis of how adding 8th weight dimension affects feedback convergence time",
+        "No strategy for memories that transition from bursty to steady (rhythm changes)",
+        "No telemetry plan to measure whether rhythm_match actually correlates with user satisfaction"
+      ]
+    },
+
+    "iteration_2": {
+      "plan": {
+        "title": "Phased Implementation: Data Collection First, Scoring Later",
+        "steps": [
+          "PHASE A — Data Collection (3 hours):",
+          "  A1. Add access_history: VecDeque<DateTime<Utc>> with #[serde(default)] to MemoryMetadata (capacity-limited ring buffer, 200 entries)",
+          "  A2. Modify update_access() to push_back() with truncation at capacity",
+          "  A3. Add access_source: AccessSource enum {UserRecall, ProactiveContext, SystemMaintenance, Hook} to distinguish human-driven from system-driven accesses",
+          "  A4. Only store UserRecall and ProactiveContext timestamps (filter out system noise)",
+          "",
+          "PHASE B — Offline Analysis (4 hours):",
+          "  B1. Create src/autocorrelation.rs with compute_autocorrelation(timestamps, max_lag) -> Option<AutocorrelationResult>",
+          "  B2. Returns None if timestamps.len() < 20 (insufficient data)",
+          "  B3. Add CLI command 'shodh-memory analyze-rhythm --user-id X' that dumps per-memory autocorrelation stats",
+          "  B4. Run analysis on real data after 2+ weeks of collection",
+          "  B5. Determine empirically: what % of memories have detectable rhythm? Does rhythm correlate with user feedback?",
+          "",
+          "PHASE C — Scoring Integration (8 hours, only if Phase B shows signal):",
+          "  C1. Add cached AutocorrelationResult to RocksDB key 'autocorr:{user_id}:{memory_id}'",
+          "  C2. Recompute on access if stale (>10 new accesses since last computation)",
+          "  C3. Use MULTIPLICATIVE scoring (1 + rhythm_bonus) rather than additive 8th dimension, preserving existing 7-weight ratios",
+          "  C4. rhythm_bonus range: [-0.03, +0.05] (asymmetric: slight penalty for anti-rhythmic, small boost for rhythmic)",
+          "  C5. A/B test with existing ab_testing.rs infrastructure: control (no rhythm) vs variant (with rhythm)",
+          "  C6. Measure MRR delta on LOCOMO benchmark before/after"
+        ],
+        "estimated_effort": "Phase A: 3h, Phase B: 4h, Phase C: 8h (contingent). Total: 7h guaranteed + 8h contingent = 7-15h",
+        "files_touched": [
+          "src/memory/types.rs (Phase A)",
+          "src/autocorrelation.rs (new, Phase B)",
+          "src/relevance.rs (Phase C, contingent)",
+          "src/memory/storage.rs (Phase A)",
+          "src/ab_testing.rs (Phase C, contingent)"
+        ]
+      }
+    },
+
+    "critique_2": {
+      "remaining_gaps": [
+        {
+          "gap": "Phase A adds a VecDeque<DateTime> to every MemoryMetadata. With 50K memories, that's 50K VecDeques in memory (even if empty). Each empty VecDeque is 24 bytes on 64-bit. Total: 1.2MB overhead for empty deques. Acceptable but not free.",
+          "severity": "low",
+          "resolution": "Use Option<VecDeque<DateTime<Utc>>> — None for memories that haven't been accessed since the feature was deployed. Saves 23 bytes per memory."
+        },
+        {
+          "gap": "AccessSource enum introduces a parameter to update_access() and record_access(), which are called from ~8 call sites. API change across handlers/recall.rs, relevance.rs, memory/mod.rs, memory/maintenance.rs.",
+          "severity": "medium",
+          "resolution": "Add new method record_access_with_source(source: AccessSource) alongside existing record_access() which defaults to AccessSource::UserRecall. Gradual migration."
+        },
+        {
+          "gap": "Phase B assumes 2+ weeks of data collection. During this time, the feature is invisible and consuming resources (storage). Stakeholder patience may be limited.",
+          "severity": "low",
+          "resolution": "Phase B analysis can run on learning_history events as a proxy. Not ideal (consolidation events != retrieval events) but provides immediate signal for whether rhythm is detectable at all."
+        },
+        {
+          "gap": "The multiplicative scoring approach (1 + rhythm_bonus) is applied AFTER fuse_scores_full(). This means rhythm is outside the learned weight system. The feedback loop (apply_feedback) cannot learn the optimal rhythm contribution.",
+          "severity": "medium",
+          "resolution": "Accept this as intentional. Rhythm should be a post-hoc modifier until validated, not a learnable weight. Once validated via A/B test, promote to 8th learnable dimension."
+        }
+      ],
+      "strengths_of_iteration_2": [
+        "Phased approach de-risks implementation: can stop after Phase A or B if data doesn't support the feature",
+        "Multiplicative scoring preserves existing weight ratios — zero regression risk during Phase A and B",
+        "A/B testing with existing infrastructure ensures empirical validation",
+        "Access source tagging (A3) is valuable infrastructure regardless of autocorrelation — enables cleaner analytics"
+      ]
+    },
+
+    "iteration_3": {
+      "plan": {
+        "title": "Final Plan: Instrumented Data Collection with Deferred Scoring",
+        "priority": "Phase A is P2 (useful infrastructure). Phase B is P3 (research). Phase C is P3 (contingent on B).",
+
+        "phase_a_data_collection": {
+          "file_changes": [
+            {
+              "file": "src/memory/types.rs",
+              "change": "Add to MemoryMetadata: `#[serde(default)] pub access_history: Option<VecDeque<DateTime<Utc>>>` and `AccessSource` enum. Add `record_access_with_source(source: AccessSource)` method that pushes to access_history (creating VecDeque if None, capping at 200 entries). Only stores UserRecall and ProactiveContext sources.",
+              "lines_changed": "~35"
+            },
+            {
+              "file": "src/memory/storage.rs",
+              "change": "No change needed — FlatMemory already uses #[serde(default)] pattern for new fields via the flatten approach.",
+              "lines_changed": "0"
+            },
+            {
+              "file": "src/handlers/recall.rs",
+              "change": "After successful recall, call memory.record_access_with_source(AccessSource::UserRecall) instead of memory.record_access().",
+              "lines_changed": "~3"
+            },
+            {
+              "file": "src/relevance.rs",
+              "change": "In surface_relevant_inner(), after selecting top memories, call memory.record_access_with_source(AccessSource::ProactiveContext).",
+              "lines_changed": "~3"
+            }
+          ],
+          "effort_hours": 3,
+          "risk": "low",
+          "validation": "cargo test + verify access_history populates on test recall"
+        },
+
+        "phase_b_offline_analysis": {
+          "file_changes": [
+            {
+              "file": "src/autocorrelation.rs (new)",
+              "change": "Module with: compute_autocorrelation(timestamps: &[DateTime<Utc>], max_lag_days: u32) -> Option<AutocorrelationResult>. Returns None if len < 20. AutocorrelationResult { dominant_lag_days: f64, peak_correlation: f64, is_bursty: bool, confidence: f64 }. Also: classify_rhythm(result) -> RhythmType { Bursty, Steady, Periodic(f64), Insufficient }.",
+              "lines_changed": "~120"
+            },
+            {
+              "file": "src/lib.rs",
+              "change": "Add `pub mod autocorrelation;`",
+              "lines_changed": "1"
+            }
+          ],
+          "effort_hours": 4,
+          "risk": "low",
+          "validation": "Unit tests with synthetic periodic timestamps. Verify known 7-day cycle is detected. Verify insufficient data returns None.",
+          "decision_gate": "Run analysis on real user data after 2 weeks of Phase A collection. If <10% of memories with >20 accesses show detectable rhythm (confidence > 0.5), STOP. Do not proceed to Phase C."
+        },
+
+        "phase_c_scoring_integration": {
+          "contingent_on": "Phase B decision gate passes (>10% of high-access memories show rhythm)",
+          "file_changes": [
+            {
+              "file": "src/relevance.rs",
+              "change": "After fuse_scores_full(), apply multiplicative rhythm_bonus: if memory has AutocorrelationResult with confidence > 0.5, compute rhythm_match = gaussian(time_since_last_access, dominant_lag, sigma=dominant_lag*0.3). Apply score *= (1.0 + (rhythm_match - 0.5) * 0.06). Net effect: [-3%, +3%] score modification.",
+              "lines_changed": "~25"
+            },
+            {
+              "file": "src/ab_testing.rs",
+              "change": "Add ABTestVariant for rhythm_scoring. Control: no rhythm modifier. Variant: rhythm modifier active.",
+              "lines_changed": "~15"
+            }
+          ],
+          "effort_hours": 8,
+          "risk": "medium",
+          "validation": "A/B test on LOCOMO benchmark. Measure MRR delta. Accept if MRR improves by >= 0.01 with p < 0.05."
+        }
+      },
+
+      "concrete_implementation_summary": {
+        "total_effort_guaranteed": "7 hours (Phase A + B)",
+        "total_effort_contingent": "8 hours (Phase C)",
+        "total_files_new": 1,
+        "total_files_modified": 4,
+        "total_lines_changed": "~200 (Phase A+B), ~240 additional (Phase C)",
+        "breaking_changes": "None. All new fields use #[serde(default)]. New method alongside existing. Multiplicative scoring preserves existing weights."
+      }
+    },
+
+    "overloop_verdict": {
+      "iteration_quality_progression": "Good. Iteration 1 was naive (direct implementation, 16h). Critique 1 found 5 critical/high issues. Iteration 2 restructured into phased approach with decision gates. Critique 2 refined to 4 remaining gaps, all low-medium. Iteration 3 is production-ready with explicit go/no-go criteria.",
+      "key_evolution": "The most important evolution was from 'add 8th scoring dimension' (Iteration 1) to 'multiplicative post-hoc modifier, contingent on data' (Iteration 3). This eliminates the weight redistribution regression risk entirely."
+    }
+  },
+
+  "verdict": {
+    "implement": true,
+    "implement_qualification": "Phase A and B only. Phase C is contingent on Phase B decision gate.",
+    "priority": "P2 for Phase A (data collection is useful infrastructure regardless), P3 for Phase B and C (research and contingent)",
+    "effort_hours": 15,
+    "effort_breakdown": {
+      "phase_a_guaranteed": 3,
+      "phase_b_guaranteed": 4,
+      "phase_c_contingent": 8
+    },
+    "risk": "low",
+    "risk_justification": "Phased approach with decision gates. Phase A has no scoring impact. Phase B is offline analysis. Phase C uses multiplicative scoring (not weight redistribution) and A/B testing. No phase can regress MRR.",
+    "conditions": [
+      "Phase A must add AccessSource tagging to distinguish human vs system accesses",
+      "Phase B must define explicit go/no-go criteria before starting (proposed: >10% of high-access memories show rhythm with confidence >0.5)",
+      "Phase C must use multiplicative scoring, NOT additive 8th weight dimension",
+      "Phase C must be validated via A/B test with MRR delta >= 0.01"
+    ],
+    "not_recommended": [
+      "Do NOT add rhythm_match as 8th dimension to LearnedWeights (redistributes existing weights)",
+      "Do NOT modify hybrid_decay_factor() for per-memory scales until Phase C validates rhythm signal",
+      "Do NOT implement without first collecting 2+ weeks of per-memory access timestamp data"
+    ],
+    "alternative_higher_priority": "P1 work remains: stemmed entity overlap (known MRR fix), query decomposition for multi-hop, session mapping. These have demonstrated benchmark failures and known fixes. Rhythm detection should not displace P1 work."
+  }
+}

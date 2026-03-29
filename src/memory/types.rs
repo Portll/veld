@@ -12,6 +12,114 @@ use crate::constants::{
     SALIENCE_RECENCY_WEIGHT,
 };
 
+/// Unified scoring signals extracted from a memory for ranking.
+///
+/// Both recall.rs (pull-based retrieval) and relevance.rs (proactive surfacing)
+/// should extract the same signals — they may apply different weights, but the
+/// signal extraction is shared. This struct bridges the two scoring clusters.
+///
+/// Fields default to 0.0 (neutral) when a signal is unavailable.
+#[derive(Debug, Clone, Default)]
+pub struct ScoringSignals {
+    /// Base score from RRF fusion or semantic similarity (0.0-1.0+)
+    pub base_score: f32,
+    /// Recency boost: exponential decay by age (0.0-1.0)
+    pub recency: f32,
+    /// Emotional arousal: high arousal = more salient (0.0-1.0)
+    pub arousal: f32,
+    /// Source credibility: trusted sources rank higher (0.0-1.0)
+    pub credibility: f32,
+    /// Temporal match: query-memory temporal ref overlap (0.0-0.25)
+    pub temporal_match: f32,
+    /// Session continuity: within current session window (0.0-0.03)
+    pub session_boost: f32,
+    /// Access count: log-scaled frequency signal (0.0-1.0)
+    pub access_count: f32,
+    /// Graph/Hebbian strength: edge-derived association strength (0.0-1.0)
+    pub graph_strength: f32,
+    /// Calibrated confidence: Bayesian alpha/beta estimate (0.0-1.0)
+    pub calibrated_confidence: f32,
+    /// Confidence observations: total feedback count (for gating)
+    pub confidence_observations: f32,
+    /// Feedback momentum: EMA from past feedback (-1.0 to 1.0)
+    pub feedback_momentum: f32,
+    /// Cross-encoder score: joint query-document attention (0.0-1.0)
+    pub cross_encoder: f32,
+    /// Memory importance: stored importance value (0.0-1.0)
+    pub importance: f32,
+    /// Entity match score: entity overlap with query (0.0-1.0)
+    pub entity_match: f32,
+    /// Tag match score: tag overlap with context (0.0-1.0)
+    pub tag_match: f32,
+}
+
+/// Pinky dimension scores pushed from the Pinky evaluation engine.
+///
+/// These scores describe the topological health of the knowledge graph
+/// region relevant to the current query context. Pinky computes them
+/// via gap analysis + Voronoi decomposition on shodh's graph API.
+///
+/// When available, they modulate retrieval: memories from high-confidence
+/// graph regions rank higher than memories from sparse/incoherent regions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PinkyDimensionScores {
+    /// Entity density in the relevant region (0.0 = sparse, 1.0 = saturated)
+    pub density: f32,
+    /// Semantic coherence of neighbors (0.0 = unrelated, 1.0 = tight cluster)
+    pub coherence: f32,
+    /// Fraction of potential triangles closed (0.0 = all open, 1.0 = fully closed)
+    pub closure: f32,
+    /// Average edge confidence in the region (0.0 = weak, 1.0 = strong)
+    pub confidence: f32,
+    /// Directional balance of knowledge (0.0 = anisotropic, 1.0 = isotropic)
+    pub isotropy: f32,
+    /// When these scores were computed (for staleness detection)
+    pub computed_at: Option<DateTime<Utc>>,
+}
+
+impl PinkyDimensionScores {
+    /// Aggregate score: geometric mean of available dimensions.
+    /// Returns 1.0 (neutral) if no scores are set.
+    pub fn aggregate(&self) -> f32 {
+        let vals = [self.density, self.coherence, self.closure, self.confidence, self.isotropy];
+        let nonzero: Vec<f32> = vals.iter().copied().filter(|&v| v > 0.0).collect();
+        if nonzero.is_empty() {
+            return 1.0; // neutral — no Pinky data available
+        }
+        let product: f32 = nonzero.iter().product();
+        product.powf(1.0 / nonzero.len() as f32) // geometric mean
+    }
+
+    /// Check if scores are stale (older than 1 hour)
+    pub fn is_stale(&self) -> bool {
+        self.computed_at
+            .map(|t| (Utc::now() - t).num_hours() >= 1)
+            .unwrap_or(true) // no timestamp = stale
+    }
+}
+
+impl ScoringSignals {
+    /// Extract signals from a memory. Requires no external state — all data
+    /// comes from the memory itself. External signals (graph_strength,
+    /// feedback_momentum, cross_encoder) must be set separately.
+    pub fn from_memory(mem: &super::types::Memory, now: DateTime<Utc>) -> Self {
+        let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
+        let ctx = mem.experience.context.as_ref();
+
+        Self {
+            importance: mem.importance(),
+            access_count: (mem.access_count() as f64).ln_1p() as f32 / 5.0,
+            recency: (-0.01 * hours_old).exp(),
+            arousal: ctx.map(|c| c.emotional.arousal).unwrap_or(0.0),
+            credibility: ctx.map(|c| (c.source.credibility - 0.5).max(0.0)).unwrap_or(0.0),
+            calibrated_confidence: mem.calibrated_confidence(),
+            confidence_observations: mem.confidence_observations(),
+            session_boost: if (now - mem.created_at).num_hours() <= 2 { 0.03 } else { 0.0 },
+            ..Default::default()
+        }
+    }
+}
+
 /// Unique identifier for memories
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)] // Serialize as plain UUID string, not array

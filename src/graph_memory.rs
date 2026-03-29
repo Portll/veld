@@ -998,6 +998,29 @@ pub enum EdgeSource {
     Explicit,
 }
 
+/// Result of memory coactivation recording.
+#[derive(Debug, Clone)]
+pub struct CoactivationResult {
+    /// Number of edges updated or created.
+    pub edges_updated: usize,
+    /// Edge tier promotions that occurred during strengthening.
+    /// Each promotion signals the memory layer to boost associated memory importance.
+    pub promotions: Vec<EdgePromotion>,
+}
+
+/// An edge tier promotion event (e.g., L1→L2, L2→L3).
+#[derive(Debug, Clone)]
+pub struct EdgePromotion {
+    /// Source entity UUID of the promoted edge.
+    pub from_entity: Uuid,
+    /// Target entity UUID of the promoted edge.
+    pub to_entity: Uuid,
+    /// Previous tier name (e.g., "L1Working").
+    pub old_tier: String,
+    /// New tier name (e.g., "L2Episodic").
+    pub new_tier: String,
+}
+
 /// Relationship types for ontological edge classification.
 ///
 /// Extends Graphiti's semantic model with management, operational, and
@@ -3796,7 +3819,12 @@ impl GraphMemory {
     ///
     /// Note: Limits to top N memories to avoid O(n²) explosion on large retrievals.
     /// Returns the number of edges created/strengthened.
-    pub fn record_memory_coactivation(&self, memory_ids: &[Uuid]) -> Result<usize> {
+    /// Result of memory coactivation recording, including edge tier promotions.
+    /// Promotions signal the memory layer to boost associated memory importance.
+    pub fn record_memory_coactivation(
+        &self,
+        memory_ids: &[Uuid],
+    ) -> Result<CoactivationResult> {
         const MAX_COACTIVATION_SIZE: usize = 20;
 
         // Limit to top N to bound worst-case complexity
@@ -3807,7 +3835,10 @@ impl GraphMemory {
         };
 
         if memories_to_process.len() < 2 {
-            return Ok(0);
+            return Ok(CoactivationResult {
+                edges_updated: 0,
+                promotions: Vec::new(),
+            });
         }
 
         let _guard = self
@@ -3819,6 +3850,7 @@ impl GraphMemory {
         let mut batch = WriteBatch::default();
         let mut edges_updated = 0;
         let mut new_edges = 0;
+        let mut promotions: Vec<EdgePromotion> = Vec::new();
 
         // Process all pairs
         for i in 0..memories_to_process.len() {
@@ -3830,8 +3862,15 @@ impl GraphMemory {
                 let existing_edge = self.find_edge_between_entities(&mem_a, &mem_b)?;
 
                 if let Some(mut edge) = existing_edge {
-                    // Strengthen existing edge
-                    let _ = edge.strengthen();
+                    // Strengthen existing edge and capture tier promotions
+                    if let Some((old_tier, new_tier)) = edge.strengthen() {
+                        promotions.push(EdgePromotion {
+                            from_entity: mem_a,
+                            to_entity: mem_b,
+                            old_tier,
+                            new_tier,
+                        });
+                    }
                     let key = edge.uuid.as_bytes();
                     if let Ok(value) =
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
@@ -3901,7 +3940,10 @@ impl GraphMemory {
             }
         }
 
-        Ok(edges_updated)
+        Ok(CoactivationResult {
+            edges_updated,
+            promotions,
+        })
     }
 
     /// Find an edge between two entities/memories (in either direction)

@@ -2094,6 +2094,11 @@ impl super::MemorySystem {
         // Acquire once outside the loop to avoid repeated locking
         let feedback_guard = self.feedback_store.as_ref().map(|fs| fs.read());
 
+        // Signal 20: Pinky dimension aggregate (graph topological health)
+        // Computed once per query — same value for all memories.
+        // Acts as a global quality multiplier: high-quality graphs boost all scores.
+        let pinky_multiplier = self.pinky_aggregate_score().unwrap_or(1.0);
+
         for (memory_id, score) in memory_ids {
             // Hebbian boost from learned graph weights (10% contribution)
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
@@ -2206,11 +2211,14 @@ impl super::MemorySystem {
                     }
                 };
 
-                // BRIDGE-1: Proven signals from relevance.rs (validated at 14%+13% weight)
-                // access_count: log-scaled frequency signal (proven 14% weight in proactive)
+                // =================================================================
+                // BRIDGE SIGNALS (9-19): Connect captured-but-forgotten signals
+                // =================================================================
+
+                // BRIDGE-1: access_count (signal 5, proven 14% in proactive)
                 let access_boost = ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * 0.07;
-                // graph_strength: Hebbian edge weight for this memory (proven 13% weight)
-                // Reuses hebbian_scores already computed in Layer 2 — zero new locks.
+
+                // BRIDGE-1: graph_strength (signal 3+, proven 13% in proactive)
                 let graph_boost = hebbian_scores
                     .get(&mem.id)
                     .copied()
@@ -2218,17 +2226,79 @@ impl super::MemorySystem {
                     .clamp(0.0, 1.0)
                     * 0.08;
 
-                // BRIDGE-3: Calibrated confidence (Bayesian alpha/beta)
-                // Only active when observation count > 5 (avoids penalizing new memories).
-                // Range: 0.85-1.0 multiplier — trusted memories rank higher, untested neutral.
+                // Signal 9: Episode ID coherence — same-episode memories get boost
+                let episode_boost = mem
+                    .experience
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.episode.episode_id.as_ref())
+                    .and_then(|mem_ep| {
+                        query.episode_id.as_ref().and_then(|q_ep| {
+                            if mem_ep == q_ep { Some(0.08_f32) } else { None }
+                        })
+                    })
+                    .unwrap_or(0.0);
+
+                // Signal 10: Source type multiplier on credibility
+                let source_type_mult = mem
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| match c.source.source_type {
+                        crate::memory::types::SourceType::User => 1.2,
+                        crate::memory::types::SourceType::File => 1.1,
+                        crate::memory::types::SourceType::System => 1.0,
+                        crate::memory::types::SourceType::ExternalApi => 0.9,
+                        crate::memory::types::SourceType::Web => 0.8,
+                        crate::memory::types::SourceType::AiGenerated => 0.7,
+                        crate::memory::types::SourceType::Inferred => 0.6,
+                        _ => 1.0,
+                    })
+                    .unwrap_or(1.0);
+                let credibility_boost = credibility_boost * source_type_mult;
+
+                // Signal 11: Emotional valence as absolute intensity
+                let valence_boost = mem
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| c.emotional.valence.abs() * 0.02)
+                    .unwrap_or(0.0);
+
+                // Signal 12: Sequence proximity within episode
+                let sequence_boost = mem
+                    .experience
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.episode.sequence_number)
+                    .map(|seq| ((seq as f64).ln_1p() / 5.0) as f32 * 0.02)
+                    .unwrap_or(0.0);
+
+                // Signal 16: Context richness — memories with richer context
+                // (more populated fields) are more useful for retrieval
+                let richness_boost = (mem.context_richness() as f32 / 10.0) * 0.02;
+
+                // Signal 17: Activation level — current Hebbian co-activation state
+                let activation_boost = mem.activation() * 0.03;
+
+                // Signal 18: Temporal fact density — more temporal refs = more anchored
+                let temporal_density = (mem.experience.temporal_refs.len() as f32 / 5.0)
+                    .min(1.0)
+                    * 0.02;
+
+                // Signal 19: Entity confidence — memories with more entity refs
+                // are more structurally connected (proxy for graph salience)
+                let entity_density = (mem.entity_refs.len() as f32 / 5.0).min(1.0) * 0.02;
+
+                // BRIDGE-3: Calibrated confidence gate (Bayesian alpha/beta)
                 let confidence_gate = {
                     let obs = mem.confidence_observations();
-                    let total_obs = (obs - 2.0).max(0.0); // subtract priors
+                    let total_obs = (obs - 2.0).max(0.0);
                     if total_obs >= 5.0 {
                         let bayesian = mem.calibrated_confidence();
-                        0.85 + 0.15 * bayesian // range: 0.85 (distrusted) to 1.0 (trusted)
+                        0.85 + 0.15 * bayesian
                     } else {
-                        1.0 // insufficient observations — neutral
+                        1.0
                     }
                 };
 
@@ -2236,12 +2306,20 @@ impl super::MemorySystem {
                     + recency_boost
                     + arousal_boost
                     + credibility_boost
+                    + valence_boost
                     + temporal_boost
                     + session_boost
                     + access_boost
-                    + graph_boost)
+                    + graph_boost
+                    + episode_boost
+                    + sequence_boost
+                    + richness_boost
+                    + activation_boost
+                    + temporal_density
+                    + entity_density)
                     * feedback_multiplier
-                    * confidence_gate;
+                    * confidence_gate
+                    * pinky_multiplier;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);

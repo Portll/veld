@@ -234,6 +234,11 @@ pub struct MemorySystem {
     /// and suppress frequently-ignored memories (up to 20% penalty for negative momentum)
     feedback_store: Option<Arc<parking_lot::RwLock<FeedbackStore>>>,
 
+    /// Pinky dimension scores: topological health of the knowledge graph.
+    /// Pushed by Pinky via `/api/pinky/dimensions`, read during Layer 5 scoring.
+    /// When available, memories from high-quality graph regions rank higher.
+    pinky_scores: Arc<parking_lot::RwLock<Option<types::PinkyDimensionScores>>>,
+
     /// Persistent learning history for significant events
     /// Enables recency-weighted retrieval and learning velocity tracking
     learning_history: Arc<learning_history::LearningHistoryStore>,
@@ -656,6 +661,8 @@ impl MemorySystem {
             graph_memory: None,
             // Feedback store is optional - wire up with set_feedback_store() for momentum scoring (PIPE-9)
             feedback_store: None,
+            // Pinky dimension scores: initialized empty, populated via API push
+            pinky_scores: Arc::new(parking_lot::RwLock::new(None)),
             // Persistent learning history for retrieval boosting
             learning_history,
             // Temporal fact store for multi-hop temporal reasoning
@@ -706,6 +713,29 @@ impl MemorySystem {
     /// Get reference to the optional feedback store
     pub fn feedback_store(&self) -> Option<&Arc<parking_lot::RwLock<FeedbackStore>>> {
         self.feedback_store.as_ref()
+    }
+
+    /// Update Pinky dimension scores (called via API push from Pinky).
+    pub fn set_pinky_scores(&self, scores: types::PinkyDimensionScores) {
+        *self.pinky_scores.write() = Some(scores);
+    }
+
+    /// Get current Pinky dimension scores (read during Layer 5 scoring).
+    /// Returns None if Pinky hasn't pushed scores or they're stale.
+    pub fn pinky_aggregate_score(&self) -> Option<f32> {
+        let guard = self.pinky_scores.read();
+        guard.as_ref().and_then(|s| {
+            if s.is_stale() {
+                None
+            } else {
+                let agg = s.aggregate();
+                if (agg - 1.0).abs() < f32::EPSILON {
+                    None // neutral = no Pinky data
+                } else {
+                    Some(agg)
+                }
+            }
+        })
     }
 
     /// Store a new memory with an explicit ID.
