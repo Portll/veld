@@ -11,7 +11,7 @@ use tokio::signal;
 use tower::ServiceBuilder;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::timeout::TimeoutLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     auth,
@@ -55,6 +55,17 @@ pub struct ServerRunConfig {
 /// Environment variables are set **before** the tokio runtime is created, so no
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
+    let local_dev_rate_limit_default =
+        !config.production
+            && crate::config::is_local_bind_host(&config.host)
+            && std::env::var("SHODH_RATE_LIMIT").is_err()
+            && config.rate_limit == 4000;
+    let effective_rate_limit = if local_dev_rate_limit_default {
+        0
+    } else {
+        config.rate_limit
+    };
+
     // SAFETY: These set_var calls run before any threads are spawned — the tokio
     // runtime is not yet built, and pre_init_ort_runtime (below) is also single-threaded.
     // `std::env::set_var` is marked unsafe starting in Rust 2024 edition because it is
@@ -70,7 +81,7 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
         if config.production {
             std::env::set_var("SHODH_ENV", "production");
         }
-        std::env::set_var("SHODH_RATE_LIMIT", config.rate_limit.to_string());
+        std::env::set_var("SHODH_RATE_LIMIT", effective_rate_limit.to_string());
         std::env::set_var("SHODH_MAX_CONCURRENT", config.max_concurrent.to_string());
     }
 
@@ -121,6 +132,7 @@ async fn async_main() -> Result<()> {
 
     // Load configuration
     let server_config = ServerConfig::from_env();
+    log_production_security_warnings(&server_config);
     print_config(&server_config);
 
     // Initialize runtime-configurable decay scales from config
@@ -541,6 +553,10 @@ fn print_banner() {
 }
 
 fn print_config(config: &ServerConfig) {
+    let encryption_enabled = std::env::var("SHODH_ENCRYPTION_KEY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
     eprintln!("  Configuration:");
     eprintln!(
         "     Mode:    {}",
@@ -553,7 +569,48 @@ fn print_config(config: &ServerConfig) {
     eprintln!("     Host:    {}", config.host);
     eprintln!("     Port:    {}", config.port);
     eprintln!("     Storage: {}", config.storage_path.display());
+    eprintln!(
+        "     Encryption: {}",
+        if encryption_enabled { "enabled" } else { "disabled" }
+    );
+    if config.cors.deny_all {
+        eprintln!("     CORS:    deny-all (set SHODH_CORS_ORIGINS)");
+    } else if config.cors.is_restricted() {
+        eprintln!("     CORS:    restricted");
+    } else {
+        eprintln!("     CORS:    permissive");
+    }
+    if config.rate_limit_per_second > 0 {
+        eprintln!(
+            "     Rate:    {} req/sec (burst {})",
+            config.rate_limit_per_second, config.rate_limit_burst
+        );
+    } else {
+        eprintln!("     Rate:    disabled");
+    }
     eprintln!();
+}
+
+fn log_production_security_warnings(config: &ServerConfig) {
+    if !config.is_production {
+        return;
+    }
+
+    let encryption_enabled = std::env::var("SHODH_ENCRYPTION_KEY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    if !encryption_enabled {
+        warn!(
+            "PRODUCTION WARNING: SHODH_ENCRYPTION_KEY is not set. Memory content will be stored in plaintext at rest."
+        );
+    }
+
+    if config.rate_limit_per_second == 0 {
+        warn!(
+            "PRODUCTION WARNING: rate limiting is disabled (SHODH_RATE_LIMIT=0)."
+        );
+    }
 }
 
 fn print_storage_stats(storage_path: &std::path::Path) {

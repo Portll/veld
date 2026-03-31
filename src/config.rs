@@ -36,11 +36,18 @@ pub fn default_storage_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(LEGACY_STORAGE_DIR))
 }
 
+/// Returns true when the server is bound only to the local machine.
+pub fn is_local_bind_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// CORS configuration
 #[derive(Debug, Clone)]
 pub struct CorsConfig {
-    /// Allowed origins (empty = allow all)
+    /// Allowed origins (empty = allow all in development)
     pub allowed_origins: Vec<String>,
+    /// Reject all cross-origin requests, used as a production safety fallback.
+    pub deny_all: bool,
     /// Allowed HTTP methods
     pub allowed_methods: Vec<String>,
     /// Allowed headers
@@ -54,10 +61,8 @@ pub struct CorsConfig {
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
-            allowed_origins: vec![
-                "http://localhost:*".to_string(),
-                "http://127.0.0.1:*".to_string(),
-            ], // Default: localhost only. Set SHODH_CORS_ORIGINS for other origins.
+            allowed_origins: Vec::new(), // Development default: permissive unless production safety checks override it.
+            deny_all: false,
             allowed_methods: vec![
                 "GET".to_string(),
                 "POST".to_string(),
@@ -79,10 +84,11 @@ impl Default for CorsConfig {
 impl CorsConfig {
     /// Load from environment variables with production safety checks
     ///
-    /// In production mode (SHODH_ENV=production), warns if CORS origins are not configured.
-    /// This prevents accidentally running in production with permissive CORS.
+    /// In production mode (SHODH_ENV=production), deny all cross-origin requests
+    /// unless SHODH_CORS_ORIGINS is explicitly configured.
     pub fn from_env() -> Self {
         let mut config = Self::default();
+        let mut cors_origins_configured = false;
 
         if let Ok(origins) = env::var("SHODH_CORS_ORIGINS") {
             config.allowed_origins = origins
@@ -90,6 +96,7 @@ impl CorsConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+            cors_origins_configured = !config.allowed_origins.is_empty();
         }
 
         if let Ok(methods) = env::var("SHODH_CORS_METHODS") {
@@ -118,8 +125,8 @@ impl CorsConfig {
             }
         }
 
-        // Safety check: warn if CORS origins are not configured
-        // Warns in ALL modes unless suppressed with SHODH_CORS_WARN=false
+        // Safety check: deny all in production if CORS origins are not configured.
+        // Warn in development unless suppressed with SHODH_CORS_WARN=false.
         let is_production = env::var("SHODH_ENV")
             .map(|v| {
                 let v = v.to_lowercase();
@@ -131,14 +138,17 @@ impl CorsConfig {
             .map(|v| v.to_lowercase() == "false" || v == "0")
             .unwrap_or(false);
 
-        if config.allowed_origins.is_empty() && !cors_warn_suppressed {
+        if !cors_origins_configured {
             if is_production {
+                config.deny_all = true;
+                if !cors_warn_suppressed {
+                    tracing::error!(
+                        "PRODUCTION SAFETY: SHODH_CORS_ORIGINS is not set. Rejecting all cross-origin requests until it is configured."
+                    );
+                }
+            } else if !cors_warn_suppressed {
                 tracing::warn!(
-                    "⚠️  PRODUCTION WARNING: CORS allows all origins. Set SHODH_CORS_ORIGINS for security."
-                );
-            } else {
-                tracing::warn!(
-                    "CORS allows all origins (no SHODH_CORS_ORIGINS set). \
+                    "CORS allows all origins in development (no SHODH_CORS_ORIGINS set). \
                      Set SHODH_CORS_WARN=false to suppress this warning."
                 );
             }
@@ -149,7 +159,7 @@ impl CorsConfig {
 
     /// Check if any origin restrictions are configured
     pub fn is_restricted(&self) -> bool {
-        !self.allowed_origins.is_empty()
+        self.deny_all || !self.allowed_origins.is_empty()
     }
 
     /// Convert to tower-http CorsLayer
@@ -159,8 +169,10 @@ impl CorsConfig {
         let mut layer = CorsLayer::new();
 
         // Configure allowed origins
-        if self.allowed_origins.is_empty() {
-            // Intentionally permissive - no origins configured
+        if self.deny_all {
+            layer = layer.allow_origin(AllowOrigin::list(Vec::<axum::http::HeaderValue>::new()));
+        } else if self.allowed_origins.is_empty() {
+            // Intentionally permissive in development when no origins are configured.
             layer = layer.allow_origin(Any);
         } else {
             // Parse configured origins, tracking failures
@@ -403,6 +415,8 @@ impl ServerConfig {
             }
         }
 
+        let rate_limit_explicit = env::var("SHODH_RATE_LIMIT").is_ok();
+
         // Rate limiting
         if let Ok(val) = env::var("SHODH_RATE_LIMIT") {
             if let Ok(n) = val.parse() {
@@ -414,6 +428,10 @@ impl ServerConfig {
             if let Ok(n) = val.parse() {
                 config.rate_limit_burst = n;
             }
+        }
+
+        if !config.is_production && is_local_bind_host(&config.host) && !rate_limit_explicit {
+            config.rate_limit_per_second = 0;
         }
 
         // Concurrency
@@ -574,9 +592,13 @@ impl ServerConfig {
         info!("   Request timeout: {}s", self.request_timeout_secs);
         info!("   Audit retention: {} days", self.audit_retention_days);
         if self.cors.is_restricted() {
-            info!("   CORS origins: {:?}", self.cors.allowed_origins);
+            if self.cors.deny_all {
+                info!("   CORS: deny-all (set SHODH_CORS_ORIGINS to allow browsers)");
+            } else {
+                info!("   CORS origins: {:?}", self.cors.allowed_origins);
+            }
         } else {
-            info!("   CORS: Permissive (all origins allowed)");
+            info!("   CORS: Permissive (development default)");
         }
         info!(
             "   Maintenance interval: {}s (decay factor: {:.2})",
@@ -607,8 +629,9 @@ pub fn print_env_help() {
     println!("  SHODH_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/shodh-memory/)");
     println!("  SHODH_API_KEYS         - Comma-separated API keys (required in production)");
     println!("  SHODH_DEV_API_KEY      - Development API key (required in dev if SHODH_API_KEYS not set)");
+    println!("  SHODH_ENCRYPTION_KEY   - 32-byte field-encryption key (required for encrypted-at-rest production)");
     println!("  SHODH_MAX_USERS        - Max users in memory LRU (default: 1000)");
-    println!("  SHODH_RATE_LIMIT       - Requests per second (default: 4000)");
+    println!("  SHODH_RATE_LIMIT       - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
     println!("  SHODH_RATE_BURST       - Burst size (default: 8000)");
     println!("  SHODH_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
     println!("  SHODH_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
@@ -622,7 +645,7 @@ pub fn print_env_help() {
     println!("  GITHUB_WEBHOOK_SECRET  - GitHub webhook secret for HMAC verification");
     println!();
     println!("CORS Configuration:");
-    println!("  SHODH_CORS_ORIGINS     - Comma-separated allowed origins (default: all)");
+    println!("  SHODH_CORS_ORIGINS     - Comma-separated allowed origins (required in production for browser access)");
     println!("  SHODH_CORS_METHODS     - Comma-separated allowed methods (default: GET,POST,PUT,DELETE,OPTIONS)");
     println!("  SHODH_CORS_HEADERS     - Comma-separated allowed headers (default: Content-Type,Authorization,X-Request-ID)");
     println!("  SHODH_CORS_CREDENTIALS - Allow credentials true/false (default: false)");
@@ -663,12 +686,61 @@ mod tests {
     }
 
     #[test]
+    fn test_local_dev_disables_rate_limit_by_default() {
+        env::remove_var("SHODH_RATE_LIMIT");
+        env::remove_var("SHODH_HOST");
+        env::remove_var("SHODH_ENV");
+
+        let config = ServerConfig::from_env();
+        assert_eq!(config.rate_limit_per_second, 0);
+    }
+
+    #[test]
+    fn test_explicit_rate_limit_override_is_preserved_locally() {
+        env::set_var("SHODH_RATE_LIMIT", "4000");
+        env::remove_var("SHODH_HOST");
+        env::remove_var("SHODH_ENV");
+
+        let config = ServerConfig::from_env();
+        assert_eq!(config.rate_limit_per_second, 4000);
+
+        env::remove_var("SHODH_RATE_LIMIT");
+    }
+
+    #[test]
     fn test_cors_default_is_permissive() {
         let cors = CorsConfig::default();
         assert!(!cors.is_restricted());
         assert!(cors.allowed_origins.is_empty());
+        assert!(!cors.deny_all);
         assert!(!cors.allowed_methods.is_empty());
         assert!(!cors.allowed_headers.is_empty());
+    }
+
+    #[test]
+    fn test_production_without_cors_origins_denies_all() {
+        env::set_var("SHODH_ENV", "production");
+        env::remove_var("SHODH_CORS_ORIGINS");
+
+        let cors = CorsConfig::from_env();
+        assert!(cors.deny_all);
+        assert!(cors.is_restricted());
+
+        env::remove_var("SHODH_ENV");
+    }
+
+    #[test]
+    fn test_production_with_cors_origins_is_restricted_but_not_deny_all() {
+        env::set_var("SHODH_ENV", "production");
+        env::set_var("SHODH_CORS_ORIGINS", "https://app.example.com");
+
+        let cors = CorsConfig::from_env();
+        assert!(!cors.deny_all);
+        assert!(cors.is_restricted());
+        assert_eq!(cors.allowed_origins, vec!["https://app.example.com".to_string()]);
+
+        env::remove_var("SHODH_ENV");
+        env::remove_var("SHODH_CORS_ORIGINS");
     }
 
     #[test]
