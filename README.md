@@ -332,13 +332,28 @@ Linux x86_64 · Linux ARM64 · macOS Apple Silicon · macOS Intel · Windows x86
 ```bash
 SHODH_ENV=production              # Production mode
 SHODH_API_KEYS=key1,key2,key3     # Comma-separated API keys
+SHODH_ENCRYPTION_KEY=<32-byte-key> # Required if you want encrypted memory content at rest
 SHODH_HOST=127.0.0.1              # Bind address (default: localhost)
 SHODH_PORT=3030                   # Port (default: 3030)
 SHODH_MEMORY_PATH=/var/lib/shodh  # Data directory
 SHODH_REQUEST_TIMEOUT=60          # Request timeout in seconds
 SHODH_MAX_CONCURRENT=200          # Max concurrent requests
+SHODH_RATE_LIMIT=4000             # Enabled by default in production unless explicitly set to 0
 SHODH_CORS_ORIGINS=https://app.example.com
 ```
+
+`SHODH_CORS_ORIGINS` is required for browser access in production. If it is missing, the server will reject all cross-origin requests until you configure it.
+</details>
+
+<details>
+<summary>Local secret scanning</summary>
+
+```bash
+./scripts/check-secrets.sh --all
+git config core.hooksPath .githooks
+```
+
+The bundled pre-commit hook scans staged files for obvious API keys, private keys, and credential assignments before the commit is created.
 </details>
 
 <details>
