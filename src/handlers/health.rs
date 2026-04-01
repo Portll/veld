@@ -60,25 +60,12 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 /// Readiness probe - indicates if service can handle traffic.
-/// Returns 503 if the server cannot initialize a test user's memory system
-/// (proves RocksDB + ONNX + vector index are operational).
+/// Returns 503 if core shared storage was not initialized successfully.
+/// This intentionally avoids lazy per-user initialization so a public probe
+/// cannot create user state or trigger heavyweight model/network work.
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let users_in_cache = state.users_in_cache();
-
-    // Probe: try to acquire the health-check user's memory system.
-    // This exercises RocksDB open + ONNX model load on first call.
-    let state_for_probe = state.clone();
-    let ready = match tokio::task::spawn_blocking(move || {
-        state_for_probe.get_user_memory("__health_probe__").is_ok()
-    })
-    .await
-    {
-        Ok(ready) => ready,
-        Err(err) => {
-            tracing::error!("Health readiness probe task failed: {}", err);
-            false
-        }
-    };
+    let ready = state.is_ready();
 
     let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     let status_str = if ready { "ready" } else { "not_ready" };

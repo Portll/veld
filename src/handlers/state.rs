@@ -1782,6 +1782,32 @@ impl MultiUserMemoryManager {
         self.user_memories.entry_count() as usize
     }
 
+    /// Lightweight readiness check for public probes.
+    ///
+    /// This intentionally avoids lazy per-user initialization, which can create
+    /// state, open RocksDB handles, and trigger model/network work for an
+    /// unauthenticated health request.
+    pub fn is_ready(&self) -> bool {
+        if !self.base_path.exists() {
+            return false;
+        }
+
+        // These column families are required for the shared stores initialized
+        // at startup. Missing handles indicate the shared DB is not usable.
+        const REQUIRED_CFS: &[&str] = &[
+            "audit",
+            "prospective",
+            "todos",
+            "projects",
+            "files",
+            "feedback",
+        ];
+
+        REQUIRED_CFS
+            .iter()
+            .all(|cf| self.shared_db.cf_handle(cf).is_some())
+    }
+
     /// Active reminder check: scan all users for due reminders, mark them triggered,
     /// and emit `REMINDER_DUE` events to the broadcast channel.
     ///
