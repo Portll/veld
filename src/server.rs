@@ -3,7 +3,7 @@
 //! Extracted from `main.rs` so that both `shodh-memory-server` (standalone)
 //! and `shodh server` (unified CLI) can start the server with identical behavior.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -276,12 +276,14 @@ async fn async_main() -> Result<()> {
         SocketAddr::from(([127, 0, 0, 1], port))
     });
 
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind TCP listener on {}", addr))?;
+
     // Small delay for log flush
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     print_ready_message(addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // Use a notify to signal the server to stop accepting new connections
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -446,17 +448,32 @@ fn start_reminder_scheduler(manager: AppState) {
 /// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix).
 async fn shutdown_signal_with_drain() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        match signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(err) => {
+                warn!(
+                    "Ctrl+C shutdown handler unavailable ({}). Continuing without Ctrl+C shutdown support.",
+                    err
+                );
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(err) => {
+                warn!(
+                    "SIGTERM shutdown handler unavailable ({}). Continuing without SIGTERM shutdown support.",
+                    err
+                );
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

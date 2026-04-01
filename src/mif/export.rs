@@ -272,6 +272,8 @@ pub fn build_document(
                 edge.uuid.to_string(),
                 serde_json::json!({
                     "strength": edge.strength,
+                    "forward_strength": edge.forward_strength,
+                    "backward_strength": edge.backward_strength,
                     "ltp_status": format!("{:?}", edge.ltp_status),
                     "tier": format!("{:?}", edge.tier),
                     "activation_count": edge.activation_count,

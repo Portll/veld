@@ -1604,21 +1604,26 @@ pub async fn proactive_context(
         "proactive_context [phase:recall] memory retrieval complete"
     );
 
-    // 2.5. Record coactivation - fire-and-forget (doesn't affect response)
-    // When memories are retrieved together, their graph edges get stronger (Hebbian learning)
+    // 2.5. Record directional coactivation - fire-and-forget (doesn't affect response)
+    // First memory (highest score) is the trigger; rest are co-retrieved.
     if memories.len() >= 2 {
         let graph = graph_memory.clone();
         let memory_ids: Vec<uuid::Uuid> = memories
             .iter()
             .filter_map(|m| uuid::Uuid::parse_str(&m.id).ok())
             .collect();
-        tokio::task::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                let graph_guard = graph.write();
-                let _ = graph_guard.record_memory_coactivation(&memory_ids);
-            })
-            .await;
-        });
+        if memory_ids.len() >= 2 {
+            let trigger_id = memory_ids[0];
+            let coactivated_ids: Vec<uuid::Uuid> = memory_ids[1..].to_vec();
+            tokio::task::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let graph_guard = graph.write();
+                    let _ =
+                        graph_guard.record_memory_coactivation(&trigger_id, &coactivated_ids);
+                })
+                .await;
+            });
+        }
     }
 
     // 3. Store pending feedback (fast, in-memory — do before parallel block)
