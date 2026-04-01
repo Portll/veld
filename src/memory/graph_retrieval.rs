@@ -269,7 +269,8 @@ fn spread_single_direction(
             };
 
             for edge in edges {
-                let target_uuid = edge.to_entity;
+                // Resolve the actual neighbor (handles bidirectional edge indexing)
+                let target_uuid = edge.neighbor_of(&entity_uuid);
 
                 // Edge-tier trust weight
                 let tier_trust = if edge.is_potentiated() {
@@ -282,9 +283,22 @@ fn spread_single_direction(
                     }
                 };
 
-                // Importance-weighted decay (using effective_strength for time-aware decay)
+                // Direction-aware strength: use the directional component
+                // matching the traversal direction (A5 Max Sphere)
+                let directional = edge.directional_strength(&entity_uuid);
                 let effective = edge.effective_strength();
-                let decay_rate = calculate_importance_weighted_decay(effective);
+                // Blend: directional strength modulates the time-decayed undirected strength
+                // When directional data exists, it biases the effective strength
+                let blended = if directional > 0.0 && (directional - effective).abs() > f32::EPSILON
+                {
+                    // Weight directional signal at 40%, undirected at 60%
+                    // This prevents old edges (pre-directional) from losing signal
+                    effective * 0.6 + directional * 0.4
+                } else {
+                    effective
+                };
+
+                let decay_rate = calculate_importance_weighted_decay(blended);
                 let decay = (-decay_rate * hop as f32).exp();
 
                 let base_spread = source_activation * decay * effective * tier_trust * degree_norm;

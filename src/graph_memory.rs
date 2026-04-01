@@ -453,6 +453,21 @@ pub struct RelationshipEdge {
     /// Enables retrieval to distinguish speculative from empirical associations.
     #[serde(default)]
     pub created_by: EdgeSource,
+
+    // === Directional Co-activation Fields (A5 Max Sphere) ===
+    // M&I bidirectional memory-identity coupling: direction matters.
+    // When memory A triggers recall of B (but not vice versa), the edge
+    // should reflect this asymmetry for spreading activation.
+
+    /// Forward activation strength (from_entity triggered, to_entity co-retrieved)
+    /// Increases when from_entity is the query match and to_entity is co-retrieved.
+    #[serde(default)]
+    pub forward_strength: f32,
+
+    /// Backward activation strength (to_entity triggered, from_entity co-retrieved)
+    /// Increases when to_entity is the query match and from_entity is co-retrieved.
+    #[serde(default)]
+    pub backward_strength: f32,
 }
 
 fn default_last_activated() -> DateTime<Utc> {
@@ -861,6 +876,118 @@ impl RelationshipEdge {
     /// Check if this edge has any LTP protection (for backward compatibility)
     pub fn is_potentiated(&self) -> bool {
         self.ltp_status.is_potentiated()
+    }
+
+    // =========================================================================
+    // A5 Max Sphere: Directional Co-activation
+    // =========================================================================
+
+    /// Lazy migration: ensure directional strength fields are populated.
+    ///
+    /// Edges created before directional co-activation will have
+    /// `forward_strength == 0.0 && backward_strength == 0.0` due to serde defaults.
+    /// This method initializes both directions to the undirected strength (symmetric).
+    /// Forward and backward are independent signals that can each range [0, 1].
+    /// Called on edge access paths where directional strength matters.
+    pub fn ensure_directional(&mut self) {
+        if self.forward_strength == 0.0 && self.backward_strength == 0.0 && self.strength > 0.0 {
+            // Pre-directional edges: assume symmetric (no directional evidence yet)
+            self.forward_strength = self.strength;
+            self.backward_strength = self.strength;
+        }
+    }
+
+    /// Get direction-aware effective strength for spreading activation.
+    ///
+    /// When traversing from entity `from` to entity `to`:
+    /// - If the edge's stored direction matches (from_entity == from), use forward_strength
+    /// - If the edge is being traversed in reverse (to_entity == from), use backward_strength
+    /// - Falls back to undirected strength if directional fields aren't populated
+    ///
+    /// Applies the same time-based decay as `effective_strength()` to prevent
+    /// directional signal from being artificially immune to forgetting.
+    ///
+    /// This is the main payoff of directional edges: "A often leads to B" is
+    /// distinguished from "B often leads to A" in spreading activation.
+    pub fn directional_strength(&self, traversal_source: &Uuid) -> f32 {
+        use crate::decay::tier_decay_factor;
+
+        // If directional fields haven't been populated yet, use undirected effective
+        if self.forward_strength == 0.0 && self.backward_strength == 0.0 {
+            return self.effective_strength();
+        }
+
+        let raw = if self.from_entity == *traversal_source {
+            // Traversing in the stored forward direction: from_entity → to_entity
+            self.forward_strength
+        } else if self.to_entity == *traversal_source {
+            // Traversing in reverse: to_entity → from_entity
+            self.backward_strength
+        } else {
+            // Edge doesn't involve this entity (shouldn't happen in normal traversal)
+            self.strength
+        };
+
+        // Apply the same time-based decay as effective_strength
+        let now = Utc::now();
+        let elapsed = now.signed_duration_since(self.last_activated);
+        let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
+
+        if hours_elapsed <= 0.0 {
+            return raw;
+        }
+
+        let tier_num = match self.tier {
+            EdgeTier::L1Working => 0,
+            EdgeTier::L2Episodic => 1,
+            EdgeTier::L3Semantic => 2,
+        };
+        let ltp_factor = self.ltp_status.decay_factor();
+        let (decay_factor, _) = tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
+        (raw * decay_factor).max(LTP_MIN_STRENGTH)
+    }
+
+    /// Get the neighbor entity when traversing from a given source.
+    ///
+    /// Returns the entity on the other side of the edge from `traversal_source`.
+    /// This correctly handles bidirectional edge indexing where either
+    /// `from_entity` or `to_entity` might be the source.
+    pub fn neighbor_of(&self, traversal_source: &Uuid) -> Uuid {
+        if self.from_entity == *traversal_source {
+            self.to_entity
+        } else {
+            self.from_entity
+        }
+    }
+
+    /// Strengthen the forward directional component (trigger → coactivated).
+    ///
+    /// Called when from_entity was the trigger (matched the query) and
+    /// to_entity was co-retrieved. Uses Hebbian delta with forward boost.
+    ///
+    /// Note: Does NOT modify `self.strength` — the undirected strength is managed
+    /// independently by `strengthen()` and represents overall edge health.
+    /// Directional fields track asymmetry only.
+    pub fn strengthen_forward(&mut self) {
+        use crate::constants::COACTIVATION_FORWARD_BOOST;
+        self.ensure_directional();
+        let delta = COACTIVATION_FORWARD_BOOST * (1.0 - self.forward_strength);
+        self.forward_strength = (self.forward_strength + delta).min(1.0);
+    }
+
+    /// Strengthen the backward directional component (coactivated → trigger).
+    ///
+    /// Called when to_entity was the trigger and from_entity was co-retrieved.
+    /// Uses Hebbian delta with backward boost (smaller than forward).
+    ///
+    /// Note: Does NOT modify `self.strength` — the undirected strength is managed
+    /// independently by `strengthen()` and represents overall edge health.
+    /// Directional fields track asymmetry only.
+    pub fn strengthen_backward(&mut self) {
+        use crate::constants::COACTIVATION_BACKWARD_BOOST;
+        self.ensure_directional();
+        let delta = COACTIVATION_BACKWARD_BOOST * (1.0 - self.backward_strength);
+        self.backward_strength = (self.backward_strength + delta).min(1.0);
     }
 
     // =========================================================================
@@ -3812,34 +3939,42 @@ impl GraphMemory {
         Ok(strengthened)
     }
 
-    /// Record co-retrieval of memories (Hebbian learning between memories)
+    /// Record directional co-retrieval of memories (Hebbian learning with direction).
     ///
-    /// When memories are retrieved together, they form associations.
-    /// This creates or strengthens CoRetrieved edges between all pairs of memories.
+    /// When memories are retrieved together, they form associations. The trigger
+    /// memory (highest scoring, matched the query) gets stronger forward edges
+    /// to co-retrieved memories, reflecting the M&I bidirectional coupling:
+    /// "A triggers B" is distinguished from "B triggers A".
     ///
-    /// Note: Limits to top N memories to avoid O(n²) explosion on large retrievals.
+    /// For pairs among co-retrieved memories (non-trigger), undirected strengthening
+    /// is applied since neither dominated the triggering relationship.
+    ///
+    /// Note: Limits to top N memories to avoid O(n^2) explosion on large retrievals.
     /// Returns the number of edges created/strengthened.
     /// Result of memory coactivation recording, including edge tier promotions.
     /// Promotions signal the memory layer to boost associated memory importance.
     pub fn record_memory_coactivation(
         &self,
-        memory_ids: &[Uuid],
+        trigger_id: &Uuid,
+        coactivated_ids: &[Uuid],
     ) -> Result<CoactivationResult> {
+        use crate::constants::COACTIVATION_FORWARD_BOOST;
+
         const MAX_COACTIVATION_SIZE: usize = 20;
 
-        // Limit to top N to bound worst-case complexity
-        let memories_to_process = if memory_ids.len() > MAX_COACTIVATION_SIZE {
-            &memory_ids[..MAX_COACTIVATION_SIZE]
-        } else {
-            memory_ids
-        };
-
-        if memories_to_process.len() < 2 {
+        if coactivated_ids.is_empty() {
             return Ok(CoactivationResult {
                 edges_updated: 0,
                 promotions: Vec::new(),
             });
         }
+
+        // Limit coactivated set to bound worst-case complexity
+        let coactivated = if coactivated_ids.len() > MAX_COACTIVATION_SIZE {
+            &coactivated_ids[..MAX_COACTIVATION_SIZE]
+        } else {
+            coactivated_ids
+        };
 
         let _guard = self
             .synapse_update_lock
@@ -3852,13 +3987,92 @@ impl GraphMemory {
         let mut new_edges = 0;
         let mut promotions: Vec<EdgePromotion> = Vec::new();
 
-        // Process all pairs
-        for i in 0..memories_to_process.len() {
-            for j in (i + 1)..memories_to_process.len() {
-                let mem_a = memories_to_process[i];
-                let mem_b = memories_to_process[j];
+        // Phase 1: Directional edges between trigger and each co-retrieved memory
+        for &coact_id in coactivated {
+            let existing_edge = self.find_edge_between_entities(trigger_id, &coact_id)?;
 
-                // Try to find existing edge between these memories
+            if let Some(mut edge) = existing_edge {
+                // Strengthen existing edge with directional awareness
+                let _ = edge.strengthen();
+
+                // Apply directional boost based on which entity is the trigger
+                if edge.from_entity == *trigger_id {
+                    // Edge stored as trigger→coactivated: boost forward
+                    edge.strengthen_forward();
+                } else {
+                    // Edge stored as coactivated→trigger: boost backward
+                    // (backward from edge's perspective = forward from trigger's perspective)
+                    edge.strengthen_backward();
+                }
+
+                let key = edge.uuid.as_bytes();
+                if let Ok(value) =
+                    bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                {
+                    batch.put_cf(self.relationships_cf(), key, value);
+                    edges_updated += 1;
+                }
+            } else {
+                // Create new CoRetrieved edge: trigger → coactivated
+                // Forward strength starts higher (trigger is evidence of directional intent)
+                let initial_weight = EdgeTier::L1Working.initial_weight();
+                let edge = RelationshipEdge {
+                    uuid: Uuid::new_v4(),
+                    from_entity: *trigger_id,
+                    to_entity: coact_id,
+                    relation_type: RelationType::CoRetrieved,
+                    strength: initial_weight,
+                    created_at: Utc::now(),
+                    valid_at: Utc::now(),
+                    invalidated_at: None,
+                    source_episode_id: None,
+                    context: String::new(),
+                    last_activated: Utc::now(),
+                    activation_count: 1,
+                    ltp_status: LtpStatus::None,
+                    activation_timestamps: None,
+                    tier: EdgeTier::L1Working,
+                    entity_confidence: None,
+                    created_by: EdgeSource::Coactivation,
+                    // Directional: forward (trigger→coact) gets initial boost
+                    // Both start at initial_weight; forward gets the first directional nudge
+                    forward_strength: (initial_weight + COACTIVATION_FORWARD_BOOST).min(1.0),
+                    backward_strength: initial_weight,
+                };
+
+                let key = edge.uuid.as_bytes();
+                if let Ok(value) =
+                    bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                {
+                    batch.put_cf(self.relationships_cf(), key, value);
+
+                    // Index both directions for lookup
+                    let idx_key_fwd = format!("mem_edge:{}:{}", trigger_id, coact_id);
+                    let idx_key_rev = format!("mem_edge:{}:{}", coact_id, trigger_id);
+                    batch.put_cf(
+                        self.relationships_cf(),
+                        idx_key_fwd.as_bytes(),
+                        edge.uuid.as_bytes(),
+                    );
+                    batch.put_cf(
+                        self.relationships_cf(),
+                        idx_key_rev.as_bytes(),
+                        edge.uuid.as_bytes(),
+                    );
+
+                    edges_updated += 1;
+                    new_edges += 1;
+                }
+            }
+        }
+
+        // Phase 2: Undirected edges among co-retrieved memories (no single trigger)
+        // These pairs have no directional signal — both were co-retrieved, neither triggered.
+        for i in 0..coactivated.len() {
+            for j in (i + 1)..coactivated.len() {
+                let mem_a = coactivated[i];
+                let mem_b = coactivated[j];
+
                 let existing_edge = self.find_edge_between_entities(&mem_a, &mem_b)?;
 
                 if let Some(mut edge) = existing_edge {
@@ -3879,14 +4093,14 @@ impl GraphMemory {
                         edges_updated += 1;
                     }
                 } else {
-                    // Create new CoRetrieved edge (bidirectional represented as single edge)
-                    // Starts in L1 (working memory) with tier-specific initial weight
+                    // New edge between co-retrieved memories (symmetric initial strengths)
+                    let initial_weight = EdgeTier::L1Working.initial_weight();
                     let edge = RelationshipEdge {
                         uuid: Uuid::new_v4(),
                         from_entity: mem_a,
                         to_entity: mem_b,
                         relation_type: RelationType::CoRetrieved,
-                        strength: EdgeTier::L1Working.initial_weight(),
+                        strength: initial_weight,
                         created_at: Utc::now(),
                         valid_at: Utc::now(),
                         invalidated_at: None,
@@ -3897,9 +4111,10 @@ impl GraphMemory {
                         ltp_status: LtpStatus::None,
                         activation_timestamps: None,
                         tier: EdgeTier::L1Working,
-                        // PIPE-5: Memory-to-memory edges use default confidence
                         entity_confidence: None,
                         created_by: EdgeSource::CoOccurrence,
+                        forward_strength: initial_weight,
+                        backward_strength: initial_weight,
                     };
 
                     let key = edge.uuid.as_bytes();
@@ -3908,7 +4123,6 @@ impl GraphMemory {
                     {
                         batch.put_cf(self.relationships_cf(), key, value);
 
-                        // Also index in the reverse direction for lookup
                         let idx_key_fwd = format!("mem_edge:{mem_a}:{mem_b}");
                         let idx_key_rev = format!("mem_edge:{mem_b}:{mem_a}");
                         batch.put_cf(
@@ -4067,12 +4281,13 @@ impl GraphMemory {
             } else {
                 // Create new ReplayStrengthened edge
                 // Replay edges start in L2 (episodic) since they represent consolidated associations
+                let replay_initial = EdgeTier::L2Episodic.initial_weight();
                 let edge = RelationshipEdge {
                     uuid: Uuid::new_v4(),
                     from_entity: from_uuid,
                     to_entity: to_uuid,
                     relation_type: RelationType::CoRetrieved,
-                    strength: EdgeTier::L2Episodic.initial_weight(),
+                    strength: replay_initial,
                     created_at: Utc::now(),
                     valid_at: Utc::now(),
                     invalidated_at: None,
@@ -4083,9 +4298,10 @@ impl GraphMemory {
                     ltp_status: LtpStatus::None,
                     activation_timestamps: None,
                     tier: EdgeTier::L2Episodic,
-                    // PIPE-5: Replay edges use default confidence
                     entity_confidence: None,
                     created_by: EdgeSource::Coactivation,
+                    forward_strength: replay_initial,
+                    backward_strength: replay_initial,
                 };
 
                 let key = edge.uuid.as_bytes();
@@ -6455,7 +6671,9 @@ mod tests {
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
             tier,
-            entity_confidence: None, // PIPE-5: Default for tests
+            entity_confidence: None,
+            forward_strength: strength,
+            backward_strength: strength,
         }
     }
 
@@ -7202,8 +7420,10 @@ mod tests {
             activation_count: 5,
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
-            tier: EdgeTier::L2Episodic, // Use L2 since it has activation count
-            entity_confidence: None,    // PIPE-5: Default for tests
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forward_strength: 0.8,
+            backward_strength: 0.8,
         };
         graph.add_relationship(edge).unwrap();
 

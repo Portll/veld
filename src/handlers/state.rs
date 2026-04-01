@@ -2287,12 +2287,13 @@ impl MultiUserMemoryManager {
         let truncated_context: String = experience.content.chars().take(150).collect();
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
+                let state_edge_init = EdgeTier::L1Working.initial_weight();
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
                     from_entity: entity_uuids[i].1,
                     to_entity: entity_uuids[j].1,
                     relation_type: RelationType::RelatedTo,
-                    strength: EdgeTier::L1Working.initial_weight(),
+                    strength: state_edge_init,
                     created_at: now,
                     valid_at: now,
                     invalidated_at: None,
@@ -2305,6 +2306,8 @@ impl MultiUserMemoryManager {
                     activation_timestamps: None,
                     entity_confidence: None,
                     created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                    forward_strength: state_edge_init,
+                    backward_strength: state_edge_init,
                 };
 
                 if let Err(e) = graph_guard.add_relationship(edge) {

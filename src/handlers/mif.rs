@@ -480,6 +480,8 @@ pub async fn add_relationship(
         activation_timestamps: None,
         entity_confidence,
         created_by: graph_memory::EdgeSource::Explicit,
+        forward_strength: strength,
+        backward_strength: strength,
     };
 
     graph_guard

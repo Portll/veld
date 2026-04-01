@@ -77,6 +77,40 @@ pub const ABSTENTION_THRESHOLD: f32 = 0.1;
 /// - Matches the "initial synaptic strength" concept in neuroscience
 pub const EDGE_INITIAL_STRENGTH: f32 = 0.5;
 
+// =============================================================================
+// DIRECTIONAL CO-ACTIVATION CONSTANTS (A5 Max Sphere)
+// M&I bidirectional memory-identity coupling: the direction of triggering matters.
+// When memory A frequently triggers recall of B but not vice versa, the
+// forward edge (A→B) should be stronger than backward (B→A).
+// =============================================================================
+
+/// Forward (trigger → coactivated) directional boost per co-activation.
+///
+/// Applied when the trigger memory's edge leads to a co-retrieved memory.
+/// Slightly higher than backward because the triggering relationship is
+/// stronger evidence of directional association (the user's query matched
+/// the trigger, not the target).
+///
+/// Justification:
+/// - 1.5% per activation: ~67 co-activations to saturate from 0.25 → 1.0
+/// - Higher than backward (1.0%) because trigger→target is the user's intent
+/// - Moderate enough to require repeated evidence, not single-shot
+/// - Hebbian delta form: δ = boost × (1 - current), asymptotic to 1.0
+pub const COACTIVATION_FORWARD_BOOST: f32 = 0.015;
+
+/// Backward (coactivated → trigger) directional boost per co-activation.
+///
+/// Applied when a co-retrieved memory's edge leads back to the trigger.
+/// Lower than forward because being co-retrieved is weaker evidence of
+/// directional relevance than being the trigger.
+///
+/// Justification:
+/// - 1.0% per activation: ~100 co-activations to saturate from 0.25 → 1.0
+/// - 2/3 of forward boost, matching the intuition that co-retrieval is
+///   weaker directional evidence than triggering
+/// - Still allows backward edges to strengthen with sufficient evidence
+pub const COACTIVATION_BACKWARD_BOOST: f32 = 0.010;
+
 /// Minimum edge strength before pruning
 ///
 /// Edges below this strength are removed during maintenance.

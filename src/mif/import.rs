@@ -337,6 +337,8 @@ pub fn import_graph_relationships(
             activation_timestamps: None,
             entity_confidence: rel.confidence,
             created_by: EdgeSource::Explicit,
+            forward_strength: strength,
+            backward_strength: strength,
         };
 
         match graph.add_relationship(edge) {

@@ -67,7 +67,18 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
 
     // Probe: try to acquire the health-check user's memory system.
     // This exercises RocksDB open + ONNX model load on first call.
-    let ready = state.get_user_memory("__health_probe__").is_ok();
+    let state_for_probe = state.clone();
+    let ready = match tokio::task::spawn_blocking(move || {
+        state_for_probe.get_user_memory("__health_probe__").is_ok()
+    })
+    .await
+    {
+        Ok(ready) => ready,
+        Err(err) => {
+            tracing::error!("Health readiness probe task failed: {}", err);
+            false
+        }
+    };
 
     let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     let status_str = if ready { "ready" } else { "not_ready" };

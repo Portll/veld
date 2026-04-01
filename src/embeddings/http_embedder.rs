@@ -81,7 +81,7 @@ struct BatchEmbeddingRequest<'a> {
 /// Falls back gracefully if server is unreachable.
 pub struct HttpEmbedder {
     config: HttpEmbedderConfig,
-    client: reqwest::blocking::Client,
+    client: ureq::Agent,
     /// Cached dimension from first successful call
     cached_dimension: std::sync::OnceLock<usize>,
 }
@@ -89,10 +89,10 @@ pub struct HttpEmbedder {
 impl HttpEmbedder {
     /// Create a new HTTP embedder.
     pub fn new(config: HttpEmbedderConfig) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(config.timeout_ms))
+        let client: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_millis(config.timeout_ms)))
             .build()
-            .expect("Failed to build HTTP client");
+            .into();
 
         Self {
             config,
@@ -109,12 +109,12 @@ impl HttpEmbedder {
             model: &self.config.model,
             input: "test",
         };
-        let mut builder = self.client.post(&url).json(&req);
+        let mut builder = self.client.post(&url);
         if let Some(ref key) = self.config.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
+            builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
-        match builder.send() {
-            Ok(resp) => resp.status().is_success(),
+        match builder.send_json(&req) {
+            Ok(_) => true,
             Err(_) => false,
         }
     }
@@ -127,23 +127,16 @@ impl HttpEmbedder {
             input: text,
         };
 
-        let mut builder = self.client.post(&url).json(&req);
+        let mut builder = self.client.post(&url);
         if let Some(ref key) = self.config.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
+            builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
 
-        let resp = builder
-            .send()
-            .context("HTTP embedding request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            anyhow::bail!("Embedding API error ({}): {}", status, &body[..body.len().min(200)]);
-        }
+        let resp = builder.send_json(&req).context("HTTP embedding request failed")?;
 
         let parsed: EmbeddingResponse = resp
-            .json()
+            .into_body()
+            .read_json()
             .context("Failed to parse embedding response")?;
 
         parsed
@@ -175,22 +168,19 @@ impl Embedder for HttpEmbedder {
             input: texts.to_vec(),
         };
 
-        let mut builder = self.client.post(&url).json(&req);
+        let mut builder = self.client.post(&url);
         if let Some(ref key) = self.config.api_key {
-            builder = builder.header("Authorization", format!("Bearer {key}"));
+            builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
 
-        let resp = builder
-            .send()
-            .context("HTTP batch embedding request failed")?;
-
-        if !resp.status().is_success() {
-            // Fall back to sequential
-            return texts.iter().map(|t| self.encode(t)).collect();
-        }
+        let resp = match builder.send_json(&req) {
+            Ok(resp) => resp,
+            Err(_) => return texts.iter().map(|t| self.encode(t)).collect(),
+        };
 
         let parsed: EmbeddingResponse = resp
-            .json()
+            .into_body()
+            .read_json()
             .context("Failed to parse batch embedding response")?;
 
         if parsed.data.len() != texts.len() {
