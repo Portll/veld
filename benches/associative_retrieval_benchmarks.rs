@@ -19,8 +19,8 @@
 use chrono::Utc;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use shodh_memory::graph_memory::{
-    EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus, RelationType,
-    RelationshipEdge,
+    EdgeSource, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
+    RelationType, RelationshipEdge,
 };
 use std::collections::{HashMap, HashSet};
 use tempfile::TempDir;
@@ -67,6 +67,9 @@ fn create_relationship(
         tier: Default::default(),
         activation_timestamps: None,
         entity_confidence: None,
+        created_by: EdgeSource::CoOccurrence,
+        forward_strength: strength,
+        backward_strength: strength,
     }
 }
 
