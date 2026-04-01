@@ -1,0 +1,204 @@
+{
+  "evaluation_type": "max_reverse",
+  "tier": "STANDARD",
+  "token_max": 20000,
+  "target": "shodh-memory",
+  "date": "2026-03-30",
+  "commit": "e583508",
+  "version": "v0.7.2",
+
+  "temporal_skeleton": {
+    "epochs": [
+      "2025-12-03..2025-12-30",
+      "2026-01-01..2026-01-31",
+      "2026-02-01..2026-02-28",
+      "2026-03-01..2026-03-26",
+      "2026-03-27..2026-04-01"
+    ],
+    "epoch_labels": ["E1 launch", "E2 consolidation", "E3 crisis", "E4 evaluation pivot", "E5 retrieval sprint"],
+    "commits_per_epoch": [322, 206, 152, 101, 76],
+    "versions": ["v0.1.0", "v0.1.1..v0.1.91", "v0.5.0..v0.5.2", "v0.6.0..v0.6.1", "v0.7.0..v0.7.2"],
+    "velocity_ema": [11.5, 10.0, 8.6, 7.2, 9.6],
+    "theme_vectors": {
+      "E1": {"feat": 0.33, "fix": 0.29, "refactor": 0.02, "docs": 0.10, "perf": 0.02, "test": 0.01},
+      "E2": {"feat": 0.35, "fix": 0.23, "refactor": 0.04, "docs": 0.04, "perf": 0.01, "test": 0.02},
+      "E3": {"feat": 0.13, "fix": 0.44, "refactor": 0.04, "docs": 0.01, "perf": 0.03, "test": 0.01},
+      "E4": {"feat": 0.25, "fix": 0.28, "refactor": 0.03, "docs": 0.05, "perf": 0.05, "test": 0.01},
+      "E5": {"feat": 0.46, "fix": 0.16, "refactor": 0.01, "docs": 0.01, "perf": 0.07, "test": 0.03}
+    },
+    "regime_shifts": [
+      {"boundary": "E2→E3", "cosine_distance": 0.48, "signature": "fix% doubles, feat% halves"},
+      {"boundary": "E4→E5", "cosine_distance": 0.41, "signature": "feat% surges, fix% drops, eval_density explodes"}
+    ],
+    "prior_claw": null
+  },
+
+  "claws": {
+    "genesis": {
+      "score": 0.40,
+      "assumptions": [
+        {"claim": "edge-optimized — Raspberry Pi, drones, IoT", "status": "OBSOLETE", "evidence": "src/zenoh_transport: 20 commits all E1-E2, zero since. No edge deployment in PROGRESS.md."},
+        {"claim": "compete with mem0 and Zep on speed/privacy", "status": "TRANSFORMED", "evidence": "PROGRESS.md: 'cognitive amplifier, not benchmark optimizer'. Mission shifted from external competition to internal precision."},
+        {"claim": "Python SDK as primary integration", "status": "OBSOLETE", "evidence": "MCP server is primary interface. python/ has no E5 commits. CLAUDE.md and hooks are the living interface."},
+        {"claim": "28 REST APIs as primary interface", "status": "PARTIALLY_OBSOLETE", "evidence": "REST still exists but MCP tools are the actual usage path for shodh-memory's stated purpose."},
+        {"claim": "100% offline / GDPR compliant", "status": "VALID", "evidence": "src/auth.rs, data locality preserved throughout. No cloud dependencies added."},
+        {"claim": "3-tier memory (Working/Session/Long-term)", "status": "VALID", "evidence": "Layer 3.5 brute-force references tiers explicitly. Architecture unchanged."},
+        {"claim": "multi-tenancy (user_id+agent_id+run_id+actor_id)", "status": "VALID", "evidence": "Wired throughout src/handlers/. Not violated."},
+        {"claim": "Docker/enterprise deployment target", "status": "OBSOLETE", "evidence": "PROGRESS.md contains zero deployment stories. Dockerfile not developed since E1."},
+        {"claim": "benchmarks vs competitors as success metric", "status": "TRANSFORMED", "evidence": "LOCOMO/LongMemEval are internal diagnostic instruments. Not external competition."},
+        {"claim": "Zenoh robotics middleware integration", "status": "VESTIGIAL", "evidence": "src/zenoh_transport/ compiles, 20 commits in E1-E2, zero development since."}
+      ],
+      "findings": [
+        "OBSOLETE founding frame: 4 of 10 founding assumptions fully abandoned (edge/IoT, Python-primary, Docker-enterprise, Zenoh)",
+        "TRANSFORMED mission: external competitive product → cognitive amplifier substrate. Different users, different moat.",
+        "3-tier architecture and offline guarantee are the genuine inherited assets worth preserving."
+      ]
+    },
+
+    "inflection": {
+      "score": 0.76,
+      "inflection_points": [
+        {"boundary": "E1→E2", "classification": "INTENTIONAL", "severity": 0.2, "description": "Style debt cleanup (style% 7%→20%). Internal decision to pay formatting debt.", "evidence": "42 style commits in E2 vs 23 in E1"},
+        {"boundary": "E2→E3", "classification": "DRIFT", "severity": 0.8, "description": "OOM, vector leaks, GDPR, race conditions surfaced in unplanned audits. Fix% 23%→44%. No decision point found.", "evidence": "fix: 12 verified audit bugs (59e2faa), fix: deep audit 14 bugs (adc4764) — all reactive"},
+        {"boundary": "E3→E4 eval pivot", "classification": "INTENTIONAL", "severity": 0.7, "description": "Evaluation framework (bifocal-eval, overlook) adopted. Shift from reactive fixing to systematic measurement.", "evidence": "bifocal.code-workspace created; evaluations/ directory; first bifocal artifacts 2026-03-27"},
+        {"boundary": "E4→E5", "classification": "INTENTIONAL", "severity": 0.6, "description": "Explicit MRR targets, 20-signal pipeline, dual-embedder. PROGRESS.md mission stated.", "evidence": "PROGRESS.md exists, v0.5.0→v0.7.2 trajectory planned"}
+      ],
+      "findings": [
+        "3 of 4 inflections were intentional — deliberate evolution is the dominant pattern",
+        "The one unintentional inflection (E2→E3 crisis) was caused by the founding velocity: production-grade promises met real production bugs",
+        "Evaluation framework adoption (E3→E4) is the most consequential intentional pivot — it changed how the project reasons about itself"
+      ]
+    },
+
+    "void": {
+      "score": 0.65,
+      "gaps": [
+        {"capability": "feedback loop unification", "status": "NEVER_BUILT", "evidence": "PROGRESS.md P1-#3: 24h effort, ScoringSignals struct exists, recall.rs static weights never connected to /api/reinforce training"},
+        {"capability": "query reformulation (embedding-level)", "status": "NEVER_BUILT", "evidence": "PROGRESS.md P2-#8: BM25 concept expansion exists, embedding-level expansion = 0 commits"},
+        {"capability": "agent-usability evaluation", "status": "NEVER_BUILT", "evidence": "evaluations/intugest_2026-03-30_candlekeep_never_forget.json: 'MRR misleads for agents'. No agent-eval infrastructure."},
+        {"capability": "benchmark expansion", "status": "NEVER_BUILT", "evidence": "PROGRESS.md P1-#6: LOCOMO-20 saturating, 4h effort, not started"}
+      ],
+      "excess": [
+        {"capability": "Zenoh transport", "evidence": "src/zenoh_transport/ 20 commits E1-E2, zero since. No callers in current architecture."},
+        {"capability": "A/B testing module", "evidence": "src/ab_testing.rs 16 commits, P3 deferred, superseded by Bifocal evaluation framework."},
+        {"capability": "GDPR deletion workflows", "evidence": "Extensive DELETE endpoints built in E1, no active development since."}
+      ],
+      "findings": [
+        "Feedback loop is the highest-leverage void: adaptive learning is architecturally ready but not wired",
+        "Benchmark saturation void is existential: without new data, future MRR work cannot be validated",
+        "Agent-usability is the void most aligned with the project's stated mission (cognitive amplifier) — and least addressed"
+      ]
+    },
+
+    "cluster": {
+      "score": 0.45,
+      "gini": 0.56,
+      "roi_map": {
+        "memory/": {"commits": 666, "fraction": 0.377, "metric_delta": 0.045, "roi": 0.0000676},
+        "handlers/": {"commits": 295, "fraction": 0.167, "metric_delta": 0.0, "roi": 0.0},
+        "main.rs": {"commits": 144, "fraction": 0.081, "metric_delta": 0.0, "roi": 0.0},
+        "embeddings/": {"commits": 98, "fraction": 0.055, "metric_delta": 0.015, "roi": 0.000153},
+        "graph_memory.rs": {"commits": 85, "fraction": 0.048, "metric_delta": 0.008, "roi": 0.0000941},
+        "zenoh_transport/": {"commits": 20, "fraction": 0.011, "metric_delta": 0.0, "roi": 0.0},
+        "ab_testing.rs": {"commits": 16, "fraction": 0.009, "metric_delta": 0.0, "roi": 0.0}
+      },
+      "findings": [
+        "memory/ is severely over-concentrated at 37.7% of all commits with diminishing ROI (last 3 signals = +0.003 MRR)",
+        "embeddings/ has HIGHER per-commit ROI than memory/ despite 7x fewer commits — the embedding quality thesis is supported",
+        "graph_memory.rs: 85 commits, 8% scoring weight, moderate ROI — well-proportioned",
+        "zenoh_transport and ab_testing: 36 commits, zero ROI — vestigial investment"
+      ]
+    },
+
+    "vortex": {
+      "score": 0.35,
+      "oscillations": [
+        {
+          "pattern": "OOM/bincode deserialization",
+          "type": "LOOP",
+          "commits": ["439e207 (E3)", "46abc42 (E5)", "a46f209 (E5)", "7bf4d44 (Jan26)", "f6877b0 (Jan26)", "7bf4d44 (Jan26)"],
+          "root_cause": "bincode 1.x→2.x migration never completed — format divergence keeps creating corrupt-length-field vulnerabilities",
+          "resolution": "Complete bincode 2.x migration, deprecate 1.x codepath entirely"
+        },
+        {
+          "pattern": "embedding model primary",
+          "type": "TENSION",
+          "epochs": ["E1 (MiniLM settled)", "E2 (multimodal added, not developed)", "E5 (dual-embedder, bifurcation open)"],
+          "root_cause": "MiniLM vs Nomic primary unresolved. P2-#7 gated on P1-#5 backfill.",
+          "resolution": "Commit to Nomic once backfill complete. Deprecate MiniLM as primary."
+        }
+      ],
+      "stable": [
+        "knowledge graph (graph_memory.rs) — consistent investment, no reversals",
+        "3-tier memory architecture — foundation unchanged all 5 epochs",
+        "RocksDB storage layer — stable throughout"
+      ],
+      "findings": [
+        "Bincode vortex will trigger again — root cause (format migration) has never been the commit target, only symptoms",
+        "Embedding vortex is architectural: deferred bifurcation point will force resolution in P1-P2 sprint",
+        "Vortex intensity is moderate (x=0.35) — the project is not dominated by oscillation, but two persistent loops exist"
+      ]
+    },
+
+    "horizon": {
+      "score": 0.35,
+      "projections": [
+        {"dimension": "MRR", "direction": "CONVERGE", "target": "0.93 asymptote in 2-3 versions", "evidence": "trajectory 0.880→0.892→0.925, marginal gains decelerating"},
+        {"dimension": "signal count", "direction": "SATURATED", "target": "20 signals, no more added", "evidence": "5 orthogonal signals adversarially collapsed, PROGRESS.md: 'algorithm is no longer the bottleneck'"},
+        {"dimension": "embedding strategy", "direction": "DIVERGE", "target": "MiniLM vs Nomic bifurcation unresolved", "evidence": "P2-#7 open, gated on P1-#5"},
+        {"dimension": "feedback loop", "direction": "GROWTH", "target": "24h to connect ScoringSignals to adaptive learning", "evidence": "PROGRESS.md P1-#3, infrastructure ready"},
+        {"dimension": "benchmark", "direction": "RISK", "target": "LOCOMO-20 saturating — evaluation ceiling", "evidence": "PROGRESS.md P1-#6, 4h effort, not started"}
+      ],
+      "findings": [
+        "65% of current momentum converging on MRR approaching its asymptote — diversity is low",
+        "The highest-leverage growth surface (feedback loop) has zero current trajectory momentum",
+        "Benchmark saturation is an existential risk: the measuring instrument is the constraint, not the algorithm"
+      ]
+    }
+  },
+
+  "interactions": {
+    "genesis_x_inflection": {
+      "correlation": 0.72,
+      "finding": "The E2→E3 crisis was caused by the founding velocity. E1's 'production-ready from day 1' positioning created the structural debt that E3 was forced to repay. The founding assumption directly caused the only unintentional inflection."
+    },
+    "void_x_horizon": {
+      "overlap": 0.15,
+      "finding": "CRITICAL: The project is diverging FROM its capability voids rather than self-correcting. Feedback loop, query reformulation, and agent-usability remain unbuilt while 65% of momentum concentrates on MRR approaching asymptote."
+    },
+    "cluster_x_vortex": {
+      "correlation": 0.75,
+      "finding": "src/memory/ is both the most-invested module (37.7% of commits) AND the vortex source (bincode OOM fixed 3x across 3 epochs, root cause untouched). Maximum investment concentrated in the module that keeps generating the same unfixed problem."
+    }
+  },
+
+  "claw_vector": [0.40, 0.76, 0.65, 0.45, 0.35, 0.35],
+  "prior_claw_vector": null,
+  "delta": null,
+  "health": 0.48,
+  "drift_magnitude": null,
+
+  "carfax": {
+    "rumination_check": "pass",
+    "avoidance_check": "pass",
+    "executive_control": "pass",
+    "distortion_load": 0.35
+  },
+
+  "recommendations": {
+    "growth_surfaces": [
+      "Feedback loop unification (P1-#3): 24h effort, enables adaptive learning. Highest ROI unbuilt feature.",
+      "Benchmark expansion (P1-#6): 4h effort, prevents measurement ceiling from masking real algorithmic gains.",
+      "Query reformulation at embedding level (P2-#8): stated remaining lever, zero E5 investment despite PROGRESS.md priority."
+    ],
+    "extinction_risks": [
+      "Benchmark saturation: LOCOMO-20 will appear to plateau at 0.93 MRR. Need adversarial/messy queries before next sprint.",
+      "Founding-frame drift: README still positions as edge/enterprise vs mem0. Active development is cognitive amplifier for LLM agents. These need alignment or the project has two incompatible identities."
+    ],
+    "unresolved_vortexes": [
+      "Bincode OOM (commit #8 will happen): complete bincode 2.x migration, deprecate 1.x codepath.",
+      "Embedding primary (MiniLM vs Nomic): resolve in P1-P2 sprint after backfill."
+    ],
+    "next_run_date": "2026-04-08"
+  }
+}

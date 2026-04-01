@@ -237,7 +237,7 @@ pub struct MemorySystem {
     /// Pinky dimension scores: topological health of the knowledge graph.
     /// Pushed by Pinky via `/api/pinky/dimensions`, read during Layer 5 scoring.
     /// When available, memories from high-quality graph regions rank higher.
-    pinky_scores: Arc<parking_lot::RwLock<Option<types::PinkyDimensionScores>>>,
+    external_scores: Arc<parking_lot::RwLock<Option<types::ExternalDimensionScores>>>,
 
     /// Persistent learning history for significant events
     /// Enables recency-weighted retrieval and learning velocity tracking
@@ -722,7 +722,7 @@ impl MemorySystem {
             // Feedback store is optional - wire up with set_feedback_store() for momentum scoring (PIPE-9)
             feedback_store: None,
             // Pinky dimension scores: initialized empty, populated via API push
-            pinky_scores: Arc::new(parking_lot::RwLock::new(None)),
+            external_scores: Arc::new(parking_lot::RwLock::new(None)),
             // Persistent learning history for retrieval boosting
             learning_history,
             // Temporal fact store for multi-hop temporal reasoning
@@ -786,14 +786,14 @@ impl MemorySystem {
     }
 
     /// Update Pinky dimension scores (called via API push from Pinky).
-    pub fn set_pinky_scores(&self, scores: types::PinkyDimensionScores) {
-        *self.pinky_scores.write() = Some(scores);
+    pub fn set_external_scores(&self, scores: types::ExternalDimensionScores) {
+        *self.external_scores.write() = Some(scores);
     }
 
     /// Get current Pinky dimension scores (read during Layer 5 scoring).
     /// Returns None if Pinky hasn't pushed scores or they're stale.
     pub fn pinky_aggregate_score(&self) -> Option<f32> {
-        let guard = self.pinky_scores.read();
+        let guard = self.external_scores.read();
         guard.as_ref().and_then(|s| {
             if s.is_stale() {
                 None
@@ -1647,7 +1647,6 @@ impl MemorySystem {
                             .next()
                             .map(|c| c.is_uppercase())
                             .unwrap_or(false),
-                        pii_classification: crate::graph_memory::PiiClassification::from_labels(&labels),
                     }
                 })
                 .collect();
@@ -1688,12 +1687,13 @@ impl MemorySystem {
                         _ => 1.0,
                     };
 
+                    let cooccurs_init = l1_base_weight * semantic_weight;
                     let edge = crate::graph_memory::RelationshipEdge {
                         uuid: Uuid::new_v4(),
                         from_entity: e1.uuid,
                         to_entity: e2.uuid,
                         relation_type: crate::graph_memory::RelationType::CoOccurs,
-                        strength: l1_base_weight * semantic_weight,
+                        strength: cooccurs_init,
                         created_at: now,
                         valid_at: now,
                         invalidated_at: None,
@@ -1706,6 +1706,8 @@ impl MemorySystem {
                         activation_timestamps: None,
                         entity_confidence,
                         created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                        forward_strength: cooccurs_init,
+                        backward_strength: cooccurs_init,
                     };
 
                     if let Err(e) = graph_guard.add_relationship(edge) {
@@ -1751,6 +1753,8 @@ impl MemorySystem {
                             activation_timestamps: None,
                             entity_confidence: None,
                             created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                            forward_strength: l1_base_weight * 0.8,
+                            backward_strength: l1_base_weight * 0.8,
                         };
                         if let Err(e) = graph_guard.add_relationship(edge) {
                             tracing::trace!(
@@ -4073,7 +4077,6 @@ impl MemorySystem {
                         .next()
                         .map(|c| c.is_uppercase())
                         .unwrap_or(false),
-                    pii_classification: crate::graph_memory::PiiClassification::from_labels(&labels),
                 };
                 if graph_guard.add_entity(entity).is_ok() {
                     entities_added += 1;
@@ -4098,12 +4101,13 @@ impl MemorySystem {
                             _ => 1.0,
                         };
 
+                        let related_init = l2_base_weight * semantic_weight;
                         let edge = crate::graph_memory::RelationshipEdge {
                             uuid: Uuid::new_v4(),
                             from_entity: e1.uuid,
                             to_entity: e2.uuid,
                             relation_type: crate::graph_memory::RelationType::RelatedTo,
-                            strength: l2_base_weight * semantic_weight,
+                            strength: related_init,
                             created_at: now,
                             valid_at: now,
                             invalidated_at: None,
@@ -4116,6 +4120,8 @@ impl MemorySystem {
                             activation_timestamps: None,
                             entity_confidence: Some(fact.confidence),
                             created_by: crate::graph_memory::EdgeSource::Coactivation,
+                            forward_strength: related_init,
+                            backward_strength: related_init,
                         };
                         if graph_guard.add_relationship(edge).is_ok() {
                             edges_added += 1;
@@ -4416,7 +4422,6 @@ impl MemorySystem {
                                 .next()
                                 .map(|c| c.is_uppercase())
                                 .unwrap_or(false),
-                            pii_classification: crate::graph_memory::PiiClassification::from_labels(&labels),
                         }
                     })
                     .collect();
@@ -4458,12 +4463,13 @@ impl MemorySystem {
                             _ => 1.0,
                         };
 
+                        let cooccurs_init2 = l1_base_weight * semantic_weight;
                         let edge = crate::graph_memory::RelationshipEdge {
                             uuid: Uuid::new_v4(),
                             from_entity: e1.uuid,
                             to_entity: e2.uuid,
                             relation_type: crate::graph_memory::RelationType::CoOccurs,
-                            strength: l1_base_weight * semantic_weight,
+                            strength: cooccurs_init2,
                             created_at: now,
                             valid_at: now,
                             invalidated_at: None,
@@ -4476,6 +4482,8 @@ impl MemorySystem {
                             activation_timestamps: None,
                             entity_confidence,
                             created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                            forward_strength: cooccurs_init2,
+                            backward_strength: cooccurs_init2,
                         };
 
                         if let Err(e) = graph_guard.add_relationship(edge) {
