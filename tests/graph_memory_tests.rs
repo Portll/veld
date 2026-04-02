@@ -11,7 +11,7 @@
 use chrono::{DateTime, Duration, Utc};
 use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 use shodh_memory::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
+    EdgeSource, EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
     RelationType, RelationshipEdge,
 };
 use shodh_memory::uuid::Uuid;
@@ -51,6 +51,7 @@ fn create_entity_from_ner(ner: &NeuralNer, text: &str) -> Vec<EntityNode> {
             name_embedding: None,
             salience: entity.confidence,
             is_proper_noun: true,
+            pii_classification: Default::default(),
         })
         .collect()
 }
@@ -81,6 +82,7 @@ fn create_entity(
         name_embedding: None,
         salience,
         is_proper_noun: is_proper,
+        pii_classification: Default::default(),
     }
 }
 
@@ -109,6 +111,9 @@ fn create_relationship(
         tier: EdgeTier::L1Working,
         activation_timestamps: None,
         entity_confidence: None,
+        created_by: EdgeSource::CoOccurrence,
+        forward_strength: strength,
+        backward_strength: strength,
     }
 }
 
@@ -143,6 +148,9 @@ fn create_relationship_with_plasticity(
         tier: EdgeTier::L2Episodic,
         activation_timestamps: None,
         entity_confidence: None,
+        created_by: EdgeSource::CoOccurrence,
+        forward_strength: strength,
+        backward_strength: strength,
     }
 }
 

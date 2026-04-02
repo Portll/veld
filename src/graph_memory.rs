@@ -82,10 +82,45 @@ pub struct EntityNode {
     /// Proper nouns have higher base salience than common nouns
     #[serde(default)]
     pub is_proper_noun: bool,
+
+    /// PII classification for cross-user safety.
+    /// Derived from entity labels: Person → PersonalIdentity,
+    /// Organization → OrganizationIdentity, otherwise Clean.
+    #[serde(default)]
+    pub pii_classification: PiiClassification,
 }
 
 fn default_salience() -> f32 {
     0.5 // Default middle salience
+}
+
+/// PII classification for entities, used to control cross-user data flow.
+///
+/// Entities classified as `PersonalIdentity` or `OrganizationIdentity` are
+/// excluded from cross-user aggregation by the selective membrane filter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum PiiClassification {
+    /// Contains personally identifiable information (names, contacts)
+    PersonalIdentity,
+    /// Contains organization-specific information
+    OrganizationIdentity,
+    /// No PII detected — safe for cross-user aggregation
+    #[default]
+    Clean,
+}
+
+impl PiiClassification {
+    /// Derive PII classification from entity labels.
+    pub fn from_labels(labels: &[EntityLabel]) -> Self {
+        for label in labels {
+            match label {
+                EntityLabel::Person => return Self::PersonalIdentity,
+                EntityLabel::Organization => return Self::OrganizationIdentity,
+                _ => {}
+            }
+        }
+        Self::Clean
+    }
 }
 
 /// Entity labels for ontological classification of graph nodes.
@@ -234,6 +269,22 @@ pub enum EdgeTier {
     L2Episodic,
     /// Semantic memory tier: consolidated edges, near-permanent
     L3Semantic,
+}
+
+/// Check whether a relationship edge is safe for cross-user collective aggregation.
+///
+/// An edge is safe when it has reached semantic tier (L3) and neither endpoint
+/// carries personal or organizational identity.
+pub fn is_edge_safe_for_collective(
+    edge: &RelationshipEdge,
+    from_pii: &PiiClassification,
+    to_pii: &PiiClassification,
+) -> bool {
+    edge.tier == EdgeTier::L3Semantic
+        && *from_pii != PiiClassification::PersonalIdentity
+        && *to_pii != PiiClassification::PersonalIdentity
+        && *from_pii != PiiClassification::OrganizationIdentity
+        && *to_pii != PiiClassification::OrganizationIdentity
 }
 
 impl EdgeTier {
@@ -1123,6 +1174,14 @@ pub enum EdgeSource {
     Coactivation,
     /// Created from MIF import or explicit user input
     Explicit,
+    /// Edge seeded from population-level collective knowledge.
+    /// Imported from collective store during new-user initialization.
+    /// Starts at low strength, rapidly potentiated if confirmed by user behavior.
+    CollectivePrior,
+    /// Unknown edge source (forward compatibility for future variants).
+    /// Deserialized from a variant not recognized by this version.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Result of memory coactivation recording.
@@ -5006,6 +5065,52 @@ impl GraphMemory {
         Ok(relationships)
     }
 
+    /// Export edges safe for cross-user collective aggregation.
+    ///
+    /// Returns L3-tier edges where both endpoints are PII-clean.
+    /// Each tuple: (from_name, to_name, strength, relation_type).
+    pub fn export_collective_edges(
+        &self,
+    ) -> Result<Vec<(String, String, f32, String)>> {
+        let mut safe_edges = Vec::new();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = self.db.iterator_cf_opt(
+            self.relationships_cf(),
+            read_opts,
+            rocksdb::IteratorMode::Start,
+        );
+        for (_, value) in iter.flatten() {
+            let edge = match bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                Ok((e, _)) => e,
+                Err(_) => continue,
+            };
+            if edge.invalidated_at.is_some() || edge.tier != EdgeTier::L3Semantic {
+                continue;
+            }
+            let from_entity = match self.get_entity(&edge.from_entity)? {
+                Some(e) => e,
+                None => continue,
+            };
+            let to_entity = match self.get_entity(&edge.to_entity)? {
+                Some(e) => e,
+                None => continue,
+            };
+            if is_edge_safe_for_collective(&edge, &from_entity.pii_classification, &to_entity.pii_classification) {
+                safe_edges.push((
+                    from_entity.name,
+                    to_entity.name,
+                    edge.strength,
+                    format!("{:?}", edge.relation_type),
+                ));
+            }
+        }
+        Ok(safe_edges)
+    }
+
     /// Get the Memory Universe visualization data
     /// Returns entities as "stars" with positions based on their relationships,
     /// sized by salience, and colored by entity type.
@@ -6671,6 +6776,7 @@ mod tests {
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
             tier,
+            created_by: EdgeSource::CoOccurrence,
             entity_confidence: None,
             forward_strength: strength,
             backward_strength: strength,
@@ -7310,6 +7416,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+                pii_classification: PiiClassification::PersonalIdentity,
         };
         let entity2 = EntityNode {
             uuid: Uuid::new_v4(),
@@ -7323,6 +7430,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+                pii_classification: PiiClassification::OrganizationIdentity,
         };
 
         let entity1_uuid = graph.add_entity(entity1.clone()).unwrap();
@@ -7372,6 +7480,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+                pii_classification: PiiClassification::PersonalIdentity,
         };
         let entity2 = EntityNode {
             uuid: entity2_uuid,
@@ -7385,6 +7494,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+                pii_classification: PiiClassification::OrganizationIdentity,
         };
 
         graph.add_entity(entity1).unwrap();
@@ -7421,6 +7531,7 @@ mod tests {
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
             tier: EdgeTier::L2Episodic,
+            created_by: EdgeSource::CoOccurrence,
             entity_confidence: None,
             forward_strength: 0.8,
             backward_strength: 0.8,
@@ -7619,6 +7730,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+                pii_classification: PiiClassification::Clean,
         };
         let node_b = EntityNode {
             uuid: entity_b,
@@ -7632,6 +7744,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+                pii_classification: PiiClassification::Clean,
         };
         graph.add_entity(node_a).unwrap();
         graph.add_entity(node_b).unwrap();
@@ -7652,7 +7765,10 @@ mod tests {
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
             tier: EdgeTier::L2Episodic,
+                created_by: EdgeSource::CoOccurrence,
             entity_confidence: None,
+            forward_strength: 0.5,
+            backward_strength: 0.5,
         };
         let edge_uuid = graph.add_relationship(edge).unwrap();
 
