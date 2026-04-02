@@ -10,7 +10,7 @@
 use chrono::Utc;
 use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
 use shodh_memory::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
+    EdgeSource, EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
 };
 use shodh_memory::uuid::Uuid;
 use std::collections::HashMap;
@@ -51,6 +51,7 @@ fn create_entity_from_ner(
         name_embedding: None,
         salience,
         is_proper_noun: is_proper,
+        pii_classification: Default::default(),
     }
 }
 
@@ -80,6 +81,7 @@ fn create_entity(
         name_embedding: None,
         salience,
         is_proper_noun: is_proper,
+        pii_classification: Default::default(),
     }
 }
 
@@ -108,6 +110,9 @@ fn create_relationship(
         tier: EdgeTier::L1Working,
         activation_timestamps: None,
         entity_confidence: None,
+        created_by: EdgeSource::CoOccurrence,
+        forward_strength: strength,
+        backward_strength: strength,
     }
 }
 
