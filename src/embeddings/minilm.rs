@@ -268,7 +268,14 @@ impl MiniLMEmbedder {
             return Err("ONNX Runtime not found and SHODH_OFFLINE=true".to_string());
         }
 
-        tracing::info!("ONNX Runtime not found. Downloading...");
+        if !super::auto_download_models_enabled() {
+            return Err(
+                "ONNX Runtime not found locally and SHODH_AUTO_DOWNLOAD_MODELS is not enabled"
+                    .to_string(),
+            );
+        }
+
+        tracing::info!("ONNX Runtime not found locally. Downloading...");
         let onnx_path =
             super::downloader::download_onnx_runtime(None).map_err(|e| e.to_string())?;
         tracing::info!(
@@ -336,6 +343,7 @@ impl MiniLMEmbedder {
     /// Model is NOT loaded until first embed() call.
     /// Set SHODH_LAZY_LOAD=false to load immediately.
     /// Set SHODH_OFFLINE=true to disable auto-download.
+    /// Set SHODH_AUTO_DOWNLOAD_MODELS=true to explicitly allow downloads.
     ///
     /// Auto-download behavior:
     /// - If model files not found, downloads from HuggingFace (~22MB)
@@ -346,9 +354,7 @@ impl MiniLMEmbedder {
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
 
-        let offline_mode = std::env::var("SHODH_OFFLINE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+        let offline_mode = super::offline_mode_enabled();
 
         // CRITICAL: Ensure ORT_DYLIB_PATH is set BEFORE any ort code runs
         // This prevents ort from picking up system DLLs with wrong versions
@@ -371,9 +377,16 @@ impl MiniLMEmbedder {
                 return Self::new_simplified(config);
             }
 
+            if !super::auto_download_models_enabled() {
+                tracing::warn!(
+                    "Model files not found locally and SHODH_AUTO_DOWNLOAD_MODELS is not enabled. Using simplified embeddings.",
+                );
+                return Self::new_simplified(config);
+            }
+
             // Try to auto-download model files
             tracing::info!(
-                "Model files not found at {:?}. Downloading...",
+                "Model files not found locally at {:?}. Downloading...",
                 config.model_path.parent().unwrap_or(&config.model_path)
             );
 

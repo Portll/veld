@@ -1,0 +1,572 @@
+{
+  "$schema": "https://shodh-memory.dev/schemas/mif-v1.json",
+  "mif_version": "1.0",
+  "generator": {
+    "name": "overlook-evaluation",
+    "version": "27-dim-v1"
+  },
+  "export": {
+    "id": "exp_overlook_antidote_20260330",
+    "created_at": "2026-03-30T00:00:00.000Z",
+    "user_id": "claude-code",
+    "checksum": "sha256:pending"
+  },
+  "memories": [
+    {
+      "id": "mem_overlook-antidote-001-phi-encryption-disconnected",
+      "content": "CRITICAL: PHI encryption service (phiEncryptionService.js) exists with full AES-256-GCM implementation but has ZERO production callers. All PHI stored in plaintext. Planet X finding — the gravitational pull of the service's existence masks that it's disconnected. The service gives false assurance during audits because it exists, but no code path actually invokes it.",
+      "type": "Discovery",
+      "importance": 0.99,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.01,
+      "tags": ["overlook", "antidote", "phi", "encryption", "security", "critical", "planet-x", "hipaa", "aes-256-gcm", "dead-code"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "phiEncryptionService.js", "type": "FILE", "confidence": 0.99 },
+        { "text": "AES-256-GCM", "type": "TECHNOLOGY", "confidence": 0.98 },
+        { "text": "PHI", "type": "CONCEPT", "confidence": 0.99 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-004-phi-audit-gaps",
+          "mem_overlook-antidote-005-fractal-pattern"
+        ],
+        "related_todos": []
+      }
+    },
+    {
+      "id": "mem_overlook-antidote-002-mfa-bypass",
+      "content": "CRITICAL: MFA check in adminAuthService.js:156-165 has empty catch{} block — MFA failure is non-fatal, login proceeds without second factor. Also: MFA bypassed entirely when import.meta.env.DEV is true (line 167). This means in development builds, MFA is completely skipped, and in production, MFA exceptions are silently swallowed. An attacker who triggers an exception in the MFA flow gets in without a second factor.",
+      "type": "Discovery",
+      "importance": 0.98,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.01,
+      "tags": ["overlook", "antidote", "mfa", "auth", "security", "critical", "bypass", "empty-catch"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "adminAuthService.js", "type": "FILE", "confidence": 0.99 },
+        { "text": "MFA", "type": "CONCEPT", "confidence": 0.99 },
+        { "text": "import.meta.env.DEV", "type": "CODE", "confidence": 0.95 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-003-edge-function-jwt",
+          "mem_overlook-antidote-006-bridge-token-positive"
+        ],
+        "related_todos": []
+      }
+    },
+    {
+      "id": "mem_overlook-antidote-003-edge-function-jwt",
+      "content": "HIGH: 12 edge functions have verify_jwt=false in supabase/config.toml:371-423. Each has internal auth mechanisms (bridge tokens, HMAC) but the attack surface is large. JWT verification disabled at the gateway means every one of these functions must independently validate every request — a single missed check in any of 12 functions creates an unauthenticated endpoint.",
+      "type": "Discovery",
+      "importance": 0.92,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.02,
+      "tags": ["overlook", "antidote", "jwt", "edge-functions", "supabase", "security", "high", "attack-surface"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "supabase/config.toml", "type": "FILE", "confidence": 0.98 },
+        { "text": "JWT", "type": "TECHNOLOGY", "confidence": 0.99 },
+        { "text": "HMAC", "type": "TECHNOLOGY", "confidence": 0.95 },
+        { "text": "bridge tokens", "type": "CONCEPT", "confidence": 0.93 },
+        { "text": "Supabase Edge Functions", "type": "TECHNOLOGY", "confidence": 0.97 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-002-mfa-bypass",
+          "mem_overlook-antidote-006-bridge-token-positive"
+        ],
+        "related_todos": []
+      }
+    },
+    {
+      "id": "mem_overlook-antidote-004-phi-audit-gaps",
+      "content": "HIGH: PHI audit logging exists in only 18 files. 10 admin pages access patient data without any audit trail: Appointments, Calendar, MrDiagnosis, QuestionnaireResponses, GenerateLetter, and others. HIPAA requires audit logging for all PHI access. Over a third of PHI-accessing pages have no audit trail — this is a compliance gap, not just a best-practice miss.",
+      "type": "Discovery",
+      "importance": 0.91,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.02,
+      "tags": ["overlook", "antidote", "phi", "audit-logging", "hipaa", "compliance", "high", "patient-data"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "PHI audit logging", "type": "CONCEPT", "confidence": 0.98 },
+        { "text": "Appointments", "type": "COMPONENT", "confidence": 0.90 },
+        { "text": "Calendar", "type": "COMPONENT", "confidence": 0.90 },
+        { "text": "MrDiagnosis", "type": "COMPONENT", "confidence": 0.90 },
+        { "text": "QuestionnaireResponses", "type": "COMPONENT", "confidence": 0.90 },
+        { "text": "GenerateLetter", "type": "COMPONENT", "confidence": 0.90 },
+        { "text": "HIPAA", "type": "STANDARD", "confidence": 0.99 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-001-phi-encryption-disconnected"
+        ],
+        "related_todos": []
+      }
+    },
+    {
+      "id": "mem_overlook-antidote-005-fractal-pattern",
+      "content": "STRUCTURAL: Core fractal pattern confirmed for Antidote: Auth>State>Fetch>Filter>Render. Holds at macro level (100% admin-page wrapper compliance). Breaks at meso level (no shared DataTable component, 76 inline table implementations). Breaks at micro level (20 services return {error}, 26 throw exceptions, mixed error handling within single files). The fractal breaks at meso and micro indicate the codebase grew through copy-paste rather than abstraction — common in rapid medical software development.",
+      "type": "Pattern",
+      "importance": 0.88,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.03,
+      "tags": ["overlook", "antidote", "fractal", "architecture", "structural", "error-handling", "code-quality", "meso-break", "micro-break"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "Auth>State>Fetch>Filter>Render", "type": "PATTERN", "confidence": 0.97 },
+        { "text": "DataTable", "type": "COMPONENT", "confidence": 0.85 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-001-phi-encryption-disconnected",
+          "mem_overlook-antidote-006-bridge-token-positive"
+        ],
+        "related_todos": []
+      }
+    },
+    {
+      "id": "mem_overlook-antidote-006-bridge-token-positive",
+      "content": "POSITIVE: Bridge token auth system in Antidote is well-designed — SHA-256 hashed, server-validated, session-limited (6 concurrent max), auto-refresh, clean logout with token revocation. This is a counter-example to the other auth findings: when Antidote builds auth intentionally (bridge tokens), it's done right. The problem is inconsistency, not incompetence.",
+      "type": "Learning",
+      "importance": 0.82,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.04,
+      "tags": ["overlook", "antidote", "bridge-token", "auth", "positive", "sha-256", "session-management", "well-designed"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "bridge token auth", "type": "CONCEPT", "confidence": 0.96 },
+        { "text": "SHA-256", "type": "TECHNOLOGY", "confidence": 0.98 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-002-mfa-bypass",
+          "mem_overlook-antidote-003-edge-function-jwt",
+          "mem_overlook-antidote-005-fractal-pattern"
+        ],
+        "related_todos": []
+      }
+    },
+    {
+      "id": "mem_overlook-antidote-007-bifocal-composite",
+      "content": "Bifocal composite score for Antidote: 64.2/120. Overlook 27-dimension awareness vector stored at antidote-dev/evaluations/overlook-full-20260330.json. This is a baseline measurement. The score reflects strong macro-level architecture (auth wrapper pattern holds everywhere) dragged down by meso/micro fractal breaks and critical security gaps (PHI encryption disconnected, MFA bypass, JWT verification gaps, audit logging holes).",
+      "type": "Decision",
+      "importance": 0.90,
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "accessed_at": "2026-03-30T00:00:00.000Z",
+      "access_count": 1,
+      "decay_rate": 0.02,
+      "tags": ["overlook", "antidote", "bifocal", "composite-score", "baseline", "27-dim", "evaluation-result"],
+      "source": {
+        "type": "evaluation",
+        "session_id": "overlook-antidote-20260330",
+        "agent": "claude-code"
+      },
+      "entities": [
+        { "text": "Bifocal composite", "type": "METRIC", "confidence": 0.97 },
+        { "text": "64.2/120", "type": "SCORE", "confidence": 0.99 },
+        { "text": "Overlook 27-dim", "type": "FRAMEWORK", "confidence": 0.96 },
+        { "text": "antidote-dev/evaluations/overlook-full-20260330.json", "type": "FILE", "confidence": 0.99 },
+        { "text": "Antidote", "type": "PROJECT", "confidence": 0.99 }
+      ],
+      "relations": {
+        "related_memories": [
+          "mem_overlook-antidote-001-phi-encryption-disconnected",
+          "mem_overlook-antidote-002-mfa-bypass",
+          "mem_overlook-antidote-003-edge-function-jwt",
+          "mem_overlook-antidote-004-phi-audit-gaps",
+          "mem_overlook-antidote-005-fractal-pattern",
+          "mem_overlook-antidote-006-bridge-token-positive"
+        ],
+        "related_todos": []
+      }
+    }
+  ],
+  "todos": [
+    {
+      "id": "todo_antidote-overlook-001-connect-phi-encryption",
+      "short_id": "ANT-OL-1",
+      "content": "Connect phiEncryptionService.js to all PHI storage paths — currently zero callers, all PHI in plaintext",
+      "status": "todo",
+      "priority": "critical",
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "due_date": null,
+      "completed_at": null,
+      "project": { "id": "proj_antidote_security", "name": "Antidote Security", "prefix": "ANT-OL" },
+      "contexts": ["@security", "@hipaa"],
+      "tags": ["phi", "encryption", "critical", "overlook"],
+      "notes": "Service already has full AES-256-GCM implementation. Need to wire it into data access layer, not rewrite it.",
+      "parent_id": null,
+      "subtask_ids": [],
+      "blocked_on": null,
+      "recurrence": null,
+      "related_memory_ids": ["mem_overlook-antidote-001-phi-encryption-disconnected"],
+      "comments": []
+    },
+    {
+      "id": "todo_antidote-overlook-002-fix-mfa-catch",
+      "short_id": "ANT-OL-2",
+      "content": "Fix empty catch{} in MFA check (adminAuthService.js:156-165) and remove DEV-mode MFA bypass (line 167)",
+      "status": "todo",
+      "priority": "critical",
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "due_date": null,
+      "completed_at": null,
+      "project": { "id": "proj_antidote_security", "name": "Antidote Security", "prefix": "ANT-OL" },
+      "contexts": ["@security", "@auth"],
+      "tags": ["mfa", "auth", "critical", "overlook"],
+      "notes": "MFA failure must be fatal. DEV bypass should use test MFA codes, not skip MFA entirely.",
+      "parent_id": null,
+      "subtask_ids": [],
+      "blocked_on": null,
+      "recurrence": null,
+      "related_memory_ids": ["mem_overlook-antidote-002-mfa-bypass"],
+      "comments": []
+    },
+    {
+      "id": "todo_antidote-overlook-003-audit-jwt-functions",
+      "short_id": "ANT-OL-3",
+      "content": "Audit 12 edge functions with verify_jwt=false — validate each has correct internal auth, add gateway-level JWT where possible",
+      "status": "todo",
+      "priority": "high",
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "due_date": null,
+      "completed_at": null,
+      "project": { "id": "proj_antidote_security", "name": "Antidote Security", "prefix": "ANT-OL" },
+      "contexts": ["@security", "@supabase"],
+      "tags": ["jwt", "edge-functions", "high", "overlook"],
+      "notes": "supabase/config.toml:371-423. Each function needs individual assessment — some legitimately need custom auth (webhooks, HMAC), others should use JWT.",
+      "parent_id": null,
+      "subtask_ids": [],
+      "blocked_on": null,
+      "recurrence": null,
+      "related_memory_ids": ["mem_overlook-antidote-003-edge-function-jwt"],
+      "comments": []
+    },
+    {
+      "id": "todo_antidote-overlook-004-phi-audit-coverage",
+      "short_id": "ANT-OL-4",
+      "content": "Add PHI audit logging to 10 admin pages that access patient data without audit trail",
+      "status": "todo",
+      "priority": "high",
+      "created_at": "2026-03-30T00:00:00.000Z",
+      "updated_at": "2026-03-30T00:00:00.000Z",
+      "due_date": null,
+      "completed_at": null,
+      "project": { "id": "proj_antidote_security", "name": "Antidote Security", "prefix": "ANT-OL" },
+      "contexts": ["@security", "@hipaa", "@compliance"],
+      "tags": ["phi", "audit", "hipaa", "high", "overlook"],
+      "notes": "Pages missing audit: Appointments, Calendar, MrDiagnosis, QuestionnaireResponses, GenerateLetter, plus 5 others. Pattern from existing 18 files should be extractable into shared middleware.",
+      "parent_id": null,
+      "subtask_ids": [],
+      "blocked_on": null,
+      "recurrence": null,
+      "related_memory_ids": ["mem_overlook-antidote-004-phi-audit-gaps"],
+      "comments": []
+    }
+  ],
+  "graph": {
+    "format": "adjacency_list",
+    "node_count": 18,
+    "edge_count": 22,
+    "nodes": [
+      { "id": "mem_overlook-antidote-001-phi-encryption-disconnected", "type": "memory" },
+      { "id": "mem_overlook-antidote-002-mfa-bypass", "type": "memory" },
+      { "id": "mem_overlook-antidote-003-edge-function-jwt", "type": "memory" },
+      { "id": "mem_overlook-antidote-004-phi-audit-gaps", "type": "memory" },
+      { "id": "mem_overlook-antidote-005-fractal-pattern", "type": "memory" },
+      { "id": "mem_overlook-antidote-006-bridge-token-positive", "type": "memory" },
+      { "id": "mem_overlook-antidote-007-bifocal-composite", "type": "memory" },
+      { "id": "entity:Antidote", "type": "entity", "entity_type": "PROJECT" },
+      { "id": "entity:PHI", "type": "entity", "entity_type": "CONCEPT" },
+      { "id": "entity:MFA", "type": "entity", "entity_type": "CONCEPT" },
+      { "id": "entity:JWT", "type": "entity", "entity_type": "TECHNOLOGY" },
+      { "id": "entity:HIPAA", "type": "entity", "entity_type": "STANDARD" },
+      { "id": "entity:AES-256-GCM", "type": "entity", "entity_type": "TECHNOLOGY" },
+      { "id": "entity:SHA-256", "type": "entity", "entity_type": "TECHNOLOGY" },
+      { "id": "entity:Supabase Edge Functions", "type": "entity", "entity_type": "TECHNOLOGY" },
+      { "id": "entity:Bifocal composite", "type": "entity", "entity_type": "METRIC" },
+      { "id": "entity:Auth>State>Fetch>Filter>Render", "type": "entity", "entity_type": "PATTERN" },
+      { "id": "entity:bridge token auth", "type": "entity", "entity_type": "CONCEPT" }
+    ],
+    "edges": [
+      {
+        "source": "mem_overlook-antidote-001-phi-encryption-disconnected",
+        "target": "entity:PHI",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-001-phi-encryption-disconnected",
+        "target": "entity:AES-256-GCM",
+        "weight": 0.95,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-001-phi-encryption-disconnected",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-001-phi-encryption-disconnected",
+        "target": "mem_overlook-antidote-004-phi-audit-gaps",
+        "weight": 0.90,
+        "type": "semantic_association",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-002-mfa-bypass",
+        "target": "entity:MFA",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-002-mfa-bypass",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-002-mfa-bypass",
+        "target": "mem_overlook-antidote-003-edge-function-jwt",
+        "weight": 0.85,
+        "type": "semantic_association",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-002-mfa-bypass",
+        "target": "mem_overlook-antidote-006-bridge-token-positive",
+        "weight": 0.78,
+        "type": "semantic_association",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-003-edge-function-jwt",
+        "target": "entity:JWT",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-003-edge-function-jwt",
+        "target": "entity:Supabase Edge Functions",
+        "weight": 0.97,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-003-edge-function-jwt",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-003-edge-function-jwt",
+        "target": "mem_overlook-antidote-006-bridge-token-positive",
+        "weight": 0.80,
+        "type": "semantic_association",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-004-phi-audit-gaps",
+        "target": "entity:PHI",
+        "weight": 0.98,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-004-phi-audit-gaps",
+        "target": "entity:HIPAA",
+        "weight": 0.95,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-004-phi-audit-gaps",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-005-fractal-pattern",
+        "target": "entity:Auth>State>Fetch>Filter>Render",
+        "weight": 0.97,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-005-fractal-pattern",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-006-bridge-token-positive",
+        "target": "entity:bridge token auth",
+        "weight": 0.96,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-006-bridge-token-positive",
+        "target": "entity:SHA-256",
+        "weight": 0.95,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-006-bridge-token-positive",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-007-bifocal-composite",
+        "target": "entity:Bifocal composite",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      },
+      {
+        "source": "mem_overlook-antidote-007-bifocal-composite",
+        "target": "entity:Antidote",
+        "weight": 0.99,
+        "type": "entity_mention",
+        "created_at": "2026-03-30T00:00:00.000Z",
+        "strengthened_count": 1
+      }
+    ],
+    "hebbian_config": {
+      "learning_rate": 0.1,
+      "decay_rate": 0.02,
+      "ltp_threshold": 0.8,
+      "max_weight": 1.0
+    }
+  },
+  "metadata": {
+    "total_memories": 7,
+    "total_todos": 4,
+    "date_range": {
+      "earliest": "2026-03-30T00:00:00.000Z",
+      "latest": "2026-03-30T00:00:00.000Z"
+    },
+    "memory_types": {
+      "Discovery": 4,
+      "Pattern": 1,
+      "Learning": 1,
+      "Decision": 1
+    },
+    "top_entities": [
+      { "text": "Antidote", "count": 7 },
+      { "text": "PHI", "count": 2 },
+      { "text": "MFA", "count": 1 },
+      { "text": "JWT", "count": 1 },
+      { "text": "HIPAA", "count": 1 }
+    ],
+    "projects": [
+      { "id": "proj_antidote_security", "name": "Antidote Security", "todo_count": 4 }
+    ],
+    "privacy": {
+      "pii_detected": false,
+      "secrets_detected": false,
+      "redacted_fields": []
+    },
+    "evaluation_context": {
+      "framework": "Overlook 27-dim awareness vector",
+      "bifocal_composite": 64.2,
+      "bifocal_max": 120,
+      "full_vector_path": "antidote-dev/evaluations/overlook-full-20260330.json",
+      "severity_breakdown": {
+        "critical": 2,
+        "high": 2,
+        "structural": 1,
+        "positive": 1,
+        "baseline": 1
+      }
+    }
+  }
+}

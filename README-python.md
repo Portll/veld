@@ -1,6 +1,10 @@
-# Shodh-Memory
+# Veld - Agentic Memory Python SDK
 
 **Persistent memory for AI agents. Single package. Local-first. Runs offline.**
+
+> Status: `v0.7.6-unstable` on this branch. The repository is being cleaned for
+> a `v0.8` cut, so the checked-out code may be ahead of the last published PyPI
+> package.
 
 [![PyPI](https://img.shields.io/pypi/v/shodh-memory.svg)](https://pypi.org/project/shodh-memory/)
 [![Downloads](https://static.pepy.tech/badge/shodh-memory)](https://pepy.tech/project/shodh-memory)
@@ -10,13 +14,23 @@
 
 Give your AI agents memory that persists across sessions, learns from experience, and runs entirely on your hardware.
 
+Product name: `Veld - Agentic Memory`. Published package name: `shodh-memory`.
+
 ## Installation
 
 ```bash
 pip install shodh-memory
 ```
 
-That's it. No additional setup required. Models and runtime are bundled.
+That installs the last published package, not the checked-out `v0.7.6-unstable`
+branch tip. Models and runtime are bundled in the published package.
+
+### Build From Source (Branch Tip)
+
+If you need the current checkout instead of the last published wheel, follow the
+repo-local source-build flow in `python/README.md` rather than installing from
+PyPI. That keeps the Python bindings aligned with the unstable branch state and
+the current native build requirements.
 
 ## Quick Start
 

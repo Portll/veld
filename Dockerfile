@@ -74,7 +74,7 @@ RUN useradd -m -u 1000 shodh && \
     chown -R shodh:shodh /data
 
 # Copy binary and ONNX Runtime from builder
-COPY --from=builder /app/target/release/shodh-memory-server /usr/local/bin/shodh-memory
+COPY --from=builder /app/target/release/veld /usr/local/bin/shodh-memory
 COPY --from=builder /usr/local/lib/libonnxruntime.so /usr/local/lib/libonnxruntime.so
 RUN ldconfig
 

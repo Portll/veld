@@ -97,12 +97,16 @@ impl super::MemorySystem {
             score_b.total_cmp(&score_a)
         });
 
-        // Filter temporally invalidated memories
+        // Filter temporally invalidated memories before competition logic.
         memories.retain(|m| !m.is_expired());
+
+        let competition_mode = query.effective_competition_mode();
+        let _ = Self::compete_memories(&mut memories, competition_mode);
 
         memories.truncate(query.max_results);
 
-        // Log retrieval
+        // Log retrieval after competition/truncation so observability reflects
+        // the actual live result set.
         self.logger
             .read()
             .log_retrieved("", memories.len(), &sources);
@@ -117,7 +121,7 @@ impl super::MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().record_memory_coactivation(&memory_uuids) {
+                match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
                     Ok(result) => {
                         // BRIDGE-4: Consume edge tier promotions — boost memory importance
                         for promo in &result.promotions {
@@ -1005,6 +1009,7 @@ impl super::MemorySystem {
             episode_id: query.episode_id.clone(),
             prospective_signals: query.prospective_signals.clone(),
             recency_weight: query.recency_weight,
+            competition_mode: query.competition_mode,
             rrf_k: query.rrf_k,
             rerank_count: query.rerank_count,
         };
@@ -1096,6 +1101,7 @@ impl super::MemorySystem {
                     episode_id: query.episode_id.clone(),
                     prospective_signals: query.prospective_signals.clone(),
                     recency_weight: query.recency_weight,
+                    competition_mode: query.competition_mode,
                     rrf_k: query.rrf_k,
                     rerank_count: query.rerank_count,
                 };
@@ -1315,11 +1321,13 @@ impl super::MemorySystem {
         // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
         // ===========================================================================
-        let (memory_ids, hebbian_scores, mut signal_attributions): (
+        type FusionLayerOutput = (
             Vec<(MemoryId, f32)>,
             std::collections::HashMap<MemoryId, f32>,
             std::collections::HashMap<MemoryId, SignalAttribution>,
-        ) = {
+        );
+
+        let (memory_ids, hebbian_scores, mut signal_attributions): FusionLayerOutput = {
             let get_content = |id: &MemoryId| -> Option<String> {
                 self.working_memory
                     .read()
@@ -2277,10 +2285,10 @@ impl super::MemorySystem {
         // Acquire once outside the loop to avoid repeated locking
         let feedback_guard = self.feedback_store.as_ref().map(|fs| fs.read());
 
-        // Signal 20: Pinky dimension aggregate (graph topological health)
+        // Signal 20: External dimension aggregate (Sleight) (graph topological health)
         // Computed once per query — same value for all memories.
         // Acts as a global quality multiplier: high-quality graphs boost all scores.
-        let pinky_multiplier = self.pinky_aggregate_score().unwrap_or(1.0);
+        let external_dim_multiplier = self.external_aggregate_score().unwrap_or(1.0);
 
         for (memory_id, score) in memory_ids {
             // Hebbian boost from learned graph weights (10% contribution)
@@ -2533,7 +2541,7 @@ impl super::MemorySystem {
                     + burstiness_boost)
                     * feedback_multiplier
                     * confidence_gate
-                    * pinky_multiplier;
+                    * external_dim_multiplier;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);
@@ -3239,9 +3247,18 @@ impl super::MemorySystem {
 
         // (Linguistic boost moved to Layer 5.85, before ordinal resolution)
 
-        self.logger
-            .read()
-            .log_retrieved(query_text, memories.len(), &sources);
+        let competition_mode = query.effective_competition_mode();
+        let (competitions_detected, memories_eliminated) =
+            Self::compete_memories(&mut memories, competition_mode);
+        if competitions_detected > 0 {
+            tracing::info!(
+                mode = ?competition_mode,
+                competitions_detected,
+                memories_eliminated,
+                post_count = memories.len(),
+                "Live retrieval: entity-aware memory competition"
+            );
+        }
 
         // SHO-106: Apply retrieval competition between similar memories FIRST
         // When highly similar memories are retrieved, they compete for activation
@@ -3272,19 +3289,30 @@ impl super::MemorySystem {
 
             // Re-order memories based on competition results (winners first)
             if !competition_result.suppressed.is_empty() {
-                let winner_set: std::collections::HashSet<_> = competition_result
-                    .winners
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .collect();
+                match competition_mode {
+                    CompetitionMode::ResolveNewest | CompetitionMode::ResolveStrongest => {
+                        let winner_set: std::collections::HashSet<_> = competition_result
+                            .winners
+                            .iter()
+                            .map(|(id, _)| id.clone())
+                            .collect();
 
-                // Keep only winners, maintain their relative order
-                memories.retain(|m| winner_set.contains(&m.id.0.to_string()));
+                        memories.retain(|m| winner_set.contains(&m.id.0.to_string()));
 
-                tracing::debug!(
-                    "Retrieval competition: {} memories suppressed",
-                    competition_result.suppressed.len()
-                );
+                        tracing::debug!(
+                            mode = ?competition_mode,
+                            suppressed = competition_result.suppressed.len(),
+                            "Retrieval competition suppressed lower-ranked memories"
+                        );
+                    }
+                    CompetitionMode::SurfaceBoth | CompetitionMode::Coexist => {
+                        tracing::debug!(
+                            mode = ?competition_mode,
+                            suppressed = competition_result.suppressed.len(),
+                            "Retrieval competition observed without suppressing candidates"
+                        );
+                    }
+                }
             }
 
             // Persist interference records from retrieval competition
@@ -3306,6 +3334,11 @@ impl super::MemorySystem {
                         tracing::debug!("Failed to persist interference event count: {e}");
                     }
                 }
+            }
+
+            if !competition_result.suppressed.is_empty() {
+                crate::metrics::SUPPRESSOR_DETECTIONS_TOTAL
+                    .inc_by(competition_result.suppressed.len() as u64);
             }
         }
 
@@ -3566,7 +3599,7 @@ impl super::MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().record_memory_coactivation(&memory_uuids) {
+                match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
                     Ok(ref result) if result.edges_updated > 0 => {
                         // Record consolidation events for coactivation visibility
                         for i in 0..memories.len().min(5) {
@@ -3596,6 +3629,10 @@ impl super::MemorySystem {
         if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
             self.stats.write().total_retrievals = count;
         }
+
+        self.logger
+            .read()
+            .log_retrieved(query_text, memories.len(), &sources);
 
         // Expand with hierarchy context (parent chain + children)
         // This ensures semantic search also surfaces contextually related memories
@@ -3779,6 +3816,173 @@ impl super::MemorySystem {
         Ok(map)
     }
 
+    /// Entity-aware retrieval-time competition for the live recall path.
+    fn compete_memories(
+        memories: &mut Vec<SharedMemory>,
+        mode: CompetitionMode,
+    ) -> (usize, usize) {
+        use crate::constants::{COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_MAX_PAIRS};
+
+        if mode == CompetitionMode::Coexist || memories.len() < 2 {
+            return (0, 0);
+        }
+
+        let entity_sets: Vec<HashSet<String>> = memories
+            .iter()
+            .map(|memory| {
+                memory
+                    .experience
+                    .entities
+                    .iter()
+                    .map(|entity| entity.to_lowercase())
+                    .collect()
+            })
+            .collect();
+
+        let mut eliminated: HashSet<usize> = HashSet::new();
+        let mut competitions_detected = 0;
+        let mut pair_count = 0;
+        let check_limit = memories.len().min(20);
+
+        for left_idx in 0..check_limit {
+            if eliminated.contains(&left_idx) {
+                continue;
+            }
+
+            for right_idx in (left_idx + 1)..check_limit {
+                if eliminated.contains(&right_idx) {
+                    continue;
+                }
+                if pair_count >= COMPETITION_MAX_PAIRS {
+                    break;
+                }
+                pair_count += 1;
+
+                if entity_sets[left_idx].is_empty() || entity_sets[right_idx].is_empty() {
+                    continue;
+                }
+
+                let overlap_count = entity_sets[left_idx]
+                    .intersection(&entity_sets[right_idx])
+                    .count();
+                if overlap_count < COMPETITION_ENTITY_OVERLAP_MIN {
+                    continue;
+                }
+
+                let similarity = match (
+                    memories[left_idx].experience.embeddings.as_ref(),
+                    memories[right_idx].experience.embeddings.as_ref(),
+                ) {
+                    (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => {
+                        crate::similarity::cosine_similarity(left, right)
+                    }
+                    _ => {
+                        let union_count =
+                            entity_sets[left_idx].union(&entity_sets[right_idx]).count();
+                        if union_count == 0 {
+                            0.0
+                        } else {
+                            overlap_count as f32 / union_count as f32
+                        }
+                    }
+                };
+
+                if similarity < crate::constants::INTERFERENCE_SIMILARITY_THRESHOLD {
+                    continue;
+                }
+
+                competitions_detected += 1;
+
+                let loser_idx = match mode {
+                    CompetitionMode::ResolveNewest => {
+                        if memories[left_idx].created_at >= memories[right_idx].created_at {
+                            right_idx
+                        } else {
+                            left_idx
+                        }
+                    }
+                    CompetitionMode::ResolveStrongest => {
+                        if memories[left_idx].importance() >= memories[right_idx].importance() {
+                            right_idx
+                        } else {
+                            left_idx
+                        }
+                    }
+                    CompetitionMode::SurfaceBoth => {
+                        let penalty = 0.01;
+                        let (stronger_idx, weaker_idx) = if memories[left_idx].score.unwrap_or(0.0)
+                            >= memories[right_idx].score.unwrap_or(0.0)
+                        {
+                            (left_idx, right_idx)
+                        } else {
+                            (right_idx, left_idx)
+                        };
+
+                        let weaker_score = memories[weaker_idx].score.unwrap_or(0.0);
+                        let mut weaker_clone: Memory = memories[weaker_idx].as_ref().clone();
+                        weaker_clone.set_score(weaker_score - penalty);
+                        weaker_clone.experience.metadata.insert(
+                            "competition_conflict".to_string(),
+                            "true".to_string(),
+                        );
+                        weaker_clone.experience.metadata.insert(
+                            "competition_opponent".to_string(),
+                            memories[stronger_idx].id.0.to_string(),
+                        );
+                        memories[weaker_idx] = Arc::new(weaker_clone);
+
+                        let mut stronger_clone: Memory = memories[stronger_idx].as_ref().clone();
+                        stronger_clone.experience.metadata.insert(
+                            "competition_conflict".to_string(),
+                            "true".to_string(),
+                        );
+                        stronger_clone.experience.metadata.insert(
+                            "competition_opponent".to_string(),
+                            memories[weaker_idx].id.0.to_string(),
+                        );
+                        memories[stronger_idx] = Arc::new(stronger_clone);
+                        continue;
+                    }
+                    CompetitionMode::Coexist => continue,
+                };
+
+                let winner_idx = if loser_idx == left_idx {
+                    right_idx
+                } else {
+                    left_idx
+                };
+                eliminated.insert(loser_idx);
+
+                let shared_entities: Vec<&String> = entity_sets[left_idx]
+                    .intersection(&entity_sets[right_idx])
+                    .collect();
+                tracing::debug!(
+                    winner_id = %memories[winner_idx].id.0,
+                    loser_id = %memories[loser_idx].id.0,
+                    shared_entities = ?shared_entities,
+                    similarity = format!("{similarity:.3}"),
+                    mode = ?mode,
+                    "Memory competition resolved"
+                );
+            }
+
+            if pair_count >= COMPETITION_MAX_PAIRS {
+                break;
+            }
+        }
+
+        let memories_eliminated = eliminated.len();
+        if memories_eliminated > 0 {
+            let mut indices: Vec<usize> = eliminated.into_iter().collect();
+            indices.sort_unstable_by(|left, right| right.cmp(left));
+            for idx in indices {
+                memories.remove(idx);
+            }
+        }
+
+        (competitions_detected, memories_eliminated)
+    }
+
 
     /// Calculate temporal relevance based on memory age (ENTERPRISE FEATURE)
     ///
@@ -3914,7 +4118,7 @@ impl super::MemorySystem {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memory_ids.iter().map(|id| id.0).collect();
                 if memory_uuids.len() >= 2 {
-                    match graph.read().record_memory_coactivation(&memory_uuids) {
+                    match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
                         Ok(result) => {
                             stats.associations_strengthened = result.edges_updated;
                             // BRIDGE-4: Boost importance for memories linked by promoted edges

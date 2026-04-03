@@ -53,16 +53,16 @@ pub struct ScoringSignals {
     pub tag_match: f32,
 }
 
-/// Pinky dimension scores pushed from the Pinky evaluation engine.
+/// External dimension scores pushed from the Sleight evaluation engine.
 ///
 /// These scores describe the topological health of the knowledge graph
-/// region relevant to the current query context. Pinky computes them
+/// region relevant to the current query context. Sleight computes them
 /// via gap analysis + Voronoi decomposition on shodh's graph API.
 ///
 /// When available, they modulate retrieval: memories from high-confidence
 /// graph regions rank higher than memories from sparse/incoherent regions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PinkyDimensionScores {
+pub struct ExternalDimensionScores {
     /// Entity density in the relevant region (0.0 = sparse, 1.0 = saturated)
     pub density: f32,
     /// Semantic coherence of neighbors (0.0 = unrelated, 1.0 = tight cluster)
@@ -77,14 +77,14 @@ pub struct PinkyDimensionScores {
     pub computed_at: Option<DateTime<Utc>>,
 }
 
-impl PinkyDimensionScores {
+impl ExternalDimensionScores {
     /// Aggregate score: geometric mean of available dimensions.
     /// Returns 1.0 (neutral) if no scores are set.
     pub fn aggregate(&self) -> f32 {
         let vals = [self.density, self.coherence, self.closure, self.confidence, self.isotropy];
         let nonzero: Vec<f32> = vals.iter().copied().filter(|&v| v > 0.0).collect();
         if nonzero.is_empty() {
-            return 1.0; // neutral — no Pinky data available
+            return 1.0; // neutral — no external evaluator data available
         }
         let product: f32 = nonzero.iter().product();
         product.powf(1.0 / nonzero.len() as f32) // geometric mean
@@ -2464,6 +2464,10 @@ pub struct Query {
     /// When None, uses hardcoded default (0.1 = 10% contribution)
     pub recency_weight: Option<f32>,
 
+    /// Optional retrieval-time competition policy for entity-overlapping
+    /// candidates. When unset, the current strongest-wins behavior is preserved.
+    pub competition_mode: Option<CompetitionMode>,
+
     /// RRF k parameter for reciprocal rank fusion (default: 20.0)
     /// Higher k = more equal weighting across ranks
     /// Lower k = sharper discrimination favoring top-ranked results
@@ -2558,6 +2562,7 @@ impl Default for Query {
             prospective_signals: None,
             episode_id: None,
             recency_weight: None,
+            competition_mode: None,
             rrf_k: None,
             rerank_count: None,
             max_results: DEFAULT_MAX_RESULTS,
@@ -2568,6 +2573,15 @@ impl Default for Query {
 }
 
 impl Query {
+    /// Resolve the effective competition policy for this retrieval.
+    ///
+    /// Defaulting to strongest-wins preserves current live behavior while still
+    /// allowing explicit per-query overrides during 0.8 cleanup.
+    pub fn effective_competition_mode(&self) -> CompetitionMode {
+        self.competition_mode
+            .unwrap_or(CompetitionMode::ResolveStrongest)
+    }
+
     /// Check if a memory matches all query filters
     ///
     /// This is the SINGLE source of truth for filtering.
@@ -2782,6 +2796,11 @@ impl QueryBuilder {
         self
     }
 
+    pub fn competition_mode(mut self, mode: CompetitionMode) -> Self {
+        self.query.competition_mode = Some(mode);
+        self
+    }
+
     pub fn max_results(mut self, max: usize) -> Self {
         self.query.max_results = max;
         self
@@ -2839,6 +2858,20 @@ impl QueryBuilder {
     pub fn build(self) -> Query {
         self.query
     }
+}
+
+/// Retrieval-time resolution policy for entity-overlapping candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompetitionMode {
+    /// Keep all candidates and only annotate conflicts where needed.
+    Coexist,
+    /// Keep the most recent competing memory.
+    ResolveNewest,
+    /// Keep the strongest competing memory.
+    ResolveStrongest,
+    /// Keep both competitors but mark them for downstream inspection.
+    SurfaceBoth,
 }
 
 /// Retrieval modes
@@ -3346,6 +3379,26 @@ pub struct RetrievalStats {
     /// Time spent on graph traversal (microseconds)
     pub graph_time_us: u64,
 
+    /// Weight profile that was used: density, query_type:*, or default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub weight_profile: String,
+
+    /// Average percentage of final score contributed by semantic signal (0.0-1.0).
+    #[serde(default)]
+    pub semantic_variance_pct: f32,
+
+    /// Average percentage of final score contributed by graph signal (0.0-1.0).
+    #[serde(default)]
+    pub graph_variance_pct: f32,
+
+    /// Average percentage of final score contributed by linguistic signal (0.0-1.0).
+    #[serde(default)]
+    pub linguistic_variance_pct: f32,
+
+    /// Number of suppressor events detected during reranking/competition.
+    #[serde(default)]
+    pub suppressor_count: usize,
+
     /// Edge UUIDs traversed during spreading activation (for Hebbian strengthening)
     /// Not serialized - internal use only for wiring strengthening calls
     #[serde(skip)]
@@ -3617,7 +3670,7 @@ impl ProspectiveTask {
 // =============================================================================
 
 /// Unique identifier for todos
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TodoId(pub Uuid);
 
@@ -3992,6 +4045,11 @@ pub struct Todo {
     /// Memories that are semantically or explicitly linked to this todo
     #[serde(default)]
     pub related_memory_ids: Vec<MemoryId>,
+
+    /// Structured dependencies: this todo cannot start until all listed todos are Done.
+    /// Replaces freeform `blocked_on` for machine-readable dependency tracking.
+    #[serde(default)]
+    pub depends_on: Vec<TodoId>,
 }
 
 impl Todo {
@@ -4023,6 +4081,7 @@ impl Todo {
             comments: Vec::new(),
             embedding: None,
             related_memory_ids: Vec::new(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -4105,7 +4164,7 @@ impl Todo {
 
     /// Add a comment to this todo
     pub fn add_comment(&mut self, author: String, content: String) -> &TodoComment {
-        let comment = TodoComment::new(self.id.clone(), author, content);
+        let comment = TodoComment::new(self.id, author, content);
         self.comments.push(comment);
         self.updated_at = Utc::now();
         self.comments.last().unwrap()
@@ -4113,7 +4172,7 @@ impl Todo {
 
     /// Add a progress update
     pub fn add_progress(&mut self, author: String, content: String) -> &TodoComment {
-        let mut comment = TodoComment::new(self.id.clone(), author, content);
+        let mut comment = TodoComment::new(self.id, author, content);
         comment.comment_type = TodoCommentType::Progress;
         self.comments.push(comment);
         self.updated_at = Utc::now();
@@ -4122,7 +4181,7 @@ impl Todo {
 
     /// Add a resolution comment
     pub fn add_resolution(&mut self, author: String, content: String) -> &TodoComment {
-        let mut comment = TodoComment::new(self.id.clone(), author, content);
+        let mut comment = TodoComment::new(self.id, author, content);
         comment.comment_type = TodoCommentType::Resolution;
         self.comments.push(comment);
         self.updated_at = Utc::now();
@@ -4131,7 +4190,7 @@ impl Todo {
 
     /// Add a system activity entry
     pub fn add_activity(&mut self, content: String) {
-        let comment = TodoComment::system_activity(self.id.clone(), content);
+        let comment = TodoComment::system_activity(self.id, content);
         self.comments.push(comment);
         self.updated_at = Utc::now();
     }
@@ -4153,6 +4212,25 @@ impl Todo {
     /// Check if this todo is linked to a specific memory
     pub fn has_related_memory(&self, memory_id: &MemoryId) -> bool {
         self.related_memory_ids.contains(memory_id)
+    }
+
+    /// Add a dependency: this todo depends on `dep_id` completing first.
+    pub fn add_dependency(&mut self, dep_id: TodoId) {
+        if !self.depends_on.contains(&dep_id) && dep_id != self.id {
+            self.depends_on.push(dep_id);
+            self.updated_at = Utc::now();
+        }
+    }
+
+    /// Remove a dependency.
+    pub fn remove_dependency(&mut self, dep_id: &TodoId) {
+        self.depends_on.retain(|id| id != dep_id);
+        self.updated_at = Utc::now();
+    }
+
+    /// Check if this todo has unresolved dependencies (needs external resolver for status lookup).
+    pub fn has_dependencies(&self) -> bool {
+        !self.depends_on.is_empty()
     }
 }
 
@@ -4828,7 +4906,12 @@ mod tests {
         assert!(query.geo_filter.is_none());
         assert!(query.action_type.is_none());
         assert!(query.reward_range.is_none());
+        assert!(query.competition_mode.is_none());
         assert_eq!(query.max_results, DEFAULT_MAX_RESULTS);
+        assert_eq!(
+            query.effective_competition_mode(),
+            CompetitionMode::ResolveStrongest
+        );
     }
 
     #[test]
@@ -4847,5 +4930,18 @@ mod tests {
         assert!(query.geo_filter.is_some());
         assert_eq!(query.action_type, Some("landing".to_string()));
         assert_eq!(query.reward_range, Some((0.5, 1.0)));
+    }
+
+    #[test]
+    fn test_query_explicit_competition_mode_override() {
+        let query = Query {
+            competition_mode: Some(CompetitionMode::SurfaceBoth),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            query.effective_competition_mode(),
+            CompetitionMode::SurfaceBoth
+        );
     }
 }

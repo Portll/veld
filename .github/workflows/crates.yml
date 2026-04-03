@@ -22,6 +22,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Refuse prerelease crate publish
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Cargo package version: $VERSION"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "::error::Refusing crates.io publish for prerelease version $VERSION"
+            exit 1
+          fi
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install LLVM (for RocksDB/clang-sys)

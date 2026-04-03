@@ -2,7 +2,7 @@
 /**
  * Postinstall script for @shodh/memory-mcp
  *
- * Downloads the appropriate shodh-memory-server binary for the current platform
+ * Downloads the appropriate veld binary for the current platform
  * from GitHub releases.
  */
 
@@ -21,15 +21,15 @@ function getPlatformInfo() {
   const arch = process.arch;
 
   if (platform === 'linux' && arch === 'x64') {
-    return { name: 'shodh-memory-linux-x64', ext: '.tar.gz', binary: 'shodh-memory-server' };
+    return { name: 'shodh-memory-linux-x64', ext: '.tar.gz', binary: 'veld' };
   } else if (platform === 'linux' && arch === 'arm64') {
-    return { name: 'shodh-memory-linux-arm64', ext: '.tar.gz', binary: 'shodh-memory-server' };
+    return { name: 'shodh-memory-linux-arm64', ext: '.tar.gz', binary: 'veld' };
   } else if (platform === 'darwin' && arch === 'x64') {
-    return { name: 'shodh-memory-macos-x64', ext: '.tar.gz', binary: 'shodh-memory-server' };
+    return { name: 'shodh-memory-macos-x64', ext: '.tar.gz', binary: 'veld' };
   } else if (platform === 'darwin' && arch === 'arm64') {
-    return { name: 'shodh-memory-macos-arm64', ext: '.tar.gz', binary: 'shodh-memory-server' };
+    return { name: 'shodh-memory-macos-arm64', ext: '.tar.gz', binary: 'veld' };
   } else if (platform === 'win32' && arch === 'x64') {
-    return { name: 'shodh-memory-windows-x64', ext: '.zip', binary: 'shodh-memory-server.exe' };
+    return { name: 'shodh-memory-windows-x64', ext: '.zip', binary: 'veld.exe' };
   } else {
     return null;
   }

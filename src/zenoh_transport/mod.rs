@@ -1,6 +1,7 @@
-//! Zenoh Transport Layer for Shodh-Memory
+//! Roots layer: transport infrastructure. Zenoh protocol routing for distributed Earth coordination.
+//! Zenoh Transport Layer for Roots
 //!
-//! Exposes memory operations over [Eclipse Zenoh](https://zenoh.io/) pub/sub and
+//! Exposes Veld operations over [Eclipse Zenoh](https://zenoh.io/) pub/sub and
 //! request/reply primitives. Runs alongside the Axum HTTP server, sharing the same
 //! `Arc<MultiUserMemoryManager>` state.
 //!
@@ -18,6 +19,8 @@
 //! {prefix}/fleet/**                  Liveliness  → robot join/leave discovery
 //! {prefix}/fleet                     Queryable   → fleet roster query
 //! {prefix}/health                    Queryable   → health check
+//! {prefix}/capabilities              Queryable   → instance capability advertisement
+//! {prefix}/embed                     Queryable   → peer embedding requests
 //! ```
 //!
 //! # ROS2 Integration
@@ -59,14 +62,29 @@ use config::{AutoTopic, PayloadMode};
 pub struct ZenohTransportHandle {
     shutdown_tx: watch::Sender<bool>,
     session: Session,
+    /// Capabilities advertised by this node to cluster peers.
+    pub capabilities: config::InstanceCapabilities,
+    /// Liveliness tokens for capability advertisement.
+    /// Tokens are un-advertised when dropped, so they must live as long as the handle.
+    _capability_tokens: Vec<zenoh::liveliness::LivelinessToken>,
 }
 
 impl ZenohTransportHandle {
+    /// Get a reference to the underlying Zenoh session.
+    ///
+    /// Useful for sharing the session with other components (e.g. ZenohEmbedder)
+    /// to avoid opening duplicate connections.
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
     /// Signal all subscriber/queryable tasks to stop, then close the Zenoh session.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         // Give tasks a moment to wind down before closing the session
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Capability tokens are dropped here, un-advertising capabilities
+        drop(self._capability_tokens);
         if let Err(e) = self.session.close().await {
             error!("Error closing Zenoh session: {}", e);
         }
@@ -76,7 +94,7 @@ impl ZenohTransportHandle {
 
 /// Start the Zenoh transport layer.
 ///
-/// Opens a Zenoh session, registers subscribers and queryables for memory operations,
+/// Opens a Zenoh session, registers subscribers and queryables for Veld operations,
 /// and returns a handle for graceful shutdown.
 ///
 /// This function spawns multiple tokio tasks (one per subscriber/queryable). Each task
@@ -84,6 +102,7 @@ impl ZenohTransportHandle {
 pub async fn start(
     manager: Arc<MultiUserMemoryManager>,
     config: ZenohConfig,
+    local_embedder: Option<Arc<dyn crate::embeddings::Embedder>>,
 ) -> anyhow::Result<ZenohTransportHandle> {
     config.validate();
 
@@ -157,6 +176,47 @@ pub async fn start(
     .await?;
     register_fleet_discovery(&session, prefix, shutdown_rx.clone()).await?;
 
+    // Build capabilities from the local embedder (if provided)
+    let capabilities = {
+        let mut caps = config::InstanceCapabilities::default();
+        if let Some(ref embedder) = local_embedder {
+            let dim = embedder.dimension();
+            let model_name = match dim {
+                384 => "minilm-l6-v2".to_string(),
+                768 => "nomic-embed-text-v1.5".to_string(),
+                other => format!("unknown-{other}d"),
+            };
+            caps.embedding_models.push(config::EmbeddingModelInfo {
+                name: model_name,
+                dimension: dim,
+                model_type: "embedding".to_string(),
+            });
+            caps.accepts_embedding_requests = true;
+        }
+        caps
+    };
+
+    // Register capability advertisement queryable
+    register_capabilities_queryable(
+        &session,
+        prefix,
+        capabilities.clone(),
+        shutdown_rx.clone(),
+    )
+    .await?;
+
+    // Register embed queryable (only if we have a local embedder)
+    if let Some(ref embedder) = local_embedder {
+        register_embed_queryable(
+            &session,
+            prefix,
+            Arc::clone(embedder),
+            api_key.clone(),
+            shutdown_rx.clone(),
+        )
+        .await?;
+    }
+
     // Register auto-topic subscribers
     for topic in &config.auto_topics {
         if topic.key_expr.is_empty() || topic.user_id.is_empty() {
@@ -185,6 +245,21 @@ pub async fn start(
         .filter(|t| !t.key_expr.is_empty() && !t.user_id.is_empty())
         .count();
 
+    // Declare capability liveliness tokens so peers can discover what this node offers
+    let mut capability_tokens = Vec::new();
+    if local_embedder.is_some() {
+        let cap_key = format!("{}/capabilities/embedding", prefix);
+        match session.liveliness().declare_token(&cap_key).await {
+            Ok(token) => {
+                info!(key_expr = %cap_key, "Declared embedding capability liveliness token");
+                capability_tokens.push(token);
+            }
+            Err(e) => {
+                warn!("Failed to declare embedding capability token: {}", e);
+            }
+        }
+    }
+
     info!(
         mode = %config.mode.as_str(),
         prefix = %prefix,
@@ -195,6 +270,8 @@ pub async fn start(
     Ok(ZenohTransportHandle {
         shutdown_tx,
         session,
+        capabilities,
+        _capability_tokens: capability_tokens,
     })
 }
 
@@ -397,10 +474,10 @@ async fn register_stream_subscribers(
                                 }
                             };
 
-                            let memory = match mgr.get_user_memory(&user_id) {
+                            let earth = match mgr.get_user_earth(&user_id) {
                                 Ok(m) => m,
                                 Err(e) => {
-                                    error!(user_id = %user_id, "Failed to get user memory: {}", e);
+                                    error!(user_id = %user_id, "Failed to get user earth: {}", e);
                                     continue;
                                 }
                             };
@@ -408,7 +485,7 @@ async fn register_stream_subscribers(
                             let mgr_clone = Arc::clone(&mgr);
                             let sid = session_id.clone();
                             tokio::spawn(async move {
-                                handlers::handle_stream_message(msg, &sid, memory, &mgr_clone).await;
+                                handlers::handle_stream_message(msg, &sid, earth, &mgr_clone).await;
                             });
                         }
                         Err(e) => {
@@ -543,6 +620,218 @@ async fn register_health_queryable(
 }
 
 // =============================================================================
+// CAPABILITY ADVERTISEMENT
+// =============================================================================
+
+/// Register a queryable on `{prefix}/capabilities` — returns instance capabilities.
+///
+/// Peers query this to discover what embedding models are available for routing.
+async fn register_capabilities_queryable(
+    session: &Session,
+    prefix: &str,
+    capabilities: config::InstanceCapabilities,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let key_expr = format!("{}/capabilities", prefix);
+    let queryable = session
+        .declare_queryable(&key_expr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare capabilities queryable: {e}"))?;
+
+    let ke = key_expr.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                query = queryable.recv_async() => {
+                    match query {
+                        Ok(query) => {
+                            if let Ok(bytes) = serde_json::to_vec(&capabilities) {
+                                if let Err(e) = query.reply(&ke, bytes).await {
+                                    error!("Failed to reply to capabilities query: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Capabilities queryable channel closed: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    debug!("Capabilities queryable shutting down");
+                    break;
+                }
+            }
+        }
+    });
+
+    debug!(key_expr = %key_expr, "Capabilities queryable registered");
+    Ok(())
+}
+
+// =============================================================================
+// PEER EMBEDDING SERVICE
+// =============================================================================
+
+/// Embed request payload from a peer node.
+#[derive(serde::Deserialize)]
+struct EmbedRequest {
+    texts: Vec<String>,
+    #[serde(default = "default_model")]
+    model: String,
+    /// Optional API key for authenticated clusters.
+    #[serde(default)]
+    #[allow(dead_code)]
+    api_key: Option<String>,
+}
+
+fn default_model() -> String {
+    "minilm-l6-v2".to_string()
+}
+
+/// Embed response returned to the querying peer.
+#[derive(serde::Serialize)]
+struct EmbedResponse {
+    embeddings: Vec<Vec<f32>>,
+    model: String,
+    dimension: usize,
+}
+
+/// Register a queryable on `{prefix}/embed` — serves embedding requests from peers.
+///
+/// Accepts JSON: `{"texts": ["text1", ...], "model": "minilm-l6-v2"}`
+/// Returns JSON: `{"embeddings": [[...]], "model": "...", "dimension": N}`
+async fn register_embed_queryable(
+    session: &Session,
+    prefix: &str,
+    embedder: Arc<dyn crate::embeddings::Embedder>,
+    api_key: Option<String>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let key_expr = format!("{}/embed", prefix);
+    let queryable = session
+        .declare_queryable(&key_expr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare embed queryable: {e}"))?;
+
+    let ke = key_expr.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                query = queryable.recv_async() => {
+                    match query {
+                        Ok(query) => {
+                            // Authenticate if API key is configured
+                            if api_key.is_some() {
+                                let authed = match query.payload() {
+                                    Some(payload) => handlers::authenticate_payload(payload, api_key.as_deref()),
+                                    None => false,
+                                };
+                                if !authed {
+                                    let err = serde_json::json!({"error": "Unauthorized", "success": false});
+                                    if let Ok(bytes) = serde_json::to_vec(&err) {
+                                        let _ = query.reply(query.key_expr(), bytes).await;
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // Parse the embed request from query payload
+                            let request: EmbedRequest = match query.payload() {
+                                Some(payload) => {
+                                    match payload.try_to_string() {
+                                        Ok(text) => match serde_json::from_str(&text) {
+                                            Ok(req) => req,
+                                            Err(e) => {
+                                                let err = serde_json::json!({"error": format!("Invalid request: {e}")});
+                                                if let Ok(bytes) = serde_json::to_vec(&err) {
+                                                    let _ = query.reply(query.key_expr(), bytes).await;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                        Err(_) => {
+                                            let err = serde_json::json!({"error": "Payload is not valid UTF-8"});
+                                            if let Ok(bytes) = serde_json::to_vec(&err) {
+                                                let _ = query.reply(query.key_expr(), bytes).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let err = serde_json::json!({"error": "Missing request payload"});
+                                    if let Ok(bytes) = serde_json::to_vec(&err) {
+                                        let _ = query.reply(query.key_expr(), bytes).await;
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            // Reject oversized batches
+                            if request.texts.len() > 512 {
+                                let err = serde_json::json!({"error": "Batch too large (max 512 texts)"});
+                                if let Ok(bytes) = serde_json::to_vec(&err) {
+                                    let _ = query.reply(query.key_expr(), bytes).await;
+                                }
+                                continue;
+                            }
+
+                            // Run embedding in a blocking task (Embedder trait is synchronous)
+                            let emb = Arc::clone(&embedder);
+                            let ke_reply = ke.clone();
+                            let texts = request.texts;
+                            let model = request.model;
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                                    emb.encode_batch(&text_refs)
+                                }).await;
+
+                                let response_bytes = match result {
+                                    Ok(Ok(embeddings)) => {
+                                        let dim = embeddings.first().map(|v| v.len()).unwrap_or(0);
+                                        let resp = EmbedResponse {
+                                            embeddings,
+                                            model,
+                                            dimension: dim,
+                                        };
+                                        serde_json::to_vec(&resp)
+                                    }
+                                    Ok(Err(e)) => {
+                                        serde_json::to_vec(&serde_json::json!({"error": format!("Embedding failed: {e}")}))
+                                    }
+                                    Err(e) => {
+                                        serde_json::to_vec(&serde_json::json!({"error": format!("Task panicked: {e}")}))
+                                    }
+                                };
+
+                                if let Ok(bytes) = response_bytes {
+                                    if let Err(e) = query.reply(&ke_reply, bytes).await {
+                                        error!("Failed to reply to embed query: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Embed queryable channel closed: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    debug!("Embed queryable shutting down");
+                    break;
+                }
+            }
+        }
+    });
+
+    debug!(key_expr = %key_expr, "Embed queryable registered");
+    Ok(())
+}
+
+// =============================================================================
 // MISSION LIFECYCLE REGISTRATION
 // =============================================================================
 
@@ -646,7 +935,7 @@ async fn register_mission_subscribers(
 
 /// Register fleet discovery using Zenoh liveliness tokens.
 ///
-/// Declares a liveliness token at `{prefix}/fleet/shodh-server` so robots can
+/// Declares a liveliness token at `{prefix}/fleet/veld` so robots can
 /// discover this server. Subscribes to `{prefix}/fleet/**` to track robot
 /// join/leave events. A queryable at `{prefix}/fleet` returns the current fleet roster.
 async fn register_fleet_discovery(
@@ -655,7 +944,7 @@ async fn register_fleet_discovery(
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Declare our own liveliness token — robots can detect the server
-    let liveliness_key = format!("{}/fleet/shodh-server", prefix);
+    let liveliness_key = format!("{}/fleet/veld", prefix);
     let _token = session
         .liveliness()
         .declare_token(&liveliness_key)
@@ -806,9 +1095,9 @@ async fn register_auto_topic(
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create stream session for auto-topic: {e}"))?;
 
-    let memory = manager
-        .get_user_memory(&topic.user_id)
-        .map_err(|e| anyhow::anyhow!("Failed to get user memory for auto-topic: {e}"))?;
+    let _earth = manager
+        .get_user_earth(&topic.user_id)
+        .map_err(|e| anyhow::anyhow!("Failed to get user earth for auto-topic: {e}"))?;
 
     let mgr = Arc::clone(manager);
     let user_id = topic.user_id.clone();

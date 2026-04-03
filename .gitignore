@@ -58,6 +58,9 @@ literature/
 # Paper (not for public release)
 paper/
 
+# Local-only legacy collateral
+/shodh-internal/
+
 # ONNX Runtime binaries (downloaded per-platform during CI wheel builds)
 python/shodh_memory/lib/*.dll
 python/shodh_memory/lib/*.so

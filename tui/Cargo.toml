@@ -2,7 +2,7 @@
 name = "shodh-tui"
 version = "0.1.91"
 edition = "2021"
-description = "Terminal UI for Shodh Memory - real-time visualization"
+description = "Terminal UI for Veld - real-time visualization"
 authors = ["Shodh"]
 license = "BUSL-1.1"
 
@@ -32,6 +32,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
 anyhow = "1.0"
+dirs = "6.0"
 
 [profile.release]
 opt-level = "z"

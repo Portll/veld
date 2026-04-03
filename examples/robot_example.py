@@ -1,8 +1,8 @@
 """
-Example: Warehouse robot using shodh-memory for local AI memory
+Example: Warehouse robot using Veld - Agentic Memory for local AI memory.
 
-This demonstrates how a warehouse robot can use shodh-memory to remember
-obstacles, navigation patterns, and task history completely offline.
+This demonstrates how a warehouse robot can use Veld - Agentic Memory to
+remember obstacles, navigation patterns, and task history completely offline.
 """
 
 import shodh_memory

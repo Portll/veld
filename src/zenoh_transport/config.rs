@@ -294,6 +294,39 @@ impl ZenohConfig {
     }
 }
 
+// =============================================================================
+// INSTANCE CAPABILITIES
+// =============================================================================
+
+/// Capabilities this node advertises to cluster peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceCapabilities {
+    /// Embedding models loaded and available for peer requests.
+    pub embedding_models: Vec<EmbeddingModelInfo>,
+    /// Whether this instance accepts peer embedding requests.
+    pub accepts_embedding_requests: bool,
+}
+
+/// Describes an embedding model available on this node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingModelInfo {
+    /// Model identifier (e.g. "minilm-l6-v2").
+    pub name: String,
+    /// Output vector dimension.
+    pub dimension: usize,
+    /// Model type: "embedding", "cross-encoder", "ner".
+    pub model_type: String,
+}
+
+impl Default for InstanceCapabilities {
+    fn default() -> Self {
+        Self {
+            embedding_models: Vec::new(),
+            accepts_embedding_requests: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +380,31 @@ mod tests {
         let json = r#""structured""#;
         let mode: PayloadMode = serde_json::from_str(json).unwrap();
         assert_eq!(mode, PayloadMode::Structured);
+    }
+
+    #[test]
+    fn test_instance_capabilities_serde() {
+        let caps = InstanceCapabilities {
+            embedding_models: vec![EmbeddingModelInfo {
+                name: "minilm-l6-v2".to_string(),
+                dimension: 384,
+                model_type: "embedding".to_string(),
+            }],
+            accepts_embedding_requests: true,
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        let parsed: InstanceCapabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.embedding_models.len(), 1);
+        assert_eq!(parsed.embedding_models[0].name, "minilm-l6-v2");
+        assert_eq!(parsed.embedding_models[0].dimension, 384);
+        assert_eq!(parsed.embedding_models[0].model_type, "embedding");
+        assert!(parsed.accepts_embedding_requests);
+    }
+
+    #[test]
+    fn test_instance_capabilities_default() {
+        let caps = InstanceCapabilities::default();
+        assert!(caps.embedding_models.is_empty());
+        assert!(!caps.accepts_embedding_requests);
     }
 }

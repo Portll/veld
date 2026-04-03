@@ -1,19 +1,22 @@
 ---
 name: shodh-memory
 description: Persistent memory system for AI agents. Use this skill to remember context across conversations, recall relevant information, and build long-term knowledge. Activate when you need to store decisions, learnings, errors, or context that should persist beyond the current session.
-version: 1.0.0
-author: Shodh AI
-tags:
-  - memory
-  - persistence
-  - context
-  - recall
-  - knowledge-management
+metadata:
+   product: Veld - Agentic Memory
+   version: 1.0.0
+   tags:
+      - memory
+      - persistence
+      - context
+      - recall
+      - knowledge-management
 ---
 
-# Shodh Memory - Persistent Context for AI Agents
+# Veld - Agentic Memory - Persistent Context for AI Agents
 
-Shodh Memory gives you persistent memory across conversations. Unlike your context window which resets each session, memories stored here persist indefinitely and can be recalled semantically.
+Veld - Agentic Memory gives you persistent memory across conversations. Unlike your context window which resets each session, memories stored here persist indefinitely and can be recalled semantically.
+
+The skill identifier remains `shodh-memory` for compatibility with existing discovery and install surfaces.
 
 ## When to Use Memory
 
@@ -211,4 +214,4 @@ You:
 
 ---
 
-*Shodh Memory: Because context shouldn't reset with every conversation.*
+*Veld - Agentic Memory: Because context shouldn't reset with every conversation.*

@@ -464,6 +464,12 @@ impl TodoStore {
             batch.put_cf(index_cf, parent_key.as_bytes(), todo.user_id.as_bytes());
         }
 
+        // Index dependencies: forward (dep:{dep_id}:{this_id}) for "who depends on dep_id?"
+        for dep_id in &todo.depends_on {
+            let dep_key = format!("dep:{}:{}", dep_id.0, id_str);
+            batch.put_cf(index_cf, dep_key.as_bytes(), todo.user_id.as_bytes());
+        }
+
         self.db
             .write(batch)
             .context("Failed to update todo indices")?;
@@ -509,6 +515,12 @@ impl TodoStore {
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
             batch.delete_cf(index_cf, parent_key.as_bytes());
+        }
+
+        // Remove dependency index entries
+        for dep_id in &todo.depends_on {
+            let dep_key = format!("dep:{}:{}", dep_id.0, id_str);
+            batch.delete_cf(index_cf, dep_key.as_bytes());
         }
 
         // Clean up vector index mapping: look up vector_id from reverse mapping
@@ -703,7 +715,7 @@ impl TodoStore {
         comment_type: Option<TodoCommentType>,
     ) -> Result<Option<TodoComment>> {
         if let Some(mut todo) = self.get_todo(user_id, todo_id)? {
-            let mut comment = TodoComment::new(todo_id.clone(), author, content);
+            let mut comment = TodoComment::new(*todo_id, author, content);
             if let Some(ct) = comment_type {
                 comment.comment_type = ct;
             }
@@ -1033,6 +1045,158 @@ impl TodoStore {
         }
 
         Ok(todos)
+    }
+
+    // =========================================================================
+    // DEPENDENCY WALK
+    // =========================================================================
+
+    /// List todos that are ready to work on: all dependencies are Done (or have none).
+    pub fn list_ready_todos(&self, user_id: &str) -> Result<Vec<Todo>> {
+        let active = &[TodoStatus::Todo, TodoStatus::Backlog];
+        let todos = self.list_todos_for_user(user_id, Some(active))?;
+
+        let mut ready = Vec::new();
+        for todo in todos {
+            if todo.depends_on.is_empty() {
+                ready.push(todo);
+                continue;
+            }
+            let all_done = todo.depends_on.iter().all(|dep_id| {
+                self.get_todo(user_id, dep_id)
+                    .ok()
+                    .flatten()
+                    .map(|d| d.status == TodoStatus::Done || d.status == TodoStatus::Cancelled)
+                    .unwrap_or(true) // missing dep = treat as satisfied
+            });
+            if all_done {
+                ready.push(todo);
+            }
+        }
+        Ok(ready)
+    }
+
+    /// List todos that directly depend on the given todo (reverse lookup via index).
+    pub fn list_dependents(&self, todo_id: &TodoId) -> Result<Vec<Todo>> {
+        let prefix = format!("dep:{}:", todo_id.0);
+        let mut dependents = Vec::new();
+
+        for item in self
+            .db
+            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes())
+        {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            let dependent_id_str = key_str.strip_prefix(&prefix).unwrap_or("");
+            let user_id = String::from_utf8_lossy(&value);
+            if let Ok(uuid) = uuid::Uuid::parse_str(dependent_id_str) {
+                if let Some(todo) = self.get_todo(&user_id, &TodoId(uuid))? {
+                    dependents.push(todo);
+                }
+            }
+        }
+        Ok(dependents)
+    }
+
+    /// Walk the full dependency chain forward (what does completing this unblock?)
+    /// Returns (todo, depth) pairs in BFS order.
+    pub fn dependency_chain_forward(
+        &self,
+        user_id: &str,
+        todo_id: &TodoId,
+        max_depth: usize,
+    ) -> Result<Vec<(Todo, usize)>> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+
+        visited.insert(*todo_id);
+        queue.push_back((*todo_id, 0usize));
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if depth > 0 {
+                if let Some(todo) = self.get_todo(user_id, &current_id)? {
+                    result.push((todo, depth));
+                }
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            for dep in self.list_dependents(&current_id)? {
+                if visited.insert(dep.id) {
+                    queue.push_back((dep.id, depth + 1));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Walk the dependency chain backward (what blocks this todo?)
+    /// Returns (todo, depth) pairs in BFS order.
+    pub fn dependency_chain_backward(
+        &self,
+        user_id: &str,
+        todo_id: &TodoId,
+        max_depth: usize,
+    ) -> Result<Vec<(Todo, usize)>> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+
+        visited.insert(*todo_id);
+        queue.push_back((*todo_id, 0usize));
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            if depth > 0 {
+                if let Some(todo) = self.get_todo(user_id, &current_id)? {
+                    result.push((todo, depth));
+                }
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            if let Some(todo) = self.get_todo(user_id, &current_id)? {
+                for dep_id in &todo.depends_on {
+                    if visited.insert(*dep_id) {
+                        queue.push_back((*dep_id, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Detect if adding `dep_id` as a dependency of `todo_id` would create a cycle.
+    /// Uses DFS from dep_id following depends_on edges to see if we reach todo_id.
+    pub fn would_create_cycle(
+        &self,
+        user_id: &str,
+        todo_id: &TodoId,
+        dep_id: &TodoId,
+    ) -> Result<bool> {
+        if todo_id == dep_id {
+            return Ok(true);
+        }
+        let mut stack = vec![*dep_id];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(*dep_id);
+
+        while let Some(current) = stack.pop() {
+            if let Some(todo) = self.get_todo(user_id, &current)? {
+                for upstream in &todo.depends_on {
+                    if upstream == todo_id {
+                        return Ok(true);
+                    }
+                    if visited.insert(*upstream) {
+                        stack.push(*upstream);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     // =========================================================================

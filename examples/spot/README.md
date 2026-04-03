@@ -1,4 +1,4 @@
-# Shodh-Memory for Boston Dynamics Spot
+# Veld - Agentic Memory for Boston Dynamics Spot
 
 Persistent cognitive memory for Spot robots. Solves 6 fundamental limitations in the Spot SDK.
 
@@ -19,7 +19,7 @@ A Spot doing daily facility inspections will rediscover the same fallen cable tr
 
 ## The Solution
 
-Shodh-memory adds a persistent cognitive layer underneath Spot's existing services:
+Veld - Agentic Memory adds a persistent cognitive layer underneath Spot's existing services:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -44,7 +44,7 @@ Shodh-memory adds a persistent cognitive layer underneath Spot's existing servic
 │                   └─────────┬─────────┘                     │
 │                             │                               │
 │                   ┌─────────┴─────────┐                     │
-│                   │   shodh-memory    │                     │
+│                   │      Veld         │                     │
 │                   │  (native engine)  │                     │
 │                   │                   │                     │
 │                   │  Hebbian learning │                     │
@@ -84,11 +84,11 @@ No `bosdyn-client` required. All Spot SDK types are simulated with compatible in
 
 ### `persistent_world_objects.py` — Solving the 15-Second TTL
 
-Spot detects 5 objects. After 15 seconds, Spot's native service returns 0. Shodh-memory returns all 5 with original positions, types, and metadata.
+Spot detects 5 objects. After 15 seconds, Spot's native service returns 0. Veld returns all 5 with original positions, types, and metadata.
 
 ```
   Spot native:  0 objects (all expired)
-  Shodh-memory: 5 objects (all retained)
+    Veld: 5 objects (all retained)
 ```
 
 ### `cross_mission_learning.py` — Knowledge Accumulation
@@ -103,7 +103,7 @@ Spot detects 5 objects. After 15 seconds, Spot's native service returns 0. Shodh
 
 ### `semantic_waypoints.py` — Queryable Waypoint Knowledge
 
-Natural language queries on waypoint annotations. GraphNav gives you: waypoint name + opaque bytes. Shodh-memory gives you: semantic search across all observations.
+Natural language queries on waypoint annotations. GraphNav gives you: waypoint name + opaque bytes. Veld gives you: semantic search across all observations.
 
 ### `area_callback_memory.py` — Learning Region Behavior
 
@@ -146,7 +146,7 @@ Run `python benchmark.py` to get numbers for your hardware.
 
 ## Spatial Recall
 
-The bridge provides real Euclidean distance filtering on stored positions. Every memory in shodh-memory stores `local_position: [f32; 3]`, which is returned as the `"position"` key in recall results.
+The bridge provides real Euclidean distance filtering on stored positions. Every memory in Veld stores `local_position: [f32; 3]`, which is returned as the `"position"` key in recall results.
 
 `recall_obstacles_nearby()` and `recall_world_objects()` use this:
 
@@ -171,7 +171,7 @@ for obs in nearby:
 
 ## Integration Points
 
-| Spot SDK Pain Point | Shodh Solution | Method |
+| Spot SDK Pain Point | Veld Solution | Method |
 |---|---|---|
 | World objects expire (15s TTL) | Permanent persistence | `bridge.persist_world_object()` |
 | No cross-mission learning | Accumulated knowledge | `bridge.recall_obstacles_nearby()` |
@@ -351,4 +351,4 @@ Obstacles you encounter repeatedly become part of the robot's permanent knowledg
 
 ## License
 
-Apache 2.0 — [shodh-memory](https://github.com/varun29ankuS/shodh-memory)
+Apache 2.0 — [Veld - Agentic Memory](https://github.com/varun29ankuS/shodh-memory)

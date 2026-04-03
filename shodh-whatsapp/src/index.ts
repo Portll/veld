@@ -10,6 +10,7 @@ import pino from "pino";
 import qrcode from "qrcode-terminal";
 import { handleMessage, getInboxSummary, clearInbox } from "./handler";
 import { config } from "./config";
+import { sanityCheckProvider } from "./llm";
 
 const OWNER_NUMBER = "919810300618@s.whatsapp.net";
 
@@ -133,6 +134,14 @@ async function main() {
   }
   if (provider === "openai" && !config.llm.openai.apiKey) {
     console.error("❌ OPENAI_API_KEY is required for openai provider");
+    process.exit(1);
+  }
+
+  try {
+    await sanityCheckProvider();
+    console.log("✅ LLM sanity check passed");
+  } catch (error) {
+    console.error("❌ LLM sanity check failed:", error);
     process.exit(1);
   }
 

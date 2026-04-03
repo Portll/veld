@@ -1,11 +1,11 @@
 //! Zenoh Message Handlers
 //!
-//! Translates Zenoh samples into shodh-memory operations.
+//! Translates Zenoh samples into Veld API operations.
 //! Each handler mirrors an equivalent HTTP handler in `src/handlers/`,
 //! reusing the same core types, validation, and processing pipeline.
 //!
 //! # Design Principles
-//! - All blocking MemorySystem operations use `spawn_blocking`
+//! - All blocking Earth operations use `spawn_blocking`
 //! - Post-processing (graph, lineage, facts) is fire-and-forget (async, non-fatal)
 //! - Handlers never panic — all errors are logged and the subscriber continues
 //! - JSON is the primary wire format (matches existing serde derives)
@@ -18,6 +18,7 @@ use zenoh::bytes::ZBytes;
 use zenoh::query::Query;
 use zenoh::sample::Sample;
 
+use crate::earth::SharedEarth;
 use crate::errors::ValidationErrorExt;
 use crate::handlers::remember::{build_rich_context, parse_experience_type};
 use crate::handlers::state::MultiUserMemoryManager;
@@ -27,7 +28,7 @@ use crate::handlers::types::{
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
 use crate::memory::types::{ForgetCriteria, GeoFilter, MemoryId};
 use crate::memory::{
-    Experience, MemorySystem, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus,
+    Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus,
 };
 use crate::metrics;
 use crate::streaming::{ExtractionConfig, StreamHandshake, StreamMessage, StreamMode};
@@ -298,7 +299,7 @@ fn default_recall_mode() -> String {
 /// 1. Deserialize JSON → ZenohRememberRequest (includes spatial, sensor, mission fields)
 /// 2. Validate user_id and content
 /// 3. Extract entities (NER + YAKE) in parallel
-/// 4. Build Experience with robotics fields, store via MemorySystem
+/// 4. Build Experience with robotics fields, store via Earth
 /// 5. Fire-and-forget graph + lineage processing
 pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager>) {
     let key = sample.key_expr().as_str().to_string();
@@ -418,23 +419,23 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
         ..Default::default()
     };
 
-    let memory = match manager.get_user_memory(&req.user_id) {
+    let earth = match manager.get_user_earth(&req.user_id) {
         Ok(m) => m,
         Err(e) => {
-            error!(user_id = %req.user_id, "Failed to get user memory: {}", e);
+            error!(user_id = %req.user_id, "Failed to get user earth: {}", e);
             return;
         }
     };
 
     // Store memory (blocking)
     let exp_clone = experience.clone();
-    let memory_clone = memory.clone();
+    let earth_clone = earth.clone();
     let agent_id = req.agent_id.clone();
     let run_id = req.run_id.clone();
     let created_at = req.created_at;
 
     let memory_id = match tokio::task::spawn_blocking(move || {
-        let guard = memory_clone.read();
+        let guard = earth_clone.read();
         if agent_id.is_some() || run_id.is_some() {
             guard.remember_with_agent(exp_clone, created_at, agent_id, run_id)
         } else {
@@ -650,10 +651,10 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
         return;
     }
 
-    let memory = match manager.get_user_memory(&req.user_id) {
+    let earth = match manager.get_user_earth(&req.user_id) {
         Ok(m) => m,
         Err(e) => {
-            reply_error(&query, &format!("Failed to get user memory: {e}")).await;
+            reply_error(&query, &format!("Failed to get user earth: {e}")).await;
             return;
         }
     };
@@ -678,7 +679,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
     };
 
     // Execute recall in blocking task
-    let memory_for_recall = memory.clone();
+    let earth_for_recall = earth.clone();
     let user_id_for_recall = user_id.clone();
     let query_for_recall = query_text.clone();
     let robot_id = req.robot_id.clone();
@@ -689,7 +690,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
     let terrain_type = req.terrain_type.clone();
 
     let memories = match tokio::task::spawn_blocking(move || {
-        let guard = memory_for_recall.read();
+        let guard = earth_for_recall.read();
         let mq = MemoryQuery {
             user_id: Some(user_id_for_recall),
             query_text: Some(query_for_recall),
@@ -753,9 +754,9 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
     // Search related todos
     let todos: Vec<RecallTodo> = {
         let query_for_embed = query_text.clone();
-        let memory_for_embed = memory.clone();
+        let earth_for_embed = earth.clone();
         let embedding: Option<Vec<f32>> = tokio::task::spawn_blocking(move || {
-            let guard = memory_for_embed.read();
+            let guard = earth_for_embed.read();
             guard.compute_embedding(&query_for_embed).ok()
         })
         .await
@@ -984,17 +985,17 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
         }
     };
 
-    let memory = match manager.get_user_memory(&user_id) {
+    let earth = match manager.get_user_earth(&user_id) {
         Ok(m) => m,
         Err(e) => {
-            error!(user_id = %user_id, "Failed to get user memory: {}", e);
+            error!(user_id = %user_id, "Failed to get user earth: {}", e);
             return;
         }
     };
 
     let mid = MemoryId(memory_uuid);
     match tokio::task::spawn_blocking(move || {
-        let guard = memory.read();
+        let guard = earth.read();
         guard.forget(ForgetCriteria::ById(mid))
     })
     .await
@@ -1061,7 +1062,7 @@ pub async fn create_stream_session(
 pub async fn handle_stream_message(
     message: StreamMessage,
     session_id: &str,
-    memory: Arc<parking_lot::RwLock<MemorySystem>>,
+    memory: SharedEarth,
     manager: &MultiUserMemoryManager,
 ) {
     let result = manager
@@ -1180,10 +1181,10 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
         None => format!("Mission started: {}", req.mission_id),
     };
 
-    let memory = match manager.get_user_memory(&user_id) {
+    let earth = match manager.get_user_earth(&user_id) {
         Ok(m) => m,
         Err(e) => {
-            error!(user_id = %user_id, "Failed to get user memory: {}", e);
+            error!(user_id = %user_id, "Failed to get user earth: {}", e);
             return;
         }
     };
@@ -1191,7 +1192,7 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
     let mission_id = req.mission_id.clone();
     let robot_id = req.robot_id.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = memory.read();
+        let guard = earth.read();
         let experience = Experience {
             content,
             mission_id: Some(mission_id),
@@ -1278,10 +1279,10 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
         ),
     };
 
-    let memory = match manager.get_user_memory(&user_id) {
+    let earth = match manager.get_user_earth(&user_id) {
         Ok(m) => m,
         Err(e) => {
-            error!(user_id = %user_id, "Failed to get user memory: {}", e);
+            error!(user_id = %user_id, "Failed to get user earth: {}", e);
             return;
         }
     };
@@ -1291,7 +1292,7 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
     let outcome_type = req.outcome.clone();
     let reward = req.reward;
     let _ = tokio::task::spawn_blocking(move || {
-        let guard = memory.read();
+        let guard = earth.read();
         let experience = Experience {
             content,
             mission_id: Some(mission_id),

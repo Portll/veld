@@ -3564,6 +3564,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4155,7 +4164,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shodh-memory"
-version = "0.7.3"
+version = "0.7.6-unstable"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4196,6 +4205,7 @@ dependencies = [
  "prometheus",
  "pyo3",
  "rand 0.8.5",
+ "redb",
  "regex",
  "reqwest",
  "rmcp",

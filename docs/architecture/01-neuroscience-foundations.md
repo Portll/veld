@@ -1,12 +1,12 @@
 # Neuroscience Foundations
 
-This document maps shodh-memory's features to their cognitive science basis, with code references proving implementation.
+This document maps Veld - Agentic Memory's features to their cognitive science basis, with code references proving implementation.
 
 ## Why Not Just Use ACT-R?
 
 ACT-R (Adaptive Control of Thought—Rational) is the gold standard cognitive architecture from CMU. We studied it extensively. Here's why we built something different:
 
-| Aspect | ACT-R | Shodh-Memory | Why We Differ |
+| Aspect | ACT-R | Veld - Agentic Memory | Why We Differ |
 |--------|-------|--------------|---------------|
 | **Memory representation** | Symbolic chunks | Vector embeddings | AI agents process natural language, not pre-encoded symbols |
 | **Retrieval** | Exact chunk matching + spreading | Semantic similarity + spreading | "borrowing" should find "ownership" even without explicit link |
@@ -15,7 +15,7 @@ ACT-R (Adaptive Control of Thought—Rational) is the gold standard cognitive ar
 | **Deployment** | Lisp runtime, research tool | Single 15MB binary, production API | Edge deployment, air-gapped environments |
 | **Integration** | Requires symbolic encoding | REST API, MCP, Python SDK | Works with any LLM, no pre-processing |
 
-**ACT-R's limitation for AI agents:** It requires pre-encoding all knowledge into symbolic chunks with explicit slot-value pairs. An AI agent receiving free-form text would need a complex encoding layer. Shodh works directly with natural language via embeddings.
+**ACT-R's limitation for AI agents:** It requires pre-encoding all knowledge into symbolic chunks with explicit slot-value pairs. An AI agent receiving free-form text would need a complex encoding layer. Veld works directly with natural language via embeddings.
 
 ## Implemented Features (With Code References)
 
@@ -160,7 +160,7 @@ pub fn traverse_with_activation(&mut self, start_entities: &[Uuid], depth: usize
 
 ## What We DON'T Implement (Honestly)
 
-| ACT-R Feature | Status in Shodh | Reason |
+| ACT-R Feature | Status in Veld | Reason |
 |---------------|-----------------|--------|
 | Procedural memory | Not implemented | AI agents have their own reasoning—we just provide declarative memory |
 | Production rules | Not implemented | Conflates memory with reasoning; let the LLM reason |

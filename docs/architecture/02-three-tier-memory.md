@@ -1,6 +1,6 @@
 # 3-Tier Memory Model
 
-Shodh-memory implements a biologically-inspired three-tier memory system based on Cowan's embedded-processes model.
+Veld - Agentic Memory implements a biologically-inspired three-tier memory system based on Cowan's embedded-processes model.
 
 ## Overview
 

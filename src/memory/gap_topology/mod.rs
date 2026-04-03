@@ -1,3 +1,4 @@
+//! Veld layer: gap analysis, TDA, golden features, persistent homology interpretation.
 //! Structural Gap Detection for Knowledge Graphs
 //!
 //! Detects structural gaps (missing edges) in the knowledge graph by analyzing

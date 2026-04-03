@@ -1,7 +1,7 @@
-//! Multi-User Memory Manager - Core State Management
+//! Multi-User Runtime Manager - Core State Management
 //!
-//! This module contains the central state manager for the shodh-memory server.
-//! It handles per-user memory systems, graph memories, audit logs, and all
+//! This module contains the central state manager for the Veld server and Roots runtime.
+//! It handles per-user Earth handles, graph stores, audit logs, and all
 //! subsidiary stores (todos, reminders, files, etc.).
 
 use anyhow::{Context, Result};
@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
+use crate::earth::{Earth, SharedEarth};
 /// Static regex for extracting all-caps terms (API, TUI, NER, REST, etc.)
 fn allcaps_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -23,11 +24,15 @@ fn issue_regex() -> &'static regex::Regex {
 }
 
 use crate::ab_testing;
+#[cfg(feature = "multi-tenant")]
+use crate::extensions::maintenance;
 use crate::backup;
-use crate::config::ServerConfig;
+use crate::backup::BackupMetadata;
+use crate::config::{ServerConfig, StorageBackend};
 use crate::embeddings::{
-    are_ner_models_downloaded, download_ner_models, get_ner_models_dir, ner::NerEntityType,
-    KeywordExtractor, NerConfig, NeuralNer,
+    are_ner_models_downloaded, auto_download_models_enabled, download_ner_models,
+    get_ner_models_dir, ner::NerEntityType, neural_ner_enabled, KeywordExtractor, NerConfig,
+    NeuralNer,
 };
 use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
@@ -35,9 +40,11 @@ use crate::graph_memory::{
 };
 use crate::memory::{
     query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
-    MemorySystem, ProspectiveStore, SessionStore, TodoStore,
+    ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::relevance::RelevanceEngine;
+use crate::storage::legacy_rocksdb::{RocksDbGraphStore, RocksDbPrimaryMemoryStore};
+use crate::storage::{AuditLogEntry, AuditStore, StorageCapabilities};
 use crate::streaming;
 
 use super::types::{AuditEvent, ContextStatus, MemoryEvent};
@@ -45,9 +52,19 @@ use super::types::{AuditEvent, ContextStatus, MemoryEvent};
 /// Type alias for context sessions map
 pub type ContextSessions = DashMap<String, ContextStatus>;
 
+struct SharedStoreBootstrap {
+    shared_db: Arc<rocksdb::DB>,
+    audit_store: Arc<dyn AuditStore>,
+    prospective_store: Arc<ProspectiveStore>,
+    todo_store: Arc<TodoStore>,
+    context_block_store: Arc<crate::memory::ContextBlockStore>,
+    file_store: Arc<FileMemoryStore>,
+    feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
+}
+
 /// Helper struct for audit log rotation (allows spawn_blocking with minimal clone)
 struct MultiUserMemoryManagerRotationHelper {
-    shared_db: Arc<rocksdb::DB>,
+    audit_store: Arc<dyn AuditStore>,
     audit_logs: Arc<DashMap<String, Arc<parking_lot::RwLock<VecDeque<AuditEvent>>>>>,
     audit_retention_days: i64,
     audit_max_entries: usize,
@@ -55,13 +72,29 @@ struct MultiUserMemoryManagerRotationHelper {
 
 const CF_AUDIT: &str = "audit";
 
-impl MultiUserMemoryManagerRotationHelper {
-    fn audit_cf(&self) -> &rocksdb::ColumnFamily {
-        self.shared_db
-            .cf_handle(CF_AUDIT)
-            .expect("audit CF must exist")
+impl From<&AuditEvent> for AuditLogEntry {
+    fn from(event: &AuditEvent) -> Self {
+        Self {
+            timestamp: event.timestamp,
+            event_type: event.event_type.clone(),
+            memory_id: event.memory_id.clone(),
+            details: event.details.clone(),
+        }
     }
+}
 
+impl From<AuditLogEntry> for AuditEvent {
+    fn from(event: AuditLogEntry) -> Self {
+        Self {
+            timestamp: event.timestamp,
+            event_type: event.event_type,
+            memory_id: event.memory_id,
+            details: event.details,
+        }
+    }
+}
+
+impl MultiUserMemoryManagerRotationHelper {
     /// Rotate audit logs for a user - delete old entries and enforce max count.
     ///
     /// Keys are `{user_id}:{timestamp_nanos:020}` so RocksDB returns them in
@@ -74,73 +107,11 @@ impl MultiUserMemoryManagerRotationHelper {
             tracing::warn!("audit cutoff timestamp outside i64 nanos range, using 0");
             0
         });
-        let prefix = format!("{user_id}:");
-        let audit = self.audit_cf();
-
-        // Pass 1: count total entries to determine excess
-        let mut total_count = 0usize;
-        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
-        for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-                total_count += 1;
-            }
-        }
-
-        if total_count == 0 {
-            return Ok(0);
-        }
-
-        let excess_count = total_count.saturating_sub(self.audit_max_entries);
-
-        // Pass 2: stream through keys, deleting those that are too old or excess.
-        // Flush WriteBatch every 10K deletes to bound memory.
-        const BATCH_FLUSH_SIZE: usize = 10_000;
-        let mut batch = rocksdb::WriteBatch::default();
-        let mut removed_count = 0usize;
-        let mut position = 0usize;
-
-        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
-        for (key, _) in iter.flatten() {
-            let key_str = match std::str::from_utf8(&key) {
-                Ok(s) => s,
-                Err(_) => {
-                    position += 1;
-                    continue;
-                }
-            };
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
-
-            let ts = key_str
-                .strip_prefix(&prefix)
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0); // Malformed keys sort first → get deleted
-
-            if ts < cutoff_nanos || position < excess_count {
-                batch.delete_cf(audit, &key);
-                removed_count += 1;
-
-                if removed_count.is_multiple_of(BATCH_FLUSH_SIZE) {
-                    self.shared_db
-                        .write(std::mem::take(&mut batch))
-                        .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
-                    batch = rocksdb::WriteBatch::default();
-                }
-            }
-
-            position += 1;
-        }
-
-        // Flush remaining
-        if !removed_count.is_multiple_of(BATCH_FLUSH_SIZE) {
-            self.shared_db
-                .write(batch)
-                .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
-        }
+        let removed_count = self.audit_store.rotate_events(
+            user_id,
+            self.audit_max_entries,
+            cutoff_time,
+        )?;
 
         // Sync in-memory cache
         if removed_count > 0 {
@@ -162,16 +133,19 @@ impl MultiUserMemoryManagerRotationHelper {
     }
 }
 
-/// Multi-user memory manager - central state for the server
+/// Multi-user Veld manager for the Roots runtime.
 pub struct MultiUserMemoryManager {
-    /// Per-user memory systems with LRU eviction
-    pub user_memories: moka::sync::Cache<String, Arc<parking_lot::RwLock<MemorySystem>>>,
+    /// Per-user Earth handles with LRU eviction.
+    pub user_earths: moka::sync::Cache<String, SharedEarth>,
 
     /// Per-user audit logs (in-memory cache)
     pub audit_logs: Arc<DashMap<String, Arc<parking_lot::RwLock<VecDeque<AuditEvent>>>>>,
 
     /// Shared DB for all global stores (todos, reminders, files, feedback, audit)
     pub shared_db: Arc<rocksdb::DB>,
+
+    /// Audit log storage routed through the backend abstraction layer.
+    audit_store: Arc<dyn AuditStore>,
 
     /// Base storage path
     pub base_path: std::path::PathBuf,
@@ -182,7 +156,7 @@ pub struct MultiUserMemoryManager {
     /// Counter for audit log rotation checks
     pub audit_log_counter: Arc<std::sync::atomic::AtomicUsize>,
 
-    /// Per-user graph memory systems
+    /// Per-user graph stores
     pub graph_memories: moka::sync::Cache<String, Arc<parking_lot::RwLock<GraphMemory>>>,
 
     /// Neural NER for automatic entity extraction
@@ -241,14 +215,14 @@ pub struct MultiUserMemoryManager {
     /// At 300s intervals, heavy cycles fire every 30 minutes.
     maintenance_cycle: std::sync::atomic::AtomicU64,
 
-    /// Per-user creation locks to prevent TOCTOU races in get_user_memory.
+    /// Per-user creation locks to prevent TOCTOU races in get_user_earth.
     /// Without this, concurrent first-access requests for the same user_id can both
     /// miss the cache check, both try to open RocksDB, and the second open fails
     /// because RocksDB holds an exclusive file lock.
-    user_memory_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
+    user_earth_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
 
     /// Separate per-user creation locks for graph memory.
-    /// Must be separate from user_memory_init_locks because get_user_memory()
+    /// Must be separate from user_earth_init_locks because get_user_earth()
     /// calls get_user_graph() while holding its lock, and parking_lot::Mutex
     /// is not re-entrant — sharing a single lock map would deadlock.
     user_graph_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
@@ -262,6 +236,9 @@ pub struct MultiUserMemoryManager {
     /// Per-user SlowStore cache. Avoids reopening SQLite on every gap analysis call,
     /// and ensures the sync TTL actually works across requests.
     pub slow_stores: DashMap<String, std::sync::Arc<crate::memory::slow_store::SlowStore>>,
+
+    /// Capabilities for the effective backend in the current runtime.
+    storage_capabilities: StorageCapabilities,
 }
 
 impl MultiUserMemoryManager {
@@ -271,18 +248,22 @@ impl MultiUserMemoryManager {
         let (event_broadcaster, _) = tokio::sync::broadcast::channel(1024);
 
         let ner_dir = get_ner_models_dir();
-        tracing::debug!("Checking for NER models at {:?}", ner_dir);
-        let neural_ner = if are_ner_models_downloaded() {
-            tracing::debug!("NER models found, using existing files");
-            let config = NerConfig {
-                model_path: ner_dir.join("model.onnx"),
-                tokenizer_path: ner_dir.join("tokenizer.json"),
-                max_length: 128,
-                confidence_threshold: 0.5,
-            };
-            match NeuralNer::new(config) {
+        let ner_config = NerConfig::from_env();
+        let local_ner_available =
+            ner_config.model_path.exists() && ner_config.tokenizer_path.exists();
+        let neural_ner = if !neural_ner_enabled() {
+            tracing::info!(
+                "Neural NER disabled (set SHODH_NEURAL_NER=true to enable local TinyBERT NER)"
+            );
+            Arc::new(NeuralNer::new_fallback(NerConfig::default()))
+        } else if local_ner_available || are_ner_models_downloaded() {
+            tracing::debug!("NER models found locally at {:?}", ner_dir);
+            match NeuralNer::new(ner_config.clone()) {
                 Ok(ner) => {
-                    info!("Neural NER initialized (TinyBERT model at {:?})", ner_dir);
+                    info!(
+                        "Neural NER initialized (TinyBERT model at {:?})",
+                        ner_config.model_path
+                    );
                     Arc::new(ner)
                 }
                 Err(e) => {
@@ -290,9 +271,8 @@ impl MultiUserMemoryManager {
                     Arc::new(NeuralNer::new_fallback(NerConfig::default()))
                 }
             }
-        } else {
-            tracing::debug!("NER models not found at {:?}, will download", ner_dir);
-            info!("Downloading NER models (TinyBERT-NER, ~15MB)...");
+        } else if auto_download_models_enabled() {
+            tracing::info!("Downloading NER models (TinyBERT-NER, ~15MB)...");
             match download_ner_models(Some(std::sync::Arc::new(|downloaded, total| {
                 if total > 0 {
                     let percent = (downloaded as f64 / total as f64 * 100.0) as u32;
@@ -302,14 +282,13 @@ impl MultiUserMemoryManager {
                 }
             }))) {
                 Ok(ner_dir) => {
-                    info!("NER models downloaded to {:?}", ner_dir);
-                    let config = NerConfig {
+                    let downloaded_config = NerConfig {
                         model_path: ner_dir.join("model.onnx"),
                         tokenizer_path: ner_dir.join("tokenizer.json"),
-                        max_length: 128,
-                        confidence_threshold: 0.5,
+                        max_length: ner_config.max_length,
+                        confidence_threshold: ner_config.confidence_threshold,
                     };
-                    match NeuralNer::new(config) {
+                    match NeuralNer::new(downloaded_config) {
                         Ok(ner) => {
                             info!("Neural NER initialized after download");
                             Arc::new(ner)
@@ -331,17 +310,24 @@ impl MultiUserMemoryManager {
                     Arc::new(NeuralNer::new_fallback(NerConfig::default()))
                 }
             }
+        } else {
+            tracing::info!(
+                "Neural NER enabled but no local models found and SHODH_AUTO_DOWNLOAD_MODELS is not enabled. Using rule-based fallback."
+            );
+            Arc::new(NeuralNer::new_fallback(NerConfig::default()))
         };
 
         let user_evictions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let evictions_clone = user_evictions.clone();
         let max_cache = server_config.max_users_in_memory;
         let eviction_base_path = base_path.clone();
+        #[cfg(feature = "multi-tenant")]
+        let eviction_multi_tenant = server_config.multi_tenant_mode;
 
-        let user_memories = moka::sync::Cache::builder()
+        let user_earths = moka::sync::Cache::builder()
             .max_capacity(server_config.max_users_in_memory as u64)
             .time_to_idle(std::time::Duration::from_secs(3600))
-            .eviction_listener(move |key: Arc<String>, value: Arc<parking_lot::RwLock<MemorySystem>>, cause| {
+            .eviction_listener(move |key: Arc<String>, value: SharedEarth, cause| {
                 if matches!(cause, moka::notification::RemovalCause::Size | moka::notification::RemovalCause::Expired) {
                     evictions_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -351,11 +337,13 @@ impl MultiUserMemoryManager {
                     // during I/O. The eviction listener runs synchronously inside moka,
                     // so we must not block here for disk writes.
                     //
-                    // CRITICAL: We must drop the Arc<RwLock<MemorySystem>> as soon as
+                    // CRITICAL: We must drop the Arc<RwLock<Earth>> as soon as
                     // possible after saving, otherwise the RocksDB file lock is held
                     // until the thread exits. If a new request arrives for the same user
                     // while the lock is held, MemorySystem::new() fails with a lock error.
                     let index_path = eviction_base_path.join(key.as_str()).join("vector_index");
+                        #[cfg(feature = "multi-tenant")]
+                        let user_path = eviction_base_path.join(key.as_str());
                     let user_key = key.clone();
                     std::thread::spawn(move || {
                         // Scope the read guard so it drops before we drop the Arc.
@@ -363,6 +351,17 @@ impl MultiUserMemoryManager {
                         let save_result = {
                             if let Some(guard) = value.try_read() {
                                 let result = guard.save_vector_index(&index_path);
+                                #[cfg(feature = "multi-tenant")]
+                                if eviction_multi_tenant {
+                                    let weights = guard.learned_weight_state();
+                                    let _ = maintenance::persist_learned_weights(
+                                        &user_path,
+                                        weights.bm25,
+                                        weights.vector,
+                                        weights.graph,
+                                        weights.update_count,
+                                    );
+                                }
                                 Some(result)
                             } else {
                                 None
@@ -423,85 +422,27 @@ impl MultiUserMemoryManager {
             crate::constants::ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
         );
 
-        // Open a single shared DB for all global stores (todos, reminders, files, feedback, audit).
-        // This dramatically reduces file descriptor usage compared to separate DBs per store.
-        let shared_db = {
-            use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, Options as RocksOptions};
-            let shared_db_path = base_path.join("shared");
-            std::fs::create_dir_all(&shared_db_path)?;
+        let shared_stores = Self::bootstrap_shared_stores(
+            &base_path,
+            &server_config,
+            &shared_rocksdb_cache,
+        )?;
 
-            let mut db_opts = RocksOptions::default();
-            db_opts.create_if_missing(true);
-            db_opts.create_missing_column_families(true);
-            db_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-            db_opts.set_max_write_buffer_number(2);
-            db_opts.set_write_buffer_size(8 * 1024 * 1024); // 8MB (shared DB is low-throughput)
-
-            // Wire shared DB into the shared block cache
-            let mut block_opts = BlockBasedOptions::default();
-            block_opts.set_block_cache(&shared_rocksdb_cache);
-            block_opts.set_cache_index_and_filter_blocks(true);
-            db_opts.set_block_based_table_factory(&block_opts);
-
-            // Collect CF descriptors from all stores + audit
-            let mut cfs = vec![ColumnFamilyDescriptor::new("default", {
-                let mut o = RocksOptions::default();
-                o.create_if_missing(true);
-                o
-            })];
-            cfs.extend(TodoStore::cf_descriptors());
-            cfs.extend(ProspectiveStore::column_family_descriptors());
-            cfs.extend(FileMemoryStore::cf_descriptors());
-            cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
-            // Feedback CF
-            cfs.push(ColumnFamilyDescriptor::new(
-                crate::memory::feedback::CF_FEEDBACK,
-                {
-                    let mut o = RocksOptions::default();
-                    o.create_if_missing(true);
-                    o.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                    o
-                },
-            ));
-            // Audit CF
-            cfs.push(ColumnFamilyDescriptor::new("audit", {
-                let mut o = RocksOptions::default();
-                o.create_if_missing(true);
-                o.set_compression_type(rocksdb::DBCompressionType::Lz4);
-                o
-            }));
-
-            Arc::new(
-                rocksdb::DB::open_cf_descriptors(&db_opts, &shared_db_path, cfs)
-                    .context("Failed to open shared DB with column families")?,
-            )
-        };
-
-        // Migrate old audit_logs DB into shared DB audit CF
-        Self::migrate_audit_db(&base_path, &shared_db)?;
-
-        let prospective_store = Arc::new(ProspectiveStore::new(shared_db.clone(), &base_path)?);
-        info!("Prospective memory store initialized");
-
-        let todo_store = Arc::new(TodoStore::new(shared_db.clone(), &base_path)?);
-        if let Err(e) = todo_store.load_vector_indices() {
+        if let Err(e) = shared_stores.todo_store.load_vector_indices() {
             tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
         }
         info!("Todo store initialized");
 
-        let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), &base_path)?);
-        info!("File memory store initialized");
-
-        let context_block_store = Arc::new(crate::memory::ContextBlockStore::new(shared_db.clone()));
-        info!("Context block store initialized");
-
-        let feedback_store = Arc::new(parking_lot::RwLock::new(
-            FeedbackStore::with_shared_db(shared_db.clone(), &base_path).unwrap_or_else(|e| {
-                tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
-                FeedbackStore::new()
-            }),
-        ));
-        info!("Feedback store initialized");
+        let backup_engine = Self::open_backup_engine(&base_path, &server_config)?;
+        if server_config.backup_enabled {
+            info!(
+                "Backup engine initialized (interval: {}h, keep: {})",
+                server_config.backup_interval_secs / 3600,
+                server_config.backup_max_count
+            );
+        } else {
+            info!("Backup engine initialized (auto-backup disabled)");
+        }
 
         // PIPE-9: StreamingMemoryExtractor no longer needs FeedbackStore
         // Feedback momentum is now applied in the MemorySystem pipeline
@@ -515,26 +456,24 @@ impl MultiUserMemoryManager {
         let relevance_engine = Arc::new(RelevanceEngine::new(neural_ner.clone()));
         info!("Relevance engine initialized (entity cache + learned weights)");
 
-        let backup_path = base_path.join("backups");
-        let backup_engine = Arc::new(backup::ShodhBackupEngine::new(backup_path)?);
-        if server_config.backup_enabled {
-            info!(
-                "Backup engine initialized (interval: {}h, keep: {})",
-                server_config.backup_interval_secs / 3600,
-                server_config.backup_max_count
-            );
-        } else {
-            info!("Backup engine initialized (auto-backup disabled)");
-        }
-
         let broadcast_capacity = (server_config.max_users_in_memory * 4).max(64);
+        let storage_capabilities =
+            StorageCapabilities::for_backend(server_config.effective_storage_backend);
 
         let manager = Self {
-            user_memories,
+            user_earths,
             audit_logs: Arc::new(DashMap::new()),
-            shared_db,
+            shared_db: shared_stores.shared_db,
+            audit_store: shared_stores.audit_store,
             base_path,
-            default_config: MemoryConfig::default(),
+            default_config: MemoryConfig {
+                collective_store_dir: if server_config.multi_tenant_mode {
+                    Some(server_config.collective_store_dir.clone())
+                } else {
+                    None
+                },
+                ..MemoryConfig::default()
+            },
             audit_log_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             graph_memories,
             neural_ner,
@@ -543,11 +482,11 @@ impl MultiUserMemoryManager {
             server_config,
             event_broadcaster,
             streaming_extractor,
-            prospective_store,
-            todo_store,
-            context_block_store,
-            file_store,
-            feedback_store,
+            prospective_store: shared_stores.prospective_store,
+            todo_store: shared_stores.todo_store,
+            context_block_store: shared_stores.context_block_store,
+            file_store: shared_stores.file_store,
+            feedback_store: shared_stores.feedback_store,
             backup_engine,
             context_sessions: Arc::new(DashMap::new()),
             context_broadcaster: {
@@ -558,10 +497,11 @@ impl MultiUserMemoryManager {
             session_store: Arc::new(SessionStore::new()),
             relevance_engine,
             maintenance_cycle: std::sync::atomic::AtomicU64::new(0),
-            user_memory_init_locks: DashMap::new(),
+            user_earth_init_locks: DashMap::new(),
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
+            storage_capabilities,
         };
 
         info!("Running initial audit log rotation...");
@@ -570,6 +510,134 @@ impl MultiUserMemoryManager {
         }
 
         Ok(manager)
+    }
+
+    fn bootstrap_shared_stores(
+        base_path: &std::path::Path,
+        server_config: &ServerConfig,
+        shared_rocksdb_cache: &rocksdb::Cache,
+    ) -> Result<SharedStoreBootstrap> {
+        match server_config.effective_storage_backend {
+            StorageBackend::RocksDb => {
+                let shared_db = Self::open_legacy_shared_db(base_path, shared_rocksdb_cache)?;
+
+                Self::migrate_audit_db(base_path, &shared_db)?;
+
+                let audit_store: Arc<dyn AuditStore> = Arc::new(
+                    crate::storage::legacy_rocksdb::RocksDbAuditStore::new(
+                        shared_db.clone(),
+                        CF_AUDIT,
+                    ),
+                );
+
+                let prospective_store =
+                    Arc::new(ProspectiveStore::new(shared_db.clone(), base_path)?);
+                info!("Prospective memory store initialized");
+
+                let todo_store = Arc::new(TodoStore::new(shared_db.clone(), base_path)?);
+
+                let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), base_path)?);
+                info!("File memory store initialized");
+
+                let context_block_store =
+                    Arc::new(crate::memory::ContextBlockStore::new(shared_db.clone()));
+                info!("Context block store initialized");
+
+                let feedback_store = Arc::new(parking_lot::RwLock::new(
+                    FeedbackStore::with_shared_db(shared_db.clone(), base_path).unwrap_or_else(
+                        |e| {
+                            tracing::warn!(
+                                "Failed to load feedback store: {}, using in-memory",
+                                e
+                            );
+                            FeedbackStore::new()
+                        },
+                    ),
+                ));
+                info!("Feedback store initialized");
+
+                Ok(SharedStoreBootstrap {
+                    shared_db,
+                    audit_store,
+                    prospective_store,
+                    todo_store,
+                    context_block_store,
+                    file_store,
+                    feedback_store,
+                })
+            }
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for shared-store bootstrap yet",
+                server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    fn open_legacy_shared_db(
+        base_path: &std::path::Path,
+        shared_rocksdb_cache: &rocksdb::Cache,
+    ) -> Result<Arc<rocksdb::DB>> {
+        use rocksdb::{BlockBasedOptions, ColumnFamilyDescriptor, Options as RocksOptions};
+
+        let shared_db_path = base_path.join("shared");
+        std::fs::create_dir_all(&shared_db_path)?;
+
+        let mut db_opts = RocksOptions::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        db_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        db_opts.set_max_write_buffer_number(2);
+        db_opts.set_write_buffer_size(8 * 1024 * 1024);
+
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(shared_rocksdb_cache);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        db_opts.set_block_based_table_factory(&block_opts);
+
+        let mut cfs = vec![ColumnFamilyDescriptor::new("default", {
+            let mut o = RocksOptions::default();
+            o.create_if_missing(true);
+            o
+        })];
+        cfs.extend(TodoStore::cf_descriptors());
+        cfs.extend(ProspectiveStore::column_family_descriptors());
+        cfs.extend(FileMemoryStore::cf_descriptors());
+        cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
+        cfs.push(ColumnFamilyDescriptor::new(
+            crate::memory::feedback::CF_FEEDBACK,
+            Self::shared_store_cf_options(),
+        ));
+        cfs.push(ColumnFamilyDescriptor::new(
+            CF_AUDIT,
+            Self::shared_store_cf_options(),
+        ));
+
+        Ok(Arc::new(
+            rocksdb::DB::open_cf_descriptors(&db_opts, &shared_db_path, cfs)
+                .context("Failed to open shared DB with column families")?,
+        ))
+    }
+
+    fn shared_store_cf_options() -> rocksdb::Options {
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        options
+    }
+
+    fn open_backup_engine(
+        base_path: &std::path::Path,
+        server_config: &ServerConfig,
+    ) -> Result<Arc<backup::ShodhBackupEngine>> {
+        let backup_path = base_path.join("backups");
+
+        match server_config.effective_storage_backend {
+            StorageBackend::RocksDb => Ok(Arc::new(backup::ShodhBackupEngine::new(backup_path)?)),
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for backup engine bootstrap yet",
+                server_config.effective_storage_backend
+            )),
+        }
     }
 
     /// Get the audit column family handle from the shared DB
@@ -664,25 +732,16 @@ impl MultiUserMemoryManager {
             details: details.to_string(),
         };
 
-        let key = format!(
-            "{}:{:020}",
-            user_id,
-            event.timestamp.timestamp_nanos_opt().unwrap_or_else(|| {
-                tracing::warn!("audit event timestamp outside i64 nanos range, using 0");
-                0
-            })
-        );
-        if let Ok(serialized) = bincode::serde::encode_to_vec(&event, bincode::config::standard()) {
-            let db = self.shared_db.clone();
-            let key_bytes = key.into_bytes();
+        let audit_store = self.audit_store.clone();
+        let storage_event = AuditLogEntry::from(&event);
+        let user_id = user_id.to_string();
+        let persisted_user_id = user_id.clone();
 
-            tokio::task::spawn_blocking(move || {
-                let audit = db.cf_handle(CF_AUDIT).expect("audit CF must exist");
-                if let Err(e) = db.put_cf(&audit, &key_bytes, &serialized) {
-                    tracing::error!("Failed to persist audit log: {}", e);
-                }
-            });
-        }
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = audit_store.append_event(&persisted_user_id, &storage_event) {
+                tracing::error!("Failed to persist audit log: {}", e);
+            }
+        });
 
         let max_entries = self.server_config.audit_max_entries_per_user;
         let log = self
@@ -703,7 +762,7 @@ impl MultiUserMemoryManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if count.is_multiple_of(self.server_config.audit_rotation_check_interval) && count > 0 {
-            let shared_db = self.shared_db.clone();
+            let audit_store = self.audit_store.clone();
             let audit_logs = self.audit_logs.clone();
             let user_id_clone = user_id.to_string();
 
@@ -712,7 +771,7 @@ impl MultiUserMemoryManager {
 
             tokio::task::spawn_blocking(move || {
                 let manager = MultiUserMemoryManagerRotationHelper {
-                    shared_db,
+                    audit_store,
                     audit_logs,
                     audit_retention_days,
                     audit_max_entries,
@@ -751,25 +810,13 @@ impl MultiUserMemoryManager {
             }
         }
 
-        let mut events = Vec::new();
-        let prefix = format!("{user_id}:");
-
-        let audit = self.audit_cf();
-        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
-        for (key, value) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
-                    events.push(event);
-                }
-            }
-        }
+        let events = self
+            .audit_store
+            .list_events(user_id, usize::MAX)
+            .unwrap_or_default()
+            .into_iter()
+            .map(AuditEvent::from)
+            .collect::<Vec<_>>();
 
         if !events.is_empty() {
             self.audit_logs
@@ -786,52 +833,99 @@ impl MultiUserMemoryManager {
         }
     }
 
-    /// Get or create memory system for a user
+    fn open_user_earth(&self, config: MemoryConfig) -> Result<Earth> {
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => {
+                let primary_store = RocksDbPrimaryMemoryStore::open(
+                    &config.storage_path,
+                    Some(&self.shared_rocksdb_cache),
+                )
+                .with_context(|| {
+                    format!("Failed to open primary memory store at {:?}", config.storage_path)
+                })?;
+
+                Earth::with_storage(config, Arc::new(primary_store.into_inner()))
+            }
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for MemorySystem construction yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    fn open_user_graph_memory(&self, user_id: &str) -> Result<GraphMemory> {
+        let graph_path = self.base_path.join(user_id).join("graph");
+
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => {
+                let graph_store = RocksDbGraphStore::open(
+                    &graph_path,
+                    Some(&self.shared_rocksdb_cache),
+                )
+                .with_context(|| {
+                    format!("Failed to open graph store for user '{user_id}' at {:?}", graph_path)
+                })?;
+
+                Ok(graph_store.into_inner())
+            }
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for GraphMemory construction yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    /// Get or create an Earth substrate for a user.
     ///
     /// Uses double-checked locking to prevent TOCTOU races where concurrent
     /// first-access requests both miss the cache and try to open RocksDB.
     /// RocksDB holds exclusive file locks, so the second open would fail.
-    pub fn get_user_memory(&self, user_id: &str) -> Result<Arc<parking_lot::RwLock<MemorySystem>>> {
+    pub fn get_user_earth(&self, user_id: &str) -> Result<SharedEarth> {
         // Fast path: already cached
-        if let Some(memory) = self.user_memories.get(user_id) {
+        if let Some(memory) = self.user_earths.get(user_id) {
             return Ok(memory);
         }
 
         // Acquire per-user creation lock to serialize initialization
         let lock = self
-            .user_memory_init_locks
+            .user_earth_init_locks
             .entry(user_id.to_string())
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
 
         // Re-check after acquiring lock (another thread may have created it)
-        if let Some(memory) = self.user_memories.get(user_id) {
+        if let Some(memory) = self.user_earths.get(user_id) {
             return Ok(memory);
         }
 
         let user_path = self.base_path.join(user_id);
         let config = MemoryConfig {
             storage_path: user_path,
+            collective_store_dir: if self.server_config.multi_tenant_mode {
+                Some(self.server_config.collective_store_dir.clone())
+            } else {
+                None
+            },
             ..self.default_config.clone()
         };
 
         // Retry with backoff for RocksDB lock contention. This can happen when a
         // moka eviction thread is still saving the vector index for this user (the
         // old MemorySystem holds the DB lock until the save thread drops its Arc).
-        let mut memory_system = {
+        let mut earth = {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
-                match MemorySystem::new(config.clone(), Some(&self.shared_rocksdb_cache)) {
-                    Ok(ms) => {
+                match self.open_user_earth(config.clone()) {
+                    Ok(earth) => {
                         if attempt > 0 {
                             info!(
-                                "Memory system for user '{}' created after {} retries (lock contention resolved)",
+                                "Earth for user '{}' created after {} retries (lock contention resolved)",
                                 user_id, attempt
                             );
                         }
-                        created = Some(ms);
+                        created = Some(earth);
                         break;
                     }
                     Err(e) => {
@@ -847,18 +941,18 @@ impl MultiUserMemoryManager {
                         } else {
                             // Non-lock error, fail immediately
                             return Err(e).with_context(|| {
-                                format!("Failed to initialize memory system for user '{user_id}'")
+                                format!("Failed to initialize Earth for user '{user_id}'")
                             });
                         }
                     }
                 }
             }
             match created {
-                Some(ms) => ms,
+                Some(earth) => earth,
                 None => {
                     return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
                         format!(
-                            "Failed to initialize memory system for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
+                            "Failed to initialize Earth for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
                             user_id
                         )
                     });
@@ -867,13 +961,13 @@ impl MultiUserMemoryManager {
         };
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
         let graph = self.get_user_graph(user_id)?;
-        memory_system.set_graph_memory(graph);
+        earth.set_graph_memory(graph);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
-        memory_system.set_feedback_store(self.feedback_store.clone());
+        earth.set_feedback_store(self.feedback_store.clone());
 
-        let memory_arc = Arc::new(parking_lot::RwLock::new(memory_system));
+        let memory_arc: SharedEarth = Arc::new(parking_lot::RwLock::new(earth));
 
-        self.user_memories
+        self.user_earths
             .insert(user_id.to_string(), memory_arc.clone());
 
         info!("Created memory system for user: {}", user_id);
@@ -884,16 +978,16 @@ impl MultiUserMemoryManager {
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
     pub fn evict_user(&self, user_id: &str) {
-        self.user_memories.invalidate(user_id);
+        self.user_earths.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
-        self.user_memories.run_pending_tasks();
+        self.user_earths.run_pending_tasks();
         self.graph_memories.run_pending_tasks();
 
         #[cfg(target_os = "windows")]
         {
             // Windows needs extra time to release file handles
             std::thread::sleep(std::time::Duration::from_millis(200));
-            self.user_memories.run_pending_tasks();
+            self.user_earths.run_pending_tasks();
             self.graph_memories.run_pending_tasks();
         }
 
@@ -903,20 +997,20 @@ impl MultiUserMemoryManager {
     /// Delete user data (GDPR compliance)
     ///
     /// Cleans up:
-    /// 1. In-memory caches (user_memories, graph_memories)
+    /// 1. In-memory caches (user_earths, graph_memories)
     /// 2. Shared RocksDB: todos, projects, todo indices, reminders, files, feedback, audit
     /// 3. Per-user filesystem: per-user RocksDB, graph DB, vector indices
     pub fn forget_user(&self, user_id: &str) -> Result<()> {
-        self.user_memories.invalidate(user_id);
+        self.user_earths.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
 
-        self.user_memories.run_pending_tasks();
+        self.user_earths.run_pending_tasks();
         self.graph_memories.run_pending_tasks();
 
         #[cfg(target_os = "windows")]
         {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            self.user_memories.run_pending_tasks();
+            self.user_earths.run_pending_tasks();
             self.graph_memories.run_pending_tasks();
         }
 
@@ -1095,7 +1189,7 @@ impl MultiUserMemoryManager {
 
     /// Get statistics for a user
     pub fn get_stats(&self, user_id: &str) -> Result<MemoryStats> {
-        let memory = self.get_user_memory(user_id)?;
+        let memory = self.get_user_earth(user_id)?;
         let memory_guard = memory.read();
         let mut stats = memory_guard.stats();
 
@@ -1146,7 +1240,7 @@ impl MultiUserMemoryManager {
 
     /// List users currently loaded in the Moka cache (no filesystem scan)
     pub fn list_cached_users(&self) -> Vec<String> {
-        self.user_memories
+        self.user_earths
             .iter()
             .map(|(id, _)| id.to_string())
             .collect()
@@ -1154,23 +1248,13 @@ impl MultiUserMemoryManager {
 
     /// Get audit logs for a user
     pub fn get_audit_logs(&self, user_id: &str, limit: usize) -> Vec<AuditEvent> {
-        let mut events: Vec<AuditEvent> = Vec::new();
-        let prefix = format!("{user_id}:");
-        let audit = self.audit_cf();
-        let iter = self.shared_db.prefix_iterator_cf(audit, prefix.as_bytes());
-        for (key, value) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with(&prefix) {
-                    break;
-                }
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
-                    events.push(event);
-                }
-            }
-        }
+        let mut events = self
+            .audit_store
+            .list_events(user_id, usize::MAX)
+            .unwrap_or_default()
+            .into_iter()
+            .map(AuditEvent::from)
+            .collect::<Vec<_>>();
         events.reverse();
         events.truncate(limit);
         events
@@ -1186,8 +1270,8 @@ impl MultiUserMemoryManager {
             .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
         info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
 
-        let user_entries: Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> = self
-            .user_memories
+        let user_entries: Vec<(String, SharedEarth)> = self
+            .user_earths
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
@@ -1217,8 +1301,8 @@ impl MultiUserMemoryManager {
     pub fn save_all_vector_indices(&self) -> Result<()> {
         info!("Saving vector indices to disk...");
 
-        let user_entries: Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> = self
-            .user_memories
+        let user_entries: Vec<(String, SharedEarth)> = self
+            .user_earths
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
@@ -1261,7 +1345,7 @@ impl MultiUserMemoryManager {
         }
 
         let helper = MultiUserMemoryManagerRotationHelper {
-            shared_db: self.shared_db.clone(),
+            audit_store: self.audit_store.clone(),
             audit_logs: self.audit_logs.clone(),
             audit_retention_days: self.server_config.audit_retention_days as i64,
             audit_max_entries: self.server_config.audit_max_entries_per_user,
@@ -1306,7 +1390,7 @@ impl MultiUserMemoryManager {
 
     /// Get or create graph memory for a user
     ///
-    /// Uses the same per-user creation lock as get_user_memory to prevent
+    /// Uses the same per-user creation lock as get_user_earth to prevent
     /// concurrent RocksDB open races on the graph directory.
     pub fn get_user_graph(&self, user_id: &str) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
         // Fast path: already cached
@@ -1314,8 +1398,8 @@ impl MultiUserMemoryManager {
             return Ok(graph);
         }
 
-        // Acquire per-user graph creation lock (separate from memory lock
-        // to avoid deadlock when get_user_memory() calls get_user_graph())
+        // Acquire per-user graph creation lock (separate from Earth lock
+        // to avoid deadlock when get_user_earth() calls get_user_graph())
         let lock = self
             .user_graph_init_locks
             .entry(user_id.to_string())
@@ -1328,15 +1412,14 @@ impl MultiUserMemoryManager {
             return Ok(graph);
         }
 
-        let graph_path = self.base_path.join(user_id).join("graph");
-        // Retry with backoff for RocksDB lock contention (same pattern as get_user_memory).
+        // Retry with backoff for RocksDB lock contention (same pattern as get_user_earth).
         // Graph eviction drops synchronously so contention is rare, but possible on Windows
         // where file handle release can lag.
         let graph_memory = {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
-                match GraphMemory::new(&graph_path, Some(&self.shared_rocksdb_cache)) {
+                match self.open_user_graph_memory(user_id) {
                     Ok(gm) => {
                         if attempt > 0 {
                             info!(
@@ -1436,9 +1519,13 @@ impl MultiUserMemoryManager {
 
         let decay_factor = self.server_config.activation_decay_factor;
         let mut total_processed = 0;
+        #[cfg(feature = "multi-tenant")]
+        let mut collective_weights = Vec::new();
+        #[cfg(feature = "multi-tenant")]
+        let mut total_feedback_events = 0u64;
 
         let user_ids: Vec<String> = self
-            .user_memories
+            .user_earths
             .iter()
             .map(|(id, _)| id.to_string())
             .collect();
@@ -1451,8 +1538,16 @@ impl MultiUserMemoryManager {
         let mut total_facts_reinforced = 0;
 
         for user_id in user_ids {
-            let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+            let maintenance_result = if let Ok(memory_lock) = self.get_user_earth(&user_id) {
                 let memory = memory_lock.read();
+                #[cfg(feature = "multi-tenant")]
+                if self.server_config.multi_tenant_mode {
+                    let learned = memory.learned_weight_state();
+                    if learned.update_count > 0 {
+                        collective_weights.push((learned.bm25, learned.vector, learned.graph));
+                        total_feedback_events += learned.update_count;
+                    }
+                }
                 match memory.run_maintenance(decay_factor, &user_id, is_heavy) {
                     Ok(result) => {
                         total_processed += result.decayed_count;
@@ -1480,7 +1575,7 @@ impl MultiUserMemoryManager {
 
                                 // Direction 1: Apply edge promotion boosts to memory importance
                                 if !promotion_boosts.is_empty() {
-                                    if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                                    if let Ok(memory_lock) = self.get_user_earth(&user_id) {
                                         let memory = memory_lock.read();
                                         match memory.apply_edge_promotion_boosts(&promotion_boosts)
                                         {
@@ -1552,7 +1647,7 @@ impl MultiUserMemoryManager {
 
                         // Direction 2: Compensate memories that lost all graph edges
                         if !decay_result.orphaned_entity_ids.is_empty() {
-                            if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                            if let Ok(memory_lock) = self.get_user_earth(&user_id) {
                                 let memory = memory_lock.read();
                                 match memory
                                     .compensate_orphaned_memories(&decay_result.orphaned_entity_ids)
@@ -1602,7 +1697,7 @@ impl MultiUserMemoryManager {
                             }
 
                             if !decay_result.orphaned_entity_ids.is_empty() {
-                                if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                                if let Ok(memory_lock) = self.get_user_earth(&user_id) {
                                     let memory = memory_lock.read();
                                     let _ = memory.compensate_orphaned_memories(
                                         &decay_result.orphaned_entity_ids,
@@ -1618,9 +1713,20 @@ impl MultiUserMemoryManager {
             }
         }
 
+        #[cfg(feature = "multi-tenant")]
+        if self.server_config.multi_tenant_mode {
+            if let Err(error) = maintenance::run_maintenance_cycle(
+                &self.server_config.collective_store_dir,
+                &collective_weights,
+                total_feedback_events,
+            ) {
+                tracing::warn!(error = %error, "Collective maintenance aggregation failed");
+            }
+        }
+
         // Heavy cycle: clean up old triggered/dismissed reminders (C4 fix)
         if is_heavy {
-            for (user_id_arc, _) in self.user_memories.iter() {
+            for (user_id_arc, _) in self.user_earths.iter() {
                 let user_id = user_id_arc.as_ref();
                 match self.prospective_store.cleanup_old_tasks(user_id, 30) {
                     Ok(deleted) if deleted > 0 => {
@@ -1652,11 +1758,11 @@ impl MultiUserMemoryManager {
             // Prune init locks: remove entries for users no longer in cache.
             // This prevents unbounded growth of the DashMaps over time.
             let active_users: std::collections::HashSet<String> = self
-                .user_memories
+                .user_earths
                 .iter()
                 .map(|(id, _)| id.to_string())
                 .collect();
-            self.user_memory_init_locks
+            self.user_earth_init_locks
                 .retain(|user_id, _| active_users.contains(user_id));
             self.user_graph_init_locks
                 .retain(|user_id, _| active_users.contains(user_id));
@@ -1766,6 +1872,11 @@ impl MultiUserMemoryManager {
         &self.server_config
     }
 
+    /// Capabilities for the backend currently serving persistence calls.
+    pub fn storage_capabilities(&self) -> StorageCapabilities {
+        self.storage_capabilities
+    }
+
     /// Get base path
     pub fn base_path(&self) -> &std::path::Path {
         &self.base_path
@@ -1779,7 +1890,7 @@ impl MultiUserMemoryManager {
 
     /// Get users in cache count
     pub fn users_in_cache(&self) -> usize {
-        self.user_memories.entry_count() as usize
+        self.user_earths.entry_count() as usize
     }
 
     /// Lightweight readiness check for public probes.
@@ -1872,11 +1983,129 @@ impl MultiUserMemoryManager {
         triggered
     }
 
-    /// Collect references to all secondary store databases for comprehensive backup.
-    /// All shared stores (todos, prospective, files, feedback, audit) share a single DB,
-    /// so we return one reference. BackupEngine handles all CFs automatically.
-    pub fn collect_secondary_store_refs(&self) -> Vec<(String, std::sync::Arc<rocksdb::DB>)> {
+    fn collect_legacy_secondary_store_refs(&self) -> Vec<(String, std::sync::Arc<rocksdb::DB>)> {
         vec![("shared".to_string(), std::sync::Arc::clone(&self.shared_db))]
+    }
+
+    pub fn create_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => {
+                let memory_sys = self.get_user_earth(user_id)?;
+                let memory_guard = memory_sys.read();
+                let db = memory_guard.get_db();
+
+                let secondary_refs = self.collect_legacy_secondary_store_refs();
+                let store_refs: Vec<crate::backup::SecondaryStoreRef<'_>> = secondary_refs
+                    .iter()
+                    .map(|(name, db)| crate::backup::SecondaryStoreRef { name, db })
+                    .collect();
+
+                let graph_lock = self.get_user_graph(user_id).ok();
+                let graph_guard = graph_lock.as_ref().map(|graph| graph.read());
+                let graph_db_ref = graph_guard.as_ref().map(|graph| graph.get_db());
+
+                if store_refs.is_empty() && graph_db_ref.is_none() {
+                    self.backup_engine.create_backup(&db, user_id)
+                } else {
+                    self.backup_engine.create_comprehensive_backup_with_graph(
+                        &db,
+                        user_id,
+                        &store_refs,
+                        graph_db_ref,
+                    )
+                }
+            }
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for backup creation yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    pub fn list_backups_for_user(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => self.backup_engine.list_backups(user_id),
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for backup listing yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    pub fn verify_backup_for_user(&self, user_id: &str, backup_id: u32) -> Result<bool> {
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => self.backup_engine.verify_backup(user_id, backup_id),
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for backup verification yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    pub fn purge_backups_for_user(&self, user_id: &str, keep_count: usize) -> Result<usize> {
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => self.backup_engine.purge_old_backups(user_id, keep_count),
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for backup purging yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
+    }
+
+    pub fn restore_user_backup(
+        &self,
+        user_id: &str,
+        backup_id: Option<u32>,
+    ) -> Result<Vec<String>> {
+        match self.server_config.effective_storage_backend {
+            StorageBackend::RocksDb => {
+                let memory_db_path = self.base_path.join(user_id).join("storage");
+                let graph_path = self.base_path.join(user_id).join("graph").join("graph");
+
+                self.evict_user(user_id);
+
+                let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
+                let restored_stores = self.backup_engine.restore_comprehensive_backup(
+                    user_id,
+                    backup_id,
+                    &memory_db_path,
+                    &secondary_restore_paths,
+                )?;
+
+                let resolved_backup_id = backup_id.unwrap_or_else(|| {
+                    self.backup_engine
+                        .list_backups(user_id)
+                        .ok()
+                        .and_then(|backups| backups.last().map(|metadata| metadata.backup_id))
+                        .unwrap_or(0)
+                });
+                let graph_checkpoint = self
+                    .backup_engine
+                    .backup_path()
+                    .join(user_id)
+                    .join(format!("secondary_{resolved_backup_id}"))
+                    .join("graph");
+
+                let mut all_restored = restored_stores;
+                if graph_checkpoint.exists() {
+                    if graph_path.exists() {
+                        let _ = std::fs::remove_dir_all(&graph_path);
+                    }
+                    if let Err(e) = crate::backup::copy_dir_recursive_pub(&graph_checkpoint, &graph_path) {
+                        tracing::warn!(error = %e, "Failed to restore graph DB from backup");
+                    } else {
+                        all_restored.push("graph".to_string());
+                        tracing::info!("Graph DB restored from backup");
+                    }
+                }
+
+                Ok(all_restored)
+            }
+            StorageBackend::Redb => Err(anyhow::anyhow!(
+                "storage backend '{}' is not wired for backup restore yet",
+                self.server_config.effective_storage_backend
+            )),
+        }
     }
 
     /// Run backups for all active users
@@ -1900,23 +2129,8 @@ impl MultiUserMemoryManager {
                     continue;
                 }
 
-                if let Ok(memory_lock) = self.get_user_memory(name) {
-                    let memory = memory_lock.read();
-                    let db = memory.get_db();
-                    let secondary_refs = self.collect_secondary_store_refs();
-                    let store_refs: Vec<crate::backup::SecondaryStoreRef<'_>> = secondary_refs
-                        .iter()
-                        .map(|(n, d)| crate::backup::SecondaryStoreRef { name: n, db: d })
-                        .collect();
-                    let graph_lock = self.get_user_graph(name).ok();
-                    let graph_guard = graph_lock.as_ref().map(|g| g.read());
-                    let graph_db_ref = graph_guard.as_ref().map(|g| g.get_db());
-                    match self.backup_engine.create_comprehensive_backup_with_graph(
-                        &db,
-                        name,
-                        &store_refs,
-                        graph_db_ref,
-                    ) {
+                if self.get_user_earth(name).is_ok() {
+                    match self.create_user_backup(name) {
                         Ok(metadata) => {
                             tracing::info!(
                                 user_id = name,
@@ -1926,7 +2140,7 @@ impl MultiUserMemoryManager {
                             );
                             backed_up += 1;
 
-                            if let Err(e) = self.backup_engine.purge_old_backups(name, max_backups)
+                            if let Err(e) = self.purge_backups_for_user(name, max_backups)
                             {
                                 tracing::warn!(
                                     user_id = name,
@@ -2093,6 +2307,7 @@ impl MultiUserMemoryManager {
                     // Only PER, ORG, LOC are proper nouns; MISC includes non-proper
                     // nouns like nationalities, events, etc.
                     is_proper_noun: !matches!(ner_entity.entity_type, NerEntityType::Misc),
+                    pii_classification: Default::default(),
                 };
                 (ner_entity.text, node)
             })
@@ -2119,6 +2334,7 @@ impl MultiUserMemoryManager {
                             name_embedding: None,
                             salience: 0.6,
                             is_proper_noun: false,
+                            pii_classification: Default::default(),
                         },
                     ))
                 } else {
@@ -2163,6 +2379,7 @@ impl MultiUserMemoryManager {
                         name_embedding: None,
                         salience: 0.5,
                         is_proper_noun: true,
+                        pii_classification: Default::default(),
                     },
                 ))
             })
@@ -2191,6 +2408,7 @@ impl MultiUserMemoryManager {
                         name_embedding: None,
                         salience: 0.7,
                         is_proper_noun: true,
+                        pii_classification: Default::default(),
                     },
                 ))
             })
@@ -2238,6 +2456,7 @@ impl MultiUserMemoryManager {
                         name_embedding: None,
                         salience: 0.4,
                         is_proper_noun: false,
+                        pii_classification: Default::default(),
                     },
                 ));
             }

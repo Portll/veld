@@ -1,5 +1,9 @@
 # Reference Homebrew formula for shodh-memory.
 #
+# NOTE: This file is archival/reference-only for the last public Homebrew release
+# line. It is not kept in sync with the current `v0.7.6-unstable` repository
+# branch and should not be treated as the source of truth for this branch.
+#
 # To use:
 #   1. Create a tap repo: github.com/varun29ankuS/homebrew-shodh-memory
 #   2. Copy this file there as Formula/shodh-memory.rb
@@ -37,7 +41,7 @@ class ShodhMemory < Formula
 
   def install
     bin.install "shodh"
-    bin.install "shodh-memory-server"
+    bin.install "veld"
     bin.install "shodh-tui"
     lib.install Dir["*.dylib"] if OS.mac?
     lib.install Dir["*.so*"] if OS.linux?

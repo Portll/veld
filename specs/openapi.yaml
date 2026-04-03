@@ -1,8 +1,11 @@
 openapi: 3.1.0
 info:
-  title: SHODH Memory API
+  title: Veld Agentic Memory API
   description: |
     Unified API specification for semantic memory implementations.
+
+    This file is an interoperability spec, not the exact runtime contract for the
+    current `v0.7.6-unstable` Veld branch.
 
     This specification defines a common interface for memory systems that support:
     - Semantic search with vector embeddings
@@ -25,7 +28,7 @@ info:
     implementations requires re-embedding all memories.
   version: 1.0.0
   contact:
-    name: SHODH Memory Community
+    name: Veld Agentic Memory Community
     url: https://github.com/varun29ankuS/shodh-memory/discussions
   license:
     name: MIT

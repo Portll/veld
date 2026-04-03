@@ -51,7 +51,7 @@ fn stem_text(text: &str) -> String {
 }
 
 /// Configuration for hybrid search
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HybridSearchConfig {
     /// Weight for BM25 scores in RRF (0.0-1.0)
     #[serde(default = "default_bm25_weight")]
@@ -939,6 +939,11 @@ impl HybridSearchEngine {
     /// Get the current learned weight state (for diagnostics/introspection)
     pub fn learned_weight_state(&self) -> LearnedWeights {
         self.learned_weights.read().clone()
+    }
+
+    /// Replace learned weights during bootstrap or restore.
+    pub fn set_learned_weight_state(&self, weights: LearnedWeights) {
+        *self.learned_weights.write() = weights;
     }
 
     /// Access the cross-encoder reranker (if configured).

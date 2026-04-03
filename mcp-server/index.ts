@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Shodh-Memory MCP Server
+ * Veld MCP Server
  *
  * Gives Claude persistent memory across sessions.
- * Connects to shodh-memory REST API running locally.
+ * Connects to the Veld REST API running locally.
  *
  * Features:
  * - Semantic search with vector similarity
@@ -513,8 +513,9 @@ async function apiCall<T>(
           body,
           MAX_CONTENT_LENGTH,
         );
-        if (!bodyValidation.ok) {
-          throw new Error(bodyValidation.error);
+        if (bodyValidation.ok === false) {
+          const validationError = bodyValidation.error;
+          throw new Error(validationError);
         }
         options.body = bodyValidation.serialized;
       }
@@ -550,8 +551,8 @@ async function apiCall<T>(
   const errMsg = lastError?.message || "Unknown error";
   if (errMsg.includes("ECONNREFUSED") || errMsg.includes("fetch failed")) {
     throw new Error(
-      `Cannot connect to shodh-memory server at ${API_URL}. ` +
-        `Start the server with: shodh-memory-server`,
+      `Cannot connect to Veld server at ${API_URL}. ` +
+        `Start the server with: veld`,
     );
   }
   throw new Error(`Failed after ${RETRY_ATTEMPTS} attempts: ${errMsg}`);
@@ -1115,6 +1116,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ["daily", "weekly", "monthly"],
               description: "Recurrence pattern for repeating tasks",
             },
+            depends_on: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Structured dependencies: list of todo short IDs (e.g. ['SHO-1', 'BOLT-3']). This todo cannot start until all listed todos are Done.",
+            },
           },
           required: ["content"],
         },
@@ -1239,6 +1246,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description:
                 "Parent todo ID or short prefix to make this a subtask. Pass empty string to remove parent.",
+            },
+            depends_on: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Structured dependencies: list of todo short IDs. Replaces existing deps. Pass [] to clear.",
             },
           },
           required: ["todo_id"],
@@ -1564,7 +1577,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: "text",
-          text: `Memory server unavailable at ${API_URL}. Please ensure shodh-memory-server is running.\n\nTo start: cd shodh-memory && cargo run`,
+          text: `Memory server unavailable at ${API_URL}. Please ensure veld is running.\n\nTo start: cd shodh-memory && cargo run`,
         },
       ],
       isError: true,
@@ -2498,6 +2511,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           score: number;
           importance: number;
           created_at: string;
+          tier?: string;
           tags: string[];
           relevance_reason: string;
           matched_entities: string[];
@@ -2654,7 +2668,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (uniqueReminders.length > 0) {
             reminderBlock = `\n\n`;
             reminderBlock += `🐘━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━🧠\n`;
-            reminderBlock += `┃  SHODH MEMORY                    REMINDERS (${String(uniqueReminders.length).padStart(2)})  ┃\n`;
+            reminderBlock += `┃  VELD MEMORY                     REMINDERS (${String(uniqueReminders.length).padStart(2)})  ┃\n`;
             reminderBlock += `┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n`;
 
             for (const r of uniqueReminders) {
@@ -3278,6 +3292,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           blocked_on,
           notes,
           recurrence,
+          depends_on,
         } = args as {
           content: string;
           status?: string;
@@ -3289,6 +3304,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           blocked_on?: string;
           notes?: string;
           recurrence?: string;
+          depends_on?: string[];
         };
 
         if (!todoContent || todoContent.length === 0) {
@@ -3339,6 +3355,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           blocked_on,
           notes,
           recurrence,
+          depends_on,
         });
 
         return {
@@ -3415,6 +3432,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           notes,
           tags,
           parent_id,
+          depends_on,
         } = args as {
           todo_id: string;
           content?: string;
@@ -3427,6 +3445,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           notes?: string;
           tags?: string[];
           parent_id?: string;
+          depends_on?: string[];
         };
 
         interface UpdateTodoResponse {
@@ -3450,6 +3469,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             notes,
             tags,
             parent_id,
+            depends_on,
           },
         );
 
@@ -3951,7 +3971,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
       uri: "shodh://commands",
       name: "Available Commands",
       mimeType: "text/markdown",
-      description: "List all shodh-memory commands and their usage",
+      description: "List all Veld commands and their usage",
     },
     {
       uri: "shodh://summary",
@@ -4013,7 +4033,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
       switch (resource) {
         case "commands": {
-          const commandList = `# Shodh-Memory Commands
+          const commandList = `# Veld Commands
 
 ## Memory Tools
 - **remember** - Store a memory (observation, decision, learning, etc.)
@@ -4642,10 +4662,10 @@ function getBinaryPath(): string | null {
   let fallbackName: string;
   if (platform === "win32") {
     wrapperName = "shodh-memory.bat";
-    fallbackName = "shodh-memory-server.exe";
+    fallbackName = "veld.exe";
   } else {
     wrapperName = "shodh-memory";
-    fallbackName = "shodh-memory-server";
+    fallbackName = "veld";
   }
 
   // Prefer direct binary (avoids spawn EINVAL with .bat + detached on Windows)
@@ -4735,7 +4755,7 @@ async function ensureServerRunning(): Promise<void> {
       "[shodh-memory] Auto-spawn disabled (SHODH_AUTO_SPAWN=false).",
     );
     console.error("[shodh-memory] Start the server manually:");
-    console.error("[shodh-memory]   shodh-memory-server");
+    console.error("[shodh-memory]   veld");
     console.error("[shodh-memory] Or with Docker:");
     console.error(
       "[shodh-memory]   docker run -d -p 3030:3030 roshera/shodh-memory",
@@ -4888,7 +4908,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Shodh-Memory MCP server v0.1.81 running");
+  console.error("Veld MCP server v0.1.81 running");
   console.error(`Connecting to: ${API_URL}`);
   console.error(`User ID: ${USER_ID}`);
   console.error(`Streaming: ${STREAM_ENABLED ? "enabled" : "disabled"}`);

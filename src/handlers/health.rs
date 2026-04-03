@@ -24,6 +24,8 @@ pub struct HealthResponse {
     pub version: String,
     pub build: String,
     pub built_at: String,
+    pub requested_storage_backend: String,
+    pub effective_storage_backend: String,
     pub users_count: usize,
     pub users_in_cache: usize,
     pub user_evictions: usize,
@@ -34,16 +36,19 @@ pub struct HealthResponse {
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let users_in_cache = state.users_in_cache();
     let user_evictions = state.user_evictions();
+    let config = state.server_config();
 
     Json(HealthResponse {
         status: "healthy".to_string(),
         version: env!("SHODH_VERSION_FULL").to_string(),
         build: env!("SHODH_BUILD_NUMBER").to_string(),
         built_at: env!("SHODH_BUILD_TIMESTAMP").to_string(),
+        requested_storage_backend: config.requested_storage_backend.to_string(),
+        effective_storage_backend: config.effective_storage_backend.to_string(),
         users_count: state.list_users().len(),
         users_in_cache,
         user_evictions,
-        max_cache_size: state.server_config().max_users_in_memory,
+        max_cache_size: config.max_users_in_memory,
     })
 }
 
@@ -75,6 +80,7 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
         Json(serde_json::json!({
             "status": status_str,
             "version": env!("SHODH_VERSION_FULL"),
+            "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
             "users_in_cache": users_in_cache,
             "timestamp": chrono::Utc::now().to_rfc3339()
         })),
@@ -90,12 +96,12 @@ pub async fn health_index(
         Some(id) => id.clone(),
         None => {
             // Return aggregate stats across currently cached users only.
-            // list_users() returns filesystem directories; get_user_memory() would
+            // list_users() returns filesystem directories; get_user_earth() would
             // open RocksDB for every user on disk, wasting FDs and memory.
             let users: Vec<(String, crate::memory::retrieval::IndexHealth)> = {
                 let mut results = Vec::new();
                 for user_id in state.list_cached_users() {
-                    if let Ok(memory) = state.get_user_memory(&user_id) {
+                    if let Ok(memory) = state.get_user_earth(&user_id) {
                         let guard = memory.read();
                         results.push((user_id, guard.index_health()));
                     }
@@ -127,7 +133,7 @@ pub async fn health_index(
     };
 
     // Get health for specific user
-    match state.get_user_memory(&user_id) {
+    match state.get_user_earth(&user_id) {
         Ok(memory) => {
             let guard = memory.read();
             let health = guard.index_health();
@@ -174,7 +180,7 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
     let mut total_vectors = 0i64;
 
     for user_id in state.list_users().iter().take(100) {
-        if let Ok(memory_sys) = state.get_user_memory(user_id) {
+        if let Ok(memory_sys) = state.get_user_earth(user_id) {
             if let Some(guard) = memory_sys.try_read() {
                 let stats = guard.stats();
                 total_working += stats.working_memory_count as i64;

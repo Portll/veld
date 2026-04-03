@@ -154,6 +154,9 @@ pub struct RecallRequest {
     /// Number of top results to rerank with cross-encoder (FIX-11, default: 20)
     #[serde(default)]
     pub rerank_count: Option<usize>,
+    /// Optional retrieval-time competition policy override.
+    #[serde(default)]
+    pub competition_mode: Option<crate::memory::CompetitionMode>,
 }
 
 pub fn default_recall_limit() -> usize {
@@ -252,6 +255,10 @@ pub struct RecallMemory {
     pub created_at: String,
     pub score: f32,
     pub tier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub competition_conflict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub competition_opponent: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -428,6 +435,8 @@ pub struct TrackedRetrieveRequest {
     pub limit: usize,
     #[serde(default = "default_recall_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub competition_mode: Option<crate::memory::CompetitionMode>,
 }
 
 /// Response with tracking ID for feedback
@@ -950,6 +959,7 @@ mod tests {
         assert_eq!(req.query, "search query");
         assert_eq!(req.limit, 5); // default
         assert_eq!(req.mode, "hybrid"); // default
+        assert!(req.competition_mode.is_none());
     }
 
     #[test]
@@ -958,11 +968,16 @@ mod tests {
             "user_id": "test-user",
             "query": "search query",
             "limit": 10,
-            "mode": "semantic"
+            "mode": "semantic",
+            "competition_mode": "resolve_strongest"
         });
         let req: RecallRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.limit, 10);
         assert_eq!(req.mode, "semantic");
+        assert_eq!(
+            req.competition_mode,
+            Some(crate::memory::CompetitionMode::ResolveStrongest)
+        );
     }
 
     #[test]

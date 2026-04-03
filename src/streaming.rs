@@ -39,9 +39,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::earth::SharedEarth;
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
-use crate::memory::{Experience, ExperienceType, MemorySystem, Query as MemoryQuery};
+use crate::memory::{Experience, ExperienceType, Query as MemoryQuery};
 use crate::similarity::cosine_similarity;
 
 /// Case-insensitive substring search without allocation.
@@ -770,7 +771,7 @@ impl StreamingMemoryExtractor {
         &self,
         session_id: &str,
         message: StreamMessage,
-        memory_system: Arc<parking_lot::RwLock<MemorySystem>>,
+        memory_system: SharedEarth,
     ) -> ExtractionResult {
         let mut sessions = self.sessions.write().await;
 
@@ -972,7 +973,7 @@ impl StreamingMemoryExtractor {
     async fn extract_memories(
         &self,
         session_id: &str,
-        memory_system: Arc<parking_lot::RwLock<MemorySystem>>,
+        memory_system: SharedEarth,
     ) -> ExtractionResult {
         let start = std::time::Instant::now();
 
@@ -1207,7 +1208,7 @@ impl StreamingMemoryExtractor {
         &self,
         session_id: &str,
         content: &str,
-        memory_system: Arc<parking_lot::RwLock<MemorySystem>>,
+        memory_system: SharedEarth,
         graph_memory: Arc<parking_lot::RwLock<GraphMemory>>,
     ) -> Option<ExtractionResult> {
         let start = std::time::Instant::now();

@@ -50,7 +50,7 @@ pub async fn export_mif(
 
     // Gather data
     let memory_sys = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
     let memories = {
         let guard = memory_sys.read();
@@ -194,7 +194,7 @@ pub async fn import_mif(
     // Build dedup set from existing memories
     let dedup_set = if req.skip_duplicates {
         let memory_sys = state
-            .get_user_memory(&req.user_id)
+            .get_user_earth(&req.user_id)
             .map_err(AppError::Internal)?;
         let guard = memory_sys.read();
         let existing: Vec<String> = guard
@@ -214,7 +214,7 @@ pub async fn import_mif(
 
     {
         let memory_sys = state
-            .get_user_memory(&req.user_id)
+            .get_user_earth(&req.user_id)
             .map_err(AppError::Internal)?;
         let guard = memory_sys.read();
 
@@ -379,6 +379,7 @@ pub async fn add_entity(
         name_embedding: None,
         salience: 0.5,
         is_proper_noun: true,
+        pii_classification: Default::default(),
     };
 
     graph_guard.add_entity(entity).map_err(AppError::Internal)?;
@@ -524,7 +525,7 @@ pub async fn get_uncompressed_old(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();

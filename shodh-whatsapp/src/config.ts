@@ -1,4 +1,4 @@
-export type LLMProvider = "claude-cli" | "groq" | "anthropic" | "openai" | "ollama";
+export type LLMProvider = "claude-cli" | "groq" | "anthropic" | "openai" | "ollama" | "lmstudio";
 
 export const config = {
   shodh: {
@@ -23,6 +23,10 @@ export const config = {
     ollama: {
       baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
       model: process.env.OLLAMA_MODEL || "llama3.2",
+    },
+    lmstudio: {
+      baseUrl: process.env.LMSTUDIO_BASE_URL || "http://localhost:1234",
+      model: process.env.LMSTUDIO_MODEL || "qwq-32b-preview",
     },
   },
   whatsapp: {

@@ -4,6 +4,8 @@
 
 use std::sync::OnceLock;
 
+use crate::auth::AuthenticatedUser;
+use crate::errors::AppError;
 use crate::memory::ExperienceType;
 
 // Static regexes for entity extraction (compiled once at startup)
@@ -299,6 +301,69 @@ pub fn strip_system_noise(content: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+pub fn resolve_request_user_id(
+    request_user_id: Option<&str>,
+    authenticated_user: Option<&AuthenticatedUser>,
+) -> Result<String, AppError> {
+    if let Some(authenticated_user) = authenticated_user {
+        if let Some(request_user_id) = request_user_id {
+            if request_user_id != authenticated_user.user_id {
+                return Err(AppError::InvalidInput {
+                    field: "user_id".to_string(),
+                    reason: "does not match the authenticated tenant binding".to_string(),
+                });
+            }
+        }
+
+        return Ok(authenticated_user.user_id.clone());
+    }
+
+    request_user_id
+        .map(str::to_string)
+        .ok_or_else(|| AppError::InvalidInput {
+            field: "user_id".to_string(),
+            reason: "user_id required when API key is not tenant-bound".to_string(),
+        })
+}
+
+#[cfg(test)]
+mod resolve_request_user_id_tests {
+    use super::resolve_request_user_id;
+    use crate::auth::AuthenticatedUser;
+
+    #[test]
+    fn resolve_request_user_id_prefers_authenticated_user() {
+        let authenticated_user = AuthenticatedUser {
+            user_id: "alice".to_string(),
+        };
+
+        let resolved =
+            resolve_request_user_id(None, Some(&authenticated_user)).expect("should resolve");
+
+        assert_eq!(resolved, "alice");
+    }
+
+    #[test]
+    fn resolve_request_user_id_rejects_mismatch() {
+        let authenticated_user = AuthenticatedUser {
+            user_id: "alice".to_string(),
+        };
+
+        let error = resolve_request_user_id(Some("bob"), Some(&authenticated_user))
+            .expect_err("should reject mismatched tenant");
+
+        assert_eq!(error.code(), "INVALID_INPUT");
+    }
+
+    #[test]
+    fn resolve_request_user_id_requires_explicit_user_without_binding() {
+        let error =
+            resolve_request_user_id(None, None).expect_err("missing user should be rejected");
+
+        assert_eq!(error.code(), "INVALID_INPUT");
+    }
 }
 
 /// Check if content is a bare question (not worth storing as memory).
@@ -652,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_strip_mcp_response_noise() {
-        let mcp_output = "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n┃ 🧠 SHODH MEMORY ┃\n┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\nSurfaced 3 facts\n📌 User prefers dark mode\n📋 Project uses Rust for backend\n💡 Authentication uses JWT\n█████████░ 90%\n[Latency: 421ms | Threshold: 65%]\nsemantic: -12%";
+        let mcp_output = "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n┃ 🧠 VELD MEMORY  ┃\n┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\nSurfaced 3 facts\n📌 User prefers dark mode\n📋 Project uses Rust for backend\n💡 Authentication uses JWT\n█████████░ 90%\n[Latency: 421ms | Threshold: 65%]\nsemantic: -12%";
         let cleaned = strip_mcp_response_noise(mcp_output);
         assert!(cleaned.contains("User prefers dark mode"));
         assert!(cleaned.contains("Project uses Rust for backend"));

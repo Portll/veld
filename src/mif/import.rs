@@ -161,6 +161,7 @@ pub fn prepare_todos(doc: &MifDocument, user_id: &str) -> Vec<Todo> {
                 embedding: None,
                 related_memory_ids,
                 external_id: t.external_id.clone(),
+                depends_on: Vec::new(),
             }
         })
         .collect()
@@ -262,6 +263,7 @@ pub fn import_graph_entities(kg: &MifKnowledgeGraph, graph: &GraphMemory) -> (us
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: true,
+            pii_classification: Default::default(),
         };
 
         match graph.add_entity(node) {

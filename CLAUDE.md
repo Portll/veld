@@ -1,17 +1,19 @@
-# Shodh-Memory Project Instructions
+# Veld - Agentic Memory Project Instructions
 
 ## Code Standards
 - Production grade code only, no TODOs, no placeholders, no mocks, no stubs
 - Understand context, take a bird's eye view, understand architecture and data flow before fixing anything
 - Don't build, don't trunk serve - user runs in background
 - `cargo check` and `cargo clippy` are allowed (compiler frontend only, no binary output)
+- On macOS, prefer `./scripts/cargo-dev.sh ...` so Cargo inherits the local
+  libclang workaround needed by the current RocksDB build path
 - DO NOT add "Generated with Claude Code" signature or "Co-Authored-By" lines to git commits - clean commit messages only
 
 ---
 
 ## You Have Persistent Memory
 
-You are running with shodh-memory, a persistent cognitive memory system. This is not a tool you query - it is part of how you think.
+You are running with Veld - Agentic Memory, a persistent cognitive memory system. This is not a tool you query - it is part of how you think.
 
 ### How It Works
 
@@ -70,7 +72,7 @@ At session start, check `list_todos` to continue where you left off.
 
 ## This Codebase
 
-You are working on shodh-memory itself. Key components:
+You are working on the Veld - Agentic Memory codebase itself. Key components:
 
 - `src/` - Rust core (memory system, API server, embeddings, graph)
 - `mcp-server/` - TypeScript MCP server for Claude/Cursor integration

@@ -1,11 +1,17 @@
-# Shodh-Memory Retrieval Progress
+# Veld - Agentic Memory Retrieval Progress
 
-**Current**: v0.7.2 | MRR 0.925 | Temporal 0.900 | Single-hop 1.000 | Composite 78.4%
-**Target**: MRR 0.93+ | Composite 82%+
+**Current Branch**: v0.7.6-unstable | Stabilization and cleanup track toward v0.8
+**Last Benchmarked Retrieval Snapshot**: v0.7.2 | MRR 0.925 | Temporal 0.900 | Single-hop 1.000 | Composite 78.4%
+**Immediate Target**: clean v0.8 cut from `main`
+**Post-v0.8 Target**: v0.9 redb integration and public release hardening
 
 ---
 
-## Shipped (this session, v0.5.0 → v0.7.2)
+> Status note: this document mixes shipped retrieval results from the last benchmarked
+> snapshot with current branch cleanup work. Treat `v0.7.6-unstable` as unreleased and
+> not suitable for public release until the stabilization pass is complete.
+
+## Shipped (retrieval track, v0.5.0 -> v0.7.2)
 
 ### Architecture
 - [x] 20-signal retrieval pipeline (up from 3 effective signals)
@@ -15,7 +21,7 @@
 - [x] Build number auto-increment (build.rs + SHODH_VERSION_FULL)
 - [x] ScoringSignals shared struct for recall/relevance unification
 - [x] Signal attribution tracking (BM25/vector/graph/cross-encoder per memory)
-- [x] Pinky dimension push API (`POST /api/pinky/dimensions`)
+- [x] Sleight dimension push API (`POST /api/sleight/dimensions`)
 
 ### Retrieval Layers
 - [x] Layer 3.5: Working+Session brute-force cosine scan (root cause fix for temporal MRR)
@@ -42,7 +48,7 @@
 - [x] Signal 17: Activation level (3%)
 - [x] Signal 18: Temporal fact density (2%)
 - [x] Signal 19: Entity density (2%)
-- [x] Signal 20: Pinky dimension aggregate multiplier
+- [x] Signal 20: External (Sleight) dimension aggregate multiplier
 
 ### Tuning
 - [x] WH-word gravity: ontological boost 0.08→0.15, penalty -0.08, Layer 2 softened 0.5→0.6
@@ -56,8 +62,8 @@
 - [x] Partition-theoretic session detection (detect_sessions_adaptive)
 - [x] Causal edge extraction (extract_causal_pairs with anti-causal filtering)
 - [x] Per-memory access timestamp history (autocorrelation Phase A)
-- [x] 21 math formulas cataloged in shodh-memory
-- [x] Rips filtration + persistent homology in Pinky
+- [x] 21 math formulas cataloged in Veld - Agentic Memory
+- [x] Rips filtration + persistent homology in Sleight
 - [x] 30+ evaluation artifacts (Bifocal, Overlook, Overloop, Supernova)
 
 ---

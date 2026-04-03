@@ -1,6 +1,10 @@
-# shodh-memory
+# Veld - Agentic Memory Rust Crate
 
 **Persistent cognitive memory for AI agents. Local-first. Runs offline.**
+
+> Status: `v0.7.6-unstable` on this branch. This repo is in internal stabilization
+> toward `v0.8` and is not yet the clean public release line. Use published registry
+> artifacts only when you explicitly want the last public package, not this branch tip.
 
 [![crates.io](https://img.shields.io/crates/v/shodh-memory.svg)](https://crates.io/crates/shodh-memory)
 [![Downloads](https://img.shields.io/crates/d/shodh-memory.svg)](https://crates.io/crates/shodh-memory)
@@ -10,6 +14,11 @@
 
 Give your AI agents memory that persists across sessions, learns from experience, and runs entirely on your hardware.
 
+Product name: `Veld - Agentic Memory`. Published crate name: `shodh-memory`.
+
+This README describes the crate surface area, but the checked-out repository state may
+be ahead of the last published crate and may include unstable or in-progress changes.
+
 ## Installation
 
 ```toml
@@ -18,6 +27,21 @@ shodh-memory = "0.1"
 ```
 
 On first use, models (~37MB) download automatically to `~/.cache/shodh-memory/`.
+
+For local development on macOS, use `./scripts/cargo-dev.sh ...` from the repo
+root so Cargo inherits the current `libclang.dylib` loader workaround required
+by the RocksDB build path on this branch.
+
+### Build From Source (Branch Tip)
+
+If you need the checked-out `v0.7.6-unstable` tree rather than the last
+published crate, work from this repository directly:
+
+```bash
+./scripts/cargo-dev.sh build --release
+./target/release/shodh version
+./target/release/veld --help
+```
 
 ## Quick Start
 

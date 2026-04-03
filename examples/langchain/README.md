@@ -1,6 +1,6 @@
-# Shodh Memory + LangChain Integration
+# Veld - Agentic Memory + LangChain Integration
 
-Use Shodh Memory as a persistent memory backend for LangChain agents.
+Use Veld - Agentic Memory as a persistent memory backend for LangChain agents.
 
 ## Installation
 
@@ -51,5 +51,5 @@ See `shodh_memory_langchain.py` for complete examples including:
 
 ## Documentation
 
-- [Shodh Memory Docs](https://www.shodh-rag.com/memory)
+- [Veld Documentation](https://www.shodh-rag.com/memory)
 - [LangChain MCP Adapters](https://github.com/langchain-ai/langchain-mcp-adapters)

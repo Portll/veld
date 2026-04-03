@@ -9,7 +9,7 @@ timestamp T is gone from ListWorldObjects by T+15s. This means:
   - Returning to an area yields zero prior knowledge
   - Object permanence doesn't exist across the SDK
 
-This example demonstrates how shodh-memory gives Spot permanent object
+This example demonstrates how Veld - Agentic Memory gives Spot permanent object
 memory. Objects persist across missions, reboots, and power cycles.
 
 Run:
@@ -151,7 +151,7 @@ def run_demo():
         # Spot's native service registers the object (starts 15-sec TTL)
         spot_service.add_object(obj)
 
-        # We persist it in shodh-memory (permanent)
+        # We persist it in Veld (permanent)
         memory_id = bridge.persist_world_object_from_proto(obj)
         print(f"  Detected: {obj.name:30s} → persisted as {memory_id[:8]}...")
 
@@ -161,7 +161,7 @@ def run_demo():
 
     print()
     print(f"  Spot native:  {len(spot_objects)} objects (within 15-sec TTL)")
-    print(f"  Shodh-memory: {len(shodh_objects)} objects (permanent)")
+    print(f"  Veld: {len(shodh_objects)} objects (permanent)")
 
     # ─────────────────────────────────────────────────────────────
     # Phase 2: Time passes — Spot's objects expire
@@ -176,7 +176,7 @@ def run_demo():
     shodh_objects_after = bridge.recall_world_objects(limit=10)
 
     print(f"  Spot native:  {len(spot_objects_after)} objects (all expired)")
-    print(f"  Shodh-memory: {len(shodh_objects_after)} objects (all retained)")
+    print(f"  Veld: {len(shodh_objects_after)} objects (all retained)")
 
     # ─────────────────────────────────────────────────────────────
     # Phase 3: Robot returns to area — queries for nearby objects
@@ -239,11 +239,11 @@ def run_demo():
     print("=" * 70)
     print()
     print("  Spot SDK (native):  Objects lost after 15 seconds")
-    print("  Shodh-memory:       Objects persist permanently")
+    print("  Veld:               Objects persist permanently")
     print()
     print("  After 30 seconds:")
     print(f"    Spot native:  {len(spot_objects_after)} objects")
-    print(f"    Shodh-memory: {len(shodh_objects_after)} objects")
+    print(f"    Veld: {len(shodh_objects_after)} objects")
     print()
     print("  Cross-mission:")
     print(f"    Mission 002 recalled {len(cross_mission)} objects from Mission 001")

@@ -1,6 +1,6 @@
 [package]
 name = "shodh-memory"
-version = "0.7.3"
+version = "0.7.6-unstable"
 edition = "2021"
 authors = ["Shodh Team <29.varuns@gmail.com>"]
 description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
@@ -87,7 +87,7 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "shodh-memory-server"
+name = "veld"
 path = "src/main.rs"
 
 [[bin]]
@@ -125,6 +125,7 @@ bincode = { version = "2", features = ["serde"] }
 bincode1 = { package = "bincode", version = "1.3" }  # Legacy format support for pre-2.0 memories
 rmp-serde = "1.3"  # MessagePack - binary format that supports serde tagged enums
 lz4 = "1.28"
+redb = { version = "2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite slow store for gap topology queries (WAL mode)
 
 # Concurrency
@@ -302,14 +303,22 @@ debug-assertions = false
 incremental = false     # Full rebuild every time (no incremental artifacts)
 
 [features]
-# Default: minimal dependencies for edge devices (Raspberry Pi, drones, robotics)
-default = []
+# Default: runtime targets the redb migration path, while legacy RocksDB remains
+# the active compatibility engine until the storage abstraction is landed.
+default = ["storage-redb"]
+
+# Backend selection scaffolding for the storage migration.
+storage-redb = ["dep:redb"]
+legacy-rocksdb = []
 
 # Python bindings for PyO3
 python = ["pyo3", "numpy"]
 
 # Optional: LLM-based query parser (future: requires API key)
 llm-parser = []
+
+# Optional: hosaka multi-tenant collective learning and auth binding.
+multi-tenant = []
 
 # Optional: Zenoh transport for robotics/ROS2 (pure Rust, cross-platform)
 zenoh = ["dep:zenoh"]
@@ -335,6 +344,8 @@ telemetry = [
 # Without it, glibc/CRT malloc fragments heavily and never returns memory to the OS.
 # Confirmed fix by rust-rocksdb maintainer (zaidoon1) in facebook/rocksdb#12364.
 # PRs #989 (ran-openai) and #1026 (timothyg-stripe) fixed jemalloc linking in v0.24.0.
+# NOTE: rocksdb is currently unconditionally compiled on non-Windows.
+# TODO(v1.0): Gate behind legacy-rocksdb feature flag (138 source refs to cfg-gate)
 [target.'cfg(not(windows))'.dependencies]
 rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jemalloc"] }
 

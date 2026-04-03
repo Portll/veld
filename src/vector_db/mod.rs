@@ -1,3 +1,4 @@
+//! Earth layer: vector index infrastructure (Vamana, SPANN).
 //! Vector database module with pluggable index backends
 //!
 //! High-performance vector similarity search for the memory system.

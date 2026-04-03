@@ -1,0 +1,292 @@
+{
+  "evaluation_type": "supernova",
+  "target": "Decouple Pinky and Shodh — Hosaka fork plan with upstream contributions",
+  "date": "2026-03-30",
+  "model": "claude-opus-4-6",
+
+  "executive_summary": {
+    "key_insight": "Don't fork. Decouple at the DATA layer (SlowStore/SQLite), not the CODE layer (git fork). The novel IP is ~400 lines in 5 files — extract it as a Hosaka extension module that depends on upstream shodh, reads topology via SlowStore concurrent access, and writes back computed insights via HTTP.",
+    "the_plan": [
+      "1. Contribute standard improvements to shodh upstream, tag v0.8.0",
+      "2. Create Hosaka repo that depends on shodh v0.8.0 (git tag, not fork)",
+      "3. Novel IP (~400 lines) lives in Hosaka as extension modules",
+      "4. Hosaka reads shodh's SlowStore (SQLite WAL) for topology — zero-copy, no HTTP overhead",
+      "5. Hosaka writes computed insights back via shodh's HTTP API (lightweight scores/signals)",
+      "6. Pinky remains a separate project, already HTTP-decoupled, unchanged",
+      "7. TUI stays in shodh repo but adds optional Hosaka panel when Hosaka API is available"
+    ]
+  },
+
+  "phase_0_seed": {
+    "lens_a_edgewalk": {
+      "findings_count": 12,
+      "top_finding": "Vendored binary at pinky/ext/shodh-memory is v0.1.91 — 6 major versions behind. Fork approach already failed empirically (severity 8).",
+      "key_boundaries": [
+        "Pinky↔Shodh: HTTP API only, zero compile-time coupling",
+        "Implicit JSON contracts (GapAnalysisResult, VoronoiResult) with no shared types",
+        "Overlook state stored as OVERLOOK_CONCEPTUAL_SELF: prefix in shodh memories — reverse dependency",
+        "EdgeSource::CollectivePrior is a breaking enum variant for persisted data",
+        "PiiClassification not backfilled on existing entities",
+        "graph_retrieval signature change creates merge conflict surface"
+      ]
+    },
+    "lens_b_hde": {
+      "findings_count": 6,
+      "top_finding": "Fork is the wrong metaphor — Hosaka is a consumer of graph topology, not a modifier of storage. SlowStore (SQLite WAL) is the natural decoupling interface.",
+      "tangents_followed": [
+        "Fork vs wrapper vs sidecar — sidecar via SlowStore wins",
+        "Hebbian graph entanglement — membrane function in shodh, policy in Hosaka",
+        "Speed from data colocation, not code colocation",
+        "Git history cannot cleanly separate interleaved IP",
+        "TUI is the canary for decoupling quality",
+        "Contribute-then-depend beats fork-then-diverge"
+      ],
+      "unifying_insight": "The selective membrane principle applies to CODEBASE architecture, not just DATA architecture. SlowStore = membrane. Topology flows out (read-only). Computed insights flow in (HTTP push)."
+    },
+    "lens_c_clustering": {
+      "findings_count": 5,
+      "top_finding": "The fork boundary is within shodh files at block/line level, not between repos. ~400 lines of novel IP in graph_memory.rs, state.rs, decay.rs, constants.rs, auth.rs.",
+      "clusters": {
+        "S_upstream": "Pure substrate (storage, embeddings, vector search, types) — ~450K lines, clean boundary",
+        "H_hosaka": "Novel IP (~400 lines mixed into 5 files) — CollectiveStore, PII policy, decay multipliers, edge export",
+        "P_pinky": "Cognitive orchestrator — entirely HTTP-decoupled, zero type coupling, clean boundary",
+        "T_interface": "TUI, MCP, hooks — separate processes, clean boundary",
+        "ambiguous": "PinkyDimensionScores (rename to ExternalDimensionScores), UserId/auth (upstream candidate)"
+      },
+      "missing_mediators": [
+        "trait CollectiveAggregator — pluggable population-level computation",
+        "trait PiiPolicy — pluggable PII classification policy",
+        "trait ExternalScoreProvider — generic external quality signal push",
+        "trait WeightPersistence — pluggable weight serialization strategy",
+        "Server version/capability endpoint — /version or /capabilities"
+      ]
+    }
+  },
+
+  "phase_1_cross_pollination": {
+    "ab_products": [
+      {"id": "XP-1", "finding": "Vendored fork at ext/shodh-memory (v0.1.91, 6 versions behind) is empirical proof that forking creates maintenance debt. SlowStore interface avoids this.", "rpn": 504},
+      {"id": "XP-2", "finding": "Overlook state + PinkyScores = two ad-hoc implementations of the same bidirectional protocol. Formalize as ExternalScoreProvider + ContextBlocks.", "rpn": 343},
+      {"id": "XP-3", "finding": "JSON contract drift (sev 7) only applies to lightweight HTTP write-back path. Heavy reads go through SlowStore (no JSON serialization).", "rpn": 294}
+    ],
+    "ac_products": [
+      {"id": "XP-4", "finding": "C's line-precise mapping of ~400 lines novel IP in 5 files gives exact cherry-pick boundaries for A's upstream PR.", "rpn": 280},
+      {"id": "XP-5", "finding": "C's 5 missing mediator traits ARE the API contract A found missing. Traits = compile-time contract enforcement.", "rpn": 392}
+    ],
+    "bc_products": [
+      {"id": "XP-6", "finding": "SlowStore = C's cluster boundary between substrate and novel IP = B's data interface. Same boundary seen from three angles.", "rpn": 448},
+      {"id": "XP-7", "finding": "Orphaned ext/shodh-memory proves shodh-core extraction is premature. Contribute-then-tag-then-depend instead.", "rpn": 336},
+      {"id": "XP-8", "finding": "Rename PinkyDimensionScores → ExternalDimensionScores as first commit before any other work.", "rpn": 120}
+    ]
+  },
+
+  "phase_2_resonances": [
+    {
+      "id": "R1",
+      "name": "SlowStore Is the Decoupling Interface",
+      "classification": "VOID",
+      "dimensionality": 5,
+      "survived_adversarial": true,
+      "adversary_score": 3,
+      "finding_score": 8,
+      "pairwise_appearances": ["XP-3 (A×B)", "XP-5 (A×C)", "XP-6 (B×C)"]
+    },
+    {
+      "id": "R2",
+      "name": "Novel IP Is ~400 Lines, Not a Fork",
+      "classification": "TENSION",
+      "dimensionality": 4,
+      "survived_adversarial": true,
+      "adversary_score": 4,
+      "finding_score": 9,
+      "three_body": "upstream shodh × Hosaka × Pinky on graph_memory.rs changes",
+      "pairwise_appearances": ["XP-1 (A×B)", "XP-4 (A×C)", "XP-7 (B×C)"]
+    },
+    {
+      "id": "R3",
+      "name": "Contribute-Then-Depend Workflow",
+      "classification": "VOID",
+      "dimensionality": 3,
+      "survived_adversarial": true,
+      "adversary_score": 5,
+      "finding_score": 8,
+      "pairwise_appearances": ["XP-1 (A×B)", "XP-7 (B×C)", "XP-5 (A×C)"]
+    },
+    {
+      "id": "R4",
+      "name": "Formalize Bidirectional Protocol",
+      "classification": "FAULT",
+      "dimensionality": 3,
+      "survived_adversarial": true,
+      "adversary_score": 5,
+      "finding_score": 7,
+      "pairwise_appearances": ["XP-2 (A×B)", "XP-5 (A×C)"]
+    }
+  ],
+
+  "phase_4_convergence": {
+    "R1_fix": {
+      "name": "SlowStore schema contract with versioning",
+      "converged_at": "iteration 2",
+      "final_fix": "Add schema_version table to SlowStore. Upstream shodh = v1 (base tables). Hosaka extends to v2+ (collective topology, Voronoi centroids, interference events). Hosaka reads via WAL concurrent readers."
+    },
+    "R2_fix": {
+      "name": "Hosaka extension module, not fork",
+      "converged_at": "iteration 2",
+      "final_fix": "Create hosaka/src/extensions/ that imports shodh types and adds CollectiveStore, pii_aware_decay, export_collective_edges. Upstream PR includes EdgeSource::CollectivePrior as inert variant + #[serde(other)] for future-proofing."
+    },
+    "R3_fix": {
+      "name": "Contribute → tag → depend workflow",
+      "converged_at": "iteration 1",
+      "final_fix": "PR standard changes to shodh main. Tag v0.8.0. Hosaka Cargo.toml: shodh-memory = { git = '...', tag = 'v0.8.0' }. CI builds Hosaka against shodh main nightly."
+    },
+    "R4_fix": {
+      "name": "ExternalScoreProvider + ContextBlocks",
+      "converged_at": "iteration 2",
+      "final_fix": "Rename PinkyDimensionScores → ExternalDimensionScores. Rename handlers/pinky.rs → handlers/external_dimensions.rs. Move Overlook state from memory prefix-hack to /api/context/blocks."
+    }
+  },
+
+  "phase_5_resolution": {
+    "ranked_actions": [
+      {
+        "priority": "P0",
+        "action": "Rename PinkyDimensionScores → ExternalDimensionScores and handlers/pinky.rs → handlers/external_dimensions.rs",
+        "rationale": "Prerequisite — removes naming coupling before any upstream PR",
+        "effort": "LOW (rename + update ~10 call sites)",
+        "files": ["src/memory/types.rs", "src/handlers/pinky.rs", "src/memory/recall.rs"]
+      },
+      {
+        "priority": "P0",
+        "action": "PR standard changes to shodh-memory main branch, tag v0.8.0",
+        "rationale": "3-lens resonance (R3). Enables Hosaka to depend on versioned shodh instead of forking.",
+        "effort": "MEDIUM (clean up diff, squash, test, PR)",
+        "upstream_changes": [
+          "UserId, AuthenticatedUser (types.rs)",
+          "hash_api_key() (auth.rs)",
+          "PiiClassification enum + EntityNode field with #[serde(default)] (graph_memory.rs)",
+          "EdgeSource::CollectivePrior as inert variant + #[serde(other)] (graph_memory.rs)",
+          "LearnedWeights.to_json()/from_json(), get_learned_weights() (hybrid_search.rs, mod.rs)",
+          "ExternalDimensionScores rename (types.rs, handlers/)",
+          "PERSON_EDGE_DECAY_MULTIPLIER, ORGANIZATION_EDGE_DECAY_MULTIPLIER (constants.rs)"
+        ]
+      },
+      {
+        "priority": "P0",
+        "action": "Create Hosaka repo with shodh-memory as git tag dependency",
+        "rationale": "3-lens resonance (R2). ~400 lines of novel IP as extension module, NOT a 500K-line fork.",
+        "effort": "MEDIUM (new repo, Cargo.toml, extract extensions)",
+        "hosaka_modules": [
+          "extensions/collective_store.rs — CollectiveStore, PopulationWeights",
+          "extensions/pii_policy.rs — is_edge_safe_for_collective, pii_aware_decay_factor, export_collective_edges",
+          "extensions/auth_binding.rs — KeyUserBindings, validate_api_key_with_user",
+          "extensions/maintenance.rs — weight aggregation, Moka eviction persistence"
+        ]
+      },
+      {
+        "priority": "P1",
+        "action": "Formalize SlowStore as the data interface contract",
+        "rationale": "3-lens resonance (R1). SlowStore = the selective membrane between shodh substrate and Hosaka intelligence.",
+        "effort": "MEDIUM (schema versioning, collective tables, Hosaka reader)",
+        "schema_additions": [
+          "schema_version table (version integer, updated_at timestamp)",
+          "collective_edges table (from_name, to_name, strength, relation_type, contributing_users)",
+          "population_weights table (bm25, vector, graph, contributing_users, updated_at)",
+          "voronoi_voids table (centroid_json, boundary_entities_json, avg_isolation, user_count)",
+          "interference_events table (entity_pair, divergence_count, user_cluster_id)"
+        ]
+      },
+      {
+        "priority": "P1",
+        "action": "Move Overlook state from memory prefix-hack to /api/context/blocks",
+        "rationale": "2-lens resonance (R4). Current OVERLOOK_CONCEPTUAL_SELF: prefix is brittle.",
+        "effort": "LOW (Pinky side: change 2 HTTP calls. Shodh side: already has ContextBlockStore)",
+        "files": ["pinky/src/mcp_helpers.rs", "pinky/src/mcp_main.rs"]
+      },
+      {
+        "priority": "P1",
+        "action": "Replace pinky/ext/shodh-memory with versioned dependency",
+        "rationale": "2-lens resonance. ext/shodh-memory at v0.1.91 is orphaned, 6 versions behind.",
+        "effort": "LOW (delete ext/shodh-memory, update shodh_server.rs to find binary via PATH or config)",
+        "files": ["pinky/src/shodh_server.rs", "pinky/ext/ (delete)"]
+      },
+      {
+        "priority": "P2",
+        "action": "Add migration to backfill PiiClassification on existing entities",
+        "rationale": "Without backfill, is_edge_safe_for_collective returns true for all edges (vacuously — all entities default to Clean)",
+        "effort": "LOW (~20 lines in maintenance cycle: iterate entities, call from_labels, persist)",
+        "files": ["src/graph_memory.rs or hosaka/extensions/maintenance.rs"]
+      },
+      {
+        "priority": "P2",
+        "action": "Add /version endpoint to shodh for capability discovery",
+        "rationale": "Pinky and Hosaka need to know which shodh version they're talking to",
+        "effort": "LOW (5 lines: return {version: env!(CARGO_PKG_VERSION), features: [...]})",
+        "files": ["src/handlers/router.rs"]
+      }
+    ],
+
+    "what_does_NOT_get_forked": [
+      "The entire shodh-memory codebase (~500K lines)",
+      "RocksDB storage, Vamana index, embedders, BM25, compression, MIF",
+      "The 11-layer recall pipeline",
+      "Graph memory (graph_memory.rs — standard parts)",
+      "Server, handlers, MCP, auth (standard parts)",
+      "TUI, hooks, Python bindings"
+    ],
+
+    "what_lives_in_hosaka": [
+      "CollectiveStore + PopulationWeights (~65 lines)",
+      "is_edge_safe_for_collective + export_collective_edges (~50 lines)",
+      "pii_aware_decay_factor (~20 lines)",
+      "KeyUserBindings + validate_api_key_with_user (~60 lines)",
+      "Maintenance weight aggregation + Moka eviction persistence (~30 lines)",
+      "SlowStore collective schema extensions (~100 lines)",
+      "Future: Voronoi atlas, interference clustering, contested gaps, behavioral archetypes (~TBD)"
+    ],
+
+    "what_lives_in_pinky": [
+      "Everything currently in pinky/ — unchanged",
+      "Overlook engine, Bifocal+, FourEyes, persistent homology, distortions",
+      "HTTP calls to shodh API (already clean)",
+      "Future: HTTP calls to Hosaka API for novel intelligence signals"
+    ],
+
+    "architecture_diagram": {
+      "description": "Three-process architecture with data-layer coupling",
+      "ascii": [
+        "┌─────────────┐     HTTP (scores)      ┌──────────────┐",
+        "│   Pinky      │◄──────────────────────►│    Shodh     │",
+        "│ (orchestrator)│     HTTP (recall)      │  (substrate) │",
+        "└──────┬────────┘                        └──────┬───────┘",
+        "       │                                        │",
+        "       │ HTTP (novel signals)                   │ writes",
+        "       ▼                                        ▼",
+        "┌──────────────┐    SQLite WAL (reads)   ┌──────────────┐",
+        "│   Hosaka      │◄───────────────────────│  SlowStore   │",
+        "│ (intelligence)│    (concurrent, 0-copy) │  (per-user)  │",
+        "└──────────────┘                         └──────────────┘"
+      ]
+    },
+
+    "coverage_ratio": {
+      "components_examined": 38,
+      "components_total": 45,
+      "coverage": 0.84
+    },
+    "orthogonality_score": {
+      "value": 0.87,
+      "note": "High — Lens A found operational coupling, B found architectural metaphor, C found code-level topology. Minimal overlap."
+    },
+    "resonance_count": {
+      "triple": 3,
+      "double": 1,
+      "survived_adversarial": 4,
+      "collapsed": 0
+    },
+    "convergence_map": {
+      "converged": ["R1 (iter 2)", "R2 (iter 2)", "R3 (iter 1)", "R4 (iter 2)"],
+      "oscillating": []
+    }
+  }
+}

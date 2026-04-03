@@ -12,7 +12,7 @@
 //! # Edge Optimizations
 //! - Lazy model loading (reduces startup RAM by ~200MB)
 //! - Configurable thread count for power efficiency
-//! - RocksDB embedded storage (no external database)
+//! - Backend-selectable embedded storage (legacy RocksDB compatibility today)
 //! - Full offline operation
 
 pub mod ab_testing;
@@ -22,9 +22,12 @@ pub mod config;
 pub mod constants;
 pub mod decay;
 pub mod decay_scales;
+pub mod earth;
 pub mod embeddings;
 pub mod encryption;
 pub mod errors;
+#[cfg(feature = "multi-tenant")]
+pub mod extensions;
 pub mod graph_memory;
 pub mod handlers;
 pub mod ingest;
@@ -35,8 +38,10 @@ pub mod middleware;
 pub mod mif;
 pub mod query_parsing;
 pub mod relevance;
+pub mod roots;
 pub mod server;
 pub mod similarity;
+pub mod storage;
 pub mod streaming;
 pub mod tracing_setup;
 pub mod validation;

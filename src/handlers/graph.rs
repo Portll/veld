@@ -4,7 +4,7 @@
 //! entity management, and memory universe visualization.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     response::Json,
 };
 use serde::Deserialize;
@@ -12,6 +12,8 @@ use tracing::info;
 
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse};
 use crate::memory::{Experience, MemoryId};
@@ -23,8 +25,13 @@ type AppState = Arc<MultiUserMemoryManager>;
 /// GET /api/graph/{user_id}/stats - Get graph statistics for a user
 pub async fn get_graph_stats(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<GraphStats>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let stats = state
@@ -165,8 +172,13 @@ pub async fn get_all_entities(
 /// GET /api/graph/{user_id}/universe - Get Memory Universe visualization
 pub async fn get_memory_universe(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<MemoryUniverse>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
@@ -182,8 +194,13 @@ pub async fn get_memory_universe(
 /// DELETE /api/graph/{user_id}/clear - Clear all graph data for a user
 pub async fn clear_user_graph(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
@@ -226,8 +243,13 @@ pub async fn clear_user_graph(
 /// POST /api/graph/{user_id}/rebuild - Rebuild graph from all existing memories
 pub async fn rebuild_user_graph(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     // First, clear existing graph data
@@ -239,7 +261,7 @@ pub async fn rebuild_user_graph(
 
     // Get all memories for this user
     let memory_sys = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
     let memories: Vec<(MemoryId, Experience)> = {
         let memory_guard = memory_sys.read();

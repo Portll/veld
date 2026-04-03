@@ -288,7 +288,7 @@ async fn handle_streaming_socket(socket: WebSocket, state: AppState) {
             .get_session_stats(&session_id)
             .await;
         match stats {
-            Some(s) => match state.get_user_memory(&s.user_id) {
+            Some(s) => match state.get_user_earth(&s.user_id) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!("Failed to get user memory: {}", e);
@@ -485,7 +485,7 @@ async fn handle_context_monitor_socket(socket: WebSocket, state: AppState) {
     };
 
     // Get user memory and graph systems
-    let memory_sys = match state.get_user_memory(&user_id) {
+    let memory_sys = match state.get_user_earth(&user_id) {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed to get user memory: {}", e);
