@@ -64,11 +64,11 @@ class ShodhLlamaMemory:
     def __post_init__(self):
         # Get API key from param or environment
         if self.api_key is None:
-            self.api_key = os.environ.get("SHODH_API_KEY")
+            self.api_key = os.environ.get("VELD_API_KEY") or os.environ.get("SHODH_API_KEY")
 
         if not self.api_key:
             raise ValueError(
-                "API key required. Pass api_key parameter or set SHODH_API_KEY env var."
+                "API key required. Pass api_key parameter or set VELD_API_KEY env var."
             )
 
         # Setup HTTP session with retry logic

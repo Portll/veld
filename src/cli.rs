@@ -26,7 +26,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use shodh_memory::config::StorageBackend;
+use shodh_memory::config::{promote_env_aliases, StorageBackend};
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 // =============================================================================
@@ -60,36 +60,36 @@ enum Commands {
     /// Start the HTTP API server
     Server {
         /// Bind address (use 0.0.0.0 for network access)
-        #[arg(short = 'H', long, env = "SHODH_HOST", default_value = "127.0.0.1")]
+        #[arg(short = 'H', long, env = "VELD_HOST", default_value = "127.0.0.1")]
         host: String,
 
         /// Port number to listen on
-        #[arg(short, long, env = "SHODH_PORT", default_value_t = 3030)]
+        #[arg(short, long, env = "VELD_PORT", default_value_t = 3030)]
         port: u16,
 
         /// Storage directory for the selected backend data
         #[arg(
             short,
             long = "storage",
-            env = "SHODH_MEMORY_PATH",
+            env = "VELD_MEMORY_PATH",
             default_value_os_t = shodh_memory::config::default_storage_path()
         )]
         storage_path: PathBuf,
 
         /// Requested storage backend (`redb` target, `rocksdb` legacy compatibility)
-        #[arg(long, env = "SHODH_STORAGE_BACKEND", default_value = "redb")]
+        #[arg(long, env = "VELD_STORAGE_BACKEND", default_value = "redb")]
         storage_backend: StorageBackend,
 
         /// Production mode: deny-all CORS fallback, backup auto-enable, and startup safety warnings
-        #[arg(long, env = "SHODH_ENV")]
+        #[arg(long, env = "VELD_ENV")]
         production: bool,
 
         /// Rate limit: max requests per second per client (0 = disabled)
-        #[arg(long, env = "SHODH_RATE_LIMIT", default_value_t = 4000)]
+        #[arg(long, env = "VELD_RATE_LIMIT", default_value_t = 4000)]
         rate_limit: u64,
 
         /// Maximum concurrent requests before load shedding
-        #[arg(long, env = "SHODH_MAX_CONCURRENT", default_value_t = 200)]
+        #[arg(long, env = "VELD_MAX_CONCURRENT", default_value_t = 200)]
         max_concurrent: usize,
     },
 
@@ -98,7 +98,7 @@ enum Commands {
         /// API URL for the Veld server
         #[arg(
             long,
-            env = "SHODH_SERVER_URL",
+            env = "VELD_SERVER_URL",
             default_value = "http://127.0.0.1:3030"
         )]
         api_url: String,
@@ -106,8 +106,8 @@ enum Commands {
         /// API key for authentication
         #[arg(
             long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
+            env = "VELD_API_KEY",
+            default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
     },
@@ -115,19 +115,19 @@ enum Commands {
     /// Run as MCP server (stdio transport)
     Serve {
         /// API URL for the Veld server
-        #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
+        #[arg(long, env = "VELD_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
         #[arg(
             long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
+            env = "VELD_API_KEY",
+            default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
 
         /// User ID for Veld operations
-        #[arg(long, env = "SHODH_USER_ID", default_value = "claude-code")]
+        #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
         user_id: String,
     },
 
@@ -137,14 +137,14 @@ enum Commands {
     /// Check server health and status
     Status {
         /// API URL for the Veld server
-        #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
+        #[arg(long, env = "VELD_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
         #[arg(
             long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
+            env = "VELD_API_KEY",
+            default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
     },
@@ -178,19 +178,19 @@ enum HookType {
     /// Session start hook - restore context
     SessionStart {
         /// API URL for the Veld server
-        #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
+        #[arg(long, env = "VELD_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
         #[arg(
             long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
+            env = "VELD_API_KEY",
+            default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
 
         /// User ID for Veld operations
-        #[arg(long, env = "SHODH_USER_ID", default_value = "claude-code")]
+        #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
         user_id: String,
 
         /// Project directory (from CLAUDE_PROJECT_DIR)
@@ -204,19 +204,19 @@ enum HookType {
         message: String,
 
         /// API URL for the Veld server
-        #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
+        #[arg(long, env = "VELD_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
         #[arg(
             long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
+            env = "VELD_API_KEY",
+            default_value = "sk-veld-dev-local-testing-key"
         )]
         api_key: String,
 
         /// User ID for Veld operations
-        #[arg(long, env = "SHODH_USER_ID", default_value = "claude-code")]
+        #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
         user_id: String,
     },
 }
@@ -229,6 +229,10 @@ enum HookType {
 async fn main() -> Result<()> {
     #[cfg(feature = "fortress")]
     shodh_memory::fortress::init();
+
+    unsafe {
+        promote_env_aliases();
+    }
 
     let cli = Cli::parse();
 

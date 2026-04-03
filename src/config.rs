@@ -28,7 +28,7 @@ pub fn env_var_truthy(primary: &str, legacy: &str) -> Option<bool> {
 /// Safety: this mutates process environment and must only run before the
 /// multi-threaded runtime starts.
 pub unsafe fn promote_env_aliases() {
-    const ALIASES: [(&str, &str); 34] = [
+    const ALIASES: [(&str, &str); 48] = [
         ("VELD_ENV", "SHODH_ENV"),
         ("VELD_HOST", "SHODH_HOST"),
         ("VELD_PORT", "SHODH_PORT"),
@@ -38,9 +38,11 @@ pub unsafe fn promote_env_aliases() {
         ("VELD_API_KEY", "SHODH_API_KEY"),
         ("VELD_DEV_API_KEY", "SHODH_DEV_API_KEY"),
         ("VELD_HIDE_DEV_KEY", "SHODH_HIDE_DEV_KEY"),
+        ("VELD_USER_ID", "SHODH_USER_ID"),
         ("VELD_MULTI_TENANT", "SHODH_MULTI_TENANT"),
         ("VELD_COLLECTIVE_STORE_DIR", "SHODH_COLLECTIVE_STORE_DIR"),
         ("VELD_KEY_USER_BINDINGS_PATH", "SHODH_KEY_USER_BINDINGS_PATH"),
+        ("VELD_ENCRYPTION_KEY", "SHODH_ENCRYPTION_KEY"),
         ("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT"),
         ("VELD_RATE_BURST", "SHODH_RATE_BURST"),
         ("VELD_MAX_CONCURRENT", "SHODH_MAX_CONCURRENT"),
@@ -63,6 +65,23 @@ pub unsafe fn promote_env_aliases() {
         ("VELD_CORS_WARN", "SHODH_CORS_WARN"),
         ("VELD_SERVER_URL", "SHODH_SERVER_URL"),
         ("VELD_API_URL", "SHODH_API_URL"),
+        ("VELD_EMBEDDING_API_URL", "SHODH_EMBEDDING_API_URL"),
+        ("VELD_EMBEDDING_API_MODEL", "SHODH_EMBEDDING_API_MODEL"),
+        ("VELD_EMBEDDING_API_KEY", "SHODH_EMBEDDING_API_KEY"),
+        (
+            "VELD_EMBEDDING_API_TIMEOUT_MS",
+            "SHODH_EMBEDDING_API_TIMEOUT_MS",
+        ),
+        ("VELD_LLM_URL", "SHODH_LLM_URL"),
+        ("VELD_LLM_MODEL", "SHODH_LLM_MODEL"),
+        ("VELD_LLM_API_TYPE", "SHODH_LLM_API_TYPE"),
+        ("VELD_ZENOH_ENABLED", "SHODH_ZENOH_ENABLED"),
+        ("VELD_ZENOH_MODE", "SHODH_ZENOH_MODE"),
+        ("VELD_ZENOH_CONNECT", "SHODH_ZENOH_CONNECT"),
+        ("VELD_ZENOH_LISTEN", "SHODH_ZENOH_LISTEN"),
+        ("VELD_ZENOH_PREFIX", "SHODH_ZENOH_PREFIX"),
+        ("VELD_ZENOH_API_KEY", "SHODH_ZENOH_API_KEY"),
+        ("VELD_ZENOH_AUTO_TOPICS", "SHODH_ZENOH_AUTO_TOPICS"),
     ];
 
     for (primary, legacy) in ALIASES {

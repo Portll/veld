@@ -7,6 +7,7 @@ use axum::{
 };
 use std::env;
 
+use crate::config::{env_var, env_var_truthy};
 use crate::errors::ErrorResponse;
 
 #[cfg(feature = "multi-tenant")]
@@ -15,7 +16,7 @@ use axum::body::{to_bytes, Body};
 #[cfg(feature = "multi-tenant")]
 pub use crate::extensions::auth_binding::KeyUserBindings;
 
-pub const KEY_USER_BINDINGS_PATH_ENV: &str = "SHODH_KEY_USER_BINDINGS_PATH";
+pub const KEY_USER_BINDINGS_PATH_ENV: &str = "VELD_KEY_USER_BINDINGS_PATH";
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedUser {
@@ -28,9 +29,9 @@ pub(crate) fn default_dev_api_key() -> String {
     use std::sync::OnceLock;
     static KEY: OnceLock<String> = OnceLock::new();
     KEY.get_or_init(|| {
-        let key = format!("sk-shodh-dev-{}", uuid::Uuid::new_v4().simple());
+        let key = format!("sk-veld-dev-{}", uuid::Uuid::new_v4().simple());
         tracing::warn!("Auto-generated dev API key: {key}");
-        tracing::warn!("Set SHODH_API_KEYS or SHODH_DEV_API_KEY to use a stable key.");
+        tracing::warn!("Set VELD_API_KEYS or VELD_DEV_API_KEY to use a stable key. Legacy SHODH_* aliases still work.");
         key
     })
     .clone()
@@ -38,31 +39,29 @@ pub(crate) fn default_dev_api_key() -> String {
 
 /// Check if running in production mode
 pub fn is_production_mode() -> bool {
-    env::var("SHODH_ENV")
+    env_var("VELD_ENV", "SHODH_ENV")
         .map(|v| v.to_lowercase() == "production" || v.to_lowercase() == "prod")
         .unwrap_or(false)
 }
 
 /// Check if dev key should be hidden from error messages.
 ///
-/// Returns true when SHODH_HIDE_DEV_KEY=true (opt-in).
+/// Returns true when VELD_HIDE_DEV_KEY=true (opt-in).
 /// In production mode, always returns true regardless of the env var.
 fn should_hide_dev_key() -> bool {
     if is_production_mode() {
         return true;
     }
-    env::var("SHODH_HIDE_DEV_KEY")
-        .map(|v| v.to_lowercase() == "true" || v == "1")
-        .unwrap_or(false)
+    env_var_truthy("VELD_HIDE_DEV_KEY", "SHODH_HIDE_DEV_KEY").unwrap_or(false)
 }
 
 /// Log security warnings at startup based on environment configuration
 pub fn log_security_status() {
-    let has_api_keys = env::var("SHODH_API_KEYS")
-        .or_else(|_| env::var("SHODH_API_KEY"))
+    let has_api_keys = env_var("VELD_API_KEYS", "SHODH_API_KEYS")
+        .or_else(|_| env_var("VELD_API_KEY", "SHODH_API_KEY"))
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false);
-    let has_dev_key = env::var("SHODH_DEV_API_KEY")
+    let has_dev_key = env_var("VELD_DEV_API_KEY", "SHODH_DEV_API_KEY")
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false);
     let is_prod = is_production_mode();
@@ -72,7 +71,7 @@ pub fn log_security_status() {
             tracing::info!("Running in PRODUCTION mode with API key authentication");
         } else {
             tracing::error!(
-                "PRODUCTION mode but SHODH_API_KEYS not set! Server will reject all authenticated requests."
+                "PRODUCTION mode but VELD_API_KEYS not set! Server will reject all authenticated requests. Legacy SHODH_API_KEYS is still accepted."
             );
         }
     } else {
@@ -80,18 +79,18 @@ pub fn log_security_status() {
         tracing::warn!("║  SECURITY WARNING: Running in DEVELOPMENT mode                 ║");
         tracing::warn!("║                                                                ║");
         if has_dev_key {
-            tracing::warn!("║  Using SHODH_DEV_API_KEY for authentication.                  ║");
+            tracing::warn!("║  Using VELD_DEV_API_KEY for authentication.                   ║");
             tracing::warn!("║  DO NOT use this configuration in production!                 ║");
         } else if !has_api_keys {
             tracing::warn!("║  No API keys configured. Using default dev key.              ║");
             tracing::warn!("║  DEPRECATION: Default dev key will be removed in v0.2.0.     ║");
-            tracing::warn!("║  Set SHODH_DEV_API_KEY or SHODH_API_KEYS to override.        ║");
-            tracing::warn!("║  Set SHODH_HIDE_DEV_KEY=true to hide key from error msgs.    ║");
+            tracing::warn!("║  Set VELD_DEV_API_KEY or VELD_API_KEYS to override.          ║");
+            tracing::warn!("║  Set VELD_HIDE_DEV_KEY=true to hide key from error msgs.     ║");
         }
         tracing::warn!("║                                                                ║");
         tracing::warn!("║  For production, set:                                          ║");
-        tracing::warn!("║    SHODH_ENV=production                                        ║");
-        tracing::warn!("║    SHODH_API_KEYS=your-secure-key-1,your-secure-key-2          ║");
+        tracing::warn!("║    VELD_ENV=production                                         ║");
+        tracing::warn!("║    VELD_API_KEYS=your-secure-key-1,your-secure-key-2           ║");
         tracing::warn!("╚════════════════════════════════════════════════════════════════╝");
     }
 }
@@ -131,14 +130,14 @@ impl IntoResponse for AuthError {
                 if is_prod {
                     "Missing X-API-Key header".to_string()
                 } else if should_hide_dev_key() {
-                    "Missing X-API-Key header. Set SHODH_DEV_API_KEY or SHODH_API_KEYS. \
+                    "Missing X-API-Key header. Set VELD_DEV_API_KEY or VELD_API_KEYS. \
                      See docs for setup."
                         .to_string()
                 } else {
                     format!(
                         "Missing X-API-Key header. Set the header in your request. \
-                         The server accepts keys from SHODH_API_KEYS (comma-separated) \
-                         or SHODH_DEV_API_KEY.\nDefault dev key: '{}'",
+                         The server accepts keys from VELD_API_KEYS (comma-separated) \
+                         or VELD_DEV_API_KEY.\nDefault dev key: '{}'",
                         default_dev_api_key()
                     )
                 }
@@ -147,17 +146,17 @@ impl IntoResponse for AuthError {
                 if is_prod {
                     "Invalid API key".to_string()
                 } else if should_hide_dev_key() {
-                    "Invalid API key. Check SHODH_DEV_API_KEY or SHODH_API_KEYS.".to_string()
+                    "Invalid API key. Check VELD_DEV_API_KEY or VELD_API_KEYS.".to_string()
                 } else {
                     format!(
-                        "Invalid API key.\nExpected a key from SHODH_API_KEYS or \
-                         SHODH_DEV_API_KEY.\nDefault dev key: '{}'",
+                        "Invalid API key.\nExpected a key from VELD_API_KEYS or \
+                         VELD_DEV_API_KEY.\nDefault dev key: '{}'",
                         default_dev_api_key()
                     )
                 }
             }
             AuthError::NotConfigured => {
-                "API keys not configured. Set SHODH_API_KEYS environment variable.".to_string()
+                "API keys not configured. Set VELD_API_KEYS environment variable. Legacy SHODH_API_KEYS is still accepted.".to_string()
             }
         };
 
@@ -202,35 +201,35 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
 /// Validate API key against configured keys using constant-time comparison
 pub fn validate_api_key(provided_key: &str) -> Result<(), AuthError> {
     // Get API keys from environment.
-    // Resolution order: SHODH_API_KEYS (plural, comma-separated) → SHODH_API_KEY (singular)
-    //                 → SHODH_DEV_API_KEY (dev mode) → built-in default (dev mode only)
-    let valid_keys = match env::var("SHODH_API_KEYS") {
+    // Resolution order: VELD_API_KEYS (plural, comma-separated) → VELD_API_KEY (singular)
+    //                 → VELD_DEV_API_KEY (dev mode) → built-in default (dev mode only)
+    let valid_keys = match env_var("VELD_API_KEYS", "SHODH_API_KEYS") {
         Ok(keys) if !keys.trim().is_empty() => keys,
-        _ => match env::var("SHODH_API_KEY") {
+        _ => match env_var("VELD_API_KEY", "SHODH_API_KEY") {
             Ok(key) if !key.trim().is_empty() => key,
             _ => {
                 // In production, refuse to start without API keys
-                let is_production = env::var("SHODH_ENV")
+                let is_production = env_var("VELD_ENV", "SHODH_ENV")
                     .map(|v| v.to_lowercase() == "production" || v.to_lowercase() == "prod")
                     .unwrap_or(false);
 
                 if is_production {
-                    tracing::error!("SHODH_API_KEYS not set in production mode");
+                    tracing::error!("VELD_API_KEYS not set in production mode");
                     return Err(AuthError::NotConfigured);
                 }
 
-                // Development mode: use SHODH_DEV_API_KEY, or fall back to built-in default
-                match env::var("SHODH_DEV_API_KEY") {
+                // Development mode: use VELD_DEV_API_KEY, or fall back to built-in default
+                match env_var("VELD_DEV_API_KEY", "SHODH_DEV_API_KEY") {
                     Ok(key) if !key.trim().is_empty() => {
                         tracing::warn!(
-                            "Using SHODH_DEV_API_KEY for development (not for production!)"
+                            "Using VELD_DEV_API_KEY for development (not for production!)"
                         );
                         key
                     }
                     _ => {
                         tracing::warn!(
                             "No API key configured. Falling back to default dev key. \
-                             Set SHODH_DEV_API_KEY to override."
+                             Set VELD_DEV_API_KEY to override."
                         );
                         default_dev_api_key()
                     }
