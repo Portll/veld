@@ -126,31 +126,38 @@ PY
       - name: Display build info (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          SIZE=$(ls -lh target/release/veld 2>/dev/null | awk '{print $5}' || echo "N/A")
+          VELD_SIZE=$(ls -lh target/release/veld 2>/dev/null | awk '{print $5}' || echo "N/A")
+          MEERKAT_SIZE=$(ls -lh target/release/meerkat 2>/dev/null | awk '{print $5}' || echo "N/A")
           echo "### Build Results (${{ matrix.os }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| veld | $SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| veld | $VELD_SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| meerkat | $MEERKAT_SIZE |" >> $GITHUB_STEP_SUMMARY
 
       - name: Display build info (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $file = Get-Item target/release/veld.exe -ErrorAction SilentlyContinue
-          $size = if ($file) { "{0:N2} MB" -f ($file.Length / 1MB) } else { "N/A" }
+          $veld = Get-Item target/release/veld.exe -ErrorAction SilentlyContinue
+          $meerkat = Get-Item target/release/meerkat.exe -ErrorAction SilentlyContinue
+          $veldSize = if ($veld) { "{0:N2} MB" -f ($veld.Length / 1MB) } else { "N/A" }
+          $meerkatSize = if ($meerkat) { "{0:N2} MB" -f ($meerkat.Length / 1MB) } else { "N/A" }
           "### Build Results (${{ matrix.os }})" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
           "" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
           "| Binary | Size |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
           "|--------|------|" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
-          "| veld.exe | $size |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "| veld.exe | $veldSize |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "| meerkat.exe | $meerkatSize |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
       - name: Upload binary (Linux)
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: veld-linux
-          path: target/release/veld
+          path: |
+            target/release/veld
+            target/release/meerkat
           if-no-files-found: ignore
 
       - name: Upload binary (macOS)
@@ -158,7 +165,9 @@ PY
         uses: actions/upload-artifact@v4
         with:
           name: veld-macos
-          path: target/release/veld
+          path: |
+            target/release/veld
+            target/release/meerkat
           if-no-files-found: ignore
 
       - name: Upload binary (Windows)
@@ -166,7 +175,9 @@ PY
         uses: actions/upload-artifact@v4
         with:
           name: veld-windows
-          path: target/release/veld.exe
+          path: |
+            target/release/veld.exe
+            target/release/meerkat.exe
           if-no-files-found: ignore
 
   test:

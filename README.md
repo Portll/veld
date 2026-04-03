@@ -28,7 +28,7 @@ AI agents forget everything between sessions. Robots lose context between missio
 
 Veld - Agentic Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. Works for chat agents (MCP/HTTP), robots (Zenoh/ROS2), and edge devices. No API keys. No cloud. No external databases. One binary.
 
-`Veld - Agentic Memory` is the product name. The current published package IDs and binaries remain `shodh-memory`, `@shodh/memory-mcp`, and `shodh` while registry surfaces catch up.
+`Veld - Agentic Memory` is the product name. The branch-tip binaries here are `veld` (unified CLI) and `meerkat` (thin standalone server). Current published package IDs still use `shodh-memory` and `@shodh/memory-mcp` while registry surfaces catch up.
 
 > Branch status: this repository is currently tracked as `v0.7.7-unstable`.
 > It is being cleaned and stabilized toward a clean `v0.8` cut before the later
@@ -68,9 +68,9 @@ published package registries.
 ./scripts/cargo-dev.sh build --release
 
 # Run the unified CLI directly from the checkout
-./target/release/shodh init
-./target/release/shodh server
-./target/release/shodh tui
+./target/release/veld init
+./target/release/veld server
+./target/release/veld tui
 ```
 
 For repo-local MCP work on this branch:
@@ -86,11 +86,11 @@ node dist/index.js
 
 ```bash
 # Download from GitHub Releases (or, for the last public release line only, brew tap varun29ankuS/shodh-memory && brew install shodh-memory)
-shodh init       # First-time setup — creates config, generates API key, downloads AI model
-shodh server     # Start the memory server on :3030
-shodh tui        # Launch the TUI dashboard
-shodh status     # Check server health
-shodh doctor     # Diagnose issues
+veld init        # First-time setup — creates config, generates API key, downloads AI model
+veld server      # Start the memory server on :3030
+veld tui         # Launch the TUI dashboard
+veld status      # Check server health
+veld doctor      # Diagnose issues
 ```
 
 One binary, all functionality. No Docker, no API keys, no external dependencies.
@@ -205,7 +205,7 @@ Single binary. No GPU required. Content-hash dedup ensures identical memories ar
 ## TUI Dashboard
 
 ```bash
-shodh tui
+veld tui
 ```
 
 <p align="center">
@@ -284,7 +284,7 @@ Veld isn't just for chat agents. It's persistent memory for robots — Spot, dro
 
 ```bash
 # Enable Zenoh transport (compile with --features zenoh)
-SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 shodh server
+SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 veld server
 
 # ROS2 robots connect via zenoh-bridge-ros2dds or rmw_zenoh — zero code changes
 ros2 run zenoh_bridge_ros2dds zenoh_bridge_ros2dds
