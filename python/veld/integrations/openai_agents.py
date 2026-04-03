@@ -6,7 +6,7 @@ Gives agents persistent memory, semantic recall, and GTD task management — no 
 for memory ops, sub-millisecond retrieval, Hebbian learning.
 
 Usage (Tools):
-    from shodh_memory.integrations.openai_agents import ShodhTools
+    from veld.integrations.openai_agents import ShodhTools
     from agents import Agent, Runner
 
     tools = ShodhTools(user_id="agent-1", api_key="your-key")
@@ -18,7 +18,7 @@ Usage (Tools):
     result = Runner.run_sync(agent, "Remember that I prefer Python over JavaScript")
 
 Usage (Session):
-    from shodh_memory.integrations.openai_agents import ShodhSession
+    from veld.integrations.openai_agents import ShodhSession
     from agents import Agent, Runner
 
     session = ShodhSession(session_id="conv-123", user_id="agent-1", api_key="your-key")
@@ -40,7 +40,7 @@ try:
 except ImportError:
     raise ImportError(
         "OpenAI Agents SDK is required for this integration. "
-        "Install with: pip install shodh-memory[openai-agents] "
+        "Install with: pip install veld[openai-agents] "
         "or: pip install openai-agents pydantic"
     )
 
@@ -200,7 +200,7 @@ class ShodhTools(_ShodhHTTPClient):
     - shodh_complete_todo: Mark a task as complete
 
     Usage:
-        from shodh_memory.integrations.openai_agents import ShodhTools
+        from veld.integrations.openai_agents import ShodhTools
         from agents import Agent, Runner
 
         tools = ShodhTools(user_id="agent-1", api_key="your-key")
@@ -434,7 +434,7 @@ class ShodhSession(_ShodhHTTPClient):
     consolidation — not just raw storage.
 
     Usage:
-        from shodh_memory.integrations.openai_agents import ShodhSession
+        from veld.integrations.openai_agents import ShodhSession
         from agents import Agent, Runner
 
         session = ShodhSession(session_id="conv-123", user_id="agent-1", api_key="your-key")

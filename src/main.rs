@@ -47,7 +47,7 @@ const AFTER_HELP: &str = r#"
 INTEGRATION:
   Unified CLI:   veld server | veld tui | veld serve
   Claude Code:   claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
-  Python:        pip install shodh-memory
+  Python:        pip install veld
   TUI:           veld tui
 
 EXAMPLES:

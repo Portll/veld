@@ -3,8 +3,8 @@ import pathlib
 import unittest
 
 
-CLIENT_PATH = pathlib.Path(__file__).resolve().parents[1] / "shodh_memory" / "client.py"
-SPEC = importlib.util.spec_from_file_location("shodh_memory_client", CLIENT_PATH)
+CLIENT_PATH = pathlib.Path(__file__).resolve().parents[1] / "veld" / "client.py"
+SPEC = importlib.util.spec_from_file_location("veld_client", CLIENT_PATH)
 CLIENT_MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None and SPEC.loader is not None
 SPEC.loader.exec_module(CLIENT_MODULE)

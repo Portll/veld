@@ -7,7 +7,7 @@ Uses Hebbian learning for association strengthening - no LLM calls for memory op
 Usage:
     from langchain.chains import ConversationChain
     from langchain_openai import ChatOpenAI
-    from shodh_memory.integrations.langchain import ShodhMemory
+    from veld.integrations.langchain import ShodhMemory
 
     memory = ShodhMemory(
         server_url="http://localhost:3030",
@@ -32,7 +32,7 @@ try:
 except ImportError:
     raise ImportError(
         "LangChain is required for this integration. "
-        "Install with: pip install shodh-memory[langchain] "
+        "Install with: pip install veld[langchain] "
         "or: pip install langchain-core"
     )
 

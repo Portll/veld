@@ -3,8 +3,8 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "veld-memory"
-version = "0.7.7.dev0"
+name = "veld"
+version = "0.7.7"
 description = "Adaptive memory runtime for AI agents and robots — Hebbian learning, hybrid retrieval, knowledge graph, gap topology. Zenoh/ROS2 native."
 authors = [{name = "Private Citizen", email = "john@portll.net"}]
 license = {text = "BUSL-1.1"}
@@ -14,7 +14,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -47,5 +47,5 @@ all = ["langchain-core>=0.2.0", "llama-index-core>=0.10.0", "openai-agents>=0.0.
 [tool.maturin]
 features = ["python"]
 python-source = "python"
-module-name = "shodh_memory.shodh_memory"
+module-name = "veld.veld"
 strip = true

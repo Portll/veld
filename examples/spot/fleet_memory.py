@@ -17,13 +17,11 @@ storage_path sequentially (RocksDB requires exclusive access).
     # On fleet server
     veld server --port 3030
 
-    # Each robot connects via HTTP client
-    from shodh_memory.client import ShodhClient
-    alpha = ShodhClient(base_url="http://fleet-server:3030", user_id="fleet")
-    beta  = ShodhClient(base_url="http://fleet-server:3030", user_id="fleet")
+    # Each robot connects to the shared Veld backend
+    # using the same fleet-scoped identity for shared recall
 
 Run:
-    pip install shodh-memory
+    pip install veld
     python fleet_memory.py
 """
 
@@ -31,7 +29,7 @@ import shutil
 from pathlib import Path
 from typing import List, Tuple
 
-from shodh_memory import Position
+from veld import Position
 from shodh_spot_bridge import SpotMemoryBridge
 
 

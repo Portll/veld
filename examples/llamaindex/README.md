@@ -5,13 +5,13 @@ Use Veld - Agentic Memory as a persistent memory backend for LlamaIndex agents.
 ## Installation
 
 ```bash
-pip install llama-index llama-index-llms-anthropic shodh-memory
+pip install llama-index llama-index-llms-anthropic veld
 ```
 
 ## Quick Start
 
 ```python
-from shodh_memory import Memory
+from veld import Memory
 
 # Option 1: Use the Python SDK directly
 memory = Memory(user_id="my-agent")
@@ -34,7 +34,7 @@ Basic memory block with semantic search:
 
 ```python
 from llama_index.core.memory import BaseMemory
-from shodh_memory import Memory
+from veld import Memory
 
 class VeldMemoryBlock(BaseMemory):
     def get(self, input: str) -> List[ChatMessage]:
