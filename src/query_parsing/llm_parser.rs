@@ -146,15 +146,15 @@ impl LlmParser {
     /// Create an LLM parser from environment variables.
     ///
     /// Reads:
-    /// - `SHODH_LLM_URL`      — base URL (default: `http://localhost:1234` for LM Studio)
-    /// - `SHODH_LLM_MODEL`    — model identifier (default: `qwq-32b-preview`)
-    /// - `SHODH_LLM_API_TYPE` — `openai` or `ollama` (default: `openai`)
+    /// - `VELD_LLM_URL`      — base URL (default: `http://localhost:1234` for LM Studio)
+    /// - `VELD_LLM_MODEL`    — model identifier (default: `qwq-32b-preview`)
+    /// - `VELD_LLM_API_TYPE` — `openai` or `ollama` (default: `openai`)
     pub fn from_env() -> Self {
-        let endpoint = std::env::var("SHODH_LLM_URL")
+        let endpoint = crate::config::env_var("VELD_LLM_URL", "SHODH_LLM_URL")
             .unwrap_or_else(|_| "http://localhost:1234".to_string());
-        let model = std::env::var("SHODH_LLM_MODEL")
+        let model = crate::config::env_var("VELD_LLM_MODEL", "SHODH_LLM_MODEL")
             .unwrap_or_else(|_| "qwq-32b-preview".to_string());
-        let api_type = match std::env::var("SHODH_LLM_API_TYPE")
+        let api_type = match crate::config::env_var("VELD_LLM_API_TYPE", "SHODH_LLM_API_TYPE")
             .unwrap_or_else(|_| "openai".to_string())
             .to_lowercase()
             .as_str()

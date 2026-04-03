@@ -253,7 +253,7 @@ pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         }
 
         let mut cmd = std::process::Command::new(&server_binary);
-        cmd.env("SHODH_PORT", port.to_string());
+        cmd.env("VELD_PORT", port.to_string());
 
         #[cfg(unix)]
         {
