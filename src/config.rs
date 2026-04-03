@@ -7,6 +7,78 @@ use std::env;
 use std::path::PathBuf;
 use tracing::info;
 
+pub fn env_var(primary: &str, legacy: &str) -> Result<String, env::VarError> {
+    env::var(primary).or_else(|_| env::var(legacy))
+}
+
+pub fn env_var_is_set(primary: &str, legacy: &str) -> bool {
+    env::var(primary).is_ok() || env::var(legacy).is_ok()
+}
+
+pub fn env_truthy(value: &str) -> bool {
+    value.eq_ignore_ascii_case("true") || value == "1"
+}
+
+pub fn env_var_truthy(primary: &str, legacy: &str) -> Option<bool> {
+    env_var(primary, legacy).ok().map(|value| env_truthy(&value))
+}
+
+/// Promote VELD_* and SHODH_* aliases so either environment surface works.
+///
+/// Safety: this mutates process environment and must only run before the
+/// multi-threaded runtime starts.
+pub unsafe fn promote_env_aliases() {
+    const ALIASES: [(&str, &str); 34] = [
+        ("VELD_ENV", "SHODH_ENV"),
+        ("VELD_HOST", "SHODH_HOST"),
+        ("VELD_PORT", "SHODH_PORT"),
+        ("VELD_MEMORY_PATH", "SHODH_MEMORY_PATH"),
+        ("VELD_STORAGE_BACKEND", "SHODH_STORAGE_BACKEND"),
+        ("VELD_API_KEYS", "SHODH_API_KEYS"),
+        ("VELD_API_KEY", "SHODH_API_KEY"),
+        ("VELD_DEV_API_KEY", "SHODH_DEV_API_KEY"),
+        ("VELD_HIDE_DEV_KEY", "SHODH_HIDE_DEV_KEY"),
+        ("VELD_MULTI_TENANT", "SHODH_MULTI_TENANT"),
+        ("VELD_COLLECTIVE_STORE_DIR", "SHODH_COLLECTIVE_STORE_DIR"),
+        ("VELD_KEY_USER_BINDINGS_PATH", "SHODH_KEY_USER_BINDINGS_PATH"),
+        ("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT"),
+        ("VELD_RATE_BURST", "SHODH_RATE_BURST"),
+        ("VELD_MAX_CONCURRENT", "SHODH_MAX_CONCURRENT"),
+        ("VELD_REQUEST_TIMEOUT", "SHODH_REQUEST_TIMEOUT"),
+        ("VELD_MAX_USERS", "SHODH_MAX_USERS"),
+        ("VELD_AUDIT_MAX_ENTRIES", "SHODH_AUDIT_MAX_ENTRIES"),
+        ("VELD_AUDIT_RETENTION_DAYS", "SHODH_AUDIT_RETENTION_DAYS"),
+        ("VELD_MAINTENANCE_INTERVAL", "SHODH_MAINTENANCE_INTERVAL"),
+        ("VELD_ACTIVATION_DECAY", "SHODH_ACTIVATION_DECAY"),
+        ("VELD_BACKUP_INTERVAL", "SHODH_BACKUP_INTERVAL"),
+        ("VELD_BACKUP_MAX_COUNT", "SHODH_BACKUP_MAX_COUNT"),
+        ("VELD_BACKUP_ENABLED", "SHODH_BACKUP_ENABLED"),
+        ("VELD_MAX_ENTITIES", "SHODH_MAX_ENTITIES"),
+        ("VELD_LOG_PERIODIC_SCALES", "SHODH_LOG_PERIODIC_SCALES"),
+        ("VELD_CORS_ORIGINS", "SHODH_CORS_ORIGINS"),
+        ("VELD_CORS_METHODS", "SHODH_CORS_METHODS"),
+        ("VELD_CORS_HEADERS", "SHODH_CORS_HEADERS"),
+        ("VELD_CORS_CREDENTIALS", "SHODH_CORS_CREDENTIALS"),
+        ("VELD_CORS_MAX_AGE", "SHODH_CORS_MAX_AGE"),
+        ("VELD_CORS_WARN", "SHODH_CORS_WARN"),
+        ("VELD_SERVER_URL", "SHODH_SERVER_URL"),
+        ("VELD_API_URL", "SHODH_API_URL"),
+    ];
+
+    for (primary, legacy) in ALIASES {
+        if env::var(primary).is_err() {
+            if let Ok(value) = env::var(legacy) {
+                env::set_var(primary, &value);
+            }
+        }
+        if env::var(legacy).is_err() {
+            if let Ok(value) = env::var(primary) {
+                env::set_var(legacy, &value);
+            }
+        }
+    }
+}
+
 /// Legacy storage directory name used in versions <= 0.1.80.
 const LEGACY_STORAGE_DIR: &str = "shodh_memory_data";
 
@@ -82,8 +154,8 @@ pub fn default_storage_path() -> PathBuf {
     if legacy_path.exists() && legacy_path.is_dir() {
         eprintln!(
               "[veld] Found legacy data at ./{LEGACY_STORAGE_DIR}/ in the current directory. \
-               Using it for backward compatibility. To migrate, move it to the platform default \
-               and unset SHODH_MEMORY_PATH. See: https://github.com/Portll/veld"
+             Using it for backward compatibility. To migrate, move it to the platform default \
+             and unset VELD_MEMORY_PATH. Legacy SHODH_MEMORY_PATH is still accepted. See: https://github.com/Portll/veld"
         );
         return legacy_path;
     }
@@ -141,13 +213,13 @@ impl Default for CorsConfig {
 impl CorsConfig {
     /// Load from environment variables with production safety checks
     ///
-    /// In production mode (SHODH_ENV=production), deny all cross-origin requests
-    /// unless SHODH_CORS_ORIGINS is explicitly configured.
+    /// In production mode (VELD_ENV=production), deny all cross-origin requests
+    /// unless VELD_CORS_ORIGINS is explicitly configured.
     pub fn from_env() -> Self {
         let mut config = Self::default();
         let mut cors_origins_configured = false;
 
-        if let Ok(origins) = env::var("SHODH_CORS_ORIGINS") {
+        if let Ok(origins) = env_var("VELD_CORS_ORIGINS", "SHODH_CORS_ORIGINS") {
             config.allowed_origins = origins
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -156,7 +228,7 @@ impl CorsConfig {
             cors_origins_configured = !config.allowed_origins.is_empty();
         }
 
-        if let Ok(methods) = env::var("SHODH_CORS_METHODS") {
+        if let Ok(methods) = env_var("VELD_CORS_METHODS", "SHODH_CORS_METHODS") {
             config.allowed_methods = methods
                 .split(',')
                 .map(|s| s.trim().to_uppercase())
@@ -164,7 +236,7 @@ impl CorsConfig {
                 .collect();
         }
 
-        if let Ok(headers) = env::var("SHODH_CORS_HEADERS") {
+        if let Ok(headers) = env_var("VELD_CORS_HEADERS", "SHODH_CORS_HEADERS") {
             config.allowed_headers = headers
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -172,26 +244,26 @@ impl CorsConfig {
                 .collect();
         }
 
-        if let Ok(val) = env::var("SHODH_CORS_CREDENTIALS") {
-            config.allow_credentials = val.to_lowercase() == "true" || val == "1";
+        if let Some(val) = env_var_truthy("VELD_CORS_CREDENTIALS", "SHODH_CORS_CREDENTIALS") {
+            config.allow_credentials = val;
         }
 
-        if let Ok(val) = env::var("SHODH_CORS_MAX_AGE") {
+        if let Ok(val) = env_var("VELD_CORS_MAX_AGE", "SHODH_CORS_MAX_AGE") {
             if let Ok(n) = val.parse() {
                 config.max_age_seconds = n;
             }
         }
 
         // Safety check: deny all in production if CORS origins are not configured.
-        // Warn in development unless suppressed with SHODH_CORS_WARN=false.
-        let is_production = env::var("SHODH_ENV")
+        // Warn in development unless suppressed with VELD_CORS_WARN=false.
+        let is_production = env_var("VELD_ENV", "SHODH_ENV")
             .map(|v| {
                 let v = v.to_lowercase();
                 v == "production" || v == "prod"
             })
             .unwrap_or(false);
 
-        let cors_warn_suppressed = env::var("SHODH_CORS_WARN")
+        let cors_warn_suppressed = env_var("VELD_CORS_WARN", "SHODH_CORS_WARN")
             .map(|v| v.to_lowercase() == "false" || v == "0")
             .unwrap_or(false);
 
@@ -200,13 +272,13 @@ impl CorsConfig {
                 config.deny_all = true;
                 if !cors_warn_suppressed {
                     tracing::error!(
-                        "PRODUCTION SAFETY: SHODH_CORS_ORIGINS is not set. Rejecting all cross-origin requests until it is configured."
+                        "PRODUCTION SAFETY: VELD_CORS_ORIGINS is not set. Rejecting all cross-origin requests until it is configured. Legacy SHODH_CORS_ORIGINS is still accepted."
                     );
                 }
             } else if !cors_warn_suppressed {
                 tracing::warn!(
-                    "CORS allows all origins in development (no SHODH_CORS_ORIGINS set). \
-                     Set SHODH_CORS_WARN=false to suppress this warning."
+                    "CORS allows all origins in development (no VELD_CORS_ORIGINS set). \
+                     Set VELD_CORS_WARN=false to suppress this warning. Legacy SHODH_* aliases are still accepted."
                 );
             }
         }
@@ -253,7 +325,7 @@ impl CorsConfig {
                 // Do NOT fall back to permissive - that would be a security hole
                 tracing::error!(
                     "CORS: All {} configured origin(s) failed to parse. \
-                     Rejecting all cross-origin requests. Fix SHODH_CORS_ORIGINS.",
+                     Rejecting all cross-origin requests. Fix VELD_CORS_ORIGINS.",
                     self.allowed_origins.len()
                 );
                 // Use an impossible origin to effectively deny all CORS
@@ -390,7 +462,7 @@ pub struct ServerConfig {
 
     /// Log-periodic fractal decay scales in days (default: [7.0, 30.0, 365.0])
     /// Controls resonance frequencies in the power-law decay function.
-    /// Weekly/monthly/yearly rhythms by default; override via SHODH_LOG_PERIODIC_SCALES
+    /// Weekly/monthly/yearly rhythms by default; override via VELD_LOG_PERIODIC_SCALES
     /// env var (comma-separated, e.g. "14.0,60.0,365.0" for biweekly/bimonthly/yearly)
     pub log_periodic_scales: Vec<f64>,
 }
@@ -435,7 +507,7 @@ impl ServerConfig {
         let mut config = Self::default();
 
         // Check production mode first
-        config.is_production = env::var("SHODH_ENV")
+        config.is_production = env_var("VELD_ENV", "SHODH_ENV")
             .map(|v| {
                 let v = v.to_lowercase();
                 v == "production" || v == "prod"
@@ -443,40 +515,40 @@ impl ServerConfig {
             .unwrap_or(false);
 
         // Host (bind address)
-        if let Ok(val) = env::var("SHODH_HOST") {
+        if let Ok(val) = env_var("VELD_HOST", "SHODH_HOST") {
             config.host = val;
         }
 
         // Port
-        if let Ok(val) = env::var("SHODH_PORT") {
+        if let Ok(val) = env_var("VELD_PORT", "SHODH_PORT") {
             if let Ok(port) = val.parse() {
                 config.port = port;
             }
         }
 
         // Storage path
-        if let Ok(val) = env::var("SHODH_MEMORY_PATH") {
+        if let Ok(val) = env_var("VELD_MEMORY_PATH", "SHODH_MEMORY_PATH") {
             config.storage_path = PathBuf::from(val);
         }
         config.collective_store_dir = config.storage_path.join("collective");
 
-        if let Ok(val) = env::var("SHODH_COLLECTIVE_STORE_DIR") {
+        if let Ok(val) = env_var("VELD_COLLECTIVE_STORE_DIR", "SHODH_COLLECTIVE_STORE_DIR") {
             config.collective_store_dir = PathBuf::from(val);
         }
 
-        if let Ok(val) = env::var("SHODH_MULTI_TENANT") {
-            config.multi_tenant_mode = val.eq_ignore_ascii_case("true") || val == "1";
+        if let Some(val) = env_var_truthy("VELD_MULTI_TENANT", "SHODH_MULTI_TENANT") {
+            config.multi_tenant_mode = val;
         }
 
         // Requested storage backend
-        if let Ok(val) = env::var("SHODH_STORAGE_BACKEND") {
+        if let Ok(val) = env_var("VELD_STORAGE_BACKEND", "SHODH_STORAGE_BACKEND") {
             match val.parse::<StorageBackend>() {
                 Ok(backend) => {
                     config.requested_storage_backend = backend;
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "SHODH_STORAGE_BACKEND='{}' ignored: {}. Using default target {}.",
+                        "VELD_STORAGE_BACKEND='{}' ignored: {}. Using default target {}.",
                         val,
                         err,
                         default_requested_storage_backend()
@@ -489,46 +561,46 @@ impl ServerConfig {
             effective_storage_backend_for_current_build(config.requested_storage_backend);
 
         // Max users in memory
-        if let Ok(val) = env::var("SHODH_MAX_USERS") {
+        if let Ok(val) = env_var("VELD_MAX_USERS", "SHODH_MAX_USERS") {
             if let Ok(n) = val.parse::<usize>() {
                 config.max_users_in_memory = n.max(1);
                 if n == 0 {
                     tracing::warn!(
-                        "SHODH_MAX_USERS=0 is invalid (would evict every user), clamped to 1"
+                        "VELD_MAX_USERS=0 is invalid (would evict every user), clamped to 1"
                     );
                 }
             }
         }
 
         // Audit settings
-        if let Ok(val) = env::var("SHODH_AUDIT_MAX_ENTRIES") {
+        if let Ok(val) = env_var("VELD_AUDIT_MAX_ENTRIES", "SHODH_AUDIT_MAX_ENTRIES") {
             if let Ok(n) = val.parse::<usize>() {
                 config.audit_max_entries_per_user = n.max(100);
                 if n < 100 {
                     tracing::warn!(
-                        "SHODH_AUDIT_MAX_ENTRIES={} is below minimum, clamped to 100",
+                        "VELD_AUDIT_MAX_ENTRIES={} is below minimum, clamped to 100",
                         n
                     );
                 }
             }
         }
 
-        if let Ok(val) = env::var("SHODH_AUDIT_RETENTION_DAYS") {
+        if let Ok(val) = env_var("VELD_AUDIT_RETENTION_DAYS", "SHODH_AUDIT_RETENTION_DAYS") {
             if let Ok(n) = val.parse() {
                 config.audit_retention_days = n;
             }
         }
 
-        let rate_limit_explicit = env::var("SHODH_RATE_LIMIT").is_ok();
+        let rate_limit_explicit = env_var_is_set("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT");
 
         // Rate limiting
-        if let Ok(val) = env::var("SHODH_RATE_LIMIT") {
+        if let Ok(val) = env_var("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT") {
             if let Ok(n) = val.parse() {
                 config.rate_limit_per_second = n;
             }
         }
 
-        if let Ok(val) = env::var("SHODH_RATE_BURST") {
+        if let Ok(val) = env_var("VELD_RATE_BURST", "SHODH_RATE_BURST") {
             if let Ok(n) = val.parse() {
                 config.rate_limit_burst = n;
             }
@@ -539,24 +611,24 @@ impl ServerConfig {
         }
 
         // Concurrency
-        if let Ok(val) = env::var("SHODH_MAX_CONCURRENT") {
+        if let Ok(val) = env_var("VELD_MAX_CONCURRENT", "SHODH_MAX_CONCURRENT") {
             if let Ok(n) = val.parse::<usize>() {
                 config.max_concurrent_requests = n.max(1);
                 if n == 0 {
                     tracing::warn!(
-                        "SHODH_MAX_CONCURRENT=0 is invalid (would reject all requests), clamped to 1"
+                        "VELD_MAX_CONCURRENT=0 is invalid (would reject all requests), clamped to 1"
                     );
                 }
             }
         }
 
         // Request timeout
-        if let Ok(val) = env::var("SHODH_REQUEST_TIMEOUT") {
+        if let Ok(val) = env_var("VELD_REQUEST_TIMEOUT", "SHODH_REQUEST_TIMEOUT") {
             if let Ok(n) = val.parse::<u64>() {
                 config.request_timeout_secs = n.max(1);
                 if n == 0 {
                     tracing::warn!(
-                        "SHODH_REQUEST_TIMEOUT=0 is invalid (would instant-timeout all requests), clamped to 1"
+                        "VELD_REQUEST_TIMEOUT=0 is invalid (would instant-timeout all requests), clamped to 1"
                     );
                 }
             }
@@ -566,23 +638,23 @@ impl ServerConfig {
         config.cors = CorsConfig::from_env();
 
         // Memory maintenance settings
-        if let Ok(val) = env::var("SHODH_MAINTENANCE_INTERVAL") {
+        if let Ok(val) = env_var("VELD_MAINTENANCE_INTERVAL", "SHODH_MAINTENANCE_INTERVAL") {
             if let Ok(n) = val.parse::<u64>() {
                 config.maintenance_interval_secs = n.max(10);
                 if n < 10 {
                     tracing::warn!(
-                        "SHODH_MAINTENANCE_INTERVAL={} is below minimum (would cause CPU spin-loop), clamped to 10",
+                        "VELD_MAINTENANCE_INTERVAL={} is below minimum (would cause CPU spin-loop), clamped to 10",
                         n
                     );
                 }
             }
         }
 
-        if let Ok(val) = env::var("SHODH_ACTIVATION_DECAY") {
+        if let Ok(val) = env_var("VELD_ACTIVATION_DECAY", "SHODH_ACTIVATION_DECAY") {
             if let Ok(n) = val.parse::<f32>() {
                 if !n.is_finite() {
                     tracing::warn!(
-                        "SHODH_ACTIVATION_DECAY={} is not finite, using default {}",
+                        "VELD_ACTIVATION_DECAY={} is not finite, using default {}",
                         val,
                         config.activation_decay_factor
                     );
@@ -590,7 +662,7 @@ impl ServerConfig {
                     let clamped = n.clamp(0.5, 0.99);
                     if (clamped - n).abs() > f32::EPSILON {
                         tracing::warn!(
-                            "SHODH_ACTIVATION_DECAY={} clamped to {} (valid range: 0.5–0.99)",
+                            "VELD_ACTIVATION_DECAY={} clamped to {} (valid range: 0.5–0.99)",
                             n,
                             clamped
                         );
@@ -601,43 +673,43 @@ impl ServerConfig {
         }
 
         // Backup configuration
-        if let Ok(val) = env::var("SHODH_BACKUP_INTERVAL") {
+        if let Ok(val) = env_var("VELD_BACKUP_INTERVAL", "SHODH_BACKUP_INTERVAL") {
             if let Ok(n) = val.parse::<u64>() {
                 if n == 0 {
                     tracing::warn!(
-                        "SHODH_BACKUP_INTERVAL=0 — backups will run every maintenance cycle"
+                        "VELD_BACKUP_INTERVAL=0 — backups will run every maintenance cycle"
                     );
                 }
                 config.backup_interval_secs = n;
             }
         }
 
-        if let Ok(val) = env::var("SHODH_BACKUP_MAX_COUNT") {
+        if let Ok(val) = env_var("VELD_BACKUP_MAX_COUNT", "SHODH_BACKUP_MAX_COUNT") {
             if let Ok(n) = val.parse::<usize>() {
                 config.backup_max_count = n.max(1);
                 if n == 0 {
                     tracing::warn!(
-                        "SHODH_BACKUP_MAX_COUNT=0 is invalid (would keep no backups), clamped to 1"
+                        "VELD_BACKUP_MAX_COUNT=0 is invalid (would keep no backups), clamped to 1"
                     );
                 }
             }
         }
 
         // Auto-enable backups in production mode unless explicitly disabled
-        if let Ok(val) = env::var("SHODH_BACKUP_ENABLED") {
-            config.backup_enabled = val.to_lowercase() == "true" || val == "1";
+        if let Some(val) = env_var_truthy("VELD_BACKUP_ENABLED", "SHODH_BACKUP_ENABLED") {
+            config.backup_enabled = val;
         } else if config.is_production {
             // Auto-enable in production
             config.backup_enabled = true;
         }
 
         // Entity extraction cap
-        if let Ok(val) = env::var("SHODH_MAX_ENTITIES") {
+        if let Ok(val) = env_var("VELD_MAX_ENTITIES", "SHODH_MAX_ENTITIES") {
             if let Ok(n) = val.parse::<usize>() {
                 let clamped = n.clamp(1, 50);
                 if clamped != n {
                     tracing::warn!(
-                        "SHODH_MAX_ENTITIES={} clamped to {} (valid range: 1–50)",
+                        "VELD_MAX_ENTITIES={} clamped to {} (valid range: 1–50)",
                         n,
                         clamped
                     );
@@ -647,7 +719,7 @@ impl ServerConfig {
         }
 
         // Log-periodic decay scales (comma-separated floats, e.g. "14.0,60.0,365.0")
-        if let Ok(val) = env::var("SHODH_LOG_PERIODIC_SCALES") {
+        if let Ok(val) = env_var("VELD_LOG_PERIODIC_SCALES", "SHODH_LOG_PERIODIC_SCALES") {
             let parsed: Vec<f64> = val
                 .split(',')
                 .filter_map(|s| s.trim().parse::<f64>().ok())
@@ -655,7 +727,7 @@ impl ServerConfig {
                 .collect();
             if parsed.is_empty() {
                 tracing::warn!(
-                    "SHODH_LOG_PERIODIC_SCALES='{}' — no valid scales (need ≥1 float in 1.0–730.0), using defaults",
+                    "VELD_LOG_PERIODIC_SCALES='{}' — no valid scales (need ≥1 float in 1.0–730.0), using defaults",
                     val
                 );
             } else {
@@ -706,7 +778,7 @@ impl ServerConfig {
         info!("   Audit retention: {} days", self.audit_retention_days);
         if self.cors.is_restricted() {
             if self.cors.deny_all {
-                info!("   CORS: deny-all (set SHODH_CORS_ORIGINS to allow browsers)");
+                info!("   CORS: deny-all (set VELD_CORS_ORIGINS to allow browsers)");
             } else {
                 info!("   CORS origins: {:?}", self.cors.allowed_origins);
             }
@@ -734,23 +806,23 @@ impl ServerConfig {
 pub fn print_env_help() {
     println!("Veld Configuration Environment Variables:");
     println!();
-    println!("  SHODH_ENV              - Set to 'production' or 'prod' for production mode");
+    println!("  VELD_ENV               - Set to 'production' or 'prod' for production mode");
     println!(
-        "  SHODH_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)"
+        "  VELD_HOST              - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)"
     );
-    println!("  SHODH_PORT             - Server port (default: 3030)");
-    println!("  SHODH_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/shodh-memory/)");
-    println!("  SHODH_STORAGE_BACKEND  - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
-    println!("  SHODH_API_KEYS         - Comma-separated API keys (required in production)");
-    println!("  SHODH_DEV_API_KEY      - Development API key (required in dev if SHODH_API_KEYS not set)");
-    println!("  SHODH_ENCRYPTION_KEY   - 32-byte field-encryption key (required for encrypted-at-rest production)");
-    println!("  SHODH_MAX_USERS        - Max users in memory LRU (default: 1000)");
-    println!("  SHODH_RATE_LIMIT       - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
-    println!("  SHODH_RATE_BURST       - Burst size (default: 8000)");
-    println!("  SHODH_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
-    println!("  SHODH_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
-    println!("  SHODH_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
-    println!("  SHODH_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");
+    println!("  VELD_PORT              - Server port (default: 3030)");
+    println!("  VELD_MEMORY_PATH       - Storage directory (default: platform data dir, e.g. ~/.local/share/shodh-memory/)");
+    println!("  VELD_STORAGE_BACKEND   - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
+    println!("  VELD_API_KEYS          - Comma-separated API keys (required in production)");
+    println!("  VELD_DEV_API_KEY       - Development API key (required in dev if VELD_API_KEYS not set)");
+    println!("  VELD_ENCRYPTION_KEY    - 32-byte field-encryption key (required for encrypted-at-rest production)");
+    println!("  VELD_MAX_USERS         - Max users in memory LRU (default: 1000)");
+    println!("  VELD_RATE_LIMIT        - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
+    println!("  VELD_RATE_BURST        - Burst size (default: 8000)");
+    println!("  VELD_MAX_CONCURRENT    - Max concurrent requests (default: 200)");
+    println!("  VELD_REQUEST_TIMEOUT   - Request timeout in seconds (default: 60)");
+    println!("  VELD_AUDIT_MAX_ENTRIES     - Max audit entries per user (default: 10000)");
+    println!("  VELD_AUDIT_RETENTION_DAYS  - Audit log retention days (default: 30)");
     println!();
     println!("Integration APIs:");
     println!("  LINEAR_API_URL         - Linear GraphQL API URL (default: https://api.linear.app/graphql)");
@@ -759,16 +831,18 @@ pub fn print_env_help() {
     println!("  GITHUB_WEBHOOK_SECRET  - GitHub webhook secret for HMAC verification");
     println!();
     println!("CORS Configuration:");
-    println!("  SHODH_CORS_ORIGINS     - Comma-separated allowed origins (required in production for browser access)");
-    println!("  SHODH_CORS_METHODS     - Comma-separated allowed methods (default: GET,POST,PUT,DELETE,OPTIONS)");
-    println!("  SHODH_CORS_HEADERS     - Comma-separated allowed headers (default: Content-Type,Authorization,X-Request-ID)");
-    println!("  SHODH_CORS_CREDENTIALS - Allow credentials true/false (default: false)");
-    println!("  SHODH_CORS_MAX_AGE     - Preflight cache seconds (default: 86400)");
+    println!("  VELD_CORS_ORIGINS      - Comma-separated allowed origins (required in production for browser access)");
+    println!("  VELD_CORS_METHODS      - Comma-separated allowed methods (default: GET,POST,PUT,DELETE,OPTIONS)");
+    println!("  VELD_CORS_HEADERS      - Comma-separated allowed headers (default: Content-Type,Authorization,X-Request-ID)");
+    println!("  VELD_CORS_CREDENTIALS  - Allow credentials true/false (default: false)");
+    println!("  VELD_CORS_MAX_AGE      - Preflight cache seconds (default: 86400)");
     println!();
     println!("Backup Configuration:");
-    println!("  SHODH_BACKUP_ENABLED   - Enable automatic backups true/false (default: auto in production)");
-    println!("  SHODH_BACKUP_INTERVAL  - Backup interval in seconds (default: 86400 = 24 hours)");
-    println!("  SHODH_BACKUP_MAX_COUNT - Max backups to keep per user (default: 7)");
+    println!("  VELD_BACKUP_ENABLED    - Enable automatic backups true/false (default: auto in production)");
+    println!("  VELD_BACKUP_INTERVAL   - Backup interval in seconds (default: 86400 = 24 hours)");
+    println!("  VELD_BACKUP_MAX_COUNT  - Max backups to keep per user (default: 7)");
+    println!();
+    println!("  Legacy SHODH_* aliases are still accepted for compatibility.");
     println!();
     println!("  RUST_LOG               - Log level (e.g., info, debug, trace)");
     println!();
