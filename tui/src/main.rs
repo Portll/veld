@@ -26,7 +26,9 @@ mod stream;
 mod types;
 mod widgets;
 
-use logo::{ELEPHANT, ELEPHANT_FRAMES, GRASS_SUFFIX, SHODH_GRADIENT, SHODH_TEXT};
+use logo::{
+    ELEPHANT, ELEPHANT_FRAMES, GRASS_PREFIX, GRASS_SUFFIX, VELD_GRADIENT, VELD_TEXT,
+};
 use stream::{
     complete_todo, next_status, refresh_todos, reorder_todo, update_todo_priority,
     update_todo_status, MemoryStream,
@@ -53,7 +55,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::GraphMap => "Graph",
     };
 
-    format!("🦣 Shodh - {}", view_name)
+    format!("🐘 Veld - {}", view_name)
 }
 
 struct UserSelector {
@@ -304,9 +306,9 @@ fn user_selector_layout(area: Rect) -> UserSelectorLayout {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2), // Top padding
-            Constraint::Length(6), // SHODH text logo
+            Constraint::Length(6), // VELD text logo
             Constraint::Length(1), // Spacing
-            Constraint::Length(6), // Elephant logo
+            Constraint::Length(6), // Elephant + grass logo
             Constraint::Length(1), // Spacing
             Constraint::Length(2), // Tagline
             Constraint::Length(1), // Spacing
@@ -434,7 +436,7 @@ fn detail_text(selector: &UserSelector) -> (&str, String) {
         AuthOption::PasteKey => (
             "Use key",
             if selector.api_key_input.is_empty() {
-                "Paste SHODH API key".to_string()
+                "Paste Veld API key".to_string()
             } else {
                 selector.api_key_input.clone()
             },
@@ -471,9 +473,9 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2), // Top padding
-            Constraint::Length(6), // SHODH text logo
+            Constraint::Length(6), // VELD text logo
             Constraint::Length(1), // Spacing
-            Constraint::Length(6), // Elephant logo
+            Constraint::Length(6), // Elephant + grass logo
             Constraint::Length(1), // Spacing
             Constraint::Length(2), // Tagline
             Constraint::Length(1), // Spacing
@@ -495,16 +497,16 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
             .split(area)[1]);
 
     // VELD text logo with gradient
-    let shodh_lines: Vec<Line> = SHODH_TEXT
+    let veld_lines: Vec<Line> = VELD_TEXT
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let (r, g, b) = SHODH_GRADIENT[i % SHODH_GRADIENT.len()];
+            let (r, g, b) = VELD_GRADIENT[i % VELD_GRADIENT.len()];
             Line::from(Span::styled(*l, Style::default().fg(Color::Rgb(r, g, b))))
         })
         .collect();
     f.render_widget(
-        Paragraph::new(shodh_lines).alignment(Alignment::Center),
+        Paragraph::new(veld_lines).alignment(Alignment::Center),
         chunks[1],
     );
 
@@ -522,7 +524,16 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
                 (200, 55, 5),
             ];
             let elephant_style = Style::default().fg(Color::Rgb(g[i % 6].0, g[i % 6].1, g[i % 6].2));
-            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
+            if let Some(body) = l
+                .strip_prefix(GRASS_PREFIX)
+                .and_then(|rest| rest.strip_suffix(GRASS_SUFFIX))
+            {
+                Line::from(vec![
+                    Span::styled(GRASS_PREFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                    Span::styled(body, elephant_style),
+                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                ])
+            } else if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
                 Line::from(vec![
                     Span::styled(body, elephant_style),
                     Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
@@ -820,7 +831,7 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(20),
-            Constraint::Length(6), // SHODH text
+            Constraint::Length(6), // VELD text
             Constraint::Length(1),
             Constraint::Length(6), // Elephant
             Constraint::Length(2),
@@ -834,13 +845,13 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
         .split(center);
 
     // VELD text with animated gradient
-    let shodh_lines: Vec<Line> = SHODH_TEXT
+    let veld_lines: Vec<Line> = VELD_TEXT
         .iter()
         .enumerate()
         .map(|(i, l)| {
             // Animate brightness based on tick
             let phase = ((tick as f32 * 0.1) + i as f32 * 0.5).sin() * 0.3 + 0.7;
-            let (r, g, b) = SHODH_GRADIENT[i % SHODH_GRADIENT.len()];
+            let (r, g, b) = VELD_GRADIENT[i % VELD_GRADIENT.len()];
             let r = (r as f32 * phase) as u8;
             let g = (g as f32 * phase) as u8;
             let b = (b as f32 * phase) as u8;
@@ -848,7 +859,7 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
         })
         .collect();
     f.render_widget(
-        Paragraph::new(shodh_lines).alignment(Alignment::Center),
+        Paragraph::new(veld_lines).alignment(Alignment::Center),
         chunks[1],
     );
 
@@ -874,7 +885,16 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
             let g = (g as f32 * phase) as u8;
             let b = (b as f32 * phase) as u8;
             let elephant_style = Style::default().fg(Color::Rgb(r, g, b));
-            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
+            if let Some(body) = l
+                .strip_prefix(GRASS_PREFIX)
+                .and_then(|rest| rest.strip_suffix(GRASS_SUFFIX))
+            {
+                Line::from(vec![
+                    Span::styled(GRASS_PREFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                    Span::styled(body, elephant_style),
+                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                ])
+            } else if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
                 Line::from(vec![
                     Span::styled(body, elephant_style),
                     Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
@@ -1001,7 +1021,7 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
 }
 
 async fn run_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    execute!(io::stdout(), SetTitle("🦣 Shodh - Loading..."))?;
+    execute!(io::stdout(), SetTitle("🐘 Veld - Loading..."))?;
 
     let start = Instant::now();
     let duration = Duration::from_secs(5);
@@ -1045,7 +1065,7 @@ async fn run_user_selector(
     base_url: &str,
     api_key: &str,
 ) -> Result<Option<(String, String)>> {
-    execute!(io::stdout(), SetTitle("🦣 Shodh - Select Profile"))?;
+    execute!(io::stdout(), SetTitle("🐘 Veld - Select Profile"))?;
     let mut selector = UserSelector::new(api_key.to_string());
 
     let result = loop {
@@ -1285,7 +1305,7 @@ async fn run_statusline() -> Result<()> {
             (0, 0)
         };
 
-    // POST to shodh-memory backend (fire and forget)
+    // POST to the Veld backend (fire and forget)
     let client = reqwest::Client::new();
     let post_body = serde_json::json!({
         "session_id": session_id,

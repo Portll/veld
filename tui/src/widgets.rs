@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, GRASS_SUFFIX, SHODH_GRADIENT, SHODH_TEXT};
+use crate::logo::{
+    ELEPHANT, ELEPHANT_GRADIENT, GRASS_PREFIX, GRASS_SUFFIX, VELD_GRADIENT, VELD_TEXT,
+};
 use crate::types::{
     AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiFileMemory, TuiPriority,
     TuiProject, TuiTodo, TuiTodoStatus, ViewMode, VERSION,
@@ -195,7 +197,16 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 (gray, gray, gray)
             };
             let elephant_style = Style::default().fg(Color::Rgb(r, g, b));
-            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
+            if let Some(body) = l
+                .strip_prefix(GRASS_PREFIX)
+                .and_then(|rest| rest.strip_suffix(GRASS_SUFFIX))
+            {
+                Line::from(vec![
+                    Span::styled(GRASS_PREFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                    Span::styled(body, elephant_style),
+                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                ])
+            } else if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
                 Line::from(vec![
                     Span::styled(body, elephant_style),
                     Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
@@ -217,11 +228,11 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(chunks[1]);
 
-    let shodh_lines: Vec<Line> = SHODH_TEXT
+    let veld_lines: Vec<Line> = VELD_TEXT
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let (r, g, b) = SHODH_GRADIENT[i % SHODH_GRADIENT.len()];
+            let (r, g, b) = VELD_GRADIENT[i % VELD_GRADIENT.len()];
             Line::from(Span::styled(
                 *l,
                 Style::default()
@@ -230,7 +241,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             ))
         })
         .collect();
-    f.render_widget(Paragraph::new(shodh_lines), title_chunks[0]);
+    f.render_widget(Paragraph::new(veld_lines), title_chunks[0]);
 
     // Stats bar
     let stats_line = Line::from(vec![
