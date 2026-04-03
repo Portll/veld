@@ -1,4 +1,4 @@
-//! Unified shodh binary - MCP server + Claude Code hooks
+//! Unified Veld binary - MCP server + Claude Code hooks
 //!
 //! Usage:
 //!   shodh serve              - Run as MCP server (stdio transport)

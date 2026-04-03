@@ -1,4 +1,4 @@
-//! MCP tool implementations for Shodh Memory.
+//! MCP tool implementations for Veld.
 //!
 //! All `#[tool]` method implementations live here. The tool names and parameter
 //! names are part of the MCP contract and MUST NOT change.

@@ -30,7 +30,7 @@ static TRACER_PROVIDER: std::sync::OnceLock<TracerProvider> = std::sync::OnceLoc
 ///
 /// Configuration via environment variables:
 /// - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP endpoint (default: http://localhost:4317)
-/// - OTEL_SERVICE_NAME: Service name (default: shodh-memory)
+/// - OTEL_SERVICE_NAME: Service name (default: veld)
 /// - OTEL_TRACE_SAMPLER: Sampling strategy (default: parentbased_always_on)
 /// - RUST_LOG: Log level filter (default: info)
 #[cfg(feature = "telemetry")]
@@ -40,7 +40,7 @@ pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
     let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "shodh-memory".to_string());
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "veld".to_string());
 
     // Build span exporter using the new builder API (opentelemetry 0.27+)
     let exporter = SpanExporter::builder()
@@ -63,7 +63,7 @@ pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // Get tracer from provider
-    let tracer = tracer_provider.tracer("shodh-memory");
+    let tracer = tracer_provider.tracer("veld");
 
     // Store provider for shutdown
     let _ = TRACER_PROVIDER.set(tracer_provider.clone());

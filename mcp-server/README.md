@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Veld - Agentic Memory">
+  <img src="../assets/logo.png" width="120" alt="Veld - Agentic Memory">
 </p>
 
 <h1 align="center">Veld - Agentic Memory MCP Server</h1>
@@ -10,12 +10,12 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp" alt="npm"></a>
-  <a href="https://github.com/varun29ankuS/shodh-memory/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
+  <a href="../LICENSE.MD"><img src="https://img.shields.io/badge/license-BUSL--1.1-blue" alt="License"></a>
 </p>
 
 <p align="center">
-  <a href="https://www.shodh-rag.com/memory">Documentation</a> |
-  <a href="https://github.com/varun29ankuS/shodh-memory">GitHub</a> |
+  <a href="../docs/">Documentation</a> |
+  <a href="https://github.com/Portll/veld">GitHub</a> |
   <a href="https://pypi.org/project/shodh-memory/">Python SDK</a> |
   <a href="https://crates.io/crates/shodh-memory">Rust Crate</a>
 </p>
@@ -288,9 +288,9 @@ The backend server runs locally and stores all data on your machine. No cloud de
 
 ## Links
 
-- [Documentation](https://www.shodh-rag.com/memory)
-- [GitHub Repository](https://github.com/varun29ankuS/shodh-memory)
-- [Issue Tracker](https://github.com/varun29ankuS/shodh-memory/issues)
+- [Documentation](../docs/)
+- [GitHub Repository](https://github.com/Portll/veld)
+- [Issue Tracker](https://github.com/Portll/veld/issues)
 
 ## License
 

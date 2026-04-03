@@ -1,4 +1,4 @@
-// Python bindings for shodh-memory using PyO3
+// Python bindings for Veld using PyO3
 //
 // Comprehensive robotics memory system with:
 // - Position/GeoLocation tracking
@@ -2252,7 +2252,7 @@ fn shodh_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("SHODH_VERSION_FULL"))?;
     m.add(
         "__doc__",
-        "Shodh-Memory: AI Memory System for Autonomous Robots & Drones\n\n\
+        "Veld - Agentic Memory: Adaptive memory runtime for AI agents and robots\n\n\
                        Features:\n\
                        - Position(x, y, z) for local coordinates\n\
                        - GeoLocation(lat, lon, alt) for GPS\n\

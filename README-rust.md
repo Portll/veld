@@ -8,7 +8,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/shodh-memory.svg)](https://crates.io/crates/shodh-memory)
 [![Downloads](https://img.shields.io/crates/d/shodh-memory.svg)](https://crates.io/crates/shodh-memory)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE.MD)
 
 ---
 
@@ -316,11 +316,11 @@ Content-hash dedup (SHA-256) ensures identical content is never stored twice.
 
 ## Links
 
-- [GitHub](https://github.com/varun29ankuS/shodh-memory)
-- [Documentation](https://www.shodh-rag.com/memory)
+- [GitHub](https://github.com/Portll/veld)
+- [Documentation](docs/)
 - [PyPI (Python)](https://pypi.org/project/shodh-memory/)
 - [npm (MCP Server)](https://www.npmjs.com/package/@shodh/memory-mcp)
 
 ## License
 
-Apache 2.0
+BUSL-1.1
