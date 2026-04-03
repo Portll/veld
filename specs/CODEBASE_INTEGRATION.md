@@ -1,4 +1,4 @@
-# Codebase Integration Specification
+# Veld - Agentic Memory Codebase Integration Specification
 
 **Status:** Draft
 **Author:** Claude + Varun
@@ -9,7 +9,7 @@
 
 ## Overview
 
-Integrate codebase awareness into shodh-memory, allowing projects to have associated codebases that the AI learns about through usage. Files are treated as contextual knowledge that supplements (never replaces) decision/learning memories.
+Integrate codebase awareness into Veld - Agentic Memory, allowing projects to have associated codebases that the AI learns about through usage. Files are treated as contextual knowledge that supplements (never replaces) decision/learning memories.
 
 ### Design Principles
 
@@ -358,7 +358,7 @@ Request:
 ```
 PROJECTS 9
 ────────────────────────────────
-📂 Shodh-memory       4 left · 82%
+📂 Veld               4 left · 82%
    📁 ~/shodh-memory  ●            ← Codebase row (NEW)
    └ tui              ✓ done       ← Subproject (existing)
    └ Implicit Feed... ✓ done
@@ -392,7 +392,7 @@ Before:
 337 memories │ 8404 edges │ 26 recalls
 
 After:
-337 memories │ 8404 edges │ 26 recalls │ 📁 shodh-memory (142)
+337 memories │ 8404 edges │ 26 recalls │ 📁 Veld (142)
                                          └── Current project's codebase
 ```
 
@@ -413,7 +413,7 @@ shodh-files ~/path/to/codebase
 ### 5.2 Layout
 
 ```
-┌─ 📁 Shodh-memory ──────────────────────────────────────────────────────────────┐
+┌─ 📁 Veld ──────────────────────────────────────────────────────────────────────┐
 │  ~/shodh-memory                                    142 files │ indexed 2h ago  │
 ├──────────────────────────────────┬─────────────────────────────────────────────┤
 │  TREE                            │  DETAILS                                    │
@@ -425,7 +425,7 @@ shodh-files ~/path/to/codebase
 │        lineage.rs         ●      │  with 50+ routes for memory operations.     │
 │        todos.rs           ●●     │                                             │
 │      embeddings/                 │  Purpose:                                   │
-│        minilm.rs                 │  Main entry point for shodh-memory server   │
+│        minilm.rs                 │  Main entry point for the Veld server        │
 │  ▾ tui/                    12    │                                             │
 │      src/                        │  Key Items:                                 │
 │        main.rs            ●●●    │  ├─ AppState      shared application state  │
@@ -702,7 +702,7 @@ If codebase has >1000 source files (after exclusions), user must specify include
 ### A.1 Link Codebase to Project
 
 ```
-1. User in TUI, selects "Shodh-memory" project
+1. User in TUI, selects "Veld" project
 2. Presses 'l' (link codebase)
 3. Dialog: "Enter codebase path: [~/shodh-memory]"
 4. Confirms
@@ -718,7 +718,7 @@ If codebase has >1000 source files (after exclusions), user must specify include
 ### A.2 Explore Files
 
 ```
-1. User selects 📁 ~/shodh-memory row
+1. User selects the Veld codebase row
 2. Presses Enter
 3. New terminal window spawns with shodh-files
 4. User navigates tree, views file details

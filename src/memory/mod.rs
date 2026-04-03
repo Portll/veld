@@ -1,6 +1,7 @@
-//! Memory System for LLM Context Management
+//! Veld layer: Earth substrate with product semantics (consolidation, importance, decay).
+//! Earth substrate for Veld context management
 //!
-//! A medium-complexity memory system that provides:
+//! A medium-complexity substrate that provides:
 //! - Hierarchical memory storage (working → session → long-term)
 //! - Smart compression based on age and importance
 //! - Multi-modal retrieval (similarity, temporal, causal)
@@ -61,6 +62,23 @@ use crate::constants::{
 
 use crate::memory::storage::MemoryStorage;
 pub use crate::memory::types::*;
+
+// ---------------------------------------------------------------------------
+// Shared Zenoh session for the ZenohEmbedder cache
+// ---------------------------------------------------------------------------
+// The transport layer stores its session here after startup so the embedder
+// cache can reuse it instead of opening a duplicate connection.
+#[cfg(feature = "zenoh")]
+static SHARED_ZENOH_SESSION: std::sync::OnceLock<zenoh::Session> = std::sync::OnceLock::new();
+
+/// Store the transport's Zenoh session so the embedder cache can reuse it.
+///
+/// Called once from server startup after the Zenoh transport is initialised.
+/// Subsequent calls are no-ops (the first session wins).
+#[cfg(feature = "zenoh")]
+pub fn set_shared_zenoh_session(session: zenoh::Session) {
+    let _ = SHARED_ZENOH_SESSION.set(session);
+}
 // pub use crate::memory::vector_storage::{VectorIndexedMemoryStorage, StorageStats};  // Disabled
 use crate::embeddings::Embedder;
 use crate::memory::compression::CompressionPipeline;
@@ -125,6 +143,9 @@ pub struct MemoryConfig {
     /// Base directory for memory storage
     pub storage_path: PathBuf,
 
+    /// Optional shared collective store directory used for multi-tenant bootstrapping.
+    pub collective_store_dir: Option<PathBuf>,
+
     /// Maximum size of working memory (in entries)
     pub working_memory_size: usize,
 
@@ -148,6 +169,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             storage_path: PathBuf::from("./memory_store"),
+            collective_store_dir: None,
             working_memory_size: DEFAULT_WORKING_MEMORY_SIZE,
             session_memory_size_mb: DEFAULT_SESSION_MEMORY_SIZE_MB,
             max_heap_per_user_mb: DEFAULT_MAX_HEAP_PER_USER_MB,
@@ -234,8 +256,8 @@ pub struct MemorySystem {
     /// and suppress frequently-ignored memories (up to 20% penalty for negative momentum)
     feedback_store: Option<Arc<parking_lot::RwLock<FeedbackStore>>>,
 
-    /// Pinky dimension scores: topological health of the knowledge graph.
-    /// Pushed by Pinky via `/api/pinky/dimensions`, read during Layer 5 scoring.
+    /// External dimension scores (Sleight): topological health of the knowledge graph.
+    /// Pushed by Sleight via `/api/sleight/dimensions`, read during Layer 5 scoring.
     /// When available, memories from high-quality graph regions rank higher.
     external_scores: Arc<parking_lot::RwLock<Option<types::ExternalDimensionScores>>>,
 
@@ -443,11 +465,21 @@ impl MemorySystem {
     /// same LRU block cache (multi-tenant server mode). Pass `None` for
     /// standalone / test use — each DB gets a small local cache.
     pub fn new(config: MemoryConfig, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
-        let storage_path = config.storage_path.clone();
         let storage = Arc::new(
-            MemoryStorage::new(&storage_path, shared_cache)
-                .with_context(|| format!("Failed to open storage at {:?}", storage_path))?,
+            MemoryStorage::new(&config.storage_path, shared_cache)
+                .with_context(|| format!("Failed to open storage at {:?}", config.storage_path))?,
         );
+
+        Self::with_storage(config, storage)
+    }
+
+    /// Create a memory system around an already-opened primary store.
+    ///
+    /// This is the seam used by backend compatibility adapters so higher-level
+    /// orchestration can choose the storage opener before constructing the
+    /// retrieval pipeline.
+    pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
+        let storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine
         // Dual-embedder: primary (MiniLM 384d, always) + optional secondary (Nomic 768d)
@@ -488,6 +520,86 @@ impl MemorySystem {
                 tracing::info!("No secondary embedder available — MiniLM only (384d)");
                 None
             }
+        };
+
+        // Option 3: Zenoh-routed embedder (cluster peer)
+        // Caches the Zenoh session (expensive) but retries peer discovery every 30s
+        // so that late-joining peers are detected without requiring a restart.
+        #[cfg(feature = "zenoh")]
+        struct ZenohEmbedderCache {
+            /// The embedder instance (session is expensive, reuse it)
+            embedder: Option<Arc<crate::embeddings::zenoh_embedder::ZenohEmbedder>>,
+            /// Whether the embedder found peers
+            available: bool,
+            /// Last availability probe time
+            last_probe: std::time::Instant,
+        }
+
+        #[cfg(feature = "zenoh")]
+        static ZENOH_EMBEDDER_CACHE: std::sync::OnceLock<std::sync::Mutex<ZenohEmbedderCache>> =
+            std::sync::OnceLock::new();
+
+        #[cfg(feature = "zenoh")]
+        let secondary = if secondary.is_none() {
+            if std::env::var("SHODH_ZENOH_EMBED_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false)
+            {
+                let cache = ZENOH_EMBEDDER_CACHE.get_or_init(|| {
+                    std::sync::Mutex::new(ZenohEmbedderCache {
+                        embedder: None,
+                        available: false,
+                        last_probe: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                    })
+                });
+                let mut guard = cache.lock().unwrap();
+                // Re-probe every 30 seconds if no available embedder cached
+                if !guard.available && guard.last_probe.elapsed() > std::time::Duration::from_secs(30) {
+                    guard.last_probe = std::time::Instant::now();
+                    if let Some(ref ze) = guard.embedder {
+                        // Re-check existing session for newly available peers
+                        if ze.is_available() {
+                            tracing::info!("Zenoh cluster embedder now available — routing to peer");
+                            guard.available = true;
+                        }
+                    } else {
+                        // First init — prefer the shared transport session if available
+                        let config = crate::embeddings::zenoh_embedder::ZenohEmbedderConfig::from_env();
+                        let result = if let Some(session) = SHARED_ZENOH_SESSION.get() {
+                            tracing::debug!("ZenohEmbedder: reusing shared transport session");
+                            crate::embeddings::zenoh_embedder::ZenohEmbedder::new_with_session(
+                                config,
+                                session.clone(),
+                            )
+                        } else {
+                            tracing::debug!("ZenohEmbedder: no shared session, opening standalone");
+                            crate::embeddings::zenoh_embedder::ZenohEmbedder::new(config)
+                        };
+                        match result {
+                            Ok(ze) => {
+                                let avail = ze.is_available();
+                                if avail {
+                                    tracing::info!("Zenoh cluster embedder available — routing to peer");
+                                }
+                                guard.embedder = Some(Arc::new(ze));
+                                guard.available = avail;
+                            }
+                            Err(e) => {
+                                tracing::debug!("Zenoh embedder init failed: {e}");
+                            }
+                        }
+                    }
+                }
+                if guard.available {
+                    guard.embedder.as_ref().map(|e| Arc::clone(e) as Arc<dyn crate::embeddings::Embedder>).or(secondary)
+                } else {
+                    secondary
+                }
+            } else {
+                secondary
+            }
+        } else {
+            secondary
         };
 
         let embedder = Arc::new(
@@ -624,12 +736,44 @@ impl MemorySystem {
         // Initialize hybrid search engine (BM25 + Vector + RRF + Reranking)
         let bm25_path = storage_path.join("bm25_index");
         let hybrid_search_config = hybrid_search::HybridSearchConfig::default();
+            #[cfg(feature = "multi-tenant")]
+            let default_collective_weights = (
+                hybrid_search_config.bm25_weight,
+                hybrid_search_config.vector_weight,
+                hybrid_search_config.graph_weight,
+            );
         let hybrid_search_engine = hybrid_search::HybridSearchEngine::new(
             &bm25_path,
             embedder.clone(),
             hybrid_search_config,
         )
         .context("Failed to initialize hybrid search engine")?;
+
+        #[cfg(feature = "multi-tenant")]
+        if let Some(collective_dir) = config.collective_store_dir.as_ref() {
+            if let Some((bm25, vector, graph, update_count)) =
+                crate::extensions::maintenance::load_learned_weights(&storage_path)
+            {
+                hybrid_search_engine.set_learned_weight_state(hybrid_search::LearnedWeights {
+                    bm25,
+                    vector,
+                    graph,
+                    update_count,
+                });
+            } else if let Ok(store) =
+                crate::extensions::collective_store::CollectiveStore::open(collective_dir)
+            {
+                let (default_bm25, default_vector, default_graph) = default_collective_weights;
+                let (bm25, vector, graph) =
+                    store.bootstrap_user_weights(default_bm25, default_vector, default_graph);
+                hybrid_search_engine.set_learned_weight_state(hybrid_search::LearnedWeights {
+                    bm25,
+                    vector,
+                    graph,
+                    update_count: 0,
+                });
+            }
+        }
 
         // Backfill BM25 index if empty but memories exist
         if hybrid_search_engine.needs_backfill() {
@@ -721,7 +865,7 @@ impl MemorySystem {
             graph_memory: None,
             // Feedback store is optional - wire up with set_feedback_store() for momentum scoring (PIPE-9)
             feedback_store: None,
-            // Pinky dimension scores: initialized empty, populated via API push
+            // External dimension scores (Sleight): initialized empty, populated via API push
             external_scores: Arc::new(parking_lot::RwLock::new(None)),
             // Persistent learning history for retrieval boosting
             learning_history,
@@ -785,22 +929,27 @@ impl MemorySystem {
         self.feedback_store.as_ref()
     }
 
-    /// Update Pinky dimension scores (called via API push from Pinky).
+    /// Snapshot the current hybrid learned weights for collective aggregation/persistence.
+    pub fn learned_weight_state(&self) -> hybrid_search::LearnedWeights {
+        self.hybrid_search.learned_weight_state()
+    }
+
+    /// Update External dimension scores (Sleight) (called via API push from Sleight).
     pub fn set_external_scores(&self, scores: types::ExternalDimensionScores) {
         *self.external_scores.write() = Some(scores);
     }
 
-    /// Get current Pinky dimension scores (read during Layer 5 scoring).
-    /// Returns None if Pinky hasn't pushed scores or they're stale.
-    pub fn pinky_aggregate_score(&self) -> Option<f32> {
+    /// Get current External dimension scores (Sleight) (read during Layer 5 scoring).
+    /// Returns None if Sleight hasn't pushed scores or they're stale.
+    pub fn external_aggregate_score(&self) -> Option<f32> {
         let guard = self.external_scores.read();
-        guard.as_ref().and_then(|s| {
+        guard.as_ref().and_then(|s: &types::ExternalDimensionScores| {
             if s.is_stale() {
                 None
             } else {
                 let agg = s.aggregate();
                 if (agg - 1.0).abs() < f32::EPSILON {
-                    None // neutral = no Pinky data
+                    None // neutral = no external evaluator data
                 } else {
                     Some(agg)
                 }
@@ -1647,6 +1796,7 @@ impl MemorySystem {
                             .next()
                             .map(|c| c.is_uppercase())
                             .unwrap_or(false),
+                        pii_classification: crate::graph_memory::PiiClassification::default(),
                     }
                 })
                 .collect();
@@ -2046,6 +2196,20 @@ impl MemorySystem {
                 // Remove from vector index (soft delete) - CRITICAL for semantic search
                 // This marks the vector as deleted so it won't appear in search results
                 let was_indexed = self.retriever.remove_memory(&memory_id);
+
+                // V2: Post-deletion verification — confirm vector index consistency
+                if was_indexed {
+                    let still_mapped = self.retriever.has_mapping(&memory_id);
+                    if still_mapped {
+                        tracing::error!(
+                            memory_id = %memory_id.0,
+                            "CONSISTENCY VIOLATION: memory deleted but vector mapping still exists. \
+                             Attempting forced cleanup."
+                        );
+                        // Force-remove the stale mapping
+                        self.retriever.remove_memory(&memory_id);
+                    }
+                }
 
                 // Clean up knowledge graph episode and sourced edges
                 if let Some(graph) = &self.graph_memory {
@@ -4077,6 +4241,7 @@ impl MemorySystem {
                         .next()
                         .map(|c| c.is_uppercase())
                         .unwrap_or(false),
+                    pii_classification: crate::graph_memory::PiiClassification::default(),
                 };
                 if graph_guard.add_entity(entity).is_ok() {
                     entities_added += 1;
@@ -4422,6 +4587,7 @@ impl MemorySystem {
                                 .next()
                                 .map(|c| c.is_uppercase())
                                 .unwrap_or(false),
+                            pii_classification: crate::graph_memory::PiiClassification::default(),
                         }
                     })
                     .collect();

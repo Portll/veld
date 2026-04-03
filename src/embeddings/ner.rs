@@ -942,6 +942,7 @@ pub fn argmax_softmax(logits: &[f32]) -> Option<(usize, f32)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

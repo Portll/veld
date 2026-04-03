@@ -231,8 +231,14 @@ impl NomicEmbedder {
             anyhow::bail!("ONNX Runtime not found and SHODH_OFFLINE=true");
         }
 
+        if !super::auto_download_models_enabled() {
+            anyhow::bail!(
+                "ONNX Runtime not found locally and SHODH_AUTO_DOWNLOAD_MODELS is not enabled"
+            );
+        }
+
         // Download as last resort
-        tracing::info!("ONNX Runtime not found. Downloading...");
+        tracing::info!("ONNX Runtime not found locally. Downloading...");
         let onnx_path = super::downloader::download_onnx_runtime(None)?;
         std::env::set_var("ORT_DYLIB_PATH", &onnx_path);
         Ok(())
@@ -243,6 +249,7 @@ impl NomicEmbedder {
     /// Model is NOT loaded until first embed() call.
     /// Set SHODH_LAZY_LOAD=false to load immediately.
     /// Set SHODH_OFFLINE=true to disable auto-download.
+    /// Set SHODH_AUTO_DOWNLOAD_MODELS=true to explicitly allow downloads.
     ///
     /// Auto-download behavior:
     /// - If model files not found, downloads from HuggingFace (~65MB quantized)
@@ -253,9 +260,7 @@ impl NomicEmbedder {
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
 
-        let offline_mode = std::env::var("SHODH_OFFLINE")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+        let offline_mode = super::offline_mode_enabled();
 
         // Ensure ORT_DYLIB_PATH is set before any ort code runs
         if let Err(e) = Self::ensure_onnx_runtime_available(offline_mode) {
@@ -277,9 +282,16 @@ impl NomicEmbedder {
                 return Self::new_simplified(config);
             }
 
+            if !super::auto_download_models_enabled() {
+                tracing::warn!(
+                    "Nomic model files not found locally and SHODH_AUTO_DOWNLOAD_MODELS is not enabled. Using simplified embeddings.",
+                );
+                return Self::new_simplified(config);
+            }
+
             // Try to auto-download model files
             tracing::info!(
-                "Nomic model files not found at {:?}. Downloading...",
+                "Nomic model files not found locally at {:?}. Downloading...",
                 config.model_path.parent().unwrap_or(&config.model_path)
             );
 

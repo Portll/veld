@@ -1,6 +1,6 @@
-# Shodh-Memory Performance Benchmarks
+# Veld - Agentic Memory Performance Benchmarks
 
-Comprehensive performance measurements for shodh-memory v0.1.5+.
+Comprehensive performance measurements for Veld - Agentic Memory v0.1.5+.
 
 **Test Environment:** Windows 11, Intel i7-1355U (10 cores, 12 threads), Rust 1.75, Release build with LTO
 
@@ -219,27 +219,17 @@ Target: **<30ms** for real-time use
 
 ### vs. Neo4j
 
-| Metric | Shodh-Memory | Neo4j | Winner |
+| Metric | Veld | Neo4j | Winner |
 |--------|--------------|-------|--------|
-| Entity Lookup | **763 ns** | 1-5 ms | Shodh (1000x) |
-| Memory Footprint | ~50 MB | 1-4 GB | Shodh |
-| Cold Start | ~200 ms | 5-30 s | Shodh |
+| Entity Lookup | **763 ns** | 1-5 ms | Veld (local graph runtime) |
+| Memory Footprint | ~50 MB | 1-4 GB | Veld |
+| Cold Start | ~200 ms | 5-30 s | Veld |
 
-### vs. Pinecone
+## Product Comparison Note
 
-| Metric | Shodh-Memory | Pinecone | Winner |
-|--------|--------------|----------|--------|
-| Latency | **2-5 ms** | 20-100 ms | Shodh (10x) |
-| Cost | $0 | $70+/month | Shodh |
-| Privacy | Local | Cloud | Shodh |
+Canonical product positioning now lives in the root `README.md` so it stays in one place.
 
-### vs. Mem0
-
-| Metric | Shodh-Memory | Mem0 | Winner |
-|--------|--------------|------|--------|
-| Latency | **1-10 ms** | 100-500 ms | Shodh (100x) |
-| Hebbian Learning | Yes | No | Shodh |
-| Edge Deployment | Yes | No | Shodh |
+This benchmark document keeps measured runtime and systems numbers. Product-level comparisons against Mem0, Cognee, Pinecone, and Zep are intentionally not duplicated here because those products are not all like-for-like benchmark targets.
 
 ---
 

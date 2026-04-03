@@ -4,7 +4,7 @@ Spot Facility Inspection — 5-Day Simulation
 Simulates a realistic industrial inspection scenario: a Spot robot
 performing daily facility inspections over 5 consecutive days.
 
-Demonstrates ALL shodh-memory capabilities working together:
+Demonstrates Veld - Agentic Memory working end-to-end:
   1. Object permanence — obstacles persist across missions
   2. Cross-mission learning — pre-recalls improve each day
   3. Semantic annotations — "this area is always hot" learned from repeated readings

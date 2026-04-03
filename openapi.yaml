@@ -1,8 +1,12 @@
 openapi: 3.0.3
 info:
-  title: Shodh Memory API
+  title: Veld Agentic Memory API
   description: |
-    Universal memory layer for AI agents with Hebbian learning.
+    Internal branch-local API snapshot for Veld Agentic Memory.
+
+    This `v0.7.6-unstable` branch is in stabilization toward `v0.8`. Treat this
+    document as a moving development snapshot rather than the public release
+    contract.
 
     ## Key Features
     - **Sub-millisecond latency**: No LLM calls in critical path
@@ -17,19 +21,17 @@ info:
     1. Store a memory: `POST /api/remember`
     2. Recall memories: `POST /api/recall`
     3. Get context summary: `POST /api/context_summary`
-  version: 0.1.91
+  version: 0.7.6-unstable
   contact:
-    name: Shodh Memory
+    name: Veld Agentic Memory
     url: https://github.com/varun29ankuS/shodh-memory
   license:
-    name: BUSL-1.1
-    url: https://opensource.org/licenses/MIT
+    name: Apache-2.0
+    url: https://opensource.org/licenses/Apache-2.0
 
 servers:
   - url: http://localhost:3030
     description: Local development server
-  - url: https://api.shodh-memory.com
-    description: Production server (if deployed)
 
 security:
   - ApiKeyAuth: []

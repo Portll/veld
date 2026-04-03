@@ -1,5 +1,5 @@
 """
-LangChain Integration for Shodh-Memory
+LangChain Integration for Veld
 
 Provides a drop-in memory class that works with LangChain chains and agents.
 Uses Hebbian learning for association strengthening - no LLM calls for memory ops.
@@ -42,7 +42,7 @@ from urllib3.util.retry import Retry
 
 
 class ShodhMemory(BaseMemory):
-    """LangChain-compatible memory backed by Shodh-Memory.
+    """LangChain-compatible memory backed by Veld.
 
     Features:
     - Sub-millisecond retrieval (no LLM calls for memory ops)
@@ -51,7 +51,7 @@ class ShodhMemory(BaseMemory):
     - Supports semantic, associative, and hybrid retrieval
 
     Attributes:
-        server_url: URL of the Shodh-Memory server
+        server_url: URL of the Veld server
         user_id: Unique identifier for this user
         api_key: API key for authentication
         memory_key: Key used in chain's memory dict (default: "shodh_context")
@@ -170,7 +170,7 @@ class ShodhMemory(BaseMemory):
         except requests.exceptions.RequestException as e:
             # Log error but don't fail the chain
             import warnings
-            warnings.warn(f"Shodh memory retrieval failed: {e}")
+            warnings.warn(f"Veld memory retrieval failed: {e}")
             return {self.memory_key: ""}
 
     def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
@@ -205,7 +205,7 @@ class ShodhMemory(BaseMemory):
             )
         except requests.exceptions.RequestException as e:
             import warnings
-            warnings.warn(f"Shodh memory save failed: {e}")
+            warnings.warn(f"Veld memory save failed: {e}")
 
     def clear(self) -> None:
         """Clear all memories for this user.
@@ -220,7 +220,7 @@ class ShodhMemory(BaseMemory):
             )
         except requests.exceptions.RequestException as e:
             import warnings
-            warnings.warn(f"Shodh memory clear failed: {e}")
+            warnings.warn(f"Veld memory clear failed: {e}")
 
     # Additional convenience methods
 

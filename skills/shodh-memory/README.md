@@ -1,4 +1,6 @@
-# Shodh Memory Skill
+# Veld - Agentic Memory Skill
+
+This skill is branded as Veld - Agentic Memory. Current install and directory identifiers still use `shodh-memory`.
 
 Persistent memory system for AI agents. Store decisions, learnings, and context that persists across conversations.
 
@@ -26,7 +28,7 @@ npx -y @anthropic-ai/shodh-memory
 
 ## What This Skill Teaches
 
-This skill teaches Claude how to effectively use the Shodh Memory MCP server:
+This skill teaches Claude how to effectively use the Veld - Agentic Memory MCP server:
 
 - **When to store memories** - Decisions, learnings, errors, patterns
 - **How to structure memories** - Rich content, proper types, useful tags
@@ -57,7 +59,7 @@ Claude (with skill):
 
 ## Requirements
 
-- Shodh Memory MCP server running (local or cloud)
+- Veld - Agentic Memory MCP server running (local or cloud)
 - Claude Code, Claude.ai, or any MCP-compatible client
 
 ## Links

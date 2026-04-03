@@ -1,11 +1,11 @@
-# 20-Dimensional Interface Analysis: Claude x Shodh Parameter Space
+# 20-Dimensional Interface Analysis: Claude x Veld Parameter Space
 
 ## The Interface Manifold
 
-The coupling surface between Claude's behavioral decisions and shodh-memory's 200+ internal constants spans exactly 20 measurable dimensions. Each dimension represents a point where Claude's behavior threads through the hook/MCP layer and modifies shodh's internal state.
+The coupling surface between Claude's behavioral decisions and Veld - Agentic Memory's 200+ internal constants spans exactly 20 measurable dimensions. Each dimension represents a point where Claude's behavior threads through the hook/MCP layer and modifies Veld's internal state.
 
 ```
-Claude Behavior ──> Hook Parameters ──> Shodh Constants ──> Retrieved Context ──> Claude Behavior
+Claude Behavior ──> Hook Parameters ──> Veld Constants ──> Retrieved Context ──> Claude Behavior
                     |                    |                                         |
                     |                    |                                         |
                     +-- editable code ---+                                         |
@@ -17,7 +17,7 @@ Claude Behavior ──> Hook Parameters ──> Shodh Constants ──> Retrieve
 
 ## Dimension Map
 
-| # | Interface Parameter | Claude Side | Shodh Side | Status |
+| # | Interface Parameter | Claude Side | Veld Side | Status |
 |---|-------------------|-------------|------------|--------|
 | 1 | `semantic_threshold` (0.6-0.65) | Query precision | Vector similarity cutoff | ACTIVE — hooks send 0.6, MCP sends 0.65 |
 | 2 | `entity_match_weight` (0.3-0.4) | Entity extraction quality | Graph traversal influence | ACTIVE — but Claude can't see entity lookup failures |
@@ -25,7 +25,7 @@ Claude Behavior ──> Hook Parameters ──> Shodh Constants ──> Retrieve
 | 4 | `max_results` (2-5) | Context window budget | Candidate pool cutoff | ACTIVE — varies by hook event type |
 | 5 | `auto_ingest` (bool) | Whether prompts become memories | Encoding trigger | ACTIVE — but segmented memories lose RichContext |
 | 6 | `mode` (semantic/associative/hybrid) | Retrieval strategy choice | Which pipeline runs | ACTIVE — but semantic mode still runs BM25+vector, just skips graph |
-| 7 | `content` truncation (1000 chars) | What of prompt reaches shodh | Embedding input | ACTIVE — but 95% of Claude's reasoning lost for FileAccess events |
+| 7 | `content` truncation (1000 chars) | What of prompt reaches Veld | Embedding input | ACTIVE — but 95% of Claude's reasoning lost for FileAccess events |
 | 8 | `type` on remember | Classification | Importance weighting (0.10-0.30) | ACTIVE — but hook auto-classifies, Claude doesn't choose |
 | 9 | `credibility` (0-1) | Confidence assessment | Interference resistance | DORMANT — hooks never set this field |
 | 10 | `emotional_arousal` (0-1) | Arousal tagging | HIGH_AROUSAL_THRESHOLD gating | NEWLY ACTIVE — hooks now classify per event type |
@@ -37,7 +37,7 @@ Claude Behavior ──> Hook Parameters ──> Shodh Constants ──> Retrieve
 | 16 | `rerank_count` (20) | Cross-encoder precision | How many candidates get reranked | STATIC — not exposed |
 | 17 | `candidate_count` (100) | Recall ceiling | How many candidates fetched per retriever | STATIC — not exposed |
 | 18 | `bm25_weight/vector_weight/graph_weight` | Retrieval signal balance | RRF fusion weights | INDIRECT — only via adaptive_weight_learning feedback |
-| 19 | `ADAPTIVE_WEIGHT_LEARNING_RATE` (0.05) | How fast shodh learns from feedback | Weight convergence speed | STATIC — hardcoded |
+| 19 | `ADAPTIVE_WEIGHT_LEARNING_RATE` (0.05) | How fast Veld learns from feedback | Weight convergence speed | STATIC — hardcoded |
 | 20 | `SPREADING_MAX_HOPS` (6) | Graph exploration depth | How far associative traversal goes | STATIC — density-adaptive but not query-controllable |
 
 ## Orthogonal Spikes (Independent Axes)

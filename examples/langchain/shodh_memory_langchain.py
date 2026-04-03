@@ -1,15 +1,15 @@
 """
-Shodh Memory + LangChain Integration Example
+Veld - Agentic Memory + LangChain Integration Example
 
-This example shows how to use Shodh Memory as a persistent memory backend
-for LangChain agents via the MCP adapter.
+This example shows how to use Veld - Agentic Memory as a persistent memory
+backend for LangChain agents via the MCP adapter.
 
 Requirements:
     pip install langchain langchain-mcp-adapters langchain-anthropic
 
 Setup:
     1. Start shodh-memory server: npx -y @shodh/memory-mcp
-    2. Or run locally: shodh-memory-server
+    2. Or run locally: veld
     3. Run this script
 
 Documentation: https://www.shodh-rag.com/memory
@@ -23,7 +23,7 @@ from langgraph.prebuilt import create_react_agent
 
 async def main():
     """
-    Create a LangChain agent with Shodh Memory for persistent context.
+    Create a LangChain agent with Veld - Agentic Memory for persistent context.
 
     The agent can:
     - Store memories with `remember`
@@ -32,7 +32,7 @@ async def main():
     - Search by tags with `recall_by_tags`
     """
 
-    # Configure Shodh Memory MCP server
+    # Configure Veld - Agentic Memory MCP server
     # Option 1: stdio transport (npx)
     async with MultiServerMCPClient(
         {
@@ -48,7 +48,7 @@ async def main():
         # Get tools from the MCP server
         tools = client.get_tools()
 
-        print(f"Available Shodh Memory tools: {[t.name for t in tools]}")
+        print(f"Available Veld tools: {[t.name for t in tools]}")
         # Expected: ['remember', 'recall', 'proactive_context', 'recall_by_tags',
         #            'recall_by_date', 'forget', 'forget_by_tags', 'memory_stats',
         #            'context_summary', 'consolidation_report', 'verify_index', 'repair_index']
@@ -144,9 +144,9 @@ async def stateful_session_example():
 
 async def http_transport_example():
     """
-    Example using HTTP transport (for remote Shodh Memory server).
+    Example using HTTP transport for a remote Veld server.
 
-    Use this when running Shodh Memory as a standalone HTTP server
+    Use this when running Veld - Agentic Memory as a standalone HTTP server
     rather than spawning via npx.
     """
 
@@ -154,7 +154,7 @@ async def http_transport_example():
         {
             "shodh-memory": {
                 "transport": "http",
-                "url": "http://localhost:3030/mcp",  # Your Shodh Memory server URL
+                "url": "http://localhost:3030/mcp",  # Your Veld server URL
                 "headers": {
                     "X-API-Key": "your-api-key",  # If authentication is enabled
                 },
@@ -162,7 +162,7 @@ async def http_transport_example():
         }
     ) as client:
         tools = client.get_tools()
-        print(f"Connected to remote Shodh Memory server with {len(tools)} tools")
+        print(f"Connected to remote Veld server with {len(tools)} tools")
 
         # Use tools as normal...
         model = ChatAnthropic(model="claude-sonnet-4-20250514")
@@ -175,7 +175,7 @@ async def http_transport_example():
 
 
 if __name__ == "__main__":
-    print("=== Shodh Memory + LangChain Integration ===\n")
+    print("=== Veld - Agentic Memory + LangChain Integration ===\n")
     asyncio.run(main())
 
     # Uncomment to try other examples:

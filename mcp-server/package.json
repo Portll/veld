@@ -1,8 +1,8 @@
 {
   "name": "@shodh/memory-mcp",
-  "version": "0.4.0",
+  "version": "0.7.6-unstable",
   "mcpName": "io.github.varun29ankuS/shodh-memory",
-  "description": "MCP server for persistent AI memory - store and recall context across sessions",
+  "description": "Unstable MCP server snapshot for the Veld v0.7.6 stabilization branch",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -22,6 +22,9 @@
     "scripts",
     "README.md"
   ],
+  "publishConfig": {
+    "tag": "unstable"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0"
   },

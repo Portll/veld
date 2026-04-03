@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Shodh-Memory">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Veld - Agentic Memory">
 </p>
 
-<h1 align="center">Shodh-Memory</h1>
+<h1 align="center">Veld - Agentic Memory Python SDK</h1>
 
 <p align="center">
   <a href="https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory"><img src="https://img.shields.io/badge/MCP-Registry-green" alt="MCP Registry"></a>
@@ -18,9 +18,13 @@
 
 ---
 
+> Status: `v0.7.6-unstable` on this branch. The repository source may be ahead
+> of the last published Python package and should be treated as internal /
+> unstable until the `v0.8` stabilization cut.
+
 We built this because AI agents forget everything between sessions. They make the same mistakes, ask the same questions, lose context constantly.
 
-Shodh-Memory fixes that. It's a cognitive memory system—Hebbian learning, activation decay, semantic consolidation—packed into a single 8MB binary that runs offline.
+Veld - Agentic Memory fixes that. It's a cognitive memory system—Hebbian learning, activation decay, semantic consolidation—packed into a single 8MB binary that runs offline.
 
 **How it works:**
 
@@ -77,13 +81,9 @@ Working Memory ──overflow──▶ Session Memory ──importance──▶ 
 
 ### Compared to alternatives
 
-| | Shodh-Memory | Mem0 | Cognee |
-|---|---|---|---|
-| **Deployment** | Single 8MB binary | Cloud API | Neo4j + Vector DB |
-| **Offline** | 100% | No | Partial |
-| **Learning** | Hebbian + decay + LTP | Vector similarity | Knowledge graphs |
-| **Latency** | Sub-millisecond | Network-bound | Database-bound |
-| **Best for** | Local-first, edge, privacy | Cloud scale | Enterprise ETL |
+The canonical product comparison now lives in the root `README.md`.
+
+Short version: Veld is strongest for local-first adaptive memory, Mem0 is stronger for managed cloud memory workflows, and Cognee is stronger for graph-heavy extraction pipelines.
 
 ### Installation
 
@@ -109,6 +109,7 @@ Config file locations:
 
 **Python:**
 ```
+# Installs the last published package, not this branch tip
 pip install shodh-memory
 
 # With LangChain support
@@ -123,9 +124,12 @@ pip install shodh-memory[all]
 
 **From source:**
 ```
-cargo build --release
-./target/release/shodh-memory-server
+./scripts/cargo-dev.sh build --release
+./target/release/veld
 ```
+
+On macOS, prefer `./scripts/cargo-dev.sh ...` on this branch so local source builds
+pick up the repo-local libclang workaround.
 
 ### Usage
 

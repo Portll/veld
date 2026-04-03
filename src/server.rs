@@ -1,6 +1,6 @@
 //! Server bootstrap module — starts the Shodh-Memory HTTP API server.
 //!
-//! Extracted from `main.rs` so that both `shodh-memory-server` (standalone)
+//! Extracted from `main.rs` so that both `veld` (standalone)
 //! and `shodh server` (unified CLI) can start the server with identical behavior.
 
 use anyhow::{Context, Result};
@@ -15,9 +15,9 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth,
-    config::ServerConfig,
+    config::{ServerConfig, StorageBackend},
     embeddings::minilm::pre_init_ort_runtime,
-    handlers::{self, AppState, MultiUserMemoryManager},
+    roots::{AppState, RootsRuntime},
     metrics, middleware,
 };
 
@@ -40,6 +40,7 @@ pub struct ServerRunConfig {
     pub host: String,
     pub port: u16,
     pub storage_path: PathBuf,
+    pub storage_backend: StorageBackend,
     pub production: bool,
     pub rate_limit: u64,
     pub max_concurrent: usize,
@@ -78,6 +79,7 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
             "SHODH_MEMORY_PATH",
             config.storage_path.to_string_lossy().to_string(),
         );
+        std::env::set_var("SHODH_STORAGE_BACKEND", config.storage_backend.as_str());
         if config.production {
             std::env::set_var("SHODH_ENV", "production");
         }
@@ -132,17 +134,25 @@ async fn async_main() -> Result<()> {
 
     // Load configuration
     let server_config = ServerConfig::from_env();
+    if server_config.requested_storage_backend != server_config.effective_storage_backend {
+        warn!(
+            requested = %server_config.requested_storage_backend,
+            effective = %server_config.effective_storage_backend,
+            "Requested storage backend is not active yet; running compatibility backend"
+        );
+    }
     log_production_security_warnings(&server_config);
     print_config(&server_config);
 
     // Initialize runtime-configurable decay scales from config
     crate::decay::init_runtime_scales(&server_config.log_periodic_scales);
 
-    // Create memory manager
-    let manager: AppState = Arc::new(MultiUserMemoryManager::new(
+    // Create orchestration runtime
+    let runtime = RootsRuntime::new(
         server_config.storage_path.clone(),
         server_config.clone(),
-    )?);
+    )?;
+    let manager: AppState = runtime.state();
 
     // Print storage stats
     print_storage_stats(&server_config.storage_path);
@@ -173,9 +183,25 @@ async fn async_main() -> Result<()> {
     let zenoh_handle = {
         let zenoh_config = crate::zenoh_transport::ZenohConfig::from_env();
         if zenoh_config.enabled {
-            match crate::zenoh_transport::start(Arc::clone(&manager), zenoh_config).await {
+            // Create a shared MiniLM embedder for serving peer embedding requests
+            let zenoh_embedder: Option<Arc<dyn crate::embeddings::Embedder>> = {
+                match crate::embeddings::minilm::MiniLMEmbedder::new(
+                    crate::embeddings::minilm::EmbeddingConfig::default(),
+                ) {
+                    Ok(e) => Some(Arc::new(e)),
+                    Err(e) => {
+                        warn!("Could not create embedder for Zenoh serving: {e}");
+                        None
+                    }
+                }
+            };
+            match crate::zenoh_transport::start(Arc::clone(&manager), zenoh_config, zenoh_embedder)
+                .await
+            {
                 Ok(handle) => {
                     info!("Zenoh transport started successfully");
+                    // Share the transport session so the ZenohEmbedder cache can reuse it
+                    crate::memory::set_shared_zenoh_session(handle.session().clone());
                     Some(handle)
                 }
                 Err(e) => {
@@ -212,14 +238,22 @@ async fn async_main() -> Result<()> {
     // Build CORS layer
     let cors = server_config.cors.to_layer();
 
+    let requested_storage_backend = server_config.requested_storage_backend.to_string();
+    let effective_storage_backend = server_config.effective_storage_backend.to_string();
+
     // Build routes using handlers module
-    let public_routes = handlers::build_public_routes(Arc::clone(&manager)).route(
+    let public_routes = runtime.public_routes().route(
         "/",
-        axum::routing::get(|| async {
+        axum::routing::get(move || {
+            let requested_storage_backend = requested_storage_backend.clone();
+            let effective_storage_backend = effective_storage_backend.clone();
+            async move {
             axum::Json(serde_json::json!({
                 "name": "shodh-memory",
                 "version": env!("SHODH_VERSION_FULL"),
                 "description": "Cognitive Memory for AI Agents",
+                "requested_storage_backend": requested_storage_backend,
+                "effective_storage_backend": effective_storage_backend,
                 "health": "/health",
                 "api": {
                     "remember": "POST /api/remember",
@@ -230,15 +264,18 @@ async fn async_main() -> Result<()> {
                 },
                 "docs": "https://github.com/varun29ankuS/shodh-memory"
             }))
+            }
         }),
     );
 
     let protected_routes = if let Some(governor) = governor_layer {
-        handlers::build_protected_routes(Arc::clone(&manager))
+        runtime
+            .protected_routes()
             .layer(axum::middleware::from_fn(auth::auth_middleware))
             .layer(governor)
     } else {
-        handlers::build_protected_routes(Arc::clone(&manager))
+        runtime
+            .protected_routes()
             .layer(axum::middleware::from_fn(auth::auth_middleware))
     };
 
@@ -561,7 +598,7 @@ fn print_banner() {
     eprintln!();
     eprintln!("  ╔═══════════════════════════════════════════════════╗");
     eprintln!(
-        "  ║         🧠 Shodh-Memory Server v{}",
+        "  ║            🧠 Veld Server v{}",
         env!("SHODH_VERSION_FULL")
     );
     eprintln!("  ║       Cognitive Memory for AI Agents              ║");
@@ -586,6 +623,14 @@ fn print_config(config: &ServerConfig) {
     eprintln!("     Host:    {}", config.host);
     eprintln!("     Port:    {}", config.port);
     eprintln!("     Storage: {}", config.storage_path.display());
+    if config.requested_storage_backend == config.effective_storage_backend {
+        eprintln!("     Backend: {}", config.effective_storage_backend);
+    } else {
+        eprintln!(
+            "     Backend: {} requested, {} active",
+            config.requested_storage_backend, config.effective_storage_backend
+        );
+    }
     eprintln!(
         "     Encryption: {}",
         if encryption_enabled { "enabled" } else { "disabled" }

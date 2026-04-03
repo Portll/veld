@@ -19,6 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Refuse prerelease PyPI publish
+        run: |
+          VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "PyPI package version: $VERSION"
+          if [[ "$VERSION" == *".dev"* ]] || [[ "$VERSION" == *"a"* ]] || [[ "$VERSION" == *"b"* ]] || [[ "$VERSION" == *"rc"* ]]; then
+            echo "::error::Refusing PyPI workflow for prerelease version $VERSION"
+            exit 1
+          fi
+
       - name: Install dependencies
         run: |
           yum install -y openssl-devel perl-IPC-Cmd clang-devel llvm-devel zip unzip
@@ -117,7 +126,9 @@ jobs:
       - name: Install LLVM (for RocksDB)
         run: |
           brew install llvm
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+          LLVM_PREFIX=$(brew --prefix llvm)
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Download models and ONNX Runtime
         run: |
@@ -204,7 +215,9 @@ jobs:
       - name: Install LLVM (for RocksDB)
         run: |
           brew install llvm
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+          LLVM_PREFIX=$(brew --prefix llvm)
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Download models and ONNX Runtime
         run: |

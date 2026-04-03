@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Latency benchmark for all shodh-memory Python SDK APIs"""
+"""Latency benchmark for all Veld Python SDK APIs"""
 
 import tempfile
 import shutil

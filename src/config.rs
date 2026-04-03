@@ -10,6 +10,63 @@ use tracing::info;
 /// Legacy storage directory name used in versions <= 0.1.80.
 const LEGACY_STORAGE_DIR: &str = "shodh_memory_data";
 
+/// Requested storage backend.
+///
+/// `redb` is the default target for the storage migration, but the current
+/// build still resolves to the legacy RocksDB runtime until the abstraction
+/// layer is landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBackend {
+    Redb,
+    RocksDb,
+}
+
+impl StorageBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redb => "redb",
+            Self::RocksDb => "rocksdb",
+        }
+    }
+
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::RocksDb)
+    }
+}
+
+impl std::fmt::Display for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StorageBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "redb" => Ok(Self::Redb),
+            "rocksdb" | "rocks" | "legacy-rocksdb" => Ok(Self::RocksDb),
+            other => Err(format!(
+                "unsupported storage backend '{other}' (expected 'redb' or 'rocksdb')"
+            )),
+        }
+    }
+}
+
+pub const fn default_requested_storage_backend() -> StorageBackend {
+    StorageBackend::Redb
+}
+
+pub const fn effective_storage_backend_for_current_build(
+    requested: StorageBackend,
+) -> StorageBackend {
+    match requested {
+        StorageBackend::Redb => StorageBackend::RocksDb,
+        StorageBackend::RocksDb => StorageBackend::RocksDb,
+    }
+}
+
 /// Returns the platform-appropriate default storage path.
 ///
 /// Resolution order:
@@ -260,8 +317,14 @@ pub struct ServerConfig {
     /// Server port (default: 3030)
     pub port: u16,
 
-    /// Storage path for RocksDB (default: platform data dir, e.g. ~/.local/share/shodh-memory/)
+    /// Storage path for the selected storage backend.
     pub storage_path: PathBuf,
+
+    /// Backend requested by config/CLI. `redb` is the default target.
+    pub requested_storage_backend: StorageBackend,
+
+    /// Backend actually used by the current build/runtime.
+    pub effective_storage_backend: StorageBackend,
 
     /// Maximum users to keep in memory LRU cache (default: 1000)
     pub max_users_in_memory: usize,
@@ -290,6 +353,12 @@ pub struct ServerConfig {
 
     /// Whether running in production mode
     pub is_production: bool,
+
+    /// Enable multi-tenant collective learning and auth binding integration.
+    pub multi_tenant_mode: bool,
+
+    /// Directory for shared collective state when multi-tenant mode is enabled.
+    pub collective_store_dir: PathBuf,
 
     /// CORS configuration
     pub cors: CorsConfig,
@@ -332,6 +401,10 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 3030,
             storage_path: default_storage_path(),
+            requested_storage_backend: default_requested_storage_backend(),
+            effective_storage_backend: effective_storage_backend_for_current_build(
+                default_requested_storage_backend(),
+            ),
             max_users_in_memory: 1000,
             audit_max_entries_per_user: 10_000,
             audit_rotation_check_interval: 100,
@@ -341,6 +414,8 @@ impl Default for ServerConfig {
             max_concurrent_requests: 200,
             request_timeout_secs: 60,
             is_production: false,
+            multi_tenant_mode: false,
+            collective_store_dir: default_storage_path().join("collective"),
             cors: CorsConfig::default(),
             maintenance_interval_secs: 3600, // 1 hour (aligns with biological consolidation timescales)
             activation_decay_factor: 0.98, // 2% decay per cycle → 62% retained after 24hr, near-zero at 30 days
@@ -383,6 +458,35 @@ impl ServerConfig {
         if let Ok(val) = env::var("SHODH_MEMORY_PATH") {
             config.storage_path = PathBuf::from(val);
         }
+        config.collective_store_dir = config.storage_path.join("collective");
+
+        if let Ok(val) = env::var("SHODH_COLLECTIVE_STORE_DIR") {
+            config.collective_store_dir = PathBuf::from(val);
+        }
+
+        if let Ok(val) = env::var("SHODH_MULTI_TENANT") {
+            config.multi_tenant_mode = val.eq_ignore_ascii_case("true") || val == "1";
+        }
+
+        // Requested storage backend
+        if let Ok(val) = env::var("SHODH_STORAGE_BACKEND") {
+            match val.parse::<StorageBackend>() {
+                Ok(backend) => {
+                    config.requested_storage_backend = backend;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "SHODH_STORAGE_BACKEND='{}' ignored: {}. Using default target {}.",
+                        val,
+                        err,
+                        default_requested_storage_backend()
+                    );
+                }
+            }
+        }
+
+        config.effective_storage_backend =
+            effective_storage_backend_for_current_build(config.requested_storage_backend);
 
         // Max users in memory
         if let Ok(val) = env::var("SHODH_MAX_USERS") {
@@ -579,6 +683,15 @@ impl ServerConfig {
         );
         info!("   Port: {}", self.port);
         info!("   Storage: {:?}", self.storage_path);
+        if self.requested_storage_backend == self.effective_storage_backend {
+            info!("   Backend: {}", self.effective_storage_backend);
+        } else {
+            info!(
+                "   Backend: requested {}, running {} (compatibility path)",
+                self.requested_storage_backend,
+                self.effective_storage_backend
+            );
+        }
         info!("   Max users in memory: {}", self.max_users_in_memory);
         if self.rate_limit_per_second > 0 {
             info!(
@@ -627,6 +740,7 @@ pub fn print_env_help() {
     );
     println!("  SHODH_PORT             - Server port (default: 3030)");
     println!("  SHODH_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/shodh-memory/)");
+    println!("  SHODH_STORAGE_BACKEND  - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
     println!("  SHODH_API_KEYS         - Comma-separated API keys (required in production)");
     println!("  SHODH_DEV_API_KEY      - Development API key (required in dev if SHODH_API_KEYS not set)");
     println!("  SHODH_ENCRYPTION_KEY   - 32-byte field-encryption key (required for encrypted-at-rest production)");
@@ -663,6 +777,9 @@ pub fn print_env_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_default_config() {
@@ -670,23 +787,31 @@ mod tests {
         assert_eq!(config.port, 3030);
         assert_eq!(config.max_users_in_memory, 1000);
         assert!(!config.is_production);
+        assert_eq!(config.requested_storage_backend, StorageBackend::Redb);
+        assert_eq!(config.effective_storage_backend, StorageBackend::RocksDb);
     }
 
     #[test]
     fn test_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("SHODH_PORT", "8080");
         env::set_var("SHODH_MAX_USERS", "500");
+        env::set_var("SHODH_STORAGE_BACKEND", "rocksdb");
 
         let config = ServerConfig::from_env();
         assert_eq!(config.port, 8080);
         assert_eq!(config.max_users_in_memory, 500);
+        assert_eq!(config.requested_storage_backend, StorageBackend::RocksDb);
+        assert_eq!(config.effective_storage_backend, StorageBackend::RocksDb);
 
         env::remove_var("SHODH_PORT");
         env::remove_var("SHODH_MAX_USERS");
+        env::remove_var("SHODH_STORAGE_BACKEND");
     }
 
     #[test]
     fn test_local_dev_disables_rate_limit_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::remove_var("SHODH_RATE_LIMIT");
         env::remove_var("SHODH_HOST");
         env::remove_var("SHODH_ENV");
@@ -697,6 +822,7 @@ mod tests {
 
     #[test]
     fn test_explicit_rate_limit_override_is_preserved_locally() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("SHODH_RATE_LIMIT", "4000");
         env::remove_var("SHODH_HOST");
         env::remove_var("SHODH_ENV");
@@ -719,6 +845,7 @@ mod tests {
 
     #[test]
     fn test_production_without_cors_origins_denies_all() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("SHODH_ENV", "production");
         env::remove_var("SHODH_CORS_ORIGINS");
 
@@ -731,6 +858,7 @@ mod tests {
 
     #[test]
     fn test_production_with_cors_origins_is_restricted_but_not_deny_all() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("SHODH_ENV", "production");
         env::set_var("SHODH_CORS_ORIGINS", "https://app.example.com");
 

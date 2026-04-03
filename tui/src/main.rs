@@ -1,6 +1,9 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
@@ -11,6 +14,8 @@ use ratatui::widgets::*;
 use std::{
     env,
     io::{self, Read as IoRead, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,7 +26,7 @@ mod stream;
 mod types;
 mod widgets;
 
-use logo::{ELEPHANT, ELEPHANT_FRAMES, SHODH_GRADIENT, SHODH_TEXT};
+use logo::{ELEPHANT, ELEPHANT_FRAMES, GRASS_SUFFIX, SHODH_GRADIENT, SHODH_TEXT};
 use stream::{
     complete_todo, next_status, refresh_todos, reorder_todo, update_todo_priority,
     update_todo_status, MemoryStream,
@@ -56,15 +61,67 @@ struct UserSelector {
     selected: usize,
     loading: bool,
     error: Option<String>,
+    notice: Option<String>,
+    api_key_input: String,
+    path_input: String,
+    default_key_path: String,
+    auth_option: AuthOption,
+    focus: SelectorFocus,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SelectorFocus {
+    AuthOptions,
+    PathInput,
+    KeyInput,
+    Users,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthOption {
+    DefaultLocation,
+    FilePath,
+    PasteKey,
+}
+
+impl AuthOption {
+    fn next(self) -> Self {
+        match self {
+            Self::DefaultLocation => Self::FilePath,
+            Self::FilePath => Self::PasteKey,
+            Self::PasteKey => Self::DefaultLocation,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::DefaultLocation => Self::PasteKey,
+            Self::FilePath => Self::DefaultLocation,
+            Self::PasteKey => Self::FilePath,
+        }
+    }
+}
+
+struct UserSelectorLayout {
+    options_area: Rect,
+    detail_field: Rect,
+    copy_button: Rect,
+    list_inner: Rect,
 }
 
 impl UserSelector {
-    fn new() -> Self {
+    fn new(api_key: String) -> Self {
         Self {
             users: vec![],
             selected: 0,
-            loading: true,
+            loading: false,
             error: None,
+            notice: None,
+            api_key_input: api_key,
+            path_input: String::new(),
+            default_key_path: default_api_key_path().display().to_string(),
+            auth_option: AuthOption::DefaultLocation,
+            focus: SelectorFocus::AuthOptions,
         }
     }
     fn select_next(&mut self) {
@@ -82,6 +139,76 @@ impl UserSelector {
     }
 }
 
+fn format_auth_message(message: &str) -> String {
+    message
+        .replace(
+            ". Expected a key from SHODH_API_KEYS or SHODH_DEV_API_KEY.",
+            ".\nExpected a key from SHODH_API_KEYS or SHODH_DEV_API_KEY.",
+        )
+        .replace(". Default dev key: '", ".\nDefault dev key: '")
+}
+
+fn default_api_key_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|dir| dir.join("shodh").join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from(".shodh").join("config.toml"))
+}
+
+fn extract_api_key_from_file(path: &Path) -> Result<String, String> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|err| format!("Cannot read {}: {}", path.display(), err))?;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "api_key" {
+                let value = value
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+            }
+        }
+    }
+
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .ok_or_else(|| format!("No API key found in {}", path.display()))
+}
+
+fn extract_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|message| message.as_str())
+                .map(format_auth_message)
+        })
+        .unwrap_or_else(|| {
+            let compact = body.trim();
+            if compact.is_empty() {
+                "Request failed with an empty response body".to_string()
+            } else {
+                compact.chars().take(240).collect()
+            }
+        })
+}
+
 async fn fetch_users(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
     let client = reqwest::Client::new();
     let url = format!("{}/api/users", base_url);
@@ -90,11 +217,8 @@ async fn fetch_users(base_url: &str, api_key: &str) -> Result<Vec<String>, Strin
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Server error {}: {}",
-                    status.as_u16(),
-                    body.chars().take(100).collect::<String>()
-                ));
+                let message = extract_error_message(&body);
+                return Err(format!("Server error {}:\n{}", status.as_u16(), message));
             }
             resp.json::<Vec<String>>()
                 .await
@@ -104,7 +228,7 @@ async fn fetch_users(base_url: &str, api_key: &str) -> Result<Vec<String>, Strin
             let err_str = e.to_string();
             if err_str.contains("Connection refused") || err_str.contains("connection refused") {
                 Err(format!(
-                    "Server not running at {}. Start with: shodh-memory-server",
+                    "Server not running at {}. Start with: veld",
                     base_url
                 ))
             } else if err_str.contains("timed out") || err_str.contains("timeout") {
@@ -116,16 +240,56 @@ async fn fetch_users(base_url: &str, api_key: &str) -> Result<Vec<String>, Strin
     }
 }
 
-fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
-    let area = f.area();
+async fn refresh_user_selector(
+    selector: &mut UserSelector,
+    base_url: &str,
+) {
+    selector.loading = true;
+    selector.error = None;
+    selector.notice = None;
 
-    // Dark background
-    f.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(15, 15, 20))),
-        area,
-    );
+    match fetch_users(base_url, &selector.api_key_input).await {
+        Ok(users) => {
+            selector.users = users;
+            selector.loading = false;
+            selector.selected = 0;
+            selector.focus = if selector.users.is_empty() {
+                SelectorFocus::AuthOptions
+            } else {
+                SelectorFocus::Users
+            };
+        }
+        Err(error) => {
+            selector.users.clear();
+            selector.loading = false;
+            selector.error = Some(error);
+            selector.focus = SelectorFocus::AuthOptions;
+        }
+    }
+}
 
-    // Center everything with generous margins
+async fn connect_with_key(selector: &mut UserSelector, base_url: &str, api_key: String) {
+    selector.api_key_input = api_key;
+    refresh_user_selector(selector, base_url).await;
+}
+
+async fn connect_with_key_file(selector: &mut UserSelector, base_url: &str, path: &str) {
+    match extract_api_key_from_file(Path::new(path)) {
+        Ok(api_key) => {
+            connect_with_key(selector, base_url, api_key).await;
+            if selector.error.is_none() {
+                selector.notice = Some(format!("Loaded key from {}", path));
+            }
+        }
+        Err(err) => {
+            selector.error = Some(err);
+            selector.notice = None;
+            selector.focus = SelectorFocus::AuthOptions;
+        }
+    }
+}
+
+fn user_selector_layout(area: Rect) -> UserSelectorLayout {
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -136,6 +300,172 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
         .split(area);
 
     let center = outer[1];
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Top padding
+            Constraint::Length(6), // SHODH text logo
+            Constraint::Length(1), // Spacing
+            Constraint::Length(6), // Elephant logo
+            Constraint::Length(1), // Spacing
+            Constraint::Length(2), // Tagline
+            Constraint::Length(1), // Spacing
+            Constraint::Length(9), // API key box
+            Constraint::Length(1), // Spacing
+            Constraint::Length(1), // "Select Profile" header
+            Constraint::Length(1), // Spacing
+            Constraint::Min(6),    // User list
+            Constraint::Length(1), // Spacing
+            Constraint::Length(3), // Footer
+        ])
+        .split(center);
+
+    let auth_inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // options
+            Constraint::Length(3), // detail + copy
+            Constraint::Length(1), // notice
+        ])
+        .split(chunks[7]);
+
+    let detail_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(12)])
+        .split(auth_inner[1]);
+
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded);
+
+    UserSelectorLayout {
+        options_area: auth_inner[0],
+        detail_field: detail_row[0],
+        copy_button: detail_row[1],
+        list_inner: list_block.inner(chunks[11]),
+    }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn try_copy_with_command(program: &str, args: &[&str], text: &str) -> Result<bool, String> {
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("{} failed to start: {}", program, err)),
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("{} failed while copying: {}", program, err))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("{} failed while waiting: {}", program, err))?;
+
+    Ok(status.success())
+}
+
+fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
+    if text.trim().is_empty() {
+        return Err("No API key to copy yet".to_string());
+    }
+
+    let candidates: &[(&str, &[&str], &str)] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[] as &[&str], "pbcopy")]
+    } else if cfg!(target_os = "windows") {
+        &[("clip", &[] as &[&str], "clip")]
+    } else {
+        &[
+            ("wl-copy", &[] as &[&str], "wl-copy"),
+            ("xclip", &["-selection", "clipboard"], "xclip"),
+            ("xsel", &["--clipboard", "--input"], "xsel"),
+        ]
+    };
+
+    for (program, args, label) in candidates {
+        match try_copy_with_command(program, args, text) {
+            Ok(true) => return Ok(label),
+            Ok(false) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err("No clipboard helper found (tried pbcopy, wl-copy, xclip, xsel)".to_string())
+}
+
+fn option_label(selector: &UserSelector, option: AuthOption) -> String {
+    match option {
+        AuthOption::DefaultLocation => {
+            format!("1. Use key in {}", selector.default_key_path)
+        }
+        AuthOption::FilePath => "2. Use key from file path".to_string(),
+        AuthOption::PasteKey => "3. Paste key directly".to_string(),
+    }
+}
+
+fn detail_text(selector: &UserSelector) -> (&str, String) {
+    match selector.auth_option {
+        AuthOption::DefaultLocation => (
+            "Default location",
+            selector.default_key_path.clone(),
+        ),
+        AuthOption::FilePath => (
+            "Paste path",
+            if selector.path_input.is_empty() {
+                "Paste path to a key file or config.toml".to_string()
+            } else {
+                selector.path_input.clone()
+            },
+        ),
+        AuthOption::PasteKey => (
+            "Use key",
+            if selector.api_key_input.is_empty() {
+                "Paste SHODH API key".to_string()
+            } else {
+                selector.api_key_input.clone()
+            },
+        ),
+    }
+}
+
+fn copy_label(selector: &UserSelector) -> &'static str {
+    match selector.auth_option {
+        AuthOption::DefaultLocation | AuthOption::FilePath => " Copy Path ",
+        AuthOption::PasteKey => " Copy Key ",
+    }
+}
+
+fn copy_payload(selector: &UserSelector) -> &str {
+    match selector.auth_option {
+        AuthOption::DefaultLocation => selector.default_key_path.as_str(),
+        AuthOption::FilePath => selector.path_input.as_str(),
+        AuthOption::PasteKey => selector.api_key_input.as_str(),
+    }
+}
+
+fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
+    let area = f.area();
+    let layout = user_selector_layout(area);
+
+    // Dark background
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(15, 15, 20))),
+        area,
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -146,16 +476,25 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
             Constraint::Length(6), // Elephant logo
             Constraint::Length(1), // Spacing
             Constraint::Length(2), // Tagline
-            Constraint::Length(2), // Spacing
+            Constraint::Length(1), // Spacing
+            Constraint::Length(9), // API key box
+            Constraint::Length(1), // Spacing
             Constraint::Length(1), // "Select Profile" header
             Constraint::Length(1), // Spacing
             Constraint::Min(6),    // User list
             Constraint::Length(1), // Spacing
             Constraint::Length(3), // Footer
         ])
-        .split(center);
+        .split(Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(area)[1]);
 
-    // SHODH text logo with gradient
+    // VELD text logo with gradient
     let shodh_lines: Vec<Line> = SHODH_TEXT
         .iter()
         .enumerate()
@@ -169,7 +508,7 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
         chunks[1],
     );
 
-    // Elephant logo with orange gradient
+    // Elephant logo with orange gradient and grass accent
     let logo_lines: Vec<Line> = ELEPHANT
         .iter()
         .enumerate()
@@ -182,10 +521,15 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
                 (255, 70, 10),
                 (200, 55, 5),
             ];
-            Line::from(Span::styled(
-                *l,
-                Style::default().fg(Color::Rgb(g[i % 6].0, g[i % 6].1, g[i % 6].2)),
-            ))
+            let elephant_style = Style::default().fg(Color::Rgb(g[i % 6].0, g[i % 6].1, g[i % 6].2));
+            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
+                Line::from(vec![
+                    Span::styled(body, elephant_style),
+                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                ])
+            } else {
+                Line::from(Span::styled(*l, elephant_style))
+            }
         })
         .collect();
     f.render_widget(
@@ -211,6 +555,128 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
         chunks[5],
     );
 
+    // API key editor
+    let auth_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            " Authentication ",
+            Style::default().fg(Color::Rgb(120, 120, 140)),
+        ));
+    let auth_inner = auth_block.inner(chunks[7]);
+    f.render_widget(auth_block, chunks[7]);
+
+    let auth_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(auth_inner);
+
+    let options = [
+        AuthOption::DefaultLocation,
+        AuthOption::FilePath,
+        AuthOption::PasteKey,
+    ];
+    let option_lines: Vec<Line> = options
+        .iter()
+        .map(|option| {
+            let selected = *option == selector.auth_option;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(60, 42, 20))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(150, 150, 170))
+            };
+            Line::from(Span::styled(option_label(selector, *option), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(option_lines), auth_chunks[0]);
+
+    let (detail_label, detail_value) = detail_text(selector);
+    let detail_focused = matches!(
+        selector.focus,
+        SelectorFocus::PathInput | SelectorFocus::KeyInput
+    );
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            format!(" {} ", detail_label),
+            Style::default().fg(Color::Rgb(120, 120, 140)),
+        ))
+        .border_style(if detail_focused {
+            Style::default().fg(Color::Rgb(255, 140, 50))
+        } else {
+            Style::default().fg(Color::Rgb(60, 60, 80))
+        });
+    f.render_widget(
+        Paragraph::new(detail_value)
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: false })
+            .block(detail_block),
+        layout.detail_field,
+    );
+
+    let copy_label = if selector.notice.as_deref() == Some("API key copied to clipboard") {
+        match selector.auth_option {
+            AuthOption::DefaultLocation | AuthOption::FilePath => " Path Copied ",
+            AuthOption::PasteKey => " Key Copied ",
+        }
+    } else {
+        copy_label(selector)
+    };
+    let copy_style = if selector.notice.as_deref() == Some("API key copied to clipboard") {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(255, 200, 120))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Rgb(255, 200, 120))
+            .add_modifier(Modifier::BOLD)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(copy_label, copy_style)))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Rgb(255, 140, 50))),
+            ),
+        layout.copy_button,
+    );
+
+    if let Some(notice) = selector.notice.as_deref() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                notice,
+                Style::default().fg(Color::Rgb(170, 220, 160)),
+            ))),
+            auth_chunks[2],
+        );
+    } else {
+        let auth_hint = match selector.focus {
+            SelectorFocus::AuthOptions => "Enter to use selected option",
+            SelectorFocus::PathInput => "Enter to load key from file",
+            SelectorFocus::KeyInput => "Enter to connect with pasted key",
+            SelectorFocus::Users => "Enter to select profile",
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                auth_hint,
+                Style::default().fg(Color::Rgb(100, 100, 120)),
+            ))),
+            auth_chunks[2],
+        );
+    }
+
     // Select Profile header
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -218,17 +684,17 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
             Style::default().fg(Color::Rgb(100, 100, 120)),
         )))
         .alignment(Alignment::Center),
-        chunks[7],
+        chunks[9],
     );
 
     // User list
-    let list_area = chunks[9];
+    let list_area = chunks[11];
     let list_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
         .border_type(ratatui::widgets::BorderType::Rounded);
 
-    let inner = list_block.inner(list_area);
+    let inner = layout.list_inner;
     f.render_widget(list_block, list_area);
 
     if selector.loading {
@@ -242,17 +708,15 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
         );
     } else if let Some(ref e) = selector.error {
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("✗ ", Style::default().fg(Color::Red)),
-                Span::styled(e.as_str(), Style::default().fg(Color::Red)),
-            ]))
-            .alignment(Alignment::Center),
+            Paragraph::new(e.as_str())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
             inner,
         );
     } else if selector.users.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No profiles found",
+                "No profiles found for this key",
                 Style::default().fg(Color::DarkGray),
             )))
             .alignment(Alignment::Center),
@@ -292,25 +756,32 @@ fn render_user_selector(f: &mut Frame, selector: &UserSelector) {
     let footer_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::Rgb(50, 50, 60)));
-    let footer_inner = footer_block.inner(chunks[11]);
-    f.render_widget(footer_block, chunks[11]);
+    let footer_inner = footer_block.inner(chunks[13]);
+    f.render_widget(footer_block, chunks[13]);
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " ↑↓ ",
+                " Tab ",
                 Style::default()
                     .fg(Color::Rgb(255, 140, 50))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("navigate  ", Style::default().fg(Color::Rgb(80, 80, 100))),
+            Span::styled("switch focus  ", Style::default().fg(Color::Rgb(80, 80, 100))),
             Span::styled(
                 " Enter ",
                 Style::default()
                     .fg(Color::Rgb(255, 140, 50))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("select  ", Style::default().fg(Color::Rgb(80, 80, 100))),
+            Span::styled("use/select  ", Style::default().fg(Color::Rgb(80, 80, 100))),
+            Span::styled(
+                " Click Copy ",
+                Style::default()
+                    .fg(Color::Rgb(255, 140, 50))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("copy key  ", Style::default().fg(Color::Rgb(80, 80, 100))),
             Span::styled(
                 " q ",
                 Style::default()
@@ -362,7 +833,7 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
         ])
         .split(center);
 
-    // SHODH text with animated gradient
+    // VELD text with animated gradient
     let shodh_lines: Vec<Line> = SHODH_TEXT
         .iter()
         .enumerate()
@@ -381,7 +852,7 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
         chunks[1],
     );
 
-    // Animated elephant logo with trunk waving
+    // Animated elephant logo with trunk waving and grass accent
     let frame_idx = (tick as usize / 8) % ELEPHANT_FRAMES.len(); // Change frame every 8 ticks
     let current_frame = ELEPHANT_FRAMES[frame_idx];
 
@@ -402,7 +873,15 @@ fn render_splash(f: &mut Frame, progress: f32, tick: u64) {
             let r = (r as f32 * phase) as u8;
             let g = (g as f32 * phase) as u8;
             let b = (b as f32 * phase) as u8;
-            Line::from(Span::styled(*l, Style::default().fg(Color::Rgb(r, g, b))))
+            let elephant_style = Style::default().fg(Color::Rgb(r, g, b));
+            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
+                Line::from(vec![
+                    Span::styled(body, elephant_style),
+                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                ])
+            } else {
+                Line::from(Span::styled(*l, elephant_style))
+            }
         })
         .collect();
     f.render_widget(
@@ -565,36 +1044,175 @@ async fn run_user_selector(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     base_url: &str,
     api_key: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     execute!(io::stdout(), SetTitle("🦣 Shodh - Select Profile"))?;
-    let mut selector = UserSelector::new();
-    match fetch_users(base_url, api_key).await {
-        Ok(u) => {
-            selector.users = u;
-            selector.loading = false;
-        }
-        Err(e) => {
-            selector.error = Some(e);
-            selector.loading = false;
-        }
-    }
+    let mut selector = UserSelector::new(api_key.to_string());
+
     let result = loop {
         terminal.draw(|f| render_user_selector(f, &selector))?;
+
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break None,
-                        KeyCode::Up | KeyCode::Char('k') => selector.select_prev(),
-                        KeyCode::Down | KeyCode::Char('j') => selector.select_next(),
-                        KeyCode::Enter => {
-                            if let Some(u) = selector.selected_user() {
-                                break Some(u.clone());
+                        KeyCode::Char('q') => break None,
+                        KeyCode::Esc => {
+                            if selector.focus == SelectorFocus::Users {
+                                selector.focus = SelectorFocus::AuthOptions;
+                            } else if matches!(
+                                selector.focus,
+                                SelectorFocus::PathInput | SelectorFocus::KeyInput
+                            ) {
+                                selector.focus = SelectorFocus::AuthOptions;
+                            } else {
+                                break None;
                             }
                         }
-                        _ => {}
+                        KeyCode::Tab => {
+                            selector.focus = match selector.focus {
+                                SelectorFocus::AuthOptions => match selector.auth_option {
+                                    AuthOption::DefaultLocation if !selector.users.is_empty() => {
+                                        SelectorFocus::Users
+                                    }
+                                    AuthOption::DefaultLocation => SelectorFocus::AuthOptions,
+                                    AuthOption::FilePath => SelectorFocus::PathInput,
+                                    AuthOption::PasteKey => SelectorFocus::KeyInput,
+                                },
+                                SelectorFocus::PathInput | SelectorFocus::KeyInput
+                                    if !selector.users.is_empty() =>
+                                {
+                                    SelectorFocus::Users
+                                }
+                                SelectorFocus::PathInput | SelectorFocus::KeyInput => {
+                                    SelectorFocus::AuthOptions
+                                }
+                                SelectorFocus::Users => SelectorFocus::AuthOptions,
+                            };
+                        }
+                        _ => match selector.focus {
+                            SelectorFocus::AuthOptions => match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    selector.auth_option = selector.auth_option.prev();
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    selector.auth_option = selector.auth_option.next();
+                                }
+                                KeyCode::Char('1') => {
+                                    selector.auth_option = AuthOption::DefaultLocation;
+                                }
+                                KeyCode::Char('2') => {
+                                    selector.auth_option = AuthOption::FilePath;
+                                }
+                                KeyCode::Char('3') => {
+                                    selector.auth_option = AuthOption::PasteKey;
+                                }
+                                KeyCode::Enter => {
+                                    match selector.auth_option {
+                                        AuthOption::DefaultLocation => {
+                                            let path = selector.default_key_path.clone();
+                                            connect_with_key_file(&mut selector, base_url, &path).await;
+                                        }
+                                        AuthOption::FilePath => {
+                                            selector.focus = SelectorFocus::PathInput;
+                                        }
+                                        AuthOption::PasteKey => {
+                                            selector.focus = SelectorFocus::KeyInput;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
+                            SelectorFocus::PathInput => match key.code {
+                                KeyCode::Enter => {
+                                    let path = selector.path_input.clone();
+                                    connect_with_key_file(&mut selector, base_url, &path).await;
+                                }
+                                KeyCode::Backspace => {
+                                    selector.path_input.pop();
+                                    selector.notice = None;
+                                }
+                                KeyCode::Char(c)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    selector.path_input.push(c);
+                                    selector.notice = None;
+                                }
+                                _ => {}
+                            },
+                            SelectorFocus::KeyInput => match key.code {
+                                KeyCode::Enter => {
+                                    let api_key = selector.api_key_input.clone();
+                                    connect_with_key(&mut selector, base_url, api_key).await;
+                                }
+                                KeyCode::Backspace => {
+                                    selector.api_key_input.pop();
+                                    selector.notice = None;
+                                }
+                                KeyCode::Char(c)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    selector.api_key_input.push(c);
+                                    selector.notice = None;
+                                }
+                                _ => {}
+                            },
+                            SelectorFocus::Users => match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => selector.select_prev(),
+                                KeyCode::Down | KeyCode::Char('j') => selector.select_next(),
+                                KeyCode::Left => selector.focus = SelectorFocus::AuthOptions,
+                                KeyCode::Enter => {
+                                    if let Some(u) = selector.selected_user() {
+                                        break Some((u.clone(), selector.api_key_input.clone()));
+                                    }
+                                }
+                                _ => {}
+                            },
+                        },
                     }
                 }
+                Event::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
+                    let size = terminal.size()?;
+                    let layout =
+                        user_selector_layout(Rect::new(0, 0, size.width, size.height));
+
+                    if rect_contains(layout.copy_button, mouse.column, mouse.row) {
+                        match copy_to_clipboard(copy_payload(&selector)) {
+                            Ok(_) => {
+                                selector.notice = Some("API key copied to clipboard".to_string());
+                                selector.error = None;
+                            }
+                            Err(err) => {
+                                selector.notice = None;
+                                selector.error = Some(err);
+                            }
+                        }
+                    } else if rect_contains(layout.options_area, mouse.column, mouse.row) {
+                        let row = mouse.row.saturating_sub(layout.options_area.y);
+                        selector.auth_option = match row {
+                            0 => AuthOption::DefaultLocation,
+                            1 => AuthOption::FilePath,
+                            _ => AuthOption::PasteKey,
+                        };
+                        selector.focus = SelectorFocus::AuthOptions;
+                    } else if rect_contains(layout.detail_field, mouse.column, mouse.row) {
+                        selector.focus = match selector.auth_option {
+                            AuthOption::DefaultLocation => SelectorFocus::AuthOptions,
+                            AuthOption::FilePath => SelectorFocus::PathInput,
+                            AuthOption::PasteKey => SelectorFocus::KeyInput,
+                        };
+                    } else if rect_contains(layout.list_inner, mouse.column, mouse.row) {
+                        selector.focus = SelectorFocus::Users;
+                        let clicked_row = mouse.row.saturating_sub(layout.list_inner.y) as usize;
+                        if clicked_row < selector.users.len() {
+                            selector.selected = clicked_row;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     };
@@ -617,7 +1235,7 @@ async fn run_statusline() -> Result<()> {
         Ok(v) => v,
         Err(_) => {
             // Fallback output if JSON parsing fails
-            println!("Shodh Memory");
+            println!("Veld Memory");
             return Ok(());
         }
     };
@@ -740,13 +1358,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string())
         .trim_end_matches("/api/events")
         .to_string();
-    let api_key = std::env::var("SHODH_API_KEY")
+    let mut api_key = std::env::var("SHODH_API_KEY")
         .unwrap_or_else(|_| "sk-shodh-dev-local-testing-key".to_string());
 
     // Initialize terminal for splash and user selector
-    // Note: Mouse capture disabled to allow native terminal text selection/copy
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     // Show splash screen
@@ -758,20 +1375,21 @@ async fn main() -> Result<()> {
         if show_splash {
             // Terminal already in alternate screen from previous run_tui cleanup
         }
-        let user = match run_user_selector(&mut terminal, &base_url, &api_key).await? {
-            Some(u) => u,
+        let (user, selected_api_key) = match run_user_selector(&mut terminal, &base_url, &api_key).await? {
+            Some(selection) => selection,
             None => {
                 // Clean up terminal before exit
                 disable_raw_mode()?;
-                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
                 terminal.show_cursor()?;
                 return Ok(());
             }
         };
+        api_key = selected_api_key;
 
         // Clean up terminal - run_tui will create its own session
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         drop(terminal);
 
@@ -790,7 +1408,7 @@ async fn main() -> Result<()> {
         let h = tokio::spawn(async move {
             stream.run().await;
         });
-        let action = run_tui(state).await?;
+        let action = run_tui(state, base_url.clone(), api_key.clone()).await?;
         h.abort();
 
         match action {
@@ -798,7 +1416,7 @@ async fn main() -> Result<()> {
             TuiExitAction::SwitchUser => {
                 // Re-create terminal for user selector
                 enable_raw_mode()?;
-                execute!(io::stdout(), EnterAlternateScreen)?;
+                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
                 terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
                 show_splash = true;
             }
@@ -806,20 +1424,18 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<TuiExitAction> {
+async fn run_tui(
+    state: Arc<Mutex<AppState>>,
+    base_url: String,
+    api_key: String,
+) -> Result<TuiExitAction> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
     // Clone state for search API calls
     let search_state = Arc::clone(&state);
-    let base_url = std::env::var("SHODH_SERVER_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string())
-        .trim_end_matches("/api/events")
-        .to_string();
-    let api_key = std::env::var("SHODH_API_KEY")
-        .unwrap_or_else(|_| "sk-shodh-dev-local-testing-key".to_string());
 
     // Set initial title
     let mut last_title = {
@@ -1938,9 +2554,31 @@ async fn run_tui(state: Arc<Mutex<AppState>>) -> Result<TuiExitAction> {
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(exit_action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_error_message, format_auth_message};
+
+    #[test]
+    fn auth_message_gets_expected_line_breaks() {
+        let formatted = format_auth_message(
+            "Invalid API key. Expected a key from SHODH_API_KEYS or SHODH_DEV_API_KEY. Default dev key: 'abc'",
+        );
+        assert!(formatted.contains("Invalid API key.\nExpected a key"));
+        assert!(formatted.contains("SHODH_DEV_API_KEY.\nDefault dev key"));
+    }
+
+    #[test]
+    fn error_message_is_extracted_from_json_body() {
+        let body = r#"{"code":"INVALID_API_KEY","message":"Invalid API key. Expected a key from SHODH_API_KEYS or SHODH_DEV_API_KEY. Default dev key: 'abc'"}"#;
+        let extracted = extract_error_message(body);
+        assert!(extracted.contains("Invalid API key.\nExpected a key"));
+        assert!(extracted.contains("Default dev key: 'abc'"));
+    }
 }
 
 async fn execute_search(

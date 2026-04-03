@@ -14,7 +14,7 @@
 #   ./scripts/fortress-build.sh [--target <triple>] [--upx] [--verify-only <binary>]
 #
 # Output:
-#   target/fortress/shodh-memory-server  (obfuscated server binary)
+#   target/fortress/veld  (obfuscated server binary)
 #   target/fortress/shodh                (obfuscated CLI binary)
 #
 set -euo pipefail
@@ -22,6 +22,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
+
+# shellcheck source=./setup-libclang-env.sh
+source "$SCRIPT_DIR/setup-libclang-env.sh"
 
 # Colors
 RED='\033[0;31m'
@@ -71,7 +74,7 @@ else
     BINARY_DIR="target/fortress"
 fi
 
-cargo "${BUILD_ARGS[@]}"
+"$SCRIPT_DIR/cargo-dev.sh" "${BUILD_ARGS[@]}"
 
 echo -e "${GREEN}  ✓ Compilation complete${NC}"
 
@@ -79,7 +82,7 @@ echo -e "${GREEN}  ✓ Compilation complete${NC}"
 echo -e "${CYAN}═══ FORTRESS BUILD: Phase 2 — Post-process ═══${NC}"
 
 BINARIES=()
-for name in shodh-memory-server shodh; do
+for name in veld shodh; do
     bin="$BINARY_DIR/$name"
     if [[ -f "$bin" ]]; then
         BINARIES+=("$bin")

@@ -59,7 +59,7 @@ pub async fn list_facts(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -86,7 +86,7 @@ pub async fn search_facts(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -114,7 +114,7 @@ pub async fn facts_by_entity(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -142,7 +142,7 @@ pub async fn get_facts_stats(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -239,7 +239,7 @@ pub async fn list_temporal_facts(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();
@@ -299,7 +299,7 @@ pub async fn search_temporal_facts(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let user_id = req.user_id.clone();

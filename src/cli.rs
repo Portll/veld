@@ -9,7 +9,7 @@
 //!   shodh doctor              - Diagnose common issues
 //!   shodh hook session-start  - Output session start hook JSON
 //!   shodh hook prompt <msg>   - Output prompt submit hook JSON
-//!   shodh claude [args...]    - Launch Claude Code with Shodh memory
+//!   shodh claude [args...]    - Launch Claude Code with Veld memory
 //!   shodh version             - Print version and build info
 
 #[global_allocator]
@@ -26,6 +26,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
+use shodh_memory::config::StorageBackend;
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 // =============================================================================
@@ -33,7 +34,7 @@ use std::{borrow::Cow, path::PathBuf, sync::Arc};
 // =============================================================================
 
 const LONG_ABOUT: &str = "\
-Shodh — cognitive memory for AI agents.
+Veld - Agentic Memory.
 
 One binary for everything: run the server, launch the TUI, serve MCP tools,
 manage configuration, and diagnose issues.
@@ -46,7 +47,7 @@ Getting started:
 
 #[derive(Parser)]
 #[command(name = "shodh")]
-#[command(about = "Shodh — cognitive memory for AI agents")]
+#[command(about = "Veld - Agentic Memory")]
 #[command(long_about = LONG_ABOUT)]
 #[command(version)]
 struct Cli {
@@ -66,7 +67,7 @@ enum Commands {
         #[arg(short, long, env = "SHODH_PORT", default_value_t = 3030)]
         port: u16,
 
-        /// Storage directory for RocksDB data
+        /// Storage directory for the selected backend data
         #[arg(
             short,
             long = "storage",
@@ -75,7 +76,11 @@ enum Commands {
         )]
         storage_path: PathBuf,
 
-        /// Production mode: stricter CORS, automatic backups enabled
+        /// Requested storage backend (`redb` target, `rocksdb` legacy compatibility)
+        #[arg(long, env = "SHODH_STORAGE_BACKEND", default_value = "redb")]
+        storage_backend: StorageBackend,
+
+        /// Production mode: deny-all CORS fallback, backup auto-enable, and startup safety warnings
         #[arg(long, env = "SHODH_ENV")]
         production: bool,
 
@@ -90,7 +95,7 @@ enum Commands {
 
     /// Launch the TUI dashboard
     Tui {
-        /// API URL for the memory server
+        /// API URL for the Veld server
         #[arg(
             long,
             env = "SHODH_SERVER_URL",
@@ -109,7 +114,7 @@ enum Commands {
 
     /// Run as MCP server (stdio transport)
     Serve {
-        /// API URL for the memory server
+        /// API URL for the Veld server
         #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
@@ -121,7 +126,7 @@ enum Commands {
         )]
         api_key: String,
 
-        /// User ID for memory operations
+        /// User ID for Veld operations
         #[arg(long, env = "SHODH_USER_ID", default_value = "claude-code")]
         user_id: String,
     },
@@ -131,7 +136,7 @@ enum Commands {
 
     /// Check server health and status
     Status {
-        /// API URL for the memory server
+        /// API URL for the Veld server
         #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
@@ -153,9 +158,9 @@ enum Commands {
         hook_type: HookType,
     },
 
-    /// Launch Claude Code with Shodh memory proxy
+    /// Launch Claude Code with the Veld proxy
     Claude {
-        /// Port for the shodh-memory server
+        /// Port for the Veld server
         #[arg(long, default_value = "3030")]
         port: u16,
 
@@ -172,7 +177,7 @@ enum Commands {
 enum HookType {
     /// Session start hook - restore context
     SessionStart {
-        /// API URL for the memory server
+        /// API URL for the Veld server
         #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
@@ -184,7 +189,7 @@ enum HookType {
         )]
         api_key: String,
 
-        /// User ID for memory operations
+        /// User ID for Veld operations
         #[arg(long, env = "SHODH_USER_ID", default_value = "claude-code")]
         user_id: String,
 
@@ -198,7 +203,7 @@ enum HookType {
         /// The user's message
         message: String,
 
-        /// API URL for the memory server
+        /// API URL for the Veld server
         #[arg(long, env = "SHODH_API_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
@@ -210,7 +215,7 @@ enum HookType {
         )]
         api_key: String,
 
-        /// User ID for memory operations
+        /// User ID for Veld operations
         #[arg(long, env = "SHODH_USER_ID", default_value = "claude-code")]
         user_id: String,
     },
@@ -235,6 +240,7 @@ async fn main() -> Result<()> {
             host,
             port,
             storage_path,
+            storage_backend,
             production,
             rate_limit,
             max_concurrent,
@@ -248,6 +254,7 @@ async fn main() -> Result<()> {
                     host,
                     port,
                     storage_path,
+                    storage_backend,
                     production,
                     rate_limit,
                     max_concurrent,
@@ -373,8 +380,9 @@ fn handle_tui(api_url: &str, api_key: &str) -> Result<()> {
         eprintln!("  Looked in: {}", exe_dir.display());
         eprintln!("  Also checked: PATH");
         eprintln!();
-        eprintln!("  If installed via brew:");
+        eprintln!("  If you intentionally installed the last public Homebrew release:");
         eprintln!("    brew reinstall shodh-memory");
+        eprintln!("    (Homebrew tracks the public release line, not this unstable branch tip)");
         eprintln!();
         eprintln!("  If installed from GitHub releases:");
         eprintln!("    Download the release archive — it includes shodh-tui");
@@ -409,7 +417,7 @@ fn which_binary(name: &str) -> Option<PathBuf> {
 
 fn handle_init() -> Result<()> {
     eprintln!();
-    eprintln!("  Shodh-Memory Setup");
+    eprintln!("  Veld Setup");
     eprintln!("  ══════════════════");
     eprintln!();
 
@@ -428,7 +436,7 @@ fn handle_init() -> Result<()> {
     } else {
         let api_key = generate_api_key();
         let config_content = format!(
-            "# Shodh-Memory Configuration\n\
+            "# Veld Configuration\n\
              # Generated by `shodh init`\n\
              \n\
              api_key = \"{api_key}\"\n\
@@ -458,7 +466,7 @@ fn handle_init() -> Result<()> {
     eprintln!();
     eprintln!("  Next steps:");
     eprintln!();
-    eprintln!("    shodh server        Start the memory server");
+    eprintln!("    shodh server        Start the Veld server");
     eprintln!("    shodh tui           Launch the TUI dashboard");
     eprintln!("    shodh status        Check server health");
     eprintln!();
@@ -487,21 +495,36 @@ fn handle_status(api_url: &str, api_key: &str) -> Result<()> {
             let body: serde_json::Value = r.json()?;
 
             eprintln!();
-            eprintln!("  Shodh-Memory Server: RUNNING");
+            eprintln!("  Veld Server: RUNNING");
             eprintln!("  ════════════════════════════");
             eprintln!();
 
             if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
                 eprintln!("  Version:  {}", version);
             }
-            if let Some(uptime) = body.get("uptime").and_then(|v| v.as_str()) {
-                eprintln!("  Uptime:   {}", uptime);
+            if let Some(backend) = body
+                .get("effective_storage_backend")
+                .and_then(|v| v.as_str())
+            {
+                eprintln!("  Backend:  {}", backend);
             }
-            if let Some(users) = body.get("active_users").and_then(|v| v.as_u64()) {
+            if let Some(requested) = body
+                .get("requested_storage_backend")
+                .and_then(|v| v.as_str())
+            {
+                if body
+                    .get("effective_storage_backend")
+                    .and_then(|v| v.as_str())
+                    != Some(requested)
+                {
+                    eprintln!("  Requested: {}", requested);
+                }
+            }
+            if let Some(users) = body.get("users_count").and_then(|v| v.as_u64()) {
                 eprintln!("  Users:    {}", users);
             }
-            if let Some(memories) = body.get("total_memories").and_then(|v| v.as_u64()) {
-                eprintln!("  Memories: {}", memories);
+            if let Some(cache_size) = body.get("users_in_cache").and_then(|v| v.as_u64()) {
+                eprintln!("  Cached:   {}", cache_size);
             }
 
             eprintln!("  URL:      {}", api_url);
@@ -513,7 +536,7 @@ fn handle_status(api_url: &str, api_key: &str) -> Result<()> {
         }
         Err(_) => {
             eprintln!();
-            eprintln!("  Shodh-Memory Server: NOT RUNNING");
+            eprintln!("  Veld Server: NOT RUNNING");
             eprintln!("  ════════════════════════════════");
             eprintln!();
             eprintln!("  Could not connect to {}", api_url);
@@ -533,7 +556,7 @@ fn handle_status(api_url: &str, api_key: &str) -> Result<()> {
 
 fn handle_doctor() -> Result<()> {
     eprintln!();
-    eprintln!("  Shodh-Memory Doctor");
+    eprintln!("  Veld Doctor");
     eprintln!("  ═══════════════════");
     eprintln!();
 
@@ -541,6 +564,7 @@ fn handle_doctor() -> Result<()> {
 
     // 1. Storage directory
     let storage = shodh_memory::config::default_storage_path();
+    let config = shodh_memory::config::ServerConfig::from_env();
     if storage.exists() {
         eprintln!("  ✓ Storage directory exists: {}", storage.display());
     } else {
@@ -560,6 +584,11 @@ fn handle_doctor() -> Result<()> {
             }
         }
     }
+
+    eprintln!(
+        "  ✓ Backend target: {} (runtime: {})",
+        config.requested_storage_backend, config.effective_storage_backend
+    );
 
     // 2. Config
     let config_dir = config_directory();
@@ -631,6 +660,8 @@ fn handle_version() {
     eprintln!("shodh {}", env!("SHODH_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
+    eprintln!("  Target backend: {}", shodh_memory::config::default_requested_storage_backend());
+    eprintln!("  Runtime backend: {}", shodh_memory::config::effective_storage_backend_for_current_build(shodh_memory::config::default_requested_storage_backend()));
     eprintln!("  License:  BUSL-1.1");
     eprintln!("  Repo:     https://github.com/varun29ankuS/shodh-memory");
 }
@@ -889,7 +920,7 @@ fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir
     );
 
     // Build context string
-    let mut context_parts = vec!["## Shodh Memory Context Restored\n".to_string()];
+    let mut context_parts = vec!["## Veld Memory Context Restored\n".to_string()];
 
     if let Ok(ctx) = context_result {
         if !ctx.memories.is_empty() {
@@ -1495,7 +1526,7 @@ impl ServerHandler for ShodhMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "Shodh Memory - persistent cognitive memory with causal reasoning. \
+                "Veld Memory - persistent cognitive memory with causal reasoning. \
                  Use proactive_context at session start to surface relevant memories. \
                  Use remember to store decisions, learnings, errors. \
                  Use recall to search memories. \
@@ -1512,7 +1543,7 @@ impl ServerHandler for ShodhMcpServer {
 // CLAUDE LAUNCH
 // =============================================================================
 
-/// Launch Claude Code with Shodh Cortex proxy
+/// Launch Claude Code with Veld Cortex proxy
 async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
     let server_url = format!("http://127.0.0.1:{port}");
 
@@ -1525,21 +1556,21 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
     let server_running = client.get(&health_url).send().await.is_ok();
 
     if !server_running {
-        eprintln!("🧠 Starting shodh-memory server on port {port}...");
+        eprintln!("🧠 Starting Veld server on port {port}...");
 
         // Start server in background
         let exe_path = std::env::current_exe()?;
         let server_binary = exe_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Cannot find executable directory"))?
-            .join("shodh-memory-server");
+            .join("veld");
 
         #[cfg(windows)]
         let server_binary = server_binary.with_extension("exe");
 
         if !server_binary.exists() {
-            eprintln!("⚠️  shodh-memory-server not found at {:?}", server_binary);
-            eprintln!("   Please ensure shodh-memory-server is installed and in PATH");
+            eprintln!("⚠️  veld not found at {:?}", server_binary);
+            eprintln!("   Please ensure veld is installed and in PATH");
             std::process::exit(1);
         }
 
@@ -1561,7 +1592,7 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         }
 
         #[allow(clippy::zombie_processes)]
-        cmd.spawn().expect("Failed to start shodh-memory-server");
+        cmd.spawn().expect("Failed to start veld");
 
         // Wait for server to be ready
         eprintln!("   Waiting for server to be ready...");
@@ -1579,11 +1610,11 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
             std::process::exit(1);
         }
     } else {
-        eprintln!("🧠 Shodh-memory server already running on port {port}");
+        eprintln!("🧠 Veld server already running on port {port}");
     }
 
     // Launch claude with ANTHROPIC_API_BASE pointing to Cortex proxy
-    eprintln!("🚀 Launching Claude Code with Shodh Cortex...");
+    eprintln!("🚀 Launching Claude Code with Veld Cortex...");
     eprintln!("   ANTHROPIC_API_BASE={}", server_url);
     eprintln!();
 

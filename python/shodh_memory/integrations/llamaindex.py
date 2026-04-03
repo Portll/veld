@@ -1,5 +1,5 @@
 """
-LlamaIndex Integration for Shodh-Memory
+LlamaIndex Integration for Veld
 
 Provides a memory class compatible with LlamaIndex chat engines and agents.
 Uses Hebbian learning for association strengthening - no LLM calls for memory ops.
@@ -34,7 +34,7 @@ from urllib3.util.retry import Retry
 
 @dataclass
 class ShodhLlamaMemory:
-    """LlamaIndex-compatible memory backed by Shodh-Memory.
+    """LlamaIndex-compatible memory backed by Veld.
 
     This class implements a simple memory interface that can be used
     with LlamaIndex chat engines and agents. It provides:
@@ -45,7 +45,7 @@ class ShodhLlamaMemory:
     - Semantic, associative, and hybrid retrieval modes
 
     Attributes:
-        server_url: URL of the Shodh-Memory server
+        server_url: URL of the Veld server
         user_id: Unique identifier for this user
         api_key: API key for authentication
         max_memories: Maximum memories to retrieve per query
@@ -119,7 +119,7 @@ class ShodhLlamaMemory:
             return response.json().get("memories", [])
         except requests.exceptions.RequestException as e:
             import warnings
-            warnings.warn(f"Shodh memory get failed: {e}")
+            warnings.warn(f"Veld memory get failed: {e}")
             return []
 
     def put(
@@ -156,7 +156,7 @@ class ShodhLlamaMemory:
             return response.json().get("id")
         except requests.exceptions.RequestException as e:
             import warnings
-            warnings.warn(f"Shodh memory put failed: {e}")
+            warnings.warn(f"Veld memory put failed: {e}")
             return None
 
     def get_all(self, limit: int = 100) -> List[Dict[str, Any]]:

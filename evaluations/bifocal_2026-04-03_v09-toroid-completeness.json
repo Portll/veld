@@ -1,0 +1,127 @@
+{
+  "evaluation_type": "bifocal_plan",
+  "date": "2026-04-03",
+  "evaluator": "claude-sonnet-4-6",
+  "target": "veld v0.9 toroid completeness",
+  "methodology": "Bifocal+ (edge-walk + fractal, HAZOP, FMEA, adversarial challenge)",
+
+  "phase_0_risk_triage": {
+    "tier": 1,
+    "justification": "Auth boundaries, multi-user state, persistent storage, embedding pipeline, external integrations (Sleight dimension push)"
+  },
+
+  "toroid_analysis": {
+    "memory_lifecycle_cycle": {
+      "store_to_index": {"score": 10, "evidence": "remember_deferred() persists to RocksDB, embed_and_index() runs background Vamana insert + BM25 indexing"},
+      "index_to_retrieve": {"score": 9.5, "evidence": "recall() does hybrid retrieval (vector + BM25 + graph). Graph loaded but underutilized in standard mode."},
+      "retrieve_to_learn": {"score": 8.5, "evidence": "reinforce_recall() boosts/decays importance, records access, strengthens Hebbian graph edges, PERSISTS to storage. Initially misidentified as void."},
+      "learn_to_store": {"score": 8.0, "evidence": "reinforce_recall() calls self.long_term_memory.update() — writes back. Feedback IS transactional."},
+      "cycle_completeness": "92%"
+    },
+    "user_lifecycle_cycle": {
+      "auth_to_query": {"score": 9.0, "evidence": "X-API-Key header validation, per-user state isolation via MultiUserMemoryManager"},
+      "query_to_result": {"score": 9.5, "evidence": "Full retrieval pipeline with 20+ scoring signals"},
+      "result_to_feedback": {"score": 8.0, "evidence": "reinforce_feedback endpoint exists and works. Hebbian coactivation recorded."},
+      "feedback_to_auth": {"score": 7.0, "evidence": "No per-user readiness probes. Cache eviction could affect active users."},
+      "cycle_completeness": "84%"
+    },
+    "overall_toroid_completeness": "88%"
+  },
+
+  "corrected_findings": {
+    "GF1_feedback_storage": "ALREADY IMPLEMENTED — reinforce_recall() in src/memory/recall.rs:3896 boosts importance AND persists via long_term_memory.update(). Bifocal fractal agent was analyzing FeedbackStore (separate mechanism) and missed the primary feedback path.",
+    "GF3_update_reembedding": "ALREADY IMPLEMENTED — update_memory() in src/memory/mod.rs:3741 calls retriever.reindex_memory() AND hybrid_search.index_memory(). Full reembedding on content update.",
+    "GF7_graceful_shutdown": "ALREADY IMPLEMENTED — src/server.rs:486-585 has full sequence: SIGTERM/Ctrl-C → drain (5s) → flush databases → save vector indices → global timeout."
+  },
+
+  "true_voids": [
+    {
+      "id": "V2",
+      "name": "Deletion verification",
+      "description": "delete_memory() returns success without verifying vector index consistency. Orphaned Vamana entries possible.",
+      "severity": "medium",
+      "effort": "1 day"
+    },
+    {
+      "id": "V5",
+      "name": "Graph-informed recall underutilized",
+      "description": "recall.rs loads _graph but doesn't use it for standard retrieval mode. spreading_activation_retrieve exists but isn't wired to the handler.",
+      "severity": "medium",
+      "effort": "2 days"
+    },
+    {
+      "id": "V6",
+      "name": "Competitive embedder dead code",
+      "description": "competitive.rs implements multi-model ensemble but is never called from the retrieval path.",
+      "severity": "low",
+      "effort": "3 days"
+    },
+    {
+      "id": "V8",
+      "name": "Per-user readiness probes missing",
+      "description": "health_ready() checks system-level readiness but not per-user cache state.",
+      "severity": "low",
+      "effort": "1 day"
+    },
+    {
+      "id": "CARGO",
+      "name": "RocksDB unconditionally compiled",
+      "description": "138 source files reference rocksdb without cfg(feature) gates. Cannot build with redb-only. Documented as v1.0 work.",
+      "severity": "medium",
+      "effort": "3 days (138 source refs to cfg-gate)"
+    }
+  ],
+
+  "golden_features_for_v09": [
+    "Post-deletion vector index verification (V2 closure)",
+    "Wire spreading_activation_retrieve into recall handler as mode=graph (V5 closure)",
+    "Per-user health probe: GET /health/ready?user_id=X (V8 closure)"
+  ],
+
+  "multi_instance_assessment": {
+    "safe": false,
+    "reason": "RocksDB exclusive file lock, Vamana unsynchronized mmap, DashMap cache per-process only",
+    "recommendation": "Single-instance for v0.9. Multi-instance requires distributed lock coordinator (v1.0)"
+  },
+
+  "build_system": {
+    "sequential_build": true,
+    "parallel_build": true,
+    "non_blocking": "cargo build works while server runs (different process, different file handles)",
+    "rocksdb_issue": "Unconditionally compiled on non-Windows. Feature-gating deferred to v1.0 (138 source refs)"
+  },
+
+  "pinky_cleanup": {
+    "rust_source_remaining": 0,
+    "total_removed": 30,
+    "files_modified": ["external_dimensions.rs", "router.rs", "mod.rs", "memory/mod.rs", "memory/recall.rs", "memory/types.rs"],
+    "api_path_changed": "/api/pinky/dimensions → /api/sleight/dimensions",
+    "cargo_check": "PASSES"
+  },
+
+  "fractal_consistency": {
+    "macro": {"grade": "A+", "breaks": 0},
+    "meso": {"grade": "A", "breaks": 3, "notes": "Minor error mapping variance, async execution variance, return type variance in health endpoints"},
+    "micro": {"grade": "B+", "breaks": 2, "notes": "Graph loaded but unused in recall (_graph binding), competitive embedder dead code"}
+  },
+
+  "scoring": {
+    "code_quality": 8.2,
+    "maintainability": 7.8,
+    "functionality": 8.5,
+    "feature_completeness": 7.5,
+    "performance": 8.0,
+    "robustness": 7.5,
+    "security": 7.8,
+    "compliance": 6.5,
+    "observability": 8.0,
+    "operational_readiness": 7.0,
+    "ux_accessibility": 7.5,
+    "data_integrity": 8.0,
+    "total": 92.3,
+    "max": 120.0,
+    "percentage": "76.9%"
+  },
+
+  "v09_verdict": "SHIP — with 3 golden features as v0.9.1 follow-ups. Toroid at 88% is sufficient for launch. Multi-instance deferred to v1.0."
+}

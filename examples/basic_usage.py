@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Basic usage example for Shodh-Memory"""
+"""Basic usage example for Veld - Agentic Memory."""
 
 from shodh_memory import Memory
 

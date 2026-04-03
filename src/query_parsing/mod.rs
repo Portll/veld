@@ -44,21 +44,21 @@ pub enum ParserType {
 pub struct ParserConfig {
     /// Which parser implementation to use
     pub parser_type: ParserType,
-    /// Path to LLM model (only used if parser_type is Llm)
-    pub llm_model_path: Option<String>,
-    /// Number of threads for LLM inference
-    pub llm_threads: usize,
-    /// Context size for LLM
-    pub llm_context_size: usize,
+    /// Base URL of the LLM server (only used if parser_type is Llm)
+    pub llm_endpoint: Option<String>,
+    /// Model identifier (only used if parser_type is Llm)
+    pub llm_model: Option<String>,
+    /// API type for the LLM server (only used if parser_type is Llm)
+    pub llm_api_type: ApiType,
 }
 
 impl Default for ParserConfig {
     fn default() -> Self {
         Self {
             parser_type: ParserType::RuleBased,
-            llm_model_path: None,
-            llm_threads: 4,
-            llm_context_size: 2048,
+            llm_endpoint: None,
+            llm_model: None,
+            llm_api_type: ApiType::OpenAI,
         }
     }
 }
@@ -69,12 +69,23 @@ impl ParserConfig {
         Self::default()
     }
 
-    /// Create config for LLM parser
-    pub fn llm(model_path: impl Into<String>) -> Self {
+    /// Create config for LLM parser with explicit endpoint and model
+    pub fn llm(endpoint: impl Into<String>, model: impl Into<String>, api_type: ApiType) -> Self {
         Self {
             parser_type: ParserType::Llm,
-            llm_model_path: Some(model_path.into()),
-            ..Default::default()
+            llm_endpoint: Some(endpoint.into()),
+            llm_model: Some(model.into()),
+            llm_api_type: api_type,
+        }
+    }
+
+    /// Create config for LLM parser from environment variables
+    pub fn llm_from_env() -> Self {
+        Self {
+            parser_type: ParserType::Llm,
+            llm_endpoint: None,
+            llm_model: None,
+            llm_api_type: ApiType::OpenAI, // from_env() on LlmParser will read SHODH_LLM_API_TYPE
         }
     }
 }
@@ -83,20 +94,14 @@ impl ParserConfig {
 pub fn create_parser(config: ParserConfig) -> Arc<dyn QueryParser> {
     match config.parser_type {
         ParserType::RuleBased => Arc::new(RuleBasedParser::new()),
-        #[cfg(feature = "llm-parser")]
         ParserType::Llm => {
-            let model_path = config
-                .llm_model_path
-                .expect("LLM model path required for LLM parser");
-            Arc::new(
-                LlmParser::new(&model_path, config.llm_threads, config.llm_context_size)
-                    .expect("Failed to load LLM model"),
-            )
-        }
-        #[cfg(not(feature = "llm-parser"))]
-        ParserType::Llm => {
-            tracing::warn!("LLM parser requested but 'llm-parser' feature not enabled, falling back to rule-based");
-            Arc::new(RuleBasedParser::new())
+            let parser = match (config.llm_endpoint, config.llm_model) {
+                (Some(endpoint), Some(model)) => {
+                    LlmParser::with_api_type(&endpoint, &model, config.llm_api_type)
+                }
+                _ => LlmParser::from_env(),
+            };
+            Arc::new(parser)
         }
     }
 }

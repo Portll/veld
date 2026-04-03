@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::types::{
     AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiFileMemory, TuiPriority,
     TuiProject, TuiTodo, TuiTodoComment, TuiTodoCommentType, TuiTodoStatus,

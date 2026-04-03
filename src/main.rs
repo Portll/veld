@@ -4,7 +4,7 @@
 //! For the unified CLI, use `shodh server` instead.
 //!
 //! Usage:
-//!   shodh-memory-server [OPTIONS]
+//!   veld [OPTIONS]
 //!
 //! Options:
 //!   -H, --host <HOST>         Bind address [env: SHODH_HOST] [default: 127.0.0.1]
@@ -18,10 +18,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::Result;
 use clap::Parser;
+use shodh_memory::config::StorageBackend;
 use std::path::PathBuf;
 
 const LONG_ABOUT: &str = r#"
-Shodh-Memory is a cognitive memory system for AI agents, featuring:
+Shodh-Memory is the Earth substrate behind Veld, featuring:
 
   • 3-tier memory (Working → Session → LongTerm) with automatic promotion
   • Hebbian learning - memories that help get stronger, misleading ones decay
@@ -29,7 +30,7 @@ Shodh-Memory is a cognitive memory system for AI agents, featuring:
   • Vector search (MiniLM embeddings + Vamana/DiskANN index)
   • 100% offline - no cloud, no API keys needed for core functionality
 
-The server exposes a REST API for memory operations. After starting:
+The server exposes a REST API for Veld remember/recall operations. After starting:
 
   Health check:  curl http://localhost:3030/health
   Store memory:  curl -X POST http://localhost:3030/api/remember \
@@ -50,17 +51,17 @@ INTEGRATION:
   TUI:           shodh tui
 
 EXAMPLES:
-  shodh-memory-server                          # Start with defaults
-  shodh-memory-server -H 0.0.0.0 -p 8080      # Custom host and port
-  shodh-memory-server --production -s /var/lib/shodh  # Production mode
+  veld                          # Start with defaults
+  veld -H 0.0.0.0 -p 8080      # Custom host and port
+  veld --production -s /var/lib/shodh  # Production mode
 
 DOCUMENTATION:
   GitHub:  https://github.com/varun29ankuS/shodh-memory
 "#;
 
-/// Shodh-Memory Server - Cognitive Memory for AI Agents
+/// Shodh-Memory Server - Earth substrate for Veld
 #[derive(Parser)]
-#[command(name = "shodh-memory-server")]
+#[command(name = "veld")]
 #[command(version, about, long_about = LONG_ABOUT, after_help = AFTER_HELP)]
 struct Cli {
     /// Bind address (use 0.0.0.0 for network access)
@@ -71,7 +72,7 @@ struct Cli {
     #[arg(short, long, env = "SHODH_PORT", default_value_t = 3030)]
     port: u16,
 
-    /// Storage directory for RocksDB data
+    /// Storage directory for the selected backend data
     #[arg(
         short,
         long = "storage",
@@ -79,6 +80,10 @@ struct Cli {
         default_value_os_t = shodh_memory::config::default_storage_path()
     )]
     storage_path: PathBuf,
+
+    /// Requested storage backend (`redb` target, `rocksdb` legacy compatibility)
+    #[arg(long, env = "SHODH_STORAGE_BACKEND", default_value = "redb")]
+    storage_backend: StorageBackend,
 
     /// Production mode: stricter CORS, automatic backups enabled
     #[arg(long, env = "SHODH_ENV")]
@@ -105,6 +110,7 @@ fn main() -> Result<()> {
         host: cli.host,
         port: cli.port,
         storage_path: cli.storage_path,
+      storage_backend: cli.storage_backend,
         production: cli.production,
         rate_limit: cli.rate_limit,
         max_concurrent: cli.max_concurrent,

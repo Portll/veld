@@ -29,7 +29,7 @@ def main():
         # User generates embedding with their model
         embedding = model.encode(doc)
 
-        # Shodh-Memory just stores it
+        # Veld just stores it
         memory.add(
             content=doc,
             experience_type="learning",

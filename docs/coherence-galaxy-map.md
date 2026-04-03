@@ -1,8 +1,8 @@
-# Coherence Galaxy Map: Claude Decision Trees x Shodh Memory Architecture
+# Coherence Galaxy Map: Claude Decision Trees x Veld/Sleight Memory Architecture
 
 ## How to Read This Map
 
-This is a **family tree / galaxy cluster** showing how Claude's decision-making improves when shodh/pinky surfaces information, and what's only visible when you know to look. Each cluster is a decision domain. Lines show information flow. Dotted lines show **flows that should exist but don't yet**.
+This is a **family tree / galaxy cluster** showing how Claude's decision-making improves when Veld/Sleight surfaces information, and what's only visible when you know to look. Each cluster is a decision domain. Lines show information flow. Dotted lines show **flows that should exist but don't yet**.
 
 ```
                               ╔═══════════════════════════════════════╗
@@ -35,15 +35,15 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║ QUERY CRAFT — How Claude shapes the question                         ║
 ╠════════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
-║  VISIBLE (shodh surfaces this):                                       ║
+║  VISIBLE (Veld surfaces this):                                        ║
 ║  ● Past memories matching current context (3-5 per prompt)            ║
 ║  ● Relevant facts with confidence scores                              ║
 ║  ● Active todos matching query semantics                              ║
 ║  ● Context-triggered reminders                                        ║
 ║                                                                       ║
-║  IMPROVEMENT FROM SHODH:                                              ║
-║  Claude without shodh: Formulates queries from scratch each session.  ║
-║  Claude with shodh: Sees "you solved a similar problem 3 days ago     ║
+║  IMPROVEMENT FROM VELD:                                               ║
+║  Claude without Veld: Formulates queries from scratch each session.   ║
+║  Claude with Veld: Sees "you solved a similar problem 3 days ago      ║
 ║  with approach X" → reformulates query to be more specific.           ║
 ║  Delta: 30-60% fewer exploratory queries, faster convergence.         ║
 ║                                                                       ║
@@ -51,7 +51,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║  ┊ Entity resolution failures — Claude says "Alice" but graph has     ║
 ║  ┊ "alice_chen". Query returns nothing. Claude doesn't know WHY.      ║
 ║  ┊                                                                    ║
-║  ┊ Query type classification — shodh internally classifies query as   ║
+║  ┊ Query type classification — Veld internally classifies query as    ║
 ║  ┊ Temporal/Attribute/Exploratory and shifts weights ±0.10. Claude    ║
 ║  ┊ doesn't know which classification was applied.                     ║
 ║  ┊                                                                    ║
@@ -87,7 +87,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║       ▼                                    │                          ║
 ║  Default ──────────────────▶ hybrid        │                          ║
 ║                                            │                          ║
-║  IMPROVEMENT FROM SHODH:                                              ║
+║  IMPROVEMENT FROM VELD:                                               ║
 ║  Without mode selection: always hybrid (safe default).                ║
 ║  With informed mode: associative for relationship queries gives       ║
 ║  2-3x more relevant results when graph is sparse/mature.              ║
@@ -134,7 +134,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║  Exploratory/browsing   ──▶ rrf_k = 60-100 (equal weighting)         ║
 ║  Default (unknown)      ──▶ rrf_k = 20 (balanced)                    ║
 ║                                                                       ║
-║  IMPROVEMENT FROM SHODH:                                              ║
+║  IMPROVEMENT FROM VELD:                                               ║
 ║  Before: K=20 hardcoded. "What color is Alice's car?" and "tell me   ║
 ║  about the project" got identical rank discrimination.                ║
 ║  After: Precise queries can use K=5 for rank-1 dominance.            ║
@@ -158,7 +158,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 
 ```
 ╔════════════════════════════════════════════════════════════════════════╗
-║ MEMORY ENCODE — What survives from Claude's intent to shodh storage   ║
+║ MEMORY ENCODE — What survives from Claude's intent to Veld storage    ║
 ╠════════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
 ║  INFORMATION FUNNEL:                                                  ║
@@ -183,9 +183,9 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║  ● "Chose A over B because X" → entities [A, B] co-occur (100% WHY) ║
 ║  ● Entity relationships → all flattened to "co-occurrence" edges      ║
 ║                                                                       ║
-║  IMPROVEMENT FROM SHODH (current):                                    ║
-║  Without shodh: zero persistence between sessions.                    ║
-║  With shodh: 5% of reasoning survives. Better than 0%.               ║
+║  IMPROVEMENT FROM VELD (current):                                     ║
+║  Without Veld: zero persistence between sessions.                     ║
+║  With Veld: 5% of reasoning survives. Better than 0%.                ║
 ║  Delta: infinite improvement, but low absolute value.                 ║
 ║                                                                       ║
 ║  ONLY VISIBLE WHEN TOLD TO LOOK:                                      ║
@@ -211,7 +211,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 
 ```
 ╔════════════════════════════════════════════════════════════════════════╗
-║ FEEDBACK — How Claude's behavior teaches shodh (and what's lost)      ║
+║ FEEDBACK — How Claude's behavior teaches Veld (and what's lost)       ║
 ╠════════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
 ║  THE FEEDBACK CIRCUIT (7 stages):                                     ║
@@ -232,7 +232,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║  ● Coactivated misleading memory: 10-20 cycles                       ║
 ║  ● Adaptive weight shift: 200+ cycles (asymptotic)                    ║
 ║                                                                       ║
-║  IMPROVEMENT FROM SHODH:                                              ║
+║  IMPROVEMENT FROM VELD:                                               ║
 ║  Without feedback: static retrieval, no adaptation.                   ║
 ║  With feedback: system gradually learns which signal (BM25/vector/    ║
 ║  graph) works best. Misleading memories eventually suppressed.        ║
@@ -247,7 +247,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║  ┊ for 10-20 interactions because its L2 edge keeps importance high.  ║
 ║  ┊                                                                    ║
 ║  ┊ Biological analogy: extinction is harder than conditioning.        ║
-║  ┊ Shodh faithfully reproduces this bug from neuroscience.            ║
+║  ┊ Veld faithfully reproduces this bug from neuroscience.             ║
 ║  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ ║
 ║                                                                       ║
 ║  FIX-04 bidirectional feedback acceleration (strong signals bypass)│  ║
@@ -266,7 +266,7 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║  THE HIDDEN DIMENSIONS:                                               ║
 ║                                                                       ║
 ║  ┌──────────────────────────────────────────────────────────────┐     ║
-║  │ What shodh knows              │ What Claude sees              │     ║
+║  │ What Veld knows               │ What Claude sees              │     ║
 ║  ├──────────────────────────────────────────────────────────────┤     ║
 ║  │ LTP status: Full (0.1x decay) │ (nothing)                    │     ║
 ║  │ Edge tier: L1 (48h to die)    │ (nothing)                    │     ║
@@ -296,9 +296,9 @@ This is a **family tree / galaxy cluster** showing how Claude's decision-making 
 ║    → Would know to check important memories at weekly intervals       ║
 ║    → Would understand why some memories survive week 7 but not 10     ║
 ║                                                                       ║
-║  IMPROVEMENT FROM SHODH (current):                                    ║
-║  Without shodh: no persistence, every session starts fresh.           ║
-║  With shodh: memories survive across sessions with biological decay.  ║
+║  IMPROVEMENT FROM VELD (current):                                     ║
+║  Without Veld: no persistence, every session starts fresh.            ║
+║  With Veld: memories survive across sessions with biological decay.   ║
 ║  Delta: persistence exists. But Claude operates it blindly.           ║
 ║                                                                       ║
 ║  THE ONE-WAY TEACHING RELATIONSHIP:                                   ║

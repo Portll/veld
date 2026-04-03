@@ -312,7 +312,7 @@ mod tests {
 
         for &days in intervals_days {
             let millis = (days * 24.0 * 60.0 * 60.0 * 1000.0) as i64;
-            current = current + chrono::Duration::milliseconds(millis);
+            current += chrono::Duration::milliseconds(millis);
             timestamps.push(current);
         }
 
@@ -506,7 +506,7 @@ mod tests {
 
         // At least one of the learned scales should be in the weekly neighborhood
         // (within a factor of 2 of 7 days, so between 3.5 and 14)
-        let has_weekly_scale = result.scales.iter().any(|&s| s >= 3.5 && s <= 14.0);
+        let has_weekly_scale = result.scales.iter().any(|&s| (3.5..=14.0).contains(&s));
 
         // This is a soft assertion: FFT on a near-constant signal may not produce
         // 3 separated peaks. If confidence is 0 (fallback), that's also acceptable.

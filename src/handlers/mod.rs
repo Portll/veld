@@ -60,8 +60,8 @@ pub mod context_blocks;
 // A/B testing
 pub mod ab_testing;
 
-// Pinky dimension push (graph topological health)
-pub mod pinky;
+// External dimension push (graph topological health — Sleight integration)
+pub mod external_dimensions;
 
 // Test utilities (compiled only in test builds)
 #[cfg(test)]

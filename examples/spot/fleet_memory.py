@@ -6,11 +6,11 @@ but each robot operates with its own isolated world view. Robot A
 discovering an obstacle doesn't help Robot B avoid it.
 
 This example shows two Spot robots sharing knowledge through a
-common shodh-memory store. The key insight: for fleet-wide sharing,
+common Veld store. The key insight: for fleet-wide sharing,
 robots use the SAME identity (or no robot_id filter) so all memories
 are visible to all fleet members. Robot attribution is done via tags.
 
-In production, both robots connect to the same shodh-memory HTTP
+In production, both robots connect to the same Veld HTTP
 server (port 3030). Here we simulate the handoff by using the same
 storage_path sequentially (RocksDB requires exclusive access).
 
@@ -43,7 +43,7 @@ class FleetSpotBridge:
     """Fleet-aware wrapper that tags memories with robot name instead of
     using robot_id as a query filter.
 
-    shodh-memory's robot_id is a hard filter on recall() — memories from
+    Veld's robot_id is a hard filter on recall() — memories from
     robot_id="spot_alpha" are invisible to robot_id="spot_beta". For fleet
     sharing, we avoid setting robot_id and instead tag each memory with
     the originating robot's name.
@@ -202,7 +202,7 @@ def run_demo():
     print(f"  Robot Alpha received:    {len(all_fleet_obstacles)} total (evening)")
     print()
     print("  How it works:")
-    print("    - Both robots share the same shodh-memory store (no robot_id filter)")
+    print("    - Both robots share the same Veld store (no robot_id filter)")
     print("    - Robot attribution via tags: ['obstacle', 'fleet', 'spot_alpha']")
     print("    - recall() returns all fleet memories regardless of origin")
     print("    - robot_id IS available for isolated queries when needed")

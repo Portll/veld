@@ -1,3 +1,4 @@
+//! Veld layer: product API surface (remember/recall/forget verbs, user-facing endpoints).
 //! Router Configuration - Centralized route definitions
 //!
 //! This module builds the Axum router using handlers from the submodules.
@@ -11,9 +12,9 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, compression, consolidation, context_blocks, crud, facts, files, gap_analysis,
-    graph, health, ingest, integrations, lineage, mif, pinky, recall, remember, search, seed,
-    sessions, todos, users, visualization, webhooks,
+    ab_testing, compression, consolidation, context_blocks, crud, external_dimensions, facts,
+    files, gap_analysis, graph, health, ingest, integrations, lineage, mif, recall, remember,
+    search, seed, sessions, todos, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -318,6 +319,9 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/todos/{todo_id}/complete", post(todos::complete_todo)) // TUI path style
         .route("/api/todos/{todo_id}/reorder", post(todos::reorder_todo)) // TUI path style
         .route("/api/todos/{todo_id}/subtasks", get(todos::list_subtasks))
+        .route("/api/todos/{todo_id}/dependents", get(todos::list_dependents))
+        .route("/api/todos/{todo_id}/dependency_chain", get(todos::dependency_chain))
+        .route("/api/todos/ready", post(todos::list_ready_todos))
         .route(
             "/api/todos/{todo_id}/comments",
             get(todos::list_todo_comments),
@@ -446,11 +450,21 @@ pub fn build_protected_routes(state: AppState) -> Router {
         )
         .route("/api/ab/summary", get(ab_testing::get_ab_summary))
         // =================================================================
-        // PINKY DIMENSION PUSH (GRAPH TOPOLOGICAL HEALTH)
+        // EXTERNAL DIMENSION PUSH (GRAPH TOPOLOGICAL HEALTH)
+        // Sleight integration — accepts topology scores from evaluator
         // =================================================================
         .route(
-            "/api/pinky/dimensions",
-            post(pinky::push_dimensions),
+            "/api/sleight/dimensions",
+            post(external_dimensions::push_dimensions),
+        )
+        // backward-compat aliases
+        .route(
+            "/api/external/dimensions",
+            post(external_dimensions::push_dimensions),
+        )
+        .route(
+            "/api/wintermute/dimensions",
+            post(external_dimensions::push_dimensions),
         )
         // =================================================================
         // EXTERNAL INTEGRATIONS (BULK SYNC)

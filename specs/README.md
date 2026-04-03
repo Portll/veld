@@ -1,4 +1,4 @@
-# SHODH Memory API Specification
+# Veld - Agentic Memory API Specification
 
 Shared API specification for interoperable memory implementations.
 
@@ -88,7 +88,7 @@ See [schemas/memory.md](./schemas/memory.md) for complete field documentation.
 
 | Project | Backend | Embeddings | Status |
 |---------|---------|------------|--------|
-| [shodh-memory](https://github.com/varun29ankuS/shodh-memory) | RocksDB (local) | MiniLM-L6-v2 (ONNX) | Reference |
+| [Veld - Agentic Memory](https://github.com/varun29ankuS/shodh-memory) | RocksDB (local) | MiniLM-L6-v2 (ONNX) | Reference |
 | [shodh-cloudflare](https://github.com/doobidoo/shodh-cloudflare) | D1 + Vectorize (edge) | Workers AI (bge-small) | Production |
 | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | SQLite-vec / Hybrid | MiniLM-L6-v2 (ONNX) | Production |
 
@@ -111,6 +111,9 @@ Authorization: Bearer your-api-key
 ```
 
 ## Versioning
+
+This spec set is a forward-looking interoperability document, not the exact
+runtime contract of the current `v0.7.6-unstable` branch.
 
 This specification follows semantic versioning:
 - **Major**: Breaking changes to required fields or core operations

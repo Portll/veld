@@ -1,17 +1,17 @@
 # Hebbian Learning & Long-Term Potentiation
 
-Deep-dive into shodh-memory's learning mechanisms with implementation details.
+Deep-dive into Veld - Agentic Memory's learning mechanisms with implementation details.
 
 ## The Core Insight
 
-Most memory systems treat storage and retrieval as separate operations. Shodh treats **retrieval as learning**—every time you access memories, the system learns which associations matter.
+Most memory systems treat storage and retrieval as separate operations. Veld treats **retrieval as learning**—every time you access memories, the system learns which associations matter.
 
 ```
 Traditional RAG:
   Store → Index → Retrieve → Done
   (static, doesn't learn)
 
-Shodh:
+Veld:
   Store → Index → Retrieve → Strengthen → Store
                      ↑           ↓
                      └───────────┘
@@ -250,7 +250,7 @@ Returns what the system learned:
 
 ### vs. RAG (No Learning)
 
-| Aspect | RAG | Shodh |
+| Aspect | RAG | Veld |
 |--------|-----|-------|
 | Retrieval affects storage | No | Yes (Hebbian) |
 | Frequently-used items boosted | No | Yes |
@@ -259,7 +259,7 @@ Returns what the system learned:
 
 ### vs. ACT-R Base-Level Learning
 
-| Aspect | ACT-R | Shodh |
+| Aspect | ACT-R | Veld |
 |--------|-------|-------|
 | Learning signal | Access count only | Co-activation + feedback |
 | Activation formula | `ln(Σ t_j^-d)` | Hebbian with saturation |
@@ -268,7 +268,7 @@ Returns what the system learned:
 
 ### vs. Memory Networks (End-to-End)
 
-| Aspect | MemNets | Shodh |
+| Aspect | MemNets | Veld |
 |--------|---------|-------|
 | Learning | Backprop through attention | Explicit Hebbian updates |
 | Interpretability | Black box | Inspectable edges |

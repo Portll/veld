@@ -1,19 +1,20 @@
 ---
 name: orchestrate
 description: This skill should be used when the user asks to 'orchestrate a task', 'break down work into parallel agents', 'coordinate subtasks', 'run agents in parallel', or mentions 'multi-agent'. Decomposes complex tasks into tracked subtasks, dispatches parallel subagents, and coordinates until completion.
-version: 1.0.0
-author: Shodh AI
-tags:
-  - orchestration
-  - multi-agent
-  - parallel
-  - task-decomposition
-  - coordination
+metadata:
+  product: Veld - Agentic Memory
+  version: 1.0.0
+  tags:
+    - orchestration
+    - multi-agent
+    - parallel
+    - task-decomposition
+    - coordination
 ---
 
 # Agent Orchestration — Todo-Driven Parallel Execution
 
-You are orchestrating a complex task by decomposing it into tracked subtasks, dispatching parallel agents, and coordinating dependencies until completion. Shodh-memory todos are your task graph. Claude Code's Task tool is your agent spawner. Hooks handle the automation.
+You are orchestrating a complex task by decomposing it into tracked subtasks, dispatching parallel agents, and coordinating dependencies until completion. Veld - Agentic Memory todos are your task graph. Claude Code's Task tool is your agent spawner. Hooks handle the automation.
 
 ## Phase 1: Decompose
 

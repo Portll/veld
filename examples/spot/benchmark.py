@@ -112,7 +112,7 @@ def format_latencies(latencies: List[float]) -> str:
 
 def run_benchmark():
     print("=" * 74)
-    print("  SHODH-MEMORY PERFORMANCE BENCHMARK — Robotics Scale")
+    print("  VELD - AGENTIC MEMORY PERFORMANCE BENCHMARK — Robotics Scale")
     print("=" * 74)
     print()
 

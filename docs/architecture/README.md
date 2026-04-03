@@ -1,10 +1,10 @@
-# Shodh-Memory Architecture
+# Veld - Agentic Memory Architecture
 
 Cognitive memory infrastructure for AI agents, grounded in neuroscience research.
 
 ## Overview
 
-Shodh-memory is not a vector database. It's a **cognitive memory system** that models how biological memory actually works—with decay, consolidation, interference, and learning that strengthens with use.
+Veld - Agentic Memory is not a vector database. It's a **cognitive memory system** that models how biological memory actually works—with decay, consolidation, interference, and learning that strengthens with use.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -37,7 +37,7 @@ Shodh-memory is not a vector database. It's a **cognitive memory system** that m
 
 | Document | Description |
 |----------|-------------|
-| [Neuroscience Foundations](./01-neuroscience-foundations.md) | The cognitive science research behind shodh-memory |
+| [Neuroscience Foundations](./01-neuroscience-foundations.md) | The cognitive science research behind Veld - Agentic Memory |
 | [3-Tier Memory Model](./02-three-tier-memory.md) | Working, session, and long-term memory tiers |
 | [Hebbian Learning](./03-hebbian-learning.md) | "Neurons that fire together, wire together" |
 | [Knowledge Graph](./04-knowledge-graph.md) | Entity extraction, relationships, spreading activation |
@@ -46,7 +46,7 @@ Shodh-memory is not a vector database. It's a **cognitive memory system** that m
 
 ## Why This Matters for AI Agents
 
-Current AI memory solutions are retrieval systems—they find what you stored. Shodh-memory is a **learning system**—it strengthens connections that matter and lets irrelevant information fade.
+Current AI memory solutions are retrieval systems—they find what you stored. Veld - Agentic Memory is a **learning system**—it strengthens connections that matter and lets irrelevant information fade.
 
 ### The Problem with RAG
 
@@ -56,9 +56,9 @@ Traditional RAG treats all memories equally:
 - No consolidation of repeated patterns into durable knowledge
 - No decay of stale information
 
-### How Shodh Differs
+### How Veld Differs
 
-Shodh-memory models cognitive processes:
+Veld - Agentic Memory models cognitive processes:
 
 1. **Memories compete for attention** — Working memory holds 7±2 items, forcing prioritization
 2. **Use strengthens memories** — Hebbian learning increases edge weights between co-accessed memories
@@ -77,7 +77,7 @@ Shodh-memory models cognitive processes:
 
 ## Single Binary Philosophy
 
-Shodh-memory ships as a single ~15MB binary with:
+Veld - Agentic Memory ships as a single ~15MB binary with:
 - Embedded ONNX runtime for embeddings
 - Bundled MiniLM-L6 model (22M params)
 - No external dependencies
@@ -105,7 +105,7 @@ This enables deployment on:
                     └─────────────┬─────────────┘
                                   │
                     ┌─────────────▼─────────────┐
-                    │    Shodh-Memory Core      │
+                    │ Veld - Agentic Memory Core │
                     │         (Rust)            │
                     └───────────────────────────┘
 ```
