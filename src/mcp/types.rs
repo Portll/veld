@@ -92,7 +92,7 @@ pub(crate) struct GapMapperParams {
 }
 
 // =============================================================================
-// API REQUEST TYPES (sent to the shodh-memory HTTP server)
+// API REQUEST TYPES (sent to the Veld HTTP server)
 // =============================================================================
 
 #[derive(Serialize)]
@@ -171,7 +171,7 @@ pub(crate) struct GapMapperRequest {
 }
 
 // =============================================================================
-// API RESPONSE TYPES (received from the shodh-memory HTTP server)
+// API RESPONSE TYPES (received from the Veld HTTP server)
 // =============================================================================
 
 #[derive(Deserialize)]

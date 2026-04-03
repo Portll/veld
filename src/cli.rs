@@ -1,4 +1,4 @@
-//! Unified shodh CLI — server, TUI, MCP, hooks, and management commands.
+//! Unified Veld CLI — server, TUI, MCP, hooks, and management commands.
 //!
 //! Usage:
 //!   shodh server              - Start the HTTP API server
@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
             api_key,
             user_id,
         } => {
-            eprintln!("Starting shodh MCP server...");
+            eprintln!("Starting Veld MCP server...");
             eprintln!("  API URL: {}", api_url);
             eprintln!("  User ID: {}", user_id);
 
@@ -474,7 +474,7 @@ fn handle_init() -> Result<()> {
     eprintln!();
     eprintln!("    claude mcp add shodh-memory -- npx -y @shodh/memory-mcp");
     eprintln!();
-    eprintln!("  Documentation: https://www.shodh-memory.com/docs");
+    eprintln!("  Documentation: https://github.com/Portll/veld");
     eprintln!();
 
     Ok(())
@@ -657,13 +657,13 @@ fn handle_doctor() -> Result<()> {
 }
 
 fn handle_version() {
-    eprintln!("shodh {}", env!("SHODH_VERSION_FULL"));
+    eprintln!("Veld {}", env!("SHODH_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
     eprintln!("  Target backend: {}", shodh_memory::config::default_requested_storage_backend());
     eprintln!("  Runtime backend: {}", shodh_memory::config::effective_storage_backend_for_current_build(shodh_memory::config::default_requested_storage_backend()));
     eprintln!("  License:  BUSL-1.1");
-    eprintln!("  Repo:     https://github.com/varun29ankuS/shodh-memory");
+    eprintln!("  Repo:     https://github.com/Portll/veld");
 }
 
 // =============================================================================
@@ -690,7 +690,7 @@ fn generate_api_key() -> String {
 // API CLIENT
 // =============================================================================
 
-/// HTTP client for the shodh-memory API (async version for MCP tools)
+/// HTTP client for the Veld API (async version for MCP tools)
 #[derive(Clone, Debug)]
 struct AsyncApiClient {
     client: reqwest::Client,
@@ -734,7 +734,7 @@ impl AsyncApiClient {
     }
 }
 
-/// HTTP client for the shodh-memory API (blocking version for hooks)
+/// HTTP client for the Veld API (blocking version for hooks)
 #[derive(Clone, Debug)]
 struct BlockingApiClient {
     client: reqwest::blocking::Client,

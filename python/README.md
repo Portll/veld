@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Veld - Agentic Memory">
+  <img src="../assets/logo.png" width="120" alt="Veld - Agentic Memory">
 </p>
 
 <h1 align="center">Veld - Agentic Memory Python SDK</h1>
@@ -9,7 +9,7 @@
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
   <a href="https://pepy.tech/project/shodh-memory"><img src="https://static.pepy.tech/badge/shodh-memory" alt="Downloads"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="../LICENSE.MD"><img src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg" alt="License"></a>
 </p>
 
 ---
@@ -292,8 +292,8 @@ SHODH_ACTIVATION_DECAY=0.95        # Decay factor per cycle
 
 ### License
 
-Apache 2.0
+BUSL-1.1
 
 ---
 
-[MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory) · [PyPI](https://pypi.org/project/shodh-memory/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [GitHub](https://github.com/varun29ankuS/shodh-memory)
+[MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory) · [PyPI](https://pypi.org/project/shodh-memory/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [GitHub](https://github.com/Portll/veld)

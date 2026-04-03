@@ -24,10 +24,10 @@ info:
   version: 0.7.7-unstable
   contact:
     name: Veld Agentic Memory
-    url: https://github.com/varun29ankuS/shodh-memory
+    url: https://github.com/Portll/veld
   license:
-    name: Apache-2.0
-    url: https://opensource.org/licenses/Apache-2.0
+    name: BUSL-1.1
+    url: https://spdx.org/licenses/BUSL-1.1.html
 
 servers:
   - url: http://localhost:3030

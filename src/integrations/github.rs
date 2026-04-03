@@ -1,4 +1,4 @@
-//! GitHub integration for syncing Issues, PRs, and Commits to Shodh memory
+//! GitHub integration for syncing issues, PRs, and commits to Veld
 //!
 //! Provides:
 //! - Webhook receiver for real-time issue/PR updates
@@ -650,7 +650,7 @@ impl GitHubClient {
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "shodh-memory")
+            .header("User-Agent", "veld")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
@@ -692,7 +692,7 @@ impl GitHubClient {
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "shodh-memory")
+            .header("User-Agent", "veld")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
@@ -735,7 +735,7 @@ impl GitHubClient {
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "shodh-memory")
+            .header("User-Agent", "veld")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
@@ -764,7 +764,7 @@ impl GitHubClient {
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "shodh-memory")
+            .header("User-Agent", "veld")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
             .await
@@ -791,10 +791,10 @@ mod tests {
     fn test_issue_to_content() {
         let repo = GitHubRepository {
             id: 1,
-            name: "shodh-memory".to_string(),
-            full_name: "varun29ankuS/shodh-memory".to_string(),
+            name: "veld".to_string(),
+            full_name: "Portll/veld".to_string(),
             description: None,
-            html_url: "https://github.com/varun29ankuS/shodh-memory".to_string(),
+            html_url: "https://github.com/Portll/veld".to_string(),
             owner: GitHubUser {
                 id: 1,
                 login: "varun29ankuS".to_string(),
@@ -808,7 +808,7 @@ mod tests {
             title: "Fix authentication bug".to_string(),
             body: Some("The auth is broken".to_string()),
             state: "open".to_string(),
-            html_url: "https://github.com/varun29ankuS/shodh-memory/issues/123".to_string(),
+            html_url: "https://github.com/Portll/veld/issues/123".to_string(),
             user: Some(GitHubUser {
                 id: 1,
                 login: "varun29ankuS".to_string(),
@@ -846,10 +846,10 @@ mod tests {
     fn test_issue_external_id() {
         let repo = GitHubRepository {
             id: 1,
-            name: "shodh-memory".to_string(),
-            full_name: "varun29ankuS/shodh-memory".to_string(),
+            name: "veld".to_string(),
+            full_name: "Portll/veld".to_string(),
             description: None,
-            html_url: "https://github.com/varun29ankuS/shodh-memory".to_string(),
+            html_url: "https://github.com/Portll/veld".to_string(),
             owner: GitHubUser {
                 id: 1,
                 login: "varun29ankuS".to_string(),
@@ -859,20 +859,20 @@ mod tests {
         };
 
         let external_id = GitHubWebhook::issue_external_id(&repo, 123);
-        assert_eq!(external_id, "github:varun29ankuS/shodh-memory#issue-123");
+        assert_eq!(external_id, "github:Portll/veld#issue-123");
 
         let pr_id = GitHubWebhook::pr_external_id(&repo, 456);
-        assert_eq!(pr_id, "github:varun29ankuS/shodh-memory#pr-456");
+        assert_eq!(pr_id, "github:Portll/veld#pr-456");
     }
 
     #[test]
     fn test_commit_external_id() {
         let repo = GitHubRepository {
             id: 1,
-            name: "shodh-memory".to_string(),
-            full_name: "varun29ankuS/shodh-memory".to_string(),
+            name: "veld".to_string(),
+            full_name: "Portll/veld".to_string(),
             description: None,
-            html_url: "https://github.com/varun29ankuS/shodh-memory".to_string(),
+            html_url: "https://github.com/Portll/veld".to_string(),
             owner: GitHubUser {
                 id: 1,
                 login: "varun29ankuS".to_string(),
@@ -884,7 +884,7 @@ mod tests {
         let commit_id = GitHubWebhook::commit_external_id(&repo, "abc123def456");
         assert_eq!(
             commit_id,
-            "github:varun29ankuS/shodh-memory#commit-abc123def456"
+            "github:Portll/veld#commit-abc123def456"
         );
     }
 
@@ -892,10 +892,10 @@ mod tests {
     fn test_commit_to_content() {
         let repo = GitHubRepository {
             id: 1,
-            name: "shodh-memory".to_string(),
-            full_name: "varun29ankuS/shodh-memory".to_string(),
+            name: "veld".to_string(),
+            full_name: "Portll/veld".to_string(),
             description: None,
-            html_url: "https://github.com/varun29ankuS/shodh-memory".to_string(),
+            html_url: "https://github.com/Portll/veld".to_string(),
             owner: GitHubUser {
                 id: 1,
                 login: "varun29ankuS".to_string(),
@@ -906,7 +906,7 @@ mod tests {
 
         let commit = GitHubCommit {
             sha: "abc123def456789".to_string(),
-            html_url: "https://github.com/varun29ankuS/shodh-memory/commit/abc123".to_string(),
+            html_url: "https://github.com/Portll/veld/commit/abc123".to_string(),
             commit: GitHubCommitData {
                 message: "feat: add commit sync\n\nThis adds commit history sync support."
                     .to_string(),

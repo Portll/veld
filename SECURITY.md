@@ -11,8 +11,8 @@
 
 If you discover a security vulnerability in Veld - Agentic Memory, please report it privately. This branch is still an internal stabilization line and should not be treated as a public security-hardened release.
 
-1. **Email**: Send details to 29.varuns@gmail.com
-2. **GitHub**: Use [Security Advisories](https://github.com/varun29ankuS/shodh-memory/security/advisories/new) to report privately
+1. **Email**: Send details to john@portll.net
+2. **GitHub**: Use [Security Advisories](https://github.com/Portll/veld/security/advisories/new) to report privately
 
 **What to include:**
 - Description of the vulnerability

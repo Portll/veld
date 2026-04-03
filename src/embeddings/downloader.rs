@@ -101,7 +101,7 @@ const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/release
 #[cfg(target_os = "macos")]
 const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz";
 
-/// Get the cache directory for shodh-memory
+/// Get the cache directory for Veld legacy model caches
 pub fn get_cache_dir() -> PathBuf {
     // Try standard cache locations
     if let Some(cache) = dirs::cache_dir() {
@@ -763,7 +763,7 @@ pub fn print_status() {
     let nomic_models_downloaded = are_nomic_models_downloaded();
     let onnx_downloaded = is_onnx_runtime_downloaded();
 
-    println!("Shodh-Memory Cache Status:");
+    println!("Veld Cache Status:");
     println!("  Cache directory: {cache_dir:?}");
     println!("  MiniLM embedding models downloaded: {models_downloaded}");
     println!("  Nomic embedding models downloaded: {nomic_models_downloaded}");
