@@ -7,10 +7,10 @@ Optional adapters for popular LLM frameworks:
 - OpenAI Agents SDK: ShodhTools + ShodhSession for agents
 
 Install extras:
-    pip install shodh-memory[langchain]
-    pip install shodh-memory[llamaindex]
-    pip install shodh-memory[openai-agents]
-    pip install shodh-memory[all]
+    pip install veld[langchain]
+    pip install veld[llamaindex]
+    pip install veld[openai-agents]
+    pip install veld[all]
 """
 
 # Lazy imports to avoid requiring dependencies

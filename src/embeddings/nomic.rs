@@ -122,7 +122,7 @@ impl NomicConfig {
     ///
     /// Search order for model files:
     /// 1. SHODH_NOMIC_MODEL_PATH environment variable
-    /// 2. Bundled in Python package (SHODH_PACKAGE_DIR/models/nomic-embed-v1.5)
+    /// 2. Bundled in Python package (VELD_PACKAGE_DIR/models/nomic-embed-v1.5)
     /// 3. ./models/nomic-embed-v1.5 (local)
     /// 4. ../models/nomic-embed-v1.5 (parent)
     /// 5. ~/.cache/shodh-memory/models/nomic-embed-v1.5 (auto-download location)
@@ -132,7 +132,7 @@ impl NomicConfig {
             .unwrap_or_else(|_| {
                 let candidates = vec![
                     // Bundled in Python package (highest priority for pip install)
-                    std::env::var("SHODH_PACKAGE_DIR")
+                    std::env::var("VELD_PACKAGE_DIR")
                         .ok()
                         .map(|p| PathBuf::from(p).join("models/nomic-embed-v1.5")),
                     Some(PathBuf::from("./models/nomic-embed-v1.5")),

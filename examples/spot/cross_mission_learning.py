@@ -12,7 +12,7 @@ This example simulates 3 missions through the same facility:
   - Mission 3 (Expertise): Full situational awareness, anomalies decayed
 
 Run:
-    pip install shodh-memory
+    pip install veld
     python cross_mission_learning.py
 """
 

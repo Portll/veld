@@ -68,16 +68,16 @@ jobs:
           # Unzip wheel
           unzip -q "$wheel_file" -d wheel_contents
 
-          # Copy bundled files into shodh_memory package
-          cp -r ../bundled/lib wheel_contents/shodh_memory/
-          cp -r ../bundled/models wheel_contents/shodh_memory/
+          # Copy bundled files into veld package
+          cp -r ../bundled/lib wheel_contents/veld/
+          cp -r ../bundled/models wheel_contents/veld/
 
           # Update RECORD file with new files
           cd wheel_contents
-          record_file=$(ls shodh_memory-*.dist-info/RECORD)
+          record_file=$(ls veld-*.dist-info/RECORD)
 
           # Add new files to RECORD (with proper SHA256 hashes)
-          for file in shodh_memory/lib/* shodh_memory/models/*/* ; do
+          for file in veld/lib/* veld/models/*/* ; do
             if [ -f "$file" ]; then
               hash=$(sha256sum "$file" | cut -d' ' -f1)
               size=$(stat -c%s "$file")
@@ -159,16 +159,16 @@ jobs:
           # Unzip wheel
           unzip -q "$wheel_file" -d wheel_contents
 
-          # Copy bundled files into shodh_memory package
-          cp -r ../bundled/lib wheel_contents/shodh_memory/
-          cp -r ../bundled/models wheel_contents/shodh_memory/
+          # Copy bundled files into veld package
+          cp -r ../bundled/lib wheel_contents/veld/
+          cp -r ../bundled/models wheel_contents/veld/
 
           # Update RECORD file with new files
           cd wheel_contents
-          record_file=$(ls shodh_memory-*.dist-info/RECORD)
+          record_file=$(ls veld-*.dist-info/RECORD)
 
           # Add new files to RECORD (with proper SHA256 hashes)
-          for file in shodh_memory/lib/* shodh_memory/models/*/* ; do
+          for file in veld/lib/* veld/models/*/* ; do
             if [ -f "$file" ]; then
               hash=$(shasum -a 256 "$file" | cut -d' ' -f1)
               size=$(stat -f%z "$file")
@@ -250,16 +250,16 @@ jobs:
           # Unzip wheel
           unzip -q "$wheel_file" -d wheel_contents
 
-          # Copy bundled files into shodh_memory package
-          cp -r ../bundled/lib wheel_contents/shodh_memory/
-          cp -r ../bundled/models wheel_contents/shodh_memory/
+          # Copy bundled files into veld package
+          cp -r ../bundled/lib wheel_contents/veld/
+          cp -r ../bundled/models wheel_contents/veld/
 
           # Update RECORD file with new files
           cd wheel_contents
-          record_file=$(ls shodh_memory-*.dist-info/RECORD)
+          record_file=$(ls veld-*.dist-info/RECORD)
 
           # Add new files to RECORD (with proper SHA256 hashes)
-          for file in shodh_memory/lib/* shodh_memory/models/*/* ; do
+          for file in veld/lib/* veld/models/*/* ; do
             if [ -f "$file" ]; then
               hash=$(shasum -a 256 "$file" | cut -d' ' -f1)
               size=$(stat -f%z "$file")
@@ -336,16 +336,16 @@ jobs:
           # Unzip wheel
           Expand-Archive -Path $wheel.FullName -DestinationPath wheel_contents -Force
 
-          # Copy bundled files into shodh_memory package
-          Copy-Item -Recurse ../bundled/lib wheel_contents/shodh_memory/
-          Copy-Item -Recurse ../bundled/models wheel_contents/shodh_memory/
+          # Copy bundled files into veld package
+          Copy-Item -Recurse ../bundled/lib wheel_contents/veld/
+          Copy-Item -Recurse ../bundled/models wheel_contents/veld/
 
           # Update RECORD file with new files
           cd wheel_contents
-          $recordFile = Get-ChildItem -Path "shodh_memory-*.dist-info/RECORD" | Select-Object -First 1
+          $recordFile = Get-ChildItem -Path "veld-*.dist-info/RECORD" | Select-Object -First 1
 
           # Add new files to RECORD
-          $files = Get-ChildItem -Path "shodh_memory/lib/*", "shodh_memory/models/*/*" -File
+          $files = Get-ChildItem -Path "veld/lib/*", "veld/models/*/*" -File
           foreach ($file in $files) {
             $relativePath = $file.FullName.Replace("$PWD\", "").Replace("\", "/")
             $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower()
@@ -407,7 +407,7 @@ jobs:
     if: github.event.inputs.publish == 'true'
     environment:
       name: pypi
-      url: https://pypi.org/project/shodh-memory/
+      url: https://pypi.org/project/veld/
 
     steps:
       - name: Download all artifacts

@@ -2234,7 +2234,7 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, PyOb
 
 /// Python module definition
 #[pymodule]
-fn shodh_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn veld(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core classes
     m.add_class::<PyMemorySystem>()?;
 

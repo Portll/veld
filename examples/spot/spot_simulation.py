@@ -14,7 +14,7 @@ Demonstrates Veld - Agentic Memory working end-to-end:
   7. Fleet readiness — multi-robot support via robot_id
 
 No hardware needed. Run:
-    pip install shodh-memory
+    pip install veld
     python spot_simulation.py
 """
 

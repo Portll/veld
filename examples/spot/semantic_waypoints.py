@@ -14,7 +14,7 @@ using Veld - Agentic Memory. Annotations accumulate over time and are queryable
 by natural language.
 
 Run:
-    pip install shodh-memory
+    pip install veld
     python semantic_waypoints.py
 """
 
