@@ -1,7 +1,7 @@
 # Reference Homebrew formula for shodh-memory.
 #
 # NOTE: This file is archival/reference-only for the last public Homebrew release
-# line. It is not kept in sync with the current `v0.7.6-unstable` repository
+# line. It is not kept in sync with the current `v0.7.7-unstable` repository
 # branch and should not be treated as the source of truth for this branch.
 #
 # To use:

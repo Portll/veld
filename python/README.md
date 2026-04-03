@@ -18,7 +18,7 @@
 
 ---
 
-> Status: `v0.7.6-unstable` on this branch. The repository source may be ahead
+> Status: `v0.7.7-unstable` on this branch. The repository source may be ahead
 > of the last published Python package and should be treated as internal /
 > unstable until the `v0.8` stabilization cut.
 

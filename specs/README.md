@@ -113,7 +113,7 @@ Authorization: Bearer your-api-key
 ## Versioning
 
 This spec set is a forward-looking interoperability document, not the exact
-runtime contract of the current `v0.7.6-unstable` branch.
+runtime contract of the current `v0.7.7-unstable` branch.
 
 This specification follows semantic versioning:
 - **Major**: Breaking changes to required fields or core operations

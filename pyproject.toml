@@ -3,10 +3,10 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "shodh-memory"
-version = "0.7.6.dev0"
-description = "Local-first AI memory system for robotics, drones, and edge AI - 100% offline capable"
-authors = [{name = "Shodh Team", email = "29.varuns@gmail.com"}]
+name = "veld-memory"
+version = "0.7.7.dev0"
+description = "Adaptive memory runtime for AI agents and robots — Hebbian learning, hybrid retrieval, knowledge graph, gap topology. Zenoh/ROS2 native."
+authors = [{name = "Private Citizen", email = "john@portll.net"}]
 license = {text = "BUSL-1.1"}
 readme = "README-python.md"
 requires-python = ">=3.8"
@@ -33,10 +33,10 @@ keywords = [
 ]
 
 [project.urls]
-Homepage = "https://www.shodh-rag.com/memory"
-Repository = "https://github.com/varun29ankuS/shodh-memory"
-Documentation = "https://www.shodh-rag.com/memory"
-"Bug Tracker" = "https://github.com/varun29ankuS/shodh-memory/issues"
+Homepage = "https://github.com/Portll/veld"
+Repository = "https://github.com/Portll/veld"
+Documentation = "https://github.com/Portll/veld"
+"Bug Tracker" = "https://github.com/Portll/veld/issues"
 
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.2.0"]

@@ -30,7 +30,7 @@ Veld - Agentic Memory fixes this. It's persistent memory that actually learns â€
 
 `Veld - Agentic Memory` is the product name. The current published package IDs and binaries remain `shodh-memory`, `@shodh/memory-mcp`, and `shodh` while registry surfaces catch up.
 
-> Branch status: this repository is currently tracked as `v0.7.6-unstable`.
+> Branch status: this repository is currently tracked as `v0.7.7-unstable`.
 > It is being cleaned and stabilized toward a clean `v0.8` cut before the later
 > `v0.9` public-release work. Treat the branch tip as internal/unstable unless a
 > tagged release says otherwise.
@@ -54,7 +54,7 @@ Veld is strongest when memory has to stay local, adaptive, and operationally sim
 ## Get Started
 
 These install commands target the last tagged public artifacts. If you are working
-from the checked-out `v0.7.6-unstable` branch, treat the repo as an internal
+from the checked-out `v0.7.7-unstable` branch, treat the repo as an internal
 stabilization tree and prefer the repo-local development docs and wrappers.
 
 ### Build From Source (Branch Tip)

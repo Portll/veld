@@ -2,7 +2,7 @@
 
 **Persistent memory for AI agents. Single package. Local-first. Runs offline.**
 
-> Status: `v0.7.6-unstable` on this branch. The repository is being cleaned for
+> Status: `v0.7.7-unstable` on this branch. The repository is being cleaned for
 > a `v0.8` cut, so the checked-out code may be ahead of the last published PyPI
 > package.
 
@@ -22,7 +22,7 @@ Product name: `Veld - Agentic Memory`. Published package name: `shodh-memory`.
 pip install shodh-memory
 ```
 
-That installs the last published package, not the checked-out `v0.7.6-unstable`
+That installs the last published package, not the checked-out `v0.7.7-unstable`
 branch tip. Models and runtime are bundled in the published package.
 
 ### Build From Source (Branch Tip)

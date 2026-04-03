@@ -2,7 +2,7 @@
 
 **Persistent cognitive memory for AI agents. Local-first. Runs offline.**
 
-> Status: `v0.7.6-unstable` on this branch. This repo is in internal stabilization
+> Status: `v0.7.7-unstable` on this branch. This repo is in internal stabilization
 > toward `v0.8` and is not yet the clean public release line. Use published registry
 > artifacts only when you explicitly want the last public package, not this branch tip.
 
@@ -34,7 +34,7 @@ by the RocksDB build path on this branch.
 
 ### Build From Source (Branch Tip)
 
-If you need the checked-out `v0.7.6-unstable` tree rather than the last
+If you need the checked-out `v0.7.7-unstable` tree rather than the last
 published crate, work from this repository directly:
 
 ```bash

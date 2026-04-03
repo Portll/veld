@@ -1,12 +1,12 @@
 {
-  "name": "@shodh/memory-mcp",
-  "version": "0.7.6-unstable",
-  "mcpName": "io.github.varun29ankuS/shodh-memory",
-  "description": "Unstable MCP server snapshot for the Veld v0.7.6 stabilization branch",
+  "name": "@portll/veld",
+  "version": "0.7.7-unstable",
+  "mcpName": "io.github.Portll/veld",
+  "description": "MCP server for the Veld adaptive memory runtime",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "shodh-memory-mcp": "dist/index.js"
+    "veld": "dist/index.js"
   },
   "scripts": {
     "start": "bun run index.ts",
@@ -40,17 +40,18 @@
     "llm",
     "persistent-memory",
     "semantic-search",
-    "shodh"
+    "veld",
+    "portll"
   ],
-  "author": "Shodh Team <29.varuns@gmail.com>",
+  "author": "Private Citizen <john@portll.net>",
   "license": "BUSL-1.1",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/varun29ankuS/shodh-memory.git"
+    "url": "git+https://github.com/Portll/veld.git"
   },
-  "homepage": "https://github.com/varun29ankuS/shodh-memory#readme",
+  "homepage": "https://github.com/Portll/veld#readme",
   "bugs": {
-    "url": "https://github.com/varun29ankuS/shodh-memory/issues"
+    "url": "https://github.com/Portll/veld/issues"
   },
   "engines": {
     "node": ">=18.0.0"
