@@ -12,8 +12,8 @@ use chrono::{Duration, Timelike, Utc};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{
     compression::{ConsolidationResult, FactType, SemanticConsolidator, SemanticFact},
     retrieval::{
         AnticipatoryPrefetch, PrefetchContext, PrefetchReason, PrefetchResult, ReinforcementStats,

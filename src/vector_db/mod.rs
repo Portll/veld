@@ -23,7 +23,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use shodh_memory::vector_db::{VectorIndexBackend, BackendConfig};
+//! use veld::vector_db::{VectorIndexBackend, BackendConfig};
 //!
 //! // Auto-select based on expected size
 //! let backend = VectorIndexBackend::auto(BackendConfig::default(), 50_000)?;

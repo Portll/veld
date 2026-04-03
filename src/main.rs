@@ -1,6 +1,6 @@
 //! Veld Server — standalone binary entry point.
 //!
-//! This is a thin wrapper around `shodh_memory::server::run()`.
+//! This is a thin wrapper around `veld::server::run()`.
 //! For the unified CLI, use `veld server` instead.
 //!
 //! Usage:
@@ -18,7 +18,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::Result;
 use clap::Parser;
-use shodh_memory::config::{promote_env_aliases, StorageBackend};
+use veld::config::{promote_env_aliases, StorageBackend};
 use std::path::PathBuf;
 
 const LONG_ABOUT: &str = r#"
@@ -77,7 +77,7 @@ struct Cli {
         short,
         long = "storage",
         env = "VELD_MEMORY_PATH",
-        default_value_os_t = shodh_memory::config::default_storage_path()
+        default_value_os_t = veld::config::default_storage_path()
     )]
     storage_path: PathBuf,
 
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
     // Fortress: install anti-debug + custom panic handler BEFORE anything else.
     // Must be the first code to execute — debugger attachment at startup is caught.
     #[cfg(feature = "fortress")]
-    shodh_memory::fortress::init();
+    veld::fortress::init();
 
     unsafe {
       promote_env_aliases();
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    shodh_memory::server::run(shodh_memory::server::ServerRunConfig {
+    veld::server::run(veld::server::ServerRunConfig {
         host: cli.host,
         port: cli.port,
         storage_path: cli.storage_path,

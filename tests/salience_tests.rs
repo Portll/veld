@@ -8,9 +8,9 @@
 //! - NER-based entity extraction and salience assignment
 
 use chrono::Utc;
-use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use shodh_memory::graph_memory::{EntityLabel, EntityNode, GraphMemory};
-use shodh_memory::uuid::Uuid;
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::graph_memory::{EntityLabel, EntityNode, GraphMemory};
+use veld::uuid::Uuid;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;

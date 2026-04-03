@@ -80,7 +80,7 @@ exclude = [
 ]
 
 [lib]
-name = "shodh_memory"
+name = "veld"
 path = "src/lib.rs"
 # rlib: for Rust library usage (tests, benchmarks, binary)
 # cdylib: for Python bindings (PyO3/maturin needs shared library)

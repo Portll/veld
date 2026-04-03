@@ -8,12 +8,12 @@
 //! - Concurrent activation updates
 //! - NER integration for entity extraction
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{
     Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem, MemoryTier, Query,
     RetrievalOutcome,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 use tempfile::TempDir;
 
 /// Create fallback NER instance for testing

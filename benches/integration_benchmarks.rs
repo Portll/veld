@@ -11,11 +11,11 @@ use hmac::{Hmac, Mac};
 use serde_json;
 use sha2::Sha256;
 
-use shodh_memory::integrations::github::{
+use veld::integrations::github::{
     GitHubBranch, GitHubIssue, GitHubLabel, GitHubPullRequest, GitHubRepository, GitHubUser,
     GitHubWebhook,
 };
-use shodh_memory::integrations::linear::{
+use veld::integrations::linear::{
     LinearCycle, LinearIssueData, LinearLabel, LinearProject, LinearState, LinearTeam, LinearUser,
     LinearWebhook,
 };

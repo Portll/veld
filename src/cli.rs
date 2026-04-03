@@ -26,7 +26,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use shodh_memory::config::{promote_env_aliases, StorageBackend};
+use veld::config::{promote_env_aliases, StorageBackend};
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 // =============================================================================
@@ -72,7 +72,7 @@ enum Commands {
             short,
             long = "storage",
             env = "VELD_MEMORY_PATH",
-            default_value_os_t = shodh_memory::config::default_storage_path()
+            default_value_os_t = veld::config::default_storage_path()
         )]
         storage_path: PathBuf,
 
@@ -228,7 +228,7 @@ enum HookType {
 #[tokio::main]
 async fn main() -> Result<()> {
     #[cfg(feature = "fortress")]
-    shodh_memory::fortress::init();
+    veld::fortress::init();
 
     unsafe {
         promote_env_aliases();
@@ -254,7 +254,7 @@ async fn main() -> Result<()> {
             // Since server::run() is blocking and builds its own runtime, we
             // spawn it in a blocking task and await.
             let result = tokio::task::spawn_blocking(move || {
-                shodh_memory::server::run(shodh_memory::server::ServerRunConfig {
+                veld::server::run(veld::server::ServerRunConfig {
                     host,
                     port,
                     storage_path,
@@ -426,7 +426,7 @@ fn handle_init() -> Result<()> {
     eprintln!();
 
     // 1. Create storage directory
-    let storage = shodh_memory::config::default_storage_path();
+    let storage = veld::config::default_storage_path();
     std::fs::create_dir_all(&storage)?;
     eprintln!("  ✓ Storage directory: {}", storage.display());
 
@@ -459,7 +459,7 @@ fn handle_init() -> Result<()> {
     eprintln!("  Downloading ONNX runtime and embedding model...");
     eprintln!("  (this only happens once, ~40MB total)");
     eprintln!();
-    shodh_memory::embeddings::minilm::pre_init_ort_runtime(false);
+    veld::embeddings::minilm::pre_init_ort_runtime(false);
     eprintln!("  ✓ ONNX runtime ready");
 
     // 4. Print next steps
@@ -567,8 +567,8 @@ fn handle_doctor() -> Result<()> {
     let mut all_ok = true;
 
     // 1. Storage directory
-    let storage = shodh_memory::config::default_storage_path();
-    let config = shodh_memory::config::ServerConfig::from_env();
+    let storage = veld::config::default_storage_path();
+    let config = veld::config::ServerConfig::from_env();
     if storage.exists() {
         eprintln!("  ✓ Storage directory exists: {}", storage.display());
     } else {
@@ -605,7 +605,7 @@ fn handle_doctor() -> Result<()> {
 
     // 3. ONNX runtime
     eprintln!("  … Checking ONNX runtime");
-    shodh_memory::embeddings::minilm::pre_init_ort_runtime(false);
+    veld::embeddings::minilm::pre_init_ort_runtime(false);
     eprintln!("  ✓ ONNX runtime loads OK");
 
     // 4. Port availability
@@ -664,8 +664,8 @@ fn handle_version() {
     eprintln!("Veld {}", env!("VELD_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
-    eprintln!("  Target backend: {}", shodh_memory::config::default_requested_storage_backend());
-    eprintln!("  Runtime backend: {}", shodh_memory::config::effective_storage_backend_for_current_build(shodh_memory::config::default_requested_storage_backend()));
+    eprintln!("  Target backend: {}", veld::config::default_requested_storage_backend());
+    eprintln!("  Runtime backend: {}", veld::config::effective_storage_backend_for_current_build(veld::config::default_requested_storage_backend()));
     eprintln!("  License:  BUSL-1.1");
     eprintln!("  Repo:     https://github.com/Portll/veld");
 }

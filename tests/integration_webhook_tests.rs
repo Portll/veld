@@ -8,7 +8,7 @@
 //! - External ID generation
 //! - Upsert flow with external linking
 
-use shodh_memory::integrations::{
+use veld::integrations::{
     github::{
         GitHubBranch, GitHubIssue, GitHubLabel, GitHubMilestone, GitHubPullRequest,
         GitHubRepository, GitHubUser, GitHubWebhook, GitHubWebhookPayload,
