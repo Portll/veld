@@ -6,8 +6,8 @@
 //! 3. Search results are properly deduplicated by memory ID
 //! 4. The full memory is returned, not just the matching chunk
 
-use shodh_memory::memory::types::{Experience, ExperienceType, Query};
-use shodh_memory::memory::{MemoryConfig, MemorySystem};
+use veld::memory::types::{Experience, ExperienceType, Query};
+use veld::memory::{MemoryConfig, MemorySystem};
 use tempfile::TempDir;
 
 fn create_test_config(temp_dir: &TempDir) -> MemoryConfig {

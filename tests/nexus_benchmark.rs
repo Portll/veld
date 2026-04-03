@@ -14,8 +14,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use dataset_loader::{BenchmarkDataset, DatasetMemory, DatasetQuery};
-use shodh_memory::memory::types::{Experience, ExperienceType, Query};
-use shodh_memory::memory::{MemoryConfig, MemoryId, MemorySystem};
+use veld::memory::types::{Experience, ExperienceType, Query};
+use veld::memory::{MemoryConfig, MemoryId, MemorySystem};
 use tempfile::TempDir;
 
 const OVERALL_COMPOSITE_THRESHOLD: f32 = 0.45;
@@ -140,7 +140,7 @@ fn absence_compliance(retrieved: &[usize], absence: &HashSet<usize>, k: usize) -
 }
 
 fn map_results_to_dataset_ids(
-    results: &[shodh_memory::memory::SharedMemory],
+    results: &[veld::memory::SharedMemory],
     reverse_map: &HashMap<uuid::Uuid, usize>,
 ) -> Vec<usize> {
     results

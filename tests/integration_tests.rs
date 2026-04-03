@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tempfile::TempDir;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::{
     memory::types::GeoFilter,
     memory::{Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode},
 };

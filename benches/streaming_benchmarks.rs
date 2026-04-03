@@ -11,10 +11,10 @@
 //! Run with: cargo bench --bench streaming_benchmarks
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{MemoryConfig, MemorySystem};
-use shodh_memory::parking_lot;
-use shodh_memory::streaming::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{MemoryConfig, MemorySystem};
+use veld::parking_lot;
+use veld::streaming::{
     contains_ignore_ascii_case, content_hash, ExtractionConfig, StreamHandshake, StreamMessage,
     StreamMode, StreamingMemoryExtractor,
 };

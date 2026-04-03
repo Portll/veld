@@ -9,12 +9,12 @@ use chrono::{Duration, Utc};
 use std::time::Instant;
 use tempfile::TempDir;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::types::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::types::{
     geohash_decode, geohash_encode, geohash_neighbors, geohash_precision_for_radius, Experience,
     ExperienceType, GeoFilter, Query,
 };
-use shodh_memory::memory::{MemoryConfig, MemorySystem};
+use veld::memory::{MemoryConfig, MemorySystem};
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -483,7 +483,7 @@ fn test_algo004_importance_index_updates_after_change() {
     // Simulate Hebbian reinforcement by retrieving with positive outcome
     // (In real usage, this would be done via reinforce_recall)
     let memory_ids = vec![memory_id.clone()];
-    let outcome = shodh_memory::memory::RetrievalOutcome::Helpful;
+    let outcome = veld::memory::RetrievalOutcome::Helpful;
     system
         .reinforce_recall(&memory_ids, outcome)
         .expect("Failed to reinforce");
@@ -700,7 +700,7 @@ fn test_sho48_forget_removes_from_semantic_search() {
 
     // Forget the memory
     let forget_result = system
-        .forget(shodh_memory::memory::ForgetCriteria::ById(
+        .forget(veld::memory::ForgetCriteria::ById(
             memory_id.clone(),
         ))
         .expect("Failed to forget");
@@ -730,7 +730,7 @@ fn test_sho48_forget_updates_stats() {
 
     // Forget the memory
     system
-        .forget(shodh_memory::memory::ForgetCriteria::ById(memory_id))
+        .forget(veld::memory::ForgetCriteria::ById(memory_id))
         .expect("Failed to forget");
 
     let stats_after = system.stats();
@@ -890,7 +890,7 @@ fn test_sho50_stats_updated_on_forget() {
 
     // Forget the memory
     system
-        .forget(shodh_memory::memory::ForgetCriteria::ById(memory_id))
+        .forget(veld::memory::ForgetCriteria::ById(memory_id))
         .expect("Failed to forget");
 
     let stats_after = system.stats();

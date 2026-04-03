@@ -11,10 +11,10 @@
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use tempfile::TempDir;
 
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{
     compression::SemanticConsolidator,
     retrieval::{AnticipatoryPrefetch, PrefetchContext, RetrievalOutcome},
     types::{Experience, ExperienceType, Query},
@@ -71,7 +71,7 @@ fn create_experience_with_ner(
     }
 }
 
-fn populate_memories(system: &MemorySystem, count: usize) -> Vec<shodh_memory::memory::MemoryId> {
+fn populate_memories(system: &MemorySystem, count: usize) -> Vec<veld::memory::MemoryId> {
     let mut ids = Vec::with_capacity(count);
     let ner = setup_fallback_ner();
 
@@ -421,8 +421,8 @@ fn bench_consolidate_scaling(c: &mut Criterion) {
 }
 
 fn bench_reinforce_fact(c: &mut Criterion) {
-    use shodh_memory::chrono::Utc;
-    use shodh_memory::memory::compression::{FactType, SemanticFact};
+    use veld::chrono::Utc;
+    use veld::memory::compression::{FactType, SemanticFact};
 
     c.bench_function("adaptive_reinforce_fact", |b| {
         let consolidator = SemanticConsolidator::new();
@@ -454,8 +454,8 @@ fn bench_reinforce_fact(c: &mut Criterion) {
 }
 
 fn bench_should_decay_fact(c: &mut Criterion) {
-    use shodh_memory::chrono::{Duration, Utc};
-    use shodh_memory::memory::compression::{FactType, SemanticFact};
+    use veld::chrono::{Duration, Utc};
+    use veld::memory::compression::{FactType, SemanticFact};
 
     let mut group = c.benchmark_group("adaptive_should_decay_fact");
 

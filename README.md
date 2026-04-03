@@ -151,12 +151,12 @@ results = memory.recall("user preferences", limit=5)
 
 ```toml
 [dependencies]
-# Last published crate surface, not this unstable branch tip
-shodh-memory = "0.1"
+# Branch-tip crate surface
+veld = "0.1"
 ```
 
 ```rust
-use shodh_memory::{MemorySystem, MemoryConfig};
+use veld::{MemorySystem, MemoryConfig};
 
 let memory = MemorySystem::new(MemoryConfig::default())?;
 memory.remember("user-1", "User prefers dark mode", MemoryType::Decision, vec![])?;

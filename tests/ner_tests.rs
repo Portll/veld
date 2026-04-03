@@ -7,7 +7,7 @@
 //! - Mixed entity extraction
 //! - Edge cases and stress tests
 
-use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 use std::path::PathBuf;
 
 /// Create a fallback NER instance for testing

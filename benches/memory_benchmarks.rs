@@ -8,8 +8,8 @@
 //! Now includes NER integration for entity extraction benchmarks.
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{Experience, MemoryConfig, MemorySystem, Query};
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{Experience, MemoryConfig, MemorySystem, Query};
 use std::fs;
 use tempfile::TempDir;
 
@@ -168,7 +168,7 @@ fn bench_retrieve_memories(c: &mut Criterion) {
                 let query = Query {
                     query_text: Some("task execution debugging".to_string()),
                     max_results: k,
-                    retrieval_mode: shodh_memory::memory::RetrievalMode::Hybrid,
+                    retrieval_mode: veld::memory::RetrievalMode::Hybrid,
                     ..Default::default()
                 };
 
@@ -188,8 +188,8 @@ fn bench_embedding_generation(c: &mut Criterion) {
     eprintln!("\n⚡ EMBEDDING BENCHMARK - Optimized v2.0 ⚡\n");
     let mut group = c.benchmark_group("embedding_generation");
 
-    use shodh_memory::embeddings::minilm::{EmbeddingConfig, MiniLMEmbedder};
-    use shodh_memory::embeddings::Embedder;
+    use veld::embeddings::minilm::{EmbeddingConfig, MiniLMEmbedder};
+    use veld::embeddings::Embedder;
 
     let config = EmbeddingConfig::default();
     let embedder = MiniLMEmbedder::new(config).expect("Failed to create embedder");
@@ -240,7 +240,7 @@ fn bench_vector_search(c: &mut Criterion) {
                     query_text: Some("debugging system performance optimization".to_string()),
                     importance_threshold: Some(0.5),
                     max_results: k,
-                    retrieval_mode: shodh_memory::memory::RetrievalMode::Similarity,
+                    retrieval_mode: veld::memory::RetrievalMode::Similarity,
                     ..Default::default()
                 };
 
@@ -398,7 +398,7 @@ fn bench_end_to_end(c: &mut Criterion) {
             let query = Query {
                 query_text: Some("task dependencies module Infosys".to_string()),
                 max_results: 5,
-                retrieval_mode: shodh_memory::memory::RetrievalMode::Hybrid,
+                retrieval_mode: veld::memory::RetrievalMode::Hybrid,
                 ..Default::default()
             };
 
@@ -789,7 +789,7 @@ fn bench_cache_performance(c: &mut Criterion) {
             let query = Query {
                 query_text: Some(format!("Unique query iteration {counter}")),
                 max_results: 5,
-                retrieval_mode: shodh_memory::memory::RetrievalMode::Hybrid,
+                retrieval_mode: veld::memory::RetrievalMode::Hybrid,
                 ..Default::default()
             };
             memory_system.recall(&query).expect("Failed to retrieve");
@@ -801,7 +801,7 @@ fn bench_cache_performance(c: &mut Criterion) {
         let query = Query {
             query_text: Some("obstacles nearby in warehouse".to_string()),
             max_results: 5,
-            retrieval_mode: shodh_memory::memory::RetrievalMode::Hybrid,
+            retrieval_mode: veld::memory::RetrievalMode::Hybrid,
             ..Default::default()
         };
         let _ = memory_system.recall(&query);
@@ -813,7 +813,7 @@ fn bench_cache_performance(c: &mut Criterion) {
             let query = Query {
                 query_text: Some("obstacles nearby in warehouse".to_string()),
                 max_results: 5,
-                retrieval_mode: shodh_memory::memory::RetrievalMode::Hybrid,
+                retrieval_mode: veld::memory::RetrievalMode::Hybrid,
                 ..Default::default()
             };
             memory_system.recall(&query).expect("Failed to retrieve");
@@ -854,7 +854,7 @@ fn bench_forget_operation(c: &mut Criterion) {
             |(mut memory_system, memory_id, _temp_dir)| {
                 // Measured: Forget operation
                 memory_system
-                    .forget(shodh_memory::memory::ForgetCriteria::ById(memory_id))
+                    .forget(veld::memory::ForgetCriteria::ById(memory_id))
                     .expect("Failed to forget");
             },
             BatchSize::SmallInput,
@@ -875,7 +875,7 @@ fn bench_forget_operation(c: &mut Criterion) {
             },
             |(mut memory_system, memory_id, stats_before, _temp_dir)| {
                 memory_system
-                    .forget(shodh_memory::memory::ForgetCriteria::ById(memory_id))
+                    .forget(veld::memory::ForgetCriteria::ById(memory_id))
                     .expect("Failed to forget");
                 let stats_after = memory_system.stats();
                 // Verify stats are properly decremented
@@ -906,7 +906,7 @@ fn bench_forget_operation(c: &mut Criterion) {
             |(mut memory_system, memory_ids, _temp_dir)| {
                 for memory_id in memory_ids {
                     memory_system
-                        .forget(shodh_memory::memory::ForgetCriteria::ById(memory_id))
+                        .forget(veld::memory::ForgetCriteria::ById(memory_id))
                         .expect("Failed to forget");
                 }
             },
@@ -941,7 +941,7 @@ fn bench_deduplication(c: &mut Criterion) {
             let query = Query {
                 query_text: Some("task execution debugging".to_string()),
                 max_results: 25,
-                retrieval_mode: shodh_memory::memory::RetrievalMode::Hybrid,
+                retrieval_mode: veld::memory::RetrievalMode::Hybrid,
                 ..Default::default()
             };
 
@@ -1052,7 +1052,7 @@ fn bench_stats_accuracy(c: &mut Criterion) {
             |(mut memory_system, memory_id, _temp_dir)| {
                 let stats_before = memory_system.stats();
                 memory_system
-                    .forget(shodh_memory::memory::ForgetCriteria::ById(memory_id))
+                    .forget(veld::memory::ForgetCriteria::ById(memory_id))
                     .expect("Failed to forget");
                 let stats_after = memory_system.stats();
 

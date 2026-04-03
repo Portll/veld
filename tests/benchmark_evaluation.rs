@@ -17,8 +17,8 @@
 
 use std::time::Instant;
 
-use shodh_memory::memory::types::{Experience, ExperienceType, Query};
-use shodh_memory::memory::{MemoryConfig, MemoryId, MemorySystem};
+use veld::memory::types::{Experience, ExperienceType, Query};
+use veld::memory::{MemoryConfig, MemoryId, MemorySystem};
 use tempfile::TempDir;
 
 // =============================================================================
@@ -463,7 +463,7 @@ fn reciprocal_rank(retrieved: &[usize], relevant: &[usize]) -> f32 {
 
 /// Map retrieved MemoryIds back to their original benchmark indices.
 fn map_results_to_indices(
-    results: &[std::sync::Arc<shodh_memory::memory::types::Memory>],
+    results: &[std::sync::Arc<veld::memory::types::Memory>],
     stored_ids: &[MemoryId],
 ) -> Vec<usize> {
     results

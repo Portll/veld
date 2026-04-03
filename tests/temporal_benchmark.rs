@@ -10,8 +10,8 @@
 //! Run with: cargo test temporal_benchmark -- --ignored --nocapture
 
 use chrono::{Duration, Utc};
-use shodh_memory::memory::types::{Experience, ExperienceType, Query, RetrievalMode};
-use shodh_memory::memory::{MemoryConfig, MemorySystem};
+use veld::memory::types::{Experience, ExperienceType, Query, RetrievalMode};
+use veld::memory::{MemoryConfig, MemorySystem};
 use tempfile::TempDir;
 
 // =============================================================================

@@ -4,7 +4,7 @@
 //! allocation on the NER hot path.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use shodh_memory::embeddings::ner::argmax_softmax;
+use veld::embeddings::ner::argmax_softmax;
 
 /// Baseline: allocating softmax then argmax (the old code path).
 fn softmax_then_argmax(logits: &[f32]) -> Option<(usize, f32)> {

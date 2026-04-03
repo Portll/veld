@@ -9,8 +9,8 @@
 //! - Importance-based promotion to session
 //! - NER integration for entity extraction
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{
     Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode,
 };
 use std::path::PathBuf;
@@ -189,8 +189,8 @@ fn test_low_importance_stays_working() {
 fn test_longterm_persistence() {
     // Verify bincode roundtrip works for Memory struct
     {
-        use shodh_memory::memory::{Experience, ExperienceType, Memory, MemoryId};
-        use shodh_memory::uuid::Uuid;
+        use veld::memory::{Experience, ExperienceType, Memory, MemoryId};
+        use veld::uuid::Uuid;
 
         let test_memory = Memory::new(
             MemoryId(Uuid::new_v4()),
@@ -444,7 +444,7 @@ fn test_forget_low_importance() {
 
     // Forget low importance
     let forgotten = memory_system
-        .forget(shodh_memory::memory::ForgetCriteria::LowImportance(0.5))
+        .forget(veld::memory::ForgetCriteria::LowImportance(0.5))
         .expect("Failed to forget");
 
     // Some memories should be forgotten
@@ -479,7 +479,7 @@ fn test_forget_by_pattern() {
 
     // Forget by pattern
     let forgotten = memory_system
-        .forget(shodh_memory::memory::ForgetCriteria::Pattern(
+        .forget(veld::memory::ForgetCriteria::Pattern(
             "DELETEME".to_string(),
         ))
         .expect("Failed to forget");
@@ -618,7 +618,7 @@ fn test_geo_filter_retrieval() {
     // Search near San Francisco
     let query = Query {
         query_text: Some("obstacle warehouse".to_string()),
-        geo_filter: Some(shodh_memory::memory::GeoFilter::new(
+        geo_filter: Some(veld::memory::GeoFilter::new(
             37.7749, -122.4194, 1000.0,
         )),
         max_results: 5,

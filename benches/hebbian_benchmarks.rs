@@ -8,7 +8,7 @@
 //! - Associative retrieval with learned associations
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use shodh_memory::memory::{Experience, MemoryConfig, MemorySystem, Query, RetrievalOutcome};
+use veld::memory::{Experience, MemoryConfig, MemorySystem, Query, RetrievalOutcome};
 use tempfile::TempDir;
 
 /// Create test memory system

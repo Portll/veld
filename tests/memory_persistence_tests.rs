@@ -15,8 +15,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{
     retrieval::RetrievalOutcome,
     types::{Experience, ExperienceType, Query},
     MemoryConfig, MemoryId, MemorySystem,

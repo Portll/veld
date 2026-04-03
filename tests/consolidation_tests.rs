@@ -9,12 +9,12 @@
 
 use std::sync::Arc;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::graph_memory::GraphMemory;
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::graph_memory::GraphMemory;
+use veld::memory::{
     Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem, MemoryTier,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 use tempfile::TempDir;
 
 /// Create fallback NER for testing (rule-based, no ONNX required)
@@ -52,7 +52,7 @@ fn setup_memory_system() -> (MemorySystem, TempDir) {
         MemorySystem::new(config, None).expect("Failed to create memory system");
     let graph_path = temp_dir.path().join("graph");
     let graph = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
-    memory_system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(graph)));
+    memory_system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(graph)));
     (memory_system, temp_dir)
 }
 
@@ -887,7 +887,7 @@ fn test_concurrent_tier_reads() {
 // =============================================================================
 
 use chrono::{Duration, TimeZone, Utc};
-use shodh_memory::memory::{ConsolidationEvent, Query};
+use veld::memory::{ConsolidationEvent, Query};
 
 /// Helper to get a "beginning of time" DateTime for all-time queries
 fn epoch() -> chrono::DateTime<chrono::Utc> {

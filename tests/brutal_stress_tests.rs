@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::graph_memory::GraphMemory;
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::graph_memory::GraphMemory;
+use veld::memory::{
     retrieval::RetrievalOutcome,
     types::{Experience, ExperienceType, Query},
     MemoryConfig, MemoryId, MemorySystem,
@@ -68,7 +68,7 @@ fn create_test_system_with_graph() -> (MemorySystem, TempDir) {
     let mut system = MemorySystem::new(config, None).expect("Failed to create memory system");
     let graph_path = temp_dir.path().join("graph");
     let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
-    system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(
+    system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
         graph_memory,
     )));
     (system, temp_dir)

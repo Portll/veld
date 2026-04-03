@@ -7,7 +7,7 @@
 //! - Comparison: Neural vs Rule-based fallback
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
+use veld::embeddings::ner::{NerConfig, NeuralNer};
 use std::time::Instant;
 
 // ==============================================================================

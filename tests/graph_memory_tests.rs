@@ -9,12 +9,12 @@
 //! - NER integration for entity extraction
 
 use chrono::{DateTime, Duration, Utc};
-use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use shodh_memory::graph_memory::{
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::graph_memory::{
     EdgeSource, EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
     RelationType, RelationshipEdge,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 use std::collections::HashMap;
 use tempfile::TempDir;
 

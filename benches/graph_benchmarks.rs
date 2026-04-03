@@ -10,12 +10,12 @@
 //! Compare against industry standards (Neo4j, Memgraph, etc.)
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use shodh_memory::chrono::Utc;
-use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use shodh_memory::graph_memory::{
+use veld::chrono::Utc;
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::graph_memory::{
     EdgeSource, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 use std::collections::HashMap;
 use tempfile::TempDir;
 

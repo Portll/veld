@@ -301,7 +301,7 @@ class Memory:
         env = os.environ.copy()
         env["VELD_PORT"] = str(self.port)
         env["VELD_MEMORY_PATH"] = self.storage_path
-        env["RUST_LOG"] = "shodh_memory=info"
+        env["RUST_LOG"] = "veld=info"
 
         # Start server process
         self._server_process = subprocess.Popen(

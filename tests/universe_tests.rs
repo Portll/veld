@@ -8,11 +8,11 @@
 //! - Bounds calculation
 
 use chrono::Utc;
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::graph_memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::graph_memory::{
     EdgeSource, EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 use std::collections::HashMap;
 use tempfile::TempDir;
 

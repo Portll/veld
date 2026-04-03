@@ -9,7 +9,7 @@
 
 #[cfg(feature = "zenoh")]
 mod zenoh_embed_tests {
-    use shodh_memory::embeddings::zenoh_embedder::{validate_embeddings, ZenohEmbedderConfig};
+    use veld::embeddings::zenoh_embedder::{validate_embeddings, ZenohEmbedderConfig};
 
     // -------------------------------------------------------------------------
     // ZenohEmbedderConfig::from_env defaults

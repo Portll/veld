@@ -46,7 +46,7 @@ published crate, work from this repository directly:
 ## Quick Start
 
 ```rust
-use shodh_memory::memory::{
+use veld::memory::{
     MemorySystem, MemoryConfig, Experience, ExperienceType, Query, ForgetCriteria
 };
 use anyhow::Result;
@@ -190,7 +190,7 @@ println!("Has more: {}", paginated.has_more);
 ### Forget Memories
 
 ```rust
-use shodh_memory::memory::types::MemoryId;
+use veld::memory::types::MemoryId;
 
 // Delete by ID
 memory.forget(ForgetCriteria::ById(memory_id))?;

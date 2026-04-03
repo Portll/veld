@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use tempfile::TempDir;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::types::{Experience, ExperienceType, GeoFilter, Query};
-use shodh_memory::memory::{MemoryConfig, MemorySystem};
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::types::{Experience, ExperienceType, GeoFilter, Query};
+use veld::memory::{MemoryConfig, MemorySystem};
 
 // ============================================================================
 // HELPER FUNCTIONS

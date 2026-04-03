@@ -94,7 +94,7 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     // SAFETY: Still single-threaded — setting default log level before runtime construction.
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
-            std::env::set_var("RUST_LOG", "shodh_memory=info,tower_http=warn");
+            std::env::set_var("RUST_LOG", "veld=info,tower_http=warn");
         }
     }
 
