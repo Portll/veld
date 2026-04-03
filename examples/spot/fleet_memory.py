@@ -15,7 +15,7 @@ server (port 3030). Here we simulate the handoff by using the same
 storage_path sequentially (RocksDB requires exclusive access).
 
     # On fleet server
-    shodh server --port 3030
+    veld server --port 3030
 
     # Each robot connects via HTTP client
     from shodh_memory.client import ShodhClient
@@ -206,7 +206,7 @@ def run_demo():
     print("    - Robot attribution via tags: ['obstacle', 'fleet', 'spot_alpha']")
     print("    - recall() returns all fleet memories regardless of origin")
     print("    - robot_id IS available for isolated queries when needed")
-    print("    - Production: both connect to shodh server on port 3030")
+    print("    - Production: both connect to veld server on port 3030")
     print("    - No Orbit server needed, no cloud dependency")
     print()
     print("  Without fleet memory: Each robot discovers obstacles independently")

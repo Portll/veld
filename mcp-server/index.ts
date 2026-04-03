@@ -4755,7 +4755,7 @@ async function ensureServerRunning(): Promise<void> {
       "[shodh-memory] Auto-spawn disabled (SHODH_AUTO_SPAWN=false).",
     );
     console.error("[shodh-memory] Start the server manually:");
-    console.error("[shodh-memory]   veld");
+    console.error("[shodh-memory]   meerkat");
     console.error("[shodh-memory] Or with Docker:");
     console.error(
       "[shodh-memory]   docker run -d -p 3030:3030 roshera/shodh-memory",

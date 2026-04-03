@@ -31,11 +31,11 @@
 //! # Example
 //! ```bash
 //! # Enable Zenoh transport (local-only)
-//! SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/127.0.0.1:7447 shodh server
+//! SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/127.0.0.1:7447 veld server
 //!
 //! # Enable Zenoh transport (network-accessible, with authentication)
 //! SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 \
-//!   SHODH_ZENOH_API_KEY=my-secret shodh server
+//!   SHODH_ZENOH_API_KEY=my-secret veld server
 //! ```
 
 pub mod config;

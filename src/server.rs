@@ -1,7 +1,7 @@
 //! Server bootstrap module — starts the Veld HTTP API server.
 //!
-//! Extracted from `main.rs` so that both `veld` (standalone)
-//! and `shodh server` (unified CLI) can start the server with identical behavior.
+//! Extracted from `main.rs` so that both `meerkat` (standalone)
+//! and `veld server` (unified CLI) can start the server with identical behavior.
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
