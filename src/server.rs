@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth,
-    config::{ServerConfig, StorageBackend},
+    config::{env_var_is_set, promote_env_aliases, ServerConfig, StorageBackend},
     embeddings::minilm::pre_init_ort_runtime,
     roots::{AppState, RootsRuntime},
     metrics, middleware,
@@ -59,7 +59,7 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     let local_dev_rate_limit_default =
         !config.production
             && crate::config::is_local_bind_host(&config.host)
-            && std::env::var("SHODH_RATE_LIMIT").is_err()
+            && !env_var_is_set("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT")
             && config.rate_limit == 4000;
     let effective_rate_limit = if local_dev_rate_limit_default {
         0
@@ -73,18 +73,19 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
     // unsound to call concurrently with `std::env::var` in other threads. Here, this
     // process is single-threaded, so the invariant holds.
     unsafe {
-        std::env::set_var("SHODH_HOST", &config.host);
-        std::env::set_var("SHODH_PORT", config.port.to_string());
+        std::env::set_var("VELD_HOST", &config.host);
+        std::env::set_var("VELD_PORT", config.port.to_string());
         std::env::set_var(
-            "SHODH_MEMORY_PATH",
+            "VELD_MEMORY_PATH",
             config.storage_path.to_string_lossy().to_string(),
         );
-        std::env::set_var("SHODH_STORAGE_BACKEND", config.storage_backend.as_str());
+        std::env::set_var("VELD_STORAGE_BACKEND", config.storage_backend.as_str());
         if config.production {
-            std::env::set_var("SHODH_ENV", "production");
+            std::env::set_var("VELD_ENV", "production");
         }
-        std::env::set_var("SHODH_RATE_LIMIT", effective_rate_limit.to_string());
-        std::env::set_var("SHODH_MAX_CONCURRENT", config.max_concurrent.to_string());
+        std::env::set_var("VELD_RATE_LIMIT", effective_rate_limit.to_string());
+        std::env::set_var("VELD_MAX_CONCURRENT", config.max_concurrent.to_string());
+        promote_env_aliases();
     }
 
     // Pre-initialize ORT_DYLIB_PATH before any threads are spawned.

@@ -7,9 +7,9 @@
 //!   meerkat [OPTIONS]
 //!
 //! Options:
-//!   -H, --host <HOST>         Bind address [env: SHODH_HOST] [default: 127.0.0.1]
-//!   -p, --port <PORT>         Port number [env: SHODH_PORT] [default: 3030]
-//!   -s, --storage <PATH>      Storage directory [env: SHODH_MEMORY_PATH]
+//!   -H, --host <HOST>         Bind address [env: VELD_HOST] [default: 127.0.0.1]
+//!   -p, --port <PORT>         Port number [env: VELD_PORT] [default: 3030]
+//!   -s, --storage <PATH>      Storage directory [env: VELD_MEMORY_PATH]
 //!   -h, --help                Print help
 //!   -V, --version             Print version
 
@@ -18,7 +18,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::Result;
 use clap::Parser;
-use shodh_memory::config::StorageBackend;
+use shodh_memory::config::{promote_env_aliases, StorageBackend};
 use std::path::PathBuf;
 
 const LONG_ABOUT: &str = r#"
@@ -35,11 +35,11 @@ The server exposes a REST API for Veld remember/recall operations. After startin
   Health check:  curl http://localhost:3030/health
   Store memory:  curl -X POST http://localhost:3030/api/remember \
                    -H "Content-Type: application/json" \
-                   -H "X-API-Key: sk-shodh-dev-local-testing-key" \
+                   -H "X-API-Key: sk-veld-dev-local-testing-key" \
                    -d '{"user_id":"test","content":"Hello world"}'
   Search:        curl -X POST http://localhost:3030/api/recall \
                    -H "Content-Type: application/json" \
-                   -H "X-API-Key: sk-shodh-dev-local-testing-key" \
+                   -H "X-API-Key: sk-veld-dev-local-testing-key" \
                    -d '{"user_id":"test","query":"hello"}'
 "#;
 
@@ -65,36 +65,36 @@ DOCUMENTATION:
 #[command(version, about, long_about = LONG_ABOUT, after_help = AFTER_HELP)]
 struct Cli {
     /// Bind address (use 0.0.0.0 for network access)
-    #[arg(short = 'H', long, env = "SHODH_HOST", default_value = "127.0.0.1")]
+    #[arg(short = 'H', long, env = "VELD_HOST", default_value = "127.0.0.1")]
     host: String,
 
     /// Port number to listen on
-    #[arg(short, long, env = "SHODH_PORT", default_value_t = 3030)]
+    #[arg(short, long, env = "VELD_PORT", default_value_t = 3030)]
     port: u16,
 
     /// Storage directory for the selected backend data
     #[arg(
         short,
         long = "storage",
-        env = "SHODH_MEMORY_PATH",
+        env = "VELD_MEMORY_PATH",
         default_value_os_t = shodh_memory::config::default_storage_path()
     )]
     storage_path: PathBuf,
 
     /// Requested storage backend (`redb` target, `rocksdb` legacy compatibility)
-    #[arg(long, env = "SHODH_STORAGE_BACKEND", default_value = "redb")]
+    #[arg(long, env = "VELD_STORAGE_BACKEND", default_value = "redb")]
     storage_backend: StorageBackend,
 
     /// Production mode: stricter CORS, automatic backups enabled
-    #[arg(long, env = "SHODH_ENV")]
+    #[arg(long, env = "VELD_ENV")]
     production: bool,
 
     /// Rate limit: max requests per second per client
-    #[arg(long, env = "SHODH_RATE_LIMIT", default_value_t = 4000)]
+    #[arg(long, env = "VELD_RATE_LIMIT", default_value_t = 4000)]
     rate_limit: u64,
 
     /// Maximum concurrent requests before load shedding
-    #[arg(long, env = "SHODH_MAX_CONCURRENT", default_value_t = 200)]
+    #[arg(long, env = "VELD_MAX_CONCURRENT", default_value_t = 200)]
     max_concurrent: usize,
 }
 
@@ -103,6 +103,10 @@ fn main() -> Result<()> {
     // Must be the first code to execute — debugger attachment at startup is caught.
     #[cfg(feature = "fortress")]
     shodh_memory::fortress::init();
+
+    unsafe {
+      promote_env_aliases();
+    }
 
     let cli = Cli::parse();
 

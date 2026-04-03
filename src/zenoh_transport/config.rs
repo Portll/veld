@@ -5,18 +5,21 @@
 //!
 //! # Environment Variables
 //! ```text
-//! SHODH_ZENOH_ENABLED=true           # Enable Zenoh transport (default: false)
-//! SHODH_ZENOH_MODE=peer              # peer | client | router (default: peer)
-//! SHODH_ZENOH_CONNECT=tcp/1.2.3.4:7447  # Connect endpoints (comma-separated)
-//! SHODH_ZENOH_LISTEN=tcp/127.0.0.1:7447 # Listen endpoints (comma-separated)
-//! SHODH_ZENOH_PREFIX=shodh           # Key expression prefix (default: shodh)
-//! SHODH_ZENOH_API_KEY=<secret>       # Shared-secret auth for Zenoh payloads
-//! SHODH_ZENOH_AUTO_TOPICS=[...]      # JSON array of AutoTopic configs
+//! VELD_ZENOH_ENABLED=true              # Enable Zenoh transport (default: false)
+//! VELD_ZENOH_MODE=peer                 # peer | client | router (default: peer)
+//! VELD_ZENOH_CONNECT=tcp/1.2.3.4:7447  # Connect endpoints (comma-separated)
+//! VELD_ZENOH_LISTEN=tcp/127.0.0.1:7447 # Listen endpoints (comma-separated)
+//! VELD_ZENOH_PREFIX=veld               # Key expression prefix (default: veld)
+//! VELD_ZENOH_API_KEY=<secret>          # Shared-secret auth for Zenoh payloads
+//! VELD_ZENOH_AUTO_TOPICS=[...]         # JSON array of AutoTopic configs
 //! ```
 
 use serde::{Deserialize, Serialize};
 
-use crate::streaming::{ExtractionConfig, StreamMode};
+use crate::{
+    config::{env_var, env_var_truthy},
+    streaming::{ExtractionConfig, StreamMode},
+};
 
 // =============================================================================
 // ZENOH TRANSPORT CONFIG
@@ -58,7 +61,7 @@ pub struct ZenohConfig {
     /// When set, every incoming Zenoh payload must include an `"api_key"` field matching
     /// this value. When `None`, authentication is skipped (suitable for local-only deployments).
     ///
-    /// Loaded from `SHODH_ZENOH_API_KEY` environment variable.
+    /// Loaded from `VELD_ZENOH_API_KEY` environment variable.
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
 }
@@ -159,7 +162,7 @@ impl Default for ZenohConfig {
             mode: ZenohMode::default(),
             connect: Vec::new(),
             listen: Vec::new(),
-            prefix: "shodh".to_string(),
+            prefix: "veld".to_string(),
             auto_topics: Vec::new(),
             api_key: None,
         }
@@ -188,15 +191,15 @@ impl ZenohConfig {
     /// Load configuration from environment variables.
     ///
     /// All variables are optional — defaults produce a disabled config.
-    /// Set `SHODH_ZENOH_ENABLED=true` to activate.
+    /// Set `VELD_ZENOH_ENABLED=true` to activate.
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_ENABLED") {
-            config.enabled = val == "true" || val == "1";
+        if let Some(val) = env_var_truthy("VELD_ZENOH_ENABLED", "SHODH_ZENOH_ENABLED") {
+            config.enabled = val;
         }
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_MODE") {
+        if let Ok(val) = env_var("VELD_ZENOH_MODE", "SHODH_ZENOH_MODE") {
             config.mode = match val.to_lowercase().as_str() {
                 "client" => ZenohMode::Client,
                 "router" => ZenohMode::Router,
@@ -204,7 +207,7 @@ impl ZenohConfig {
             };
         }
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_CONNECT") {
+        if let Ok(val) = env_var("VELD_ZENOH_CONNECT", "SHODH_ZENOH_CONNECT") {
             config.connect = val
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -212,7 +215,7 @@ impl ZenohConfig {
                 .collect();
         }
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_LISTEN") {
+        if let Ok(val) = env_var("VELD_ZENOH_LISTEN", "SHODH_ZENOH_LISTEN") {
             config.listen = val
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -220,26 +223,26 @@ impl ZenohConfig {
                 .collect();
         }
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_PREFIX") {
+        if let Ok(val) = env_var("VELD_ZENOH_PREFIX", "SHODH_ZENOH_PREFIX") {
             let trimmed = val.trim().to_string();
             if !trimmed.is_empty() {
                 config.prefix = trimmed;
             }
         }
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_AUTO_TOPICS") {
+        if let Ok(val) = env_var("VELD_ZENOH_AUTO_TOPICS", "SHODH_ZENOH_AUTO_TOPICS") {
             match serde_json::from_str::<Vec<AutoTopic>>(&val) {
                 Ok(topics) => config.auto_topics = topics,
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to parse SHODH_ZENOH_AUTO_TOPICS: {}. Expected JSON array.",
+                        "Failed to parse VELD_ZENOH_AUTO_TOPICS: {}. Expected JSON array.",
                         e
                     );
                 }
             }
         }
 
-        if let Ok(val) = std::env::var("SHODH_ZENOH_API_KEY") {
+        if let Ok(val) = env_var("VELD_ZENOH_API_KEY", "SHODH_ZENOH_API_KEY") {
             let trimmed = val.trim().to_string();
             if !trimmed.is_empty() {
                 config.api_key = Some(trimmed);
@@ -253,7 +256,7 @@ impl ZenohConfig {
     pub fn validate(&self) {
         if self.prefix.contains('/') {
             tracing::warn!(
-                "SHODH_ZENOH_PREFIX contains '/' — this may cause unexpected key expression nesting"
+                "VELD_ZENOH_PREFIX contains '/' — this may cause unexpected key expression nesting"
             );
         }
 

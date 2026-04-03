@@ -209,7 +209,7 @@ class Memory:
             port: Port for the memory server (default: 3030)
             storage_path: Path to store memory data (default: platform data dir)
             auto_start: Automatically start server if not running (default: True)
-            api_key: API key for authentication (optional, uses env SHODH_API_KEY if not set)
+            api_key: API key for authentication (optional, uses env VELD_API_KEY if not set)
             timeout: Request timeout in seconds (default: 30)
             max_retries: Maximum number of retry attempts (default: 3)
         """
@@ -220,12 +220,12 @@ class Memory:
         self.timeout = timeout
 
         # API Key - required for authentication
-        self.api_key = api_key or os.environ.get("SHODH_API_KEY")
+        self.api_key = api_key or os.environ.get("VELD_API_KEY") or os.environ.get("SHODH_API_KEY")
         if not self.api_key:
             raise ShodhAuthenticationError(
-                "SHODH_API_KEY not set. "
-                "Pass api_key parameter or set SHODH_API_KEY environment variable. "
-                "For local development, use the same key set in SHODH_DEV_API_KEY on the server."
+                "VELD_API_KEY not set. "
+                "Pass api_key parameter or set VELD_API_KEY environment variable. "
+                "For local development, use the same key set in VELD_DEV_API_KEY on the server."
             )
 
         self._server_process = None
@@ -299,8 +299,8 @@ class Memory:
 
         # Set environment variables
         env = os.environ.copy()
-        env["SHODH_MEMORY_PORT"] = str(self.port)
-        env["SHODH_MEMORY_PATH"] = self.storage_path
+        env["VELD_PORT"] = str(self.port)
+        env["VELD_MEMORY_PATH"] = self.storage_path
         env["RUST_LOG"] = "shodh_memory=info"
 
         # Start server process
@@ -318,11 +318,11 @@ class Memory:
         """Get platform-specific binary name"""
         system = platform.system().lower()
         if system == "windows":
-            return "shodh-memory.exe"
+            return "meerkat.exe"
         elif system == "darwin":
-            return "shodh-memory-darwin"
+            return "meerkat"
         else:
-            return "shodh-memory"
+            return "meerkat"
 
     def _find_binary(self, binary_name: str) -> Optional[Path]:
         """Find binary in common locations"""

@@ -5,12 +5,14 @@
 //! when local ONNX model isn't available but a server is running.
 //!
 //! Configuration via environment variables:
-//! - SHODH_EMBEDDING_API_URL: Base URL (default: http://127.0.0.1:1234)
-//! - SHODH_EMBEDDING_API_MODEL: Model name (default: text-embedding-nomic-embed-text-v1.5)
-//! - SHODH_EMBEDDING_API_KEY: Optional API key (default: none)
+//! - VELD_EMBEDDING_API_URL: Base URL (default: http://127.0.0.1:1234)
+//! - VELD_EMBEDDING_API_MODEL: Model name (default: text-embedding-nomic-embed-text-v1.5)
+//! - VELD_EMBEDDING_API_KEY: Optional API key (default: none)
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::config::env_var;
 
 use super::Embedder;
 
@@ -37,12 +39,15 @@ impl HttpEmbedderConfig {
     /// Create configuration from environment variables
     pub fn from_env() -> Self {
         Self {
-            base_url: std::env::var("SHODH_EMBEDDING_API_URL")
+            base_url: env_var("VELD_EMBEDDING_API_URL", "SHODH_EMBEDDING_API_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:1234".to_string()),
-            model: std::env::var("SHODH_EMBEDDING_API_MODEL")
+            model: env_var("VELD_EMBEDDING_API_MODEL", "SHODH_EMBEDDING_API_MODEL")
                 .unwrap_or_else(|_| "text-embedding-nomic-embed-text-v1.5".to_string()),
-            api_key: std::env::var("SHODH_EMBEDDING_API_KEY").ok(),
-            timeout_ms: std::env::var("SHODH_EMBEDDING_API_TIMEOUT_MS")
+            api_key: env_var("VELD_EMBEDDING_API_KEY", "SHODH_EMBEDDING_API_KEY").ok(),
+            timeout_ms: env_var(
+                "VELD_EMBEDDING_API_TIMEOUT_MS",
+                "SHODH_EMBEDDING_API_TIMEOUT_MS",
+            )
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5000),

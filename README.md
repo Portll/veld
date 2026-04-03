@@ -129,18 +129,18 @@ claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
 }
 ```
 
-For local use, no API key is needed — one is generated automatically. For remote servers, add `"env": { "SHODH_API_KEY": "your-key" }`.
+For local use, no API key is needed — one is generated automatically. For remote servers, add `"env": { "VELD_API_KEY": "your-key" }`.
 </details>
 
 ### Python
 
 ```bash
 # Last published package surface, not this unstable branch tip
-pip install shodh-memory
+pip install veld
 ```
 
 ```python
-from shodh_memory import Memory
+from veld import Memory
 
 memory = Memory(storage_path="./my_data")
 memory.remember("User prefers dark mode", memory_type="Decision")

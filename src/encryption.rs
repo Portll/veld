@@ -6,7 +6,7 @@
 //!
 //! # Key Management
 //!
-//! The encryption key is sourced from the `SHODH_ENCRYPTION_KEY` environment variable.
+//! The encryption key is sourced from the `VELD_ENCRYPTION_KEY` environment variable.
 //! Accepted formats:
 //! - 64-character hex string (32 bytes decoded)
 //! - 44-character base64 string (32 bytes decoded)
@@ -22,6 +22,8 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
+
+use crate::config::env_var;
 
 /// AES-256-GCM nonce size in bytes (96 bits per NIST SP 800-38D).
 const NONCE_SIZE: usize = 12;
