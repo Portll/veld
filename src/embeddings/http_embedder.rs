@@ -113,10 +113,7 @@ impl HttpEmbedder {
         if let Some(ref key) = self.config.api_key {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
-        match builder.send_json(&req) {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        builder.send_json(&req).is_ok()
     }
 
     /// Encode a single text via the HTTP API.

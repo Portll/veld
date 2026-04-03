@@ -75,6 +75,12 @@ impl TestHarness {
     }
 }
 
+impl Default for TestHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------- Request builders ----------
 
 /// Build a GET request to `uri` with the test API key header.

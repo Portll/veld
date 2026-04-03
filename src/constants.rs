@@ -346,6 +346,30 @@ pub const HYBRID_GRAPH_WEIGHT: f32 = 0.35;
 pub const HYBRID_LINGUISTIC_WEIGHT: f32 = 0.15;
 
 // =============================================================================
+// QUERY-TYPE-DEPENDENT HYBRID WEIGHTS
+// When graph density is unavailable, use lightweight query classification to
+// pick a better signal mix than the global hybrid defaults.
+// =============================================================================
+
+/// Attribute query weights: "What is X's Y?"
+pub const QUERY_TYPE_ATTRIBUTE_SEMANTIC: f32 = 0.15;
+pub const QUERY_TYPE_ATTRIBUTE_GRAPH: f32 = 0.40;
+pub const QUERY_TYPE_ATTRIBUTE_LINGUISTIC: f32 = 0.45;
+
+/// Temporal query weights: "When did X do Y?"
+pub const QUERY_TYPE_TEMPORAL_SEMANTIC: f32 = 0.35;
+pub const QUERY_TYPE_TEMPORAL_GRAPH: f32 = 0.30;
+pub const QUERY_TYPE_TEMPORAL_LINGUISTIC: f32 = 0.35;
+
+/// Exploratory query weights: "Tell me about X"
+pub const QUERY_TYPE_EXPLORATORY_SEMANTIC: f32 = 0.60;
+pub const QUERY_TYPE_EXPLORATORY_GRAPH: f32 = 0.25;
+pub const QUERY_TYPE_EXPLORATORY_LINGUISTIC: f32 = 0.15;
+
+/// Rank displacement threshold for suppressor detection.
+pub const SUPPRESSOR_RANK_THRESHOLD: usize = 5;
+
+// =============================================================================
 // DENSITY-DEPENDENT RETRIEVAL WEIGHTS (SHO-26)
 // Based on GraphRAG Survey (arXiv 2408.08921) - hybrid KG-Vector improves 13.1%
 // Biological model: Dense graphs = noisy (fresh L1 edges), Sparse = curated (pruned)
@@ -2060,6 +2084,18 @@ pub const INTERFERENCE_VULNERABILITY_HOURS: i64 = 24;
 pub const INTERFERENCE_MAX_TRACKED: usize = 10;
 
 // =============================================================================
+// RETRIEVAL-TIME MEMORY COMPETITION
+// Entity-aware competition can be enabled per-query while 0.8 retrieval cleanup
+// settles without forcing a single global policy.
+// =============================================================================
+
+/// Maximum number of pairwise comparisons during retrieval-time competition.
+pub const COMPETITION_MAX_PAIRS: usize = 20;
+
+/// Minimum shared-entity overlap required before two memories can compete.
+pub const COMPETITION_ENTITY_OVERLAP_MIN: usize = 1;
+
+// =============================================================================
 // PATTERN-TRIGGERED REPLAY CONSTANTS (PIPE-2)
 // Based on hippocampal sharp-wave ripple research (Rasch & Born 2013)
 // Consolidation should be triggered by meaningful patterns, not fixed intervals
@@ -2435,6 +2471,20 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | HYBRID_SEMANTIC_WEIGHT    | memory/graph_retrieval.rs | spreading_activation_retrieve()   |
 // | HYBRID_GRAPH_WEIGHT       | memory/graph_retrieval.rs | spreading_activation_retrieve()   |
 // | HYBRID_LINGUISTIC_WEIGHT  | memory/graph_retrieval.rs | spreading_activation_retrieve()   |
+//
+// ## Query-Type-Dependent Weights
+// | Constant                          | File                      | Function/Context             |
+// |-----------------------------------|---------------------------|------------------------------|
+// | QUERY_TYPE_ATTRIBUTE_SEMANTIC     | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_ATTRIBUTE_GRAPH        | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_ATTRIBUTE_LINGUISTIC   | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_TEMPORAL_SEMANTIC      | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_TEMPORAL_GRAPH         | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_TEMPORAL_LINGUISTIC    | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_EXPLORATORY_SEMANTIC   | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_EXPLORATORY_GRAPH      | memory/graph_retrieval.rs | no-density weight selection  |
+// | QUERY_TYPE_EXPLORATORY_LINGUISTIC | memory/graph_retrieval.rs | no-density weight selection  |
+// | SUPPRESSOR_RANK_THRESHOLD         | memory/types.rs           | suppressor observability     |
 //
 // ## Semantic Consolidation Constants
 // | Constant                      | File                  | Function/Context                  |

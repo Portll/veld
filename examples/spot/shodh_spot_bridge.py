@@ -1,8 +1,8 @@
 """
-Spot SDK <> Shodh-Memory Bridge
+Spot SDK <> Veld - Agentic Memory Bridge
 
 Type translation layer that maps Boston Dynamics Spot SDK protobuf types
-to shodh-memory's cognitive memory primitives.
+to Veld's cognitive memory primitives.
 
 This bridge enables persistent memory for Spot robots — solving the SDK's
 fundamental limitation that world objects expire after 15 seconds, maps
@@ -26,7 +26,7 @@ Usage:
     objects = bridge.recall_world_objects(position=(3.0, 1.0, 0.0), radius=5.0)
 
 Type Mapping:
-    Spot SDK Type              -> shodh-memory Type
+    Spot SDK Type              -> Veld Type
     ──────────────────────────────────────────────────
     SE3Pose.position (Vec3)    -> Position(x, y, z)
     GPS (lat/lon/alt)          -> GeoLocation(latitude, longitude, altitude)
@@ -152,7 +152,7 @@ class RobotState:
 # =============================================================================
 
 class SpotMemoryBridge:
-    """Bridge between Spot SDK and shodh-memory cognitive system.
+    """Bridge between Spot SDK and Veld's cognitive system.
 
     Provides persistent memory for Spot robots, solving:
     - 15-second world object TTL -> permanent object persistence
@@ -161,7 +161,7 @@ class SpotMemoryBridge:
     - No fleet sharing -> multi-robot knowledge via shared storage
 
     Args:
-        storage_path: Directory for shodh-memory's RocksDB storage
+        storage_path: Directory for Veld's RocksDB storage
         robot_id: Unique identifier for this robot (enables fleet memory)
     """
 
@@ -208,7 +208,7 @@ class SpotMemoryBridge:
     ) -> List[dict]:
         """Filter recalled memories by Euclidean distance to a query position.
 
-        shodh-memory stores local_position on every memory and returns it as
+        Veld stores local_position on every memory and returns it as
         the "position" key in recall results. This method uses it for real
         distance-based spatial filtering — not text matching.
 

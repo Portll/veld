@@ -26,8 +26,11 @@ use anyhow::{anyhow, Context, Result};
 /// AES-256-GCM nonce size in bytes (96 bits per NIST SP 800-38D).
 const NONCE_SIZE: usize = 12;
 
-/// Minimum ciphertext size: nonce (12) + GCM tag (16) + at least 1 byte of ciphertext.
-const MIN_ENCRYPTED_SIZE: usize = NONCE_SIZE + 16 + 1;
+/// Minimum encrypted payload size after the marker: nonce (12) + GCM tag (16).
+///
+/// AES-GCM permits empty plaintexts, so a valid encrypted blob may contain no
+/// ciphertext bytes beyond the authentication tag.
+const MIN_ENCRYPTED_SIZE: usize = NONCE_SIZE + 16;
 
 /// Prefix marker for encrypted content fields.
 /// Stored as the first 4 bytes before the nonce to distinguish encrypted content

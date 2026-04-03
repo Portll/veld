@@ -18,7 +18,7 @@
 #          }]
 #        }
 #      }
-#   3. Ensure shodh-memory-server is running on localhost:3030
+#   3. Ensure veld is running on localhost:3030
 #
 # Environment Variables:
 #   SHODH_API_URL - API endpoint (default: http://127.0.0.1:3030)

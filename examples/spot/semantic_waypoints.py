@@ -10,7 +10,7 @@ knowledge like "this area is usually congested at 9am" or "charging
 station with 2-hour wait time."
 
 This example adds a rich semantic layer on top of GraphNav waypoints
-using shodh-memory. Annotations accumulate over time and are queryable
+using Veld - Agentic Memory. Annotations accumulate over time and are queryable
 by natural language.
 
 Run:
@@ -206,7 +206,7 @@ def run_demo():
     print(f"  Total waypoint memories: {len(VISIT_LOG) + len(static_annotations)}+")
     print()
     print("  GraphNav SDK provides: waypoint name + opaque bytes")
-    print("  Shodh-memory provides: semantic search, sensor history,")
+    print("  Veld provides: semantic search, sensor history,")
     print("                         learned patterns, natural language queries")
     print()
 

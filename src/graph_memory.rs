@@ -277,14 +277,23 @@ pub enum EdgeTier {
 /// carries personal or organizational identity.
 pub fn is_edge_safe_for_collective(
     edge: &RelationshipEdge,
-    from_pii: &PiiClassification,
-    to_pii: &PiiClassification,
+    from_entity: &EntityNode,
+    to_entity: &EntityNode,
 ) -> bool {
-    edge.tier == EdgeTier::L3Semantic
-        && *from_pii != PiiClassification::PersonalIdentity
-        && *to_pii != PiiClassification::PersonalIdentity
-        && *from_pii != PiiClassification::OrganizationIdentity
-        && *to_pii != PiiClassification::OrganizationIdentity
+    #[cfg(feature = "multi-tenant")]
+    {
+        crate::extensions::pii_policy::is_edge_safe_for_collective(edge, from_entity, to_entity)
+    }
+
+    #[cfg(not(feature = "multi-tenant"))]
+    {
+        edge.invalidated_at.is_none()
+            && edge.tier == EdgeTier::L3Semantic
+            && from_entity.pii_classification != PiiClassification::PersonalIdentity
+            && to_entity.pii_classification != PiiClassification::PersonalIdentity
+            && from_entity.pii_classification != PiiClassification::OrganizationIdentity
+            && to_entity.pii_classification != PiiClassification::OrganizationIdentity
+    }
 }
 
 impl EdgeTier {
@@ -5099,7 +5108,7 @@ impl GraphMemory {
                 Some(e) => e,
                 None => continue,
             };
-            if is_edge_safe_for_collective(&edge, &from_entity.pii_classification, &to_entity.pii_classification) {
+            if is_edge_safe_for_collective(&edge, &from_entity, &to_entity) {
                 safe_edges.push((
                     from_entity.name,
                     to_entity.name,

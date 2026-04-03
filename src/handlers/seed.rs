@@ -433,7 +433,7 @@ pub async fn seed_project(
     let user_id = req.user_id.clone();
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     // Run in spawn_blocking since we do filesystem I/O

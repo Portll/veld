@@ -57,7 +57,7 @@ pub async fn get_brain_state(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -151,7 +151,7 @@ pub async fn get_visualization_stats(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -168,7 +168,7 @@ pub async fn get_visualization_dot(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -191,7 +191,7 @@ pub async fn build_visualization(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -261,7 +261,7 @@ pub async fn get_graph_data(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();

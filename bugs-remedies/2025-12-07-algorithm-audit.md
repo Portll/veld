@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Comprehensive audit of all core algorithms in shodh-memory. This audit covers:
+Comprehensive audit of all core algorithms in Veld - Agentic Memory. This audit covers:
 - Vector search (Vamana/DiskANN)
 - Memory retrieval and ranking
 - Hebbian learning and importance calculation

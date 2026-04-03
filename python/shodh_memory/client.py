@@ -66,7 +66,7 @@ class ShodhError(Exception):
 
 
 class ShodhConnectionError(ShodhError):
-    """Failed to connect to the Shodh-Memory server."""
+    """Failed to connect to the Veld server."""
     pass
 
 
@@ -268,7 +268,7 @@ class Memory:
             pass
 
         # Start server
-        logger.info("Starting Shodh-Memory server...")
+        logger.info("Starting Veld server...")
         self._start_server()
 
         # Wait for server to be ready
@@ -277,13 +277,13 @@ class Memory:
             try:
                 response = requests.get(f"{self.base_url}/health", timeout=1)
                 if response.status_code == 200:
-                    logger.info("Shodh-Memory server ready")
+                    logger.info("Veld server ready")
                     return
             except requests.exceptions.RequestException:
                 pass
             time.sleep(0.5)
 
-        raise RuntimeError("Failed to start Shodh-Memory server")
+        raise RuntimeError("Failed to start Veld server")
 
     def _start_server(self):
         """Start the Rust server binary"""
@@ -293,7 +293,7 @@ class Memory:
 
         if not binary_path or not binary_path.exists():
             raise RuntimeError(
-                f"Shodh-Memory binary not found: {binary_name}\n"
+                f"Veld binary not found: {binary_name}\n"
                 "Please ensure the binary is built or installed correctly."
             )
 

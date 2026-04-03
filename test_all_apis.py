@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive test of all shodh-memory Python SDK APIs"""
+"""Comprehensive test of all Veld Python SDK APIs"""
 
 import tempfile
 import shutil

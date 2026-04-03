@@ -9,6 +9,19 @@ use std::env;
 
 use crate::errors::ErrorResponse;
 
+#[cfg(feature = "multi-tenant")]
+use axum::body::{to_bytes, Body};
+
+#[cfg(feature = "multi-tenant")]
+pub use crate::extensions::auth_binding::KeyUserBindings;
+
+pub const KEY_USER_BINDINGS_PATH_ENV: &str = "SHODH_KEY_USER_BINDINGS_PATH";
+
+#[derive(Clone, Debug)]
+pub struct AuthenticatedUser {
+    pub user_id: String,
+}
+
 /// Auto-generated dev API key, created at startup. Not hardcoded — each
 /// server instance gets a unique key. Logged to stderr so the user can copy it.
 pub(crate) fn default_dev_api_key() -> String {
@@ -30,7 +43,7 @@ pub fn is_production_mode() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if generated dev-key guidance should be hidden from error messages.
+/// Check if dev key should be hidden from error messages.
 ///
 /// Returns true when SHODH_HIDE_DEV_KEY=true (opt-in).
 /// In production mode, always returns true regardless of the env var.
@@ -122,11 +135,12 @@ impl IntoResponse for AuthError {
                      See docs for setup."
                         .to_string()
                 } else {
-                    "Missing X-API-Key header. Set the header in your request. \
-                     The server accepts keys from SHODH_API_KEYS (comma-separated) \
-                     or SHODH_DEV_API_KEY. If no key is configured, check local server startup logs \
-                     for the generated dev key."
-                        .to_string()
+                    format!(
+                        "Missing X-API-Key header. Set the header in your request. \
+                         The server accepts keys from SHODH_API_KEYS (comma-separated) \
+                         or SHODH_DEV_API_KEY.\nDefault dev key: '{}'",
+                        default_dev_api_key()
+                    )
                 }
             }
             AuthError::InvalidApiKey => {
@@ -135,10 +149,11 @@ impl IntoResponse for AuthError {
                 } else if should_hide_dev_key() {
                     "Invalid API key. Check SHODH_DEV_API_KEY or SHODH_API_KEYS.".to_string()
                 } else {
-                    "Invalid API key. Expected a key from SHODH_API_KEYS or \
-                     SHODH_DEV_API_KEY. If no key is configured, check local server startup logs \
-                     for the generated dev key."
-                        .to_string()
+                    format!(
+                        "Invalid API key.\nExpected a key from SHODH_API_KEYS or \
+                         SHODH_DEV_API_KEY.\nDefault dev key: '{}'",
+                        default_dev_api_key()
+                    )
                 }
             }
             AuthError::NotConfigured => {
@@ -242,6 +257,137 @@ pub fn validate_api_key(provided_key: &str) -> Result<(), AuthError> {
     }
 }
 
+#[cfg(feature = "multi-tenant")]
+pub fn validate_api_key_with_user(
+    plaintext_key: &str,
+    bindings: &KeyUserBindings,
+) -> Result<Option<String>, AuthError> {
+    crate::extensions::auth_binding::validate_api_key_with_user(plaintext_key, bindings)
+}
+
+#[cfg(feature = "multi-tenant")]
+fn multi_tenant_auth_enabled() -> bool {
+    env::var("SHODH_MULTI_TENANT")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "multi-tenant")]
+fn key_user_bindings_path() -> Option<std::path::PathBuf> {
+    env::var(KEY_USER_BINDINGS_PATH_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env::var("SHODH_COLLECTIVE_STORE_DIR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|dir| std::path::PathBuf::from(dir).join("key_user_bindings.json"))
+        })
+}
+
+#[cfg(feature = "multi-tenant")]
+fn validate_api_key_with_optional_binding(plaintext_key: &str) -> Result<Option<String>, AuthError> {
+    if !multi_tenant_auth_enabled() {
+        validate_api_key(plaintext_key)?;
+        return Ok(None);
+    }
+
+    if let Some(path) = key_user_bindings_path() {
+        match KeyUserBindings::open(&path) {
+            Ok(bindings) => return validate_api_key_with_user(plaintext_key, &bindings),
+            Err(error) => {
+                tracing::warn!(path = ?path, error = %error, "Failed to load key-user bindings; falling back to plain API key validation");
+            }
+        }
+    }
+
+    validate_api_key(plaintext_key)?;
+    Ok(None)
+}
+
+#[cfg(feature = "multi-tenant")]
+fn bound_user_mismatch_response() -> Response {
+    let body = ErrorResponse {
+        code: "BOUND_USER_MISMATCH".to_string(),
+        message: "Request user_id does not match the authenticated tenant binding".to_string(),
+        details: None,
+        request_id: None,
+    };
+
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+#[cfg(feature = "multi-tenant")]
+async fn attach_bound_user_to_request(
+    request: Request,
+    bound_user_id: String,
+) -> Result<Request, Response> {
+    let should_patch_json = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/json"))
+        .unwrap_or(false);
+
+    let (parts, body) = request.into_parts();
+    let body_bytes = to_bytes(body, 2 * 1024 * 1024).await.map_err(|error| {
+        tracing::warn!(error = %error, "Failed to read authenticated request body");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "INVALID_REQUEST_BODY".to_string(),
+                message: "Failed to read request body".to_string(),
+                details: None,
+                request_id: None,
+            }),
+        )
+            .into_response()
+    })?;
+
+    let request_body = if should_patch_json && !body_bytes.is_empty() {
+        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            Ok(serde_json::Value::Object(mut object)) => {
+                match object.get("user_id") {
+                    Some(serde_json::Value::String(existing)) if existing != &bound_user_id => {
+                        return Err(bound_user_mismatch_response());
+                    }
+                    None | Some(serde_json::Value::Null) => {
+                        object.insert(
+                            "user_id".to_string(),
+                            serde_json::Value::String(bound_user_id.clone()),
+                        );
+                    }
+                    _ => {}
+                }
+
+                serde_json::to_vec(&serde_json::Value::Object(object)).map_err(|error| {
+                    tracing::warn!(error = %error, "Failed to rebuild authenticated JSON body");
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            code: "INVALID_REQUEST_BODY".to_string(),
+                            message: "Failed to process request body".to_string(),
+                            details: None,
+                            request_id: None,
+                        }),
+                    )
+                        .into_response()
+                })?
+            }
+            Ok(_) | Err(_) => body_bytes.to_vec(),
+        }
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let mut request = Request::from_parts(parts, Body::from(request_body));
+    request.extensions_mut().insert(AuthenticatedUser {
+        user_id: bound_user_id,
+    });
+    Ok(request)
+}
+
 /// Authentication middleware
 pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let path = request.uri().path();
@@ -295,16 +441,31 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
         None => return AuthError::MissingApiKey.into_response(),
     };
 
-    // Validate the cloned key
+    #[cfg(feature = "multi-tenant")]
+    let bound_user = match validate_api_key_with_optional_binding(&api_key_value) {
+        Ok(user_id) => user_id,
+        Err(error) => return error.into_response(),
+    };
+
+    #[cfg(not(feature = "multi-tenant"))]
     if let Err(e) = validate_api_key(&api_key_value) {
         return e.into_response();
     }
 
-    // Now we can move request to next layer
+    #[cfg(feature = "multi-tenant")]
+    let request = match bound_user {
+        Some(user_id) => match attach_bound_user_to_request(request, user_id).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        },
+        None => request,
+    };
+
     next.run(request).await
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
@@ -322,6 +483,9 @@ mod tests {
         env::remove_var("SHODH_DEV_API_KEY");
         env::remove_var("SHODH_ENV");
         env::remove_var("SHODH_HIDE_DEV_KEY");
+        env::remove_var("SHODH_MULTI_TENANT");
+        env::remove_var(KEY_USER_BINDINGS_PATH_ENV);
+        env::remove_var("SHODH_COLLECTIVE_STORE_DIR");
     }
 
     // ── constant_time_compare ──
@@ -568,12 +732,8 @@ mod tests {
             "Should mention SHODH_DEV_API_KEY"
         );
         assert!(
-            !parsed.message.contains(&default_dev_api_key()),
-            "Should not expose the default dev key"
-        );
-        assert!(
-            parsed.message.contains("startup logs"),
-            "Should direct local users to startup logs instead"
+            parsed.message.contains(&default_dev_api_key()),
+            "Should show the default dev key"
         );
         clear_auth_env();
     }
@@ -590,12 +750,8 @@ mod tests {
             "Should mention SHODH_API_KEYS"
         );
         assert!(
-            !parsed.message.contains(&default_dev_api_key()),
-            "Should not expose the default dev key"
-        );
-        assert!(
-            parsed.message.contains("startup logs"),
-            "Should direct local users to startup logs instead"
+            parsed.message.contains(&default_dev_api_key()),
+            "Should show the default dev key"
         );
         clear_auth_env();
     }
@@ -815,6 +971,100 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "Should reject invalid query parameter API key on WebSocket"
         );
+
+        clear_auth_env();
+    }
+
+    #[cfg(feature = "multi-tenant")]
+    #[tokio::test]
+    async fn auth_middleware_injects_bound_user_into_json_body() {
+        use axum::extract::Extension;
+        use axum::routing::post;
+        use axum::Router;
+        use tempfile::NamedTempFile;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        env::set_var("SHODH_API_KEYS", "bound-key");
+        env::set_var("SHODH_MULTI_TENANT", "true");
+
+        let bindings_file = NamedTempFile::new().unwrap();
+        let bindings = KeyUserBindings::open(bindings_file.path()).unwrap();
+        bindings.register("bound-key", "alice", Some("test")).unwrap();
+        env::set_var(KEY_USER_BINDINGS_PATH_ENV, bindings_file.path());
+
+        let app = Router::new()
+            .route(
+                "/api/remember",
+                post(
+                    |user: Option<Extension<AuthenticatedUser>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        let resolved = user.map(|extension| extension.0.user_id);
+                        Json(serde_json::json!({
+                            "user_id": body.get("user_id").and_then(|value| value.as_str()),
+                            "resolved_user": resolved,
+                        }))
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn(auth_middleware));
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/remember")
+            .header("content-type", "application/json")
+            .header("x-api-key", "bound-key")
+            .body(Body::from(r#"{"content":"hello"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user_id"], "alice");
+        assert_eq!(json["resolved_user"], "alice");
+
+        clear_auth_env();
+    }
+
+    #[cfg(feature = "multi-tenant")]
+    #[tokio::test]
+    async fn auth_middleware_rejects_mismatched_bound_user() {
+        use axum::routing::post;
+        use axum::Router;
+        use tempfile::NamedTempFile;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        env::set_var("SHODH_API_KEYS", "bound-key");
+        env::set_var("SHODH_MULTI_TENANT", "true");
+
+        let bindings_file = NamedTempFile::new().unwrap();
+        let bindings = KeyUserBindings::open(bindings_file.path()).unwrap();
+        bindings.register("bound-key", "alice", Some("test")).unwrap();
+        env::set_var(KEY_USER_BINDINGS_PATH_ENV, bindings_file.path());
+
+        let app = Router::new()
+            .route("/api/remember", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(auth_middleware));
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/remember")
+            .header("content-type", "application/json")
+            .header("x-api-key", "bound-key")
+            .body(Body::from(r#"{"user_id":"bob","content":"hello"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BOUND_USER_MISMATCH");
 
         clear_auth_env();
     }

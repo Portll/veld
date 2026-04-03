@@ -1,8 +1,8 @@
 """
-Shodh Memory + LlamaIndex Integration Example
+Veld - Agentic Memory + LlamaIndex Integration Example
 
-This example shows how to use Shodh Memory as a custom memory backend
-for LlamaIndex agents.
+This example shows how to use Veld - Agentic Memory as a custom memory
+backend for LlamaIndex agents.
 
 Requirements:
     pip install llama-index llama-index-llms-anthropic shodh-memory
@@ -34,9 +34,9 @@ except ImportError:
     import httpx  # Fallback to HTTP API
 
 
-class ShodhMemoryBlock(BaseMemory):
+class VeldMemoryBlock(BaseMemory):
     """
-    Custom LlamaIndex memory block backed by Shodh Memory.
+    Custom LlamaIndex memory block backed by Veld - Agentic Memory.
 
     Features:
     - Persistent storage across sessions
@@ -46,7 +46,7 @@ class ShodhMemoryBlock(BaseMemory):
     """
 
     user_id: str = Field(default="llamaindex-agent", description="User ID for memory isolation")
-    api_url: str = Field(default="http://localhost:3030", description="Shodh Memory server URL")
+    api_url: str = Field(default="http://localhost:3030", description="Veld server URL")
     api_key: Optional[str] = Field(default=None, description="API key if authentication enabled")
     max_memories: int = Field(default=10, description="Max memories to retrieve per query")
 
@@ -169,11 +169,11 @@ class ShodhMemoryBlock(BaseMemory):
             return "Context"
 
 
-class ShodhProactiveMemory(ShodhMemoryBlock):
+class VeldProactiveMemory(VeldMemoryBlock):
     """
     Enhanced memory block that proactively surfaces relevant context.
 
-    Uses Shodh Memory's proactive_context endpoint which:
+    Uses Veld's proactive_context endpoint which:
     - Retrieves semantically relevant memories
     - Stores the current context as a Conversation memory
     - Builds association graphs over time
@@ -183,7 +183,7 @@ class ShodhProactiveMemory(ShodhMemoryBlock):
         """
         Proactively surface relevant memories and store current context.
 
-        This is the recommended way to use Shodh Memory - call this
+        This is the recommended way to use Veld - Agentic Memory - call this
         at the start of every conversation turn.
         """
         if not input:
@@ -225,12 +225,12 @@ class ShodhProactiveMemory(ShodhMemoryBlock):
             return response.json().get("memories", [])
 
 
-def create_agent_with_shodh_memory():
+def create_agent_with_veld_memory():
     """
-    Create a LlamaIndex agent with Shodh Memory for persistent context.
+    Create a LlamaIndex agent with Veld - Agentic Memory for persistent context.
     """
     # Initialize memory
-    memory = ShodhProactiveMemory(
+    memory = VeldProactiveMemory(
         user_id="my-llamaindex-agent",
         max_memories=5,
     )
@@ -250,12 +250,12 @@ def create_agent_with_shodh_memory():
 
 
 def main():
-    """Example usage of Shodh Memory with LlamaIndex."""
+    """Example usage of Veld - Agentic Memory with LlamaIndex."""
 
-    print("=== Shodh Memory + LlamaIndex Integration ===\n")
+    print("=== Veld - Agentic Memory + LlamaIndex Integration ===\n")
 
     # Create memory block
-    memory = ShodhProactiveMemory(
+    memory = VeldProactiveMemory(
         user_id="example-agent",
         max_memories=5,
     )
@@ -285,7 +285,7 @@ def main():
     # Example 3: Use with an agent
     print("\n--- Creating agent with persistent memory ---")
     try:
-        agent = create_agent_with_shodh_memory()
+        agent = create_agent_with_veld_memory()
         print("Agent created successfully!")
 
         # The agent now has persistent memory across sessions

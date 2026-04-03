@@ -1,6 +1,6 @@
-# Contributing to Shodh-Memory
+# Contributing to Veld - Agentic Memory
 
-Thank you for your interest in contributing to Shodh-Memory! This document provides guidelines and instructions for contributing.
+Thank you for your interest in Veld - Agentic Memory! This document provides guidelines and instructions for contributing.
 
 ## Table of Contents
 
@@ -41,30 +41,33 @@ Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 ### Building from Source
 
 ```bash
+# On macOS, use the wrapper so librocksdb-sys/bindgen inherit the local
+# libclang loader workaround automatically.
+
 # Build debug version
-cargo build
+./scripts/cargo-dev.sh build
 
 # Build release version
-cargo build --release
+./scripts/cargo-dev.sh build --release
 
 # Run the server
-cargo run
+./scripts/cargo-dev.sh run
 
 # Run with debug logging
-RUST_LOG=debug cargo run
+RUST_LOG=debug ./scripts/cargo-dev.sh run
 ```
 
 ### Running Tests
 
 ```bash
 # Run all tests
-cargo test
+./scripts/cargo-dev.sh test
 
 # Run tests with output
-cargo test -- --nocapture
+./scripts/cargo-dev.sh test -- --nocapture
 
 # Run specific test
-cargo test test_name
+./scripts/cargo-dev.sh test test_name
 
 # Run tests with coverage (requires cargo-tarpaulin)
 cargo install cargo-tarpaulin
@@ -81,13 +84,13 @@ cargo fmt
 cargo fmt -- --check
 
 # Run clippy (linter)
-cargo clippy
+./scripts/cargo-dev.sh clippy
 
 # Run clippy with all features
-cargo clippy --all-targets --all-features
+./scripts/cargo-dev.sh clippy --all-targets --all-features
 
 # Check for common mistakes
-cargo clippy -- -D warnings
+./scripts/cargo-dev.sh clippy -- -D warnings
 ```
 
 ## Making Changes
@@ -351,4 +354,4 @@ Contributors will be:
 - Mentioned in release notes
 - Given credit in documentation
 
-Thank you for contributing to Shodh-Memory! 🧠
+Thank you for contributing to Veld - Agentic Memory! 🧠

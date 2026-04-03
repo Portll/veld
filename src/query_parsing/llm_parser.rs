@@ -15,6 +15,7 @@ pub struct LlmParser {
     client: reqwest::blocking::Client,
     endpoint: String,
     model: String,
+    api_type: ApiType,
     generation_lock: Mutex<()>,
 }
 
@@ -127,7 +128,7 @@ impl LlmParser {
     }
 
     /// Create a new LLM parser with specified API type
-    pub fn with_api_type(endpoint: &str, model: &str, _api_type: ApiType) -> Self {
+    pub fn with_api_type(endpoint: &str, model: &str, api_type: ApiType) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -137,8 +138,31 @@ impl LlmParser {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model: model.to_string(),
+            api_type,
             generation_lock: Mutex::new(()),
         }
+    }
+
+    /// Create an LLM parser from environment variables.
+    ///
+    /// Reads:
+    /// - `SHODH_LLM_URL`      — base URL (default: `http://localhost:1234` for LM Studio)
+    /// - `SHODH_LLM_MODEL`    — model identifier (default: `qwq-32b-preview`)
+    /// - `SHODH_LLM_API_TYPE` — `openai` or `ollama` (default: `openai`)
+    pub fn from_env() -> Self {
+        let endpoint = std::env::var("SHODH_LLM_URL")
+            .unwrap_or_else(|_| "http://localhost:1234".to_string());
+        let model = std::env::var("SHODH_LLM_MODEL")
+            .unwrap_or_else(|_| "qwq-32b-preview".to_string());
+        let api_type = match std::env::var("SHODH_LLM_API_TYPE")
+            .unwrap_or_else(|_| "openai".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "ollama" => ApiType::Ollama,
+            _ => ApiType::OpenAI,
+        };
+        Self::with_api_type(&endpoint, &model, api_type)
     }
 
     /// Build the prompt for query parsing
@@ -228,15 +252,24 @@ Output this exact JSON structure:
             .ok_or_else(|| "No response from API".to_string())
     }
 
-    /// Try Ollama first, fall back to OpenAI-compatible API
+    /// Generate using the configured API type, with fallback to the other on error.
     fn generate(&self, prompt: &str) -> Result<String, String> {
-        // Try Ollama first
-        if let Ok(response) = self.generate_ollama(prompt) {
-            return Ok(response);
+        match self.api_type {
+            ApiType::OpenAI => {
+                // Try OpenAI-compatible first (LM Studio / vLLM), fall back to Ollama
+                if let Ok(response) = self.generate_openai(prompt) {
+                    return Ok(response);
+                }
+                self.generate_ollama(prompt)
+            }
+            ApiType::Ollama => {
+                // Try Ollama first, fall back to OpenAI-compatible
+                if let Ok(response) = self.generate_ollama(prompt) {
+                    return Ok(response);
+                }
+                self.generate_openai(prompt)
+            }
         }
-
-        // Fall back to OpenAI-compatible API
-        self.generate_openai(prompt)
     }
 
     /// Parse the LLM output JSON into ParsedQuery

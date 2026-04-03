@@ -21,23 +21,46 @@ jobs:
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           NPM_VERSION=$(grep '"version"' mcp-server/package.json | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
           PYPI_VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          normalize_core() {
+            python3 - "$1" <<'PY'
+import re
+import sys
+
+version = sys.argv[1].strip()
+match = re.match(r"^(\d+\.\d+\.\d+)", version)
+print(match.group(1) if match else version)
+PY
+          }
+          CARGO_CORE=$(normalize_core "$CARGO_VERSION")
+          NPM_CORE=$(normalize_core "$NPM_VERSION")
+          PYPI_CORE=$(normalize_core "$PYPI_VERSION")
 
           echo "Cargo.toml version: $CARGO_VERSION"
           echo "package.json version: $NPM_VERSION"
           echo "pyproject.toml version: $PYPI_VERSION"
+          echo "Normalized Cargo core: $CARGO_CORE"
+          echo "Normalized npm core: $NPM_CORE"
+          echo "Normalized PyPI core: $PYPI_CORE"
 
-          # Check all versions match
-          if [ "$CARGO_VERSION" != "$NPM_VERSION" ] || [ "$CARGO_VERSION" != "$PYPI_VERSION" ]; then
-            echo "::error::Version mismatch detected!"
-            echo "  Cargo.toml:     $CARGO_VERSION"
-            echo "  package.json:   $NPM_VERSION"
-            echo "  pyproject.toml: $PYPI_VERSION"
+          # Check all normalized release cores match. This allows branch-local
+          # prerelease markers like Cargo/npm `-unstable` and PyPI `.dev0`.
+          if [ "$CARGO_CORE" != "$NPM_CORE" ] || [ "$CARGO_CORE" != "$PYPI_CORE" ]; then
+            echo "::error::Version core mismatch detected!"
+            echo "  Cargo.toml:     $CARGO_VERSION ($CARGO_CORE)"
+            echo "  package.json:   $NPM_VERSION ($NPM_CORE)"
+            echo "  pyproject.toml: $PYPI_VERSION ($PYPI_CORE)"
             exit 1
           fi
 
-          echo "✓ All versions match: $CARGO_VERSION"
+          echo "✓ All normalized version cores match: $CARGO_CORE"
           echo "### Version Check" >> $GITHUB_STEP_SUMMARY
-          echo "All packages at version **$CARGO_VERSION**" >> $GITHUB_STEP_SUMMARY
+          echo "Normalized package version core: **$CARGO_CORE**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Raw Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cargo | $CARGO_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| npm | $NPM_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| PyPI | $PYPI_VERSION |" >> $GITHUB_STEP_SUMMARY
 
   format:
     name: Format Check
@@ -92,8 +115,10 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           brew install llvm
-          echo "LLVM_CONFIG_PATH=$(brew --prefix llvm)/bin/llvm-config" >> $GITHUB_ENV
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+          LLVM_PREFIX=$(brew --prefix llvm)
+          echo "LLVM_CONFIG_PATH=$LLVM_PREFIX/bin/llvm-config" >> $GITHUB_ENV
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Build Release
         run: cargo build --release
@@ -101,31 +126,31 @@ jobs:
       - name: Display build info (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          SIZE=$(ls -lh target/release/shodh-memory-server 2>/dev/null | awk '{print $5}' || echo "N/A")
+          SIZE=$(ls -lh target/release/veld 2>/dev/null | awk '{print $5}' || echo "N/A")
           echo "### Build Results (${{ matrix.os }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
-          echo "| shodh-memory-server | $SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| veld | $SIZE |" >> $GITHUB_STEP_SUMMARY
 
       - name: Display build info (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $file = Get-Item target/release/shodh-memory-server.exe -ErrorAction SilentlyContinue
+          $file = Get-Item target/release/veld.exe -ErrorAction SilentlyContinue
           $size = if ($file) { "{0:N2} MB" -f ($file.Length / 1MB) } else { "N/A" }
           "### Build Results (${{ matrix.os }})" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
           "" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
           "| Binary | Size |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
           "|--------|------|" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
-          "| shodh-memory-server.exe | $size |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "| veld.exe | $size |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
       - name: Upload binary (Linux)
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: shodh-memory-linux
-          path: target/release/shodh-memory-server
+          path: target/release/veld
           if-no-files-found: ignore
 
       - name: Upload binary (macOS)
@@ -133,7 +158,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shodh-memory-macos
-          path: target/release/shodh-memory-server
+          path: target/release/veld
           if-no-files-found: ignore
 
       - name: Upload binary (Windows)
@@ -141,7 +166,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shodh-memory-windows
-          path: target/release/shodh-memory-server.exe
+          path: target/release/veld.exe
           if-no-files-found: ignore
 
   test:

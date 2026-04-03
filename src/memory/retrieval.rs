@@ -1,3 +1,4 @@
+//! Earth↔Veld seam: takes Earth capabilities (embedder, vector index) and applies Veld search strategy.
 //! Production-grade retrieval engine for memory search
 //! Integrated with Vamana graph-based ANN and MiniLM embeddings
 //!
@@ -138,6 +139,11 @@ impl IdMapping {
     fn clear(&mut self) {
         self.memory_to_vectors.clear();
         self.vector_to_memory.clear();
+    }
+
+    /// Check if a memory ID has any vector mappings (for deletion verification)
+    fn contains(&self, memory_id: &MemoryId) -> bool {
+        self.memory_to_vectors.contains_key(memory_id)
     }
 }
 
@@ -765,6 +771,11 @@ impl RetrievalEngine {
             tracing::debug!("Memory {:?} not found in vector index", memory_id);
             false
         }
+    }
+
+    /// Check if a memory ID still has a vector mapping (for post-deletion verification).
+    pub fn has_mapping(&self, memory_id: &MemoryId) -> bool {
+        self.id_mapping.read().contains(memory_id)
     }
 
     /// Extract searchable text from memory

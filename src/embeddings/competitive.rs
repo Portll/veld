@@ -25,6 +25,8 @@ use std::sync::Arc;
 use super::minilm::MiniLMEmbedder;
 use super::Embedder;
 
+type DualEmbeddingBatch = (Vec<Vec<f32>>, Option<Vec<Vec<f32>>>);
+
 /// Dual-model competitive embedder.
 ///
 /// Wraps a primary embedder (always available, backward-compatible) and an optional
@@ -113,10 +115,7 @@ impl CompetitiveEmbedder {
     ///
     /// Returns parallel vectors: `(primary_embeddings, Option<secondary_embeddings>)`.
     /// If the secondary model fails mid-batch, the entire secondary result is `None`.
-    pub fn encode_dual_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<(Vec<Vec<f32>>, Option<Vec<Vec<f32>>>)> {
+    pub fn encode_dual_batch(&self, texts: &[&str]) -> Result<DualEmbeddingBatch> {
         let primary_batch = self.primary.encode_batch(texts)?;
 
         let secondary_batch = match &self.secondary {
@@ -279,10 +278,7 @@ mod tests {
 
         // Simulate the graceful degradation path from encode_dual
         let secondary_emb: Option<Vec<f32>> = match &secondary {
-            Some(embedder) => match embedder.encode("test") {
-                Ok(emb) => Some(emb),
-                Err(_) => None, // graceful degradation
-            },
+            Some(embedder) => embedder.encode("test").ok(), // graceful degradation
             None => None,
         };
         assert!(secondary_emb.is_none());

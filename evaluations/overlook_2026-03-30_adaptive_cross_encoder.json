@@ -1,0 +1,529 @@
+{
+  "overlook_metadata": {
+    "date": "2026-03-30",
+    "evaluator": "Overlook v1 (Claude Opus 4.6)",
+    "methodology": "27-dimension cognitive awareness vector with spike detection, A* priority, and anomaly interrupts",
+    "project": "shodh-memory",
+    "target": "Combined A+B+C fix for open-domain retrieval weakness",
+    "fix_components": [
+      "Fix A: Adaptive cross-encoder weight (82/18 -> 55/45 when CE spread < 0.20)",
+      "Fix B: Abstract query decomposition (Rule 4 in decompose_query, zero entities + no temporal)",
+      "Fix C: Dual-gated signal dampening (entity_overlap 0.10->0.04, recency 0.10->0.03, graph 0.08->0.02)"
+    ],
+    "prior_analyses": [
+      "bifocal_2026-03-30_adaptive_cross_encoder.json (score: 82.5/120)",
+      "intugest_2026-03-30_adaptive_cross_encoder.json (6 improvement surfaces found)",
+      "overloop_2026-03-30_adaptive_cross_encoder.json (4 improvements, MRR 0.83-0.88)"
+    ],
+    "files_examined": [
+      "src/memory/recall.rs (Layers 0.5-5.9, semantic_retrieve, unified scoring, cross-encoder blend, MMR)",
+      "src/memory/query_parser.rs (decompose_query, expand_abstract_terms_for_bm25, classify_query, QueryType)",
+      "src/memory/hybrid_search.rs (CrossEncoderReranker, CROSS_ENCODER_BLEND_WEIGHT, adaptive weights)",
+      "src/memory/graph_retrieval.rs (apply_query_type_weights, spreading activation)",
+      "src/constants.rs (all coefficients, QUERY_DECOMPOSITION_*, MMR_LAMBDA_*, ADAPTIVE_WEIGHT_*)"
+    ]
+  },
+
+  "phase_0_initialize": {
+    "paradigm_classification": {
+      "domain": "devtools/ai-ml",
+      "stack": "Rust (core), TypeScript (MCP server), Python (bindings). RocksDB + Vamana HNSW + ONNX cross-encoder.",
+      "maturity": "mature — 739 tests across 72 files, 11-layer pipeline with documented constants, 3 prior analysis cycles on this target",
+      "risk_profile": "elevated — core retrieval pipeline, changes affect ALL queries, no rollback mechanism besides revert",
+      "team_pattern": "solo/small — commit history shows single primary contributor"
+    },
+    "weight_matrix": {
+      "description": "Devtools/ai-ml mature elevated-risk solo paradigm",
+      "D1_intent_clarity": 1.3,
+      "D2_evaluation_depth": 1.4,
+      "D3_coverage_breadth": 1.2,
+      "D4_phase_position": 1.0,
+      "D5_attention_balance": 1.5,
+      "D6_evidence_density": 1.6,
+      "D7_code_groundedness": 1.7,
+      "D8_structural_groundedness": 1.5,
+      "D9_error_coverage": 1.8,
+      "D10_contract_coverage": 1.4,
+      "D11_attack_surface": 0.8,
+      "D12_hazop_completion": 1.3,
+      "D13_fmea_completion": 1.3,
+      "D14_mirror_symmetry": 1.5,
+      "D15_fractal_consistency": 1.7,
+      "D16_paradigm_stability": 1.0,
+      "D17_sibling_consistency": 1.6,
+      "D18_pattern_confidence": 1.4,
+      "D19_scale_coverage": 1.2,
+      "D20_auth_risk": 0.5,
+      "D21_pii_exposure": 0.5,
+      "D22_integration_fragility": 1.3,
+      "D23_session_novelty": 1.0,
+      "D24_pattern_confirmation": 1.2,
+      "D25_ratchet_candidates": 1.0,
+      "D26_cross_session_drift": 0.8,
+      "D27_seed_utilization": 1.0
+    },
+    "seed_context": {
+      "prior_session_state": "v0.7.0, MRR 0.88 single-hop, 0.28 LOCOMO, 0.68 open-domain. Reranker P1 complete, decomposition P2 in progress.",
+      "known_patterns": "11-layer pipeline with fractal-inconsistent query-type adaptation (3/9 layers adapted). Dual cross-encoder blend cascade. Candidate pool ceiling at 40 for abstract queries."
+    }
+  },
+
+  "phase_1_dimension_walk": {
+    "cluster_A_intent": {
+      "D1_intent_clarity": {
+        "raw": 0.78,
+        "ema": 0.78,
+        "evidence": "The three fixes are well-defined with specific code locations, coefficient values, and gate conditions. However, the interaction model between A+B+C is underspecified. Fix B widens the candidate pool; Fix A changes how those candidates are scored; Fix C dampens signals that differentiate them. The ORDER in which they fire matters (B at Layer 3, C split across Layers 4-5, A at Layer 5.3) but no explicit sequencing analysis exists. Also: the CE 'spread' threshold of 0.20 for Fix A is not justified against the actual distribution of CE spreads in production data.",
+        "updates": "+0.20 (clear per-fix specs), -0.12 (interaction model underspecified), -0.05 (threshold not calibrated)"
+      },
+      "D2_evaluation_depth": {
+        "raw": 0.82,
+        "ema": 0.82,
+        "evidence": "Three prior analyses (bifocal, intugest, overloop) reached depth 4+ on the scoring layers. Intugest correctly identified the candidate pool ceiling as prerequisite. However, no analysis has traced the full data flow for a SPECIFIC failing query (e.g., Q19 'performance improvements') through ALL 11 layers with concrete candidate sets at each stage. The analysis is structural, not trace-based.",
+        "updates": "+0.35 (three prior analyses compound), -0.08 (no concrete trace)"
+      },
+      "D3_coverage_breadth": {
+        "raw": 0.55,
+        "ema": 0.55,
+        "evidence": "Prior analyses cover: Layer 3 decomposition, Layer 4 RRF, Layer 4.525-4.535 (entity overlap, BM25 discount, light pollution), Layer 5 unified scoring, Layer 5.3 CE blend, Layer 5.4 MMR, Layer 5.7 confidence pruning. NOT covered: Layer 0.5 (attribute detection interaction — could Fix C's entity-absent gate misfire for attribute queries where the entity IS present but not detected?), Layer 0.6 (temporal fact lookup — does Fix B's decomposition interact with temporal fact pre-fetching?), Layer 1 (episode filter — does decomposed query use same episode_candidates?), Layer 3.5 (brute-force cosine scan — does it use the fused embedding from 3.1 or individual sub-query embeddings?), Layer 5.85 (linguistic boost — does it still fire after Fix C suppresses entity overlap?). Five layers unexamined.",
+        "updates": "+0.30 (9+ layers covered), -0.25 (5 layers unexamined)"
+      },
+      "D4_phase_position": {
+        "raw": 0.70,
+        "ema": 0.70,
+        "evidence": "Three analyses complete (bifocal, intugest, overloop). This overlook is the 4th. Implementation has not started. We are in late design/early validation phase."
+      },
+      "D5_attention_balance": {
+        "raw": 0.38,
+        "ema": 0.38,
+        "evidence": "SPIKE CANDIDATE. Gini coefficient of attention across query categories: open-domain/abstract has received ~70% of analysis attention. Single-hop (0.88 MRR), multi-hop, temporal, and attribute categories have received ~30% combined. Specific concern: will Fix B's Rule 4 decomposition fire for queries that SHOULD NOT be decomposed? The gate is 'zero focal entities AND no temporal signal'. But some single-hop queries like 'What bugs did we encounter?' have zero focal entities and no temporal signal — they would incorrectly trigger Rule 4 decomposition, potentially DEGRADING a currently-working category.",
+        "updates": "-0.30 (tunnel vision on open-domain), -0.07 (regression risk to single-hop unexamined)"
+      }
+    },
+
+    "cluster_B_observation": {
+      "D6_evidence_density": {
+        "raw": 0.72,
+        "ema": 0.72,
+        "evidence": "Bifocal provided dual-evidenced findings (HAZOP + FMEA + code references) for 4 boundaries. Intugest provided 6 improvement surfaces with code line references. Most findings have at least one evidence anchor. Gap: Fix B's Rule 4 gate condition ('zero focal entities + no temporal') has no evidence for false positive rate. How many of the 120 LOCOMO queries would trigger Rule 4? How many of those are currently succeeding?",
+        "updates": "+0.30 (prior analyses well-evidenced), -0.08 (Fix B gate FP rate unknown)"
+      },
+      "D7_code_groundedness": {
+        "raw": 0.85,
+        "ema": 0.85,
+        "evidence": "All three fixes have been mapped to specific code locations. Fix A: recall.rs:2656-2665 (outer blend). Fix B: query_parser.rs:3830-3914 (decompose_query). Fix C: recall.rs:2364 (access_weight precedent), recall.rs:1561-1654 (entity overlap), recall.rs:2262-2267 (recency_scale), recall.rs:2367-2373 (graph_boost). The dual-blend cascade (hybrid_search.rs:678 inner, recall.rs:2665 outer) is grounded. Test coverage for decompose_query exists (7 tests at query_parser.rs:4329-4386) but none test abstract/entity-absent queries.",
+        "updates": "+0.40 (all fixes line-anchored), +0.10 (test coverage exists for siblings), -0.05 (no tests for the proposed change)"
+      },
+      "D8_structural_groundedness": {
+        "raw": 0.70,
+        "ema": 0.70,
+        "evidence": "The 'adapt by query type' pattern has been identified and mapped across all 9 scoring layers (intugest step_3 fractal_analysis). The inconsistency is documented: 3/9 layers have query-type adaptation. Fix A+C would bring it to 5/9. The candidate pool ceiling is structurally grounded (40 candidates from max_results*8, rerank_budget=30, rerank_pool=20). Pattern of 'gate condition -> coefficient switch' is consistent across existing precedents (access_weight, MMR lambda, RRF weights).",
+        "updates": "+0.35 (pattern mapped across pipeline), -0.05 (no structural analysis of decomposition sub-query quality)"
+      },
+      "D9_error_coverage": {
+        "raw": 0.52,
+        "ema": 0.52,
+        "evidence": "CRITICAL DIMENSION. New failure modes identified by this analysis that prior work missed:\n\n1. FIX B FALSE POSITIVE: 'What bugs did we encounter?' has 0 focal entities and no temporal signal. Rule 4 fires. Decomposition expands into sub-queries like ['bugs', 'encounter', 'issues', 'problems']. This DILUTES the original query's vector, spreading it across noisy sub-queries. Currently this query works via BM25 ('bugs' is a high-IDF term). Decomposition adds lower-quality candidates that push the correct results down in RRF fusion.\n\n2. FIX A + B COMPOUND FAILURE: Fix B widens pool from ~40 to ~120. Fix A then computes CE spread across all 120 candidates. With 120 weak candidates, CE spread is almost guaranteed to be < 0.20, triggering the adaptive blend for queries that DON'T NEED IT. The gate fires too often because the condition (low spread) is now partially caused by the fix (more candidates = lower spread).\n\n3. FIX C GRAPH BOOST IS ALREADY ZERO: Intugest correctly identified that graph traversal produces 0 results for entity-less queries. So graph_boost dampening (0.08->0.02) is dampening a signal that is ALREADY 0.0 for the target query category. This part of Fix C has zero effect. But the code change persists, adding complexity for no benefit.\n\n4. FIX C ENTITY OVERLAP GATE INTERACTS WITH BM25 SPECIFICITY DISCOUNT: At Layer 4.527, memories with BM25>0.5 and no entity overlap get a 5% discount. Fix C reduces entity overlap boost from 0.10 to 0.04 for entity-absent queries. But the BM25 specificity discount checks for entity_overlap=true/false (line 1668), not for the MAGNITUDE of the boost. So Fix C's reduction doesn't affect the discount trigger — it's a boolean check. This means the penalty structure is unaffected, but the reward for entity overlap is halved. Net effect: memories WITH entity overlap lose relative advantage, but memories WITHOUT entity overlap still get the full 5% discount. This is backwards from intent.\n\n5. FIX A CE SPREAD COMPUTED ON RERANK_BUDGET, NOT FULL POOL: Layer 5.3 only CE-ranks the top rerank_budget = min(memories.len(), max_results*2, 20) = 10 candidates. The CE spread is computed over these 10, not the full pool. If Fix B widens to 120 candidates, only the top 10 (post Layer 5 scoring) reach the CE. The spread is therefore determined by the TOP 10 after unified scoring — which already have similar scores due to the narrow score band of the additive model. Spread < 0.20 may be the DEFAULT condition, not an abstract-query indicator.",
+        "updates": "+0.15 (bifocal HAZOP identified 8 failure modes), -0.23 (5 new compound failure modes found)"
+      },
+      "D10_contract_coverage": {
+        "raw": 0.45,
+        "ema": 0.45,
+        "evidence": "Score invariants are partially checked: bifocal noted base_weight + ce_weight should sum to ~1.0 (PART_OF HAZOP). No contract for: decomposition sub-query count must be <= QUERY_DECOMPOSITION_MAX_SUBQUERIES (4). No contract for: the combined score after all fixes must remain in the same range as before (Fix B+C could compress scores into a narrower band, defeating Layer 5.7 confidence pruning thresholds). No contract for: the CE spread threshold (0.20) must be calibrated to the actual CE spread distribution.",
+        "updates": "+0.20 (some invariants checked), -0.25 (3 critical contracts missing)"
+      },
+      "D11_attack_surface": {
+        "raw": 0.90,
+        "ema": 0.90,
+        "evidence": "Not applicable for this target. The fixes modify internal scoring coefficients — no new external interfaces, no new user inputs, no new attack vectors. The BM25 expansion vocabulary in expand_abstract_terms_for_bm25 is a hardcoded static map (13 entries). Fix B would reuse this existing vocabulary, not add external dependency.",
+        "updates": "+0.40 (no new attack surface)"
+      },
+      "D12_hazop_completion": {
+        "raw": 0.60,
+        "ema": 0.60,
+        "evidence": "Bifocal performed full HAZOP (NO, MORE, LESS, REVERSE, PART_OF, OTHER_THAN, EARLY, LATE) on boundary_1 (abstractness detection -> CE weight) and boundary_3 (intent classification -> signal dampening). No HAZOP performed on Fix B's decomposition boundary. Missing: HAZOP for 'Rule 4 fires when it should not' (MORE), 'Rule 4 decomposition produces wrong sub-queries' (OTHER_THAN), 'Sub-query embeddings are worse than original' (REVERSE).",
+        "updates": "+0.25 (two boundaries HAZOPed), -0.15 (Fix B boundary not HAZOPed)"
+      },
+      "D13_fmea_completion": {
+        "raw": 0.55,
+        "ema": 0.55,
+        "evidence": "Bifocal computed RPN for 2 failure modes: over-detection (RPN=108) and scale mismatch (RPN=140). No FMEA for: Fix B false positive decomposition (severity=7, probability=6, detectability=5, RPN=210 — highest risk), Fix A+B compound gate failure (severity=8, probability=5, detectability=6, RPN=240), Fix C graph-boost-is-zero ineffectiveness (severity=2, probability=10, detectability=2, RPN=40).",
+        "updates": "+0.20 (2 RPNs computed), -0.15 (3 missing, including the highest-RPN pair)"
+      },
+      "D14_mirror_symmetry": {
+        "raw": 0.35,
+        "ema": 0.35,
+        "evidence": "SPIKE CANDIDATE (DROP). All three prior analyses examined the 'read' path (query -> retrieval -> scoring). None examined the 'write' path consequences. Specifically: Fix B adds decomposed candidates to the vector search results. These candidates then pass through Layer 4 RRF fusion. In RRF, rank determines score (weight / (K + rank)). If decomposed results have different ranking properties than non-decomposed results (they do — they use max-merge RRF at line 1101), the write-into-fusion step has asymmetric properties. A decomposed candidate at rank 1 in a sub-query gets RRF score 0.6/21 = 0.0286, while a non-decomposed candidate at rank 1 gets 1.0/21 = 0.0476. The sub-query discount (0.6x) means decomposed candidates start at a 40% disadvantage in RRF — they need to appear at rank 1 in MULTIPLE sub-queries to overcome a single rank-1 appearance in the original query. This asymmetry is by design for the existing rules but may be wrong for Rule 4 where the sub-queries are BETTER than the original (abstract query is diffuse, sub-queries are focused).",
+        "updates": "-0.15 (write-path asymmetry not analyzed), -0.10 (sub-query RRF discount may be inverted for Rule 4)"
+      }
+    },
+
+    "cluster_C_pattern": {
+      "D15_fractal_consistency": {
+        "raw": 0.30,
+        "ema": 0.30,
+        "evidence": "SPIKE FIRED (DROP). The pipeline now has FOUR distinct query-type-specific behaviors, each using a DIFFERENT mechanism:\n\n1. Attribute queries: Hard-gated via QueryType::Attribute. Affects Layer 0.5 (fact-first retrieval), Layer 2 (graph weight +0.10), Layer 4.5 (attribute boost +0.5), Layer 5.4 (MMR skipped). The gate is structural (detect_attribute_query returns Some).\n\n2. Temporal queries: Multi-signal gated via has_temporal_query, has_any_temporal_intent, temporal_intent variants. Affects Layer 0.6 (temporal fact lookup), Layer 1 (episode filter), Layer 2 (BM25 weight +0.10), Layer 4.55 (temporal fact boost), Layer 5.35 (fragment demotion exempted), Layer 5.87 (temporal range demotion), Layer 5.9 (ordinal resolution). Gate is the broadest — at least 6 different boolean/enum signals propagate.\n\n3. Exploratory queries: Weakly gated via QueryType::Exploratory (default bucket). Only affects: Layer 4 RRF (no weight shift), Layer 5 access_weight (0.07->0.02), Layer 5.4 MMR lambda=0.6. PROPOSED additions: Layer 5 signal dampening (Fix C), Layer 5.3 adaptive CE blend (Fix A).\n\n4. Abstract queries (NEW, proposed): Gated via 'zero focal entities + no temporal' (Fix B) AND 'CE spread < 0.20' (Fix A). Affects: Layer 3 (Rule 4 decomposition), Layer 4.525 (entity overlap 0.10->0.04), Layer 5 (recency 0.10->0.03, graph 0.08->0.02, access 0.02->0.01), Layer 5.3 (CE blend 82/18->55/45).\n\nFRACTAL BREAK: Each query type uses a DIFFERENT detection mechanism (pattern match, multi-signal boolean, default bucket, score-spread heuristic), a DIFFERENT set of affected layers, and a DIFFERENT modification strategy (additive boost, multiplicative dampening, gate bypass, coefficient interpolation). There is no uniform 'query type adapter' abstraction. Adding Fix A+B+C creates a FOURTH ad-hoc adaptation path without consolidating the pattern.\n\nAt the micro level: the coefficient-switch mechanism IS consistent (match on enum variant -> select coefficient). But the GATE mechanisms are not fractally consistent across the three levels.",
+        "updates": "-0.35 (four distinct adaptation mechanisms), -0.05 (no unified abstraction), +0.10 (micro-level coefficient pattern is consistent)"
+      },
+      "D16_paradigm_stability": {
+        "raw": 0.85,
+        "ema": 0.85,
+        "evidence": "The paradigm (devtools/ai-ml, mature, elevated risk, solo) is stable. No reclassification needed. The target is a refinement of existing patterns, not a paradigm shift.",
+        "updates": "+0.35 (stable)"
+      },
+      "D17_sibling_consistency": {
+        "raw": 0.42,
+        "ema": 0.42,
+        "evidence": "PARTIAL SPIKE (DROP). The three fixes A, B, C are siblings in the proposal but use INCONSISTENT patterns:\n\nFix A gate: CE score spread < 0.20 (POST-retrieval, computed from Layer 5.3 rerank candidates). This is a score-distribution-based gate.\nFix B gate: Zero focal entities AND no temporal signal (PRE-retrieval, computed from query analysis). This is a query-structure-based gate.\nFix C pre-fetch gate: Entity-absent (from query analysis, same as Fix B). Query-structure-based.\nFix C post-fetch gate: Entity-absent AND low CE spread (conjunction of Fix B and Fix A gates). Hybrid gate.\n\nThe siblings use three different gating strategies. If the gates DISAGREE (Fix B fires but Fix A does not, or vice versa), the combined effect is unpredictable:\n- Fix B fires, Fix A does not: Pool widens to 120 candidates, but CE blend stays at 82/18 and signals stay at full strength. The extra candidates are scored with the entity-heavy pipeline. This is actually FINE — more candidates scored normally.\n- Fix B does not fire, Fix A fires: Pool stays at 40, but CE blend shifts to 55/45 and signals dampen. This would happen when a concrete query happens to have low CE spread (e.g., all candidates are equally relevant). The dampening HURTS a working query.\n- Fix B fires, Fix A fires, Fix C fires: Full combined effect. All three reinforce.\n\nThe SECOND case is the dangerous one. Fix A's gate (CE spread < 0.20) is weakly correlated with Fix B's gate (zero entities + no temporal). A concrete entity-bearing query could have low CE spread if the cross-encoder model is poorly calibrated for that domain. In this case, Fix A fires without Fix B, and the dampening (Fix C post-fetch gate uses entity-absent AND low spread, so it WOULD fire if spread is low even with entities present — need to verify the gate definition).",
+        "updates": "-0.20 (three different gating strategies), -0.08 (dangerous disagreement case)"
+      },
+      "D18_pattern_confidence": {
+        "raw": 0.55,
+        "ema": 0.55,
+        "evidence": "The 'gate -> coefficient switch' pattern is well-established (5+ precedents in the pipeline). Confidence in this MECHANISM is high. But the specific gate conditions for Fix A (spread < 0.20) and Fix B (zero entities + no temporal) are novel — no existing precedent uses CE score spread as a gate, and no existing rule in decompose_query uses the ABSENCE of entities as a trigger (all 3 existing rules require the PRESENCE of some structure). Fix B inverts the pattern: existing rules fire when structure is found, Rule 4 fires when structure is ABSENT.",
+        "updates": "+0.25 (mechanism well-precedented), -0.15 (gate conditions are novel), -0.05 (Rule 4 inverts the decomposition pattern)"
+      },
+      "D19_scale_coverage": {
+        "raw": 0.60,
+        "ema": 0.60,
+        "evidence": "Macro: Pipeline-level flow is well understood (11 layers, data flow traced). Meso: Individual layer behavior documented for most layers. Micro: Specific coefficient values and their justifications are in constants.rs. Gap: No micro-level analysis of how specific LOCOMO queries (Q19, Q20) would flow through the modified pipeline with concrete candidate sets. The macro and meso are covered; the micro (specific input -> specific output) is not.",
+        "updates": "+0.20 (macro+meso covered), -0.10 (micro not traced)"
+      }
+    },
+
+    "cluster_D_risk": {
+      "D20_auth_risk": {
+        "raw": 0.95,
+        "ema": 0.95,
+        "evidence": "Not applicable. The fixes modify internal scoring coefficients. No authentication boundaries touched. The user_id filter in query.user_id (recall.rs:1054) is unaffected.",
+        "updates": "+0.45 (no auth impact)"
+      },
+      "D21_pii_exposure": {
+        "raw": 0.95,
+        "ema": 0.95,
+        "evidence": "Not applicable. No PII boundaries modified. Memory content retrieval and filtering paths are unchanged.",
+        "updates": "+0.45 (no PII impact)"
+      },
+      "D22_integration_fragility": {
+        "raw": 0.72,
+        "ema": 0.72,
+        "evidence": "Fix B creates a new dependency path: decompose_query Rule 4 -> expand_abstract_terms_for_bm25 vocabulary -> sub-query vector search. The expansion vocabulary is STATIC (13 hardcoded stem->synonym mappings at query_parser.rs:3938-3952). No external API, no model inference, no dynamic lookup. The Vamana vector search is the same path used by all other decomposition rules. The ONNX cross-encoder model (ms-marco-MiniLM-L-6-v2) is an existing dependency, not new.\n\nHowever: Fix A introduces a new runtime DEPENDENCY between the CE reranking output (score distribution) and the CE blending input (weight selection). Currently these are independent: CE reranks, then blend is applied with fixed weights. Fix A creates a feedback loop where the CE output determines its own weight in the final blend. This is not technically a circular dependency (the scores are computed before the weights are selected), but it creates a tight coupling between the CE model's score distribution properties and the gate threshold. If the CE model is updated or fine-tuned, the spread distribution changes, and the gate behavior shifts. This is an implicit version dependency.",
+        "updates": "+0.10 (no new external deps), -0.08 (implicit CE model version dependency)"
+      }
+    },
+
+    "cluster_E_learning": {
+      "D23_session_novelty": {
+        "raw": 0.65,
+        "ema": 0.65,
+        "evidence": "This is the 4th analysis of the same target. Novel findings in this session: (1) Fix A+B compound gate failure (CE spread determined by pool size, not query abstractness), (2) Fix B false positive on entity-absent concrete queries like 'What bugs did we encounter?', (3) Fix C graph boost dampening is a no-op for the target category, (4) Sub-query RRF discount (0.6x) may be inverted for Rule 4, (5) Mirror asymmetry in write-path.",
+        "updates": "+0.25 (5 novel findings), -0.10 (4th pass on same target)"
+      },
+      "D24_pattern_confirmation": {
+        "raw": 0.70,
+        "ema": 0.70,
+        "evidence": "Confirms: (1) Candidate pool ceiling is the primary bottleneck (intugest tension_1), (2) Fractal inconsistency in query-type adaptation (intugest step_3), (3) Dual-blend cascade identified by bifocal boundary_2. New contradictions: (1) Intugest rated Fix B as prerequisite for A+C, but this analysis finds Fix B introduces its own failure modes (false positives, RRF discount asymmetry) that could make A+C worse, not better.",
+        "updates": "+0.20 (3 confirmations), +0.10 (1 meaningful contradiction of prior analysis)"
+      },
+      "D25_ratchet_candidates": {
+        "raw": 0.75,
+        "ema": 0.75,
+        "evidence": "Three findings meet the specificity ratchet: (1) CE spread is computed on rerank_budget (10 candidates), not full pool — the gate condition is structural, not data-dependent. (2) decompose_query Rule 4 gate ('zero entities + no temporal') has a known false positive class: entity-absent concrete queries. (3) The sub-query RRF weight of 0.6x (QUERY_DECOMPOSITION_SUB_WEIGHT) is calibrated for entity-split sub-queries where the original query is better, but for abstract decomposition the sub-queries may be better than the original — weight should be inverted.",
+        "updates": "+0.35 (3 ratchet-quality findings)"
+      },
+      "D26_cross_session_drift": {
+        "raw": 0.50,
+        "ema": 0.50,
+        "evidence": "No code changes between sessions. This analysis is on a PROPOSAL, not implemented code. Low drift.",
+        "updates": "+0.00 (no drift)"
+      },
+      "D27_seed_utilization": {
+        "raw": 0.70,
+        "ema": 0.70,
+        "evidence": "Prior seeds consumed: (1) Bifocal 82.5/120 score and dual-blend cascade — fully utilized, confirmed, extended. (2) Intugest candidate pool ceiling — confirmed AND complicated (Fix B widens pool but at a cost). (3) Overloop MRR projection 0.83-0.88 — contradicted (this analysis identifies failure modes that reduce expected MRR improvement). Not utilized: graph boost mootness was noted by intugest but not reflected in Fix C design.",
+        "updates": "+0.20 (3 seeds utilized), +0.10 (1 seed contradicted with evidence), -0.10 (1 seed ignored in fix design)"
+      }
+    }
+  },
+
+  "phase_2_spike_detection": {
+    "spikes_detected": [
+      {
+        "type": "absolute_drop",
+        "dimension": "D15_fractal_consistency",
+        "value": 0.30,
+        "threshold": 0.40,
+        "trigger": "Four distinct query-type adaptation mechanisms with no unifying abstraction. Fix A+B+C adds a fourth ad-hoc path (abstract queries) using yet another gating strategy (CE spread heuristic) incompatible with the existing three (pattern match, multi-boolean, default bucket).",
+        "severity": "HIGH",
+        "recommendation": "Before implementing A+B+C, refactor query-type adaptation into a unified QueryProfile struct that ALL layers consume. The struct would carry: query_type (Attribute/Temporal/Exploratory/Abstract), confidence score, per-signal weight overrides, decomposition hint. This consolidates the 4 ad-hoc paths into one data-driven adapter. Implementation cost: ~200 lines in query_parser.rs, ~50 lines in recall.rs to replace per-layer switches with profile lookups."
+      },
+      {
+        "type": "absolute_drop",
+        "dimension": "D5_attention_balance",
+        "value": 0.38,
+        "threshold": 0.45,
+        "trigger": "70% of analysis attention on open-domain/abstract queries. Fix B's Rule 4 gate condition (zero entities + no temporal) has a false positive class of entity-absent concrete queries ('What bugs did we encounter?', 'What decisions were made?') that could regress currently-working categories. No regression analysis performed for these.",
+        "severity": "HIGH",
+        "recommendation": "Before implementing Fix B, enumerate ALL LOCOMO queries and classify which ones trigger Rule 4. For each, predict whether decomposition helps or hurts. Expect ~15-20% false positive rate on entity-absent concrete queries. Add a NEGATIVE gate: exclude queries whose BM25 expansion vocabulary (expand_abstract_terms_for_bm25) returns None — these are concrete queries that don't need abstract expansion."
+      },
+      {
+        "type": "absolute_drop",
+        "dimension": "D14_mirror_symmetry",
+        "value": 0.35,
+        "threshold": 0.40,
+        "trigger": "All analyses examine the read path (query->score->rank). None examine the write path: Fix B writes decomposed candidates into RRF fusion with a 0.6x sub-query discount that may be WRONG for abstract decomposition (where sub-queries are more focused than the original).",
+        "severity": "MEDIUM",
+        "recommendation": "For Rule 4 abstract decomposition, consider INVERTING the RRF weight: original query at 0.6, sub-queries at 1.0. The rationale: the original abstract query is DIFFUSE (bad embedding), while the sub-queries are FOCUSED (good embeddings). The existing 1.0/0.6 split assumes the original query is better — this assumption fails for abstract queries."
+      },
+      {
+        "type": "cumulative",
+        "dimensions": ["D9_error_coverage", "D10_contract_coverage", "D13_fmea_completion"],
+        "cumulative_delta": -0.53,
+        "window": "5 observations",
+        "trigger": "Cluster B observation dimensions are collectively declining. Five new failure modes discovered, three contracts missing, three FMEA RPNs uncomputed. The compound failure mode (Fix A+B CE gate fires universally because wider pool drives spread below threshold) is the highest-RPN risk in the entire proposal and was not identified until this analysis.",
+        "severity": "HIGH",
+        "recommendation": "Compute FMEA RPNs for all five new failure modes. Prioritize the Fix A+B compound gate failure (estimated RPN=240) and the Fix B false positive decomposition (estimated RPN=210)."
+      },
+      {
+        "type": "cross_cluster",
+        "dimensions": ["D15_fractal_consistency", "D17_sibling_consistency"],
+        "movement": "both dropped >0.15",
+        "trigger": "FRACTAL BREAK DETECTED. D15 (0.30) and D17 (0.42) both in Pattern cluster show significant drops. The three fixes use inconsistent gating strategies AND the overall pipeline has fractally inconsistent query-type adaptation. This is a structural problem, not a tuning problem.",
+        "severity": "HIGH",
+        "recommendation": "The fractal break means adding MORE query-type-specific code increases maintenance burden non-linearly. Each new query category requires updating ALL adapted layers. With 4 categories and 9 layers, that's 36 potential adaptation points. Currently only ~12 are implemented. The missing 24 are latent bugs — layers that SHOULD adapt but DON'T."
+      }
+    ]
+  },
+
+  "phase_3_a_star_priority": {
+    "description": "A* informed traversal of unexplored/high-uncertainty nodes. f(n) = g(n) + h(n) where g = accumulated evidence cost, h = base_tier * paradigm_risk + isolation_penalty + spike_bonus.",
+    "priority_queue": [
+      {
+        "rank": 1,
+        "node": "Fix B Rule 4 false positive analysis",
+        "f_score": 4.8,
+        "g_cost": 0.0,
+        "h_estimate": 4.8,
+        "rationale": "HIGHEST PRIORITY. Rule 4 gate (zero entities + no temporal) has unknown false positive rate. Could regress currently-working concrete queries. No prior analysis examined this. Isolation penalty HIGH (no evaluated neighbors in the 'false positive' subgraph). Spike bonus from D5 attention imbalance.",
+        "suggested_action": "Run Rule 4 gate against all LOCOMO queries. Categorize: true positive (abstract, needs decomposition), false positive (concrete, decomposition hurts), true negative (entity-bearing, correctly skipped). Compute expected MRR impact for false positives."
+      },
+      {
+        "rank": 2,
+        "node": "Fix A CE spread distribution calibration",
+        "f_score": 4.2,
+        "g_cost": 0.5,
+        "h_estimate": 3.7,
+        "rationale": "The 0.20 threshold is unjustified. CE spread is computed on rerank_budget (10 candidates after unified scoring). Need to know: what is the actual distribution of CE spreads for (a) abstract queries, (b) concrete queries, (c) temporal queries? If the distributions overlap significantly, the threshold cannot reliably discriminate. Fix B's wider pool may SHIFT the distribution, making calibration data from the current pipeline invalid.",
+        "suggested_action": "Add telemetry: log CE spread per query, classified by QueryType. Collect on 100+ representative queries before choosing threshold. Also: simulate with Fix B's wider pool to see if spread distribution shifts."
+      },
+      {
+        "rank": 3,
+        "node": "Sub-query RRF weight inversion for Rule 4",
+        "f_score": 3.5,
+        "g_cost": 0.3,
+        "h_estimate": 3.2,
+        "rationale": "QUERY_DECOMPOSITION_SUB_WEIGHT=0.6 was calibrated for entity-split sub-queries. Abstract decomposition inverts the quality relationship: sub-queries > original query. Using 0.6 for sub-queries disadvantages the better embeddings. No prior analysis flagged this weight inversion.",
+        "suggested_action": "For Rule 4 specifically, set sub-query weight to 1.0 and original query weight to 0.6 (or even 0.4). Alternatively, add a per-rule weight parameter to decompose_query return value."
+      },
+      {
+        "rank": 4,
+        "node": "Layer 3.5 brute-force interaction with Fix B",
+        "f_score": 3.0,
+        "g_cost": 0.5,
+        "h_estimate": 2.5,
+        "rationale": "Layer 3.5 performs brute-force cosine scan over working + session memory using the fused embedding from Layer 3.1. When Fix B decomposes, Layer 3.1 fuses sub-query embeddings. For abstract decomposition, the fused embedding is an AVERAGE of concrete sub-query embeddings. This average may be BETTER than the original abstract embedding (concrete terms average closer to relevant memories). Or it may be WORSE (averaging unrelated concrete terms creates a new diffuse embedding). Not analyzed.",
+        "suggested_action": "Test: embed 'strategic priorities', then embed ['strategy', 'priorities', 'goals', 'decisions'], average the 4, compare cosine similarity to known-relevant memories for both."
+      },
+      {
+        "rank": 5,
+        "node": "MMR interaction with Fix B wider pool",
+        "f_score": 2.8,
+        "g_cost": 0.8,
+        "h_estimate": 2.0,
+        "rationale": "Intugest identified MMR (lambda=0.6) ejecting correct results. Fix B widens pool to ~120 candidates. After Layer 5 scoring, ~20 reach MMR. With more candidates from decomposed sub-queries, there may be MORE semantically similar results (sub-queries target related topics), increasing MMR's diversity penalty. The wider pool could make MMR's ejection problem WORSE, not better.",
+        "suggested_action": "Consider: for abstract queries (Rule 4 triggered), relax MMR lambda to 0.8 or skip MMR entirely. Abstract queries benefit from thematic clustering, not diversity."
+      }
+    ]
+  },
+
+  "phase_4_anomaly_interrupts": [
+    {
+      "interrupt_id": "OVERLOOK-INT-001",
+      "type": "COMPOUND_FAILURE_CASCADE",
+      "anomaly": "Fix A+B create a self-reinforcing gate failure",
+      "trigger": "Fix B widens candidate pool from ~40 to ~120. More candidates with weak/uniform CE scores reduces CE spread. Fix A's gate (spread < 0.20) fires more often with wider pools. Therefore: Fix B CAUSES Fix A to fire on queries where it should NOT fire. The two fixes amplify each other's failure mode.",
+      "evidence": "CE spread is computed on rerank_budget = min(memories.len(), max_results*2, 20) at recall.rs:2636. With max_results=5, rerank_budget=10. These are the top-10 after unified scoring. Fix B adds decomposed candidates that, after RRF fusion with 0.6x discount, may cluster in the middle ranks (not top-10). If they DO reach top-10, they have similar scores (came from related sub-queries), compressing CE spread. If they DON'T reach top-10, Fix B has no effect on Fix A's gate — but also means the wider pool didn't help the target query.",
+      "current_node": "Fix A + Fix B interaction",
+      "suggested_action": "DECOUPLE the gates. Fix A should NOT use CE spread as its gate. Instead, use Fix B's gate condition directly: if Rule 4 decomposition fired, apply adaptive CE blend. This makes Fix A a CONSEQUENT of Fix B, not an independent gate. Eliminates the self-reinforcing failure.",
+      "severity": "CRITICAL — defeats the primary mechanism of Fix A"
+    },
+    {
+      "interrupt_id": "OVERLOOK-INT-002",
+      "type": "FALSE_POSITIVE_REGRESSION",
+      "anomaly": "Fix B Rule 4 fires on entity-absent concrete queries, degrading currently-working categories",
+      "trigger": "Gate condition: zero focal entities AND no temporal signal. Concrete queries with no named entities: 'What bugs did we encounter?', 'What decisions were made?', 'What risks were identified?', 'How did the project go?'. These have 0 focal entities and no temporal signal. Rule 4 fires. Decomposition adds sub-queries from BM25 expansion vocabulary. But these queries already work via BM25 keyword matching — decomposition adds noise.",
+      "evidence": "analyze_query() at query_parser.rs extracts focal_entities using NER + pattern matching. 'bugs', 'decisions', 'risks', 'project' are common nouns, not named entities. They would NOT be extracted as focal entities. The gate fires. expand_abstract_terms_for_bm25 has entries for 'risk' -> ['concerns', 'issues', 'problems', 'challenges', 'threats'] but NOT for 'bug' or 'decision'. So for 'What bugs did we encounter?', the BM25 expansion returns None, and decomposition has nothing to decompose into. The function would need to be extended, or Rule 4 would return the original query only — a no-op. For 'What risks were identified?', expansion DOES fire, and decomposition would work. The false positive problem is real but VARIABLE across the concrete query space.",
+      "current_node": "Fix B gate condition",
+      "suggested_action": "Add a secondary gate: Rule 4 only fires when expand_abstract_terms_for_bm25(query) returns Some. If the expansion vocabulary doesn't recognize any abstract terms, the query is concrete-without-entities, not abstract. This gates Rule 4 on the expansion vocabulary being relevant, not just on entity absence.",
+      "severity": "HIGH — regression risk to 0.88 single-hop MRR"
+    },
+    {
+      "interrupt_id": "OVERLOOK-INT-003",
+      "type": "MULTI_HOP_REGRESSION",
+      "anomaly": "Fix C's recency dampening (0.10->0.03) hurts multi-hop temporal queries that happen to have no focal entities",
+      "trigger": "Fix C's pre-fetch gate fires on entity-absent queries. Some multi-hop queries are entity-absent but temporal: 'What happened recently that affected our timeline?' has no focal entities but has temporal intent ('recently'). The temporal signal SHOULD prevent Fix C from firing (gate is 'entity-absent AND no temporal'). But 'recently' is detected by the recency heuristic (query_lower.contains('recent')), not by detect_temporal_intent() which looks for specific date references. If detect_temporal_intent returns None for 'recently', the gate condition is met and Fix C fires — dampening recency for a query that NEEDS recency.",
+      "evidence": "detect_temporal_intent() at query_parser.rs checks for: WhenQuestion, SpecificTime, Duration, Ordering. 'Recently' maps to none of these explicitly — it's a recency keyword, not a temporal intent. The has_temporal_query flag (requires_temporal_filtering) checks for date references. 'Recently' may or may not trigger it depending on whether requires_temporal_filtering includes relative time words. Need to verify. If 'recently' does NOT set has_temporal_query, Fix C's gate fires on recency-focused queries.",
+      "current_node": "Fix C gate condition + temporal intent detection",
+      "suggested_action": "Verify: does requires_temporal_filtering('What happened recently?') return true? If not, add 'recently', 'latest', 'last few' to the temporal detection. Alternatively, add a separate recency-keyword check to Fix C's gate: exclude queries containing any of the wants_recent keywords (recall.rs:2253-2258).",
+      "severity": "MEDIUM — affects queries at the temporal/recency boundary"
+    },
+    {
+      "interrupt_id": "OVERLOOK-INT-004",
+      "type": "DEAD_CODE_SIGNAL",
+      "anomaly": "Fix C graph_boost dampening (0.08->0.02) has zero effect for the target query category",
+      "trigger": "For entity-absent queries, graph traversal (Layer 2) produces 0 results because it has no seed entities. The hebbian_scores HashMap is empty. graph_boost = hebbian_scores.get(&mem.id) * 0.08 = 0.0 * 0.08 = 0.0. Dampening 0.08 to 0.02 changes 0.0 * 0.08 = 0.0 to 0.0 * 0.02 = 0.0. No effect.",
+      "evidence": "recall.rs:2367-2373: graph_boost = hebbian_scores.get(&mem.id).unwrap_or(0.0).clamp(0.0, 1.0) * 0.08. When graph traversal yields no results, hebbian_scores is populated only from graph_results which is empty for entity-absent queries. The only way graph_boost > 0 is if a memory appears in graph_results, which requires seed entities in Layer 2.",
+      "current_node": "Fix C graph_boost component",
+      "suggested_action": "Remove graph_boost dampening from Fix C. It adds code complexity for zero behavioral change. If the intent is to dampen graph signal for queries that DO have entities but are still abstract, then the gate condition needs to be different (not 'entity-absent').",
+      "severity": "LOW — no regression risk, but wasted complexity"
+    }
+  ],
+
+  "phase_5_synthesis": {
+    "final_vector_state": {
+      "D1_intent_clarity":           {"raw": 0.78, "ema": 0.78, "trend": "stable"},
+      "D2_evaluation_depth":         {"raw": 0.82, "ema": 0.82, "trend": "rising"},
+      "D3_coverage_breadth":         {"raw": 0.55, "ema": 0.55, "trend": "stalled"},
+      "D4_phase_position":           {"raw": 0.70, "ema": 0.70, "trend": "advancing"},
+      "D5_attention_balance":        {"raw": 0.38, "ema": 0.38, "trend": "SPIKED_DROP"},
+      "D6_evidence_density":         {"raw": 0.72, "ema": 0.72, "trend": "stable"},
+      "D7_code_groundedness":        {"raw": 0.85, "ema": 0.85, "trend": "high_stable"},
+      "D8_structural_groundedness":  {"raw": 0.70, "ema": 0.70, "trend": "stable"},
+      "D9_error_coverage":           {"raw": 0.52, "ema": 0.52, "trend": "declining"},
+      "D10_contract_coverage":       {"raw": 0.45, "ema": 0.45, "trend": "low_stable"},
+      "D11_attack_surface":          {"raw": 0.90, "ema": 0.90, "trend": "not_applicable"},
+      "D12_hazop_completion":        {"raw": 0.60, "ema": 0.60, "trend": "partial"},
+      "D13_fmea_completion":         {"raw": 0.55, "ema": 0.55, "trend": "declining"},
+      "D14_mirror_symmetry":         {"raw": 0.35, "ema": 0.35, "trend": "SPIKED_DROP"},
+      "D15_fractal_consistency":     {"raw": 0.30, "ema": 0.30, "trend": "SPIKED_DROP"},
+      "D16_paradigm_stability":      {"raw": 0.85, "ema": 0.85, "trend": "stable"},
+      "D17_sibling_consistency":     {"raw": 0.42, "ema": 0.42, "trend": "SPIKED_DROP"},
+      "D18_pattern_confidence":      {"raw": 0.55, "ema": 0.55, "trend": "mixed"},
+      "D19_scale_coverage":          {"raw": 0.60, "ema": 0.60, "trend": "stable"},
+      "D20_auth_risk":               {"raw": 0.95, "ema": 0.95, "trend": "not_applicable"},
+      "D21_pii_exposure":            {"raw": 0.95, "ema": 0.95, "trend": "not_applicable"},
+      "D22_integration_fragility":   {"raw": 0.72, "ema": 0.72, "trend": "stable"},
+      "D23_session_novelty":         {"raw": 0.65, "ema": 0.65, "trend": "declining"},
+      "D24_pattern_confirmation":    {"raw": 0.70, "ema": 0.70, "trend": "rising"},
+      "D25_ratchet_candidates":      {"raw": 0.75, "ema": 0.75, "trend": "strong"},
+      "D26_cross_session_drift":     {"raw": 0.50, "ema": 0.50, "trend": "none"},
+      "D27_seed_utilization":        {"raw": 0.70, "ema": 0.70, "trend": "productive"}
+    },
+
+    "dimension_movement_summary": {
+      "biggest_drops": [
+        {"dimension": "D15", "value": 0.30, "cause": "Four fractally inconsistent query-type adaptation paths"},
+        {"dimension": "D14", "value": 0.35, "cause": "Write-path analysis completely absent (RRF discount asymmetry)"},
+        {"dimension": "D5",  "value": 0.38, "cause": "Tunnel vision on open-domain; false positive regression risk unexamined"},
+        {"dimension": "D17", "value": 0.42, "cause": "Three fixes use three different gating strategies"}
+      ],
+      "biggest_rises": [
+        {"dimension": "D7",  "value": 0.85, "cause": "All fixes grounded to specific code locations with line numbers"},
+        {"dimension": "D25", "value": 0.75, "cause": "Three ratchet-quality findings (CE spread on rerank_budget, RRF weight inversion, expansion gate)"}
+      ],
+      "movement_pattern": "The analysis is CODE-GROUNDED (D7 high) but STRUCTURALLY FRAGMENTED (D15, D17 low). The individual fixes are well-specified at the code level but the combined proposal has fractal inconsistencies and unexamined interaction effects. This is a common pattern in solo/small-team mature codebases: each fix is locally rational but globally incoherent."
+    },
+
+    "improvement_surfaces": [
+      {
+        "surface": "Unified QueryProfile abstraction",
+        "gap": "D15 at 0.30 vs achievable 0.75+",
+        "description": "Replace the 4 ad-hoc query-type adaptation paths with a single QueryProfile struct computed once in query_parser.rs and consumed by ALL layers. The struct carries: query_category (Attribute/Temporal/Concrete/Abstract), entity_richness (0-1), temporal_strength (0-1), abstractness (0-1), per-signal weight multipliers. Each layer reads the profile instead of independently detecting query type. This eliminates the fractal break.",
+        "estimated_effort": "Medium (2-3 hours): define struct, populate in analyze_query, thread through semantic_retrieve, replace per-layer switches",
+        "expected_impact": "HIGH — eliminates the root cause of fractal inconsistency, makes A+B+C implementation cleaner, and prevents future ad-hoc adaptations"
+      },
+      {
+        "surface": "Fix A gate should be Fix B consequent, not CE spread",
+        "gap": "D17 at 0.42 vs achievable 0.70+",
+        "description": "Instead of using CE spread < 0.20 as Fix A's gate, make Fix A conditional on Fix B having fired (Rule 4 decomposition triggered). This couples the two fixes into a coherent unit: 'when the query is abstract (detected structurally by Rule 4), also apply adaptive CE blend and signal dampening.' The CE spread becomes a TELEMETRY metric for validation, not a gate condition.",
+        "estimated_effort": "Low (30 minutes): pass a `rule4_fired: bool` from Layer 3 through to Layer 5.3",
+        "expected_impact": "HIGH — eliminates the compound gate failure (OVERLOOK-INT-001) and makes the three fixes consistently gated"
+      },
+      {
+        "surface": "Fix B needs a secondary expansion-vocabulary gate",
+        "gap": "D9 at 0.52 vs achievable 0.70+",
+        "description": "Rule 4 should only fire when expand_abstract_terms_for_bm25() returns Some (abstract vocabulary recognized). This prevents false positives on entity-absent concrete queries like 'What bugs did we encounter?' where the expansion vocabulary has no relevant entries. The gate becomes: zero entities + no temporal + abstract vocabulary recognized.",
+        "estimated_effort": "Low (15 minutes): add the check before entering decomposition logic",
+        "expected_impact": "MEDIUM — eliminates the false positive regression risk on single-hop queries"
+      },
+      {
+        "surface": "RRF weight inversion for Rule 4 sub-queries",
+        "gap": "D14 at 0.35 vs achievable 0.60+",
+        "description": "For Rule 4 abstract decomposition, the sub-queries are MORE focused than the original query. The current QUERY_DECOMPOSITION_SUB_WEIGHT=0.6 disadvantages sub-queries. For Rule 4 specifically, invert: original=0.6, sub-queries=1.0. This requires decompose_query to return a weight hint per rule, or a separate constant for Rule 4.",
+        "estimated_effort": "Low (30 minutes): add QUERY_DECOMPOSITION_RULE4_ORIGINAL_WEIGHT to constants.rs, branch in Layer 3 decomposed RRF",
+        "expected_impact": "MEDIUM — ensures the focused sub-query embeddings get full RRF weight, improving abstract query recall"
+      },
+      {
+        "surface": "Remove Fix C graph_boost dampening (dead code)",
+        "gap": "Complexity reduction",
+        "description": "Fix C proposes dampening graph_boost from 0.08 to 0.02 for entity-absent queries. This is a no-op because graph traversal produces 0 results for entity-absent queries, so graph_boost is already 0.0. Remove this component to reduce unnecessary code complexity.",
+        "estimated_effort": "Trivial (5 minutes): don't implement this part",
+        "expected_impact": "LOW (complexity reduction) — but important signal: it indicates the Fix C design was made without tracing the actual data flow for entity-absent queries"
+      },
+      {
+        "surface": "MMR lambda relaxation for abstract queries",
+        "gap": "Not in current proposal",
+        "description": "Intugest identified MMR (lambda=0.6) ejecting correct results for multi-answer abstract queries. Fix B widens the candidate pool, potentially making MMR worse (more similar candidates from related sub-queries). Consider: when Rule 4 fires, set MMR lambda=0.85 or skip MMR entirely. Abstract queries benefit from topical coherence, not diversity.",
+        "estimated_effort": "Low (15 minutes): add a branch in the MMR gate at recall.rs:2735",
+        "expected_impact": "MEDIUM — prevents Fix B's wider pool from being undermined by MMR diversity penalties"
+      }
+    ],
+
+    "net_risk_assessment": {
+      "overall_risk": "ELEVATED — the combined A+B+C fix has a higher failure surface than the prior analyses estimated",
+      "risk_breakdown": {
+        "regression_risk": "HIGH. Fix B's Rule 4 false positive class could regress single-hop MRR (0.88). Fix A's CE spread gate may fire universally after Fix B widens the pool. Combined: 30-40% probability of measurable regression on non-abstract queries without the mitigation steps above.",
+        "improvement_ceiling": "MODERATE. With all mitigations applied (expansion gate, consequent coupling, RRF weight inversion, MMR relaxation), expected open-domain MRR improvement from 0.68 to 0.78-0.83. Without mitigations, improvement is 0.68 to 0.72-0.75 due to false positive drag.",
+        "implementation_risk": "LOW. All fixes are coefficient changes and gate additions in well-understood code paths. No new dependencies, no new async paths, no new data structures. The risk is in DESIGN (wrong gates, wrong coefficients), not implementation.",
+        "maintenance_risk": "HIGH without QueryProfile refactoring. Each new query category would require updating 5+ layers with ad-hoc switches. With QueryProfile, maintenance risk drops to LOW."
+      },
+      "recommended_implementation_order": [
+        "1. Implement QueryProfile abstraction (eliminates fractal break, required foundation)",
+        "2. Implement Fix B with expansion-vocabulary gate and RRF weight inversion (widens pool correctly)",
+        "3. Implement Fix A as Fix B consequent, not CE-spread-gated (consistent gating)",
+        "4. Implement Fix C pre-fetch dampening only (entity_overlap 0.10->0.04, content 0.05->0.02). Drop graph_boost dampening (dead code).",
+        "5. Implement Fix C post-fetch dampening ONLY if Rule 4 fired (recency 0.10->0.03, access 0.02->0.01). Couple to same gate as Fix A.",
+        "6. Add MMR lambda relaxation for Rule 4 queries (lambda=0.85)",
+        "7. Add telemetry: log CE spread, decomposition trigger rate, false positive rate per query category"
+      ]
+    },
+
+    "paradigm_verdict": "Paradigm classification HOLDS. Devtools/ai-ml, mature, elevated risk, solo/small team. The fractal break (D15=0.30) is a MAINTENANCE risk, not a paradigm shift. The recommended QueryProfile refactoring addresses it within the current paradigm.",
+
+    "learning_candidates": [
+      {
+        "finding": "CE spread is computed on rerank_budget (10 candidates), not full pool. Using CE spread as a gate for query abstractness is unreliable because the spread is determined by the TOP candidates after unified scoring, which have similar scores by construction.",
+        "dimension_movement": "D9 moved from 0.75 to 0.52",
+        "specificity": "HIGH — grounded to recall.rs:2636, constants involved, mathematical argument",
+        "persistence_recommendation": "STORE — this invalidates Fix A's primary gate mechanism"
+      },
+      {
+        "finding": "decompose_query Rule 4 gate (zero entities + no temporal) has false positive class: entity-absent concrete queries. Secondary gate needed: expand_abstract_terms_for_bm25() must return Some.",
+        "dimension_movement": "D5 moved from 0.75 to 0.38",
+        "specificity": "HIGH — specific gate condition, specific false positive examples, specific mitigation",
+        "persistence_recommendation": "STORE — required before Fix B implementation"
+      },
+      {
+        "finding": "QUERY_DECOMPOSITION_SUB_WEIGHT=0.6 is calibrated for entity-split where original > sub-queries. For abstract decomposition, sub-queries > original. Weight should be inverted for Rule 4.",
+        "dimension_movement": "D14 moved from 0.50 to 0.35",
+        "specificity": "HIGH — specific constant, specific inversion logic, clear rationale",
+        "persistence_recommendation": "STORE — changes the RRF fusion behavior for all Rule 4 queries"
+      }
+    ],
+
+    "delta_report": {
+      "dimensions_moved_most": "D15 (-0.35), D5 (-0.30), D14 (-0.25), D17 (-0.20)",
+      "movement_interpretation": "The proposal has strong LOCAL quality (D7=0.85 code groundedness) but weak GLOBAL coherence (D15=0.30 fractal consistency, D17=0.42 sibling consistency). This is the signature of a mature codebase under solo development: each fix is well-crafted in isolation but the combined system has accumulated structural debt in the query-type adaptation layer. The path forward is not to abandon A+B+C but to PRECEDE it with the QueryProfile unification, then implement the fixes as profile-driven adaptations rather than ad-hoc gate additions."
+    }
+  }
+}

@@ -572,6 +572,51 @@ pub static EMBEDDING_CACHE_CONTENT_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("EMBEDDING_CACHE_CONTENT_SIZE metric must be valid at compile time")
 });
 
+// ============================================================================
+// Retrieval Signal Variance Metrics
+// ============================================================================
+
+pub static RETRIEVAL_VARIANCE_SEMANTIC: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "shodh_retrieval_variance_semantic",
+            "Average semantic signal contribution to final retrieval score",
+        )
+        .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+    )
+    .expect("RETRIEVAL_VARIANCE_SEMANTIC metric must be valid at compile time")
+});
+
+pub static RETRIEVAL_VARIANCE_GRAPH: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "shodh_retrieval_variance_graph",
+            "Average graph signal contribution to final retrieval score",
+        )
+        .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+    )
+    .expect("RETRIEVAL_VARIANCE_GRAPH metric must be valid at compile time")
+});
+
+pub static RETRIEVAL_VARIANCE_LINGUISTIC: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "shodh_retrieval_variance_linguistic",
+            "Average linguistic signal contribution to final retrieval score",
+        )
+        .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+    )
+    .expect("RETRIEVAL_VARIANCE_LINGUISTIC metric must be valid at compile time")
+});
+
+pub static SUPPRESSOR_DETECTIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_suppressor_detections_total",
+        "Total suppressor events where multi-signal competition removed or demoted a candidate",
+    )
+    .expect("SUPPRESSOR_DETECTIONS_TOTAL metric must be valid at compile time")
+});
+
 /// Register all metrics with the global registry
 ///
 /// # Returns
@@ -688,6 +733,13 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(EMBEDDING_CACHE_CONTENT, "EMBEDDING_CACHE_CONTENT");
     register!(EMBEDDING_CACHE_QUERY_SIZE, "EMBEDDING_CACHE_QUERY_SIZE");
     register!(EMBEDDING_CACHE_CONTENT_SIZE, "EMBEDDING_CACHE_CONTENT_SIZE");
+    register!(RETRIEVAL_VARIANCE_SEMANTIC, "RETRIEVAL_VARIANCE_SEMANTIC");
+    register!(RETRIEVAL_VARIANCE_GRAPH, "RETRIEVAL_VARIANCE_GRAPH");
+    register!(
+        RETRIEVAL_VARIANCE_LINGUISTIC,
+        "RETRIEVAL_VARIANCE_LINGUISTIC"
+    );
+    register!(SUPPRESSOR_DETECTIONS_TOTAL, "SUPPRESSOR_DETECTIONS_TOTAL");
 
     if errors.is_empty() {
         Ok(())

@@ -1,3 +1,4 @@
+//! Earth layer: embedding infrastructure (model loading, inference, trait definitions).
 //! Embedding generation module
 //!
 //! Provides semantic embedding generation for memory retrieval.
@@ -10,6 +11,8 @@
 //!
 //! # Configuration
 //! - `SHODH_OFFLINE=true` - Disable auto-download
+//! - `SHODH_AUTO_DOWNLOAD_MODELS=true` - Explicitly allow model/runtime downloads
+//! - `SHODH_NEURAL_NER=true` - Enable neural NER when local models exist
 //! - `SHODH_LAZY_LOAD=false` - Load model at startup
 //! - `SHODH_ONNX_THREADS=N` - Set ONNX intra-op thread count (default: 1 on macOS ARM64, 2 elsewhere)
 
@@ -23,6 +26,8 @@ pub mod keywords;
 pub mod minilm;
 pub mod ner;
 pub mod nomic;
+#[cfg(feature = "zenoh")]
+pub mod zenoh_embedder;
 
 // Re-export chunking types
 pub use chunking::{chunk_text, ChunkConfig, ChunkResult};
@@ -50,6 +55,24 @@ pub use circuit_breaker::{
 
 // Re-export competitive embedder
 pub use competitive::CompetitiveEmbedder;
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
+pub(crate) fn offline_mode_enabled() -> bool {
+    env_flag("SHODH_OFFLINE", false)
+}
+
+pub(crate) fn auto_download_models_enabled() -> bool {
+    env_flag("SHODH_AUTO_DOWNLOAD_MODELS", false)
+}
+
+pub(crate) fn neural_ner_enabled() -> bool {
+    env_flag("SHODH_NEURAL_NER", false)
+}
 
 /// Trait for embedding generation
 pub trait Embedder: Send + Sync {

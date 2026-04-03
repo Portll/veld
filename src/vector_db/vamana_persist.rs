@@ -47,6 +47,7 @@ const MAGIC: [u8; 4] = *b"VAMA";
 const VERSION: u32 = 1;
 const HEADER_SIZE: usize = 64;
 const ALIGNMENT: usize = 64;
+const MAX_REASONABLE_DIMENSION: usize = 16_384;
 
 /// Header for persisted Vamana index
 #[repr(C, packed)]
@@ -165,6 +166,107 @@ fn compute_checksum(data: &[u8]) -> u64 {
 /// Align offset to boundary
 fn align_to(offset: usize, alignment: usize) -> usize {
     (offset + alignment - 1) & !(alignment - 1)
+}
+
+fn checked_add(a: usize, b: usize, context: &str) -> Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| anyhow!("Overflow while computing {context}"))
+}
+
+fn checked_mul(a: usize, b: usize, context: &str) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| anyhow!("Overflow while computing {context}"))
+}
+
+fn ensure_available(file_len: usize, offset: usize, bytes: usize, context: &str) -> Result<()> {
+    let end = checked_add(offset, bytes, context)?;
+    if end > file_len {
+        return Err(anyhow!(
+            "Persisted Vamana index truncated while reading {context}: need {} bytes at offset {}, file len {}",
+            bytes,
+            offset,
+            file_len
+        ));
+    }
+    Ok(())
+}
+
+fn validate_layout(header: &VamanaHeader, file_len: usize) -> Result<(usize, usize, usize)> {
+    if file_len < HEADER_SIZE {
+        return Err(anyhow!(
+            "Persisted Vamana index too small: {} bytes",
+            file_len
+        ));
+    }
+
+    let num_vectors: usize = header
+        .num_vectors
+        .try_into()
+        .map_err(|_| anyhow!("num_vectors does not fit in usize"))?;
+    let dimension: usize = header
+        .dimension
+        .try_into()
+        .map_err(|_| anyhow!("dimension does not fit in usize"))?;
+    let deleted_count: usize = header
+        .deleted_count
+        .try_into()
+        .map_err(|_| anyhow!("deleted_count does not fit in usize"))?;
+
+    if dimension == 0 || dimension > MAX_REASONABLE_DIMENSION {
+        return Err(anyhow!(
+            "Invalid persisted Vamana dimension: {}",
+            dimension
+        ));
+    }
+
+    if deleted_count > num_vectors {
+        return Err(anyhow!(
+            "Invalid persisted deleted_count {} for {} vectors",
+            deleted_count,
+            num_vectors
+        ));
+    }
+
+    let medoid = header.medoid;
+    if num_vectors > 0 && medoid as usize >= num_vectors {
+        return Err(anyhow!(
+            "Invalid persisted medoid {} for {} vectors",
+            medoid,
+            num_vectors
+        ));
+    }
+
+    let deleted_section_size = checked_mul(deleted_count, 4, "deleted section size")?;
+    let graph_min_section_size = checked_mul(num_vectors, 2, "minimum graph section size")?;
+    let graph_offset = checked_add(
+        HEADER_SIZE,
+        deleted_section_size,
+        "graph section offset",
+    )?;
+    let vectors_offset = align_to(
+        checked_add(
+            graph_offset,
+            graph_min_section_size,
+            "minimum vectors offset",
+        )?,
+        ALIGNMENT,
+    );
+    let vector_section_size = checked_mul(
+        checked_mul(num_vectors, dimension, "vector count × dimension")?,
+        4,
+        "vector bytes",
+    )?;
+    let minimum_file_size = checked_add(vectors_offset, vector_section_size, "minimum file size")?;
+
+    if minimum_file_size > file_len {
+        return Err(anyhow!(
+            "Persisted Vamana layout exceeds file size: need at least {} bytes, file has {}",
+            minimum_file_size,
+            file_len
+        ));
+    }
+
+    Ok((num_vectors, dimension, deleted_count))
 }
 
 impl VamanaIndex {
@@ -296,9 +398,11 @@ impl VamanaIndex {
 
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        ensure_available(mmap.len(), 0, HEADER_SIZE, "header")?;
 
         // Read header
         let header = VamanaHeader::from_bytes(&mmap[..HEADER_SIZE])?;
+        let (num_vectors, dimension, deleted_count) = validate_layout(&header, mmap.len())?;
 
         // Verify checksum
         let stored_checksum = header.checksum;
@@ -311,14 +415,11 @@ impl VamanaIndex {
             ));
         }
 
-        let num_vectors = header.num_vectors as usize;
-        let dimension = header.dimension as usize;
-        let deleted_count = header.deleted_count as usize;
-
         // Read deleted IDs
         let mut offset = HEADER_SIZE;
         let mut deleted_ids = HashSet::with_capacity(deleted_count);
         for _ in 0..deleted_count {
+            ensure_available(mmap.len(), offset, 4, "deleted id")?;
             let id = u32::from_le_bytes(mmap[offset..offset + 4].try_into()?);
             deleted_ids.insert(id);
             offset += 4;
@@ -327,8 +428,23 @@ impl VamanaIndex {
         // Read graph
         let mut graph = Vec::with_capacity(num_vectors);
         for node_id in 0..num_vectors {
+            ensure_available(mmap.len(), offset, 2, "graph neighbor count")?;
             let count = u16::from_le_bytes(mmap[offset..offset + 2].try_into()?) as usize;
             offset += 2;
+            if count > num_vectors {
+                return Err(anyhow!(
+                    "Invalid persisted neighbor count {} for node {} (num_vectors={})",
+                    count,
+                    node_id,
+                    num_vectors
+                ));
+            }
+            ensure_available(
+                mmap.len(),
+                offset,
+                checked_mul(count, 4, "graph neighbor bytes")?,
+                "graph neighbors",
+            )?;
             let mut neighbors = Vec::with_capacity(count);
             for _ in 0..count {
                 let neighbor = u32::from_le_bytes(mmap[offset..offset + 4].try_into()?);
@@ -343,13 +459,32 @@ impl VamanaIndex {
 
         // Calculate vectors offset (aligned)
         let vectors_offset = align_to(offset, ALIGNMENT);
+        let vector_section_size = checked_mul(
+            checked_mul(num_vectors, dimension, "vector count × dimension")?,
+            4,
+            "vector bytes",
+        )?;
+        ensure_available(
+            mmap.len(),
+            vectors_offset,
+            vector_section_size,
+            "vector section",
+        )?;
 
         // Read vectors into memory (could also keep mmap'd)
-        let vectors_bytes = &mmap[vectors_offset..];
+        let vectors_bytes = &mmap[vectors_offset..vectors_offset + vector_section_size];
         let mut vectors = Vec::with_capacity(num_vectors);
         for i in 0..num_vectors {
-            let start = i * dimension * 4;
-            let end = start + dimension * 4;
+            let start = checked_mul(
+                checked_mul(i, dimension, "vector row offset")?,
+                4,
+                "vector row byte offset",
+            )?;
+            let end = checked_add(
+                start,
+                checked_mul(dimension, 4, "vector row byte length")?,
+                "vector row end",
+            )?;
             let vec: Vec<f32> = vectors_bytes[start..end]
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
@@ -416,6 +551,9 @@ impl VamanaIndex {
         }
 
         let header = VamanaHeader::from_bytes(&mmap[..HEADER_SIZE])?;
+        if validate_layout(&header, mmap.len()).is_err() {
+            return Ok(false);
+        }
         let stored_checksum = header.checksum;
         let computed_checksum = compute_checksum(&mmap[HEADER_SIZE..]);
 
@@ -529,5 +667,19 @@ mod tests {
         assert_eq!(medoid, 42);
         assert_eq!(deleted_count, 5);
         assert_eq!(incremental_inserts, 100);
+    }
+
+    #[test]
+    fn test_rejects_invalid_layout_before_allocation() {
+        let temp_dir = tempdir().unwrap();
+        let index_path = temp_dir.path().join("invalid-layout.vamana");
+
+        let mut header =
+            VamanaHeader::new(1_000_000, 384, 32, 0, DistanceMetric::NormalizedDotProduct, 0, 0);
+        header.checksum = compute_checksum(&[]);
+        std::fs::write(&index_path, header.to_bytes()).unwrap();
+
+        assert!(!VamanaIndex::verify_index_file(&index_path).unwrap());
+        assert!(VamanaIndex::load_from_file(&index_path).is_err());
     }
 }

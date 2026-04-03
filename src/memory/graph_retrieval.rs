@@ -38,6 +38,10 @@ use crate::constants::{
     DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
     EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
     IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
+    QUERY_TYPE_ATTRIBUTE_GRAPH, QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC,
+    QUERY_TYPE_EXPLORATORY_GRAPH, QUERY_TYPE_EXPLORATORY_LINGUISTIC,
+    QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH, QUERY_TYPE_TEMPORAL_LINGUISTIC,
+    QUERY_TYPE_TEMPORAL_SEMANTIC,
     MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION,
     MEMORY_TIER_GRAPH_MULT_WORKING, ONTOLOGICAL_DENSITY_THRESHOLD, ONTOLOGICAL_ENTITY_PENALTY,
     ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, SALIENCE_BOOST_FACTOR,
@@ -48,10 +52,10 @@ use crate::constants::{
 };
 use crate::embeddings::Embedder;
 use crate::graph_memory::{EdgeTier, EntityLabel, EpisodicNode, GraphMemory, RelationType};
-use crate::memory::query_parser::{infer_ontological_intent, OntologicalIntent};
+use crate::memory::query_parser::{classify_query, infer_ontological_intent, OntologicalIntent};
 use crate::memory::types::MemoryTier;
 // Note: compute_relevance removed - using unified density-weighted scoring directly
-use crate::memory::query_parser::{analyze_query, QueryAnalysis};
+use crate::memory::query_parser::{analyze_query, QueryAnalysis, QueryType};
 use crate::memory::types::{Memory, Query, RetrievalStats, SharedMemory};
 use crate::similarity::cosine_similarity;
 
@@ -517,6 +521,7 @@ pub fn spreading_activation_retrieve(
         graph,
         embedder,
         None, // No density = use legacy fixed weights
+        None, // No pre-computed query type = classify internally
         None, // No pre-computed intent = compute internally
         episode_to_memory_fn,
     )?;
@@ -527,7 +532,9 @@ pub fn spreading_activation_retrieve(
 ///
 /// Enhanced version that:
 /// - Uses density-dependent hybrid weights (graph trust scales with associations)
+/// - Uses query-type-dependent weights when density is unavailable
 /// - Applies importance-weighted decay (important memories decay slower)
+/// - Tracks per-signal contribution variance for observability
 /// - Returns RetrievalStats for observability
 ///
 /// # Arguments
@@ -535,32 +542,75 @@ pub fn spreading_activation_retrieve(
 /// - `query`: Query parameters including max_results
 /// - `graph`: The knowledge graph for spreading activation
 /// - `embedder`: Embedding model for semantic scoring
-/// - `graph_density`: Optional density (edges/memories). If None, uses fixed weights.
+/// - `graph_density`: Optional density (edges/memories). If None, uses query-type or fixed weights.
+/// - `query_type`: Optional query classification. Used for weight selection when density is None.
 /// - `ontological_intent`: Pre-computed ontological intent. When `Some`, avoids recomputing.
 /// - `episode_to_memory_fn`: Function to convert episodes to memories
 ///
 /// # Returns
 /// (Vec<ActivatedMemory>, RetrievalStats)
+#[allow(clippy::too_many_arguments)]
 pub fn spreading_activation_retrieve_with_stats(
     query_text: &str,
     query: &Query,
     graph: &GraphMemory,
     embedder: &dyn Embedder,
     graph_density: Option<f32>,
+    query_type: Option<&QueryType>,
     ontological_intent: Option<&OntologicalIntent>,
     episode_to_memory_fn: impl Fn(&EpisodicNode) -> Result<Option<SharedMemory>>,
 ) -> Result<(Vec<ActivatedMemory>, RetrievalStats)> {
     let start_time = Instant::now();
     let mut stats = RetrievalStats::default();
 
-    // Determine weights based on density
+    let computed_query_type;
+    let resolved_query_type = match query_type {
+        Some(query_type) => Some(query_type),
+        None => {
+            computed_query_type = classify_query(query_text);
+            Some(&computed_query_type)
+        }
+    };
+
+    // Determine weights: density takes precedence, then query type, then defaults.
     let (semantic_weight, graph_weight, linguistic_weight) = if let Some(density) = graph_density {
         stats.mode = "associative".to_string();
         stats.graph_density = density;
+        stats.weight_profile = "density".to_string();
         calculate_density_weights(density)
+    } else if let Some(query_type) = resolved_query_type {
+        stats.mode = "hybrid".to_string();
+        stats.graph_density = 0.0;
+        match query_type {
+            QueryType::Attribute(_) => {
+                stats.weight_profile = "query_type:attribute".to_string();
+                (
+                    QUERY_TYPE_ATTRIBUTE_SEMANTIC,
+                    QUERY_TYPE_ATTRIBUTE_GRAPH,
+                    QUERY_TYPE_ATTRIBUTE_LINGUISTIC,
+                )
+            }
+            QueryType::Temporal => {
+                stats.weight_profile = "query_type:temporal".to_string();
+                (
+                    QUERY_TYPE_TEMPORAL_SEMANTIC,
+                    QUERY_TYPE_TEMPORAL_GRAPH,
+                    QUERY_TYPE_TEMPORAL_LINGUISTIC,
+                )
+            }
+            QueryType::Exploratory => {
+                stats.weight_profile = "query_type:exploratory".to_string();
+                (
+                    QUERY_TYPE_EXPLORATORY_SEMANTIC,
+                    QUERY_TYPE_EXPLORATORY_GRAPH,
+                    QUERY_TYPE_EXPLORATORY_LINGUISTIC,
+                )
+            }
+        }
     } else {
         stats.mode = "hybrid".to_string();
         stats.graph_density = 0.0;
+        stats.weight_profile = "default".to_string();
         (
             HYBRID_SEMANTIC_WEIGHT,
             HYBRID_GRAPH_WEIGHT,
@@ -958,6 +1008,10 @@ pub fn spreading_activation_retrieve_with_stats(
 
     // Step 5: Convert episodes to memories and calculate scores using UNIFIED scoring
     let mut scored_memories = Vec::new();
+    let mut total_semantic_contrib = 0.0_f32;
+    let mut total_graph_contrib = 0.0_f32;
+    let mut total_linguistic_contrib = 0.0_f32;
+    let mut variance_sample_count = 0_usize;
 
     // Generate query embedding once (for semantic scoring)
     let embedding_start = Instant::now();
@@ -1004,6 +1058,13 @@ pub fn spreading_activation_retrieve_with_stats(
                 + graph_activation * norm_graph
                 + linguistic_score * norm_linguistic;
 
+            if hybrid_score > 0.0 {
+                total_semantic_contrib += (semantic_score * norm_semantic) / hybrid_score;
+                total_graph_contrib += (graph_activation * norm_graph) / hybrid_score;
+                total_linguistic_contrib += (linguistic_score * norm_linguistic) / hybrid_score;
+                variance_sample_count += 1;
+            }
+
             // Recency decay (10% contribution) - recent memories get boost
             // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
             const RECENCY_DECAY_RATE: f32 = 0.01;
@@ -1036,6 +1097,18 @@ pub fn spreading_activation_retrieve_with_stats(
                 final_score,
             });
         }
+    }
+
+    if variance_sample_count > 0 {
+        let n = variance_sample_count as f32;
+        stats.semantic_variance_pct = total_semantic_contrib / n;
+        stats.graph_variance_pct = total_graph_contrib / n;
+        stats.linguistic_variance_pct = total_linguistic_contrib / n;
+
+        crate::metrics::RETRIEVAL_VARIANCE_SEMANTIC.observe(stats.semantic_variance_pct as f64);
+        crate::metrics::RETRIEVAL_VARIANCE_GRAPH.observe(stats.graph_variance_pct as f64);
+        crate::metrics::RETRIEVAL_VARIANCE_LINGUISTIC
+            .observe(stats.linguistic_variance_pct as f64);
     }
 
     // Step 6: Sort by final score (descending)
@@ -1213,6 +1286,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_adaptive_constants_valid() {
         use crate::constants::*;
 
@@ -1302,6 +1376,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_bidirectional_constants_valid() {
         // Minimum entities must be at least 2 for bidirectional to make sense
         assert!(BIDIRECTIONAL_MIN_ENTITIES >= 2);
@@ -1412,7 +1487,7 @@ mod tests {
     #[test]
     fn test_bidirectional_entity_split() {
         // Test alternating assignment distributes evenly
-        let entities = vec![
+        let entities = [
             (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity3".to_string(), 1.0, 0.5),
@@ -1438,7 +1513,7 @@ mod tests {
     #[test]
     fn test_bidirectional_odd_entities() {
         // Test odd number of entities doesn't leave backward empty
-        let entities = vec![
+        let entities = [
             (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity3".to_string(), 1.0, 0.5),
@@ -1470,18 +1545,18 @@ mod tests {
         // Test when bidirectional is triggered vs unidirectional
 
         // 1 entity: unidirectional
-        let single_entity = vec![(Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5)];
+        let single_entity = [(Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5)];
         assert!(single_entity.len() < BIDIRECTIONAL_MIN_ENTITIES);
 
         // 2 entities: bidirectional
-        let two_entities = vec![
+        let two_entities = [
             (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
         ];
         assert!(two_entities.len() >= BIDIRECTIONAL_MIN_ENTITIES);
 
         // 5 entities: bidirectional
-        let many_entities = vec![
+        let many_entities = [
             (Uuid::new_v4(), "entity1".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity2".to_string(), 1.0, 0.5),
             (Uuid::new_v4(), "entity3".to_string(), 1.0, 0.5),

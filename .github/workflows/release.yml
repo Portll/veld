@@ -65,7 +65,9 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install llvm
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
+          LLVM_PREFIX=$(brew --prefix llvm)
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Download ONNX Runtime (Unix)
         if: runner.os != 'Windows'
@@ -99,7 +101,7 @@ jobs:
         run: |
           mkdir -p package
           cp target/${{ matrix.target }}/release/shodh package/
-          cp target/${{ matrix.target }}/release/shodh-memory-server package/
+          cp target/${{ matrix.target }}/release/veld package/
           cp tui/target/${{ matrix.target }}/release/shodh-tui package/
           cp ${{ matrix.ort_lib_name }} package/
           cat > package/shodh-memory << 'EOF'
@@ -110,7 +112,7 @@ jobs:
           EOF
           chmod +x package/shodh-memory
           chmod +x package/shodh
-          chmod +x package/shodh-memory-server
+          chmod +x package/veld
           chmod +x package/shodh-tui
           tar -czvf ${{ matrix.name }}.tar.gz -C package .
 
@@ -119,7 +121,7 @@ jobs:
         run: |
           mkdir -p package
           cp target/${{ matrix.target }}/release/shodh package/
-          cp target/${{ matrix.target }}/release/shodh-memory-server package/
+          cp target/${{ matrix.target }}/release/veld package/
           cp tui/target/${{ matrix.target }}/release/shodh-tui package/
           cp ${{ matrix.ort_lib_name }} package/
           cat > package/shodh-memory << 'EOF'
@@ -130,7 +132,7 @@ jobs:
           EOF
           chmod +x package/shodh-memory
           chmod +x package/shodh
-          chmod +x package/shodh-memory-server
+          chmod +x package/veld
           chmod +x package/shodh-tui
           tar -czvf ${{ matrix.name }}.tar.gz -C package .
 
@@ -140,7 +142,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path package
           Copy-Item "target\${{ matrix.target }}\release\shodh.exe" -Destination "package\"
-          Copy-Item "target\${{ matrix.target }}\release\shodh-memory-server.exe" -Destination "package\"
+          Copy-Item "target\${{ matrix.target }}\release\veld.exe" -Destination "package\"
           Copy-Item "tui\target\${{ matrix.target }}\release\shodh-tui.exe" -Destination "package\"
           Copy-Item "onnxruntime.dll" -Destination "package\"
           @"
@@ -199,7 +201,7 @@ jobs:
         run: |
           mkdir -p package
           cp target/aarch64-unknown-linux-gnu/release/shodh package/
-          cp target/aarch64-unknown-linux-gnu/release/shodh-memory-server package/
+          cp target/aarch64-unknown-linux-gnu/release/veld package/
           cp tui/target/aarch64-unknown-linux-gnu/release/shodh-tui package/
           cp libonnxruntime.so package/
           cat > package/shodh-memory << 'EOF'
@@ -210,7 +212,7 @@ jobs:
           EOF
           chmod +x package/shodh-memory
           chmod +x package/shodh
-          chmod +x package/shodh-memory-server
+          chmod +x package/veld
           chmod +x package/shodh-tui
           tar -czvf shodh-memory-linux-arm64.tar.gz -C package .
 

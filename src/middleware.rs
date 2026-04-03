@@ -331,6 +331,7 @@ fn is_id(segment: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

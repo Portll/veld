@@ -1,8 +1,8 @@
-//! Pinky Dimension Push Handlers
+//! External Dimension Push Handlers (Sleight integration)
 //!
-//! Accepts dimension scores from the Pinky evaluation engine via HTTP POST.
-//! Pinky computes topological health metrics (density, coherence, closure,
-//! confidence, isotropy) from gap analysis + Voronoi decomposition on shodh's
+//! Accepts dimension scores from the Sleight evaluation engine via HTTP POST.
+//! Sleight computes topological health metrics (density, coherence, closure,
+//! confidence, isotropy) from gap analysis + Voronoi decomposition on Veld's
 //! graph API. These scores modulate retrieval scoring in Layer 5.
 
 use axum::{extract::State, response::Json};
@@ -10,15 +10,15 @@ use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::types::PinkyDimensionScores;
+use crate::memory::types::ExternalDimensionScores;
 use crate::validation;
 
 /// Application state type alias
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 
-/// Request body for POST /api/pinky/dimensions
+/// Request body for POST /api/sleight/dimensions
 #[derive(Debug, Deserialize)]
-pub struct PinkyDimensionsRequest {
+pub struct SleightDimensionsRequest {
     pub user_id: String,
     /// Entity density in the relevant region (0.0 = sparse, 1.0 = saturated)
     pub density: f32,
@@ -32,21 +32,24 @@ pub struct PinkyDimensionsRequest {
     pub isotropy: f32,
 }
 
-/// Response body for POST /api/pinky/dimensions
+/// Response body for POST /api/sleight/dimensions
 #[derive(Debug, Serialize)]
-pub struct PinkyDimensionsResponse {
+pub struct SleightDimensionsResponse {
     pub success: bool,
 }
 
-/// POST /api/pinky/dimensions
+pub type WintermuteDosDimensionsRequest = SleightDimensionsRequest;
+pub type WintermuteDosDimensionsResponse = SleightDimensionsResponse;
+
+/// POST /api/sleight/dimensions
 ///
-/// Accept dimension scores from Pinky and store them on the user's MemorySystem.
+/// Accept dimension scores from Sleight and store them on the user's MemorySystem.
 /// These scores are consumed during retrieval (Layer 5) as a global quality
-/// multiplier via `pinky_aggregate_score()`.
+/// multiplier via `external_aggregate_score()`.
 pub async fn push_dimensions(
     State(state): State<AppState>,
-    Json(req): Json<PinkyDimensionsRequest>,
-) -> Result<Json<PinkyDimensionsResponse>, AppError> {
+    Json(req): Json<SleightDimensionsRequest>,
+) -> Result<Json<SleightDimensionsResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     // Validate score ranges (all must be 0.0..=1.0)
@@ -66,11 +69,11 @@ pub async fn push_dimensions(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
-    let scores = PinkyDimensionScores {
+    let scores = ExternalDimensionScores {
         density: req.density,
         coherence: req.coherence,
         closure: req.closure,
@@ -79,7 +82,7 @@ pub async fn push_dimensions(
         computed_at: Some(chrono::Utc::now()),
     };
 
-    memory_guard.set_pinky_scores(scores);
+    memory_guard.set_external_scores(scores);
 
     tracing::info!(
         user_id = %req.user_id,
@@ -88,8 +91,8 @@ pub async fn push_dimensions(
         closure = req.closure,
         confidence = req.confidence,
         isotropy = req.isotropy,
-        "Pinky dimension scores updated"
+        "Sleight dimension scores updated"
     );
 
-    Ok(Json(PinkyDimensionsResponse { success: true }))
+    Ok(Json(SleightDimensionsResponse { success: true }))
 }

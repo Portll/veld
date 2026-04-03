@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Shodh-Memory">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Veld - Agentic Memory">
 </p>
 
-<h1 align="center">Shodh-Memory</h1>
+<h1 align="center">Veld - Agentic Memory</h1>
 
 <p align="center"><b>Persistent cognitive memory for AI agents and robots. Remembers what matters, forgets what doesn't, gets smarter with use.</b></p>
 
@@ -21,34 +21,71 @@
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/Shodh_preview.gif" width="800" alt="Shodh-Memory Demo — Claude Code with persistent memory and TUI dashboard">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/Shodh_preview.gif" width="800" alt="Veld - Agentic Memory Demo — Claude Code with persistent memory and TUI dashboard">
 </p>
 
 AI agents forget everything between sessions. Robots lose context between missions. They repeat mistakes, miss patterns, and treat every interaction like the first one.
 
-Shodh-Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. Works for chat agents (MCP/HTTP), robots (Zenoh/ROS2), and edge devices. No API keys. No cloud. No external databases. One binary.
+Veld - Agentic Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. Works for chat agents (MCP/HTTP), robots (Zenoh/ROS2), and edge devices. No API keys. No cloud. No external databases. One binary.
 
-## Why Not Just Use mem0 / Cognee / Zep?
+`Veld - Agentic Memory` is the product name. The current published package IDs and binaries remain `shodh-memory`, `@shodh/memory-mcp`, and `shodh` while registry surfaces catch up.
 
-| | **Shodh** | **mem0** | **Cognee** | **Zep** |
+> Branch status: this repository is currently tracked as `v0.7.6-unstable`.
+> It is being cleaned and stabilized toward a clean `v0.8` cut before the later
+> `v0.9` public-release work. Treat the branch tip as internal/unstable unless a
+> tagged release says otherwise.
+>
+> Local macOS builds on this branch should use `./scripts/cargo-dev.sh ...` from
+> the repo root so Cargo inherits the current `libclang.dylib` workaround needed
+> by the RocksDB build path.
+
+## How Veld Compares
+
+| Product | What it is | Deployment | Learns from usage | Best fit |
 |---|---|---|---|---|
-| LLM calls to store a memory | **0** | 2+ per add | 3+ per cognify | 2+ per episode |
-| External services needed | **None** | OpenAI + vector DB | OpenAI + Neo4j + vector DB | OpenAI + Neo4j |
-| Time to store a memory | **55ms** | ~20 seconds | seconds | seconds |
-| Learns from usage | **Yes** (Hebbian) | No | No | No |
-| Forgets irrelevant data | **Yes** (decay) | No | No | Temporal only |
-| Runs fully offline | **Yes** | No | No | No |
-| Robotics / ROS2 native | **Yes** (Zenoh) | No | No | No |
-| Binary size | **~17MB** | pip install + API keys | pip install + API keys + Neo4j | Cloud only |
+| **Veld** | Local-first agentic memory runtime | Single binary + local models | **Yes**: Hebbian learning, decay, replay | Agents, robotics, offline systems |
+| **Mem0** | Managed memory layer | Cloud API and hosted services | LLM-assisted memory workflows | Cloud-managed app memory |
+| **Cognee** | Knowledge graph extraction stack | Neo4j + vector DB + LLM stack | Graph construction and retrieval | Graph-heavy ETL and knowledge workflows |
+| **Pinecone** | Hosted vector database | Cloud service | No memory runtime behavior | Managed vector infrastructure at scale |
+| **Zep** | Hosted conversational memory service | Cloud service | Session and conversation memory | SaaS chat memory |
 
-Every other memory system delegates intelligence to LLM API calls — that's why they're slow, expensive, and can't work offline. Shodh uses algorithmic intelligence: local embeddings, mathematical decay, learned associations. No LLM in the loop.
+Veld is strongest when memory has to stay local, adaptive, and operationally simple. Mem0 is better when you want managed cloud memory workflows. Cognee is better when the main job is graph-heavy extraction. Pinecone is better when you need hosted vector infra. Zep is better when you want a hosted conversational memory service. The key distinction is that Veld is a memory runtime, not just storage or orchestration.
 
 ## Get Started
+
+These install commands target the last tagged public artifacts. If you are working
+from the checked-out `v0.7.6-unstable` branch, treat the repo as an internal
+stabilization tree and prefer the repo-local development docs and wrappers.
+
+### Build From Source (Branch Tip)
+
+If you intentionally want this branch rather than the last tagged release
+artifacts, build and run from the repo checkout instead of using Homebrew or the
+published package registries.
+
+```bash
+# Build the current branch tip with the repo-local wrapper
+./scripts/cargo-dev.sh build --release
+
+# Run the unified CLI directly from the checkout
+./target/release/shodh init
+./target/release/shodh server
+./target/release/shodh tui
+```
+
+For repo-local MCP work on this branch:
+
+```bash
+cd mcp-server
+bun install
+bun run build
+node dist/index.js
+```
 
 ### Unified CLI
 
 ```bash
-# Download from GitHub Releases (or brew tap varun29ankuS/shodh-memory && brew install shodh-memory)
+# Download from GitHub Releases (or, for the last public release line only, brew tap varun29ankuS/shodh-memory && brew install shodh-memory)
 shodh init       # First-time setup — creates config, generates API key, downloads AI model
 shodh server     # Start the memory server on :3030
 shodh tui        # Launch the TUI dashboard
@@ -98,6 +135,7 @@ For local use, no API key is needed — one is generated automatically. For remo
 ### Python
 
 ```bash
+# Last published package surface, not this unstable branch tip
 pip install shodh-memory
 ```
 
@@ -113,6 +151,7 @@ results = memory.recall("user preferences", limit=5)
 
 ```toml
 [dependencies]
+# Last published crate surface, not this unstable branch tip
 shodh-memory = "0.1"
 ```
 
@@ -143,8 +182,10 @@ Under the hood, memories flow through three tiers:
 
 ```
 Working Memory ──overflow──▶ Session Memory ──importance──▶ Long-Term Memory
-   (100 items)                  (100 MB)                      (RocksDB)
+  (100 items)                  (100 MB)                      (backend-selected store)
 ```
+
+The storage migration is underway: `redb` is the default backend target, while RocksDB remains the legacy compatibility engine until the backend abstraction lands.
 
 This is based on [Cowan's working memory model](https://doi.org/10.1177/0963721409359277) and [Wixted's memory decay research](https://doi.org/10.1111/j.1467-9280.2004.00687.x). The neuroscience isn't a gimmick — it's why the system gets better with use instead of just accumulating data.
 
@@ -168,13 +209,13 @@ shodh tui
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/recall.png" width="700" alt="Shodh Recall">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/recall.png" width="700" alt="Veld Recall">
 </p>
 
 <p align="center"><i>Semantic recall with hybrid search — relevance scores, memory tiers, and activity feed</i></p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/projects-todos.jpg" width="700" alt="Shodh Projects & Todos">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/projects-todos.jpg" width="700" alt="Veld Projects & Todos">
 </p>
 
 <p align="center"><i>GTD task management — projects, todos, comments, and causal lineage</i></p>
@@ -239,7 +280,7 @@ curl -X POST http://localhost:3030/api/recall \
 
 ## Robotics & ROS2
 
-Shodh-Memory isn't just for chat agents. It's persistent memory for robots — Spot, drones, humanoids, any system running ROS2 or Zenoh.
+Veld isn't just for chat agents. It's persistent memory for robots — Spot, drones, humanoids, any system running ROS2 or Zenoh.
 
 ```bash
 # Enable Zenoh transport (compile with --features zenoh)

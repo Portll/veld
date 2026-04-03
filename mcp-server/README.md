@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Shodh-Memory">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Veld - Agentic Memory">
 </p>
 
-<h1 align="center">Shodh-Memory MCP Server</h1>
+<h1 align="center">Veld - Agentic Memory MCP Server</h1>
 
 <p align="center">
-  <strong>v0.1.90</strong> | Persistent cognitive memory for AI agents
+  <strong>Internal branch: v0.7.6-unstable</strong> | Persistent cognitive memory for AI agents
 </p>
 
 <p align="center">
@@ -21,6 +21,12 @@
 </p>
 
 ---
+
+Product name: `Veld - Agentic Memory`. Published MCP package: `@shodh/memory-mcp`.
+
+> Status: this repo branch is in internal stabilization toward `v0.8`. The
+> published npm package may lag behind the checked-out source here; treat this
+> branch as unstable unless you are intentionally doing repo-local development.
 
 ## Features
 
@@ -71,6 +77,19 @@ env = { SHODH_API_KEY = "your-api-key-here" }
 > **Note**: First run downloads the server binary (~15MB) plus embedding model (~23MB). The `startup_timeout_sec = 60` ensures enough time for initial setup.
 
 **For Cursor/other MCP clients**: Similar configuration with the npx command.
+
+### Build From Source (Branch Tip)
+
+The published npm package tracks the last public release line. If you are
+testing the checked-out `v0.7.6-unstable` branch, build the MCP server from this
+repo and point your client at the generated `dist/index.js` instead of `npx`.
+
+```bash
+cd mcp-server
+bun install
+bun run build
+node dist/index.js
+```
 
 ## Environment Variables
 
@@ -264,8 +283,8 @@ The backend server runs locally and stores all data on your machine. No cloud de
 
 ## Related Packages
 
-- **Python SDK**: `pip install shodh-memory` - Native Python bindings
-- **Rust Crate**: `cargo add shodh-memory` - Use as a library
+- **Python SDK**: `pip install shodh-memory` - last published Python package line
+- **Rust Crate**: `cargo add shodh-memory` - last published crate line
 
 ## Links
 

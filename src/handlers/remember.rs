@@ -8,6 +8,7 @@ use axum::{extract::State, response::Json};
 
 use super::health::AppState;
 use super::types::MemoryEvent;
+use crate::earth::SharedEarth;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     types::{
@@ -476,7 +477,7 @@ pub async fn remember(
     };
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_id = {
@@ -760,7 +761,7 @@ pub async fn remember(
 /// Reference: Bai et al. (2026) §4.2.3 — H-MEM weight regulation, WISE side-memory
 fn detect_and_resolve_conflicts(
     state: &AppState,
-    memory_arc: &std::sync::Arc<parking_lot::RwLock<crate::memory::MemorySystem>>,
+    memory_arc: &SharedEarth,
     user_id: &str,
     new_memory_id: &crate::memory::MemoryId,
 ) -> anyhow::Result<()> {
@@ -885,6 +886,8 @@ fn detect_and_resolve_conflicts(
                 activation_timestamps: None,
                 entity_confidence: None,
                 created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+                forward_strength: sim,
+                backward_strength: sim,
             };
             let _ = graph.add_relationship(edge);
         }
@@ -966,7 +969,7 @@ pub async fn batch_remember(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let extract_entities = req.options.extract_entities;
@@ -1208,7 +1211,7 @@ pub async fn upsert_memory(
     };
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let external_id = req.external_id.clone();

@@ -4,7 +4,7 @@
 //! and bulk delete operations (forget by age, importance, tags, etc.)
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ use tracing::info;
 
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{self, ExperienceType, Memory};
 use crate::validation;
@@ -199,19 +201,20 @@ pub struct PatchMemoryRequest {
 #[tracing::instrument(skip(state))]
 pub async fn get_memory(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(memory_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<MemoryWithHierarchy>, AppError> {
-    let user_id = params
-        .get("user_id")
-        .ok_or_else(|| AppError::InvalidInput {
-            field: "user_id".to_string(),
-            reason: "user_id required".to_string(),
-        })?;
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
 
-    validation::validate_user_id(user_id).map_validation_err("user_id")?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let memory = state
+        .get_user_earth(&user_id)
+        .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
     let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -242,13 +245,18 @@ pub async fn get_memory(
 #[tracing::instrument(skip(state), fields(user_id = %user_id))]
 pub async fn list_memories(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -355,7 +363,7 @@ async fn list_memories_inner(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -438,7 +446,7 @@ pub async fn update_memory(
     }
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -496,7 +504,7 @@ pub async fn delete_memory(
 
     validation::validate_user_id(user_id).map_validation_err("user_id")?;
 
-    let memory = state.get_user_memory(user_id).map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(user_id).map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
     let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -546,7 +554,7 @@ pub async fn forget_by_id(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -594,7 +602,7 @@ pub async fn patch_memory(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -667,7 +675,7 @@ pub async fn forget_by_age(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -709,7 +717,7 @@ pub async fn forget_by_importance(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -758,7 +766,7 @@ pub async fn forget_by_pattern(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -800,7 +808,7 @@ pub async fn forget_by_tags(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -854,7 +862,7 @@ pub async fn forget_by_date(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -909,7 +917,7 @@ pub async fn bulk_delete_memories(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -980,7 +988,7 @@ pub async fn clear_all_memories(
     }
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1084,7 +1092,7 @@ pub async fn get_memory_health(
     validation::validate_user_id(user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_memory(user_id)
+        .get_user_earth(user_id)
         .map_err(AppError::Internal)?;
 
     let mem = {
@@ -1188,7 +1196,7 @@ pub async fn anchor_memory(
     let memory_id = memory::MemoryId(uuid);
 
     let memory_sys = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let anchor_value = req.anchor;

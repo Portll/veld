@@ -4,7 +4,7 @@
 |-------|-------|
 | SEP | 002 |
 | Title | Memory Interchange Format |
-| Author | Shodh Team |
+| Author | Veld - Agentic Memory Team |
 | Status | Draft |
 | Created | 2026-01-03 |
 | Updated | 2026-01-03 |
@@ -299,7 +299,7 @@ The graph captures learned associations between memories:
     "top_entities": [
       {"text": "Rust", "count": 45},
       {"text": "TypeScript", "count": 38},
-      {"text": "shodh-memory", "count": 32}
+      {"text": "Veld", "count": 32}
     ],
     "projects": [
       {"id": "proj_1", "name": "Backend", "todo_count": 23},

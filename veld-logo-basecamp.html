@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Veld Logo — Basecamp Style</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #f8f6f3; font-family: 'Inter', sans-serif; min-height: 100vh; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 60px 30px; }
+  h1 { font-size: 13px; letter-spacing: 3px; color: #999; text-transform: uppercase; margin-bottom: 8px; font-weight: 500; }
+  .subtitle { font-size: 11px; color: #bbb; margin-bottom: 50px; letter-spacing: 1px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 30px;
+  }
+  .cell {
+    background: #fff;
+    border: 1px solid #e8e5e0;
+    border-radius: 12px;
+    padding: 36px 24px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    transition: box-shadow 0.2s;
+  }
+  .cell:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+  .cell svg { margin-bottom: 20px; }
+  .name { font-size: 11px; font-weight: 600; color: #444; margin-bottom: 4px; }
+  .desc { font-size: 10px; color: #999; text-align: center; line-height: 1.6; }
+
+  .dark-row { margin-top: 40px; }
+  .dark-row .section-label { font-size: 11px; letter-spacing: 2px; color: #bbb; text-transform: uppercase; margin-bottom: 16px; font-weight: 500; }
+  .dark-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 30px;
+  }
+  .dark-cell {
+    background: #0a0a0c;
+    border: 1px solid #1a1a1e;
+    border-radius: 12px;
+    padding: 36px 24px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .dark-cell svg { margin-bottom: 20px; }
+  .dark-cell .name { color: #888; }
+  .dark-cell .desc { color: #555; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Veld — Logo Exploration</h1>
+<div class="subtitle">3 grass blades, digital neuron roots in white, brown earth. Basecamp warmth.</div>
+
+<div class="grid">
+
+  <!-- 01: Clean & Centered -->
+  <div class="cell">
+    <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- ▼ EARTH — warm brown band at bottom -->
+      <rect x="20" y="130" width="140" height="50" rx="6" fill="#8B6F47" opacity="0.15"/>
+      <rect x="20" y="130" width="140" height="50" rx="6" fill="none" stroke="#8B6F47" stroke-width="1" opacity="0.2"/>
+      <!-- Earth texture -->
+      <circle cx="50" cy="155" r="3" fill="#8B6F47" opacity="0.06"/>
+      <circle cx="100" cy="160" r="4" fill="#8B6F47" opacity="0.05"/>
+      <circle cx="130" cy="148" r="2.5" fill="#8B6F47" opacity="0.06"/>
+      <circle cx="70" cy="168" r="3.5" fill="#8B6F47" opacity="0.04"/>
+
+      <!-- ▼ ROOTS — white digital neuron network spreading into earth -->
+      <g stroke="#ffffff" fill="none">
+        <!-- Left blade roots -->
+        <line x1="68" y1="118" x2="65" y2="140" stroke-width="2.2" opacity="0.85"/>
+        <line x1="65" y1="140" x2="45" y2="162" stroke-width="1.5" opacity="0.6"/>
+        <line x1="65" y1="140" x2="70" y2="165" stroke-width="1.2" opacity="0.5"/>
+        <line x1="45" y1="162" x2="32" y2="175" stroke-width="0.8" opacity="0.3"/>
+        <line x1="45" y1="162" x2="50" y2="178" stroke-width="0.8" opacity="0.3"/>
+        <!-- Node clusters on left roots -->
+        <circle cx="65" cy="140" r="3" fill="#ffffff" opacity="0.7" stroke="none"/>
+        <circle cx="45" cy="162" r="2" fill="#ffffff" opacity="0.5" stroke="none"/>
+        <circle cx="32" cy="175" r="1.5" fill="#ffffff" opacity="0.25" stroke="none"/>
+
+        <!-- Centre blade roots (strongest, deepest) -->
+        <line x1="90" y1="118" x2="90" y2="145" stroke-width="2.5" opacity="0.9"/>
+        <line x1="90" y1="145" x2="75" y2="168" stroke-width="1.5" opacity="0.55"/>
+        <line x1="90" y1="145" x2="105" y2="168" stroke-width="1.5" opacity="0.55"/>
+        <line x1="90" y1="145" x2="90" y2="178" stroke-width="1.8" opacity="0.65"/>
+        <line x1="75" y1="168" x2="65" y2="178" stroke-width="0.8" opacity="0.3"/>
+        <line x1="105" y1="168" x2="115" y2="178" stroke-width="0.8" opacity="0.3"/>
+        <line x1="90" y1="160" x2="78" y2="172" stroke-width="0.8" opacity="0.3"/>
+        <line x1="90" y1="160" x2="102" y2="172" stroke-width="0.8" opacity="0.3"/>
+        <!-- Centre root nodes -->
+        <circle cx="90" cy="145" r="3.5" fill="#ffffff" opacity="0.75" stroke="none"/>
+        <circle cx="90" cy="160" r="2" fill="#ffffff" opacity="0.5" stroke="none"/>
+        <circle cx="75" cy="168" r="2" fill="#ffffff" opacity="0.4" stroke="none"/>
+        <circle cx="105" cy="168" r="2" fill="#ffffff" opacity="0.4" stroke="none"/>
+
+        <!-- Right blade roots -->
+        <line x1="112" y1="118" x2="115" y2="140" stroke-width="2.2" opacity="0.85"/>
+        <line x1="115" y1="140" x2="135" y2="162" stroke-width="1.5" opacity="0.6"/>
+        <line x1="115" y1="140" x2="110" y2="165" stroke-width="1.2" opacity="0.5"/>
+        <line x1="135" y1="162" x2="148" y2="175" stroke-width="0.8" opacity="0.3"/>
+        <line x1="135" y1="162" x2="130" y2="178" stroke-width="0.8" opacity="0.3"/>
+        <!-- Right root nodes -->
+        <circle cx="115" cy="140" r="3" fill="#ffffff" opacity="0.7" stroke="none"/>
+        <circle cx="135" cy="162" r="2" fill="#ffffff" opacity="0.5" stroke="none"/>
+        <circle cx="148" cy="175" r="1.5" fill="#ffffff" opacity="0.25" stroke="none"/>
+
+        <!-- Cross-connections between root systems (neural network) -->
+        <line x1="65" y1="140" x2="90" y2="145" stroke-width="0.8" opacity="0.2" stroke-dasharray="3 3"/>
+        <line x1="115" y1="140" x2="90" y2="145" stroke-width="0.8" opacity="0.2" stroke-dasharray="3 3"/>
+        <line x1="70" y1="165" x2="90" y2="160" stroke-width="0.6" opacity="0.15" stroke-dasharray="2 3"/>
+        <line x1="110" y1="165" x2="90" y2="160" stroke-width="0.6" opacity="0.15" stroke-dasharray="2 3"/>
+      </g>
+
+      <!-- ▼ GROUND LINE -->
+      <line x1="30" y1="120" x2="150" y2="120" stroke="#8B6F47" stroke-width="1.5" opacity="0.25"/>
+
+      <!-- ▼ GRASS — 3 healthy blades, organic curves, Basecamp warmth -->
+      <!-- Left blade -->
+      <path d="M68 120 C66 95, 55 65, 48 28 C50 25, 54 25, 56 28 C60 55, 66 88, 72 120" fill="#4CAF50" opacity="0.85"/>
+      <path d="M58 70 L48 28" stroke="#3d9142" stroke-width="0.5" opacity="0.3"/>
+
+      <!-- Centre blade (tallest, strongest) -->
+      <path d="M86 120 C85 90, 82 55, 86 12 C88 8, 92 8, 94 12 C98 55, 95 90, 94 120" fill="#43A047" opacity="0.9"/>
+      <path d="M90 60 L90 12" stroke="#357a38" stroke-width="0.5" opacity="0.3"/>
+
+      <!-- Right blade -->
+      <path d="M108 120 C114 95, 125 65, 132 28 C130 25, 126 25, 124 28 C120 55, 114 88, 112 120" fill="#4CAF50" opacity="0.85"/>
+      <path d="M122 70 L132 28" stroke="#3d9142" stroke-width="0.5" opacity="0.3"/>
+    </svg>
+    <div class="name">01 — Clean & Centred</div>
+    <div class="desc">Three even blades. White neuron roots spread symmetrically into warm earth.</div>
+  </div>
+
+  <!-- 02: Asymmetric Growth -->
+  <div class="cell">
+    <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect x="15" y="125" width="150" height="55" rx="8" fill="#8B6F47" opacity="0.12"/>
+
+      <!-- Roots — more organic, asymmetric -->
+      <g stroke="#ffffff" fill="none">
+        <line x1="60" y1="115" x2="55" y2="138" stroke-width="2" opacity="0.8"/>
+        <line x1="55" y1="138" x2="35" y2="158" stroke-width="1.3" opacity="0.5"/>
+        <line x1="55" y1="138" x2="58" y2="162" stroke-width="1" opacity="0.4"/>
+        <line x1="35" y1="158" x2="25" y2="172" stroke-width="0.7" opacity="0.25"/>
+        <circle cx="55" cy="138" r="2.5" fill="#ffffff" opacity="0.65" stroke="none"/>
+        <circle cx="35" cy="158" r="1.8" fill="#ffffff" opacity="0.4" stroke="none"/>
+
+        <line x1="85" y1="115" x2="82" y2="142" stroke-width="2.5" opacity="0.9"/>
+        <line x1="82" y1="142" x2="68" y2="170" stroke-width="1.5" opacity="0.5"/>
+        <line x1="82" y1="142" x2="95" y2="172" stroke-width="1.5" opacity="0.5"/>
+        <line x1="82" y1="142" x2="80" y2="178" stroke-width="1.8" opacity="0.6"/>
+        <line x1="82" y1="155" x2="72" y2="168" stroke-width="0.8" opacity="0.3"/>
+        <line x1="82" y1="155" x2="92" y2="165" stroke-width="0.8" opacity="0.3"/>
+        <circle cx="82" cy="142" r="3.5" fill="#ffffff" opacity="0.7" stroke="none"/>
+        <circle cx="82" cy="155" r="2" fill="#ffffff" opacity="0.45" stroke="none"/>
+        <circle cx="68" cy="170" r="1.5" fill="#ffffff" opacity="0.3" stroke="none"/>
+
+        <line x1="120" y1="115" x2="125" y2="140" stroke-width="2" opacity="0.8"/>
+        <line x1="125" y1="140" x2="142" y2="160" stroke-width="1.3" opacity="0.5"/>
+        <line x1="125" y1="140" x2="120" y2="168" stroke-width="1" opacity="0.4"/>
+        <line x1="142" y1="160" x2="155" y2="170" stroke-width="0.7" opacity="0.25"/>
+        <circle cx="125" cy="140" r="2.5" fill="#ffffff" opacity="0.65" stroke="none"/>
+        <circle cx="142" cy="160" r="1.8" fill="#ffffff" opacity="0.4" stroke="none"/>
+
+        <!-- Neural cross-links -->
+        <line x1="55" y1="138" x2="82" y2="142" stroke-width="0.7" opacity="0.18" stroke-dasharray="3 4"/>
+        <line x1="82" y1="142" x2="125" y2="140" stroke-width="0.7" opacity="0.18" stroke-dasharray="3 4"/>
+      </g>
+
+      <line x1="25" y1="118" x2="155" y2="118" stroke="#8B6F47" stroke-width="1.5" opacity="0.2"/>
+
+      <!-- Grass — natural lean, different heights -->
+      <path d="M60 118 C55 90, 42 55, 35 22 C37 18, 42 19, 43 22 C48 50, 58 85, 65 118" fill="#66BB6A" opacity="0.85"/>
+      <path d="M82 118 C80 85, 78 48, 82 8 C84 4, 88 4, 90 8 C94 48, 91 85, 90 118" fill="#43A047"/>
+      <path d="M115 118 C120 92, 130 58, 140 30 C138 26, 134 27, 133 30 C128 55, 120 88, 118 118" fill="#66BB6A" opacity="0.85"/>
+
+      <!-- Subtle vein lines -->
+      <path d="M48 65 L35 22" stroke="#338a36" stroke-width="0.4" opacity="0.25"/>
+      <path d="M86 55 L86 8" stroke="#2d7a30" stroke-width="0.4" opacity="0.3"/>
+      <path d="M130 60 L140 30" stroke="#338a36" stroke-width="0.4" opacity="0.25"/>
+    </svg>
+    <div class="name">02 — Asymmetric Growth</div>
+    <div class="desc">Natural lean. Left and right blades curve outward. Centre stands tall.</div>
+  </div>
+
+  <!-- 03: Thick & Bold -->
+  <div class="cell">
+    <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect x="18" y="128" width="144" height="52" rx="6" fill="#A0845C" opacity="0.14"/>
+
+      <!-- Bold roots -->
+      <g stroke="#ffffff" fill="none">
+        <line x1="65" y1="120" x2="60" y2="142" stroke-width="3" opacity="0.85"/>
+        <line x1="60" y1="142" x2="40" y2="165" stroke-width="2" opacity="0.55"/>
+        <line x1="60" y1="142" x2="65" y2="170" stroke-width="1.5" opacity="0.45"/>
+        <line x1="40" y1="165" x2="28" y2="176" stroke-width="1" opacity="0.25"/>
+        <circle cx="60" cy="142" r="4" fill="#ffffff" opacity="0.7" stroke="none"/>
+        <circle cx="40" cy="165" r="2.5" fill="#ffffff" opacity="0.4" stroke="none"/>
+
+        <line x1="90" y1="120" x2="90" y2="148" stroke-width="3.5" opacity="0.9"/>
+        <line x1="90" y1="148" x2="72" y2="172" stroke-width="2" opacity="0.5"/>
+        <line x1="90" y1="148" x2="108" y2="172" stroke-width="2" opacity="0.5"/>
+        <line x1="90" y1="148" x2="90" y2="178" stroke-width="2.5" opacity="0.6"/>
+        <circle cx="90" cy="148" r="4.5" fill="#ffffff" opacity="0.75" stroke="none"/>
+        <circle cx="72" cy="172" r="2.5" fill="#ffffff" opacity="0.35" stroke="none"/>
+        <circle cx="108" cy="172" r="2.5" fill="#ffffff" opacity="0.35" stroke="none"/>
+
+        <line x1="115" y1="120" x2="120" y2="142" stroke-width="3" opacity="0.85"/>
+        <line x1="120" y1="142" x2="140" y2="165" stroke-width="2" opacity="0.55"/>
+        <line x1="120" y1="142" x2="115" y2="170" stroke-width="1.5" opacity="0.45"/>
+        <line x1="140" y1="165" x2="152" y2="176" stroke-width="1" opacity="0.25"/>
+        <circle cx="120" cy="142" r="4" fill="#ffffff" opacity="0.7" stroke="none"/>
+        <circle cx="140" cy="165" r="2.5" fill="#ffffff" opacity="0.4" stroke="none"/>
+
+        <!-- Cross-links -->
+        <line x1="60" y1="142" x2="90" y2="148" stroke-width="1" opacity="0.2" stroke-dasharray="4 4"/>
+        <line x1="120" y1="142" x2="90" y2="148" stroke-width="1" opacity="0.2" stroke-dasharray="4 4"/>
+      </g>
+
+      <line x1="28" y1="122" x2="152" y2="122" stroke="#8B6F47" stroke-width="2" opacity="0.2"/>
+
+      <!-- Thick healthy blades -->
+      <path d="M62 122 C58 92, 44 56, 36 18 C39 12, 46 13, 48 18 C52 50, 62 86, 70 122" fill="#43A047" opacity="0.9"/>
+      <path d="M84 122 C82 85, 80 45, 85 6 C88 0, 93 0, 96 6 C100 45, 98 85, 96 122" fill="#2E7D32"/>
+      <path d="M110 122 C116 92, 130 56, 140 18 C137 12, 130 13, 128 18 C124 50, 116 86, 114 122" fill="#43A047" opacity="0.9"/>
+    </svg>
+    <div class="name">03 — Thick & Bold</div>
+    <div class="desc">Chunky, confident blades. Heavy root nodes. High visual weight.</div>
+  </div>
+
+  <!-- 04: Iconic / App Icon -->
+  <div class="cell">
+    <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- Rounded square background like an app icon -->
+      <rect x="30" y="20" width="120" height="160" rx="24" fill="#f0ece6"/>
+      <rect x="30" y="20" width="120" height="160" rx="24" fill="none" stroke="#ddd5c9" stroke-width="1"/>
+
+      <!-- Earth zone -->
+      <clipPath id="iconClip"><rect x="30" y="20" width="120" height="160" rx="24"/></clipPath>
+      <g clip-path="url(#iconClip)">
+        <rect x="30" y="118" width="120" height="62" fill="#8B6F47" opacity="0.12"/>
+
+        <!-- Roots -->
+        <g stroke="#ffffff" fill="none">
+          <line x1="72" y1="112" x2="68" y2="132" stroke-width="2.2" opacity="0.8"/>
+          <line x1="68" y1="132" x2="52" y2="152" stroke-width="1.3" opacity="0.5"/>
+          <line x1="68" y1="132" x2="72" y2="158" stroke-width="1" opacity="0.4"/>
+          <circle cx="68" cy="132" r="2.5" fill="#ffffff" opacity="0.6" stroke="none"/>
+          <circle cx="52" cy="152" r="1.5" fill="#ffffff" opacity="0.35" stroke="none"/>
+
+          <line x1="90" y1="112" x2="90" y2="138" stroke-width="2.5" opacity="0.85"/>
+          <line x1="90" y1="138" x2="78" y2="162" stroke-width="1.5" opacity="0.5"/>
+          <line x1="90" y1="138" x2="102" y2="162" stroke-width="1.5" opacity="0.5"/>
+          <line x1="90" y1="138" x2="90" y2="170" stroke-width="1.8" opacity="0.55"/>
+          <circle cx="90" cy="138" r="3" fill="#ffffff" opacity="0.7" stroke="none"/>
+          <circle cx="78" cy="162" r="1.5" fill="#ffffff" opacity="0.3" stroke="none"/>
+          <circle cx="102" cy="162" r="1.5" fill="#ffffff" opacity="0.3" stroke="none"/>
+
+          <line x1="108" y1="112" x2="112" y2="132" stroke-width="2.2" opacity="0.8"/>
+          <line x1="112" y1="132" x2="128" y2="152" stroke-width="1.3" opacity="0.5"/>
+          <line x1="112" y1="132" x2="108" y2="158" stroke-width="1" opacity="0.4"/>
+          <circle cx="112" cy="132" r="2.5" fill="#ffffff" opacity="0.6" stroke="none"/>
+          <circle cx="128" cy="152" r="1.5" fill="#ffffff" opacity="0.35" stroke="none"/>
+
+          <line x1="68" y1="132" x2="90" y2="138" stroke-width="0.7" opacity="0.15" stroke-dasharray="3 3"/>
+          <line x1="112" y1="132" x2="90" y2="138" stroke-width="0.7" opacity="0.15" stroke-dasharray="3 3"/>
+        </g>
+
+        <line x1="38" y1="114" x2="142" y2="114" stroke="#8B6F47" stroke-width="1" opacity="0.2"/>
+
+        <!-- Grass -->
+        <path d="M72 114 C69 90, 58 58, 52 32 C54 28, 58 29, 59 32 C62 52, 69 84, 76 114" fill="#43A047" opacity="0.85"/>
+        <path d="M86 114 C85 85, 84 52, 87 28 C89 24, 92 24, 93 28 C96 52, 94 85, 94 114" fill="#2E7D32"/>
+        <path d="M104 114 C108 90, 118 58, 126 32 C124 28, 120 29, 119 32 C116 52, 109 84, 107 114" fill="#43A047" opacity="0.85"/>
+      </g>
+    </svg>
+    <div class="name">04 — App Icon</div>
+    <div class="desc">Rounded container. Works as favicon, app icon, social avatar.</div>
+  </div>
+
+  <!-- 05: Minimal / Single Weight -->
+  <div class="cell">
+    <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- Entire mark drawn with consistent 2px stroke, no fills -->
+      <g stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <!-- Earth line -->
+        <line x1="40" y1="120" x2="140" y2="120" stroke="#A0845C" opacity="0.35"/>
+
+        <!-- Grass blades (outlines only) -->
+        <path d="M70 120 C67 92, 55 58, 48 25" stroke="#43A047" opacity="0.8"/>
+        <path d="M90 120 C89 85, 88 50, 90 15" stroke="#2E7D32" opacity="0.9"/>
+        <path d="M110 120 C113 92, 125 58, 132 25" stroke="#43A047" opacity="0.8"/>
+
+        <!-- Roots (white strokes) -->
+        <line x1="70" y1="120" x2="65" y2="142" stroke="#888" opacity="0.6"/>
+        <line x1="65" y1="142" x2="48" y2="162" stroke="#888" opacity="0.4"/>
+        <line x1="65" y1="142" x2="70" y2="162" stroke="#888" opacity="0.35"/>
+
+        <line x1="90" y1="120" x2="90" y2="148" stroke="#888" opacity="0.65"/>
+        <line x1="90" y1="148" x2="75" y2="168" stroke="#888" opacity="0.4"/>
+        <line x1="90" y1="148" x2="105" y2="168" stroke="#888" opacity="0.4"/>
+        <line x1="90" y1="148" x2="90" y2="175" stroke="#888" opacity="0.5"/>
+
+        <line x1="110" y1="120" x2="115" y2="142" stroke="#888" opacity="0.6"/>
+        <line x1="115" y1="142" x2="132" y2="162" stroke="#888" opacity="0.4"/>
+        <line x1="115" y1="142" x2="110" y2="162" stroke="#888" opacity="0.35"/>
+
+        <!-- Root nodes -->
+        <circle cx="65" cy="142" r="2.5" fill="#888" opacity="0.5" stroke="none"/>
+        <circle cx="90" cy="148" r="3" fill="#888" opacity="0.55" stroke="none"/>
+        <circle cx="115" cy="142" r="2.5" fill="#888" opacity="0.5" stroke="none"/>
+      </g>
+    </svg>
+    <div class="name">05 — Line Weight</div>
+    <div class="desc">Stroke only. Monoline feel. Prints at any size. Engraving-ready.</div>
+  </div>
+
+  <!-- 06: With Wordmark -->
+  <div class="cell">
+    <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <!-- Earth -->
+      <rect x="25" y="105" width="130" height="40" rx="5" fill="#8B6F47" opacity="0.1"/>
+
+      <!-- Roots -->
+      <g stroke="#ffffff" fill="none">
+        <line x1="68" y1="98" x2="64" y2="115" stroke-width="2" opacity="0.8"/>
+        <line x1="64" y1="115" x2="48" y2="132" stroke-width="1.3" opacity="0.5"/>
+        <line x1="64" y1="115" x2="68" y2="135" stroke-width="1" opacity="0.4"/>
+        <circle cx="64" cy="115" r="2.5" fill="#ffffff" opacity="0.6" stroke="none"/>
+
+        <line x1="90" y1="98" x2="90" y2="120" stroke-width="2.5" opacity="0.85"/>
+        <line x1="90" y1="120" x2="78" y2="138" stroke-width="1.3" opacity="0.45"/>
+        <line x1="90" y1="120" x2="102" y2="138" stroke-width="1.3" opacity="0.45"/>
+        <line x1="90" y1="120" x2="90" y2="142" stroke-width="1.5" opacity="0.5"/>
+        <circle cx="90" cy="120" r="3" fill="#ffffff" opacity="0.65" stroke="none"/>
+
+        <line x1="112" y1="98" x2="116" y2="115" stroke-width="2" opacity="0.8"/>
+        <line x1="116" y1="115" x2="132" y2="132" stroke-width="1.3" opacity="0.5"/>
+        <line x1="116" y1="115" x2="112" y2="135" stroke-width="1" opacity="0.4"/>
+        <circle cx="116" cy="115" r="2.5" fill="#ffffff" opacity="0.6" stroke="none"/>
+
+        <line x1="64" y1="115" x2="90" y2="120" stroke-width="0.6" opacity="0.15" stroke-dasharray="3 3"/>
+        <line x1="116" y1="115" x2="90" y2="120" stroke-width="0.6" opacity="0.15" stroke-dasharray="3 3"/>
+      </g>
+
+      <line x1="35" y1="100" x2="145" y2="100" stroke="#8B6F47" stroke-width="1" opacity="0.2"/>
+
+      <!-- Grass — compact -->
+      <path d="M68 100 C65 80, 55 50, 50 22 C52 18, 56 19, 57 22 C60 45, 66 76, 72 100" fill="#43A047" opacity="0.85"/>
+      <path d="M86 100 C85 75, 84 45, 87 12 C89 8, 92 8, 93 12 C96 45, 94 75, 94 100" fill="#2E7D32"/>
+      <path d="M108 100 C112 80, 122 50, 128 22 C126 18, 122 19, 121 22 C118 45, 112 76, 110 100" fill="#43A047" opacity="0.85"/>
+
+      <!-- Wordmark -->
+      <text x="90" y="175" text-anchor="middle" font-family="Inter, sans-serif" font-size="28" font-weight="700" fill="#2E7D32" letter-spacing="6">VELD</text>
+      <text x="90" y="192" text-anchor="middle" font-family="Inter, sans-serif" font-size="9" fill="#999" letter-spacing="3">AGENTIC MEMORY</text>
+    </svg>
+    <div class="name">06 — With Wordmark</div>
+    <div class="desc">Logo + name lockup. Ready for headers and landing pages.</div>
+  </div>
+
+</div>
+
+<!-- Dark versions -->
+<div class="dark-row">
+  <div class="dark-row section-label">On Dark Background</div>
+  <div class="dark-grid">
+    <div class="dark-cell">
+      <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="20" y="130" width="140" height="50" rx="6" fill="#8B6F47" opacity="0.2"/>
+        <g stroke="#ffffff" fill="none">
+          <line x1="68" y1="118" x2="65" y2="140" stroke-width="2.2" opacity="0.85"/>
+          <line x1="65" y1="140" x2="45" y2="162" stroke-width="1.5" opacity="0.6"/>
+          <line x1="65" y1="140" x2="70" y2="165" stroke-width="1.2" opacity="0.5"/>
+          <line x1="45" y1="162" x2="32" y2="175" stroke-width="0.8" opacity="0.3"/>
+          <circle cx="65" cy="140" r="3" fill="#ffffff" opacity="0.7" stroke="none"/>
+          <circle cx="45" cy="162" r="2" fill="#ffffff" opacity="0.5" stroke="none"/>
+          <line x1="90" y1="118" x2="90" y2="145" stroke-width="2.5" opacity="0.9"/>
+          <line x1="90" y1="145" x2="75" y2="168" stroke-width="1.5" opacity="0.55"/>
+          <line x1="90" y1="145" x2="105" y2="168" stroke-width="1.5" opacity="0.55"/>
+          <line x1="90" y1="145" x2="90" y2="178" stroke-width="1.8" opacity="0.65"/>
+          <circle cx="90" cy="145" r="3.5" fill="#ffffff" opacity="0.75" stroke="none"/>
+          <circle cx="75" cy="168" r="2" fill="#ffffff" opacity="0.4" stroke="none"/>
+          <circle cx="105" cy="168" r="2" fill="#ffffff" opacity="0.4" stroke="none"/>
+          <line x1="112" y1="118" x2="115" y2="140" stroke-width="2.2" opacity="0.85"/>
+          <line x1="115" y1="140" x2="135" y2="162" stroke-width="1.5" opacity="0.6"/>
+          <line x1="115" y1="140" x2="110" y2="165" stroke-width="1.2" opacity="0.5"/>
+          <circle cx="115" cy="140" r="3" fill="#ffffff" opacity="0.7" stroke="none"/>
+          <circle cx="135" cy="162" r="2" fill="#ffffff" opacity="0.5" stroke="none"/>
+          <line x1="65" y1="140" x2="90" y2="145" stroke-width="0.8" opacity="0.2" stroke-dasharray="3 3"/>
+          <line x1="115" y1="140" x2="90" y2="145" stroke-width="0.8" opacity="0.2" stroke-dasharray="3 3"/>
+        </g>
+        <line x1="30" y1="120" x2="150" y2="120" stroke="#8B6F47" stroke-width="1.5" opacity="0.3"/>
+        <path d="M68 120 C66 95, 55 65, 48 28 C50 25, 54 25, 56 28 C60 55, 66 88, 72 120" fill="#4CAF50" opacity="0.85"/>
+        <path d="M86 120 C85 90, 82 55, 86 12 C88 8, 92 8, 94 12 C98 55, 95 90, 94 120" fill="#43A047" opacity="0.9"/>
+        <path d="M108 120 C114 95, 125 65, 132 28 C130 25, 126 25, 124 28 C120 55, 114 88, 112 120" fill="#4CAF50" opacity="0.85"/>
+      </svg>
+      <div class="name">01 — On Dark</div>
+      <div class="desc">White roots pop. Green glows. The roots become the star.</div>
+    </div>
+
+    <div class="dark-cell">
+      <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="18" y="128" width="144" height="52" rx="6" fill="#A0845C" opacity="0.18"/>
+        <g stroke="#ffffff" fill="none">
+          <line x1="65" y1="120" x2="60" y2="142" stroke-width="3" opacity="0.85"/>
+          <line x1="60" y1="142" x2="40" y2="165" stroke-width="2" opacity="0.55"/>
+          <line x1="60" y1="142" x2="65" y2="170" stroke-width="1.5" opacity="0.45"/>
+          <circle cx="60" cy="142" r="4" fill="#ffffff" opacity="0.7" stroke="none"/>
+          <circle cx="40" cy="165" r="2.5" fill="#ffffff" opacity="0.4" stroke="none"/>
+          <line x1="90" y1="120" x2="90" y2="148" stroke-width="3.5" opacity="0.9"/>
+          <line x1="90" y1="148" x2="72" y2="172" stroke-width="2" opacity="0.5"/>
+          <line x1="90" y1="148" x2="108" y2="172" stroke-width="2" opacity="0.5"/>
+          <line x1="90" y1="148" x2="90" y2="178" stroke-width="2.5" opacity="0.6"/>
+          <circle cx="90" cy="148" r="4.5" fill="#ffffff" opacity="0.75" stroke="none"/>
+          <circle cx="72" cy="172" r="2.5" fill="#ffffff" opacity="0.35" stroke="none"/>
+          <circle cx="108" cy="172" r="2.5" fill="#ffffff" opacity="0.35" stroke="none"/>
+          <line x1="115" y1="120" x2="120" y2="142" stroke-width="3" opacity="0.85"/>
+          <line x1="120" y1="142" x2="140" y2="165" stroke-width="2" opacity="0.55"/>
+          <line x1="120" y1="142" x2="115" y2="170" stroke-width="1.5" opacity="0.45"/>
+          <circle cx="120" cy="142" r="4" fill="#ffffff" opacity="0.7" stroke="none"/>
+          <circle cx="140" cy="165" r="2.5" fill="#ffffff" opacity="0.4" stroke="none"/>
+          <line x1="60" y1="142" x2="90" y2="148" stroke-width="1" opacity="0.2" stroke-dasharray="4 4"/>
+          <line x1="120" y1="142" x2="90" y2="148" stroke-width="1" opacity="0.2" stroke-dasharray="4 4"/>
+        </g>
+        <line x1="28" y1="122" x2="152" y2="122" stroke="#8B6F47" stroke-width="2" opacity="0.25"/>
+        <path d="M62 122 C58 92, 44 56, 36 18 C39 12, 46 13, 48 18 C52 50, 62 86, 70 122" fill="#43A047" opacity="0.9"/>
+        <path d="M84 122 C82 85, 80 45, 85 6 C88 0, 93 0, 96 6 C100 45, 98 85, 96 122" fill="#2E7D32"/>
+        <path d="M110 122 C116 92, 130 56, 140 18 C137 12, 130 13, 128 18 C124 50, 116 86, 114 122" fill="#43A047" opacity="0.9"/>
+      </svg>
+      <div class="name">03 — Bold on Dark</div>
+      <div class="desc">Maximum weight. The root network becomes a constellation.</div>
+    </div>
+
+    <div class="dark-cell">
+      <svg width="180" height="200" viewBox="0 0 180 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="25" y="105" width="130" height="40" rx="5" fill="#8B6F47" opacity="0.15"/>
+        <g stroke="#ffffff" fill="none">
+          <line x1="68" y1="98" x2="64" y2="115" stroke-width="2" opacity="0.8"/>
+          <line x1="64" y1="115" x2="48" y2="132" stroke-width="1.3" opacity="0.5"/>
+          <line x1="64" y1="115" x2="68" y2="135" stroke-width="1" opacity="0.4"/>
+          <circle cx="64" cy="115" r="2.5" fill="#ffffff" opacity="0.6" stroke="none"/>
+          <line x1="90" y1="98" x2="90" y2="120" stroke-width="2.5" opacity="0.85"/>
+          <line x1="90" y1="120" x2="78" y2="138" stroke-width="1.3" opacity="0.45"/>
+          <line x1="90" y1="120" x2="102" y2="138" stroke-width="1.3" opacity="0.45"/>
+          <line x1="90" y1="120" x2="90" y2="142" stroke-width="1.5" opacity="0.5"/>
+          <circle cx="90" cy="120" r="3" fill="#ffffff" opacity="0.65" stroke="none"/>
+          <line x1="112" y1="98" x2="116" y2="115" stroke-width="2" opacity="0.8"/>
+          <line x1="116" y1="115" x2="132" y2="132" stroke-width="1.3" opacity="0.5"/>
+          <line x1="116" y1="115" x2="112" y2="135" stroke-width="1" opacity="0.4"/>
+          <circle cx="116" cy="115" r="2.5" fill="#ffffff" opacity="0.6" stroke="none"/>
+          <line x1="64" y1="115" x2="90" y2="120" stroke-width="0.6" opacity="0.15" stroke-dasharray="3 3"/>
+          <line x1="116" y1="115" x2="90" y2="120" stroke-width="0.6" opacity="0.15" stroke-dasharray="3 3"/>
+        </g>
+        <line x1="35" y1="100" x2="145" y2="100" stroke="#8B6F47" stroke-width="1" opacity="0.25"/>
+        <path d="M68 100 C65 80, 55 50, 50 22 C52 18, 56 19, 57 22 C60 45, 66 76, 72 100" fill="#43A047" opacity="0.85"/>
+        <path d="M86 100 C85 75, 84 45, 87 12 C89 8, 92 8, 93 12 C96 45, 94 75, 94 100" fill="#2E7D32"/>
+        <path d="M108 100 C112 80, 122 50, 128 22 C126 18, 122 19, 121 22 C118 45, 112 76, 110 100" fill="#43A047" opacity="0.85"/>
+        <text x="90" y="175" text-anchor="middle" font-family="Inter, sans-serif" font-size="28" font-weight="700" fill="#4CAF50" letter-spacing="6">VELD</text>
+        <text x="90" y="192" text-anchor="middle" font-family="Inter, sans-serif" font-size="9" fill="#666" letter-spacing="3">AGENTIC MEMORY</text>
+      </svg>
+      <div class="name">06 — Wordmark on Dark</div>
+      <div class="desc">Full lockup. Green on black. The product mark.</div>
+    </div>
+  </div>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,320 @@
+{
+  "evaluation": "Bifocal+ Unseen Dimensions Analysis",
+  "date": "2026-03-29",
+  "analyst": "bifocal_plus",
+  "baseline": {
+    "mrr": 0.892,
+    "composite": 0.769,
+    "signals": 20,
+    "prior_evaluations": "4 Supernova, 15+ Bifocal, multiple Overloop cycles",
+    "build": "eeee903"
+  },
+  "thesis": "All 15+ prior evaluations examined RETRIEVAL ALGORITHM signals (scoring, ranking, decay, graph traversal, fusion weights). Five proposed orthogonal signals (causal, centrality, novelty, completeness, coherence) were rejected as non-orthogonal. The unseen dimensions are NOT in the retrieval algorithm — they are in the SURROUNDING INFRASTRUCTURE: how queries are understood, how memories are created, how the benchmark measures quality, what the data looks like, and how temporal structure is modeled.",
+
+  "dimensions": [
+    {
+      "id": "D1",
+      "name": "QUERY-SIDE: Pre-Retrieval Query Understanding",
+      "coverage_in_20_signals": "ZERO — all 20 signals operate on (query, memory) PAIRS after candidates are fetched. No signal transforms the query BEFORE retrieval begins.",
+      "code_evidence": {
+        "file": "src/memory/recall.rs:231-270",
+        "finding": "semantic_retrieve() takes raw query_text, generates ONE embedding, and searches. The query text is analyzed (classify_query, analyze_query, infer_ontological_intent) but the analysis only guides SCORING — it never REWRITES the query. The embedding is always generated from the verbatim user query.",
+        "query_parser_finding": "query_parser.rs extracts focal_entities, discriminative_modifiers, relational_context, temporal refs, and ontological intent. But it does NOT: (a) expand synonyms into the embedding generation, (b) reformulate vague queries, (c) detect ambiguous references ('it', 'that', 'the thing'), or (d) decompose compound queries before search.",
+        "hook_finding": "memory-hook.ts passes the raw user prompt directly to proactive_context (line 329). No client-side query preprocessing at all."
+      },
+      "specific_surfaces": [
+        {
+          "name": "Query Reformulation",
+          "description": "Transform vague queries into explicit ones before embedding generation. Example: 'What database?' is a 2-token query that generates a poor embedding. 'Which database technology did we select for the project?' generates a much richer embedding vector that would match memory #3 and #18 more strongly.",
+          "affected_queries": [
+            "What database are we using? (works at MRR 1.0 — but only because BM25 catches 'database' literally)",
+            "What are the biggest risks? (works — but again, keyword match, not semantic)",
+            "What patterns do you see in our decision-making? (MRR 0.5 — THIS is where poor query embedding hurts. 'patterns' and 'decision-making' are abstract. The embedding doesn't capture that memory #59 about 'lessons learned' is the answer.)"
+          ],
+          "mrr_impact_estimate": "+0.015 to +0.030",
+          "effort": "Medium — add a query_reformulate() step before embedding generation that prepends extracted entity context and expands abstract terms. No model call needed, rule-based expansion from the already-parsed query_analysis.",
+          "orthogonality": "TRUE — operates BEFORE the 20 signals fire. Changes the input embedding, not the scoring function."
+        },
+        {
+          "name": "Multi-Query Embedding Fusion",
+          "description": "For compound queries ('Why did we change the database AND what was the impact on the timeline?'), generate SEPARATE embeddings for each sub-query and search with each. Currently, the single combined embedding dilutes both sub-queries. Query 11 (multi_hop) gets MRR 0.5 — memory #18 ranks 2nd but memory #24 ranks 6th because the combined embedding pulls toward 'database change' and away from 'timeline impact'.",
+          "affected_queries": [
+            "Why did we change the database AND what was the impact on the timeline? (MRR 0.5 — #24 at rank 6)",
+            "What decisions were reversed and why? (MRR 1.0 but R@5 only 0.5 — #48 missed)",
+            "What went well and what didn't? (MRR 1.0 — works because both halves are semantically similar)"
+          ],
+          "mrr_impact_estimate": "+0.020 to +0.040",
+          "effort": "Medium — detect 'AND'/'OR'/'also' conjunctions, split, search each sub-query independently, merge results with RRF. The conjunction detection is simple; the merging reuses existing RRF infrastructure.",
+          "orthogonality": "TRUE — generates additional candidate sets before scoring. The 20 signals then score the merged candidate pool normally."
+        },
+        {
+          "name": "Pronoun/Reference Resolution",
+          "description": "In conversational settings (the actual product use case, not LOCOMO), queries contain anaphora: 'What did we decide about it?', 'Tell me more about that bug', 'The thing we discussed yesterday'. The query parser has zero anaphora handling. LOCOMO doesn't test this (all queries are self-contained), which means the benchmark is blind to a major real-world failure mode.",
+          "affected_queries": "0 LOCOMO queries affected (all self-contained). Estimated 15-25% of REAL queries would benefit.",
+          "mrr_impact_estimate": "+0.000 on LOCOMO, +0.050 to +0.100 on real-world queries",
+          "effort": "High — requires conversation history tracking at query time. The hook already has session context but doesn't pass prior turns into recall.",
+          "orthogonality": "TRUE — transforms query text, not scoring."
+        }
+      ]
+    },
+    {
+      "id": "D2",
+      "name": "INGESTION-SIDE: Memory Construction Quality",
+      "coverage_in_20_signals": "ZERO — all 20 signals assume memories are GIVEN and well-formed. No signal evaluates or improves memory CONTENT at write time.",
+      "code_evidence": {
+        "file": "src/memory/mod.rs:861-1060",
+        "finding": "remember_impl() takes the Experience as-is. It generates an embedding from raw content, extracts temporal refs, and indexes. But it does NOT: (a) enrich content with entity context, (b) normalize entity names, (c) extract structured facts into the memory metadata, (d) assess content quality or informativeness.",
+        "hook_finding": "memory-hook.ts (lines 413-441) constructs memories with minimal context. An Edit produces 'Edited src/foo.rs: replaced old_text → new_text' — truncated to 80 chars each. A Bash error produces 'Command failed: cmd → output' — truncated to 200 chars. The REASONING behind the action (what was the developer trying to do? why?) is lost.",
+        "benchmark_finding": "locomo_benchmark.rs (line 1200-1206) stores memories with tags as entities, no metadata enrichment. This means the benchmark tests a BEST CASE where memories are already well-written narratives. Real hook-generated memories are terse operational logs."
+      },
+      "specific_surfaces": [
+        {
+          "name": "Embedding Enrichment at Ingestion",
+          "description": "Currently, embeddings are generated from raw memory content (remember_impl line 902). For the hook-generated memory 'Edited src/memory/recall.rs: replaced foo → bar', the embedding captures syntax, not semantics. If we prepend extracted entities and context BEFORE embedding generation — 'Context: memory retrieval pipeline, recall function. Edited src/memory/recall.rs: replaced foo → bar' — the embedding would be much more retrievable by semantic queries.",
+          "affected_queries": "0 LOCOMO queries (corpus memories are already descriptive). Massive impact on real-world hook-ingested memories.",
+          "mrr_impact_estimate": "+0.000 on LOCOMO, +0.030 to +0.060 on real-world",
+          "effort": "Low — concatenate entity context before self.embedder.encode() in remember_impl. The entities and tags are already available.",
+          "orthogonality": "TRUE — changes what is stored, not how retrieval works."
+        },
+        {
+          "name": "Memory Content Quality Gate",
+          "description": "Some hook-generated memories are noise: 'Created/wrote /tmp/foo.txt (42 chars)', 'Command failed: ls → No such file'. These pollute the index. A content quality gate at ingestion — minimum content length, minimum entity count, informativeness heuristic — would reduce noise in the candidate pool, improving precision.",
+          "affected_queries": "LOCOMO P@5 is already low (0.320) because 3-4 of top-5 are irrelevant. In real-world with hook noise, this is worse.",
+          "mrr_impact_estimate": "+0.005 on LOCOMO (via reduced noise in candidates), +0.020 on real-world",
+          "effort": "Low — add a quality check before indexing. Already have importance calculation; extend it to gate indexing.",
+          "orthogonality": "TRUE — changes the corpus, not retrieval."
+        },
+        {
+          "name": "Entity Normalization at Ingestion",
+          "description": "Entities are stored as-is from tags. 'mongodb', 'MongoDB', 'Mongo', 'mongo db' are all different entities. The graph handles some merging via Hebbian learning, but BM25 and entity matching are case/format sensitive. Normalizing at ingestion (canonical forms) would improve entity-based retrieval.",
+          "affected_queries": "Potentially affects all entity-bearing queries. Currently masked because LOCOMO corpus has consistent entity naming.",
+          "mrr_impact_estimate": "+0.005 on LOCOMO, +0.015 on real-world",
+          "effort": "Low — apply lowercasing + stemming to entities at ingestion, or maintain an alias table.",
+          "orthogonality": "TRUE — ingestion-side, not retrieval-side."
+        }
+      ]
+    },
+    {
+      "id": "D3",
+      "name": "EVALUATION-SIDE: Benchmark Representativeness",
+      "coverage_in_20_signals": "ZERO — all optimization targets LOCOMO scores. No signal evaluates whether LOCOMO is representative of actual usage patterns.",
+      "code_evidence": {
+        "file": "tests/locomo_benchmark.rs",
+        "finding_1": "20 queries, 60 memories, 4 sessions. This is a TINY benchmark. With 5 queries per type, a single query improvement/regression swings MRR by 0.200 per type. The benchmark has high variance — individual signal effects are lost in noise.",
+        "finding_2": "All queries are grammatically perfect, self-contained English sentences with no ambiguity. Real queries from the hook are messy: 'that auth bug', 'what was the rust thing', 'db decision from last time'. NONE of this is tested.",
+        "finding_3": "All memories are handcrafted narratives (50-150 words each, well-structured, entity-rich). Real hook-generated memories are 'Edited src/foo.rs: replaced X → Y' (20-30 words, low entity density). The benchmark tests a fundamentally different data distribution.",
+        "finding_4": "Ground truth is fixed and hand-labeled. Queries like 'What patterns do you see in our decision-making?' have expected=[52, 59] but memories #46 (decision reversal), #51 (what didn't go well), #50 (retrospective) are arguably also valid answers. Tight ground truth penalizes correct retrievals.",
+        "finding_5": "Absence checks test 55 (entity, memory) pairs, but 6 are violated (89.1% compliance). These violations are counted in composite but the SPECIFIC patterns of absence violation are not analyzed — are they systematic or random?"
+      },
+      "specific_surfaces": [
+        {
+          "name": "Benchmark Expansion: Messy Queries",
+          "description": "Add 10-20 queries that mimic real conversational patterns: pronoun references, incomplete sentences, typos, slang, implicit context. 'that db thing', 'raj's arch proposal', 'the bug sarah found', 'what we talked about re: testing'. These expose query understanding weaknesses that LOCOMO's clean queries cannot.",
+          "mrr_impact_estimate": "DIAGNOSTIC — reveals true MRR on real-world queries, likely 0.65-0.75 vs 0.89 on clean LOCOMO",
+          "effort": "Low — add queries to locomo_queries(), no code changes needed",
+          "orthogonality": "TRUE — changes measurement, not the system."
+        },
+        {
+          "name": "Benchmark Expansion: Noisy Memories",
+          "description": "Add 20-30 hook-style memories to the corpus: 'Edited src/collab/crdt.rs: replaced merge_ops → merge_ops_safe', 'Command failed: cargo test -- --nocapture → thread panicked', 'Read file: src/gateway/websocket.rs'. These test retrieval PRECISION when the corpus has realistic noise mixed with signal.",
+          "mrr_impact_estimate": "DIAGNOSTIC — reveals true P@5 under noise, likely 0.15-0.22 vs 0.32 on clean corpus",
+          "effort": "Low — add memories to locomo_corpus()",
+          "orthogonality": "TRUE — changes measurement."
+        },
+        {
+          "name": "Ground Truth Relaxation: Partial Credit",
+          "description": "Currently, R@5 for 'What patterns do you see in our decision-making?' is 0.5 because only memory #52 is in top-5 (expected: [52, 59]). But memory #46 (architecture decision reversed) is arguably pattern-relevant. Introducing a 'partial credit' tier (primary expected vs secondary acceptable) would reduce ground truth noise and give more signal about actual retrieval quality.",
+          "mrr_impact_estimate": "MEASUREMENT — may increase apparent MRR by +0.020 to +0.040 by reducing false negatives",
+          "effort": "Low-Medium — add optional 'acceptable_indices' field to LocomoQuery, modify scoring to count partial credit",
+          "orthogonality": "TRUE — changes measurement."
+        }
+      ]
+    },
+    {
+      "id": "D4",
+      "name": "DATA-SIDE: Memory Corpus Topology",
+      "coverage_in_20_signals": "ZERO — all signals treat the corpus as fixed. No signal analyzes or modifies the SHAPE of the stored data.",
+      "code_evidence": {
+        "file": "src/memory/mod.rs:867-880",
+        "finding_1": "Content deduplication exists (content hash), but near-duplicate detection does not. Two memories 'Decided to use Rust for backend' and 'Using Rust for the backend — decided in kickoff' are different content hashes but 95% semantically identical. Near-duplicates dilute retrieval by occupying multiple top-K slots with the same information.",
+        "finding_2": "No memory consolidation at query time. If 5 memories discuss 'MongoDB', the retrieval pipeline returns all 5 individually. A CONSOLIDATION pass that merges related memories into a single rich context would improve both precision and answer quality.",
+        "file_2": "evaluations/locomo_v0.6.1_eeee903.json",
+        "finding_3": "Query 6 ('What decisions did we make last week?') retrieves [58, 52, 14, 3, 46, 49, ...]. Memories 3 (session 1: database decision) and 14 (session 1: sprint cadence) are from 4 weeks ago, not 'last week'. These are absence violations caused by high semantic similarity to 'decisions' overriding temporal appropriateness. The data has many decision-type memories across all sessions, and no signal distinguishes 'decisions made recently' from 'decisions made ever'."
+      },
+      "specific_surfaces": [
+        {
+          "name": "Near-Duplicate Clustering",
+          "description": "At ingestion, compute embedding similarity against recent memories. If >0.92 cosine similarity, either merge or mark as a cluster. At retrieval, deduplicate clusters so only the best representative occupies a top-K slot. This directly improves P@5.",
+          "affected_queries": "All queries benefit. Currently, top-10 results often contain 2-3 near-duplicates that occupy slots better used by truly different relevant memories.",
+          "mrr_impact_estimate": "+0.005 to +0.010 MRR, +0.030 to +0.050 P@5",
+          "effort": "Medium — requires embedding comparison at ingestion (already generated) and a cluster-aware dedup pass in retrieval.",
+          "orthogonality": "TRUE — operates on corpus topology, not scoring."
+        },
+        {
+          "name": "Memory Metadata Completeness Audit",
+          "description": "Memories ingested via different paths (remember API, proactive_context auto-ingest, hook PostToolUse) have varying metadata completeness. Hook memories lack user_id context for graph processing (remember_impl line 1050: 'We don't have user_id in remember()'). Auto-ingested memories may lack episode_id. Incomplete metadata means some retrieval layers (graph expansion, episode coherence, temporal facts) silently skip these memories.",
+          "affected_queries": "Unknown — this is a LATENT issue. Memories are stored but partially invisible to certain retrieval layers.",
+          "mrr_impact_estimate": "+0.010 to +0.020 on real-world (fixing metadata gaps makes all layers work on all memories)",
+          "effort": "Low — audit ingestion paths, ensure all required fields are populated",
+          "orthogonality": "TRUE — data quality, not retrieval algorithm."
+        }
+      ]
+    },
+    {
+      "id": "D5",
+      "name": "TEMPORAL STRUCTURE: Session Topology and Narrative Arc",
+      "coverage_in_20_signals": "PARTIAL — recency decay and temporal fact extraction exist. But session-level structure (session boundaries, session summaries, inter-session narrative) is NOT modeled.",
+      "code_evidence": {
+        "file": "tests/locomo_benchmark.rs:1177-1194",
+        "finding_1": "Sessions are modeled as timestamp offsets (1 week apart, 5 minutes between intra-session memories). But the benchmark does NOT test session boundary queries: 'What changed between the architecture meeting and the debugging session?' or 'What was different about our approach in the later sessions?'. These require understanding session topology.",
+        "file_2": "src/memory/recall.rs:693-711",
+        "finding_2": "Layer 1 (Episode Coherence) only activates when query.episode_id is provided — i.e., when querying WITHIN the current session. There is no mechanism to query ACROSS sessions or to find memories at session boundaries. The wavelet session detection (wavelet_sessions.rs) exists but is not integrated into the recall path for cross-session queries.",
+        "file_3": "hooks/memory-hook.ts:79-86",
+        "finding_3": "The hook generates episode IDs per session (sessionEpisodeId) and tracks sequence numbers. But when a NEW session starts, there is no mechanism to: (a) summarize the previous session, (b) create a 'session transition' memory, or (c) link the new session to the previous one. Sessions are isolated islands."
+      },
+      "specific_surfaces": [
+        {
+          "name": "Session Summary Generation",
+          "description": "At session end (or start of next session), auto-generate a summary memory: 'Session 3 covered debugging: CRDT merge panic, WebSocket leak, MongoDB write concern. Key outcomes: 5 bugs found by proptest, testing strategy expanded to fuzz testing.' This summary would be a high-quality, entity-rich memory that serves as an anchor for temporal queries about 'the debugging phase' or 'what happened two weeks ago'.",
+          "affected_queries": [
+            "What happened during the second meeting? (MRR 1.0 — works because memories are well-tagged with session)",
+            "What was the most recent architecture change? (MRR 0.333 — session summary would provide a direct anchor)",
+            "What decisions did we make last week? (MRR 0.500 — session summary would cluster decisions by session)"
+          ],
+          "mrr_impact_estimate": "+0.020 to +0.040",
+          "effort": "Medium — add session summarization at Stop hook or SessionStart of next session. Could be rule-based (aggregate entities/tags from session memories) or LLM-based.",
+          "orthogonality": "TRUE — adds new data at ingestion, not a retrieval signal."
+        },
+        {
+          "name": "Temporal Superlative Resolution",
+          "description": "'Most recent', 'first', 'last', 'latest' are temporal superlatives that require ORDERING, not similarity. 'What was the most recent architecture change?' (MRR 0.333) fails because semantic search finds architecture-related memories from all sessions, and recency decay isn't strong enough to push session-4 memories above session-2 memories that are more semantically similar. A dedicated superlative resolver would detect 'most recent' → sort by created_at FIRST, then filter by topic.",
+          "affected_queries": [
+            "What was the most recent architecture change? (MRR 0.333 — THE worst performing non-bug query)",
+            "What decisions did we make last week? (MRR 0.500 — 'last week' = temporal superlative)"
+          ],
+          "mrr_impact_estimate": "+0.040 to +0.070 (directly fixes the 2 worst queries)",
+          "effort": "Medium — detect superlative temporal modifiers in query_parser, apply hard temporal sort before semantic filtering. The temporal extraction machinery exists; the missing piece is using it as a PRIMARY sort key rather than a score boost.",
+          "orthogonality": "MOSTLY TRUE — extends temporal extraction (already a signal) but the mechanism (sort-first-then-filter) is fundamentally different from the existing score-boost approach."
+        },
+        {
+          "name": "Cross-Session Narrative Linking",
+          "description": "Memories within a session form a narrative arc (problem → investigation → solution). Queries that span this arc ('How did the testing strategy evolve?') need memories from the beginning AND end of the arc. Currently, the retrieval pipeline has no notion of narrative structure. A lightweight approach: at ingestion, detect when a memory REFERENCES a prior memory's entities and tag it as a 'continuation' or 'resolution'. Then at retrieval, when a continuation is retrieved, boost the memory it continues.",
+          "affected_queries": [
+            "How did the testing strategy change based on the bugs we found? (MRR 1.0, R@5 1.0 — works because both memories are independently relevant)",
+            "What decisions were reversed and why? (MRR 1.0, R@5 0.5 — #48 missed because it's a 'resolution' of #47 but this link isn't modeled)"
+          ],
+          "mrr_impact_estimate": "+0.010 to +0.020",
+          "effort": "High — requires entity overlap detection at ingestion and a new retrieval signal. The graph already captures co-occurrence, but not temporal directionality (cause→effect).",
+          "orthogonality": "PARTIAL — related to graph traversal (existing signal family) but the temporal directionality is new."
+        }
+      ]
+    }
+  ],
+
+  "failure_analysis": {
+    "description": "Per-query analysis of the 4 queries with MRR < 1.0 to identify which unseen dimensions would fix each.",
+    "failures": [
+      {
+        "query": "What decisions did we make last week?",
+        "mrr": 0.500,
+        "type": "temporal",
+        "expected": [46, 49, 52],
+        "retrieved_top5": [58, 52, 14, 3, 46],
+        "root_cause": "Semantic similarity to 'decisions' pulls in session-1 memories (#3 database, #14 sprints) that are 4 weeks old, not 'last week'. Memory #58 (client SDK decision) ranks #1 despite being less temporally relevant. Recency boost exists but is overwhelmed by semantic similarity.",
+        "fixing_dimensions": ["D5: Temporal Superlative Resolution (hard temporal sort would eliminate session-1 memories)", "D1: Query Reformulation ('last week' → concrete date range before search)"],
+        "absence_violations": 2,
+        "absence_note": "Memories #3 and #14 from session 1 appear in top-10 — temporal filtering too weak."
+      },
+      {
+        "query": "What was the most recent architecture change?",
+        "mrr": 0.333,
+        "type": "temporal",
+        "expected": [46, 48],
+        "retrieved_top5": [59, 18, 46, 52, 29],
+        "root_cause": "THE WORST QUERY. 'Most recent' is a temporal superlative but the retrieval treats it as a semantic modifier. Memory #59 (lessons learned) and #18 (MongoDB switch from session 2) outrank #48 (microservice revert from session 4). The system finds 'architecture' memories but doesn't enforce temporal ordering. Memory #48 ranks outside top-5 entirely.",
+        "fixing_dimensions": ["D5: Temporal Superlative Resolution (sort by time first, THEN filter by 'architecture')", "D3: Ground Truth — #59 is arguably about architecture patterns"],
+        "absence_violations": 0
+      },
+      {
+        "query": "Why did we change the database AND what was the impact on the timeline?",
+        "mrr": 0.500,
+        "type": "multi_hop",
+        "expected": [18, 24],
+        "retrieved_top5": [16, 18, 49, 3, 32],
+        "root_cause": "Compound query — 'database change' and 'timeline impact' are two distinct information needs. The single embedding captures 'database change' well (#18 at rank 2) but dilutes 'timeline impact'. Memory #24 (timeline impact of MongoDB switch) ranks at position 6. Memory #16 (schema migration) is a false positive — it matches 'database' but not the specific change or timeline.",
+        "fixing_dimensions": ["D1: Multi-Query Embedding Fusion (split at 'AND', search each sub-query separately, merge results)"],
+        "absence_violations": 0
+      },
+      {
+        "query": "What patterns do you see in our decision-making?",
+        "mrr": 0.500,
+        "type": "open_domain",
+        "expected": [52, 59],
+        "retrieved_top5": [46, 52, 58, 49, 16],
+        "root_cause": "Abstract query — 'patterns' and 'decision-making' are high-level concepts. Memory #52 (RFC process improvement) is retrieved because it explicitly discusses decision-making process. Memory #59 (lessons learned) ranks 8th-10th because its embedding is about 'lessons' and 'testing' more than 'patterns'. Memory #46 (architecture reversal) ranks #1 — it's a PATTERN INSTANCE but not the PATTERN DESCRIPTION.",
+        "fixing_dimensions": ["D1: Query Reformulation (expand 'patterns in decision-making' → 'decision-making process, lessons learned, retrospective observations')", "D3: Ground Truth Relaxation (#46 is arguably a valid answer)"],
+        "absence_violations": 1
+      }
+    ]
+  },
+
+  "priority_ranking": [
+    {
+      "rank": 1,
+      "surface": "D5: Temporal Superlative Resolution",
+      "mrr_impact": "+0.040 to +0.070",
+      "effort": "Medium",
+      "rationale": "Directly fixes the 2 worst-performing queries (MRR 0.333 and 0.500). The temporal extraction machinery already exists — the missing piece is using temporal modifiers as a PRIMARY sort rather than a score boost. Highest ROI because it targets the exact failure mode."
+    },
+    {
+      "rank": 2,
+      "surface": "D1: Multi-Query Embedding Fusion",
+      "mrr_impact": "+0.020 to +0.040",
+      "effort": "Medium",
+      "rationale": "Directly fixes the compound query failure (MRR 0.500 on 'database AND timeline'). Simple conjunction detection, independent searches, RRF merge. Reuses existing infrastructure."
+    },
+    {
+      "rank": 3,
+      "surface": "D3: Benchmark Expansion (Messy Queries + Noisy Memories)",
+      "mrr_impact": "Diagnostic (reveals true real-world MRR)",
+      "effort": "Low",
+      "rationale": "Essential for calibrating all future work. If real-world MRR is 0.70 instead of 0.89, the improvement surfaces are completely different. Must be done before investing in any new signal."
+    },
+    {
+      "rank": 4,
+      "surface": "D1: Query Reformulation",
+      "mrr_impact": "+0.015 to +0.030",
+      "effort": "Medium",
+      "rationale": "Broad improvement across abstract/vague queries. Uses already-parsed query_analysis to enrich the query before embedding generation. No new infrastructure needed."
+    },
+    {
+      "rank": 5,
+      "surface": "D5: Session Summary Generation",
+      "mrr_impact": "+0.020 to +0.040",
+      "effort": "Medium",
+      "rationale": "Creates high-quality anchor memories that serve temporal and open-domain queries. Addresses the root cause of session-boundary confusion."
+    },
+    {
+      "rank": 6,
+      "surface": "D2: Embedding Enrichment at Ingestion",
+      "mrr_impact": "+0.000 LOCOMO, +0.030 to +0.060 real-world",
+      "effort": "Low",
+      "rationale": "Zero LOCOMO impact but high real-world impact. Low effort — just prepend entities to content before embedding. Should be done after benchmark expansion reveals the gap."
+    },
+    {
+      "rank": 7,
+      "surface": "D4: Near-Duplicate Clustering",
+      "mrr_impact": "+0.005 MRR, +0.030 P@5",
+      "effort": "Medium",
+      "rationale": "Primarily improves precision, not MRR. Important for answer quality but lower priority than MRR improvements."
+    }
+  ],
+
+  "combined_ceiling": {
+    "estimated_mrr_with_all_surfaces": "0.940 to 0.960",
+    "estimated_composite_with_all_surfaces": "0.82 to 0.85",
+    "rationale": "D5 Temporal Superlative fixes 2 queries from 0.333/0.500 → ~0.900 each (+0.055 overall). D1 Multi-Query Fusion fixes 1 query from 0.500 → ~0.900 (+0.020 overall). D1 Query Reformulation provides broad +0.015. Combined effect with interaction: +0.070 to +0.090 on MRR. Composite gains from P@5 improvements via D4 dedup and D2 ingestion quality."
+  },
+
+  "key_insight": "The retrieval ALGORITHM is not the bottleneck. The 20 signals have been optimized to near-ceiling for the current (query, memory) input distribution. The remaining MRR gap comes from: (1) POOR QUERY REPRESENTATION — the embedding is generated from verbatim text without expansion or decomposition, (2) TEMPORAL PRIMACY — temporal superlatives need sort-first semantics, not score-boost semantics, and (3) BENCHMARK BLINDNESS — LOCOMO's clean queries and curated corpus hide real-world weaknesses in ingestion quality and query messiness. The next wave of improvements must move UP the pipeline (query understanding, ingestion enrichment) and OUT of the pipeline (benchmark representativeness)."
+}

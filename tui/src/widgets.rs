@@ -1,8 +1,9 @@
-use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, SHODH_GRADIENT, SHODH_TEXT};
+#![allow(dead_code)]
+
+use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, GRASS_SUFFIX, SHODH_GRADIENT, SHODH_TEXT};
 use crate::types::{
-    AppState, DisplayEvent, FocusPanel, LineageEdge, LineageNode, LineageTrace, SearchMode,
-    SearchResult, TuiFileMemory, TuiPriority, TuiProject, TuiTodo, TuiTodoComment,
-    TuiTodoCommentType, TuiTodoStatus, ViewMode, VERSION,
+    AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiFileMemory, TuiPriority,
+    TuiProject, TuiTodo, TuiTodoStatus, ViewMode, VERSION,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -193,7 +194,15 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
                 let gray = (60.0 + pulse * 40.0) as u8;
                 (gray, gray, gray)
             };
-            Line::from(Span::styled(*l, Style::default().fg(Color::Rgb(r, g, b))))
+            let elephant_style = Style::default().fg(Color::Rgb(r, g, b));
+            if let Some(body) = l.strip_suffix(GRASS_SUFFIX) {
+                Line::from(vec![
+                    Span::styled(body, elephant_style),
+                    Span::styled(GRASS_SUFFIX, Style::default().fg(Color::Rgb(88, 172, 74))),
+                ])
+            } else {
+                Line::from(Span::styled(*l, elephant_style))
+            }
         })
         .collect();
     f.render_widget(Paragraph::new(logo_lines), chunks[0]);
@@ -6737,9 +6746,6 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         f.render_widget(Paragraph::new(result_line).block(block), area);
         return;
     }
-
-    // Normal footer - context-sensitive based on view
-    let is_graph_view = matches!(state.view_mode, ViewMode::GraphMap);
 
     let mut keys = vec![
         Span::styled(

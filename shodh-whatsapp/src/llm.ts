@@ -12,6 +12,7 @@ export interface Message {
 let anthropicClient: Anthropic | null = null;
 let groqClient: Groq | null = null;
 let openaiClient: OpenAI | null = null;
+let lmstudioClient: OpenAI | null = null;
 
 function buildSystemPrompt(memoryContext: string): string {
   let systemPrompt = config.whatsapp.systemPrompt;
@@ -200,6 +201,36 @@ async function generateWithOllama(
   return data.message?.content || "No response generated.";
 }
 
+async function generateWithLMStudio(
+  userMessage: string,
+  memoryContext: string,
+  conversationHistory: Message[]
+): Promise<string> {
+  if (!lmstudioClient) {
+    lmstudioClient = new OpenAI({
+      apiKey: "lm-studio",
+      baseURL: `${config.llm.lmstudio.baseUrl}/v1`,
+    });
+  }
+
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: "system", content: buildSystemPrompt(memoryContext) },
+    ...conversationHistory.map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content,
+    })),
+    { role: "user", content: userMessage },
+  ];
+
+  const response = await lmstudioClient.chat.completions.create({
+    model: config.llm.lmstudio.model,
+    messages,
+    max_tokens: 1024,
+  });
+
+  return response.choices[0]?.message?.content || "No response generated.";
+}
+
 export async function generateResponse(
   userMessage: string,
   memoryContext: string,
@@ -217,11 +248,68 @@ export async function generateResponse(
         return await generateWithOpenAI(userMessage, memoryContext, conversationHistory);
       case "ollama":
         return await generateWithOllama(userMessage, memoryContext, conversationHistory);
+      case "lmstudio":
+        return await generateWithLMStudio(userMessage, memoryContext, conversationHistory);
       default:
         throw new Error(`Unknown LLM provider: ${config.llm.provider}`);
     }
   } catch (error) {
     console.error("LLM error:", error);
     throw error;
+  }
+}
+
+export async function sanityCheckProvider(): Promise<void> {
+  switch (config.llm.provider) {
+    case "lmstudio": {
+      if (!lmstudioClient) {
+        lmstudioClient = new OpenAI({
+          apiKey: "lm-studio",
+          baseURL: `${config.llm.lmstudio.baseUrl}/v1`,
+        });
+      }
+      await lmstudioClient.models.list();
+      return;
+    }
+    case "ollama": {
+      const response = await fetch(`${config.llm.ollama.baseUrl}/api/tags`);
+      if (!response.ok) {
+        throw new Error(`Ollama health check failed: ${response.status}`);
+      }
+      return;
+    }
+    case "openai": {
+      if (!openaiClient) {
+        if (!config.llm.openai.apiKey) {
+          throw new Error("OPENAI_API_KEY is required");
+        }
+        openaiClient = new OpenAI({ apiKey: config.llm.openai.apiKey });
+      }
+      await openaiClient.models.list();
+      return;
+    }
+    case "groq": {
+      if (!groqClient) {
+        if (!config.llm.groq.apiKey) {
+          throw new Error("GROQ_API_KEY is required");
+        }
+        groqClient = new Groq({ apiKey: config.llm.groq.apiKey });
+      }
+      await groqClient.models.list();
+      return;
+    }
+    case "anthropic": {
+      if (!anthropicClient) {
+        if (!config.llm.anthropic.apiKey) {
+          throw new Error("ANTHROPIC_API_KEY is required");
+        }
+        anthropicClient = new Anthropic({ apiKey: config.llm.anthropic.apiKey });
+      }
+      await anthropicClient.models.list();
+      return;
+    }
+    case "claude-cli": {
+      return;
+    }
   }
 }

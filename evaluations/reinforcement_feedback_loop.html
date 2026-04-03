@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>shodh-memory Reinforcement Feedback Loop</title>
+<style>
+  :root {
+    --bg: #0a1018;
+    --panel: rgba(13, 22, 33, 0.92);
+    --panel2: rgba(18, 30, 44, 0.94);
+    --line: rgba(145, 180, 220, 0.14);
+    --text: #e7eef8;
+    --muted: #96aac0;
+    --good: #7ddc71;
+    --bad: #ff6a83;
+    --neutral: #5bb9ff;
+    --feedback: #ff5d73;
+    --graph: #9b8cff;
+    --weight: #52b6ff;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background:
+      radial-gradient(circle at 12% 12%, rgba(255, 93, 115, 0.12), transparent 22%),
+      radial-gradient(circle at 85% 18%, rgba(82, 182, 255, 0.14), transparent 24%),
+      linear-gradient(180deg, #0b121a 0%, #070d13 100%);
+    color: var(--text);
+    font-family: "SF Mono", "Fira Code", Menlo, Consolas, monospace;
+  }
+
+  body { padding: 22px; }
+
+  .frame {
+    max-width: 1480px;
+    margin: 0 auto;
+    display: grid;
+    gap: 18px;
+  }
+
+  .panel {
+    background: linear-gradient(180deg, rgba(16, 27, 39, 0.95), rgba(10, 18, 28, 0.95));
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    box-shadow: 0 28px 80px rgba(0, 0, 0, 0.42);
+  }
+
+  .hero {
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 16px;
+    padding: 22px;
+  }
+
+  .eyebrow {
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(30px, 4.8vw, 58px);
+    line-height: 0.96;
+    letter-spacing: -0.04em;
+  }
+
+  .hero p {
+    color: #bfd0e3;
+    font-size: 14px;
+    line-height: 1.72;
+    margin: 14px 0 0;
+  }
+
+  .hero-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 18px;
+  }
+
+  .hero-links a,
+  .hero-links span,
+  .selector button {
+    text-decoration: none;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 9px 14px;
+    background: rgba(19, 31, 45, 0.9);
+    font-size: 12px;
+  }
+
+  .side-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .metric {
+    padding: 16px;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background: rgba(17, 29, 42, 0.9);
+  }
+
+  .metric .label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+
+  .metric .value {
+    margin-top: 6px;
+    font-size: 26px;
+    font-weight: 700;
+  }
+
+  .metric p {
+    margin: 8px 0 0;
+    color: #b8cadc;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  .selector {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 14px 18px;
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .selector button {
+    cursor: pointer;
+  }
+
+  .selector button.active {
+    border-color: rgba(145, 180, 220, 0.34);
+    background: rgba(28, 44, 60, 0.96);
+  }
+
+  .main {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 18px;
+    padding: 18px;
+  }
+
+  .timeline,
+  .detail,
+  .state-panel {
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: linear-gradient(180deg, rgba(15, 25, 36, 0.96), rgba(10, 17, 25, 0.96));
+  }
+
+  .timeline {
+    padding: 16px;
+  }
+
+  .timeline h2,
+  .detail h2,
+  .state-panel h2 {
+    margin: 0;
+    font-size: 16px;
+  }
+
+  .timeline p,
+  .detail-head p,
+  .state-panel p {
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .stage-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 16px;
+  }
+
+  .stage-item {
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: rgba(20, 33, 47, 0.88);
+    padding: 14px;
+    cursor: pointer;
+    transition: transform 120ms ease, border-color 120ms ease;
+  }
+
+  .stage-item:hover,
+  .stage-item.active {
+    transform: translateY(-1px);
+    border-color: rgba(145, 180, 220, 0.32);
+  }
+
+  .stage-item .step {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+
+  .stage-item h3 {
+    margin: 8px 0 0;
+    font-size: 14px;
+  }
+
+  .stage-item p {
+    margin: 8px 0 0;
+    color: #b8cadc;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  .detail {
+    padding: 18px;
+    display: grid;
+    gap: 16px;
+  }
+
+  .detail-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    align-items: end;
+  }
+
+  .outcome-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .outcome-card {
+    padding: 14px;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: rgba(18, 29, 42, 0.9);
+  }
+
+  .outcome-card strong {
+    display: block;
+    font-size: 13px;
+  }
+
+  .outcome-card span {
+    display: block;
+    margin-top: 6px;
+    color: #b7c8da;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .diagram {
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 18px;
+    background:
+      linear-gradient(180deg, rgba(10, 17, 27, 0.96), rgba(8, 14, 22, 0.96)),
+      repeating-linear-gradient(90deg, transparent 0, transparent 108px, rgba(255,255,255,0.018) 108px, rgba(255,255,255,0.018) 109px);
+  }
+
+  .flow {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 12px;
+    align-items: center;
+  }
+
+  .flow-node {
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: rgba(18, 30, 43, 0.92);
+    padding: 14px;
+    min-height: 110px;
+    position: relative;
+  }
+
+  .flow-node::after {
+    content: "";
+    position: absolute;
+    right: -19px;
+    top: 50%;
+    width: 24px;
+    height: 2px;
+    background: rgba(145, 180, 220, 0.24);
+  }
+
+  .flow-node:last-child::after { display: none; }
+
+  .flow-node .step {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+
+  .flow-node h3 {
+    margin: 8px 0 0;
+    font-size: 14px;
+  }
+
+  .flow-node p {
+    margin: 8px 0 0;
+    color: #b7c8da;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  .anchor-cloud {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .anchor-cloud a {
+    color: #dcf0ff;
+    text-decoration: none;
+    border: 1px solid rgba(145, 180, 220, 0.16);
+    border-radius: 999px;
+    background: rgba(18, 31, 44, 0.92);
+    padding: 7px 10px;
+    font-size: 11px;
+  }
+
+  .state-panel {
+    padding: 18px;
+  }
+
+  .state-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+  }
+
+  .state-card {
+    padding: 14px;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: rgba(17, 28, 40, 0.9);
+  }
+
+  .state-card h3 {
+    margin: 0;
+    font-size: 13px;
+  }
+
+  .state-card p {
+    margin: 8px 0 0;
+    color: #b8cadc;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+
+  @media (max-width: 1180px) {
+    .hero,
+    .main {
+      grid-template-columns: 1fr;
+    }
+
+    .flow {
+      grid-template-columns: 1fr;
+    }
+
+    .flow-node::after {
+      display: none;
+    }
+  }
+
+  @media (max-width: 720px) {
+    body { padding: 12px; }
+    .hero,
+    .main,
+    .selector { padding: 14px; }
+    .side-grid,
+    .outcome-strip,
+    .state-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <section class="panel hero">
+      <div>
+        <p class="eyebrow">shodh-memory / focused adaptive loop</p>
+        <h1>Reinforcement And Adaptive Weight Loop</h1>
+        <p>
+          This page isolates the part of the system that learns from retrieval outcomes. Attribution is cached at retrieval time,
+          implicit or explicit signals arrive later, Hebbian reinforcement updates memory salience and graph coactivation, and
+          the hybrid search learner shifts BM25, vector, and graph blend weights toward what actually helped.
+        </p>
+        <div class="hero-links">
+          <a href="memory_integration_pipeline.html">back to full pipeline</a>
+          <span>/api/proactive_context</span>
+          <span>/api/reinforce</span>
+          <span>last_signal_attributions</span>
+          <span>HybridSearchEngine</span>
+        </div>
+      </div>
+      <div class="side-grid">
+        <div class="metric">
+          <div class="label">Loop Stages</div>
+          <div class="value">5</div>
+          <p>Capture, classify, reinforce, coactivate, and rebalance are separate transitions, not one blended side effect.</p>
+        </div>
+        <div class="metric">
+          <div class="label">Signal Sources</div>
+          <div class="value">2</div>
+          <p>Explicit scoring_signals have priority. Cached last_signal_attributions are the automatic fallback.</p>
+        </div>
+        <div class="metric">
+          <div class="label">Outcome Modes</div>
+          <div class="value">3</div>
+          <p>Helpful boosts, misleading decays, neutral leaves weights untouched.</p>
+        </div>
+        <div class="metric">
+          <div class="label">Observed Metrics</div>
+          <div class="value">2</div>
+          <p>Reinforcement count and duration are exposed through the metrics registry for later operational tuning.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel selector" id="selector"></section>
+
+    <section class="panel main">
+      <aside class="timeline">
+        <h2>Loop Timeline</h2>
+        <p>Select a stage to focus the detail panel on one part of the adaptive feedback circuit.</p>
+        <div class="stage-list" id="stageList"></div>
+      </aside>
+
+      <div style="display:grid; gap:18px;">
+        <section class="detail">
+          <div class="detail-head">
+            <div>
+              <h2 id="detailTitle"></h2>
+              <p id="detailBody"></p>
+            </div>
+            <div class="hero-links" style="margin-top:0;">
+              <span id="detailTag"></span>
+            </div>
+          </div>
+
+          <div class="outcome-strip">
+            <div class="outcome-card" style="border-color: rgba(125,220,113,0.24);">
+              <strong style="color: var(--good);">Helpful</strong>
+              <span>Boosts importance, encourages coactivation, and nudges blend weights toward the winning signal mix.</span>
+            </div>
+            <div class="outcome-card" style="border-color: rgba(255,106,131,0.24);">
+              <strong style="color: var(--bad);">Misleading</strong>
+              <span>Decays importance and teaches the learner to distrust the dominant contributing signals for that miss.</span>
+            </div>
+            <div class="outcome-card" style="border-color: rgba(91,185,255,0.24);">
+              <strong style="color: var(--neutral);">Neutral</strong>
+              <span>Records access but intentionally does not update the blend learner to avoid training on weak supervision.</span>
+            </div>
+          </div>
+
+          <div class="diagram" id="diagram"></div>
+
+          <div>
+            <h2 style="margin:0 0 10px; font-size:16px;">Exact Anchors</h2>
+            <div class="anchor-cloud" id="anchorCloud"></div>
+          </div>
+        </section>
+
+        <section class="state-panel">
+          <h2>Loop State Surfaces</h2>
+          <p>The reinforcement loop changes more than a single score. It alters multiple persistent surfaces whose interaction determines future recall quality.</p>
+          <div class="state-grid">
+            <article class="state-card">
+              <h3>Attribution Cache</h3>
+              <p>Retrieval stores per-memory signal contributions in last_signal_attributions so delayed supervision can still train on the actual ranking context that produced the answer.</p>
+            </article>
+            <article class="state-card">
+              <h3>Feedback Store</h3>
+              <p>Pending response state captures followup text, context embedding, and tool usage so implicit feedback can be classified after the user responds.</p>
+            </article>
+            <article class="state-card">
+              <h3>Graph Coactivation</h3>
+              <p>Helpful sets of memories are pushed through GraphMemory.record_memory_coactivation, which means reinforcement strengthens structure, not only scalar memory weights.</p>
+            </article>
+            <article class="state-card">
+              <h3>Hybrid Blend Learner</h3>
+              <p>Average BM25, vector, and graph contributions feed update_weights_from_feedback so future retrieval uses a gradually learned mix instead of fixed static fusion.</p>
+            </article>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const STAGES = [
+      {
+        key: 'capture',
+        title: '1. Attribution Capture During Retrieval',
+        tag: 'recall phase',
+        body: 'Retrieval writes signal attributions for winning memories. That cached state is what makes delayed reinforcement operationally meaningful instead of speculative.',
+        summary: 'The ranking pipeline stores signal attribution snapshots as retrieval exits.',
+        anchors: [
+          { label: 'src/memory/recall.rs:3628 last_signal_attributions write', href: '../src/memory/recall.rs' },
+          { label: 'src/memory/mod.rs:816 last_signal_attributions accessor', href: '../src/memory/mod.rs' },
+          { label: 'src/memory/recall.rs:1384 search_with_dynamic_weights', href: '../src/memory/recall.rs' }
+        ]
+      },
+      {
+        key: 'implicit',
+        title: '2. Implicit Feedback Classification',
+        tag: 'proactive_context phase',
+        body: 'When proactive_context receives a previous response and a followup, it runs the feedback processor, folds in tool actions, and classifies whether surfaced memories helped or harmed the conversation.',
+        summary: 'Previous response, followup, and tool actions become implicit supervision.',
+        anchors: [
+          { label: 'src/handlers/recall.rs:930 proactive_context', href: '../src/handlers/recall.rs' },
+          { label: 'src/handlers/recall.rs:1001 pending feedback processing', href: '../src/handlers/recall.rs' },
+          { label: 'src/memory/feedback.rs:964 process_implicit_feedback_with_semantics', href: '../src/memory/feedback.rs' },
+          { label: 'src/memory/feedback.rs:1059 compute_tool_usage_signal', href: '../src/memory/feedback.rs' },
+          { label: 'src/memory/feedback.rs:1080 negative followup penalty', href: '../src/memory/feedback.rs' }
+        ]
+      },
+      {
+        key: 'explicit',
+        title: '3. Explicit Reinforce Call',
+        tag: '/api/reinforce',
+        body: 'The explicit reinforce endpoint can carry per-memory scoring_signals. If the caller omits them, the memory layer falls back to the cached attribution snapshot from the last retrieval.',
+        summary: 'Explicit scoring_signals override the cached fallback path.',
+        anchors: [
+          { label: 'src/handlers/recall.rs:2443 reinforce_recall_with_signals', href: '../src/handlers/recall.rs' },
+          { label: 'src/memory/recall.rs:3919 reinforce_recall_with_signals', href: '../src/memory/recall.rs' },
+          { label: 'src/memory/recall.rs:4079 attribution fallback read', href: '../src/memory/recall.rs' }
+        ]
+      },
+      {
+        key: 'hebbian',
+        title: '4. Hebbian Memory And Graph Update',
+        tag: 'memory salience + graph',
+        body: 'Helpful outcomes boost importance and coactivation across the retrieved set. Misleading outcomes decay importance. Graph promotions can produce secondary boosts that connect reinforcement back to topology.',
+        summary: 'Reinforcement alters both scalar importance and graph structure.',
+        anchors: [
+          { label: 'src/memory/recall.rs:3945 record_memory_coactivation from reinforce', href: '../src/memory/recall.rs' },
+          { label: 'src/graph_memory.rs:3956 record_memory_coactivation', href: '../src/graph_memory.rs' },
+          { label: 'src/memory/recall.rs:3912 reinforce_recall wrapper', href: '../src/memory/recall.rs' }
+        ]
+      },
+      {
+        key: 'weights',
+        title: '5. Adaptive Blend Weight Update',
+        tag: 'hybrid search learner',
+        body: 'Collected BM25, vector, and graph contributions are averaged and sent to HybridSearchEngine.update_weights_from_feedback. The blend learner then slowly shifts future retrieval toward the signals that actually worked.',
+        summary: 'Average contribution scores train the future retrieval mix.',
+        anchors: [
+          { label: 'src/memory/recall.rs:4112 update_weights_from_feedback', href: '../src/memory/recall.rs' },
+          { label: 'src/memory/hybrid_search.rs:871 update_weights_from_feedback', href: '../src/memory/hybrid_search.rs' },
+          { label: 'src/metrics.rs:416 HEBBIAN_REINFORCE_TOTAL', href: '../src/metrics.rs' },
+          { label: 'src/metrics.rs:428 HEBBIAN_REINFORCE_DURATION', href: '../src/metrics.rs' }
+        ]
+      }
+    ];
+
+    const selector = document.getElementById('selector');
+    const stageList = document.getElementById('stageList');
+    const detailTitle = document.getElementById('detailTitle');
+    const detailBody = document.getElementById('detailBody');
+    const detailTag = document.getElementById('detailTag');
+    const anchorCloud = document.getElementById('anchorCloud');
+    const diagram = document.getElementById('diagram');
+
+    let active = STAGES[0].key;
+
+    function renderSelector() {
+      selector.innerHTML = STAGES.map((stage) => {
+        const activeClass = stage.key === active ? 'active' : '';
+        return `<button class="${activeClass}" data-key="${stage.key}">${stage.title}</button>`;
+      }).join('');
+      selector.querySelectorAll('[data-key]').forEach((button) => {
+        button.addEventListener('click', () => {
+          active = button.dataset.key;
+          renderAll();
+        });
+      });
+    }
+
+    function renderTimeline() {
+      stageList.innerHTML = STAGES.map((stage) => {
+        const activeClass = stage.key === active ? 'active' : '';
+        return `
+          <div class="stage-item ${activeClass}" data-key="${stage.key}">
+            <div class="step">${stage.tag}</div>
+            <h3>${stage.title}</h3>
+            <p>${stage.summary}</p>
+          </div>
+        `;
+      }).join('');
+      stageList.querySelectorAll('[data-key]').forEach((item) => {
+        item.addEventListener('click', () => {
+          active = item.dataset.key;
+          renderAll();
+        });
+      });
+    }
+
+    function renderDetail() {
+      const stage = STAGES.find((entry) => entry.key === active);
+      detailTitle.textContent = stage.title;
+      detailBody.textContent = stage.body;
+      detailTag.textContent = stage.tag;
+      anchorCloud.innerHTML = stage.anchors.map((anchor) => `<a href="${anchor.href}">${anchor.label}</a>`).join('');
+      diagram.innerHTML = `
+        <div class="flow">
+          ${STAGES.map((entry, index) => `
+            <div class="flow-node" style="border-color:${entry.key === active ? 'rgba(145,180,220,0.32)' : 'var(--line)'}; box-shadow:${entry.key === active ? '0 0 0 1px rgba(145,180,220,0.18) inset' : 'none'};">
+              <div class="step">step ${index + 1}</div>
+              <h3>${entry.title.replace(/^\d+\.\s*/, '')}</h3>
+              <p>${entry.summary}</p>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function renderAll() {
+      renderSelector();
+      renderTimeline();
+      renderDetail();
+    }
+
+    renderAll();
+  </script>
+</body>
+</html>

@@ -188,6 +188,10 @@ pub struct CreateTodoRequest {
     pub recurrence: Option<String>,
     #[serde(default)]
     pub external_id: Option<String>,
+    /// Structured dependencies: list of todo short IDs (e.g. ["SHO-1", "BOLT-3"]) or UUIDs.
+    /// This todo cannot start until all listed todos are Done.
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
 }
 
 /// Response for todo operations
@@ -272,6 +276,9 @@ pub struct UpdateTodoRequest {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub external_id: Option<String>,
+    /// Structured dependencies: list of todo short IDs (e.g. ["SHO-1", "BOLT-3"]) or UUIDs.
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
 }
 
 /// Request to reorder a todo
@@ -494,7 +501,7 @@ pub async fn create_reminder(
 
     // Cache embedding at creation time for context triggers (avoids recomputation on every check)
     if matches!(task.trigger, ProspectiveTrigger::OnContext { .. }) {
-        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_earth(&req.user_id) {
             let content_for_embed = task.content.clone();
             let memory_clone = memory_system.clone();
             if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || {
@@ -692,7 +699,7 @@ pub async fn check_context_reminders(
     }
 
     let memory_system = state
-        .get_user_memory(&req.user_id)
+        .get_user_earth(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let context_for_embed = req.context.clone();
@@ -954,6 +961,24 @@ pub async fn create_todo(
         todo.recurrence = parse_recurrence(recurrence_str);
     }
 
+    // Resolve structured dependencies from short IDs / UUIDs
+    if let Some(ref dep_ids) = req.depends_on {
+        for dep_str in dep_ids {
+            if let Some(dep_todo) = state
+                .todo_store
+                .find_todo_by_prefix(&req.user_id, dep_str)
+                .map_err(AppError::Internal)?
+            {
+                // Cycle detection: adding dep_todo as a dependency of this new todo
+                // cannot cycle since the new todo has no dependents yet, but check anyway
+                // in case someone passes self-referential IDs.
+                if dep_todo.id != todo.id {
+                    todo.add_dependency(dep_todo.id);
+                }
+            }
+        }
+    }
+
     // Compute embedding for semantic search
     let embedding_text = format!(
         "{} {} {}",
@@ -962,7 +987,7 @@ pub async fn create_todo(
         todo.tags.join(" ")
     );
 
-    if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory_system) = state.get_user_earth(&req.user_id) {
         let memory_clone = memory_system.clone();
         let embedding_text_clone = embedding_text.clone();
 
@@ -1028,7 +1053,7 @@ pub async fn create_todo(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory) = state.get_user_earth(&req.user_id) {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let state_clone = state.clone();
@@ -1129,7 +1154,7 @@ pub async fn list_todos(
             Vec::new()
         } else {
             let memory_system = state
-                .get_user_memory(&req.user_id)
+                .get_user_earth(&req.user_id)
                 .map_err(AppError::Internal)?;
 
             let query_clone = query.clone();
@@ -1405,7 +1430,34 @@ pub async fn update_todo(
             .todo_store
             .find_todo_by_prefix(&req.user_id, parent_id_str)
         {
-            todo.parent_id = Some(parent.id.clone());
+            todo.parent_id = Some(parent.id);
+        }
+    }
+
+    // Resolve structured dependencies
+    if let Some(ref dep_ids) = req.depends_on {
+        todo.depends_on.clear();
+        for dep_str in dep_ids {
+            if let Some(dep_todo) = state
+                .todo_store
+                .find_todo_by_prefix(&req.user_id, dep_str)
+                .map_err(AppError::Internal)?
+            {
+                if state
+                    .todo_store
+                    .would_create_cycle(&req.user_id, &todo.id, &dep_todo.id)
+                    .map_err(AppError::Internal)?
+                {
+                    return Err(AppError::InvalidInput {
+                        field: "depends_on".to_string(),
+                        reason: format!(
+                            "Adding dependency on {} would create a cycle",
+                            dep_str
+                        ),
+                    });
+                }
+                todo.add_dependency(dep_todo.id);
+            }
         }
     }
 
@@ -1440,7 +1492,7 @@ pub async fn update_todo(
             todo.tags.join(" ")
         );
 
-        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_earth(&req.user_id) {
             let memory_clone = memory_system.clone();
             let embedding_text_clone = embedding_text.clone();
 
@@ -1493,6 +1545,25 @@ pub async fn update_todo(
                 todo.blocked_on.as_deref().unwrap_or("cleared")
             ));
         }
+        if req.depends_on.is_some() {
+            let dep_display: Vec<String> = todo
+                .depends_on
+                .iter()
+                .filter_map(|id| {
+                    state
+                        .todo_store
+                        .get_todo(&req.user_id, id)
+                        .ok()
+                        .flatten()
+                        .map(|t| t.short_id())
+                })
+                .collect();
+            if dep_display.is_empty() {
+                changes.push("dependencies cleared".to_string());
+            } else {
+                changes.push(format!("depends on: {}", dep_display.join(", ")));
+            }
+        }
         changes.join(", ")
     };
 
@@ -1530,7 +1601,7 @@ pub async fn update_todo(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory) = state.get_user_earth(&req.user_id) {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -1654,7 +1725,7 @@ pub async fn complete_todo(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_memory(&req.user_id) {
+        if let Ok(memory) = state.get_user_earth(&req.user_id) {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -1904,6 +1975,169 @@ pub async fn list_subtasks(
     }))
 }
 
+/// POST /api/todos/ready - List todos that are ready to work on (all deps satisfied)
+pub async fn list_ready_todos(
+    State(state): State<AppState>,
+    Json(req): Json<ListTodosRequest>,
+) -> Result<Json<TodoListResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let ready = state
+        .todo_store
+        .list_ready_todos(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let projects = state
+        .todo_store
+        .list_projects(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = if ready.is_empty() {
+        "No ready todos (all tasks have unresolved dependencies)".to_string()
+    } else {
+        let mut output =
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+             ┃  READY (all dependencies satisfied)  ┃\n\
+             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                .to_string();
+        output.push_str(&todo_formatter::format_todo_list(&ready, &projects));
+        output
+    };
+
+    Ok(Json(TodoListResponse {
+        success: true,
+        count: ready.len(),
+        todos: ready,
+        projects,
+        formatted,
+    }))
+}
+
+/// GET /api/todos/{todo_id}/dependents - List todos that depend on this todo
+pub async fn list_dependents(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Query(query): Query<TodoQuery>,
+) -> Result<Json<TodoListResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    let todo = state
+        .todo_store
+        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    let dependents = state
+        .todo_store
+        .list_dependents(&todo.id)
+        .map_err(AppError::Internal)?;
+
+    let projects = state
+        .todo_store
+        .list_projects(&query.user_id)
+        .map_err(AppError::Internal)?;
+
+    let formatted = if dependents.is_empty() {
+        format!("Nothing depends on {}", todo.short_id())
+    } else {
+        let mut output = format!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+             ┃  DEPENDENTS OF {}  ┃\n\
+             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n",
+            todo.short_id()
+        );
+        output.push_str(&todo_formatter::format_todo_list(&dependents, &projects));
+        output
+    };
+
+    Ok(Json(TodoListResponse {
+        success: true,
+        count: dependents.len(),
+        todos: dependents,
+        projects,
+        formatted,
+    }))
+}
+
+/// Params for dependency chain walk
+#[derive(Debug, Deserialize)]
+pub struct DependencyChainQuery {
+    pub user_id: String,
+    #[serde(default = "default_direction")]
+    pub direction: String,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+}
+
+fn default_direction() -> String {
+    "forward".to_string()
+}
+fn default_max_depth() -> usize {
+    10
+}
+
+/// GET /api/todos/{todo_id}/dependency_chain - Walk the dependency graph
+pub async fn dependency_chain(
+    State(state): State<AppState>,
+    Path(todo_id): Path<String>,
+    Query(query): Query<DependencyChainQuery>,
+) -> Result<Json<TodoListResponse>, AppError> {
+    validation::validate_user_id(&query.user_id).map_validation_err("user_id")?;
+
+    let todo = state
+        .todo_store
+        .find_todo_by_prefix(&query.user_id, &todo_id)
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::TodoNotFound(todo_id.clone()))?;
+
+    let chain = if query.direction == "backward" {
+        state
+            .todo_store
+            .dependency_chain_backward(&query.user_id, &todo.id, query.max_depth)
+            .map_err(AppError::Internal)?
+    } else {
+        state
+            .todo_store
+            .dependency_chain_forward(&query.user_id, &todo.id, query.max_depth)
+            .map_err(AppError::Internal)?
+    };
+
+    let chain_todos: Vec<Todo> = chain.into_iter().map(|(t, _)| t).collect();
+
+    let projects = state
+        .todo_store
+        .list_projects(&query.user_id)
+        .map_err(AppError::Internal)?;
+
+    let label = if query.direction == "backward" {
+        "BLOCKS (upstream)"
+    } else {
+        "UNBLOCKS (downstream)"
+    };
+
+    let formatted = if chain_todos.is_empty() {
+        format!("No {} dependencies for {}", query.direction, todo.short_id())
+    } else {
+        let mut output = format!(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+             ┃  {} — {}  ┃\n\
+             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n",
+            label,
+            todo.short_id()
+        );
+        output.push_str(&todo_formatter::format_todo_list(&chain_todos, &projects));
+        output
+    };
+
+    Ok(Json(TodoListResponse {
+        success: true,
+        count: chain_todos.len(),
+        todos: chain_todos,
+        projects,
+        formatted,
+    }))
+}
+
 /// POST /api/todos/stats - Get todo statistics
 pub async fn get_todo_stats(
     State(state): State<AppState>,
@@ -2012,7 +2246,7 @@ pub async fn add_todo_comment(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_memory(&req.user_id) {
+    if let Ok(memory) = state.get_user_earth(&req.user_id) {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let memory_result = tokio::task::spawn_blocking(move || {

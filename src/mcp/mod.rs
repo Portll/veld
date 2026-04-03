@@ -50,7 +50,7 @@ impl ServerHandler for ShodhMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "Shodh Memory - persistent cognitive memory with causal reasoning. \
+                "Veld Memory - persistent cognitive memory with causal reasoning. \
                  Use proactive_context at session start to surface relevant memories. \
                  Use remember to store decisions, learnings, errors. \
                  Use recall to search memories. \
@@ -69,7 +69,7 @@ impl ServerHandler for ShodhMcpServer {
 
 /// Run the MCP server over stdio transport.
 pub async fn run_mcp_server(api_url: String, api_key: String, user_id: String) -> Result<()> {
-    eprintln!("Starting shodh MCP server...");
+    eprintln!("Starting Veld MCP server...");
     eprintln!("  API URL: {}", api_url);
     eprintln!("  User ID: {}", user_id);
 
@@ -126,7 +126,7 @@ pub fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project
     );
 
     // Build context string
-    let mut context_parts = vec!["## Shodh Memory Context Restored\n".to_string()];
+    let mut context_parts = vec!["## Veld Memory Context Restored\n".to_string()];
 
     if let Ok(ctx) = context_result {
         if !ctx.memories.is_empty() {
@@ -220,7 +220,7 @@ pub fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message
     }
 }
 
-/// Launch Claude Code with Shodh Cortex proxy
+/// Launch Claude Code with Veld Cortex proxy
 pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
     let server_url = format!("http://127.0.0.1:{port}");
 
@@ -233,22 +233,22 @@ pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
     let server_running = client.get(&health_url).send().await.is_ok();
 
     if !server_running {
-        eprintln!("🧠 Starting shodh-memory server on port {port}...");
+        eprintln!("🧠 Starting Veld memory server on port {port}...");
 
         // Start server in background
         let exe_path = std::env::current_exe()?;
         let server_binary = exe_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Cannot find executable directory"))?
-            .join("shodh-memory-server");
+            .join("veld");
 
         #[cfg(windows)]
         let server_binary = server_binary.with_extension("exe");
 
         if !server_binary.exists() {
             // Try finding in PATH
-            eprintln!("⚠️  shodh-memory-server not found at {:?}", server_binary);
-            eprintln!("   Please ensure shodh-memory-server is installed and in PATH");
+            eprintln!("⚠️  veld not found at {:?}", server_binary);
+            eprintln!("   Please ensure veld is installed and in PATH");
             std::process::exit(1);
         }
 
@@ -270,7 +270,7 @@ pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         }
 
         #[allow(clippy::zombie_processes)] // Intentionally detached background server
-        cmd.spawn().expect("Failed to start shodh-memory-server");
+        cmd.spawn().expect("Failed to start veld");
 
         // Wait for server to be ready
         eprintln!("   Waiting for server to be ready...");
@@ -288,11 +288,11 @@ pub async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
             std::process::exit(1);
         }
     } else {
-        eprintln!("🧠 Shodh-memory server already running on port {port}");
+        eprintln!("🧠 Veld memory server already running on port {port}");
     }
 
     // Launch claude with ANTHROPIC_API_BASE pointing to Cortex proxy
-    eprintln!("🚀 Launching Claude Code with Shodh Cortex...");
+    eprintln!("🚀 Launching Claude Code with Veld Cortex...");
     eprintln!("   ANTHROPIC_API_BASE={}", server_url);
     eprintln!();
 
