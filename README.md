@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png" width="120" alt="Veld - Agentic Memory">
+  <img src="assets/logo.png" width="120" alt="Veld - Agentic Memory">
 </p>
 
 <h1 align="center">Veld - Agentic Memory</h1>
@@ -7,21 +7,21 @@
 <p align="center"><b>Persistent cognitive memory for AI agents and robots. Remembers what matters, forgets what doesn't, gets smarter with use.</b></p>
 
 <p align="center">
-  <a href="https://github.com/varun29ankuS/shodh-memory/actions"><img src="https://github.com/varun29ankuS/shodh-memory/workflows/CI/badge.svg" alt="build"></a>
+  <a href="https://github.com/Portll/veld"><img src="https://img.shields.io/badge/branch-v0.7.7--unstable-orange" alt="branch status"></a>
   <a href="https://registry.modelcontextprotocol.io/v0/servers?search=shodh"><img src="https://img.shields.io/badge/MCP-Registry-green" alt="MCP Registry"></a>
   <a href="https://cursor.directory/plugins/shodh-memory-1"><img src="https://img.shields.io/badge/Cursor-Directory-black?logo=cursor" alt="Cursor Directory"></a>
   <a href="https://crates.io/crates/shodh-memory"><img src="https://img.shields.io/crates/v/shodh-memory.svg" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
   <a href="https://hub.docker.com/r/varunshodh/shodh-memory"><img src="https://img.shields.io/docker/pulls/varunshodh/shodh-memory.svg?logo=docker" alt="Docker"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="LICENSE.MD"><img src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg" alt="License"></a>
   <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
 
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/Shodh_preview.gif" width="800" alt="Veld - Agentic Memory Demo — Claude Code with persistent memory and TUI dashboard">
+  <img src="assets/Shodh_preview.gif" width="800" alt="Veld - Agentic Memory Demo — Claude Code with persistent memory and TUI dashboard">
 </p>
 
 AI agents forget everything between sessions. Robots lose context between missions. They repeat mistakes, miss patterns, and treat every interaction like the first one.
@@ -209,13 +209,13 @@ shodh tui
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/recall.png" width="700" alt="Veld Recall">
+  <img src="assets/recall.png" width="700" alt="Veld Recall">
 </p>
 
 <p align="center"><i>Semantic recall with hybrid search — relevance scores, memory tiers, and activity feed</i></p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/projects-todos.jpg" width="700" alt="Veld Projects & Todos">
+  <img src="assets/projects-todos.jpg" width="700" alt="Veld Projects & Todos">
 </p>
 
 <p align="center"><i>GTD task management — projects, todos, comments, and causal lineage</i></p>
@@ -258,7 +258,7 @@ Full list of tools available to Claude, Cursor, and other MCP clients:
 
 160+ endpoints on `http://localhost:3030`. All `/api/*` endpoints require `X-API-Key` header.
 
-[Full API reference →](https://www.shodh-memory.com/docs/api)
+[Full API reference →](openapi.yaml)
 
 <details>
 <summary>Quick examples</summary>
@@ -454,10 +454,10 @@ memory.example.com {
 
 ## License
 
-Apache 2.0
+BUSL-1.1
 
 ---
 
 <p align="center">
-  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=shodh">MCP Registry</a> · <a href="https://hub.docker.com/r/varunshodh/shodh-memory">Docker Hub</a> · <a href="https://pypi.org/project/shodh-memory/">PyPI</a> · <a href="https://www.npmjs.com/package/@shodh/memory-mcp">npm</a> · <a href="https://crates.io/crates/shodh-memory">crates.io</a> · <a href="https://www.shodh-memory.com">Docs</a>
+  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=shodh">MCP Registry</a> · <a href="https://hub.docker.com/r/varunshodh/shodh-memory">Docker Hub</a> · <a href="https://pypi.org/project/shodh-memory/">PyPI</a> · <a href="https://www.npmjs.com/package/@shodh/memory-mcp">npm</a> · <a href="https://crates.io/crates/shodh-memory">crates.io</a> · <a href="docs/">Docs</a>
 </p>

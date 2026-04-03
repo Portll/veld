@@ -1,4 +1,4 @@
-//! Configuration management for Shodh-Memory
+//! Configuration management for Veld
 //!
 //! All configurable parameters in one place with environment variable overrides.
 //! Follows the principle: sensible defaults, configurable in production.
@@ -81,9 +81,9 @@ pub fn default_storage_path() -> PathBuf {
     let legacy_path = PathBuf::from(LEGACY_STORAGE_DIR);
     if legacy_path.exists() && legacy_path.is_dir() {
         eprintln!(
-            "[shodh-memory] Found legacy data at ./{LEGACY_STORAGE_DIR}/ in the current directory. \
-             Using it for backward compatibility. To migrate, move it to the platform default \
-             and unset SHODH_MEMORY_PATH. See: https://github.com/varun29ankuS/shodh-memory/issues/89"
+              "[veld] Found legacy data at ./{LEGACY_STORAGE_DIR}/ in the current directory. \
+               Using it for backward compatibility. To migrate, move it to the platform default \
+               and unset SHODH_MEMORY_PATH. See: https://github.com/Portll/veld"
         );
         return legacy_path;
     }
@@ -732,7 +732,7 @@ impl ServerConfig {
 /// Environment variable documentation
 #[allow(unused)] // Public API - available for CLI help output
 pub fn print_env_help() {
-    println!("Shodh-Memory Configuration Environment Variables:");
+    println!("Veld Configuration Environment Variables:");
     println!();
     println!("  SHODH_ENV              - Set to 'production' or 'prod' for production mode");
     println!(

@@ -8,7 +8,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/shodh-memory.svg)](https://pypi.org/project/shodh-memory/)
 [![Downloads](https://static.pepy.tech/badge/shodh-memory)](https://pepy.tech/project/shodh-memory)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE.MD)
 
 ---
 
@@ -267,11 +267,11 @@ Working Memory ──overflow──> Session Memory ──importance──> Long
 
 ## Links
 
-- [GitHub](https://github.com/varun29ankuS/shodh-memory)
-- [Documentation](https://www.shodh-rag.com/memory)
+- [GitHub](https://github.com/Portll/veld)
+- [Documentation](docs/)
 - [npm (MCP Server)](https://www.npmjs.com/package/@shodh/memory-mcp)
 - [crates.io (Rust)](https://crates.io/crates/shodh-memory)
 
 ## License
 
-Apache 2.0
+BUSL-1.1

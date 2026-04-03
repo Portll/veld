@@ -1,4 +1,4 @@
-//! Shodh-Memory Server — standalone binary entry point.
+//! Veld Server — standalone binary entry point.
 //!
 //! This is a thin wrapper around `shodh_memory::server::run()`.
 //! For the unified CLI, use `shodh server` instead.
@@ -22,7 +22,7 @@ use shodh_memory::config::StorageBackend;
 use std::path::PathBuf;
 
 const LONG_ABOUT: &str = r#"
-Shodh-Memory is the Earth substrate behind Veld, featuring:
+Veld is the adaptive memory runtime for AI agents and robots, featuring:
 
   • 3-tier memory (Working → Session → LongTerm) with automatic promotion
   • Hebbian learning - memories that help get stronger, misleading ones decay
@@ -56,10 +56,10 @@ EXAMPLES:
   veld --production -s /var/lib/shodh  # Production mode
 
 DOCUMENTATION:
-  GitHub:  https://github.com/varun29ankuS/shodh-memory
+  GitHub:  https://github.com/Portll/veld
 "#;
 
-/// Shodh-Memory Server - Earth substrate for Veld
+/// Veld Server - Earth substrate for Veld
 #[derive(Parser)]
 #[command(name = "veld")]
 #[command(version, about, long_about = LONG_ABOUT, after_help = AFTER_HELP)]

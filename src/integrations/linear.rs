@@ -1,4 +1,4 @@
-//! Linear integration for syncing issues to Shodh memory
+//! Linear integration for syncing issues to Veld
 //!
 //! Provides:
 //! - Webhook receiver for real-time issue updates
@@ -634,7 +634,7 @@ mod tests {
             }],
             team: Some(LinearTeam {
                 id: "team-id".to_string(),
-                name: Some("Shodh".to_string()),
+                name: Some("Veld".to_string()),
                 key: Some("SHO".to_string()),
             }),
             project: None,

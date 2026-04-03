@@ -1,9 +1,9 @@
-//! HTTP clients for the shodh-memory API.
+//! HTTP clients for the Veld API.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// HTTP client for the shodh-memory API (async version for MCP tools)
+/// HTTP client for the Veld API (async version for MCP tools)
 #[derive(Clone)]
 pub(crate) struct AsyncApiClient {
     client: reqwest::Client,
@@ -57,7 +57,7 @@ impl AsyncApiClient {
     }
 }
 
-/// HTTP client for the shodh-memory API (blocking version for hooks)
+/// HTTP client for the Veld API (blocking version for hooks)
 #[derive(Clone)]
 pub(crate) struct BlockingApiClient {
     client: reqwest::blocking::Client,

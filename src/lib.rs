@@ -1,4 +1,4 @@
-//! Shodh-Memory Library
+//! Veld Library
 //!
 //! Edge-native AI memory system for autonomous agents.
 //! Optimized for deployment on resource-constrained devices.

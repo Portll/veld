@@ -1,4 +1,4 @@
-//! Server bootstrap module — starts the Shodh-Memory HTTP API server.
+//! Server bootstrap module — starts the Veld HTTP API server.
 //!
 //! Extracted from `main.rs` so that both `veld` (standalone)
 //! and `shodh server` (unified CLI) can start the server with identical behavior.
@@ -46,7 +46,7 @@ pub struct ServerRunConfig {
     pub max_concurrent: usize,
 }
 
-/// Start the shodh-memory HTTP server.
+/// Start the Veld HTTP server.
 ///
 /// This is a **blocking** call that runs until a shutdown signal (Ctrl-C / SIGTERM).
 /// It sets environment variables, pre-initialises the ONNX runtime, builds a tokio
@@ -249,9 +249,9 @@ async fn async_main() -> Result<()> {
             let effective_storage_backend = effective_storage_backend.clone();
             async move {
             axum::Json(serde_json::json!({
-                "name": "shodh-memory",
+                "name": "veld",
                 "version": env!("SHODH_VERSION_FULL"),
-                "description": "Cognitive Memory for AI Agents",
+                "description": "Adaptive memory runtime for AI agents and robots",
                 "requested_storage_backend": requested_storage_backend,
                 "effective_storage_backend": effective_storage_backend,
                 "health": "/health",
@@ -262,7 +262,7 @@ async fn async_main() -> Result<()> {
                     "todos": "GET /api/todos",
                     "graph": "GET /api/graph/stats"
                 },
-                "docs": "https://github.com/varun29ankuS/shodh-memory"
+                "docs": "https://github.com/Portll/veld"
             }))
             }
         }),

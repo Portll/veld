@@ -1,6 +1,6 @@
 //! API Request/Response Types
 //!
-//! All HTTP API request and response structures for the shodh-memory server.
+//! All HTTP API request and response structures for the Veld server.
 //! Extracted from main.rs for better organization.
 
 use serde::{Deserialize, Serialize};
