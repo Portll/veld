@@ -5,10 +5,10 @@ This demonstrates how a warehouse robot can use Veld - Agentic Memory to
 remember obstacles, navigation patterns, and task history completely offline.
 """
 
-import shodh_memory
+import veld
 
 # Initialize memory system (fully offline, no network required)
-memory = shodh_memory.MemorySystem(storage_path="./robot_memory")
+memory = veld.MemorySystem(storage_path="./robot_memory")
 
 print("🤖 Warehouse Robot Memory System\n")
 

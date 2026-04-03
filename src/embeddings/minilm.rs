@@ -128,7 +128,7 @@ impl EmbeddingConfig {
     ///
     /// Search order for model files:
     /// 1. SHODH_MODEL_PATH environment variable
-    /// 2. Bundled in Python package (SHODH_PACKAGE_DIR/models/minilm-l6)
+    /// 2. Bundled in Python package (VELD_PACKAGE_DIR/models/minilm-l6)
     /// 3. ./models/minilm-l6 (local)
     /// 4. ../models/minilm-l6 (parent)
     /// 5. ~/.cache/shodh-memory/models/minilm-l6 (auto-download location)
@@ -139,7 +139,7 @@ impl EmbeddingConfig {
                 // Try common locations in order (bundled first for 1-click install)
                 let candidates = vec![
                     // Bundled in Python package (highest priority for pip install)
-                    std::env::var("SHODH_PACKAGE_DIR")
+                    std::env::var("VELD_PACKAGE_DIR")
                         .ok()
                         .map(|p| PathBuf::from(p).join("models/minilm-l6")),
                     Some(PathBuf::from("./models/minilm-l6")),
@@ -289,8 +289,8 @@ impl MiniLMEmbedder {
 
     /// Find bundled ONNX Runtime in the Python package's lib/ directory
     fn find_bundled_onnx_runtime() -> Option<PathBuf> {
-        // Try to find ONNX Runtime bundled with the Python package
-        // The lib/ folder is adjacent to the shodh_memory.pyd file
+        // Try to find ONNX Runtime bundled with the Python package.
+        // The lib/ folder is adjacent to the veld extension module.
 
         #[cfg(target_os = "windows")]
         let dll_name = "onnxruntime.dll";
@@ -313,17 +313,17 @@ impl MiniLMEmbedder {
             Some(PathBuf::from("lib").join(dll_name)),
             // In working directory directly
             Some(PathBuf::from(dll_name)),
-            // Python site-packages layout: shodh_memory/lib/onnxruntime.dll
+            // Python site-packages layout: veld/lib/onnxruntime.dll
             dirs::data_dir().map(|p| {
                 p.join("Python")
                     .join("site-packages")
-                    .join("shodh_memory")
+                    .join("veld")
                     .join("lib")
                     .join(dll_name)
             }),
             // Check relative to this module (for pip-installed packages)
-            // This uses the fact that Python modules are in site-packages/shodh_memory/
-            std::env::var("SHODH_PACKAGE_DIR")
+            // This uses the fact that Python modules are in site-packages/veld/
+            std::env::var("VELD_PACKAGE_DIR")
                 .ok()
                 .map(|p| PathBuf::from(p).join("lib").join(dll_name)),
         ];

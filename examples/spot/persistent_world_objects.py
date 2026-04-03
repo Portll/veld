@@ -13,7 +13,7 @@ This example demonstrates how Veld - Agentic Memory gives Spot permanent object
 memory. Objects persist across missions, reboots, and power cycles.
 
 Run:
-    pip install shodh-memory
+    pip install veld
     python persistent_world_objects.py
 """
 

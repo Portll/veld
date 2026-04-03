@@ -14,7 +14,7 @@ After 3 traversals, the callback has learned which regions are
 dangerous and automatically adjusts behavior.
 
 Run:
-    pip install shodh-memory
+    pip install veld
     python area_callback_memory.py
 """
 

@@ -7,8 +7,8 @@
 <p align="center">
   <a href="https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory"><img src="https://img.shields.io/badge/MCP-Registry-green" alt="MCP Registry"></a>
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
-  <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
-  <a href="https://pepy.tech/project/shodh-memory"><img src="https://static.pepy.tech/badge/shodh-memory" alt="Downloads"></a>
+  <a href="https://pypi.org/project/veld/"><img src="https://img.shields.io/pypi/v/veld.svg" alt="PyPI"></a>
+  <a href="https://pepy.tech/project/veld"><img src="https://static.pepy.tech/badge/veld" alt="Downloads"></a>
   <a href="../LICENSE.MD"><img src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg" alt="License"></a>
 </p>
 
@@ -18,9 +18,9 @@
 
 ---
 
-> Status: `v0.7.7-unstable` on this branch. The repository source may be ahead
-> of the last published Python package and should be treated as internal /
-> unstable until the `v0.8` stabilization cut.
+> Status: `v0.7.7-unstable` on this branch. The repository source should be
+> treated as internal / unstable until the `v0.8` stabilization cut. The
+> branch-tip Python package surface is now `veld`.
 
 We built this because AI agents forget everything between sessions. They make the same mistakes, ask the same questions, lose context constantly.
 
@@ -109,17 +109,17 @@ Config file locations:
 
 **Python:**
 ```
-# Installs the last published package, not this branch tip
-pip install shodh-memory
+# Install the current Python package surface
+pip install veld
 
 # With LangChain support
-pip install shodh-memory[langchain]
+pip install veld[langchain]
 
 # With LlamaIndex support
-pip install shodh-memory[llamaindex]
+pip install veld[llamaindex]
 
 # All integrations
-pip install shodh-memory[all]
+pip install veld[all]
 ```
 
 **From source:**
@@ -136,7 +136,7 @@ pick up the repo-local libclang workaround.
 **Python**
 
 ```python
-from shodh_memory import Memory
+from veld import Memory
 
 memory = Memory(user_id="my-agent")
 
@@ -157,7 +157,7 @@ summary = memory.context_summary()
 ```python
 from langchain.chains import ConversationChain
 from langchain_openai import ChatOpenAI
-from shodh_memory.integrations.langchain import ShodhMemory
+from veld.integrations.langchain import ShodhMemory
 
 memory = ShodhMemory(
     server_url="http://localhost:3030",
@@ -175,7 +175,7 @@ response = chain.invoke({"input": "Hello!"})
 **LlamaIndex**
 
 ```python
-from shodh_memory.integrations.llamaindex import ShodhLlamaMemory
+from veld.integrations.llamaindex import ShodhLlamaMemory
 
 memory = ShodhLlamaMemory(
     server_url="http://localhost:3030",
@@ -265,7 +265,7 @@ Importance also increases with: content length, entity density, technical terms,
 
 ```
 SHODH_PORT=3030                    # Default: 3030
-SHODH_MEMORY_PATH=./data           # Default: ./shodh_memory_data
+SHODH_MEMORY_PATH=./data           # Default: platform data dir; reuses ./shodh_memory_data if present
 SHODH_API_KEYS=key1,key2           # Required in production
 SHODH_MAINTENANCE_INTERVAL=300     # Decay cycle (seconds)
 SHODH_ACTIVATION_DECAY=0.95        # Decay factor per cycle
@@ -296,4 +296,4 @@ BUSL-1.1
 
 ---
 
-[MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory) · [PyPI](https://pypi.org/project/shodh-memory/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [GitHub](https://github.com/Portll/veld)
+[MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.varun29ankuS/shodh-memory) · [PyPI](https://pypi.org/project/veld/) · [npm](https://www.npmjs.com/package/@shodh/memory-mcp) · [GitHub](https://github.com/Portll/veld)

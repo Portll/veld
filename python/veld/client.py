@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-logger = logging.getLogger("shodh_memory")
+logger = logging.getLogger("veld")
 
 import requests
 from requests.adapters import HTTPAdapter

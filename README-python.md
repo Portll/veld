@@ -6,20 +6,20 @@
 > a `v0.8` cut, so the checked-out code may be ahead of the last published PyPI
 > package.
 
-[![PyPI](https://img.shields.io/pypi/v/shodh-memory.svg)](https://pypi.org/project/shodh-memory/)
-[![Downloads](https://static.pepy.tech/badge/shodh-memory)](https://pepy.tech/project/shodh-memory)
+[![PyPI](https://img.shields.io/pypi/v/veld.svg)](https://pypi.org/project/veld/)
+[![Downloads](https://static.pepy.tech/badge/veld)](https://pepy.tech/project/veld)
 [![License](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE.MD)
 
 ---
 
 Give your AI agents memory that persists across sessions, learns from experience, and runs entirely on your hardware.
 
-Product name: `Veld - Agentic Memory`. Published package name: `shodh-memory`.
+Product name: `Veld - Agentic Memory`. On this branch, the Python package name is `veld`.
 
 ## Installation
 
 ```bash
-pip install shodh-memory
+pip install veld
 ```
 
 That installs the last published package, not the checked-out `v0.7.7-unstable`
@@ -35,7 +35,7 @@ the current native build requirements.
 ## Quick Start
 
 ```python
-from shodh_memory import Memory
+from veld import Memory
 
 # Create memory (data stored locally)
 memory = Memory(storage_path="./my_agent_data")
@@ -213,7 +213,7 @@ print(f"Vectors: {health['total_vectors']}, Needs rebuild: {health['needs_rebuil
 ### LangChain
 
 ```python
-from shodh_memory.integrations.langchain import ShodhMemory
+from veld.integrations.langchain import ShodhMemory
 
 # Use as LangChain memory
 memory = ShodhMemory(storage_path="./langchain_data")
@@ -222,7 +222,7 @@ memory = ShodhMemory(storage_path="./langchain_data")
 ### LlamaIndex
 
 ```python
-from shodh_memory.integrations.llamaindex import ShodhLlamaMemory
+from veld.integrations.llamaindex import ShodhLlamaMemory
 
 # Use as LlamaIndex memory
 memory = ShodhLlamaMemory(storage_path="./llamaindex_data")

@@ -5,10 +5,10 @@ This example shows how to use Veld - Agentic Memory as a custom memory
 backend for LlamaIndex agents.
 
 Requirements:
-    pip install llama-index llama-index-llms-anthropic shodh-memory
+    pip install llama-index llama-index-llms-anthropic veld
 
 Setup:
-    1. Install shodh-memory Python SDK: pip install shodh-memory
+    1. Install veld Python SDK: pip install veld
     2. Or start server: npx -y @shodh/memory-mcp
     3. Run this script
 
@@ -27,7 +27,7 @@ from llama_index.core.agent import FunctionCallingAgent
 
 # Option 1: Use the Python SDK directly
 try:
-    from shodh_memory import Memory
+    from veld import Memory
     USE_SDK = True
 except ImportError:
     USE_SDK = False

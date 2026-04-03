@@ -6,7 +6,7 @@ Uses Hebbian learning for association strengthening - no LLM calls for memory op
 
 Usage:
     from llama_index.core.chat_engine import SimpleChatEngine
-    from shodh_memory.integrations.llamaindex import ShodhLlamaMemory
+    from veld.integrations.llamaindex import ShodhLlamaMemory
 
     memory = ShodhLlamaMemory(
         server_url="http://localhost:3030",

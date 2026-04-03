@@ -9,7 +9,7 @@ Requirements:
 
 Setup:
     1. Start shodh-memory server: npx -y @shodh/memory-mcp
-    2. Or run locally: veld
+    2. Or run locally: veld server
     3. Run this script
 
 Documentation: https://github.com/Portll/veld/tree/main/docs

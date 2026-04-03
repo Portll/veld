@@ -11,7 +11,7 @@ Tests:
   - Memory footprint (RocksDB directory size on disk)
 
 Run:
-    pip install shodh-memory
+    pip install veld
     python benchmark.py
 """
 

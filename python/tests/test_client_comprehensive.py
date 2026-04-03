@@ -1,4 +1,4 @@
-"""Comprehensive tests for shodh_memory.client
+"""Comprehensive tests for veld.client
 
 Covers all public methods, exception handling, auto-start logic,
 platform detection, and edge cases. Uses unittest.mock exclusively
@@ -13,8 +13,8 @@ import unittest
 from unittest import mock
 
 # Load the client module directly from file path to avoid import issues
-CLIENT_PATH = pathlib.Path(__file__).resolve().parents[1] / "shodh_memory" / "client.py"
-SPEC = importlib.util.spec_from_file_location("shodh_memory_client", CLIENT_PATH)
+CLIENT_PATH = pathlib.Path(__file__).resolve().parents[1] / "veld" / "client.py"
+SPEC = importlib.util.spec_from_file_location("veld_client", CLIENT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 CLIENT_MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CLIENT_MODULE)

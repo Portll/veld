@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Basic usage example for Veld - Agentic Memory."""
 
-from shodh_memory import Memory
+from veld import Memory
 
 def main():
     # Create memory for user

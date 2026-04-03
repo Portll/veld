@@ -61,7 +61,7 @@ Veld - Agentic Memory adds a persistent cognitive layer underneath Spot's existi
 ## Quick Start
 
 ```bash
-pip install shodh-memory
+pip install veld
 cd examples/spot
 
 # Run the full 5-day simulation

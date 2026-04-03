@@ -160,7 +160,7 @@ impl NerConfig {
                 // Try common locations - bundled package dir has highest priority
                 let candidates: Vec<Option<PathBuf>> = vec![
                     // Bundled in Python package (highest priority for pip install)
-                    std::env::var("SHODH_PACKAGE_DIR")
+                    std::env::var("VELD_PACKAGE_DIR")
                         .ok()
                         .map(|p| PathBuf::from(p).join("models/bert-tiny-ner")),
                     // Local development paths

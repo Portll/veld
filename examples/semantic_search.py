@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Semantic search example - user provides their own embedding model"""
 
-from shodh_memory import Memory
+from veld import Memory
 
 # User brings their own embedding model (any model they want)
 from sentence_transformers import SentenceTransformer

@@ -1,11 +1,11 @@
 """
-Shodh-Memory: AI Memory System for Autonomous Robots & Drones
+Veld: Adaptive Memory Runtime for AI Agents & Robots
 
 Native Python bindings for high-performance memory operations
 optimized for robotics, drones, and offline AI applications.
 
 Usage:
-    from shodh_memory import Memory  # or MemorySystem (same class)
+    from veld import Memory  # or MemorySystem (same class)
 
     memory = Memory(storage_path="./my_data")
     memory.remember("Important fact", memory_type="Context")
@@ -24,13 +24,13 @@ Features:
 - 100% offline operation - No cloud, no API keys
 
 LLM Framework Integrations:
-    # LangChain - pip install shodh-memory[langchain]
-    from shodh_memory.integrations.langchain import ShodhMemory
+    # LangChain - pip install veld[langchain]
+    from veld.integrations.langchain import ShodhMemory
 
-    # LlamaIndex - pip install shodh-memory[llamaindex]
-    from shodh_memory.integrations.llamaindex import ShodhLlamaMemory
+    # LlamaIndex - pip install veld[llamaindex]
+    from veld.integrations.llamaindex import ShodhLlamaMemory
 
-    # Both - pip install shodh-memory[all]
+    # Both - pip install veld[all]
 """
 
 import os as _os
@@ -39,9 +39,9 @@ from pathlib import Path as _Path
 # Set package directory for bundled ONNX Runtime discovery
 # This allows the Rust code to find lib/onnxruntime.dll bundled in the wheel
 _package_dir = _Path(__file__).parent
-_os.environ.setdefault("SHODH_PACKAGE_DIR", str(_package_dir))
+_os.environ.setdefault("VELD_PACKAGE_DIR", str(_package_dir))
 
-from .shodh_memory import (
+from .veld import (
     MemorySystem,
     # Location types
     Position,
@@ -76,9 +76,9 @@ __all__ = [
 
 # Show GitHub prompt once per session
 import sys as _sys
-if not getattr(_sys, '_shodh_star_shown', False):
+if not getattr(_sys, '_veld_star_shown', False):
     try:
         print("\u2b50 Love Veld? Star us: https://github.com/Portll/veld")
     except UnicodeEncodeError:
         print("* Love Veld? Star us: https://github.com/Portll/veld")
-    _sys._shodh_star_shown = True
+    _sys._veld_star_shown = True
