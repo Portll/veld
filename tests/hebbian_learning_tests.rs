@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::graph_memory::GraphMemory;
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::graph_memory::GraphMemory;
+use veld::memory::{
     Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalOutcome,
 };
 use tempfile::TempDir;
@@ -41,7 +41,7 @@ fn setup_memory_system() -> (MemorySystem, TempDir) {
     // Wire up GraphMemory for Hebbian association tests
     let graph_path = temp_dir.path().join("graph");
     let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
-    memory_system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(
+    memory_system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
         graph_memory,
     )));
 
@@ -376,7 +376,7 @@ fn test_reinforcement_stats_counts() {
 fn test_reinforcement_empty_ids() {
     let (mut memory, _temp) = setup_memory_system();
 
-    let ids: Vec<shodh_memory::memory::MemoryId> = vec![];
+    let ids: Vec<veld::memory::MemoryId> = vec![];
     let stats = memory
         .reinforce_recall(&ids, RetrievalOutcome::Helpful)
         .unwrap();
@@ -393,8 +393,8 @@ fn test_reinforcement_invalid_ids() {
 
     // Create random IDs that don't exist
     let ids = vec![
-        shodh_memory::memory::MemoryId(shodh_memory::uuid::Uuid::new_v4()),
-        shodh_memory::memory::MemoryId(shodh_memory::uuid::Uuid::new_v4()),
+        veld::memory::MemoryId(veld::uuid::Uuid::new_v4()),
+        veld::memory::MemoryId(veld::uuid::Uuid::new_v4()),
     ];
 
     let stats = memory
@@ -735,7 +735,7 @@ fn create_system_with_graph(config: MemoryConfig) -> MemorySystem {
     let graph_path = config.storage_path.join("graph");
     let mut system = MemorySystem::new(config, None).expect("Failed to create memory system");
     let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
-    system.set_graph_memory(Arc::new(shodh_memory::parking_lot::RwLock::new(
+    system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
         graph_memory,
     )));
     system

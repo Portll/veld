@@ -3,9 +3,9 @@
 //! These tests download the TinyBERT-finetuned-NER model and run entity extraction.
 //! Requires network access on first run to download the model (~14.5MB quantized).
 
-use shodh_memory::embeddings::minilm::pre_init_ort_runtime;
-use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use shodh_memory::embeddings::{
+use veld::embeddings::minilm::pre_init_ort_runtime;
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::embeddings::{
     are_ner_models_downloaded, download_ner_models, get_ner_models_dir,
 };
 use std::sync::Arc;

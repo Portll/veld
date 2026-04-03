@@ -7,11 +7,11 @@ use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::types::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::types::{
     Experience, ExperienceType, GeoFilter, Memory, MemoryId, Query, RetrievalMode,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 
 /// Create fallback NER instance for testing
 fn setup_fallback_ner() -> NeuralNer {

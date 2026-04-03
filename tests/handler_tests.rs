@@ -19,7 +19,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use shodh_memory::{
+use veld::{
     config::ServerConfig,
     handlers::{build_protected_routes, build_public_routes, MultiUserMemoryManager},
 };
@@ -67,7 +67,7 @@ impl Harness {
         // Mirror main.rs: auth middleware only wraps protected routes.
         let public = build_public_routes(self.mgr.clone());
         let protected = build_protected_routes(self.mgr.clone()).layer(axum::middleware::from_fn(
-            shodh_memory::auth::auth_middleware,
+            veld::auth::auth_middleware,
         ));
         Router::new().merge(public).merge(protected)
     }

@@ -6,9 +6,9 @@
 //! - Configuration impact on latency
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem};
-use shodh_memory::relevance::{RelevanceConfig, RelevanceEngine};
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem};
+use veld::relevance::{RelevanceConfig, RelevanceEngine};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;

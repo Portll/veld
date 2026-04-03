@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::{Duration, Utc};
-use shodh_memory::memory::types::{Experience, ExperienceType, Query};
-use shodh_memory::memory::{MemoryConfig, MemoryId, MemorySystem};
+use veld::memory::types::{Experience, ExperienceType, Query};
+use veld::memory::{MemoryConfig, MemoryId, MemorySystem};
 use tempfile::TempDir;
 
 // =============================================================================
@@ -995,7 +995,7 @@ fn count_absence_violations(retrieved: &[usize], absence: &[usize]) -> usize {
 
 /// Map MemoryIds returned by recall back to corpus indices.
 fn map_results_to_indices(
-    results: &[std::sync::Arc<shodh_memory::memory::types::Memory>],
+    results: &[std::sync::Arc<veld::memory::types::Memory>],
     stored_ids: &[MemoryId],
 ) -> Vec<usize> {
     results

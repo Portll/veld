@@ -14,8 +14,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use rocksdb::Options;
-use shodh_memory::memory::files::FileMemoryStore;
-use shodh_memory::memory::types::{
+use veld::memory::files::FileMemoryStore;
+use veld::memory::types::{
     CodebaseConfig, FileMemory, FileMemoryId, FileType, LearnedFrom, ProjectId,
 };
 use uuid::Uuid;

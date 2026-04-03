@@ -8,9 +8,9 @@
 //! - Serialization roundtrips
 //! - NER integration for entity extraction
 
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{EntityRef, Experience, ExperienceType, Memory, MemoryId, MemoryTier};
-use shodh_memory::uuid::Uuid;
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{EntityRef, Experience, ExperienceType, Memory, MemoryId, MemoryTier};
+use veld::uuid::Uuid;
 
 /// Create fallback NER instance for testing
 fn setup_fallback_ner() -> NeuralNer {

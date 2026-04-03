@@ -10,10 +10,10 @@
 //! Run with: cargo bench --bench pipeline_benchmarks
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use shodh_memory::embeddings::minilm::{EmbeddingConfig, MiniLMEmbedder};
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::embeddings::Embedder;
-use shodh_memory::memory::{
+use veld::embeddings::minilm::{EmbeddingConfig, MiniLMEmbedder};
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::embeddings::Embedder;
+use veld::memory::{
     Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode,
 };
 use std::time::Instant;

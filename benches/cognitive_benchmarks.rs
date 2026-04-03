@@ -9,12 +9,12 @@
 //! - NER integration for entity extraction
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use shodh_memory::embeddings::ner::{NerConfig, NeuralNer};
-use shodh_memory::memory::{
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{
     EntityRef, Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem,
     MemoryTier, Query, RetrievalOutcome,
 };
-use shodh_memory::uuid::Uuid;
+use veld::uuid::Uuid;
 use tempfile::TempDir;
 
 /// Create test memory system

@@ -18,7 +18,7 @@
 
 use chrono::Utc;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use shodh_memory::graph_memory::{
+use veld::graph_memory::{
     EdgeSource, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
     RelationType, RelationshipEdge,
 };
