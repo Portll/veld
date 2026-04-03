@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "veld"
+name = "theveld"
 version = "0.7.7"
 description = "Adaptive memory runtime for AI agents and robots — Hebbian learning, hybrid retrieval, knowledge graph, gap topology. Zenoh/ROS2 native."
 authors = [{name = "Private Citizen", email = "john@portll.net"}]
