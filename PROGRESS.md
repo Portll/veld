@@ -1,6 +1,6 @@
 # Veld - Agentic Memory Retrieval Progress
 
-**Current Branch**: v0.7.6-unstable | Stabilization and cleanup track toward v0.8
+**Current Branch**: v0.7.7-unstable | Stabilization and cleanup track toward v0.8
 **Last Benchmarked Retrieval Snapshot**: v0.7.2 | MRR 0.925 | Temporal 0.900 | Single-hop 1.000 | Composite 78.4%
 **Immediate Target**: clean v0.8 cut from `main`
 **Post-v0.8 Target**: v0.9 redb integration and public release hardening
@@ -8,7 +8,7 @@
 ---
 
 > Status note: this document mixes shipped retrieval results from the last benchmarked
-> snapshot with current branch cleanup work. Treat `v0.7.6-unstable` as unreleased and
+> snapshot with current branch cleanup work. Treat `v0.7.7-unstable` as unreleased and
 > not suitable for public release until the stabilization pass is complete.
 
 ## Shipped (retrieval track, v0.5.0 -> v0.7.2)

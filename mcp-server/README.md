@@ -5,7 +5,7 @@
 <h1 align="center">Veld - Agentic Memory MCP Server</h1>
 
 <p align="center">
-  <strong>Internal branch: v0.7.6-unstable</strong> | Persistent cognitive memory for AI agents
+  <strong>Internal branch: v0.7.7-unstable</strong> | Persistent cognitive memory for AI agents
 </p>
 
 <p align="center">
@@ -81,7 +81,7 @@ env = { SHODH_API_KEY = "your-api-key-here" }
 ### Build From Source (Branch Tip)
 
 The published npm package tracks the last public release line. If you are
-testing the checked-out `v0.7.6-unstable` branch, build the MCP server from this
+testing the checked-out `v0.7.7-unstable` branch, build the MCP server from this
 repo and point your client at the generated `dist/index.js` instead of `npx`.
 
 ```bash

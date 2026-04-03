@@ -5,7 +5,7 @@ info:
     Unified API specification for semantic memory implementations.
 
     This file is an interoperability spec, not the exact runtime contract for the
-    current `v0.7.6-unstable` Veld branch.
+    current `v0.7.7-unstable` Veld branch.
 
     This specification defines a common interface for memory systems that support:
     - Semantic search with vector embeddings
