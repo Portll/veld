@@ -17,10 +17,10 @@
 /// Each `cargo build` produces a different key, so the encrypted bytes
 /// differ across builds (prevents known-plaintext attacks).
 const FORTRESS_KEY: [u8; 32] = {
-    // Build.rs sets SHODH_FORTRESS_KEY as 32 comma-separated bytes.
-    // If not set, use a compile-time fallback derived from build timestamp.
+    // Build.rs sets VELD_BUILD_NUMBER and VELD_FORTRESS_SEED for each build.
+    // We derive a per-build fallback key from the build number here.
     // This is NOT a secret — it's a speed bump against `strings`, not crypto.
-    let ts = env!("SHODH_BUILD_NUMBER");
+    let ts = env!("VELD_BUILD_NUMBER");
     let b = ts.as_bytes();
     let mut key = [0x5Au8; 32];
     let mut i = 0;
