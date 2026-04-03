@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shodh Memory - Stop Hook
+# Veld - Stop Hook
 # Stores the interaction when Claude finishes responding
 
 SHODH_API_URL="${SHODH_API_URL:-http://127.0.0.1:3030}"

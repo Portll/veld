@@ -12,7 +12,7 @@ const https = require('https');
 const { execFileSync } = require('child_process');
 
 const VERSION = require('../package.json').version;
-const REPO = 'varun29ankuS/shodh-memory';
+const REPO = 'Portll/veld';
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 
 // Platform detection

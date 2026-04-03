@@ -84,7 +84,7 @@ CONTENT_ESCAPED=$(echo "$CONTENT" | jq -Rs '.')
 CWD=$(echo "$INPUT" | jq -r '.cwd // "unknown"')
 PROJECT=$(basename "$CWD")
 
-# Send to shodh-memory API (fire and forget, don't block Claude)
+# Send to the Veld API (fire and forget, don't block Claude)
 curl -s -X POST "$API_URL/api/record" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: $API_KEY" \

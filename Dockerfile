@@ -69,17 +69,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN useradd -m -u 1000 shodh && \
+RUN useradd -m -u 1000 veld && \
     mkdir -p /data && \
-    chown -R shodh:shodh /data
+    chown -R veld:veld /data
 
 # Copy binary and ONNX Runtime from builder
-COPY --from=builder /app/target/release/veld /usr/local/bin/shodh-memory
+COPY --from=builder /app/target/release/veld /usr/local/bin/veld
 COPY --from=builder /usr/local/lib/libonnxruntime.so /usr/local/lib/libonnxruntime.so
 RUN ldconfig
 
 # Switch to non-root user
-USER shodh
+USER veld
 
 # Set working directory
 WORKDIR /data
@@ -99,4 +99,4 @@ ENV RUST_LOG=info \
     LD_LIBRARY_PATH=/usr/local/lib
 
 # Run the binary
-CMD ["shodh-memory"]
+CMD ["veld"]

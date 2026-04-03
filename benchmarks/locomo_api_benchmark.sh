@@ -1,5 +1,5 @@
 #!/bin/bash
-# LOCOMO-style benchmark against shodh-memory API
+# LOCOMO-style benchmark against the Veld API
 # Stores 20 memories, runs 20 queries, computes MRR/R@5/R@10
 set -euo pipefail
 
@@ -9,7 +9,7 @@ USER_ID="locomo_bench_$(date +%s)"
 RESULTS_FILE="/tmp/locomo_bench_results_$$.json"
 
 echo "========================================================================"
-echo "LOCOMO-STYLE BENCHMARK — shodh-memory API"
+echo "LOCOMO-STYLE BENCHMARK — Veld API"
 echo "Server: $BASE_URL"
 echo "User:   $USER_ID"
 echo "Time:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
