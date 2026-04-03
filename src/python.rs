@@ -2249,7 +2249,7 @@ fn veld(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEnvironment>()?;
 
     // Version and metadata
-    m.add("__version__", env!("SHODH_VERSION_FULL"))?;
+    m.add("__version__", env!("VELD_VERSION_FULL"))?;
     m.add(
         "__doc__",
         "Veld - Agentic Memory: Adaptive memory runtime for AI agents and robots\n\n\

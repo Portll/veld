@@ -250,7 +250,7 @@ async fn async_main() -> Result<()> {
             async move {
             axum::Json(serde_json::json!({
                 "name": "veld",
-                "version": env!("SHODH_VERSION_FULL"),
+                "version": env!("VELD_VERSION_FULL"),
                 "description": "Adaptive memory runtime for AI agents and robots",
                 "requested_storage_backend": requested_storage_backend,
                 "effective_storage_backend": effective_storage_backend,
@@ -599,7 +599,7 @@ fn print_banner() {
     eprintln!("  ╔═══════════════════════════════════════════════════╗");
     eprintln!(
         "  ║            🧠 Veld Server v{}",
-        env!("SHODH_VERSION_FULL")
+        env!("VELD_VERSION_FULL")
     );
     eprintln!("  ║       Cognitive Memory for AI Agents              ║");
     eprintln!("  ╚═══════════════════════════════════════════════════╝");

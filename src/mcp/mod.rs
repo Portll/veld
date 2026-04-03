@@ -1,9 +1,9 @@
 //! Unified Veld binary - MCP server + Claude Code hooks
 //!
 //! Usage:
-//!   shodh serve              - Run as MCP server (stdio transport)
-//!   shodh hook session-start - Output session start hook JSON
-//!   shodh hook prompt <msg>  - Output prompt submit hook JSON
+//!   veld serve               - Run as MCP server (stdio transport)
+//!   veld hook session-start  - Output session start hook JSON
+//!   veld hook prompt <msg>   - Output prompt submit hook JSON
 //!
 //! Both modes use the same core memory functionality, ready for future MCP push.
 

@@ -3,15 +3,15 @@
 //! Maintains a monotonic counter in `.build_number` at the project root.
 //! Each `cargo build` / `cargo check` bumps it by 1 and exposes:
 //!
-//! - `SHODH_BUILD_NUMBER` — the counter (e.g., "142")
-//! - `SHODH_BUILD_TIMESTAMP` — ISO 8601 UTC timestamp of the build
-//! - `SHODH_VERSION_FULL` — "{cargo_version}+{build_number}" (e.g., "0.5.1-1+142")
+//! - `VELD_BUILD_NUMBER` — the counter (e.g., "142")
+//! - `VELD_BUILD_TIMESTAMP` — ISO 8601 UTC timestamp of the build
+//! - `VELD_VERSION_FULL` — "{cargo_version}+{build_number}" (e.g., "0.5.1-1+142")
 //!
 //! Access in Rust via:
 //! ```ignore
-//! env!("SHODH_BUILD_NUMBER")
-//! env!("SHODH_BUILD_TIMESTAMP")
-//! env!("SHODH_VERSION_FULL")
+//! env!("VELD_BUILD_NUMBER")
+//! env!("VELD_BUILD_TIMESTAMP")
+//! env!("VELD_VERSION_FULL")
 //! ```
 //!
 //! The `.build_number` file should be gitignored — it's local to each machine.
@@ -46,16 +46,16 @@ fn main() {
     let full_version = format!("{}+{}", pkg_version, next);
 
     // Expose to the crate
-    println!("cargo:rustc-env=SHODH_BUILD_NUMBER={}", next);
-    println!("cargo:rustc-env=SHODH_BUILD_TIMESTAMP={}", ts);
-    println!("cargo:rustc-env=SHODH_VERSION_FULL={}", full_version);
+    println!("cargo:rustc-env=VELD_BUILD_NUMBER={}", next);
+    println!("cargo:rustc-env=VELD_BUILD_TIMESTAMP={}", ts);
+    println!("cargo:rustc-env=VELD_VERSION_FULL={}", full_version);
 
     // Fortress: generate per-build random encryption seed
     // The seed is derived from build number + timestamp, ensuring every build
     // produces different encrypted byte patterns (prevents known-plaintext attacks).
     // This is NOT cryptographic security — it's obfuscation against `strings`.
     let fortress_seed = format!("{}:{}", next, secs);
-    println!("cargo:rustc-env=SHODH_FORTRESS_SEED={}", fortress_seed);
+    println!("cargo:rustc-env=VELD_FORTRESS_SEED={}", fortress_seed);
 
     // Only re-run when the build file changes (not on every source change)
     // This is a compromise: the number increments on every build invocation

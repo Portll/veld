@@ -286,7 +286,7 @@ pub fn build_document(
     vendor_extensions.insert(
         "shodh-memory".to_string(),
         serde_json::json!({
-            "version": env!("SHODH_VERSION_FULL"),
+            "version": env!("VELD_VERSION_FULL"),
             "memory_metadata": vendor_memory_meta,
             "edge_metadata": edge_metadata,
         }),
@@ -310,7 +310,7 @@ pub fn build_document(
         mif_version: "2.0".to_string(),
         generator: MifGenerator {
             name: "shodh-memory".to_string(),
-            version: env!("SHODH_VERSION_FULL").to_string(),
+            version: env!("VELD_VERSION_FULL").to_string(),
         },
         export_meta: MifExportMeta {
             id: export_id,
