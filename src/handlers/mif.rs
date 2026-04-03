@@ -36,7 +36,7 @@ pub struct MifExportRequest {
 }
 
 fn default_format() -> String {
-    "shodh".to_string()
+    "veld".to_string()
 }
 
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
@@ -103,7 +103,7 @@ pub async fn export_mif(
     .map_err(AppError::Internal)?;
 
     // Convert to requested output format
-    let output = if req.format == "shodh" || req.format == "json" {
+    let output = if req.format == "veld" || req.format == "shodh" || req.format == "json" {
         serde_json::to_value(&doc).map_err(|e| AppError::Internal(e.into()))?
     } else {
         let registry = AdapterRegistry::new();
@@ -314,7 +314,7 @@ pub async fn list_adapters() -> Json<serde_json::Value> {
 
     Json(serde_json::json!({
         "adapters": adapters,
-        "default_export": "shodh",
+        "default_export": "veld",
         "default_import": "auto-detect",
     }))
 }

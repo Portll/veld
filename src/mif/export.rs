@@ -1,4 +1,4 @@
-//! Streaming export from shodh internals to MifDocument.
+//! Streaming export from veld internals to MifDocument.
 //!
 //! Converts internal Memory, Todo, Project, Reminder, and Graph data
 //! into the vendor-neutral MIF v2 schema. Entity types are preserved
@@ -31,7 +31,7 @@ pub struct ExportOptions {
     pub since: Option<DateTime<Utc>>,
 }
 
-/// Build a complete MIF v2 document from shodh internals.
+/// Build a complete MIF v2 document from veld internals.
 ///
 /// This function takes pre-fetched data (memories, graph, todos, etc.) so the
 /// caller can control locking and streaming. Entity types are resolved from the
@@ -229,7 +229,7 @@ pub fn build_document(
             version: m.version,
         });
 
-        // Vendor extension: shodh-specific metadata per memory
+        // Vendor extension: veld-specific metadata per memory
         vendor_memory_meta.insert(
             m.id.0.to_string(),
             serde_json::json!({
@@ -284,7 +284,7 @@ pub fn build_document(
     }
 
     vendor_extensions.insert(
-        "shodh-memory".to_string(),
+        "veld-memory".to_string(),
         serde_json::json!({
             "version": env!("VELD_VERSION_FULL"),
             "memory_metadata": vendor_memory_meta,
@@ -309,7 +309,7 @@ pub fn build_document(
     Ok(MifDocument {
         mif_version: "2.0".to_string(),
         generator: MifGenerator {
-            name: "shodh-memory".to_string(),
+            name: "veld-memory".to_string(),
             version: env!("VELD_VERSION_FULL").to_string(),
         },
         export_meta: MifExportMeta {
