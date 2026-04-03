@@ -1,8 +1,8 @@
 services:
-  shodh-memory:
+  veld:
     build: .
-    image: ghcr.io/varun29ankus/shodh-memory:latest
-    container_name: shodh-memory
+    image: ghcr.io/portll/veld:latest
+    container_name: veld
     ports:
       - "3030:3030"
     environment:
@@ -11,7 +11,7 @@ services:
       - SHODH_PORT=3030
       - SHODH_MEMORY_PATH=/data
     volumes:
-      - shodh-data:/data
+      - veld-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3030/health"]
@@ -20,12 +20,12 @@ services:
       retries: 3
       start_period: 40s
     networks:
-      - shodh-network
+      - veld-network
 
 volumes:
-  shodh-data:
+  veld-data:
     driver: local
 
 networks:
-  shodh-network:
+  veld-network:
     driver: bridge

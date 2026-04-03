@@ -193,7 +193,7 @@ pub struct MultiUserMemoryManager {
     pub feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
 
     /// Backup engine for automated and manual backups
-    pub backup_engine: Arc<backup::ShodhBackupEngine>,
+    pub backup_engine: Arc<backup::VeldBackupEngine>,
 
     /// Context status from Claude Code sessions
     pub context_sessions: Arc<ContextSessions>,
@@ -628,11 +628,11 @@ impl MultiUserMemoryManager {
     fn open_backup_engine(
         base_path: &std::path::Path,
         server_config: &ServerConfig,
-    ) -> Result<Arc<backup::ShodhBackupEngine>> {
+    ) -> Result<Arc<backup::VeldBackupEngine>> {
         let backup_path = base_path.join("backups");
 
         match server_config.effective_storage_backend {
-            StorageBackend::RocksDb => Ok(Arc::new(backup::ShodhBackupEngine::new(backup_path)?)),
+            StorageBackend::RocksDb => Ok(Arc::new(backup::VeldBackupEngine::new(backup_path)?)),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup engine bootstrap yet",
                 server_config.effective_storage_backend
@@ -1818,7 +1818,7 @@ impl MultiUserMemoryManager {
     }
 
     /// Get the backup engine
-    pub fn backup_engine(&self) -> &Arc<backup::ShodhBackupEngine> {
+    pub fn backup_engine(&self) -> &Arc<backup::VeldBackupEngine> {
         &self.backup_engine
     }
 

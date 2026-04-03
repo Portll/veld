@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shodh Memory - User Prompt Submit Hook
+# Veld - User Prompt Submit Hook
 # Enriches context based on what user is asking
 
 SHODH_API_URL="${SHODH_API_URL:-http://127.0.0.1:3030}"

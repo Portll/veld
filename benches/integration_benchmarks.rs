@@ -81,7 +81,7 @@ fn create_linear_issue() -> LinearIssueData {
         ],
         team: Some(LinearTeam {
             id: "team-id".to_string(),
-            name: Some("Shodh Memory".to_string()),
+            name: Some("Veld".to_string()),
             key: Some("SHO".to_string()),
         }),
         project: Some(LinearProject {
@@ -107,13 +107,13 @@ fn create_linear_issue() -> LinearIssueData {
 fn create_github_repo() -> GitHubRepository {
     GitHubRepository {
         id: 123456789,
-        name: "shodh-memory".to_string(),
-        full_name: "varun29ankuS/shodh-memory".to_string(),
+        name: "veld".to_string(),
+        full_name: "Portll/veld".to_string(),
         description: Some("Cognitive memory system for AI agents".to_string()),
-        html_url: "https://github.com/varun29ankuS/shodh-memory".to_string(),
+        html_url: "https://github.com/Portll/veld".to_string(),
         owner: GitHubUser {
             id: 1,
-            login: "varun29ankuS".to_string(),
+            login: "Portll".to_string(),
             name: Some("Varun Sharma".to_string()),
             avatar_url: Some("https://avatars.githubusercontent.com/u/1".to_string()),
         },
@@ -136,14 +136,14 @@ fn create_github_issue() -> GitHubIssue {
             ## Environment\n\
             - OS: Ubuntu 22.04\n\
             - Rust: 1.75\n\
-            - shodh-memory: 0.1.5"
+            - veld: 0.1.5"
                 .to_string(),
         ),
         state: "open".to_string(),
-        html_url: "https://github.com/varun29ankuS/shodh-memory/issues/42".to_string(),
+        html_url: "https://github.com/Portll/veld/issues/42".to_string(),
         user: Some(GitHubUser {
             id: 1,
-            login: "varun29ankuS".to_string(),
+            login: "Portll".to_string(),
             name: Some("Varun".to_string()),
             avatar_url: None,
         }),
@@ -187,7 +187,7 @@ fn create_github_pr() -> GitHubPullRequest {
         title: "feat(integrations): Add GitHub webhook receiver and bulk sync".to_string(),
         body: Some(
             "## Summary\n\
-            Adds comprehensive GitHub integration for syncing issues and PRs to Shodh memory.\n\n\
+            Adds comprehensive GitHub integration for syncing issues and PRs to Veld.\n\n\
             ## Changes\n\
             - Add webhook handler with HMAC verification\n\
             - Add REST API client for bulk sync\n\
@@ -200,7 +200,7 @@ fn create_github_pr() -> GitHubPullRequest {
                 .to_string(),
         ),
         state: "open".to_string(),
-        html_url: "https://github.com/varun29ankuS/shodh-memory/pull/55".to_string(),
+        html_url: "https://github.com/Portll/veld/pull/55".to_string(),
         user: Some(GitHubUser {
             id: 1,
             login: "varun29ankuS".to_string(),
@@ -276,7 +276,7 @@ fn create_linear_webhook_payload() -> String {
             ],
             "team": {
                 "id": "team-id",
-                "name": "Shodh Memory",
+                "name": "Veld",
                 "key": "SHO"
             },
             "project": {
@@ -301,7 +301,7 @@ fn create_github_webhook_payload() -> String {
             "title": "Fix memory leak in retrieval engine",
             "body": "Memory usage grows unbounded during batch retrieval.",
             "state": "open",
-            "html_url": "https://github.com/varun29ankuS/shodh-memory/issues/42",
+            "html_url": "https://github.com/Portll/veld/issues/42",
             "user": {"id": 1, "login": "varun29ankuS"},
             "assignee": {"id": 2, "login": "contributor"},
             "labels": [
@@ -313,12 +313,12 @@ fn create_github_webhook_payload() -> String {
         },
         "repository": {
             "id": 123456789,
-            "name": "shodh-memory",
-            "full_name": "varun29ankuS/shodh-memory",
-            "html_url": "https://github.com/varun29ankuS/shodh-memory",
-            "owner": {"id": 1, "login": "varun29ankuS"}
+            "name": "veld",
+            "full_name": "Portll/veld",
+            "html_url": "https://github.com/Portll/veld",
+            "owner": {"id": 1, "login": "Portll"}
         },
-        "sender": {"id": 1, "login": "varun29ankuS"}
+        "sender": {"id": 1, "login": "Portll"}
     })
     .to_string()
 }

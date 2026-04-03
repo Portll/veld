@@ -351,4 +351,4 @@ Obstacles you encounter repeatedly become part of the robot's permanent knowledg
 
 ## License
 
-Apache 2.0 — [Veld - Agentic Memory](https://github.com/varun29ankuS/shodh-memory)
+Apache 2.0 — [Veld - Agentic Memory](https://github.com/Portll/veld)

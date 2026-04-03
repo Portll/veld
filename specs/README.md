@@ -88,7 +88,7 @@ See [schemas/memory.md](./schemas/memory.md) for complete field documentation.
 
 | Project | Backend | Embeddings | Status |
 |---------|---------|------------|--------|
-| [Veld - Agentic Memory](https://github.com/varun29ankuS/shodh-memory) | RocksDB (local) | MiniLM-L6-v2 (ONNX) | Reference |
+| [Veld - Agentic Memory](https://github.com/Portll/veld) | RocksDB (local) | MiniLM-L6-v2 (ONNX) | Reference |
 | [shodh-cloudflare](https://github.com/doobidoo/shodh-cloudflare) | D1 + Vectorize (edge) | Workers AI (bge-small) | Production |
 | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | SQLite-vec / Hybrid | MiniLM-L6-v2 (ONNX) | Production |
 

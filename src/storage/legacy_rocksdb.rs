@@ -12,7 +12,7 @@ use super::{
     AuditLogEntry, AuditStore, BackupStore, GraphStore, KeyValueStore, MigrationStore,
     PrimaryMemoryStore, StorageFactory,
 };
-use crate::backup::{BackupMetadata, ShodhBackupEngine};
+use crate::backup::{BackupMetadata, VeldBackupEngine};
 use crate::config::StorageBackend;
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge};
 use crate::memory::storage::{MemoryStorage, SearchCriteria, VectorMappingEntry};
@@ -175,16 +175,16 @@ impl GraphStore for RocksDbGraphStore {
 
 /// Trait adapter for the current RocksDB backup engine.
 pub struct RocksDbBackupStore {
-    inner: ShodhBackupEngine,
+    inner: VeldBackupEngine,
     primary_db: Arc<DB>,
 }
 
 impl RocksDbBackupStore {
-    pub fn new(inner: ShodhBackupEngine, primary_db: Arc<DB>) -> Self {
+    pub fn new(inner: VeldBackupEngine, primary_db: Arc<DB>) -> Self {
         Self { inner, primary_db }
     }
 
-    pub fn inner(&self) -> &ShodhBackupEngine {
+    pub fn inner(&self) -> &VeldBackupEngine {
         &self.inner
     }
 }

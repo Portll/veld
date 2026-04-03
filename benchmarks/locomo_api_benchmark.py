@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LOCOMO-style benchmark against the shodh-memory API.
+LOCOMO-style benchmark against the Veld API.
 
 Stores 20 diverse conversational memories simulating multi-session project work,
 then runs 20 retrieval queries across 4 categories:
@@ -447,7 +447,7 @@ def compute_hit_at_k(ranked_ids: list[str], expected_ids: set[str], k: int) -> f
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 72)
-    print("LOCOMO-STYLE BENCHMARK — shodh-memory API")
+    print("LOCOMO-STYLE BENCHMARK — Veld API")
     print(f"Server: {BASE_URL}")
     print(f"User:   {USER_ID}")
     print(f"Time:   {datetime.now(timezone.utc).isoformat()}")

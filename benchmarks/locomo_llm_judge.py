@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LOCOMO LLM-judged evaluation for shodh-memory.
+LOCOMO LLM-judged evaluation for Veld.
 
 Stores 20 conversational memories, runs 20 retrieval queries, then uses
 a local LLM (QwQ on LM Studio) to judge whether the retrieved context
@@ -35,12 +35,12 @@ from eval_metrics import (
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SHODH_URL = "http://127.0.0.1:3030"
-SHODH_API_KEY = "dev-key-antidote"
+BASE_URL = "http://127.0.0.1:3030"
+API_KEY = "dev-key-antidote"
 LM_STUDIO_URL = "http://localhost:1234/v1"
 JUDGE_MODEL = "qwen/qwq-32b"
 USER_ID = f"locomo_judge_{int(time.time())}"
-HEADERS = {"Content-Type": "application/json", "X-API-Key": SHODH_API_KEY}
+HEADERS = {"Content-Type": "application/json", "X-API-Key": API_KEY}
 
 # ---------------------------------------------------------------------------
 # Memories — 20 entries across 4 weeks
@@ -338,7 +338,7 @@ def store_memory(mem: dict) -> str | None:
     }
     if mem.get("created_at"):
         payload["created_at"] = mem["created_at"]
-    resp = requests.post(f"{SHODH_URL}/api/remember", headers=HEADERS, json=payload)
+    resp = requests.post(f"{BASE_URL}/api/remember", headers=HEADERS, json=payload)
     if resp.status_code != 200:
         print(f"  ERROR storing {mem['id_tag']}: {resp.status_code} {resp.text}")
         return None
@@ -347,7 +347,7 @@ def store_memory(mem: dict) -> str | None:
 
 def recall_memories(query: str, limit: int = 10) -> list[dict]:
     payload = {"user_id": USER_ID, "query": query, "limit": limit, "mode": "hybrid"}
-    resp = requests.post(f"{SHODH_URL}/api/recall", headers=HEADERS, json=payload)
+    resp = requests.post(f"{BASE_URL}/api/recall", headers=HEADERS, json=payload)
     if resp.status_code != 200:
         print(f"  ERROR recalling: {resp.status_code} {resp.text}")
         return []
@@ -585,8 +585,8 @@ def judge_with_llm(query: str, gold_answer: str, retrieved_memories: list[dict])
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 72)
-    print("LOCOMO LLM-JUDGED EVALUATION — shodh-memory")
-    print(f"Server:  {SHODH_URL}")
+    print("LOCOMO LLM-JUDGED EVALUATION — Veld")
+    print(f"Server:  {BASE_URL}")
     print(f"Judge:   {JUDGE_MODEL} @ LM Studio")
     print(f"User:    {USER_ID}")
     print(f"Time:    {datetime.now(timezone.utc).isoformat()}")
@@ -595,10 +595,10 @@ def main():
     # Health check
     print("\n[1/5] Health checks...")
     try:
-        h = requests.get(f"{SHODH_URL}/health", timeout=5).json()
-        print(f"  shodh: {h.get('status')} v{h.get('version')}")
+        h = requests.get(f"{BASE_URL}/health", timeout=5).json()
+        print(f"  veld: {h.get('status')} v{h.get('version')}")
     except Exception as e:
-        print(f"  FATAL: shodh unreachable: {e}")
+        print(f"  FATAL: Veld unreachable: {e}")
         sys.exit(1)
     try:
         m = requests.get(f"{LM_STUDIO_URL}/models", timeout=5).json()
@@ -615,7 +615,7 @@ def main():
     try:
         build = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd="/Users/gourmetfire/Repositories/shodh-memory",
+            cwd="/Users/gourmetfire/Repositories/External/Portll/veld",
             text=True
         ).strip()
     except Exception:

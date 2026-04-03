@@ -1,7 +1,7 @@
 cff-version: 1.2.0
-message: "If you use shodh-memory in your research, please cite it as below."
+message: "If you use Veld in your research, please cite it as below."
 type: software
-title: "shodh-memory"
+title: "Veld"
 abstract: >-
   Persistent cognitive memory for AI agents and edge devices.
   Implements Hebbian learning, 3-tier memory architecture (Cowan 2001),
@@ -16,8 +16,8 @@ doi: "10.5281/zenodo.18668709"
 version: "0.1.91"
 date-released: "2026-03-25"
 license: "BUSL-1.1"
-url: "https://www.shodh-memory.com"
-repository-code: "https://github.com/varun29ankuS/shodh-memory"
+url: "https://github.com/Portll/veld"
+repository-code: "https://github.com/Portll/veld"
 identifiers:
   - type: doi
     value: "10.5281/zenodo.18668709"

@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
             eprintln!("  API URL: {}", api_url);
             eprintln!("  User ID: {}", user_id);
 
-            let server = ShodhMcpServer::new(api_url, api_key, user_id);
+            let server = VeldMcpServer::new(api_url, api_key, user_id);
             let service = server.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
         }
@@ -1175,13 +1175,13 @@ struct LineageStatsResponse {
 // =============================================================================
 
 #[derive(Debug, Clone)]
-struct ShodhMcpServer {
+struct VeldMcpServer {
     client: Arc<AsyncApiClient>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
-impl ShodhMcpServer {
+impl VeldMcpServer {
     fn new(api_url: String, api_key: String, user_id: String) -> Self {
         Self {
             client: Arc::new(AsyncApiClient::new(api_url, api_key, user_id)),
@@ -1519,7 +1519,7 @@ impl ShodhMcpServer {
 }
 
 #[tool_handler]
-impl ServerHandler for ShodhMcpServer {
+impl ServerHandler for VeldMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,

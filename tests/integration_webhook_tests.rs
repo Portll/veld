@@ -68,7 +68,7 @@ mod linear_tests {
             ],
             team: Some(LinearTeam {
                 id: "team-id".to_string(),
-                name: Some("Shodh Memory".to_string()),
+                name: Some("Veld".to_string()),
                 key: Some("SHO".to_string()),
             }),
             project: Some(LinearProject {
@@ -305,14 +305,14 @@ mod github_tests {
     fn create_test_repo() -> GitHubRepository {
         GitHubRepository {
             id: 123456,
-            name: "shodh-memory".to_string(),
-            full_name: "varun29ankuS/shodh-memory".to_string(),
+            name: "veld".to_string(),
+            full_name: "Portll/veld".to_string(),
             description: Some("Cognitive memory system for AI agents".to_string()),
-            html_url: "https://github.com/varun29ankuS/shodh-memory".to_string(),
+            html_url: "https://github.com/Portll/veld".to_string(),
             owner: GitHubUser {
                 id: 1,
-                login: "varun29ankuS".to_string(),
-                name: Some("Varun".to_string()),
+                login: "Portll".to_string(),
+                name: Some("Portll".to_string()),
                 avatar_url: Some("https://avatars.githubusercontent.com/u/1".to_string()),
             },
         }
@@ -324,11 +324,11 @@ mod github_tests {
             title: "Fix memory leak in retrieval engine".to_string(),
             body: Some("Memory usage grows unbounded during batch retrieval.\n\nSteps to reproduce:\n1. Run batch query\n2. Check memory usage".to_string()),
             state: "open".to_string(),
-            html_url: "https://github.com/varun29ankuS/shodh-memory/issues/42".to_string(),
+            html_url: "https://github.com/Portll/veld/issues/42".to_string(),
             user: Some(GitHubUser {
                 id: 1,
-                login: "varun29ankuS".to_string(),
-                name: Some("Varun".to_string()),
+                login: "Portll".to_string(),
+                name: Some("Portll".to_string()),
                 avatar_url: None,
             }),
             assignee: Some(GitHubUser {
@@ -370,7 +370,7 @@ mod github_tests {
             title: "Add GitHub integration".to_string(),
             body: Some("## Summary\nAdds webhook receiver and bulk sync for GitHub.\n\n## Test Plan\n- Unit tests added".to_string()),
             state: "open".to_string(),
-            html_url: "https://github.com/varun29ankuS/shodh-memory/pull/55".to_string(),
+            html_url: "https://github.com/Portll/veld/pull/55".to_string(),
             user: Some(GitHubUser {
                 id: 1,
                 login: "varun29ankuS".to_string(),
@@ -554,7 +554,7 @@ mod github_tests {
         assert!(content.contains("Assignee: contributor"));
         assert!(content.contains("Labels: bug, memory"));
         assert!(content.contains("Milestone: v0.2.0"));
-        assert!(content.contains("Repo: varun29ankuS/shodh-memory"));
+        assert!(content.contains("Repo: Portll/veld"));
 
         // Check body
         assert!(content.contains("Memory usage grows unbounded"));
@@ -614,7 +614,7 @@ mod github_tests {
 
         assert!(tags.contains(&"github".to_string()));
         assert!(tags.contains(&"issue".to_string()));
-        assert!(tags.contains(&"varun29ankuS/shodh-memory".to_string()));
+        assert!(tags.contains(&"Portll/veld".to_string()));
         assert!(tags.contains(&"#42".to_string()));
         assert!(tags.contains(&"open".to_string()));
         assert!(tags.contains(&"bug".to_string()));
@@ -632,7 +632,7 @@ mod github_tests {
         assert!(tags.contains(&"github".to_string()));
         assert!(tags.contains(&"pr".to_string()));
         assert!(tags.contains(&"pull-request".to_string()));
-        assert!(tags.contains(&"varun29ankuS/shodh-memory".to_string()));
+        assert!(tags.contains(&"Portll/veld".to_string()));
         assert!(tags.contains(&"#55".to_string()));
         assert!(tags.contains(&"open".to_string()));
         assert!(tags.contains(&"enhancement".to_string()));
@@ -657,7 +657,7 @@ mod github_tests {
         let repo = create_test_repo();
         let external_id = GitHubWebhook::issue_external_id(&repo, 42);
 
-        assert_eq!(external_id, "github:varun29ankuS/shodh-memory#issue-42");
+        assert_eq!(external_id, "github:Portll/veld#issue-42");
     }
 
     #[test]
@@ -665,7 +665,7 @@ mod github_tests {
         let repo = create_test_repo();
         let external_id = GitHubWebhook::pr_external_id(&repo, 55);
 
-        assert_eq!(external_id, "github:varun29ankuS/shodh-memory#pr-55");
+        assert_eq!(external_id, "github:Portll/veld#pr-55");
     }
 
     #[test]
@@ -743,11 +743,11 @@ mod external_id_tests {
         let identifier = linear_id.strip_prefix("linear:").unwrap();
         assert_eq!(identifier, "SHO-42");
 
-        let github_id = "github:varun29ankuS/shodh-memory#issue-123";
+        let github_id = "github:Portll/veld#issue-123";
         assert!(github_id.starts_with("github:"));
         let rest = github_id.strip_prefix("github:").unwrap();
         let parts: Vec<&str> = rest.split('#').collect();
-        assert_eq!(parts[0], "varun29ankuS/shodh-memory");
+        assert_eq!(parts[0], "Portll/veld");
         assert_eq!(parts[1], "issue-123");
     }
 

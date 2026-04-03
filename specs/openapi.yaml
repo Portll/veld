@@ -18,7 +18,7 @@ info:
 
     | Project | Backend | Embeddings |
     |---------|---------|------------|
-    | [shodh-memory](https://github.com/varun29ankuS/shodh-memory) | RocksDB | MiniLM-L6-v2 (ONNX) |
+    | [Veld](https://github.com/Portll/veld) | RocksDB | MiniLM-L6-v2 (ONNX) |
     | [shodh-cloudflare](https://github.com/doobidoo/shodh-cloudflare) | D1 + Vectorize | Workers AI (bge-small) |
     | [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service) | SQLite-vec / Hybrid | MiniLM-L6-v2 (ONNX) |
 
@@ -29,7 +29,7 @@ info:
   version: 1.0.0
   contact:
     name: Veld Agentic Memory Community
-    url: https://github.com/varun29ankuS/shodh-memory/discussions
+    url: https://github.com/Portll/veld/discussions
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT

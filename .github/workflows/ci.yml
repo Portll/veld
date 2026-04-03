@@ -149,7 +149,7 @@ PY
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: shodh-memory-linux
+          name: veld-linux
           path: target/release/veld
           if-no-files-found: ignore
 
@@ -157,7 +157,7 @@ PY
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: shodh-memory-macos
+          name: veld-macos
           path: target/release/veld
           if-no-files-found: ignore
 
@@ -165,7 +165,7 @@ PY
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: shodh-memory-windows
+          name: veld-windows
           path: target/release/veld.exe
           if-no-files-found: ignore
 

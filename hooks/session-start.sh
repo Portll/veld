@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shodh Memory - Session Start Hook
+# Veld - Session Start Hook
 # Loads proactive context at session start
 
 SHODH_API_URL="${SHODH_API_URL:-http://127.0.0.1:3030}"

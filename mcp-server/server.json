@@ -4,18 +4,18 @@
   "description": "Cognitive memory for AI agents — semantic search, Hebbian learning, knowledge graphs.",
   "icons": [
     {
-      "src": "https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo.png",
-      "mimeType": "image/png",
+      "src": "https://raw.githubusercontent.com/Portll/veld/main/assets/veld-logo.svg",
+      "mimeType": "image/svg+xml",
       "sizes": ["120x120"]
     },
     {
-      "src": "https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/logo_32x32.png",
-      "mimeType": "image/png",
+      "src": "https://raw.githubusercontent.com/Portll/veld/main/assets/veld-logo.svg",
+      "mimeType": "image/svg+xml",
       "sizes": ["32x32"]
     }
   ],
   "repository": {
-    "url": "https://github.com/varun29ankuS/shodh-memory",
+    "url": "https://github.com/Portll/veld",
     "source": "github",
     "subfolder": "mcp-server"
   },
@@ -31,7 +31,7 @@
       "environmentVariables": [
         {
           "name": "SHODH_API_URL",
-          "description": "URL of the shodh-memory backend server",
+          "description": "URL of the Veld backend server",
           "isRequired": false,
           "format": "string",
           "isSecret": false,

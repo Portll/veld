@@ -60,11 +60,11 @@ pub enum BackupType {
 }
 
 /// Backup engine for creating and managing backups
-pub struct ShodhBackupEngine {
+pub struct VeldBackupEngine {
     backup_path: PathBuf,
 }
 
-impl ShodhBackupEngine {
+impl VeldBackupEngine {
     /// Create a new backup engine
     ///
     /// # Arguments
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn test_backup_engine_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let backup_engine = ShodhBackupEngine::new(temp_dir.path().to_path_buf());
+        let backup_engine = VeldBackupEngine::new(temp_dir.path().to_path_buf());
         assert!(backup_engine.is_ok());
     }
 
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn test_list_backups_empty_when_user_missing() {
         let temp_dir = TempDir::new().unwrap();
-        let engine = ShodhBackupEngine::new(temp_dir.path().to_path_buf()).unwrap();
+        let engine = VeldBackupEngine::new(temp_dir.path().to_path_buf()).unwrap();
         let backups = engine.list_backups("missing-user").unwrap();
         assert!(backups.is_empty());
     }
@@ -749,7 +749,7 @@ mod tests {
         db.put(b"k1", b"v1").unwrap();
         db.put(b"k2", b"v2").unwrap();
 
-        let engine = ShodhBackupEngine::new(backup_root.clone()).unwrap();
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
         let metadata = engine.create_backup(&db, user_id).unwrap();
 
         let verified = engine.verify_backup(user_id, metadata.backup_id).unwrap();
@@ -768,7 +768,7 @@ mod tests {
         let db = DB::open(&opts, &db_path).unwrap();
         db.put(b"k", b"v").unwrap();
 
-        let engine = ShodhBackupEngine::new(backup_root.clone()).unwrap();
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
         let metadata = engine.create_backup(&db, user_id).unwrap();
 
         let metadata_path = backup_root
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn test_purge_old_backups_validates_keep_count() {
         let temp_dir = TempDir::new().unwrap();
-        let engine = ShodhBackupEngine::new(temp_dir.path().to_path_buf()).unwrap();
+        let engine = VeldBackupEngine::new(temp_dir.path().to_path_buf()).unwrap();
         let err = engine.purge_old_backups("user", 0).unwrap_err();
         assert!(err.to_string().contains("keep_count must be >= 1"));
     }
@@ -806,7 +806,7 @@ mod tests {
         opts.create_if_missing(true);
         let db = DB::open(&opts, &db_path).unwrap();
 
-        let engine = ShodhBackupEngine::new(backup_root.clone()).unwrap();
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
         db.put(b"k1", b"v1").unwrap();
         let first = engine.create_backup(&db, user_id).unwrap();
         db.put(b"k2", b"v2").unwrap();

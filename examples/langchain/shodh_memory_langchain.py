@@ -12,7 +12,7 @@ Setup:
     2. Or run locally: veld
     3. Run this script
 
-Documentation: https://www.shodh-rag.com/memory
+Documentation: https://github.com/Portll/veld/tree/main/docs
 """
 
 import asyncio
