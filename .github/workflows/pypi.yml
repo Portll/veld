@@ -407,7 +407,7 @@ jobs:
     if: github.event.inputs.publish == 'true'
     environment:
       name: pypi
-      url: https://pypi.org/project/veld/
+      url: https://pypi.org/project/theveld/
 
     steps:
       - name: Download all artifacts
