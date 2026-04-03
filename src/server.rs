@@ -707,12 +707,14 @@ fn print_ready_message(addr: SocketAddr) {
     eprintln!("     Stream:    ws://{}/api/stream", addr);
     #[cfg(feature = "zenoh")]
     {
-        let zenoh_enabled = std::env::var("SHODH_ZENOH_ENABLED")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        let zenoh_enabled = crate::config::env_var_truthy(
+            "VELD_ZENOH_ENABLED",
+            "SHODH_ZENOH_ENABLED",
+        )
+        .unwrap_or(false);
         if zenoh_enabled {
-            let prefix =
-                std::env::var("SHODH_ZENOH_PREFIX").unwrap_or_else(|_| "shodh".to_string());
+            let prefix = crate::config::env_var("VELD_ZENOH_PREFIX", "SHODH_ZENOH_PREFIX")
+                .unwrap_or_else(|_| "veld".to_string());
             eprintln!(
                 "     Zenoh:     {}/*/{{remember,recall,forget,stream,mission}}",
                 prefix

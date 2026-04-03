@@ -74,14 +74,13 @@ published package registries.
 ```
 
 For repo-local MCP work on this branch:
-
+  <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
 ```bash
 cd mcp-server
 bun install
 bun run build
 node dist/index.js
 ```
-
 ### Unified CLI
 
 ```bash
@@ -108,7 +107,7 @@ That's it. The MCP server auto-downloads the backend binary and starts it. No Do
 
 ```bash
 # 1. Start the server
-docker run -d -p 3030:3030 -v shodh-data:/data varunshodh/shodh-memory
+VELD_ZENOH_ENABLED=true VELD_ZENOH_LISTEN=tcp/0.0.0.0:7447 veld server
 
 # 2. Add to Claude Code
 claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
@@ -120,14 +119,14 @@ claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
 
 ```json
 {
-  "mcpServers": {
-    "shodh-memory": {
-      "command": "npx",
-      "args": ["-y", "@shodh/memory-mcp"]
-    }
+VELD_ZENOH_ENABLED=true                # Enable Zenoh transport
+VELD_ZENOH_MODE=peer                   # peer | client | router
+VELD_ZENOH_LISTEN=tcp/0.0.0.0:7447    # Listen endpoints
+VELD_ZENOH_CONNECT=tcp/1.2.3.4:7447   # Connect endpoints
+VELD_ZENOH_PREFIX=veld                 # Key expression prefix
   }
 }
-```
+VELD_ZENOH_AUTO_TOPICS='[
 
 For local use, no API key is needed — one is generated automatically. For remote servers, add `"env": { "VELD_API_KEY": "your-key" }`.
 </details>
@@ -166,7 +165,7 @@ let results = memory.recall("user-1", "user preferences", 5)?;
 ### Docker
 
 ```bash
-docker run -d -p 3030:3030 -v shodh-data:/data varunshodh/shodh-memory
+docker run -d -p 3030:3030 -v veld-data:/data varunshodh/shodh-memory
 ```
 
 ## What It Does
@@ -284,7 +283,7 @@ Veld isn't just for chat agents. It's persistent memory for robots — Spot, dro
 
 ```bash
 # Enable Zenoh transport (compile with --features zenoh)
-SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 veld server
+VELD_ZENOH_ENABLED=true VELD_ZENOH_LISTEN=tcp/0.0.0.0:7447 veld server
 
 # ROS2 robots connect via zenoh-bridge-ros2dds or rmw_zenoh — zero code changes
 ros2 run zenoh_bridge_ros2dds zenoh_bridge_ros2dds
@@ -294,13 +293,13 @@ ros2 run zenoh_bridge_ros2dds zenoh_bridge_ros2dds
 
 | Operation | Key Expression | Description |
 |-----------|---------------|-------------|
-| Remember | `shodh/{user_id}/remember` | Store with GPS, local position, heading, sensor data, mission context |
-| Recall | `shodh/{user_id}/recall` | Spatial search (haversine), mission replay, action-outcome filtering |
-| Stream | `shodh/{user_id}/stream/sensor` | Auto-remember high-frequency sensor data via extraction pipeline |
-| Mission | `shodh/{user_id}/mission/start` | Track mission boundaries, searchable across missions |
-| Fleet | `shodh/fleet/**` | Automatic peer discovery via Zenoh liveliness tokens |
+| Remember | `veld/{user_id}/remember` | Store with GPS, local position, heading, sensor data, mission context |
+| Recall | `veld/{user_id}/recall` | Spatial search (haversine), mission replay, action-outcome filtering |
+| Stream | `veld/{user_id}/stream/sensor` | Auto-remember high-frequency sensor data via extraction pipeline |
+| Mission | `veld/{user_id}/mission/start` | Track mission boundaries, searchable across missions |
+| Fleet | `veld/fleet/**` | Automatic peer discovery via Zenoh liveliness tokens |
 
-Each robot uses its own `user_id` as the key segment (e.g., `shodh/spot-1/remember`). The `robot_id` is an optional payload field for fleet grouping.
+Each robot uses its own `user_id` as the key segment (e.g., `veld/spot-1/remember`). The `robot_id` is an optional payload field for fleet grouping.
 
 Every Experience carries 26 robotics-specific fields: `geo_location`, `local_position`, `heading`, `sensor_data`, `robot_id`, `mission_id`, `action_type`, `reward`, `terrain_type`, `nearby_agents`, `decision_context`, `action_params`, `outcome_type`, `confidence`, failure/anomaly tracking, recovery actions, and prediction learning.
 
@@ -345,14 +344,14 @@ Every Experience carries 26 robotics-specific fields: `geo_location`, `local_pos
 <summary>Environment variables</summary>
 
 ```bash
-SHODH_ZENOH_ENABLED=true                # Enable Zenoh transport
-SHODH_ZENOH_MODE=peer                   # peer | client | router
-SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447    # Listen endpoints
-SHODH_ZENOH_CONNECT=tcp/1.2.3.4:7447   # Connect endpoints
-SHODH_ZENOH_PREFIX=shodh               # Key expression prefix
+VELD_ZENOH_ENABLED=true                # Enable Zenoh transport
+VELD_ZENOH_MODE=peer                   # peer | client | router
+VELD_ZENOH_LISTEN=tcp/0.0.0.0:7447    # Listen endpoints
+VELD_ZENOH_CONNECT=tcp/1.2.3.4:7447   # Connect endpoints
+VELD_ZENOH_PREFIX=veld                 # Key expression prefix
 
 # Auto-subscribe to ROS2 topics (via zenoh-bridge-ros2dds)
-SHODH_ZENOH_AUTO_TOPICS='[
+VELD_ZENOH_AUTO_TOPICS='[
   {"key_expr": "rt/spot1/status", "user_id": "spot-1", "mode": "sensor"},
   {"key_expr": "rt/nav/events", "user_id": "spot-1", "mode": "event"}
 ]'
@@ -376,7 +375,7 @@ SHODH_API_KEYS=key1,key2,key3     # Comma-separated API keys
 SHODH_ENCRYPTION_KEY=<32-byte-key> # Required if you want encrypted memory content at rest
 SHODH_HOST=127.0.0.1              # Bind address (default: localhost)
 SHODH_PORT=3030                   # Port (default: 3030)
-SHODH_MEMORY_PATH=/var/lib/shodh  # Data directory
+VELD_MEMORY_PATH=/var/lib/veld  # Data directory
 SHODH_REQUEST_TIMEOUT=60          # Request timeout in seconds
 SHODH_MAX_CONCURRENT=200          # Max concurrent requests
 SHODH_RATE_LIMIT=4000             # Enabled by default in production unless explicitly set to 0
@@ -402,14 +401,14 @@ The bundled pre-commit hook scans staged files for obvious API keys, private key
 
 ```yaml
 services:
-  shodh-memory:
+  veld-memory:
     image: varunshodh/shodh-memory:latest
     environment:
       - SHODH_ENV=production
       - SHODH_HOST=0.0.0.0
       - SHODH_API_KEYS=${SHODH_API_KEYS}
     volumes:
-      - shodh-data:/data
+      - veld-data:/data
     networks:
       - internal
 
@@ -423,7 +422,7 @@ services:
       - internal
 
 volumes:
-  shodh-data:
+  veld-data:
 
 networks:
   internal:

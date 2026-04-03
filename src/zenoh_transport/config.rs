@@ -46,11 +46,11 @@ pub struct ZenohConfig {
     /// Empty = Zenoh picks an ephemeral port (fine for client/peer mode).
     pub listen: Vec<String>,
 
-    /// Key expression prefix for all shodh-memory topics.
-    /// Default: `"shodh"`.
+    /// Key expression prefix for all veld-memory topics.
+    /// Default: `"veld"`.
     ///
     /// Topic structure: `{prefix}/{user_id}/{operation}`
-    /// Example: `shodh/robot-1/remember`
+    /// Example: `veld/robot-1/remember`
     pub prefix: String,
 
     /// Auto-subscribe topics — automatically remember data from external Zenoh sources.
@@ -147,7 +147,7 @@ pub enum PayloadMode {
     Passthrough,
 
     /// Parse the payload as a `StreamMessage` (expects `{"type": "content", ...}`).
-    /// Best for shodh-native publishers that construct proper stream messages.
+    /// Best for veld-native publishers that construct proper stream messages.
     Structured,
 }
 
@@ -289,8 +289,8 @@ impl ZenohConfig {
             .any(|ep| ep.contains("0.0.0.0") || ep.contains("[::]"));
         if binds_all_interfaces && self.api_key.is_none() {
             tracing::warn!(
-                "Zenoh listen endpoints include 0.0.0.0 but no SHODH_ZENOH_API_KEY is set — \
-                 any network peer can invoke memory operations. Set SHODH_ZENOH_API_KEY or \
+                "Zenoh listen endpoints include 0.0.0.0 but no VELD_ZENOH_API_KEY is set — \
+                 any network peer can invoke memory operations. Set VELD_ZENOH_API_KEY or \
                  bind to 127.0.0.1 for local-only deployments."
             );
         }
@@ -339,7 +339,7 @@ mod tests {
         let config = ZenohConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.mode, ZenohMode::Peer);
-        assert_eq!(config.prefix, "shodh");
+        assert_eq!(config.prefix, "veld");
         assert!(config.connect.is_empty());
         assert!(config.listen.is_empty());
         assert!(config.auto_topics.is_empty());

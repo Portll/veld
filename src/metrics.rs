@@ -57,7 +57,7 @@ pub static METRICS_REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 pub static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         latency_histogram_opts(
-            "shodh_http_request_duration_seconds",
+            "veld_http_request_duration_seconds",
             "HTTP request duration in seconds",
         ),
         &["method", "endpoint", "status"],
@@ -68,7 +68,7 @@ pub static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// Total HTTP requests
 pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("shodh_http_requests_total", "Total HTTP requests"),
+        Opts::new("veld_http_requests_total", "Total HTTP requests"),
         &["method", "endpoint", "status"],
     )
     .expect("HTTP_REQUESTS_TOTAL metric must be valid at compile time")
@@ -82,7 +82,7 @@ pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// Memory store operations (record)
 pub static MEMORY_STORE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("shodh_memory_store_total", "Total memory store operations"),
+        Opts::new("veld_memory_store_total", "Total memory store operations"),
         &["result"],
     )
     .expect("MEMORY_STORE_TOTAL metric must be valid at compile time")
@@ -92,7 +92,7 @@ pub static MEMORY_STORE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static MEMORY_STORE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_memory_store_duration_seconds",
+            "veld_memory_store_duration_seconds",
             "Memory store operation duration",
         )
         .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
@@ -104,7 +104,7 @@ pub static MEMORY_STORE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 pub static MEMORY_RETRIEVE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_memory_retrieve_total",
+            "veld_memory_retrieve_total",
             "Total memory retrieve operations",
         ),
         &["retrieval_mode", "result"],
@@ -116,7 +116,7 @@ pub static MEMORY_RETRIEVE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static MEMORY_RETRIEVE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         HistogramOpts::new(
-            "shodh_memory_retrieve_duration_seconds",
+            "veld_memory_retrieve_duration_seconds",
             "Memory retrieve operation duration",
         )
         .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
@@ -129,7 +129,7 @@ pub static MEMORY_RETRIEVE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static MEMORY_RETRIEVE_RESULTS: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         HistogramOpts::new(
-            "shodh_memory_retrieve_results",
+            "veld_memory_retrieve_results",
             "Number of results returned per query",
         )
         .buckets(vec![0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
@@ -146,7 +146,7 @@ pub static MEMORY_RETRIEVE_RESULTS: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static ONTOLOGICAL_INTENT_CONFIDENCE: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_ontological_intent_confidence",
+            "veld_ontological_intent_confidence",
             "Distribution of inferred ontological intent confidence scores",
         )
         .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
@@ -158,7 +158,7 @@ pub static ONTOLOGICAL_INTENT_CONFIDENCE: LazyLock<Histogram> = LazyLock::new(||
 pub static ONTOLOGICAL_RERANK_BOOST_APPLIED: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_ontological_rerank_boost",
+            "veld_ontological_rerank_boost",
             "Distribution of ontological re-rank boost values applied to memories",
         )
         .buckets(vec![0.0, 0.02, 0.04, 0.08, 0.12, 0.16, 0.20, 0.25]),
@@ -169,7 +169,7 @@ pub static ONTOLOGICAL_RERANK_BOOST_APPLIED: LazyLock<Histogram> = LazyLock::new
 /// Queries where ontological intent was below confidence threshold (fallback to unfiltered)
 pub static ONTOLOGICAL_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_ontological_fallback_total",
+        "veld_ontological_fallback_total",
         "Queries where ontological intent was below confidence threshold",
     )
     .expect("ONTOLOGICAL_FALLBACK_TOTAL metric must be valid at compile time")
@@ -178,7 +178,7 @@ pub static ONTOLOGICAL_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
 /// Queries where ontological filtering was disabled due to high graph density
 pub static ONTOLOGICAL_DENSITY_SKIP_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_ontological_density_skip_total",
+        "veld_ontological_density_skip_total",
         "Queries where ontological filtering was disabled due to high graph density",
     )
     .expect("ONTOLOGICAL_DENSITY_SKIP_TOTAL metric must be valid at compile time")
@@ -192,7 +192,7 @@ pub static ONTOLOGICAL_DENSITY_SKIP_TOTAL: LazyLock<IntCounter> = LazyLock::new(
 pub static EMBEDDING_GENERATE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_embedding_generate_total",
+            "veld_embedding_generate_total",
             "Total embedding generations",
         ),
         &["mode", "result"], // mode: "onnx" or "simplified"
@@ -204,7 +204,7 @@ pub static EMBEDDING_GENERATE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
 pub static EMBEDDING_GENERATE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         HistogramOpts::new(
-            "shodh_embedding_generate_duration_seconds",
+            "veld_embedding_generate_duration_seconds",
             "Embedding generation duration",
         )
         .buckets(vec![
@@ -219,7 +219,7 @@ pub static EMBEDDING_GENERATE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|
 pub static EMBED_BACKGROUND_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_embed_background_duration_seconds",
+            "veld_embed_background_duration_seconds",
             "Background embed_and_index operation duration",
         )
         .buckets(vec![0.01, 0.05, 0.1, 0.15, 0.25, 0.5, 1.0]),
@@ -230,7 +230,7 @@ pub static EMBED_BACKGROUND_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 /// Embedding timeout count
 pub static EMBEDDING_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_embedding_timeout_total",
+        "veld_embedding_timeout_total",
         "Total embedding generation timeouts",
     )
     .expect("EMBEDDING_TIMEOUT_TOTAL metric must be valid at compile time")
@@ -239,7 +239,7 @@ pub static EMBEDDING_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
 /// NER session lock timeout count
 pub static NER_LOCK_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_ner_lock_timeout_total",
+        "veld_ner_lock_timeout_total",
         "Total NER session lock timeouts (degraded entity extraction)",
     )
     .expect("NER_LOCK_TIMEOUT_TOTAL metric must be valid at compile time")
@@ -252,7 +252,7 @@ pub static NER_LOCK_TIMEOUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
 /// Active users in cache
 pub static ACTIVE_USERS: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
-        "shodh_active_users",
+        "veld_active_users",
         "Number of users with active memory sessions",
     )
     .expect("ACTIVE_USERS metric must be valid at compile time")
@@ -261,7 +261,7 @@ pub static ACTIVE_USERS: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Total memories stored by tier (aggregate across all users)
 pub static MEMORIES_BY_TIER: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
-        Opts::new("shodh_memories_by_tier", "Total memories by tier"),
+        Opts::new("veld_memories_by_tier", "Total memories by tier"),
         &["tier"], // tier: "working", "session", "longterm"
     )
     .expect("MEMORIES_BY_TIER metric must be valid at compile time")
@@ -270,7 +270,7 @@ pub static MEMORIES_BY_TIER: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// Total memory system heap usage (estimated, aggregate)
 pub static MEMORY_HEAP_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
-        "shodh_memory_heap_bytes_total",
+        "veld_memory_heap_bytes_total",
         "Total estimated heap usage across all users",
     )
     .expect("MEMORY_HEAP_BYTES_TOTAL metric must be valid at compile time")
@@ -283,7 +283,7 @@ pub static MEMORY_HEAP_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Total vector index size (number of vectors across all users)
 pub static VECTOR_INDEX_SIZE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
-        "shodh_vector_index_size_total",
+        "veld_vector_index_size_total",
         "Total number of vectors in all indices",
     )
     .expect("VECTOR_INDEX_SIZE_TOTAL metric must be valid at compile time")
@@ -293,7 +293,7 @@ pub static VECTOR_INDEX_SIZE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 pub static VECTOR_SEARCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_vector_search_total",
+            "veld_vector_search_total",
             "Total vector search operations",
         ),
         &["result"],
@@ -304,7 +304,7 @@ pub static VECTOR_SEARCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// Vector search duration
 pub static VECTOR_SEARCH_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(fast_histogram_opts(
-        "shodh_vector_search_duration_seconds",
+        "veld_vector_search_duration_seconds",
         "Vector search duration",
     ))
     .expect("VECTOR_SEARCH_DURATION metric must be valid at compile time")
@@ -317,7 +317,7 @@ pub static VECTOR_SEARCH_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 /// RocksDB operations
 pub static ROCKSDB_OPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("shodh_rocksdb_ops_total", "Total RocksDB operations"),
+        Opts::new("veld_rocksdb_ops_total", "Total RocksDB operations"),
         &["operation", "result"], // operation: "get", "put", "delete"
     )
     .expect("ROCKSDB_OPS_TOTAL metric must be valid at compile time")
@@ -327,7 +327,7 @@ pub static ROCKSDB_OPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static ROCKSDB_OPS_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         fast_histogram_opts(
-            "shodh_rocksdb_ops_duration_seconds",
+            "veld_rocksdb_ops_duration_seconds",
             "RocksDB operation duration",
         ),
         &["operation"],
@@ -339,7 +339,7 @@ pub static ROCKSDB_OPS_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static LEGACY_FALLBACK_BRANCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_legacy_fallback_branch_total",
+            "veld_legacy_fallback_branch_total",
             "Total fallback deserialization branch hits",
         ),
         &["branch"],
@@ -354,7 +354,7 @@ pub static LEGACY_FALLBACK_BRANCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
 /// Total errors by type
 pub static ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new("shodh_errors_total", "Total errors by type"),
+        Opts::new("veld_errors_total", "Total errors by type"),
         &["error_type", "endpoint"],
     )
     .expect("ERRORS_TOTAL metric must be valid at compile time")
@@ -364,7 +364,7 @@ pub static ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static RESOURCE_LIMIT_REJECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_resource_limit_rejections",
+            "veld_resource_limit_rejections",
             "Requests rejected due to resource limits",
         ),
         &["resource"],
@@ -379,7 +379,7 @@ pub static RESOURCE_LIMIT_REJECTIONS: LazyLock<IntCounterVec> = LazyLock::new(||
 /// Current concurrent requests
 pub static CONCURRENT_REQUESTS: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
-        "shodh_concurrent_requests",
+        "veld_concurrent_requests",
         "Current number of concurrent requests",
     )
     .expect("CONCURRENT_REQUESTS metric must be valid at compile time")
@@ -387,7 +387,7 @@ pub static CONCURRENT_REQUESTS: LazyLock<IntGauge> = LazyLock::new(|| {
 
 /// Request queue size (if queuing implemented)
 pub static REQUEST_QUEUE_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
-    IntGauge::new("shodh_request_queue_size", "Number of queued requests")
+    IntGauge::new("veld_request_queue_size", "Number of queued requests")
         .expect("REQUEST_QUEUE_SIZE metric must be valid at compile time")
 });
 
@@ -399,7 +399,7 @@ pub static REQUEST_QUEUE_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
 pub static HEBBIAN_REINFORCE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_hebbian_reinforce_total",
+            "veld_hebbian_reinforce_total",
             "Total Hebbian reinforcement operations",
         ),
         &["outcome", "result"], // outcome: "helpful", "misleading", "neutral"
@@ -411,7 +411,7 @@ pub static HEBBIAN_REINFORCE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static HEBBIAN_REINFORCE_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     HistogramVec::new(
         HistogramOpts::new(
-            "shodh_hebbian_reinforce_duration_seconds",
+            "veld_hebbian_reinforce_duration_seconds",
             "Hebbian reinforcement operation duration",
         )
         .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]),
@@ -428,7 +428,7 @@ pub static HEBBIAN_REINFORCE_DURATION: LazyLock<HistogramVec> = LazyLock::new(||
 pub static CONSOLIDATE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_consolidate_total",
+            "veld_consolidate_total",
             "Total memory consolidation operations",
         ),
         &["result"],
@@ -440,7 +440,7 @@ pub static CONSOLIDATE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static CONSOLIDATE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_consolidate_duration_seconds",
+            "veld_consolidate_duration_seconds",
             "Memory consolidation operation duration",
         )
         .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
@@ -456,7 +456,7 @@ pub static CONSOLIDATE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 pub static BATCH_STORE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_batch_store_duration_seconds",
+            "veld_batch_store_duration_seconds",
             "Batch memory store operation duration",
         )
         .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
@@ -468,7 +468,7 @@ pub static BATCH_STORE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 pub static BATCH_STORE_SIZE: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_batch_store_size",
+            "veld_batch_store_size",
             "Number of memories in batch store operations",
         )
         .buckets(vec![
@@ -485,7 +485,7 @@ pub static BATCH_STORE_SIZE: LazyLock<Histogram> = LazyLock::new(|| {
 /// Memories absorbed by the write gate (redundant content detected)
 pub static WRITE_GATE_ABSORBED: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_write_gate_absorbed_total",
+        "veld_write_gate_absorbed_total",
         "Memories absorbed by write gate due to semantic redundancy",
     )
     .expect("WRITE_GATE_ABSORBED metric must be valid at compile time")
@@ -498,7 +498,7 @@ pub static WRITE_GATE_ABSORBED: LazyLock<IntCounter> = LazyLock::new(|| {
 /// Edges discovered during dream replay phase
 pub static DREAM_REPLAY_EDGES_CREATED: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_dream_replay_edges_created_total",
+        "veld_dream_replay_edges_created_total",
         "Graph edges discovered during dream replay consolidation",
     )
     .expect("DREAM_REPLAY_EDGES_CREATED metric must be valid at compile time")
@@ -507,7 +507,7 @@ pub static DREAM_REPLAY_EDGES_CREATED: LazyLock<IntCounter> = LazyLock::new(|| {
 /// Memory pairs evaluated during dream replay
 pub static DREAM_REPLAY_PAIRS_EVALUATED: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_dream_replay_pairs_evaluated_total",
+        "veld_dream_replay_pairs_evaluated_total",
         "Memory pairs compared during dream replay",
     )
     .expect("DREAM_REPLAY_PAIRS_EVALUATED metric must be valid at compile time")
@@ -520,7 +520,7 @@ pub static DREAM_REPLAY_PAIRS_EVALUATED: LazyLock<IntCounter> = LazyLock::new(||
 /// Memories reconsolidated (importance boosted on retrieval)
 pub static RECONSOLIDATION_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_reconsolidation_total",
+        "veld_reconsolidation_total",
         "Memories reconsolidated (importance updated on retrieval)",
     )
     .expect("RECONSOLIDATION_TOTAL metric must be valid at compile time")
@@ -534,7 +534,7 @@ pub static RECONSOLIDATION_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
 pub static EMBEDDING_CACHE_QUERY: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_embedding_cache_query_total",
+            "veld_embedding_cache_query_total",
             "Query embedding cache operations",
         ),
         &["result"], // result: "hit" or "miss"
@@ -546,7 +546,7 @@ pub static EMBEDDING_CACHE_QUERY: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static EMBEDDING_CACHE_CONTENT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "shodh_embedding_cache_content_total",
+            "veld_embedding_cache_content_total",
             "Content embedding cache operations",
         ),
         &["result"], // result: "hit" or "miss"
@@ -557,7 +557,7 @@ pub static EMBEDDING_CACHE_CONTENT: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// Current cache size (query cache)
 pub static EMBEDDING_CACHE_QUERY_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
-        "shodh_embedding_cache_query_size",
+        "veld_embedding_cache_query_size",
         "Current number of entries in query embedding cache",
     )
     .expect("EMBEDDING_CACHE_QUERY_SIZE metric must be valid at compile time")
@@ -566,7 +566,7 @@ pub static EMBEDDING_CACHE_QUERY_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Current cache size (content cache)
 pub static EMBEDDING_CACHE_CONTENT_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
-        "shodh_embedding_cache_content_size",
+        "veld_embedding_cache_content_size",
         "Current number of entries in content embedding cache",
     )
     .expect("EMBEDDING_CACHE_CONTENT_SIZE metric must be valid at compile time")
@@ -579,7 +579,7 @@ pub static EMBEDDING_CACHE_CONTENT_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
 pub static RETRIEVAL_VARIANCE_SEMANTIC: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_retrieval_variance_semantic",
+            "veld_retrieval_variance_semantic",
             "Average semantic signal contribution to final retrieval score",
         )
         .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
@@ -590,7 +590,7 @@ pub static RETRIEVAL_VARIANCE_SEMANTIC: LazyLock<Histogram> = LazyLock::new(|| {
 pub static RETRIEVAL_VARIANCE_GRAPH: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_retrieval_variance_graph",
+            "veld_retrieval_variance_graph",
             "Average graph signal contribution to final retrieval score",
         )
         .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
@@ -601,7 +601,7 @@ pub static RETRIEVAL_VARIANCE_GRAPH: LazyLock<Histogram> = LazyLock::new(|| {
 pub static RETRIEVAL_VARIANCE_LINGUISTIC: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::with_opts(
         HistogramOpts::new(
-            "shodh_retrieval_variance_linguistic",
+            "veld_retrieval_variance_linguistic",
             "Average linguistic signal contribution to final retrieval score",
         )
         .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
@@ -611,7 +611,7 @@ pub static RETRIEVAL_VARIANCE_LINGUISTIC: LazyLock<Histogram> = LazyLock::new(||
 
 pub static SUPPRESSOR_DETECTIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
-        "shodh_suppressor_detections_total",
+        "veld_suppressor_detections_total",
         "Total suppressor events where multi-signal competition removed or demoted a candidate",
     )
     .expect("SUPPRESSOR_DETECTIONS_TOTAL metric must be valid at compile time")

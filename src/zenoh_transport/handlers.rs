@@ -118,7 +118,7 @@ fn deserialize_json<T: serde::de::DeserializeOwned>(payload: &ZBytes) -> Result<
 
 /// Extract user_id from a key expression.
 ///
-/// Given a key like `shodh/robot-1/remember` and prefix `shodh`,
+/// Given a key like `veld/robot-1/remember` and prefix `veld`,
 /// extracts `robot-1`.
 ///
 /// Returns `None` if the key doesn't match the expected structure.
@@ -967,7 +967,7 @@ pub async fn handle_forget(sample: Sample, manager: Arc<MultiUserMemoryManager>)
 
     // Extract user_id from key expression or payload
     let user_id = req.user_id.unwrap_or_else(|| {
-        // Try to extract from key expr: shodh/{user_id}/forget
+        // Try to extract from key expr: veld/{user_id}/forget
         // This will be the fallback since we parsed from payload first
         String::new()
     });
@@ -1094,7 +1094,7 @@ pub async fn handle_stream_message(
 
 /// Wrap a raw Zenoh payload string into a `StreamMessage::Content`.
 ///
-/// Used for `passthrough` auto-topics where the payload is not a shodh StreamMessage.
+/// Used for `passthrough` auto-topics where the payload is not a veld StreamMessage.
 pub fn wrap_passthrough(payload: &str, tags: &[String]) -> StreamMessage {
     StreamMessage::Content {
         content: payload.to_string(),
@@ -1150,7 +1150,7 @@ pub async fn handle_mission_start(sample: Sample, manager: Arc<MultiUserMemoryMa
         }
     };
 
-    let prefix = key.split('/').next().unwrap_or("shodh");
+    let prefix = key.split('/').next().unwrap_or("veld");
     let user_id = match extract_user_id(&key, prefix) {
         Some(uid) => uid.to_string(),
         None => {
@@ -1256,7 +1256,7 @@ pub async fn handle_mission_end(sample: Sample, manager: Arc<MultiUserMemoryMana
         }
     };
 
-    let prefix = key.split('/').next().unwrap_or("shodh");
+    let prefix = key.split('/').next().unwrap_or("veld");
     let user_id = match extract_user_id(&key, prefix) {
         Some(uid) => uid.to_string(),
         None => {
@@ -1412,11 +1412,11 @@ mod tests {
     #[test]
     fn test_extract_user_id_valid() {
         assert_eq!(
-            extract_user_id("shodh/robot-1/remember", "shodh"),
+            extract_user_id("veld/robot-1/remember", "veld"),
             Some("robot-1")
         );
         assert_eq!(
-            extract_user_id("shodh/user@example.com/recall", "shodh"),
+            extract_user_id("veld/user@example.com/recall", "veld"),
             Some("user@example.com")
         );
         assert_eq!(
@@ -1428,13 +1428,13 @@ mod tests {
     #[test]
     fn test_extract_user_id_invalid() {
         // No user_id segment
-        assert_eq!(extract_user_id("shodh/remember", "shodh"), None);
+        assert_eq!(extract_user_id("veld/remember", "veld"), None);
         // Wrong prefix
-        assert_eq!(extract_user_id("other/robot-1/remember", "shodh"), None);
+        assert_eq!(extract_user_id("other/robot-1/remember", "veld"), None);
         // Empty user_id
-        assert_eq!(extract_user_id("shodh//remember", "shodh"), None);
+        assert_eq!(extract_user_id("veld//remember", "veld"), None);
         // No trailing operation
-        assert_eq!(extract_user_id("shodh/robot-1", "shodh"), None);
+        assert_eq!(extract_user_id("veld/robot-1", "veld"), None);
     }
 
     #[test]
@@ -1579,7 +1579,7 @@ mod tests {
         peers.insert(
             "spot-1".to_string(),
             FleetPeer {
-                key_expr: "shodh/fleet/spot-1".to_string(),
+                key_expr: "veld/fleet/spot-1".to_string(),
                 joined_at: chrono::Utc::now(),
             },
         );

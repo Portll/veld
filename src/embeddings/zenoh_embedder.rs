@@ -1,17 +1,17 @@
 //! Roots layer: Zenoh-routed embedder for cluster peer embedding requests.
 //!
-//! Routes embedding requests to peer shodh instances over Zenoh. Used as a
+//! Routes embedding requests to peer veld instances over Zenoh. Used as a
 //! secondary embedder when the local node lacks a model but a cluster peer
 //! has one available.
 //!
 //! # Configuration
 //! ```text
-//! SHODH_ZENOH_EMBED_ENABLED=true          # Enable Zenoh-routed embedding
-//! SHODH_ZENOH_EMBED_PREFIX=shodh          # Key expression prefix (default: shodh)
-//! SHODH_ZENOH_EMBED_MODEL=minilm-l6-v2   # Target model on the peer
-//! SHODH_ZENOH_EMBED_DIMENSION=384         # Expected output dimension
-//! SHODH_ZENOH_EMBED_TIMEOUT_MS=5000       # Request timeout
-//! SHODH_ZENOH_CONNECT=tcp/1.2.3.4:7447   # Connect endpoints (comma-separated)
+//! VELD_ZENOH_EMBED_ENABLED=true          # Enable Zenoh-routed embedding
+//! VELD_ZENOH_EMBED_PREFIX=veld           # Key expression prefix (default: veld)
+//! VELD_ZENOH_EMBED_MODEL=minilm-l6-v2    # Target model on the peer
+//! VELD_ZENOH_EMBED_DIMENSION=384         # Expected output dimension
+//! VELD_ZENOH_EMBED_TIMEOUT_MS=5000       # Request timeout
+//! VELD_ZENOH_CONNECT=tcp/1.2.3.4:7447    # Connect endpoints (comma-separated)
 //! ```
 
 #[cfg(feature = "zenoh")]
@@ -43,19 +43,19 @@ impl ZenohEmbedderConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         Self {
-            prefix: std::env::var("SHODH_ZENOH_EMBED_PREFIX")
-                .unwrap_or_else(|_| "shodh".into()),
-            target_model: std::env::var("SHODH_ZENOH_EMBED_MODEL")
+            prefix: crate::config::env_var("VELD_ZENOH_EMBED_PREFIX", "SHODH_ZENOH_EMBED_PREFIX")
+                .unwrap_or_else(|_| "veld".into()),
+            target_model: crate::config::env_var("VELD_ZENOH_EMBED_MODEL", "SHODH_ZENOH_EMBED_MODEL")
                 .unwrap_or_else(|_| "minilm-l6-v2".into()),
-            dimension: std::env::var("SHODH_ZENOH_EMBED_DIMENSION")
+            dimension: crate::config::env_var("VELD_ZENOH_EMBED_DIMENSION", "SHODH_ZENOH_EMBED_DIMENSION")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(384),
-            timeout_ms: std::env::var("SHODH_ZENOH_EMBED_TIMEOUT_MS")
+            timeout_ms: crate::config::env_var("VELD_ZENOH_EMBED_TIMEOUT_MS", "SHODH_ZENOH_EMBED_TIMEOUT_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5000),
-            connect_endpoints: std::env::var("SHODH_ZENOH_CONNECT")
+            connect_endpoints: crate::config::env_var("VELD_ZENOH_CONNECT", "SHODH_ZENOH_CONNECT")
                 .map(|s| {
                     s.split(',')
                         .map(|e| e.trim().to_string())
@@ -63,7 +63,7 @@ impl ZenohEmbedderConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
-            api_key: std::env::var("SHODH_ZENOH_API_KEY").ok(),
+            api_key: crate::config::env_var("VELD_ZENOH_API_KEY", "SHODH_ZENOH_API_KEY").ok(),
         }
     }
 }

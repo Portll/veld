@@ -1,7 +1,7 @@
 //! MIF Adapter trait and registry for format detection and conversion.
 //!
 //! Each adapter handles a specific interchange format:
-//! - `shodh` — MIF v2 JSON (native, lossless round-trip) + v1 backward compat
+//! - `veld` — MIF v2 JSON (native, lossless round-trip) + v1 backward compat
 //! - `mem0` — mem0 memory format: `[{memory, metadata, ...}]`
 //! - `generic` — Generic JSON array: `[{content, timestamp, tags, ...}]`
 //! - `markdown` — Markdown with YAML frontmatter (Letta/Obsidian style)
@@ -9,7 +9,7 @@
 pub mod generic;
 pub mod markdown;
 pub mod mem0;
-pub mod shodh;
+pub mod veld;
 
 use anyhow::Result;
 
@@ -45,7 +45,7 @@ impl AdapterRegistry {
     pub fn new() -> Self {
         Self {
             adapters: vec![
-                Box::new(shodh::ShodhAdapter),
+                Box::new(veld::VeldAdapter),
                 Box::new(mem0::Mem0Adapter),
                 Box::new(generic::GenericJsonAdapter),
                 Box::new(markdown::MarkdownAdapter),
@@ -55,7 +55,7 @@ impl AdapterRegistry {
 
     /// Auto-detect the format and convert to MifDocument.
     ///
-    /// Tries each adapter's `detect()` in order. The shodh adapter is checked
+    /// Tries each adapter's `detect()` in order. The veld adapter is checked
     /// first (most specific), then mem0, generic JSON, and finally markdown.
     pub fn auto_import(&self, data: &[u8]) -> Result<MifDocument> {
         for adapter in &self.adapters {
@@ -63,11 +63,12 @@ impl AdapterRegistry {
                 return adapter.to_mif(data);
             }
         }
-        anyhow::bail!("No adapter could detect the input format. Supported: shodh (MIF JSON), mem0, generic JSON array, markdown.")
+        anyhow::bail!("No adapter could detect the input format. Supported: veld (MIF JSON), mem0, generic JSON array, markdown.")
     }
 
     /// Import using a specific adapter by format ID.
     pub fn import_with(&self, format_id: &str, data: &[u8]) -> Result<MifDocument> {
+        let format_id = if format_id == "shodh" { "veld" } else { format_id };
         for adapter in &self.adapters {
             if adapter.format_id() == format_id {
                 return adapter.to_mif(data);
@@ -82,6 +83,7 @@ impl AdapterRegistry {
 
     /// Export using a specific adapter by format ID.
     pub fn export_with(&self, format_id: &str, doc: &MifDocument) -> Result<Vec<u8>> {
+        let format_id = if format_id == "shodh" { "veld" } else { format_id };
         for adapter in &self.adapters {
             if adapter.format_id() == format_id {
                 return adapter.from_mif(doc);

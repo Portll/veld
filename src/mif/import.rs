@@ -1,4 +1,4 @@
-//! Reference-preserving import from MifDocument to shodh internals.
+//! Reference-preserving import from MifDocument to veld internals.
 //!
 //! Key improvements over v1:
 //! - UUID preservation: memories keep their original IDs via `remember_with_id()`
@@ -286,9 +286,10 @@ pub fn import_graph_relationships(
     let mut imported = 0;
     let mut errors = Vec::new();
 
-    // Extract shodh edge metadata if available for restoring strength/LTP
+    // Extract veld edge metadata if available for restoring strength/LTP
     let edge_meta = vendor_extensions
-        .get("shodh-memory")
+        .get("veld-memory")
+        .or_else(|| vendor_extensions.get("shodh-memory"))
         .and_then(|v| v.get("edge_metadata"))
         .and_then(|v| v.as_object());
 
@@ -296,7 +297,7 @@ pub fn import_graph_relationships(
         let relation_type = parse_relation_type(&rel.relation_type);
         let strength = rel.confidence.unwrap_or(0.5);
 
-        // Restore shodh-specific metadata from vendor extensions
+        // Restore veld-specific metadata from vendor extensions
         let (ltp_status, tier, activation_count) = if let Some(meta) = edge_meta {
             if let Some(em) = meta.get(&rel.id.to_string()) {
                 let ltp = em

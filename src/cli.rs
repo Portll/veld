@@ -365,9 +365,9 @@ fn handle_tui(api_url: &str, api_key: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot determine executable directory"))?;
 
     let tui_name = if cfg!(windows) {
-        "shodh-tui.exe"
+        "veld-tui.exe"
     } else {
-        "shodh-tui"
+        "veld-tui"
     };
 
     let tui_binary = exe_dir.join(tui_name);
@@ -379,7 +379,7 @@ fn handle_tui(api_url: &str, api_key: &str) -> Result<()> {
             return exec_tui(&path, api_url, api_key);
         }
 
-        eprintln!("Error: shodh-tui not found");
+        eprintln!("Error: veld-tui not found");
         eprintln!();
         eprintln!("  Looked in: {}", exe_dir.display());
         eprintln!("  Also checked: PATH");
@@ -389,8 +389,8 @@ fn handle_tui(api_url: &str, api_key: &str) -> Result<()> {
         eprintln!("    (Homebrew tracks the public release line, not this unstable branch tip)");
         eprintln!();
         eprintln!("  If installed from GitHub releases:");
-        eprintln!("    Download the release archive — it includes shodh-tui");
-        eprintln!("    Place shodh-tui alongside the veld binary");
+        eprintln!("    Download the release archive — it includes veld-tui");
+        eprintln!("    Place veld-tui alongside the veld binary");
         std::process::exit(1);
     }
 
@@ -399,8 +399,8 @@ fn handle_tui(api_url: &str, api_key: &str) -> Result<()> {
 
 fn exec_tui(tui_binary: &std::path::Path, api_url: &str, api_key: &str) -> Result<()> {
     let status = std::process::Command::new(tui_binary)
-        .env("SHODH_SERVER_URL", api_url)
-        .env("SHODH_API_KEY", api_key)
+        .env("VELD_SERVER_URL", api_url)
+        .env("VELD_API_KEY", api_key)
         .status()?;
 
     std::process::exit(status.code().unwrap_or(1));
@@ -609,7 +609,7 @@ fn handle_doctor() -> Result<()> {
     eprintln!("  ✓ ONNX runtime loads OK");
 
     // 4. Port availability
-    let port: u16 = std::env::var("SHODH_PORT")
+    let port: u16 = veld::config::env_var("VELD_PORT", "SHODH_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3030);
@@ -676,8 +676,8 @@ fn handle_version() {
 
 fn config_directory() -> PathBuf {
     dirs::config_dir()
-        .map(|d| d.join("shodh"))
-        .unwrap_or_else(|| PathBuf::from(".shodh"))
+        .map(|d| d.join("veld"))
+        .unwrap_or_else(|| PathBuf::from(".veld"))
 }
 
 fn generate_api_key() -> String {
@@ -687,7 +687,7 @@ fn generate_api_key() -> String {
         .unwrap_or_default()
         .as_nanos();
     // Simple deterministic key — good enough for local dev, user can change later
-    format!("sk-shodh-{:x}", timestamp)
+    format!("sk-veld-{:x}", timestamp)
 }
 
 // =============================================================================
