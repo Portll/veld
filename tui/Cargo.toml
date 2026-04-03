@@ -3,7 +3,7 @@ name = "shodh-tui"
 version = "0.1.91"
 edition = "2021"
 description = "Terminal UI for Veld - real-time visualization"
-authors = ["Shodh"]
+authors = ["Portll"]
 license = "BUSL-1.1"
 
 [[bin]]
