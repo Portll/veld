@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="120" alt="Veld - Agentic Memory">
+  <img src="assets/veld-logo.svg" width="120" alt="Veld - Agentic Memory">
 </p>
 
 <h1 align="center">Veld - Agentic Memory</h1>
