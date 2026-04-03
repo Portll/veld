@@ -1115,7 +1115,7 @@ pub fn build_health_response() -> serde_json::Value {
     serde_json::json!({
         "status": "ok",
         "transport": "zenoh",
-        "version": env!("SHODH_VERSION_FULL"),
+        "version": env!("VELD_VERSION_FULL"),
         "timestamp": chrono::Utc::now().to_rfc3339(),
     })
 }

@@ -272,7 +272,7 @@ async fn main() -> Result<()> {
         }
 
         // =====================================================================
-        // EXISTING: shodh serve — MCP server
+        // EXISTING: veld serve — MCP server
         // =====================================================================
         Commands::Serve {
             api_url,
@@ -657,7 +657,7 @@ fn handle_doctor() -> Result<()> {
 }
 
 fn handle_version() {
-    eprintln!("Veld {}", env!("SHODH_VERSION_FULL"));
+    eprintln!("Veld {}", env!("VELD_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
     eprintln!("  Target backend: {}", shodh_memory::config::default_requested_storage_backend());

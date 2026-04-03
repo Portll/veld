@@ -40,9 +40,9 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
     Json(HealthResponse {
         status: "healthy".to_string(),
-        version: env!("SHODH_VERSION_FULL").to_string(),
-        build: env!("SHODH_BUILD_NUMBER").to_string(),
-        built_at: env!("SHODH_BUILD_TIMESTAMP").to_string(),
+        version: env!("VELD_VERSION_FULL").to_string(),
+        build: env!("VELD_BUILD_NUMBER").to_string(),
+        built_at: env!("VELD_BUILD_TIMESTAMP").to_string(),
         requested_storage_backend: config.requested_storage_backend.to_string(),
         effective_storage_backend: config.effective_storage_backend.to_string(),
         users_count: state.list_users().len(),
@@ -79,7 +79,7 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
         status_code,
         Json(serde_json::json!({
             "status": status_str,
-            "version": env!("SHODH_VERSION_FULL"),
+            "version": env!("VELD_VERSION_FULL"),
             "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
             "users_in_cache": users_in_cache,
             "timestamp": chrono::Utc::now().to_rfc3339()
