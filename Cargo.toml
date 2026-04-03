@@ -1,12 +1,12 @@
 [package]
-name = "shodh-memory"
-version = "0.7.6-unstable"
+name = "veld"
+version = "0.7.7-unstable"
 edition = "2021"
-authors = ["Shodh Team <29.varuns@gmail.com>"]
-description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
+authors = ["Private Citizen <john@portll.net>"]
+description = "Adaptive memory runtime for AI agents and robots — Hebbian learning, hybrid retrieval, knowledge graph, gap topology. Zenoh/ROS2 native."
 license = "BUSL-1.1"
-repository = "https://github.com/varun29ankuS/shodh-memory"
-homepage = "https://github.com/varun29ankuS/shodh-memory"
+repository = "https://github.com/Portll/veld"
+homepage = "https://github.com/Portll/veld"
 readme = "README-rust.md"
 keywords = ["memory", "ai", "robotics", "zenoh", "cognitive"]
 categories = ["science", "database", "embedded"]

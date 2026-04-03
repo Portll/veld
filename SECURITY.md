@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.7.6-unstable | Best-effort internal stabilization branch |
-| < 0.7.6 | :x: |
+| 0.7.7-unstable | Best-effort internal stabilization branch |
+| < 0.7.7 | :x: |
 
 ## Reporting a Vulnerability
 
