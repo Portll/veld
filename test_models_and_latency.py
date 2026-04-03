@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 
 def main():
-    test_dir = tempfile.mkdtemp(prefix="shodh_verify_")
+    test_dir = tempfile.mkdtemp(prefix="veld_verify_")
     print(f"Test directory: {test_dir}")
     print("=" * 70)
 

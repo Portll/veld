@@ -4769,7 +4769,7 @@ async function ensureServerRunning(): Promise<void> {
       "[shodh-memory] Server binary not found. Please run: npx @shodh/memory-mcp",
     );
     console.error(
-      "[shodh-memory] Or download from: https://github.com/varun29ankuS/shodh-memory/releases",
+      "[shodh-memory] Or download from: https://github.com/Portll/veld/releases",
     );
     return;
   }

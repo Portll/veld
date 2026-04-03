@@ -13,10 +13,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::types::*;
-use super::ShodhMcpServer;
+use super::VeldMcpServer;
 
 #[tool_router]
-impl ShodhMcpServer {
+impl VeldMcpServer {
     pub(crate) fn create(api_url: String, api_key: String, user_id: String) -> Self {
         Self {
             client: Arc::new(super::client::AsyncApiClient::new(api_url, api_key, user_id)),

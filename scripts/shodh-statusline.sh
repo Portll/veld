@@ -1,7 +1,7 @@
 #!/bin/bash
-# Shodh Memory Status Line for Claude Code
+# Veld Status Line for Claude Code
 # This script receives context info from Claude Code and:
-# 1. POSTs to shodh-memory backend for TUI display
+# 1. POSTs to the Veld backend for TUI display
 # 2. Outputs a formatted status line
 
 # Configuration
@@ -29,7 +29,7 @@ else
     PERCENT=0
 fi
 
-# POST to shodh-memory backend (fire and forget, don't block status line)
+# POST to the Veld backend (fire and forget, don't block status line)
 curl -s -X POST "${SHODH_API}/api/context_status" \
     -H "Content-Type: application/json" \
     -d "{\"session_id\": \"$SESSION_ID\", \"tokens_used\": $CURRENT_TOKENS, \"tokens_budget\": $CONTEXT_SIZE, \"current_dir\": \"$CWD\", \"model\": \"$MODEL\"}" \

@@ -16,7 +16,7 @@ This proposal adds an optional `conversationEvents` capability that allows MCP s
 
 ## Motivation
 
-I'm building a memory system for AI assistants ([shodh-memory](https://github.com/varun29ankuS/shodh-memory)). The goal is simple: when a user asks "what did we discuss about the database schema?", relevant memories should surface automatically.
+I'm building a memory system for AI assistants ([Veld](https://github.com/Portll/veld)). The goal is simple: when a user asks "what did we discuss about the database schema?", relevant memories should surface automatically.
 
 But MCP doesn't let me do this.
 
@@ -154,7 +154,7 @@ This is purely additive:
 
 ## Reference Implementation
 
-[shodh-memory](https://github.com/varun29ankuS/shodh-memory) will implement this capability once accepted. The implementation would:
+[Veld](https://github.com/Portll/veld) will implement this capability once accepted. The implementation would:
 
 1. Subscribe to `onUserMessage` events
 2. Extract entities and embeddings from user message

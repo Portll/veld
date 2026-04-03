@@ -2,7 +2,7 @@
 
 This file is deprecated as a public top-level artifact.
 
-The full historical Portll/Shodh pitch deck has been moved to `shodh-internal/STPI_PITCH_DECK.md` for local-only reference and is now git-excluded.
+The full historical pre-Veld pitch deck has been moved to `shodh-internal/STPI_PITCH_DECK.md` for local-only reference and is now git-excluded.
 
 Reason:
 - the deck is materially stale on naming, licensing, traction, package identities, and market claims

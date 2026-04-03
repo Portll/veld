@@ -51,5 +51,5 @@ See `shodh_memory_langchain.py` for complete examples including:
 
 ## Documentation
 
-- [Veld Documentation](https://www.shodh-rag.com/memory)
+- [Veld Documentation](https://github.com/Portll/veld/tree/main/docs)
 - [LangChain MCP Adapters](https://github.com/langchain-ai/langchain-mcp-adapters)

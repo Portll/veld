@@ -78,7 +78,7 @@ __all__ = [
 import sys as _sys
 if not getattr(_sys, '_shodh_star_shown', False):
     try:
-        print("\u2b50 Love shodh-memory? Star us: https://github.com/varun29ankuS/shodh-memory")
+        print("\u2b50 Love Veld? Star us: https://github.com/Portll/veld")
     except UnicodeEncodeError:
-        print("* Love shodh-memory? Star us: https://github.com/varun29ankuS/shodh-memory")
+        print("* Love Veld? Star us: https://github.com/Portll/veld")
     _sys._shodh_star_shown = True

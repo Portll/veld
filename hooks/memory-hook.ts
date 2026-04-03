@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Shodh Memory Hook - Native Claude Code Integration
+ * Veld Hook - Native Claude Code Integration
  *
  * Aggressive proactive context surfacing at every opportunity.
  * Memory should be woven into every interaction - the AI thinks with memory.
@@ -307,14 +307,14 @@ async function handleSessionStart(): Promise<void> {
     console.error(`[shodh] Session context loaded`);
 
     try {
-      await Bun.write(memoryFile, `# Shodh Memory Context\n\n${memoryContext}\n`);
+      await Bun.write(memoryFile, `# Veld Context\n\n${memoryContext}\n`);
     } catch {
       // Directory might not exist
     }
   } else if (backendDown) {
     console.error(`[shodh] Memory system unreachable — operating without persistent context`);
     try {
-      await Bun.write(memoryFile, `# Shodh Memory Context\n\n⚠️ Memory system offline. No persistent context available.\n`);
+      await Bun.write(memoryFile, `# Veld Context\n\n⚠️ Memory system offline. No persistent context available.\n`);
     } catch {
       // Directory might not exist
     }

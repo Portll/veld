@@ -12,7 +12,7 @@ Setup:
     2. Or start server: npx -y @shodh/memory-mcp
     3. Run this script
 
-Documentation: https://www.shodh-rag.com/memory
+Documentation: https://github.com/Portll/veld/tree/main/docs
 """
 
 import os

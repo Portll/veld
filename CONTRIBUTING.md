@@ -22,12 +22,12 @@ Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 1. **Fork the repository** on GitHub
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/shodh-memory
-   cd shodh-memory
+   git clone https://github.com/YOUR_USERNAME/veld
+   cd veld
    ```
 3. **Add upstream remote**:
    ```bash
-   git remote add upstream https://github.com/varun29ankuS/shodh-memory
+   git remote add upstream https://github.com/Portll/veld
    ```
 
 ## Development Setup
@@ -344,7 +344,7 @@ We welcome contributions in these areas:
 ## Getting Help
 
 - **Discord**: Join our [Discord server](https://discord.gg/shodh-memory)
-- **GitHub Issues**: [Create an issue](https://github.com/varun29ankuS/shodh-memory/issues)
+- **GitHub Issues**: [Create an issue](https://github.com/Portll/veld/issues)
 - **Email**: 29.varuns@gmail.com
 
 ## Recognition

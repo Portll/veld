@@ -29,12 +29,12 @@ use types::*;
 // =============================================================================
 
 #[derive(Debug, Clone)]
-pub struct ShodhMcpServer {
+pub struct VeldMcpServer {
     pub(crate) client: Arc<AsyncApiClient>,
     tool_router: ToolRouter<Self>,
 }
 
-impl ShodhMcpServer {
+impl VeldMcpServer {
     pub fn new(api_url: String, api_key: String, user_id: String) -> Self {
         // Delegate to tools::create which has access to the #[tool_router]-generated
         // associated function within the same impl block.
@@ -43,7 +43,7 @@ impl ShodhMcpServer {
 }
 
 #[tool_handler]
-impl ServerHandler for ShodhMcpServer {
+impl ServerHandler for VeldMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
@@ -73,7 +73,7 @@ pub async fn run_mcp_server(api_url: String, api_key: String, user_id: String) -
     eprintln!("  API URL: {}", api_url);
     eprintln!("  User ID: {}", user_id);
 
-    let server = ShodhMcpServer::new(api_url, api_key, user_id);
+    let server = VeldMcpServer::new(api_url, api_key, user_id);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
