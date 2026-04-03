@@ -1,4 +1,4 @@
-//! Shodh-native MIF adapter.
+//! Veld-native MIF adapter.
 //!
 //! Handles MIF v2 JSON (lossless round-trip) and MIF v1 backward compatibility.
 //! v1 documents have `mif_version: "1.0"` and use `mem_`/`todo_` prefixed IDs.
@@ -11,15 +11,15 @@ use std::collections::HashMap;
 use super::MifAdapter;
 use crate::mif::schema::*;
 
-pub struct ShodhAdapter;
+pub struct VeldAdapter;
 
-impl MifAdapter for ShodhAdapter {
+impl MifAdapter for VeldAdapter {
     fn name(&self) -> &str {
-        "Shodh Memory (MIF v2/v1)"
+        "Veld Memory (MIF v2/v1)"
     }
 
     fn format_id(&self) -> &str {
-        "shodh"
+        "veld"
     }
 
     fn detect(&self, data: &[u8]) -> bool {
@@ -31,19 +31,19 @@ impl MifAdapter for ShodhAdapter {
         if !trimmed.starts_with('{') {
             return false;
         }
-        // Look for MIF markers: mif_version field or shodh-memory generator
-        trimmed.contains("\"mif_version\"") || trimmed.contains("\"shodh-memory\"")
+        // Accept both current and legacy generator/vendor identifiers.
+        trimmed.contains("\"mif_version\"")
+            || trimmed.contains("\"veld-memory\"")
+            || trimmed.contains("\"shodh-memory\"")
     }
 
     fn to_mif(&self, data: &[u8]) -> Result<MifDocument> {
         let s = std::str::from_utf8(data)?;
 
-        // Try v2 first (direct deserialization)
         if let Ok(doc) = serde_json::from_str::<MifDocument>(s) {
             return Ok(doc);
         }
 
-        // Try v1 format and convert
         let v1: serde_json::Value = serde_json::from_str(s)?;
         convert_v1_to_v2(&v1)
     }
@@ -54,13 +54,6 @@ impl MifAdapter for ShodhAdapter {
     }
 }
 
-/// Convert MIF v1 JSON to MIF v2 document.
-///
-/// v1 format differences:
-/// - IDs are strings with `mem_`/`todo_` prefixes
-/// - Memory types use PascalCase ("Observation" vs "observation")
-/// - No vendor_extensions section
-/// - Graph uses adjacency list with `entity:name` node IDs
 fn convert_v1_to_v2(v1: &serde_json::Value) -> Result<MifDocument> {
     let version = v1
         .get("mif_version")
@@ -106,7 +99,7 @@ fn convert_v1_to_v2(v1: &serde_json::Value) -> Result<MifDocument> {
     Ok(MifDocument {
         mif_version: "2.0".to_string(),
         generator: MifGenerator {
-            name: "shodh-memory-v1-import".to_string(),
+            name: "veld-memory-v1-import".to_string(),
             version: version.to_string(),
         },
         export_meta: MifExportMeta {

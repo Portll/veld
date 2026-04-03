@@ -32,7 +32,7 @@ pub struct MifDocument {
     pub projects: Vec<MifProject>,
     #[serde(default)]
     pub reminders: Vec<MifReminder>,
-    /// Vendor-specific metadata. Key = vendor name (e.g., "shodh-memory").
+    /// Vendor-specific metadata. Key = vendor name (e.g., "veld-memory").
     /// Allows lossless round-trip of system-specific data without polluting the core schema.
     #[serde(default)]
     pub vendor_extensions: HashMap<String, serde_json::Value>,

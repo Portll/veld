@@ -25,17 +25,17 @@
 //!
 //! # ROS2 Integration
 //! ROS2 robots connect via `zenoh-bridge-ros2dds` or `rmw_zenoh`. Robot topics become
-//! Zenoh key expressions that shodh auto-subscribes to via `AutoTopic` configuration.
-//! No ROS2 dependencies are required on the shodh side.
+//! Zenoh key expressions that veld auto-subscribes to via `AutoTopic` configuration.
+//! No ROS2 dependencies are required on the veld side.
 //!
 //! # Example
 //! ```bash
 //! # Enable Zenoh transport (local-only)
-//! SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/127.0.0.1:7447 veld server
+//! VELD_ZENOH_ENABLED=true VELD_ZENOH_LISTEN=tcp/127.0.0.1:7447 veld server
 //!
 //! # Enable Zenoh transport (network-accessible, with authentication)
-//! SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 \
-//!   SHODH_ZENOH_API_KEY=my-secret veld server
+//! VELD_ZENOH_ENABLED=true VELD_ZENOH_LISTEN=tcp/0.0.0.0:7447 \
+//!   VELD_ZENOH_API_KEY=my-secret veld server
 //! ```
 
 pub mod config;
@@ -838,7 +838,7 @@ async fn register_embed_queryable(
 /// Subscribe to `{prefix}/*/mission/start` and `{prefix}/*/mission/end`.
 ///
 /// Tracks mission boundaries in the session store. When a robot publishes
-/// a mission start/end event, shodh stores it as a searchable memory and
+/// a mission start/end event, veld stores it as a searchable memory and
 /// emits an SSE event for dashboards.
 async fn register_mission_subscribers(
     session: &Session,
@@ -977,7 +977,7 @@ async fn register_fleet_discovery(
                     match sample {
                         Ok(sample) => {
                             let key = sample.key_expr().as_str().to_string();
-                            // Extract robot_id from key: shodh/fleet/{robot_id}
+                            // Extract robot_id from key: veld/fleet/{robot_id}
                             let robot_id = key
                                 .strip_prefix(&pfx)
                                 .and_then(|rest| rest.strip_prefix("/fleet/"))
