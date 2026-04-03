@@ -1,10 +1,10 @@
 //! Veld Server — standalone binary entry point.
 //!
 //! This is a thin wrapper around `shodh_memory::server::run()`.
-//! For the unified CLI, use `shodh server` instead.
+//! For the unified CLI, use `veld server` instead.
 //!
 //! Usage:
-//!   veld [OPTIONS]
+//!   meerkat [OPTIONS]
 //!
 //! Options:
 //!   -H, --host <HOST>         Bind address [env: SHODH_HOST] [default: 127.0.0.1]
@@ -45,15 +45,15 @@ The server exposes a REST API for Veld remember/recall operations. After startin
 
 const AFTER_HELP: &str = r#"
 INTEGRATION:
-  Unified CLI:   shodh server | shodh tui | shodh serve
+  Unified CLI:   veld server | veld tui | veld serve
   Claude Code:   claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
   Python:        pip install shodh-memory
-  TUI:           shodh tui
+  TUI:           veld tui
 
 EXAMPLES:
-  veld                          # Start with defaults
-  veld -H 0.0.0.0 -p 8080      # Custom host and port
-  veld --production -s /var/lib/shodh  # Production mode
+  meerkat                       # Start the thin standalone server
+  meerkat -H 0.0.0.0 -p 8080   # Custom host and port
+  meerkat --production -s /var/lib/veld  # Production mode
 
 DOCUMENTATION:
   GitHub:  https://github.com/Portll/veld
@@ -61,7 +61,7 @@ DOCUMENTATION:
 
 /// Veld Server - Earth substrate for Veld
 #[derive(Parser)]
-#[command(name = "veld")]
+#[command(name = "meerkat")]
 #[command(version, about, long_about = LONG_ABOUT, after_help = AFTER_HELP)]
 struct Cli {
     /// Bind address (use 0.0.0.0 for network access)

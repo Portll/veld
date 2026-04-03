@@ -125,7 +125,7 @@ pip install shodh-memory[all]
 **From source:**
 ```
 ./scripts/cargo-dev.sh build --release
-./target/release/veld
+./target/release/meerkat
 ```
 
 On macOS, prefer `./scripts/cargo-dev.sh ...` on this branch so local source builds

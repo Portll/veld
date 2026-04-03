@@ -1,16 +1,16 @@
 //! Unified Veld CLI — server, TUI, MCP, hooks, and management commands.
 //!
 //! Usage:
-//!   shodh server              - Start the HTTP API server
-//!   shodh tui                 - Launch the TUI dashboard
-//!   shodh serve               - Run as MCP server (stdio transport)
-//!   shodh init                - First-time setup wizard
-//!   shodh status              - Check server health
-//!   shodh doctor              - Diagnose common issues
-//!   shodh hook session-start  - Output session start hook JSON
-//!   shodh hook prompt <msg>   - Output prompt submit hook JSON
-//!   shodh claude [args...]    - Launch Claude Code with Veld memory
-//!   shodh version             - Print version and build info
+//!   veld server              - Start the HTTP API server
+//!   veld tui                 - Launch the TUI dashboard
+//!   veld serve               - Run as MCP server (stdio transport)
+//!   veld init                - First-time setup wizard
+//!   veld status              - Check server health
+//!   veld doctor              - Diagnose common issues
+//!   veld hook session-start  - Output session start hook JSON
+//!   veld hook prompt <msg>   - Output prompt submit hook JSON
+//!   veld claude [args...]    - Launch Claude Code with Veld memory
+//!   veld version             - Print version and build info
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -40,13 +40,13 @@ One binary for everything: run the server, launch the TUI, serve MCP tools,
 manage configuration, and diagnose issues.
 
 Getting started:
-  shodh init        Set up storage directory, API key, and ONNX runtime
-  shodh server      Start the HTTP API server on localhost:3030
-  shodh tui         Launch the terminal dashboard
-  shodh status      Check if the server is running";
+    veld init        Set up storage directory, API key, and ONNX runtime
+    veld server      Start the HTTP API server on localhost:3030
+    veld tui         Launch the terminal dashboard
+    veld status      Check if the server is running";
 
 #[derive(Parser)]
-#[command(name = "shodh")]
+#[command(name = "veld")]
 #[command(about = "Veld - Agentic Memory")]
 #[command(long_about = LONG_ABOUT)]
 #[command(version)]
@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // =====================================================================
-        // NEW: shodh server — start the HTTP API server in-process
+        // NEW: veld server — start the HTTP API server in-process
         // =====================================================================
         Commands::Server {
             host,
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
         }
 
         // =====================================================================
-        // NEW: shodh tui — launch the TUI dashboard
+        // NEW: veld tui — launch the TUI dashboard
         // =====================================================================
         Commands::Tui { api_url, api_key } => {
             handle_tui(&api_url, &api_key)?;
@@ -289,28 +289,28 @@ async fn main() -> Result<()> {
         }
 
         // =====================================================================
-        // NEW: shodh init — first-time setup
+        // NEW: veld init — first-time setup
         // =====================================================================
         Commands::Init => {
             handle_init()?;
         }
 
         // =====================================================================
-        // NEW: shodh status — health check
+        // NEW: veld status — health check
         // =====================================================================
         Commands::Status { api_url, api_key } => {
             handle_status(&api_url, &api_key)?;
         }
 
         // =====================================================================
-        // NEW: shodh doctor — diagnostics
+        // NEW: veld doctor — diagnostics
         // =====================================================================
         Commands::Doctor => {
             handle_doctor()?;
         }
 
         // =====================================================================
-        // EXISTING: shodh hook — Claude Code hooks
+        // EXISTING: veld hook — Claude Code hooks
         // =====================================================================
         Commands::Hook { hook_type } => match hook_type {
             HookType::SessionStart {
@@ -333,14 +333,14 @@ async fn main() -> Result<()> {
         },
 
         // =====================================================================
-        // EXISTING: shodh claude — launch Claude Code
+        // EXISTING: veld claude — launch Claude Code
         // =====================================================================
         Commands::Claude { port, args } => {
             handle_claude_launch(port, args).await?;
         }
 
         // =====================================================================
-        // NEW: shodh version — version and build info
+        // NEW: veld version — version and build info
         // =====================================================================
         Commands::Version => {
             handle_version();
@@ -386,7 +386,7 @@ fn handle_tui(api_url: &str, api_key: &str) -> Result<()> {
         eprintln!();
         eprintln!("  If installed from GitHub releases:");
         eprintln!("    Download the release archive — it includes shodh-tui");
-        eprintln!("    Place shodh-tui alongside the shodh binary");
+        eprintln!("    Place shodh-tui alongside the veld binary");
         std::process::exit(1);
     }
 
@@ -437,7 +437,7 @@ fn handle_init() -> Result<()> {
         let api_key = generate_api_key();
         let config_content = format!(
             "# Veld Configuration\n\
-             # Generated by `shodh init`\n\
+             # Generated by `veld init`\n\
              \n\
              api_key = \"{api_key}\"\n\
              host = \"127.0.0.1\"\n\
@@ -466,9 +466,9 @@ fn handle_init() -> Result<()> {
     eprintln!();
     eprintln!("  Next steps:");
     eprintln!();
-    eprintln!("    shodh server        Start the Veld server");
-    eprintln!("    shodh tui           Launch the TUI dashboard");
-    eprintln!("    shodh status        Check server health");
+    eprintln!("    veld server         Start the Veld server");
+    eprintln!("    veld tui            Launch the TUI dashboard");
+    eprintln!("    veld status         Check server health");
     eprintln!();
     eprintln!("  For Claude Code / Cursor:");
     eprintln!();
@@ -542,10 +542,10 @@ fn handle_status(api_url: &str, api_key: &str) -> Result<()> {
             eprintln!("  Could not connect to {}", api_url);
             eprintln!();
             eprintln!("  Start it with:");
-            eprintln!("    shodh server");
+            eprintln!("    veld server");
             eprintln!();
             eprintln!("  Or diagnose with:");
-            eprintln!("    shodh doctor");
+            eprintln!("    veld doctor");
             eprintln!();
             std::process::exit(1);
         }
@@ -596,7 +596,7 @@ fn handle_doctor() -> Result<()> {
     if config_path.exists() {
         eprintln!("  ✓ Config file exists: {}", config_path.display());
     } else {
-        eprintln!("  ⚠ No config file (run `shodh init` to create one)");
+        eprintln!("  ⚠ No config file (run `veld init` to create one)");
     }
 
     // 3. ONNX runtime
@@ -649,7 +649,7 @@ fn handle_doctor() -> Result<()> {
     if all_ok {
         eprintln!("  All checks passed.");
     } else {
-        eprintln!("  Some issues found. Run `shodh init` to fix setup issues.");
+        eprintln!("  Some issues found. Run `veld init` to fix setup issues.");
     }
     eprintln!();
 

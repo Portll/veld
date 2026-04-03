@@ -39,8 +39,8 @@ published crate, work from this repository directly:
 
 ```bash
 ./scripts/cargo-dev.sh build --release
-./target/release/shodh version
-./target/release/veld --help
+./target/release/veld version
+./target/release/meerkat --help
 ```
 
 ## Quick Start
