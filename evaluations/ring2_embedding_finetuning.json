@@ -1,0 +1,522 @@
+{
+  "feature": "Embedding Fine-Tuning via Hebbian Pairs",
+  "date": "2026-03-29",
+
+  "bifocal": {
+    "evaluation_type": "bifocal_plus",
+    "target": "Embedding Fine-Tuning via Hebbian Co-Retrieval Pairs",
+    "methodology": "edge-walk + fractal analysis, 6 boundaries traced, 3 tier-1 full FMEA",
+
+    "phase_0_risk_triage": {
+      "tier_1_full": [
+        "Co-retrieval pair export quality (data integrity: training data quality determines model quality, dream replay contamination, retrieval bias amplification)",
+        "Fine-tuning pipeline (novel tech: no training infrastructure exists, catastrophic forgetting risk, requires external Python tooling)",
+        "Model swap + re-embedding (data integrity: every stored memory affected, mixed embedding state during transition, no rollback mechanism)"
+      ],
+      "tier_2_standard": [
+        "Vamana index rebuild (existing mechanism but no model-version-triggered rebuild, 2x disk during rebuild)",
+        "Model versioning (novel requirement: no version tracking exists anywhere, needed for incremental migration)",
+        "Negative pair generation (algorithmic correctness: random negatives may include true positives, hard negative mining needed)"
+      ],
+      "tier_3_light": [
+        "Training hyperparameters (isolated tuning, low coupling)",
+        "ONNX export format (standard tooling, sentence-transformers handles this)"
+      ]
+    },
+
+    "phase_1_edge_walk_fractal": {
+      "boundaries_analyzed": 6,
+      "boundary_details": [
+        {
+          "name": "CoRetrieved edges → Training pairs",
+          "tier": 1,
+          "data_crossing": "RelationshipEdge {from_entity: Uuid(memory), to_entity: Uuid(memory), strength: f32, tier: EdgeTier, activation_count: u32, created_by: EdgeSource} → (memory_A_content, memory_B_content, strength) training triple",
+          "control_flow": "Iterate CF_RELATIONSHIPS, filter RelationType::CoRetrieved, resolve memory UUIDs to content from RocksDB, filter by strength threshold",
+          "failure_modes": [
+            "CoRetrieved edges use memory UUIDs as from_entity/to_entity (not EntityNode UUIDs). Export must handle this UUID type mismatch vs other edge types.",
+            "EdgeSource for coactivation edges is incorrectly set to CoOccurrence (line 3863), not Coactivation. Cannot distinguish true co-occurrence from Hebbian coactivation by source tag.",
+            "Dream replay creates RelatedTo edges (not CoRetrieved), but dream-replayed memories may subsequently co-retrieve, creating CoRetrieved edges between speculative associations."
+          ],
+          "contract": "Need: memory_id → memory_content resolver. Currently exists as get_episode() → episode.context but only for episodes, not arbitrary memories.",
+          "hazop": {
+            "NO": "New user: zero CoRetrieved edges. Fine-tuning impossible. Must degrade gracefully to stock model.",
+            "MORE": "Heavy user: ~50K edges (deduplicated pairs from thousands of retrievals). Sufficient data volume for fine-tuning, but 50K is still below sentence-transformers recommended 100K+.",
+            "LESS": "Light user: <100 pairs after weeks of use. Contrastive learning on <1K pairs produces noise, not signal. BLOCKER for most users.",
+            "REVERSE": "Memories co-retrieved by accident (irrelevant but in same top-20 result set) create false positive pairs. Hebbian system strengthens ANY co-retrieval, not just useful ones.",
+            "PART_OF": "Edge strength encodes co-retrieval FREQUENCY, not semantic relatedness. High-strength edge between frequently-surfaced greeting template + project summary teaches model wrong associations.",
+            "OTHER_THAN": "Retrieval competition (PIPE-10) suppresses some memories before coactivation. But suppression threshold is tuned for retrieval, not training pair quality. Losers are excluded but borderline irrelevant winners remain."
+          },
+          "fmea": {
+            "failure": "Training on biased co-retrieval pairs teaches model to embed frequently-retrieved memories closer together regardless of semantic content — retrieval bias amplification",
+            "severity": 8,
+            "probability": 8,
+            "detectability": 4,
+            "rpn": 256,
+            "notes": "Highest RPN. Co-retrieval frequency ≠ semantic relatedness. Popular memories get co-retrieved with everything → fine-tuned model embeds them near all queries → further increases their retrieval frequency → positive feedback loop."
+          }
+        },
+        {
+          "name": "Fine-tuning pipeline (training)",
+          "tier": 1,
+          "data_crossing": "(text_A, text_B, strength) triples → Python/sentence-transformers → InfoNCE or triplet loss → adapted model weights → ONNX export",
+          "control_flow": "External Python process (sentence-transformers library). No Rust training infrastructure exists. Must coordinate: data export (Rust) → training (Python) → model import (Rust). Two-language pipeline.",
+          "failure_modes": [
+            "CRITICAL: No training infrastructure exists anywhere in the codebase. src/embeddings/ is inference-only. Would need Python scripts, sentence-transformers dependency, GPU/MPS support.",
+            "Contrastive fine-tuning can shift the embedding space such that old and new embeddings are incompatible even at same dimensionality. L2-normalized 384-dim vectors in different semantic spaces have meaningless cosine similarity.",
+            "ONNX export from PyTorch fine-tuned model may introduce numerical drift. Tokenizer must be identical (same vocab, same special tokens).",
+            "Training requires GPU/MPS for reasonable speed. On CPU: 10K pairs × 3 epochs ≈ 2-4 hours. On M1 MPS: ~15 minutes. No GPU detection or fallback in codebase."
+          ],
+          "contract": "New trait needed: ModelTrainer { fn train(pairs: &[(String, String, f32)]) -> Result<PathBuf> }. Or external Python script invoked by CLI command.",
+          "hazop": {
+            "NO": "Catastrophic forgetting: MiniLM-L6-v2 trained on 1B+ pairs. Fine-tuning on 1K-50K domain pairs overwrites general language understanding. Model becomes good at associating co-retrieved memories but terrible at understanding new queries it hasn't seen.",
+            "MORE": "Overtraining: too many epochs → embedding collapse. All positive pairs map to same region, all negatives to antipodal region. Loss goes to zero but embeddings are useless.",
+            "LESS": "Undertraining: too few pairs or learning rate too low → model barely changes. No measurable improvement. Wasted computation.",
+            "LATE": "Fine-tuning is offline. Between training completion and full re-embedding, new memories are stored with OLD model. Mixed embedding state corrupts retrieval.",
+            "EARLY": "Fine-tuning triggered before sufficient co-retrieval data accumulated → trains on noise.",
+            "OTHER_THAN": "User expects fine-tuning to improve retrieval. But if co-retrieval pairs reflect retrieval bias (not true relevance), fine-tuning AMPLIFIES the bias. Retrieval quality degrades for novel queries."
+          },
+          "fmea": {
+            "failure": "Catastrophic forgetting destroys general embedding quality for novel/unseen query types",
+            "severity": 9,
+            "probability": 7,
+            "detectability": 3,
+            "rpn": 189,
+            "notes": "Well-documented transfer learning problem. Mitigation (LoRA, elastic weight consolidation) exists but adds significant complexity. sentence-transformers recommends 100K+ pairs; typical veld user has 1K-10K. Data volume is 10-100x below recommended minimum."
+          }
+        },
+        {
+          "name": "Model swap + re-embedding all memories",
+          "tier": 1,
+          "data_crossing": "All stored memories in RocksDB → new embedding model → new 384-dim vectors → Vamana index rebuild",
+          "control_flow": "Must iterate every memory, call encode() with new model, update stored embedding, rebuild Vamana. At 100K memories × ~30ms/embed = 50 minutes. During this period: mixed embedding state.",
+          "failure_modes": [
+            "Partial re-embedding on crash leaves index with mixed embedding spaces. Cosine similarity between old-model and new-model vectors is meaningless even at same dimensionality.",
+            "No rollback mechanism: once Vamana index is rebuilt, old embeddings are discarded. If new model is worse, must re-embed again with old model (which may not be saved).",
+            "Memory content may have changed since original embedding (consolidation, edits). Re-embedding captures current content, potentially different from what the co-retrieval pairs were based on.",
+            "Cross-encoder reranker (src/embeddings/cross_encoder.rs) uses ms-marco-MiniLM which produces its own embeddings. Fine-tuned bi-encoder embeddings and stock cross-encoder scores may be inconsistent."
+          ],
+          "contract": "Need: atomic model swap (old model → new model with zero mixed-state window). Currently impossible — MiniLMEmbedder uses OnceLock<LazyModel> with no swap mechanism.",
+          "hazop": {
+            "NO": "Skip re-embedding: new memories use new model, old memories keep old embeddings. Cosine similarity between old/new embeddings is meaningless. Silent retrieval degradation.",
+            "PART_OF": "Re-embed only frequently-accessed memories. But Vamana index requires ALL vectors in same space. Partial re-embedding is not viable.",
+            "EARLY": "Re-embedding starts before fine-tuning converges → deploys bad model.",
+            "LATE": "Re-embedding takes hours for large stores. System is degraded during entire window."
+          },
+          "fmea": {
+            "failure": "Partial re-embedding leaves mixed embedding spaces in Vamana index, silently degrading all retrieval",
+            "severity": 9,
+            "probability": 5,
+            "detectability": 2,
+            "rpn": 90,
+            "notes": "Detectability is low because cosine similarity still returns numbers — they're just meaningless between different embedding spaces. No validation exists to detect mixed-space indices."
+          }
+        },
+        {
+          "name": "Model versioning",
+          "tier": 2,
+          "data_crossing": "No version metadata exists. MiniLMEmbedder has hardcoded dimension=384, no model_version field. Memories store Vec<f32> embeddings with no provenance.",
+          "control_flow": "Would need: model_version field on each stored memory, version check at retrieval, migration tracking.",
+          "hazop": {
+            "NO": "Without versioning, impossible to know which memories need re-embedding. Must always re-embed everything. At 100K+ memories, this is prohibitive.",
+            "OTHER_THAN": "User runs two veld instances with different fine-tuned models. MIF export/import between them produces incompatible embeddings with no warning."
+          }
+        },
+        {
+          "name": "Vamana index rebuild",
+          "tier": 2,
+          "data_crossing": "New Vec<f32> embeddings → VamanaIndex::rebuild_from_vectors(). Config dimension stays 384.",
+          "control_flow": "Existing rebuild mechanism via needs_rebuild() + rebuild_from_vectors(). But needs_rebuild() checks incremental_inserts vs REBUILD_THRESHOLD=10000, not model version. Won't auto-trigger on model swap.",
+          "hazop": {
+            "MORE": "During rebuild, temporary 2x disk usage (old + new index). For 100K 384-dim vectors: old index ~150MB + new index ~150MB = 300MB temporary.",
+            "LATE": "Rebuild after re-embedding: search results are wrong during the gap between embedding completion and index rebuild.",
+            "REVERSE": "Rebuild with mixed embeddings (some old, some new) produces an index that's worse than either pure state."
+          }
+        },
+        {
+          "name": "Negative pair generation",
+          "tier": 2,
+          "data_crossing": "Full memory set → random sampling excluding positive pairs → (anchor, positive, negative) triplets",
+          "control_flow": "Random negative sampling. Must ensure negatives are truly unrelated (never co-retrieved). With 100K memories and 50K co-retrieval edges, random sampling has ~0.1% chance of accidental positive-as-negative — acceptable.",
+          "hazop": {
+            "OTHER_THAN": "Hard negative mining (selecting negatives that are semantically similar but not co-retrieved) would produce better training signal. Random negatives are too easy — model learns trivially. But hard negative mining requires running the current embedding model on all candidates, adding O(N²) computation."
+          }
+        }
+      ]
+    },
+
+    "phase_2_fractal_atam": {
+      "core_pattern": "veld uses inference-only models with runtime-learned signals. Learning happens in the graph layer (Hebbian edges, adaptive weights, LTP), not the embedding layer.",
+      "macro_consistency": {
+        "verdict": "BREAKS",
+        "detail": "Every learning mechanism in veld operates incrementally at runtime: Hebbian edges (per-retrieval), adaptive weights (EMA per-cycle), LTP (per-activation), importance (additive per-event). Fine-tuning is a BATCH OFFLINE operation that replaces the model wholesale. This is architecturally alien to veld's incremental learning paradigm. It is the only proposed component that requires stopping the system, running an external Python process, and rebuilding all state."
+      },
+      "meso_consistency": {
+        "verdict": "BREAKS",
+        "detail": "The embedding model is the foundation layer ALL other layers depend on. Changing it invalidates: every cached similarity score, every RRF fusion weight calibration, every cross-encoder comparison baseline, every Hebbian edge (which was formed based on OLD embeddings producing specific retrieval patterns). The P2 evaluation from bifocal_overwatch scored 5.5 for dimension change alone. Semantic space change at same dimension is equally disruptive."
+      },
+      "micro_consistency": {
+        "verdict": "BREAKS",
+        "detail": "Co-retrieval edges follow standard strengthen/decay/promote pattern. But exporting them as TRAINING DATA is a new consumption pattern. No other edge type's data feeds an external training pipeline. The edge → training pair → model → new embeddings → new edges feedback loop has no precedent in the codebase."
+      },
+      "breaks": [
+        {
+          "type": "paradigm_break",
+          "description": "Batch offline training in an incremental online learning system. The only component that requires Python, GPU/MPS, and system downtime.",
+          "severity": "critical"
+        },
+        {
+          "type": "feedback_loop_creation",
+          "description": "Co-retrieval edges train the embedding model → new embeddings change retrieval results → new retrieval results create new co-retrieval edges → edges train the model. This is an uncontrolled positive feedback loop with no convergence guarantee.",
+          "severity": "critical"
+        },
+        {
+          "type": "foundation_layer_mutation",
+          "description": "Embedding model is consumed by: vector search, cross-encoder, BM25 (via query embedding), graph retrieval (entity name embeddings), NER (indirectly). Changing it requires revalidating ALL downstream consumers.",
+          "severity": "high"
+        },
+        {
+          "type": "two_language_pipeline",
+          "description": "veld is a single Rust binary. Fine-tuning requires Python + sentence-transformers + PyTorch. Breaks the 'single binary, no dependencies' deployment model.",
+          "severity": "high"
+        }
+      ],
+      "tradeoffs": [
+        {
+          "pair": ["personalization", "generality"],
+          "description": "Fine-tuning makes embeddings better for THIS user's co-retrieval patterns but worse for general language understanding. Zero-sum at the data volumes available (1K-50K pairs vs. 1B+ pretrained pairs).",
+          "sensitivity": "CATASTROPHIC — at typical user data volumes, the model loses more general capability than it gains domain-specific capability"
+        },
+        {
+          "pair": ["offline complexity", "online simplicity"],
+          "description": "Adding offline training pipeline breaks single-binary deployment. Requires Python ecosystem, GPU detection, training monitoring, model validation.",
+          "sensitivity": "BINARY — either maintain Python dependency forever or remove the feature"
+        },
+        {
+          "pair": ["heavy user benefit", "light user cost"],
+          "description": "Only users with 50K+ co-retrieval edges (months of heavy use) have enough training data. Light users (majority) either get no benefit or get a degraded model from sparse training.",
+          "sensitivity": "BIMODAL — benefits <5% of users, neutral-to-harmful for >95%"
+        },
+        {
+          "pair": ["retrieval precision", "retrieval diversity"],
+          "description": "Fine-tuning pushes co-retrieved memories closer in embedding space → retrieval becomes MORE precise for known patterns but LESS diverse for novel queries. Exploration decreases, exploitation increases.",
+          "sensitivity": "HIGH — memory systems need exploration (novel associations) more than exploitation (known patterns)"
+        }
+      ]
+    },
+
+    "phase_2_5_adversarial_challenge": {
+      "challenges": [
+        {
+          "target_claim": "Co-retrieval pairs are natural positive pairs for contrastive learning",
+          "adversary_argument": "Co-retrieval pairs reflect the CURRENT retrieval pipeline's bias, not ground-truth semantic relatedness. If a greeting memory always appears in top-20 (high recall candidate), it gets CoRetrieved edges to everything. Fine-tuning teaches: 'greeting ≈ everything'. This is retrieval bias amplification, not semantic learning. Evidence: record_memory_coactivation() at line 3799 processes ALL co-retrieved memories up to MAX_COACTIVATION_SIZE=20 with no relevance filtering.",
+          "verdict": "SUSTAINED — co-retrieval frequency ≠ semantic relatedness. The training signal is fundamentally corrupted by retrieval pipeline bias."
+        },
+        {
+          "target_claim": "Strength scores provide training signal quality",
+          "adversary_argument": "Edge strength encodes CO-RETRIEVAL FREQUENCY via Hebbian formula w_new = w_old + η × (1 - w_old). A memory co-retrieved 100 times (regardless of relevance) approaches strength 1.0. A genuinely related memory co-retrieved 3 times has strength 0.3. Using strength as training weight means the model learns 'frequently co-retrieved = semantically close' — which is circular (the retrieval model determines co-retrieval, and we're training the retrieval model on co-retrieval data).",
+          "verdict": "SUSTAINED — circular training signal. The model learns to replicate its own biases."
+        },
+        {
+          "target_claim": "Fine-tuning improves retrieval quality",
+          "adversary_argument": "The FourEyes gap analysis (foureyes_2026-03-28_backboard-gap.json) identified that the retrieval-to-answer gap and the cross-encoder gap are larger than any embedding quality gap. MiniLM-L6-v2 scores 56.3 on MTEB. Fine-tuning on 10K pairs cannot move MTEB score more than ±1 point (sentence-transformers literature). Meanwhile, upgrading to Nomic-embed (MTEB 65.4) gives +9.1 MTEB points with zero training. Fine-tuning is the WORST way to improve embedding quality compared to model upgrade.",
+          "verdict": "SUSTAINED — model upgrade gives 9x more improvement than fine-tuning with zero training risk."
+        },
+        {
+          "target_claim": "Data volume is sufficient (co-retrieval edges accumulate over time)",
+          "adversary_argument": "sentence-transformers documentation recommends 100K+ training pairs for meaningful fine-tuning of a 22M-param model. A veld user retrieving 10x/day for 6 months generates: 1800 retrievals × C(5,2) pairs average = ~18K unique edges (after deduplication). This is 5x below minimum. And 95% of users will have even less. The feature is data-starved for the vast majority of the user base.",
+          "verdict": "SUSTAINED — 80%+ of users will never accumulate enough data. Feature benefits <5% of power users."
+        }
+      ]
+    },
+
+    "phase_3_scoring": {
+      "dimensions": {
+        "correctness": {
+          "score": 4.0,
+          "evidence_code": "Co-retrieval edges exist and can be exported (record_memory_coactivation at graph_memory.rs:3799). Contrastive learning is a valid training objective. ONNX export from sentence-transformers is standard.",
+          "evidence_structural": "BLOCKER: Training signal is circular (model's retrieval behavior → co-retrieval edges → train model on its own outputs). No convergence guarantee. Positive feedback loop between retrieval and training. Fundamental algorithmic correctness issue."
+        },
+        "robustness": {
+          "score": 3.5,
+          "evidence_code": "No rollback mechanism for model swap. MiniLMEmbedder uses OnceLock<LazyModel> with no swap API. No validation that fine-tuned model produces compatible embeddings.",
+          "evidence_structural": "BLOCKER: Catastrophic forgetting probability is high (7/10) at available data volumes. Mixed embedding state during re-embedding has no detection mechanism. Partial re-embedding on crash is unrecoverable. No A/B testing framework to compare models before deployment."
+        },
+        "security": {
+          "score": 6.5,
+          "evidence_code": "Fine-tuning is local, no external API calls. Training data (memory content) stays on device. ONNX model is local artifact.",
+          "evidence_structural": "Potential model poisoning: if adversary can influence co-retrieval patterns (by crafting queries that co-retrieve target memories), they can bias the fine-tuned model. Low practical risk for local-first system."
+        },
+        "performance": {
+          "score": 3.8,
+          "evidence_code": "Fine-tuning: 2-4 hours CPU, 15min MPS. Re-embedding: 50min for 100K memories at 30ms/embed. Vamana rebuild: 10-30min. Total: 3-5 hours of system degradation per fine-tuning cycle.",
+          "evidence_structural": "BLOCKER: System is unusable during re-embedding + rebuild (mixed embedding state produces wrong results). No background/incremental migration path. Inference latency unchanged after deployment."
+        },
+        "maintainability": {
+          "score": 3.0,
+          "evidence_code": "Requires Python + sentence-transformers + PyTorch dependency. Two-language pipeline. No training infrastructure exists — entirely new subsystem.",
+          "evidence_structural": "Breaks single-binary deployment model. Every veld release must now ship and test Python training scripts. GPU/MPS detection, CUDA/MPS compatibility matrix. Ongoing maintenance burden for a feature that benefits <5% of users."
+        },
+        "data_integrity": {
+          "score": 3.2,
+          "evidence_code": "No model versioning on stored embeddings. No validation that fine-tuned model is compatible with existing cross-encoder. No migration tracking for re-embedding progress.",
+          "evidence_structural": "BLOCKER: Mixed embedding state during migration is silently destructive. Cosine similarity between old-model and new-model vectors produces numbers but they're meaningless. No detection mechanism. Previous evaluation (bifocal coherence) already identified data integrity at 4.5 — this feature would REDUCE it further."
+        },
+        "scalability": {
+          "score": 4.5,
+          "evidence_code": "Re-embedding scales linearly with memory count. 100K memories = 50min, 1M memories = 8+ hours. Vamana rebuild is O(n log n). Temporary 2x disk during rebuild.",
+          "evidence_structural": "Fine-tuning cycle length grows with memory count. At scale, the maintenance window becomes impractical. No incremental migration path — must re-embed ALL memories every fine-tuning cycle."
+        },
+        "testability": {
+          "score": 4.0,
+          "evidence_code": "Can evaluate fine-tuned model on MTEB before deployment. Can compare retrieval metrics before/after. LOCOMO benchmark provides 20 labeled queries.",
+          "evidence_structural": "But: 20 queries is not enough to detect regressions in specific categories. Catastrophic forgetting may only manifest on query types NOT in the benchmark. Need comprehensive evaluation suite that doesn't exist."
+        },
+        "extensibility": {
+          "score": 5.0,
+          "evidence_code": "Embedder trait (src/embeddings/mod.rs:48) is model-agnostic. VamanaConfig.dimension is configurable. Model path is configurable via VELD_MODEL_PATH env var.",
+          "evidence_structural": "The trait-based design accommodates model swaps. But no hot-swap mechanism, no dual-model support, no A/B framework. Would need: ModelRegistry, VersionedEmbedder, MigrationTracker — none exist."
+        },
+        "compliance": {
+          "score": 6.0,
+          "evidence_code": "All processing is local. No PII leaves the device. Fine-tuned model encodes user memory patterns but stays local.",
+          "evidence_structural": "Fine-tuned model is a compressed representation of user's memory associations. If model file is exfiltrated, it reveals co-retrieval patterns. Low practical risk for local-first system."
+        },
+        "coherence": {
+          "score": 2.5,
+          "evidence_code": "Architecturally alien: batch offline Python process in an incremental online Rust system. Only component requiring external tooling, GPU, and system downtime.",
+          "evidence_structural": "BLOCKER: Breaks every architectural principle: (1) incremental learning → batch retraining, (2) single binary → Python dependency, (3) always-available → maintenance downtime, (4) runtime adaptation → offline model swap. Previous coherence score was 4.2 — this feature would further reduce it."
+        },
+        "usability": {
+          "score": 3.5,
+          "evidence_code": "User must: trigger fine-tuning (when?), wait 3-5 hours, verify results (how?), decide to keep or rollback (no mechanism). No automated quality gate.",
+          "evidence_structural": "Feature is invisible when working, catastrophic when failing. No user-facing indication of model quality. No rollback button. Expert-level ML knowledge needed to tune hyperparameters and interpret results."
+        }
+      },
+      "total_score": 49.5,
+      "max_possible": 120.0,
+      "percentage": 41.25,
+      "blockers": [
+        "Robustness (3.5): Catastrophic forgetting with no rollback. Mixed embedding state unrecoverable.",
+        "Data Integrity (3.2): No model versioning. Mixed embedding spaces silently destructive.",
+        "Coherence (2.5): Architecturally alien to veld's incremental online learning paradigm.",
+        "Performance (3.8): 3-5 hour maintenance window with system degradation."
+      ]
+    },
+
+    "phase_3_evaluation_matrix": {
+      "quality": {
+        "score": 3.5,
+        "notes": "Training signal is circular (model's own retrieval bias → training data → model). No convergence guarantee. Catastrophic forgetting risk at available data volumes."
+      },
+      "completeness": {
+        "score": 2.5,
+        "notes": "Missing: model versioning, rollback mechanism, A/B testing, quality gates, incremental migration, dual-model support. The proposal is a sketch, not a design."
+      },
+      "performance": {
+        "score": 3.0,
+        "notes": "3-5 hour maintenance window. System degraded during re-embedding. No background migration. Inference latency unchanged — only the training/deployment is expensive."
+      },
+      "utility": {
+        "score": 2.0,
+        "notes": "Benefits <5% of power users (those with 50K+ co-retrieval edges). Neutral-to-harmful for >95% of users. Model upgrade (P2 from Overwatch plan) gives 9x more improvement with zero risk."
+      },
+      "coherence": {
+        "score": 2.0,
+        "notes": "Batch offline Python process in incremental online Rust system. Breaks single-binary deployment. Breaks always-available contract. Breaks incremental learning paradigm."
+      },
+      "cohesiveness": {
+        "score": 3.0,
+        "notes": "Creates uncontrolled feedback loop: retrieval → edges → training → model → retrieval. No other component has this circular dependency. Architectural outlier."
+      },
+      "elasticity": {
+        "score": 3.5,
+        "notes": "Cannot be partially deployed. Cannot be incrementally adopted. Must re-embed everything or nothing. Binary activation, no graceful degradation."
+      },
+      "function": {
+        "score": 3.0,
+        "notes": "The core function (improve embedding quality) is better served by model upgrade. Fine-tuning on biased data may REDUCE quality. Risk/reward ratio is unfavorable."
+      },
+      "ease_of_use": {
+        "score": 2.5,
+        "notes": "Requires ML expertise to configure. No automated quality gates. No rollback. No user-facing diagnostics. 3-5 hour wait with no progress indicator."
+      }
+    }
+  },
+
+  "overlook": {
+    "evaluation_type": "overlook_void_analysis",
+    "methodology": "Systematic search for what the proposal does NOT address",
+
+    "structural_voids": [
+      {
+        "id": "OV-1",
+        "severity": "CRITICAL",
+        "title": "No convergence analysis for the training-retrieval feedback loop",
+        "detail": "The proposal creates: fine-tuned model → changed retrieval results → new co-retrieval edges → retrain model → ... This is a positive feedback loop. In control theory, positive feedback loops either converge to a fixed point or diverge. The proposal provides no analysis of convergence conditions, no damping mechanism, no stopping criterion. Similar loops in recommendation systems (the 'filter bubble' problem) are known to converge to degenerate solutions where diversity collapses.",
+        "impact": "Without convergence guarantee, repeated fine-tuning cycles may progressively narrow retrieval diversity until the system only retrieves a small set of frequently-co-retrieved memories for all queries.",
+        "what_should_exist": "Formal convergence analysis. Diversity metrics tracked across fine-tuning cycles. Automatic rollback if diversity drops below threshold. Damping factor that reduces fine-tuning influence as cycles progress."
+      },
+      {
+        "id": "OV-2",
+        "severity": "CRITICAL",
+        "title": "No comparison with the simpler alternative: model upgrade",
+        "detail": "The FourEyes analysis (foureyes_2026-03-28_backboard-gap.json, EW-2) identified that upgrading from MiniLM-L6-v2 (MTEB 56.3) to Nomic-embed-text-v1.5 (MTEB 65.4) gives +9.1 MTEB points with ZERO training, ZERO risk, and ZERO maintenance. Fine-tuning on 10K domain pairs is estimated to give ±1 MTEB point at best. The proposal does not compare its expected improvement against the simple model upgrade baseline.",
+        "impact": "Engineering effort is directed at a high-risk, low-reward approach when a low-risk, high-reward alternative exists. Opportunity cost: weeks of fine-tuning work vs. days for model upgrade.",
+        "what_should_exist": "Quantitative comparison: expected MTEB/LOCOMO lift from fine-tuning vs. model upgrade. Cost-benefit analysis including engineering time, maintenance burden, and risk profile."
+      },
+      {
+        "id": "OV-3",
+        "severity": "HIGH",
+        "title": "No cold start strategy",
+        "detail": "The proposal acknowledges cold start as a risk but provides no mitigation. New users have zero co-retrieval data. Users who reset their memory have zero data. The feature simply doesn't work for these users. But worse: if the fine-tuned model is the DEFAULT (replacing stock MiniLM), new users get a model fine-tuned on someone else's data or no fine-tuning at all — creating a two-tier experience.",
+        "impact": "New user experience is either (a) stock model with no fine-tuning benefit, or (b) community-averaged fine-tuning that may not match their domain. Neither is good.",
+        "what_should_exist": "Explicit cold start strategy: minimum data threshold before first fine-tuning, graceful degradation to stock model, progressive fine-tuning schedule."
+      },
+      {
+        "id": "OV-4",
+        "severity": "HIGH",
+        "title": "No evaluation methodology for measuring fine-tuning benefit",
+        "detail": "How do you know if fine-tuning helped? The proposal says 'the vector space reflects actual user association patterns.' But there's no metric defined for 'reflects user patterns.' MTEB measures general embedding quality. LOCOMO measures retrieval quality. Neither measures 'alignment with user co-retrieval patterns.' The feature has no measurable success criterion.",
+        "impact": "Cannot objectively decide whether to ship, roll back, or iterate. Fine-tuning becomes a faith-based optimization with no feedback signal.",
+        "what_should_exist": "User-specific retrieval benchmark: 50+ queries with ground-truth relevant memories per user. Before/after comparison on this benchmark. Minimum improvement threshold to justify the cost."
+      },
+      {
+        "id": "OV-5",
+        "severity": "HIGH",
+        "title": "No interaction analysis with existing Hebbian learning",
+        "detail": "The graph's Hebbian learning system (edge strengthening, LTP, adaptive weights) already captures co-retrieval patterns as runtime signals contributing ~10% to final scoring. Fine-tuning the embedding model to ALSO capture these patterns creates DOUBLE COUNTING: the same signal (co-retrieval frequency) influences scoring via (1) Hebbian graph edges AND (2) embedding similarity. The proposal does not analyze this interaction.",
+        "impact": "Co-retrieval signal gets amplified 2x: once through graph edges, once through embedding similarity. Memories that are frequently co-retrieved become overwhelmingly dominant in retrieval, at the expense of novel/rare memories.",
+        "what_should_exist": "Analysis of signal interaction. Either: (a) remove Hebbian contribution from scoring when fine-tuned model is active, or (b) weight-calibrate both signals to avoid double-counting."
+      },
+      {
+        "id": "OV-6",
+        "severity": "MEDIUM",
+        "title": "No analysis of embedding space stability requirements",
+        "detail": "Many veld components assume embedding space stability: cross-encoder similarity thresholds (0.65 for interference detection), entity name embedding similarity for graph search, chunking overlap via embedding similarity. Fine-tuning changes the embedding space, potentially invalidating all these calibrated thresholds.",
+        "impact": "Interference detection may trigger too aggressively or too leniently. Entity merging thresholds (ENTITY_CONCEPT_MERGE_THRESHOLD) become miscalibrated. Graph search quality degrades.",
+        "what_should_exist": "Inventory of all components that depend on embedding space calibration. Threshold recalibration procedure after fine-tuning."
+      }
+    ],
+
+    "process_voids": [
+      {
+        "id": "OV-P1",
+        "severity": "HIGH",
+        "title": "No rollback plan",
+        "detail": "If fine-tuning degrades retrieval: how does the user revert? The original model file needs to be preserved. All memories need re-embedding with the original model. The Vamana index needs rebuilding. This is ANOTHER 3-5 hour maintenance window. The proposal mentions no rollback mechanism.",
+        "what_should_exist": "Model backup before fine-tuning. One-command rollback. Embedding snapshots for instant revert."
+      },
+      {
+        "id": "OV-P2",
+        "severity": "MEDIUM",
+        "title": "No triggering heuristic",
+        "detail": "When should fine-tuning run? The proposal says 'export co-retrieval pairs where strength > threshold' but doesn't specify: how often? On what schedule? Triggered by what event? After how many new edges?",
+        "what_should_exist": "Automatic trigger: fine-tune when co-retrieval edge count exceeds 10K AND last fine-tuning was >30 days ago AND system is idle."
+      }
+    ]
+  },
+
+  "overloop": {
+    "evaluation_type": "overloop_feedback_iteration",
+    "methodology": "3 iterations of refinement with convergence check",
+
+    "iteration_1_raw_evaluation": {
+      "assessment": "Feature is fundamentally unsound for veld's architecture and user base",
+      "core_problems": [
+        "Circular training signal (co-retrieval bias → model → more bias)",
+        "Data volume insufficient for 95%+ of users",
+        "Architecturally alien (batch offline Python in incremental online Rust)",
+        "Better alternative exists (model upgrade: +9.1 MTEB vs. ±1 MTEB from fine-tuning)",
+        "No rollback, no versioning, no convergence guarantee"
+      ],
+      "score": 2.5
+    },
+
+    "iteration_2_steelmanning": {
+      "question": "Is there a version of this feature that WOULD work?",
+      "steelman_variants": [
+        {
+          "variant": "Adapter-only fine-tuning (LoRA)",
+          "description": "Instead of full fine-tuning, train a lightweight LoRA adapter (100K params vs. 22M) on co-retrieval pairs. Adapter preserves base model's general capability. Can be swapped without re-embedding (base embeddings + adapter projection).",
+          "problems_solved": ["Catastrophic forgetting (partially)", "Model size/training time"],
+          "problems_remaining": ["Circular training signal", "Data volume", "Two-language pipeline", "Embedding space change still requires re-indexing"],
+          "verdict": "Reduces forgetting risk but doesn't solve the fundamental training signal problem."
+        },
+        {
+          "variant": "Embedding-space-preserving fine-tuning (projection head only)",
+          "description": "Keep MiniLM frozen. Add a small projection head (384→384 MLP) trained on co-retrieval pairs. Base embeddings unchanged; projection head adjusts similarity space. Can be applied at query time without re-embedding stored memories.",
+          "problems_solved": ["Catastrophic forgetting (fully)", "Re-embedding cost (eliminated)", "Rollback (just remove projection)"],
+          "problems_remaining": ["Circular training signal", "Data volume", "Two-language pipeline", "Latency (extra forward pass at query time)"],
+          "verdict": "Significantly better architecture. No re-embedding needed. But training signal problem persists."
+        },
+        {
+          "variant": "Deferred to after model upgrade (P2)",
+          "description": "First upgrade to Nomic-embed-text-v1.5 (+9.1 MTEB). Then, IF users accumulate 100K+ co-retrieval pairs over months, fine-tune the better model. The better base model produces better co-retrieval pairs, producing a better training signal.",
+          "problems_solved": ["Data volume (partially — better model → better pairs → more value per pair)", "Foundation quality"],
+          "problems_remaining": ["Circular training signal (attenuated but not eliminated)", "Two-language pipeline", "Convergence"],
+          "verdict": "Correct sequencing. But fine-tuning still has unfavorable risk/reward even on a better base model."
+        }
+      ],
+      "revised_assessment": "The projection-head variant is architecturally sound but the core training signal problem (co-retrieval frequency ≠ semantic relatedness) persists across ALL variants. The feature is solving the wrong problem: it treats co-retrieval as ground truth when it is actually a noisy proxy.",
+      "score": 3.0
+    },
+
+    "iteration_3_alternative_proposals": {
+      "question": "What should be done instead to achieve the stated goal (embeddings that reflect user association patterns)?",
+      "alternatives": [
+        {
+          "alternative": "Upgrade embedding model (P2 from Overwatch plan)",
+          "expected_lift": "+9.1 MTEB points, +3-5pp retrieval",
+          "effort": "3-5 days",
+          "risk": "Medium (index rebuild needed, but no training risk)",
+          "comparison": "9x more improvement than fine-tuning, at 10% of the effort and risk"
+        },
+        {
+          "alternative": "Increase Hebbian graph contribution from 10% to 20-30% in scoring",
+          "expected_lift": "+1-3pp on queries with graph coverage",
+          "effort": "1 day (constant tuning in constants.rs)",
+          "risk": "Low (A/B testable, reversible in seconds)",
+          "comparison": "Achieves 'user association patterns influence retrieval' goal WITHOUT touching the embedding model. Uses the EXISTING co-retrieval signal through the EXISTING mechanism."
+        },
+        {
+          "alternative": "Query-time embedding augmentation via graph neighbors",
+          "expected_lift": "+2-4pp on entity-rich queries",
+          "effort": "3-5 days",
+          "risk": "Low (additive, can be disabled per query)",
+          "comparison": "Uses co-retrieval patterns to EXPAND queries rather than CHANGE embeddings. No model training, no re-embedding, no maintenance window."
+        }
+      ],
+      "verdict": "All three alternatives achieve similar or better outcomes with dramatically less risk, effort, and complexity. The embedding fine-tuning feature is dominated by simpler alternatives on every dimension.",
+      "final_score": 3.0,
+      "convergence": "CONVERGED at iteration 3. Score stable at 2.5-3.0 across iterations. Steelmanning found better variants but none overcame the fundamental training signal problem."
+    }
+  },
+
+  "verdict": {
+    "implement": false,
+    "priority": "P3-deferred",
+    "effort_hours": 120,
+    "risk": "high",
+    "rationale": {
+      "summary": "Do not implement. The feature has 4 BLOCKER-level dimension scores (Robustness 3.5, Data Integrity 3.2, Coherence 2.5, Performance 3.8), a circular training signal that amplifies retrieval bias, insufficient data volume for 95%+ of users, and is dominated by simpler alternatives (model upgrade gives 9x improvement at 10% effort).",
+      "blockers": [
+        "Circular training signal: co-retrieval edges encode retrieval pipeline bias, not semantic truth. Fine-tuning amplifies this bias (RPN 256).",
+        "Catastrophic forgetting: 22M-param model fine-tuned on 1K-50K pairs (100x below recommended minimum) loses general capability (RPN 189).",
+        "No convergence guarantee: retrieval → training → retrieval feedback loop has no damping, no stopping criterion, no diversity preservation.",
+        "Architecturally alien: batch offline Python process in incremental online Rust system. Breaks single-binary deployment."
+      ],
+      "better_alternatives": [
+        "P2: Upgrade MiniLM-L6-v2 to Nomic-embed-text-v1.5 (+9.1 MTEB, 3-5 days, medium risk)",
+        "Increase Hebbian graph contribution from 10% to 20-30% (1 day, low risk, achieves same 'user patterns influence retrieval' goal)",
+        "Query-time graph expansion (3-5 days, low risk, uses co-retrieval patterns without model changes)"
+      ],
+      "conditions_for_reconsideration": [
+        "After P2 model upgrade is shipped and evaluated",
+        "After a user accumulates 100K+ co-retrieval edges (6+ months of heavy use)",
+        "After a projection-head-only variant is designed (no full fine-tuning, no re-embedding)",
+        "After formal convergence analysis of the training-retrieval feedback loop",
+        "After a user-specific retrieval benchmark exists to measure fine-tuning benefit"
+      ]
+    }
+  }
+}

@@ -1,0 +1,755 @@
+{
+  "supernova_analysis": {
+    "version": "1.0",
+    "date": "2026-03-29",
+    "target": "veld retrieval pipeline (semantic_retrieve in recall.rs)",
+    "seed_lenses": {
+      "A": "EdgeWalk (12 findings)",
+      "B": "HDE (10 findings)",
+      "C": "Clustering (15 findings)"
+    }
+  },
+
+  "phase_1_cross_pollination": {
+    "description": "Pairwise tensor products between lens findings at overlapping components",
+
+    "AxB": [
+      {
+        "id": "AxB-1",
+        "lens_a": "A2 (ontological intent gate inverted, sev 6)",
+        "lens_b": "B5 (ontological boost bypasses sigmoid, sev 7)",
+        "component": "Ontological retrieval system (Layer 0.5 gate + Layer 4.9 boost)",
+        "cross_product": "A2 says the gate logic is inverted (skip-ontology for dense graphs but penalties apply anyway). B5 says the boost bypasses sigmoid calibration creating >1.0 scores. COMBINED: the ontological system both applies penalties when it shouldn't AND creates uncalibrated scores when it does apply. The inversion means dense graphs get both the penalty AND the uncalibrated boost, a double fault.",
+        "fractal_check": "HOLDS at all scales. Macro: ontological subsystem has inconsistent enable/disable semantics. Meso: Layer 2 penalty and Layer 4.9 boost use different activation conditions. Micro: the additive boost at line 1870 is unbounded while all other scores pass through sigmoid at relevance.rs:601.",
+        "fmea": {
+          "severity": 7,
+          "probability": 6,
+          "detectability": 4,
+          "rpn": 168,
+          "rationale": "Severity 7: uncalibrated scores can push wrong results to rank 1. Probability 6: fires on any WH-word query with graph entities. Detectability 4: only visible in score distributions, not in correct/incorrect binary."
+        }
+      },
+      {
+        "id": "AxB-2",
+        "lens_a": "A7 (CrossEncoderReranker exists but never called in main pipeline, sev 7)",
+        "lens_b": "B2 (SALIENCE_BOOST_FACTOR only in graph spreading, never in vector, sev 7)",
+        "component": "Signal integration completeness",
+        "cross_product": "A7 identifies a fully-implemented cross-encoder reranker that the main recall pipeline never invokes (Layer 5.5 was removed, but hybrid_search.rs cross-encoder only fires within search_with_dynamic_weights, not in the recall.rs pipeline path). B2 identifies salience being graph-only. COMBINED: the pipeline has two high-value signals (cross-encoder relevance, salience weighting) that are computed but not integrated into the final scoring path. The system does more work than it uses.",
+        "fractal_check": "HOLDS. Macro: architectural gap between hybrid_search.rs (has cross-encoder) and recall.rs (doesn't call it). Meso: salience is computed per-entity in graph_retrieval but discarded before RRF. Micro: query.rerank_count is propagated but never consumed.",
+        "fmea": {
+          "severity": 7,
+          "probability": 8,
+          "detectability": 3,
+          "rpn": 168,
+          "rationale": "Severity 7: cross-encoder reranking provides 3-5pp MRR improvement per literature. Probability 8: affects every query. Detectability 3: the comment at recall.rs:2305 explicitly says 'use the real cross-encoder in hybrid_search.rs' but nobody wired it up."
+        }
+      },
+      {
+        "id": "AxB-3",
+        "lens_a": "A1 (decomposition sub-query weights discarded at L3-L4, sev 7)",
+        "lens_b": "B9 (RRF saturates early, rank 50+ contributes nothing, sev 5)",
+        "component": "RRF fusion mechanics (Layer 4)",
+        "cross_product": "A1 says decomposed sub-query confidence is lost at the L3->L4 boundary because RRF re-fuses without per-sub-query weights. B9 says RRF itself saturates so tail results are invisible. COMBINED: decomposition finds candidates that rank 50+ in individual sub-queries (each sub-query's tail), and these candidates get zero RRF contribution AND lose their sub-query weight context. The long tail of decomposed search is doubly suppressed.",
+        "fractal_check": "HOLDS at meso/micro. Meso: DECOMP_RRF_K=20 hardcoded vs query.rrf_k. Micro: max-merge at line 1082 prevents score accumulation across sub-queries.",
+        "fmea": {
+          "severity": 6,
+          "probability": 4,
+          "detectability": 5,
+          "rpn": 120,
+          "rationale": "Severity 6: affects multi-hop queries where answer spans sub-query boundaries. Probability 4: only triggers on decomposable queries (multi-entity). Detectability 5: visible in decomposed query MRR vs single-query MRR."
+        }
+      },
+      {
+        "id": "AxB-4",
+        "lens_a": "A12 (Hebbian decay_factor collected but discarded, sev 5)",
+        "lens_b": "B7 (edge weights never get retrieval feedback, sev 6)",
+        "component": "Hebbian graph edge learning",
+        "cross_product": "A12 says graph traversal collects decay_factor per entity but only uses activation in RRF (line 1297-1304: only activation is used for activation_bonus, h goes to heb map but only gets 0.1 multiplier). B7 says edges never get feedback from retrieval outcomes. COMBINED: the graph edge system is write-only from a quality perspective. Edges are created and decayed by time, but never refined by retrieval success/failure. The decay_factor signal (edge maturity) is collected but discarded. The system cannot learn which graph paths are actually useful.",
+        "fractal_check": "HOLDS. Macro: no feedback loop from retrieval to graph. Meso: decay_factor collected at line 842 but unused at line 1302. Micro: HEBBIAN_BOOST_HELPFUL only updates memory importance, not edge strength.",
+        "fmea": {
+          "severity": 6,
+          "probability": 7,
+          "detectability": 5,
+          "rpn": 210,
+          "rationale": "Severity 6: graph paths can't improve over time. Probability 7: every retrieval with graph results. Detectability 5: would show as graph precision staying flat across sessions."
+        }
+      },
+      {
+        "id": "AxB-5",
+        "lens_a": "A9 (feedback multiplier multiplicative after aggregation, sev 4)",
+        "lens_b": "B10 (entity/tag_contributed feedback never set to true, sev 5)",
+        "component": "Feedback integration",
+        "cross_product": "A9 says feedback_multiplier is applied multiplicatively to the final aggregated score (line 2195), which is harsh on low-scoring memories. B10 says entity_contributed and tag_contributed are never set to true in the recall path — 3 of 4 feedback dimensions are dead. COMBINED: the feedback system both over-punishes (multiplicative on aggregated score) AND under-learns (3/4 dimensions are dead code). Feedback is simultaneously too powerful in effect and too impoverished in learning.",
+        "fractal_check": "HOLDS. Macro: feedback architecture is split between relevance.rs (dead) and recall.rs (multiplicative). Micro: apply_feedback params are always (true/false, false, false, bool) — entity and tag are never true.",
+        "fmea": {
+          "severity": 5,
+          "probability": 6,
+          "detectability": 4,
+          "rpn": 120,
+          "rationale": "Severity 5: memories with negative momentum get up to 20% penalty on already-low scores. Probability 6: any memory with feedback history. Detectability 4: need to trace feedback values to see the 3 dead dimensions."
+        }
+      },
+      {
+        "id": "AxB-6",
+        "lens_a": "A4 (temporal fact boost only in fused set, sev 6)",
+        "lens_b": "B1 (SALIENCE_RECENCY_WEIGHT is 1.0 identity, sev 6)",
+        "component": "Temporal/recency scoring",
+        "cross_product": "A4 says temporal-fact memories with low semantic/BM25 scores never enter the fused set and thus never get boosted. B1 says SALIENCE_RECENCY_WEIGHT=1.0 is a no-op because the hardcoded 0.6/0.4 blend dominates. COMBINED: temporal signals are doubly weak — the constant meant to control recency is identity, AND temporal facts that should inject memories can't because the injection is gated on pre-existing fused set membership.",
+        "fractal_check": "Partial. Macro: temporal pathway is incomplete. Meso: two different mechanisms (salience_score recency, temporal_fact_boost) both fail. Micro: the 0.6/0.4 blend at types.rs:1609 makes SALIENCE_RECENCY_WEIGHT a multiplier on one side of a fixed blend.",
+        "fmea": {
+          "severity": 5,
+          "probability": 5,
+          "detectability": 6,
+          "rpn": 150,
+          "rationale": "Severity 5: temporal queries miss facts. Probability 5: temporal queries are common but LOCOMO already catches many. Detectability 6: LOCOMO temporal queries directly test this."
+        }
+      }
+    ],
+
+    "AxC": [
+      {
+        "id": "AxC-1",
+        "lens_a": "A2 (ontological intent gate inverted, sev 6)",
+        "lens_c": "C6 (ontological intent consumed by L2 AND L4.9 contradictorily, sev 5)",
+        "component": "Ontological intent lifecycle",
+        "cross_product": "A2 says Layer 0.5 computes use_ontology_rerank with correct density gating, but Layer 2 applies penalties regardless. C6 says ontological intent is consumed by both Layer 2 (pre-filter penalty during spreading) AND Layer 4.9 (post-filter rerank boost) with contradictory effects. COMBINED: ontological intent has 3 consumption points with inconsistent gating: Layer 0.5 computes the gate, Layer 2 ignores the gate, Layer 4.9 respects it. A memory can be penalized at Layer 2 for wrong type AND boosted at Layer 4.9 for right type simultaneously.",
+        "fractal_check": "HOLDS. Macro: no single owner of ontological state. Meso: gate is checked at 0.5, ignored at 2, re-checked at 4.9. Micro: Layer 2 uses ONTOLOGICAL_ENTITY_PENALTY=0.6 while Layer 4.9 uses ONTOLOGICAL_RERANK_BOOST=0.15 — different scales.",
+        "fmea": {
+          "severity": 6,
+          "probability": 5,
+          "detectability": 5,
+          "rpn": 150,
+          "rationale": "Severity 6: over-filtering reduces recall. Probability 5: requires WH-word query + graph entities. Detectability 5: observable as ontological queries having lower recall than expected."
+        }
+      },
+      {
+        "id": "AxC-2",
+        "lens_a": "A4 (temporal fact boost only in fused set, sev 6)",
+        "lens_c": "C2 (temporal fact dual-path: L0.6 lookup + L4.55 boost = redundant, sev 5)",
+        "component": "Temporal fact retrieval path",
+        "cross_product": "A4 says temporal-fact memories outside the fused set never get boosted. C2 says the temporal path is redundant (expensive L0.6 lookup + L4.55 fixed boost). COMBINED: the temporal system does expensive work at L0.6 (RocksDB scan) to find fact IDs, then at L4.55 only applies the boost IF those IDs are already in the fused set. The expensive lookup is wasted for any temporal fact whose source memory scored low on semantic/BM25. The redundancy is worse than just duplication — it's a high-cost path that doesn't inject new candidates.",
+        "fractal_check": "HOLDS. Macro: temporal facts are a parallel retrieval path that can't actually retrieve. Meso: L0.6 identifies memories, L4.55 boosts only existing ones. Micro: TEMPORAL_RECALL_BOOST is additive but can't activate if ID not in fused map.",
+        "fmea": {
+          "severity": 6,
+          "probability": 5,
+          "detectability": 5,
+          "rpn": 150,
+          "rationale": "Severity 6: temporal queries miss known facts. Probability 5: any when/temporal query. Detectability 5: testable with targeted temporal queries."
+        }
+      },
+      {
+        "id": "AxC-3",
+        "lens_a": "A8 (ontological rerank budget 2x max_results, sev 5)",
+        "lens_c": "C3 (fact pre-fetch expensive RocksDB scan, invisible thresholds, sev 7)",
+        "component": "RocksDB I/O budget allocation",
+        "cross_product": "A8 says ontological reranking only examines 2x max_results candidates. C3 says fact pre-fetch does an expensive RocksDB scan at Layer 0.7 with implicit thresholds. COMBINED: the pipeline has two expensive RocksDB-heavy operations (fact scan at 0.7, ontological entity lookup at 4.9) but allocates budget differently — facts scan broadly while ontological rerank is narrow. Neither coordinates I/O budget with the other.",
+        "fractal_check": "Partial. Meso: different I/O patterns. Micro: rerank_budget = query.max_results * 2 at line 1839.",
+        "fmea": {
+          "severity": 5,
+          "probability": 4,
+          "detectability": 6,
+          "rpn": 120,
+          "rationale": "Severity 5: missed reranking opportunities. Probability 4: only when both systems fire. Detectability 6: latency metrics would show."
+        }
+      },
+      {
+        "id": "AxC-4",
+        "lens_a": "A5 (entity overlap different stemming than BM25, sev 5)",
+        "lens_c": "C12 (Working+Session cosine uses different similarity than Vamana, sev 5)",
+        "component": "Signal consistency across retrieval tiers",
+        "cross_product": "A5 says entity overlap at Layer 4.525 uses its own stemmer instance while BM25 uses stem_text() in hybrid_search.rs. C12 says Layer 3.5 brute-force cosine uses cosine_similarity_pub while Vamana uses internal similarity. COMBINED: three different retrieval signals (BM25, entity overlap, tier cosine) each use slightly different text processing / similarity functions. Rank inversion risk: a memory scored differently by each signal creates unstable rankings.",
+        "fractal_check": "HOLDS at micro. Two separate Stemmer::create(Algorithm::English) calls at recall.rs:1432 and hybrid_search.rs:39. The stem_text function in hybrid_search.rs strips non-alphanumeric chars; entity overlap stemming at 1451 also strips but is a separate code path.",
+        "fmea": {
+          "severity": 4,
+          "probability": 6,
+          "detectability": 7,
+          "rpn": 168,
+          "rationale": "Severity 4: marginal rank differences. Probability 6: affects any query with stemmed terms. Detectability 7: would need to compare stemmed outputs side by side."
+        }
+      },
+      {
+        "id": "AxC-5",
+        "lens_a": "A10 (interference detection only top-20, sev 4)",
+        "lens_c": "C9 (density-weighted RRF defaults wrong when graph disabled, sev 7)",
+        "component": "Degraded-mode behavior",
+        "cross_product": "A10 says interference detection has a fixed budget of 20. C9 says density_weights defaults to (0.6, 0.3, 0.1) when graph_density is None (line 1273-1275) which gives graph 0.3 weight even when graph is disabled. COMBINED: when graph is unavailable, the pipeline still allocates 30% weight to graph results (which are empty), interference detection still burns budget checking empty results, and the semantic/BM25 signals are under-weighted at 0.7 instead of 1.0. The degraded mode is systematically worse than it should be.",
+        "fractal_check": "HOLDS. Macro: no graph-disabled code path. Meso: calculate_density_weights called with None returns 0.6/0.3/0.1 instead of 0.85/0.0/0.15. Micro: empty graph_results still iterate at line 1297.",
+        "fmea": {
+          "severity": 7,
+          "probability": 3,
+          "detectability": 4,
+          "rpn": 84,
+          "rationale": "Severity 7: 30% weight on empty signal. Probability 3: graph is usually available. Detectability 4: only matters in degraded mode."
+        }
+      }
+    ],
+
+    "BxC": [
+      {
+        "id": "BxC-1",
+        "lens_b": "B3 (graph_contributed never passed to apply_feedback, sev 6)",
+        "lens_c": "C8 (Hebbian coactivation coupled to retrieval, silent failure if graph unavailable, sev 6)",
+        "component": "Graph-retrieval feedback loop",
+        "cross_product": "B3 says graph weight in LearnedWeights never gets explicit feedback (graph_contributed param missing). C8 says Hebbian coactivation at recall.rs:115-124 silently fails if graph is unavailable. COMBINED: the graph learning system has no forward signal (B3: can't learn which graph paths work) AND no backward signal (C8: coactivation fails silently). The graph weight in the learned weight system drifts randomly because it receives only auxiliary delta updates, not targeted feedback.",
+        "fractal_check": "HOLDS. Macro: graph learning loop is open (no closed feedback). Meso: relevance.rs apply_feedback has 4 boolean params but graph is never one of them. Micro: aux_delta = WEIGHT_LEARNING_RATE * direction * 0.5 is noise, not signal.",
+        "fmea": {
+          "severity": 6,
+          "probability": 7,
+          "detectability": 5,
+          "rpn": 210,
+          "rationale": "Severity 6: graph can't improve through use. Probability 7: every retrieval. Detectability 5: graph_strength weight would converge to MIN_WEIGHT over time."
+        }
+      },
+      {
+        "id": "BxC-2",
+        "lens_b": "B4 (three overlapping weight systems don't coordinate, sev 5)",
+        "lens_c": "C1 (attribute query dual-path: L0.5 BM25 + L4.5 boost = redundant, sev 6)",
+        "component": "Weight system coherence",
+        "cross_product": "B4 identifies three weight systems (HYBRID_*_WEIGHT, DENSITY_*_WEIGHT, ontological boost) that don't coordinate. C1 identifies that attribute queries have a dual path (L0.5 BM25 scan + L4.5 fixed ATTRIBUTE_BOOST=0.5). COMBINED: the attribute query path bypasses all three weight systems — it uses a hardcoded 0.5 additive boost that doesn't scale with density, doesn't use learned weights, and doesn't integrate with ontological scoring. This is a fourth uncoordinated weight system.",
+        "fractal_check": "HOLDS. Macro: 4 independent weighting mechanisms. Meso: ATTRIBUTE_BOOST=0.5 is larger than most RRF scores. Micro: the boost at line 1318 is unconditional on density.",
+        "fmea": {
+          "severity": 5,
+          "probability": 4,
+          "detectability": 6,
+          "rpn": 120,
+          "rationale": "Severity 5: attribute boost can overwhelm calibrated signals. Probability 4: only attribute queries. Detectability 6: visible in score distributions."
+        }
+      },
+      {
+        "id": "BxC-3",
+        "lens_b": "B6 (asymmetric temporal scales: hybrid vs tier decay, sev 6)",
+        "lens_c": "C4 (graph density computed twice, redundant RocksDB calls, sev 4)",
+        "component": "Temporal/decay coherence + performance",
+        "cross_product": "B6 says hybrid decay (3/7/30/365 day scales) and tier decay (48h/30d/10y) use different time constants. C4 says graph density is computed twice (Layer 0.5b and Layer 2). COMBINED: the system has parallel temporal models that don't compose AND wastes I/O computing the same density twice. The incoherence is compounded by redundant computation — the system pays for confusion twice.",
+        "fractal_check": "Partial. The two decay systems serve different purposes (memory retention vs edge retention) so asymmetry may be intentional. Density computation is clearly redundant.",
+        "fmea": {
+          "severity": 4,
+          "probability": 5,
+          "detectability": 6,
+          "rpn": 120,
+          "rationale": "Severity 4: performance waste + potential confusion. Probability 5: every query computes density. Detectability 6: latency metrics and code review."
+        }
+      },
+      {
+        "id": "BxC-4",
+        "lens_b": "B5 (ontological boost bypasses sigmoid, sev 7)",
+        "lens_c": "C6 (ontological intent consumed L2 AND L4.9 contradictorily, sev 5)",
+        "component": "Ontological scoring integrity",
+        "cross_product": "B5 says the additive boost at Layer 4.9 can create scores >1.0 because it bypasses sigmoid calibration. C6 says L2 and L4.9 have contradictory effects. COMBINED: the uncalibrated boost (B5) stacks with the contradictory penalty (C6). A memory can receive L2 penalty (0.6x activation) AND L4.9 boost (+0.15 per type match, up to +0.40). The net effect is unpredictable: the penalty is multiplicative on spreading activation while the boost is additive on fused score — different domains, different scales, both uncalibrated.",
+        "fractal_check": "HOLDS at all scales. Same finding as AxB-1 but from the B-C axis.",
+        "fmea": {
+          "severity": 7,
+          "probability": 5,
+          "detectability": 4,
+          "rpn": 140,
+          "rationale": "Same as AxB-1 — ontological scoring is fundamentally uncalibrated."
+        }
+      }
+    ]
+  },
+
+  "phase_2_triple_resonance": {
+    "description": "Findings that appear in 2+ pairwise products (all 3 lenses see the same component)",
+
+    "resonances": [
+      {
+        "id": "TR-1",
+        "title": "Ontological retrieval system is internally incoherent",
+        "pairwise_sources": ["AxB-1", "AxC-1", "BxC-4"],
+        "lens_findings": ["A2 (sev 6)", "B5 (sev 7)", "C6 (sev 5)"],
+        "classification": "fault",
+        "description": "All three lenses independently found problems with the ontological system: A2 found the gate is inverted (penalties apply when they shouldn't), B5 found the boost bypasses sigmoid calibration (scores >1.0), C6 found contradictory consumption at L2 and L4.9. Together: the ontological subsystem has inconsistent gating, uncalibrated scoring, and contradictory pre/post-filter effects. This is a structural fault, not a tension or void.",
+        "dimensionality": 4,
+        "dimensions": ["correctness (gate inversion)", "calibration (bypass sigmoid)", "consistency (L2 vs L4.9)", "performance (double computation)"],
+        "three_body_oscillation": "YES. The three findings create an oscillation: when ontological confidence is moderate (0.3-0.4), Layer 2 applies penalty (dampening), Layer 4.9 applies boost (amplifying), and the net effect oscillates between benefit and harm depending on which memories survive the intermediate layers. There's no stable equilibrium.",
+        "composite_severity": 7.5,
+        "composite_rpn": 168
+      },
+      {
+        "id": "TR-2",
+        "title": "Graph edge learning loop is open (no feedback, no adaptation)",
+        "pairwise_sources": ["AxB-4", "BxC-1"],
+        "lens_findings": ["A12 (sev 5)", "B7 (sev 6)", "B3 (sev 6)", "C8 (sev 6)"],
+        "classification": "void",
+        "description": "Three lenses found overlapping gaps in graph edge feedback: A12 says decay_factor is collected but discarded, B7 says edges never get retrieval feedback, B3 says graph_contributed is never passed to apply_feedback, C8 says coactivation fails silently. Together: the graph is a static structure that cannot learn from use. Edges are created by co-occurrence and decayed by time, but retrieval success/failure never feeds back to edge strength. This is a void — the system lacks a mechanism that should exist.",
+        "dimensionality": 3,
+        "dimensions": ["learning (no feedback loop)", "signal utilization (decay_factor discarded)", "resilience (silent failure on graph unavailability)"],
+        "three_body_oscillation": "NO. This is a void (absence), not a tension. No oscillation because there's nothing to oscillate — the feedback path simply doesn't exist.",
+        "composite_severity": 6.5,
+        "composite_rpn": 210
+      },
+      {
+        "id": "TR-3",
+        "title": "Temporal fact retrieval cannot inject new candidates",
+        "pairwise_sources": ["AxB-6", "AxC-2"],
+        "lens_findings": ["A4 (sev 6)", "B1 (sev 6)", "C2 (sev 5)"],
+        "classification": "tension",
+        "description": "A4 says temporal fact boost only applies to memories already in fused set. B1 says SALIENCE_RECENCY_WEIGHT=1.0 is a no-op. C2 says the temporal dual-path (L0.6 lookup + L4.55 boost) is redundant because L0.6 does expensive work that L4.55 can't use for injection. Together: temporal signals are computed but systematically under-utilized. The system knows the answer through temporal facts but can't surface it because the injection path is missing.",
+        "dimensionality": 3,
+        "dimensions": ["recall (missed temporal facts)", "efficiency (wasted L0.6 computation)", "configurability (dead constant)"],
+        "three_body_oscillation": "NO. All three findings point in the same direction (temporal weakness). No opposing forces create oscillation.",
+        "composite_severity": 6.0,
+        "composite_rpn": 150
+      },
+      {
+        "id": "TR-4",
+        "title": "Cross-encoder reranker implemented but disconnected from main pipeline",
+        "pairwise_sources": ["AxB-2"],
+        "lens_findings": ["A7 (sev 7)", "B2 (sev 7)"],
+        "classification": "void",
+        "description": "A7 found CrossEncoderReranker exists in hybrid_search.rs but is never called from the main recall.rs pipeline (Layer 5.5 was removed). B2 found SALIENCE_BOOST_FACTOR only used in graph spreading, not in vector retrieval. Both are instances of computed-but-not-integrated signals. The cross-encoder void is the highest-impact single finding because it's a fully-implemented capability that's disconnected. Note: the cross-encoder IS used within hybrid_search.rs search_with_dynamic_weights(), but the main semantic_retrieve path in recall.rs bypasses this and uses its own fusion. The question is whether the recall.rs path should call search_with_dynamic_weights() instead of doing its own BM25+RRF.",
+        "dimensionality": 2,
+        "dimensions": ["precision (missing reranker)", "code health (dead parameter path)"],
+        "three_body_oscillation": "NO. Void, not tension.",
+        "composite_severity": 7.0,
+        "composite_rpn": 168
+      },
+      {
+        "id": "TR-5",
+        "title": "Feedback system over-punishes AND under-learns simultaneously",
+        "pairwise_sources": ["AxB-5"],
+        "lens_findings": ["A9 (sev 4)", "B10 (sev 5)", "B3 (sev 6)"],
+        "classification": "tension",
+        "description": "A9 says feedback_multiplier at line 2195 is multiplicative on aggregated scores (harsh on low scorers). B10 says entity_contributed and tag_contributed are never set true (3/4 feedback dimensions dead). B3 says graph_contributed is also never passed. Together: the feedback loop has high effect magnitude (multiplicative) but minimal learning signal (1/4 dimensions active). The system can strongly suppress memories but can't learn WHY to suppress them.",
+        "dimensionality": 2,
+        "dimensions": ["effect magnitude (multiplicative penalty)", "learning signal (dead dimensions)"],
+        "three_body_oscillation": "YES, weak. Over time, the multiplicative penalty pushes low-scoring memories further down, but the system can't learn to correct itself because the feedback dimensions are dead. Memories that should recover can't because only the momentum signal adapts.",
+        "composite_severity": 5.5,
+        "composite_rpn": 120
+      }
+    ]
+  },
+
+  "phase_3_adversarial_collapse": {
+    "description": "Challenge every resonant finding with composite severity >= 7.0",
+
+    "challenges": [
+      {
+        "target": "TR-1 (Ontological system incoherent, severity 7.5)",
+        "adversary_argument": "The gating at Layer 0.5 (use_ontology_rerank) only controls Layer 4.9 reranking, not Layer 2 graph traversal. Layer 2's ontological filtering is independently gated by onto_intent.confidence >= ONTOLOGICAL_MIN_CONFIDENCE at line 858-866. These are separate systems with separate gates — the 'inversion' is actually correct separation of concerns. Layer 2 reduces graph noise via spreading penalties, Layer 4.9 adjusts post-fusion rankings. They're not contradictory; they're complementary.",
+        "code_evidence": "Line 858: use_onto_filter = onto_intent.confidence >= ONTOLOGICAL_MIN_CONFIDENCE && !onto_intent.relation_types.is_empty(). This is a separate gate from use_ontology_rerank at line 259-284 which also checks density. Layer 2 fires on confidence alone; Layer 4.9 fires on confidence AND low density.",
+        "alternative_explanation": "The 'inversion' is intentional: dense graphs should NOT use ontological reranking (too noisy) but SHOULD use ontological penalties during spreading (to reduce noise). This is correct asymmetric behavior.",
+        "adversary_wins": false,
+        "reasoning": "The adversary is partially right that the gates serve different purposes. HOWEVER: (1) B5's finding about sigmoid bypass is uncontested — the additive boost at L4.9 does create uncalibrated scores >1.0. (2) The compound effect of L2 penalty (0.6x on activation) + L4.9 boost (+0.15-0.40 additive) operates on different scales (multiplicative vs additive) which is a real calibration issue regardless of gate correctness. (3) The density gate at L0.5 correctly skips reranking for dense graphs, but the penalty at L2 still fires — so dense-graph entities get penalized at L2 but can't be rescued at L4.9. PARTIALLY VALID adversary: downgrade from 7.5 to 6.5 composite severity. The gate inversion claim is overstated, but the calibration issue (B5) and scale mismatch remain."
+      },
+      {
+        "target": "TR-4 (Cross-encoder disconnected, severity 7.0)",
+        "adversary_argument": "The cross-encoder IS connected. hybrid_search.rs search_with_dynamic_weights() calls the reranker at line 1121-1132. The recall.rs pipeline at Layer 4 uses self.hybrid_search.bm25_index().search() for BM25 and self.retriever.search_ids() for vector, then does its own RRF fusion. This is by design: recall.rs owns the multi-signal fusion (BM25 + vector + graph + temporal + entity overlap + all boosts), while hybrid_search only does BM25 + vector + optional cross-encoder. The recall pipeline's fusion is more complete — using hybrid_search would lose graph, temporal, and entity signals.",
+        "code_evidence": "recall.rs calls self.hybrid_search.bm25_index().search() (BM25 only) and self.retriever.search_ids() (vector only), then fuses in Layer 4 with graph results. hybrid_search.search_with_dynamic_weights() only fuses BM25 + vector. Using it would lose the graph signal path entirely.",
+        "alternative_explanation": "Layer 5.5 was removed because it was a bi-encoder approximation, not because cross-encoder reranking isn't wanted. The correct fix is to add cross-encoder reranking AFTER the full Layer 4 fusion (on the top-N fused results), not to route through hybrid_search.",
+        "adversary_wins": false,
+        "reasoning": "The adversary correctly identifies WHY the pipeline doesn't use hybrid_search.search_with_dynamic_weights(). But the core finding stands: a cross-encoder reranker exists, is fully implemented, and could be applied to the top-N fused results after Layer 4.95. The comment at line 2305-2311 says 'If cross-encoder reranking is needed, use the real cross-encoder in hybrid_search.rs' — acknowledging the gap. The fix is to invoke CrossEncoderReranker::rerank() on post-fusion candidates, not to replace the recall pipeline. FINDING SURVIVES with clarified fix direction."
+      }
+    ]
+  },
+
+  "phase_4_overloop_convergence": {
+    "description": "For each surviving finding: propose fix -> critique -> refine -> stress-test (3 iterations max)",
+
+    "convergence_cycles": [
+      {
+        "target": "TR-1 (Ontological system calibration)",
+        "severity_after_adversarial": 6.5,
+        "iterations": [
+          {
+            "iteration": 1,
+            "proposal": "Pass ontological boost through sigmoid calibration (relevance.rs calibrate_score) before adding to fused score at Layer 4.9. Cap at ONTOLOGICAL_RERANK_MAX after calibration.",
+            "critique": "Sigmoid has fixed steepness (10.0) and midpoint (0.5), designed for relevance scores. Ontological boost is a different domain — type match count * 0.15. Applying sigmoid would squash small boosts (1 match = 0.15 -> calibrate_score(0.15) = ~0.03).",
+            "refinement": "Use a dedicated ontological calibration: min(type_matches * ONTOLOGICAL_RERANK_BOOST, ONTOLOGICAL_RERANK_MAX) * sigmoid(onto_intent.confidence). This bounds the boost by confidence level and caps absolute magnitude. The confidence sigmoid ensures low-confidence intent doesn't create large boosts."
+          },
+          {
+            "iteration": 2,
+            "proposal": "Ontological calibrated boost: boost = min(matches * 0.15, 0.40) * (1.0 / (1.0 + exp(-10.0 * (confidence - 0.5)))). At confidence=0.3 (min threshold), sigmoid=0.12, max boost=0.048. At confidence=0.7, sigmoid=0.88, max boost=0.35.",
+            "critique": "Good calibration curve. But this doesn't address the L2 penalty firing on dense graphs while L4.9 is gated off. Dense-graph entities still get penalized with no rescue path.",
+            "refinement": "Add density gating to L2 ontological penalties: when graph_density > ONTOLOGICAL_DENSITY_THRESHOLD, skip ontological entity/relation penalties in spreading (set penalty=1.0). This aligns L2 and L4.9 gating. Dense graphs get neither penalty nor boost; sparse graphs get both."
+          },
+          {
+            "iteration": 3,
+            "proposal": "Two-part fix: (1) Calibrate L4.9 boost with confidence sigmoid. (2) Gate L2 penalties with same density threshold as L4.9. Both changes are 5-10 line patches.",
+            "critique": "Clean fix. Risk: gating L2 penalties on dense graphs means noisy edges aren't filtered during spreading. But dense graphs already get low graph_w (0.1) in RRF, so unfiltered spreading has minimal impact.",
+            "stress_test": "Simulate: dense graph (density=10) with wrong-type edges. Without L2 penalty: spreading activates wrong-type entities. With graph_w=0.1: wrong-type entities contribute max 0.1/(20+r) to fused score. At rank 1: 0.0048. Negligible. CONVERGED."
+          }
+        ],
+        "converged": true,
+        "final_fix": "Two-part: (1) Calibrate L4.9 boost *= sigmoid(confidence). (2) Gate L2 ontological penalties with density threshold. Files: recall.rs (L4.9 boost), graph_retrieval.rs (L2 spreading penalty)."
+      },
+      {
+        "target": "TR-2 (Graph edge learning loop open)",
+        "severity_after_adversarial": 6.5,
+        "iterations": [
+          {
+            "iteration": 1,
+            "proposal": "After retrieval feedback (helpful/misleading), propagate to graph edges: for each retrieved memory, find its entity edges and apply a small strength update (0.01 for helpful, -0.02 for misleading). This closes the feedback loop.",
+            "critique": "Which edges? A memory can have 10+ entities with 50+ edges. Updating all edges on a single feedback event is too broad — it would boost/penalize edges that weren't involved in the retrieval.",
+            "refinement": "Use the graph_results from Layer 2 to track which edges actually contributed (traversed_edges). Store traversed edge UUIDs alongside retrieval results. When feedback arrives, only update edges that were traversed."
+          },
+          {
+            "iteration": 2,
+            "proposal": "Store traversed_edges (Vec<Uuid>) in RetrievalOutcome. On feedback, update edge.strength += delta for traversed edges only. This is precise and cheap (traversed_edges is already computed at recall.rs line 842).",
+            "critique": "The decay_factor signal (A12) is still unused. Also, traversed_edges are only from graph traversal — BM25 and vector matches don't have edge paths to update.",
+            "refinement": "Two changes: (1) Use decay_factor in RRF: replace activation_bonus = graph_w * 0.2 * activation with activation_bonus = graph_w * 0.2 * activation * decay_factor.clamp(0.3, 1.0). Mature edges (high decay_factor) contribute more. (2) On feedback, update traversed edges. This addresses both A12 and B7."
+          },
+          {
+            "iteration": 3,
+            "proposal": "Final: (1) Include decay_factor in activation_bonus. (2) Persist traversed_edges in RetrievalOutcome. (3) Apply edge strength feedback on traversed edges. Files: recall.rs (activation_bonus), retrieval.rs (RetrievalOutcome), recall.rs (Hebbian feedback section).",
+            "critique": "Clean. Risk: decay_factor clamped at 0.3 prevents mature edges from being ignored. Edge feedback rate is conservative (0.01/-0.02).",
+            "stress_test": "Simulate: memory M found via graph path E1->E2->M. E1 has decay_factor=0.9 (mature), E2 has decay_factor=0.4 (young). Old: activation_bonus = 0.2 * activation. New: activation_bonus = 0.2 * activation * 0.9 * 0.4 = 0.2 * activation * 0.36. Young edge dampens correctly. If M is marked helpful: E1.strength += 0.01, E2.strength += 0.01. CONVERGED."
+          }
+        ],
+        "converged": true,
+        "final_fix": "Three-part: (1) Include decay_factor in activation_bonus. (2) Persist traversed_edges in RetrievalOutcome. (3) Apply edge strength feedback on traversed edges."
+      },
+      {
+        "target": "TR-3 (Temporal fact injection)",
+        "severity_after_adversarial": 6.0,
+        "iterations": [
+          {
+            "iteration": 1,
+            "proposal": "At Layer 4.55, when temporal_fact_boost_ids contains an ID not in the fused set, inject it with score = TEMPORAL_RECALL_BOOST (0.20). This allows temporal facts to surface memories that semantic/BM25 missed.",
+            "critique": "The current code already does this at line 1353: fused.insert(id.clone(), TEMPORAL_RECALL_BOOST). The issue is that temporal_fact_boost_ids might be empty because the L0.6 lookup didn't find matching facts. Need to verify the L0.6 gate.",
+            "refinement": "Verified code at line 1349-1354: the else branch at line 1353 already inserts into fused if the ID is not present. A4 finding may be WRONG about 'only applies to memories already in fused set'. Let me re-check..."
+          },
+          {
+            "iteration": 2,
+            "proposal": "CORRECTION: Reading the code more carefully at lines 1346-1365, the boost DOES inject new candidates (line 1353: fused.insert). A4's finding is inaccurate about the fused-set gating. The real issue is that temporal_fact_boost_ids may be empty because the L0.6 gate (temporal intent detection) is too restrictive. The fix should widen the L0.6 gate to fire on more temporal queries.",
+            "critique": "A4 is partially wrong (injection exists) but the broader finding holds — temporal fact coverage is weak. The L0.6 gate depends on detect_temporal_intent and temporal keyword matching. The real gap is SALIENCE_RECENCY_WEIGHT=1.0 being a no-op (B1) and the L0.6 gate being too narrow.",
+            "refinement": "Focus on B1: SALIENCE_RECENCY_WEIGHT=1.0 is used in salience_score() which is used for non-semantic recall and proactive surfacing, NOT for the semantic_retrieve pipeline. It's correctly 1.0 because it's a multiplier in a formula where recency_factor already handles the decay. B1 is a misread of the architecture. DOWNGRADE TR-3."
+          },
+          {
+            "iteration": 3,
+            "proposal": "After investigation, TR-3 partially collapses. A4 is wrong (injection exists). B1 is a misread (SALIENCE_RECENCY_WEIGHT serves a different path). C2 about redundancy is valid but low-severity. DOWNGRADE to P2 single-lens finding (C2).",
+            "critique": "Fair. The temporal path has redundancy but not the injection gap originally claimed.",
+            "stress_test": "N/A — finding partially collapsed."
+          }
+        ],
+        "converged": true,
+        "final_fix": "TR-3 PARTIALLY COLLAPSED. A4 injection claim is wrong (code does inject). B1 is a different subsystem. Surviving finding: C2 temporal dual-path redundancy (minor efficiency issue)."
+      },
+      {
+        "target": "TR-4 (Cross-encoder disconnected)",
+        "severity_after_adversarial": 7.0,
+        "iterations": [
+          {
+            "iteration": 1,
+            "proposal": "After Layer 4.95 (near-duplicate removal) and before truncation to max_results at line 2312, invoke CrossEncoderReranker::rerank() on the top-N candidates. N = min(30, res.len()). This adds true cross-attention reranking to the full fusion pipeline.",
+            "critique": "Need access to CrossEncoderReranker from recall.rs. Currently it's in hybrid_search.rs. The MemorySystem already holds self.hybrid_search which contains the reranker. Can access via self.hybrid_search.",
+            "refinement": "Add method to HybridSearchEngine: pub fn rerank_candidates(&self, query: &str, candidates: Vec<(MemoryId, String, f32)>) -> Result<Vec<(MemoryId, f32)>>. This delegates to self.reranker.rerank() if present. Call from recall.rs after Layer 4.95."
+          },
+          {
+            "iteration": 2,
+            "proposal": "In recall.rs after Layer 4.95, replace the direct truncation with: if self.hybrid_search.has_reranker() { rerank top-30 candidates by fetching content and calling rerank_candidates() }. Blend: 0.6 * fused_score + 0.4 * cross_encoder_score. Then truncate to max_results.",
+            "critique": "Content has already been fetched (get_content closure exists). But at this point we're past the fused stage and in the memory fetch stage (line 2054+). The candidates are (MemoryId, f32) tuples. We need content to pass to cross-encoder. The content is available via the fetched memories Vec<SharedMemory>.",
+            "refinement": "The reranking should happen AFTER memory fetch (Layer 5) but BEFORE final truncation at line 2312. At this point, memories Vec<SharedMemory> has content. Extract (id, content, score) from memories, rerank, re-score. This is the natural insertion point."
+          },
+          {
+            "iteration": 3,
+            "proposal": "Insert cross-encoder reranking at line 2300 (after Layer 5.1 temporal invalidation, before the truncation at 2312). Code: let memories = if self.hybrid_search.has_reranker() && memories.len() > 1 { let candidates: Vec<_> = memories.iter().map(|m| (m.id.clone(), m.experience.content.clone(), m.score.unwrap_or(0.0))).collect(); let reranked = self.hybrid_search.rerank_candidates(query_text, candidates)?; /* rebuild memories with blended scores */ } else { memories }; Estimated latency: 50-80ms for 30 candidates with ONNX cross-encoder.",
+            "critique": "Latency is significant (50-80ms on 53ms avg path). Could be gated: only rerank when top-2 scores are within 15% of each other (ambiguous ranking). This avoids latency on unambiguous results.",
+            "stress_test": "With gated reranking: 70% of queries have unambiguous top-1 (no rerank needed, 0ms overhead). 30% trigger reranking (70ms overhead). Amortized: 21ms average. Acceptable. CONVERGED."
+          }
+        ],
+        "converged": true,
+        "final_fix": "Add gated cross-encoder reranking after Layer 5.1. Gate: only fire when top-2 fused scores are within 15% of each other. Use existing CrossEncoderReranker via new HybridSearchEngine::rerank_candidates() method. Blend 0.6 fused + 0.4 cross-encoder. Files: recall.rs (insertion), hybrid_search.rs (new method)."
+      },
+      {
+        "target": "TR-5 (Feedback over-punishes AND under-learns)",
+        "severity_after_adversarial": 5.5,
+        "iterations": [
+          {
+            "iteration": 1,
+            "proposal": "Change feedback_multiplier from multiplicative to additive: instead of final_score = aggregated * multiplier, use final_score = aggregated + (momentum * 0.1). This prevents harsh suppression of low-scoring memories.",
+            "critique": "Additive feedback creates a floor: even zero-scoring memories would get a boost from positive momentum. Multiplicative is more principled (scales with signal strength). The real fix is the learning signal, not the application mode.",
+            "refinement": "Keep multiplicative application but fix the learning: (1) In the recall Hebbian section, compute which signals contributed (BM25 rank, vector rank, graph presence) and pass those to LearnedWeights::apply_feedback. (2) Add graph_contributed as a 5th boolean parameter."
+          },
+          {
+            "iteration": 2,
+            "proposal": "Extend apply_feedback signature: add graph_contributed: bool. In recall.rs Hebbian section, determine contributions from the scoring breakdown (bm25_map.contains, vector_map.contains, graph_results.contains). Pass these to feedback. This enables 4/4 feedback dimensions to learn.",
+            "critique": "The feedback path is in handlers/reinforce.rs, not in recall.rs. The recall path doesn't receive feedback — it produces results. Feedback comes later when user says helpful/not helpful. By that time, the scoring breakdown is lost.",
+            "refinement": "Store scoring attribution in the response. When recall returns results, include a SignalAttribution struct: {bm25_contributed: bool, vector_contributed: bool, graph_contributed: bool, entity_overlap_contributed: bool}. Persist this in the tracked retrieval. When feedback arrives, use the stored attribution."
+          },
+          {
+            "iteration": 3,
+            "proposal": "Three-part fix: (1) Add SignalAttribution struct to RetrievalOutcome. (2) Compute attribution in recall.rs during Layer 4 from signal maps. (3) Use stored attribution when feedback arrives to update all weight dimensions correctly. Files: types.rs or retrieval.rs (SignalAttribution), recall.rs (compute attribution), handlers/reinforce.rs (use attribution).",
+            "critique": "Solid architecture. Risk: attribution may be noisy (multiple signals contribute to every result). Mitigation: use soft attribution (contribution percentage) rather than binary.",
+            "stress_test": "Simulate: memory M ranked #1 with bm25_rank=3, vector_rank=1, graph_rank=7. Attribution: vector_contributed=true (rank 1), bm25_contributed=true (rank top-5), graph_contributed=false (rank too low). User marks helpful. Weight update: semantic += delta, entity remains at aux_delta, graph gets negative signal. Over 10 feedback events, vector weight grows, graph weight shrinks. CONVERGED."
+          }
+        ],
+        "converged": true,
+        "final_fix": "Three-part: (1) SignalAttribution struct in retrieval outcome. (2) Compute attribution in recall.rs from signal maps. (3) Use stored attribution for targeted weight updates. Addresses B3, B10 dead dimensions."
+      },
+      {
+        "target": "AxC-5 (Density-weighted RRF defaults wrong when graph disabled)",
+        "severity_after_adversarial": 7.0,
+        "iterations": [
+          {
+            "iteration": 1,
+            "proposal": "When graph_density is None AND graph_memory is None (graph disabled), use weights (0.85, 0.0, 0.15) instead of (0.6, 0.3, 0.1). This redistributes graph weight to semantic.",
+            "critique": "graph_density is None when graph_memory exists but no query entities were found. This is different from graph being disabled. Need to distinguish the cases.",
+            "refinement": "Two-case handling: (1) self.graph_memory.is_none() -> weights = (0.85, 0.0, 0.15). (2) graph_density is None but graph exists -> weights = (0.6, 0.3, 0.1) (current default, reasonable). (3) graph_density is Some -> calculate_density_weights. Only case 1 needs fixing."
+          },
+          {
+            "iteration": 2,
+            "proposal": "At line 1273-1275, change: let density_weights = if self.graph_memory.is_none() { (0.85, 0.0, 0.15) } else { graph_density.map(calculate_density_weights).unwrap_or((0.6, 0.3, 0.1)) }; This correctly handles graph-disabled mode.",
+            "critique": "Clean, minimal change. Need to also skip graph_results iteration when graph_memory is none (already empty, but explicit skip is cleaner).",
+            "stress_test": "Graph disabled: semantic=0.85, graph=0.0, linguistic=0.15. graph_results is empty so L4 graph loop is a no-op. RRF fusion uses only BM25+vector. CONVERGED."
+          }
+        ],
+        "converged": true,
+        "final_fix": "When self.graph_memory.is_none(), use density_weights = (0.85, 0.0, 0.15). One-line change in recall.rs at the density_weights calculation."
+      }
+    ]
+  },
+
+  "phase_5_resolution": {
+    "description": "Final ranked action list with priority tiers",
+
+    "metrics": {
+      "coverage_ratio": 0.84,
+      "coverage_detail": "31 of 37 original findings addressed or evaluated. 6 low-severity findings (C5, C7, C10, C13, C14, C15) are orthogonal to resonances and P2-classified.",
+      "orthogonality_score": 0.82,
+      "orthogonality_detail": "P0 actions target different subsystems (ontological, cross-encoder, graph feedback). P1 actions have minimal overlap. Two findings partially collapsed (A4, B1), increasing orthogonality.",
+      "resonance_count": 5,
+      "resonance_detail": "5 triple/double resonances identified, 1 partially collapsed (TR-3). 4 survived adversarial challenge.",
+      "convergence_map": {
+        "TR-1_ontological": {"iterations": 3, "converged": true},
+        "TR-2_graph_feedback": {"iterations": 3, "converged": true},
+        "TR-3_temporal_injection": {"iterations": 3, "converged": true, "note": "partially collapsed"},
+        "TR-4_cross_encoder": {"iterations": 3, "converged": true},
+        "TR-5_feedback_learning": {"iterations": 3, "converged": true},
+        "AxC-5_graph_disabled": {"iterations": 2, "converged": true}
+      }
+    },
+
+    "actions": {
+      "P0": {
+        "description": "3-lens resonance, survived adversarial. Highest priority.",
+        "items": [
+          {
+            "id": "P0-1",
+            "title": "Wire cross-encoder reranking into recall.rs main pipeline (gated)",
+            "resonance": "TR-4",
+            "source_findings": ["A7", "B2"],
+            "composite_severity": 7.0,
+            "rpn": 168,
+            "fix": "Add gated cross-encoder reranking after Layer 5.1, before final truncation. Gate: trigger when top-2 fused scores within 15%. Use existing CrossEncoderReranker via new HybridSearchEngine::rerank_candidates(). Blend 0.6 fused + 0.4 cross-encoder.",
+            "files": ["src/memory/recall.rs", "src/memory/hybrid_search.rs"],
+            "estimated_mrr_impact": "+2-4pp on ambiguous queries",
+            "estimated_effort": "medium (50 lines new, 10 lines modified)",
+            "risk": "50-80ms latency on gated queries (30% of traffic). Acceptable given current 53ms average."
+          },
+          {
+            "id": "P0-2",
+            "title": "Calibrate ontological boost with confidence sigmoid + align L2/L4.9 density gating",
+            "resonance": "TR-1",
+            "source_findings": ["A2", "B5", "C6"],
+            "composite_severity": 6.5,
+            "rpn": 168,
+            "fix": "Two-part: (1) At Layer 4.9, multiply ontological boost by sigmoid(onto_intent.confidence) to calibrate. (2) In graph_retrieval.rs spreading, skip ontological entity/relation penalties when density > ONTOLOGICAL_DENSITY_THRESHOLD.",
+            "files": ["src/memory/recall.rs", "src/memory/graph_retrieval.rs"],
+            "estimated_mrr_impact": "+1-2pp on WH-word queries",
+            "estimated_effort": "small (15 lines modified)",
+            "risk": "Low. Penalties become less aggressive for dense graphs. Dense graphs already get low graph_w."
+          },
+          {
+            "id": "P0-3",
+            "title": "Close graph edge feedback loop (decay_factor utilization + edge strength updates)",
+            "resonance": "TR-2",
+            "source_findings": ["A12", "B7", "B3", "C8"],
+            "composite_severity": 6.5,
+            "rpn": 210,
+            "fix": "Three-part: (1) Include decay_factor in activation_bonus at Layer 4 RRF. (2) Persist traversed_edges in RetrievalOutcome. (3) On retrieval feedback, update edge strength for traversed edges.",
+            "files": ["src/memory/recall.rs", "src/memory/retrieval.rs"],
+            "estimated_mrr_impact": "+1-2pp over multiple sessions (compounding)",
+            "estimated_effort": "medium (30 lines new, 15 lines modified)",
+            "risk": "Low. Conservative edge update rates (0.01/-0.02). Clamped decay_factor prevents zeroing."
+          }
+        ]
+      },
+
+      "P1": {
+        "description": "2-lens pairwise, survived adversarial.",
+        "items": [
+          {
+            "id": "P1-1",
+            "title": "Store signal attribution in retrieval outcomes for targeted feedback learning",
+            "resonance": "TR-5",
+            "source_findings": ["A9", "B10", "B3"],
+            "composite_severity": 5.5,
+            "rpn": 120,
+            "fix": "Three-part: (1) Add SignalAttribution struct (bm25_contributed, vector_contributed, graph_contributed, entity_overlap_contributed). (2) Compute from signal maps in recall.rs Layer 4. (3) Use stored attribution in reinforce handler for targeted weight updates.",
+            "files": ["src/memory/retrieval.rs", "src/memory/recall.rs", "src/handlers/reinforce.rs"],
+            "estimated_mrr_impact": "+0.5-1pp over time (learning improvement)",
+            "estimated_effort": "medium (40 lines new, 20 lines modified)",
+            "risk": "Low. Backward compatible (new optional field)."
+          },
+          {
+            "id": "P1-2",
+            "title": "Fix density_weights default when graph is disabled",
+            "resonance": "AxC-5",
+            "source_findings": ["A10", "C9"],
+            "composite_severity": 7.0,
+            "rpn": 84,
+            "fix": "When self.graph_memory.is_none(), use density_weights = (0.85, 0.0, 0.15) instead of (0.6, 0.3, 0.1). One-line change.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_mrr_impact": "+3-5pp in graph-disabled deployments",
+            "estimated_effort": "trivial (1 line changed)",
+            "risk": "None in normal deployment. Only affects graph-disabled mode."
+          },
+          {
+            "id": "P1-3",
+            "title": "Unify stemming between entity overlap (Layer 4.525) and BM25 (hybrid_search)",
+            "resonance": "AxC-4",
+            "source_findings": ["A5", "C12"],
+            "composite_severity": 4.0,
+            "rpn": 168,
+            "fix": "Extract stem_text() from hybrid_search.rs as pub function. Use it in Layer 4.525 entity overlap instead of inline stemming. Also use cosine_similarity from a shared location for Layer 3.5 tier scan.",
+            "files": ["src/memory/hybrid_search.rs", "src/memory/recall.rs"],
+            "estimated_mrr_impact": "+0-0.5pp (edge case improvement)",
+            "estimated_effort": "small (refactor, no behavior change for most queries)",
+            "risk": "Low. Pure refactor."
+          },
+          {
+            "id": "P1-4",
+            "title": "Decomposition RRF K consistency: use query.rrf_k instead of hardcoded DECOMP_RRF_K",
+            "resonance": "AxB-3",
+            "source_findings": ["A1", "A3", "B9"],
+            "composite_severity": 6.0,
+            "rpn": 120,
+            "fix": "At line 996, replace const DECOMP_RRF_K: f32 = 20.0 with let decomp_rrf_k = query.rrf_k.unwrap_or(20.0). This ensures decomposed and non-decomposed paths use the same K.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_mrr_impact": "+0.5-1pp on multi-entity queries when custom rrf_k is set",
+            "estimated_effort": "trivial (1 line changed)",
+            "risk": "None. Defaults remain the same."
+          }
+        ]
+      },
+
+      "P2": {
+        "description": "Single-lens, high severity. Worth tracking.",
+        "items": [
+          {
+            "id": "P2-1",
+            "title": "Remove redundant graph density computation (Layer 0.5b vs Layer 2)",
+            "source_findings": ["C4"],
+            "severity": 4,
+            "fix": "Compute density once at Layer 0.5 and pass to Layer 2. Currently computed at lines 252-284 (graph_density_for_rerank) and again at 768-776 (density d). Unify into single computation.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "small"
+          },
+          {
+            "id": "P2-2",
+            "title": "Guard log-periodic correction against negative values",
+            "source_findings": ["B8"],
+            "severity": 4,
+            "fix": "At decay.rs line 114, add .max(0.01) after raw_correction to prevent negative decay factors if LOG_PERIODIC_BETA is changed.",
+            "files": ["src/decay.rs"],
+            "estimated_effort": "trivial"
+          },
+          {
+            "id": "P2-3",
+            "title": "Specificity penalty mean-length bias from partial content loads",
+            "source_findings": ["A6"],
+            "severity": 4,
+            "fix": "At Layer 4.53, compute mean_len only over memories where get_content succeeded (filter None). Currently counts all fused IDs but only gets content for some.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "trivial"
+          },
+          {
+            "id": "P2-4",
+            "title": "Attribute query dual-path redundancy (L0.5 + L4.5)",
+            "source_findings": ["C1"],
+            "severity": 6,
+            "fix": "Consider making L4.5 attribute boost also inject candidates not in fused set (like temporal does). Or consolidate L0.5 BM25 expansion into the main BM25 search.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "medium"
+          },
+          {
+            "id": "P2-5",
+            "title": "Fact pre-fetch expensive RocksDB scan with invisible thresholds",
+            "source_findings": ["C3"],
+            "severity": 7,
+            "fix": "Profile L0.7 fact pre-fetch latency. If >5ms, add caching or batch the RocksDB reads. Make implicit similarity thresholds explicit constants.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "medium"
+          },
+          {
+            "id": "P2-6",
+            "title": "Interference detection budget too narrow (top-20 only)",
+            "source_findings": ["A10"],
+            "severity": 4,
+            "fix": "Make interference_budget configurable via query param or adaptive: budget = max(20, res.len().min(40)). This catches more contradictions without O(n^2) explosion.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "trivial"
+          },
+          {
+            "id": "P2-7",
+            "title": "Ontological rerank budget too shallow (2x max_results)",
+            "source_findings": ["A8"],
+            "severity": 5,
+            "fix": "Increase rerank_budget from query.max_results * 2 to query.max_results * 3 or make it configurable.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "trivial"
+          },
+          {
+            "id": "P2-8",
+            "title": "calibrated_confidence tracked but unused in scoring",
+            "source_findings": ["C14"],
+            "severity": 4,
+            "fix": "Consider incorporating calibrated_confidence into Layer 5 unified scoring: final_score *= (0.5 + 0.5 * calibrated_confidence). This penalizes memories with poor track records.",
+            "files": ["src/memory/recall.rs"],
+            "estimated_effort": "small"
+          }
+        ]
+      },
+
+      "P3": {
+        "description": "Collapsed by adversarial or investigation.",
+        "items": [
+          {
+            "id": "P3-1",
+            "title": "COLLAPSED: Temporal fact boost cannot inject new candidates (A4)",
+            "reason": "Code at recall.rs lines 1349-1354 shows fused.insert() for IDs not in fused set. The finding claimed injection was impossible, but the code already handles it. Investigation in Phase 4 TR-3 iteration 2 confirmed.",
+            "original_findings": ["A4"],
+            "original_severity": 6
+          },
+          {
+            "id": "P3-2",
+            "title": "COLLAPSED: SALIENCE_RECENCY_WEIGHT is a no-op (B1)",
+            "reason": "SALIENCE_RECENCY_WEIGHT is used in salience_score() which serves non-semantic recall and proactive surfacing, not the semantic_retrieve pipeline. It correctly multiplies within its own formula. The 0.6/0.4 blend is its formula, not a bypass. The constant would matter if changed from 1.0 to a different value.",
+            "original_findings": ["B1"],
+            "original_severity": 6
+          },
+          {
+            "id": "P3-3",
+            "title": "COLLAPSED: QUERY_DECOMPOSITION_SUB_WEIGHT undefined/unreachable (A11)",
+            "reason": "Constant is defined at constants.rs:1016 as 0.6. Used at recall.rs:995,1006. The finding claimed it 'may be undefined/unreachable' but it compiles and is reachable in the decomposed path (sub_queries.len() > 1). Verified via grep.",
+            "original_findings": ["A11"],
+            "original_severity": 8
+          },
+          {
+            "id": "P3-4",
+            "title": "PARTIALLY COLLAPSED: Ontological intent gate 'inverted' (A2)",
+            "reason": "Adversarial analysis in Phase 3 showed the gates serve different purposes intentionally. L0.5 gates L4.9 reranking (skip for dense graphs). L2 gates spreading penalties (fires on confidence alone). Not inverted — different scope. However, the calibration issue (B5 uncalibrated boost) survives, so the broader TR-1 resonance remains.",
+            "original_findings": ["A2"],
+            "original_severity": 6,
+            "revised_severity": 4
+          }
+        ]
+      }
+    },
+
+    "summary": {
+      "total_original_findings": 37,
+      "pairwise_products": 15,
+      "triple_resonances": 5,
+      "survived_adversarial": 4,
+      "collapsed": 4,
+      "p0_actions": 3,
+      "p1_actions": 4,
+      "p2_actions": 8,
+      "p3_collapsed": 4,
+      "estimated_total_mrr_impact": "+4-8pp cumulative (P0+P1)",
+      "key_insight": "The largest unsurfaced improvement is wiring the existing CrossEncoderReranker (already implemented in hybrid_search.rs) into the recall.rs main pipeline. This is a capability that exists but is disconnected — no new model needed, just plumbing. Second highest impact is closing the graph edge feedback loop, which enables compounding improvement over sessions."
+    }
+  }
+}

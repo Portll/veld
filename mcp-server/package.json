@@ -1,0 +1,54 @@
+{
+  "name": "@veld/memory-mcp",
+  "version": "0.7.7",
+  "mcpName": "io.github.Portll/veld",
+  "description": "Persistent cognitive memory for AI agents — semantic search, knowledge graph, Hebbian learning. MCP server for Claude, Cursor, and Codex.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "veld-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "start": "bun run index.ts",
+    "build": "bun build index.ts --outdir dist --target node",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "postinstall": "node scripts/postinstall.cjs",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md"
+  ],
+  "dependencies": {},
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "ai",
+    "llm",
+    "persistent-memory",
+    "semantic-search",
+    "veld"
+  ],
+  "author": "Veld Team <john@portll.net>",
+  "license": "BUSL-1.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Portll/veld.git"
+  },
+  "homepage": "https://github.com/Portll/veld#readme",
+  "bugs": {
+    "url": "https://github.com/Portll/veld/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

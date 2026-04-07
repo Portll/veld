@@ -1,0 +1,891 @@
+openapi: 3.0.3
+info:
+  title: Veld Agentic Memory API
+  description: |
+    Internal branch-local API snapshot for Veld Agentic Memory.
+
+    This `v0.7.6-unstable` branch is in stabilization toward `v0.8`. Treat this
+    document as a moving development snapshot rather than the public release
+    contract.
+
+    ## Key Features
+    - **Sub-millisecond latency**: No LLM calls in critical path
+    - **Hebbian learning**: Associations strengthen through use
+    - **Offline capable**: Local embeddings, no external API dependencies
+    - **Three retrieval modes**: semantic, associative, hybrid
+
+    ## Authentication
+    All endpoints require `X-API-Key` header.
+
+    ## Quick Start
+    1. Store a memory: `POST /api/remember`
+    2. Recall memories: `POST /api/recall`
+    3. Get context summary: `POST /api/context_summary`
+  version: 0.7.6-unstable
+  contact:
+    name: Veld Agentic Memory
+    url: https://github.com/Portll/veld
+  license:
+    name: Apache-2.0
+    url: https://opensource.org/licenses/Apache-2.0
+
+servers:
+  - url: http://localhost:3030
+    description: Local development server
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for authentication
+
+  schemas:
+    # Core Memory Types
+    MemoryType:
+      type: string
+      enum:
+        - Observation
+        - Decision
+        - Learning
+        - Error
+        - Discovery
+        - Pattern
+        - Context
+        - Task
+        - Conversation
+      description: Type of memory being stored
+
+    RetrievalMode:
+      type: string
+      enum:
+        - semantic
+        - associative
+        - hybrid
+      default: hybrid
+      description: |
+        - semantic: Pure vector similarity search
+        - associative: Graph traversal with Hebbian-learned edges
+        - hybrid: Combined semantic + graph (recommended)
+
+    # Request/Response Schemas
+    RememberRequest:
+      type: object
+      required:
+        - user_id
+        - content
+      properties:
+        user_id:
+          type: string
+          description: Unique identifier for the user
+          example: "user-123"
+        content:
+          type: string
+          description: The memory content to store
+          example: "User prefers dark mode for all applications"
+        tags:
+          type: array
+          items:
+            type: string
+          description: Optional tags for categorization
+          example: ["preferences", "ui"]
+        memory_type:
+          $ref: '#/components/schemas/MemoryType'
+        external_id:
+          type: string
+          description: External system ID for linking (e.g., "linear:SHO-39")
+          example: "github:issue-123"
+        created_at:
+          type: string
+          format: date-time
+          description: Optional timestamp (ISO 8601). Defaults to current time.
+          example: "2025-12-15T06:30:00Z"
+
+    RememberResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Unique memory ID
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        success:
+          type: boolean
+          example: true
+
+    RecallRequest:
+      type: object
+      required:
+        - user_id
+        - query
+      properties:
+        user_id:
+          type: string
+          description: User ID to search memories for
+          example: "user-123"
+        query:
+          type: string
+          description: Natural language search query
+          example: "What are the user's UI preferences?"
+        limit:
+          type: integer
+          default: 5
+          minimum: 1
+          maximum: 100
+          description: Maximum number of memories to return
+        mode:
+          $ref: '#/components/schemas/RetrievalMode'
+
+    RecallMemory:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        experience:
+          type: object
+          properties:
+            content:
+              type: string
+              example: "User prefers dark mode for all applications"
+            memory_type:
+              type: string
+              example: "Decision"
+            tags:
+              type: array
+              items:
+                type: string
+              example: ["preferences", "ui"]
+        importance:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          example: 0.75
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-12-15T06:30:00Z"
+        score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Relevance score for this query
+          example: 0.92
+
+    RecallResponse:
+      type: object
+      properties:
+        memories:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecallMemory'
+        count:
+          type: integer
+          example: 3
+        retrieval_stats:
+          type: object
+          description: Optional retrieval statistics
+          properties:
+            semantic_candidates:
+              type: integer
+            graph_candidates:
+              type: integer
+            final_count:
+              type: integer
+
+    ContextSummaryRequest:
+      type: object
+      required:
+        - user_id
+      properties:
+        user_id:
+          type: string
+          example: "user-123"
+        include_decisions:
+          type: boolean
+          default: true
+        include_learnings:
+          type: boolean
+          default: true
+        include_context:
+          type: boolean
+          default: true
+        max_items:
+          type: integer
+          default: 5
+          minimum: 1
+          maximum: 50
+
+    SummaryItem:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        importance:
+          type: number
+          format: float
+        created_at:
+          type: string
+          format: date-time
+
+    ContextSummaryResponse:
+      type: object
+      properties:
+        total_memories:
+          type: integer
+          example: 42
+        decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SummaryItem'
+        learnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/SummaryItem'
+        context:
+          type: array
+          items:
+            $ref: '#/components/schemas/SummaryItem'
+        patterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/SummaryItem'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/SummaryItem'
+
+    RelevanceConfig:
+      type: object
+      properties:
+        semantic_threshold:
+          type: number
+          format: float
+          default: 0.65
+          minimum: 0
+          maximum: 1
+          description: Minimum semantic similarity to surface
+        entity_threshold:
+          type: number
+          format: float
+          default: 0.4
+          minimum: 0
+          maximum: 1
+        max_results:
+          type: integer
+          default: 5
+          minimum: 1
+          maximum: 20
+        memory_types:
+          type: array
+          items:
+            type: string
+          description: Filter to specific memory types (empty = all)
+
+    ProactiveContextRequest:
+      type: object
+      required:
+        - user_id
+        - context
+      properties:
+        user_id:
+          type: string
+          example: "user-123"
+        context:
+          type: string
+          description: Current conversation context or user message
+          example: "I'm working on the authentication module"
+        entities:
+          type: array
+          items:
+            type: string
+          description: Pre-extracted entities (skips NER if provided)
+        config:
+          $ref: '#/components/schemas/RelevanceConfig'
+
+    SurfacedMemory:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        memory_type:
+          type: string
+        importance:
+          type: number
+          format: float
+        relevance_score:
+          type: number
+          format: float
+        reason:
+          type: string
+          enum: [EntityMatch, SemanticSimilarity, Combined, RecentImportant]
+        matched_entities:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+
+    ProactiveContextResponse:
+      type: object
+      properties:
+        memories:
+          type: array
+          items:
+            $ref: '#/components/schemas/SurfacedMemory'
+        detected_entities:
+          type: array
+          items:
+            type: object
+            properties:
+              text:
+                type: string
+              entity_type:
+                type: string
+              salience:
+                type: number
+                format: float
+        latency_ms:
+          type: number
+          format: float
+          description: Processing time in milliseconds
+          example: 0.85
+        latency_target_met:
+          type: boolean
+          description: Whether <30ms target was met
+          example: true
+
+    BatchRememberRequest:
+      type: object
+      required:
+        - user_id
+        - memories
+      properties:
+        user_id:
+          type: string
+        memories:
+          type: array
+          items:
+            type: object
+            required:
+              - content
+            properties:
+              content:
+                type: string
+              tags:
+                type: array
+                items:
+                  type: string
+              memory_type:
+                type: string
+
+    BatchRememberResponse:
+      type: object
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+        success_count:
+          type: integer
+        error_count:
+          type: integer
+
+    ForgetByTagsRequest:
+      type: object
+      required:
+        - user_id
+        - tags
+      properties:
+        user_id:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+          description: Delete memories matching ANY of these tags
+
+    ForgetByDateRequest:
+      type: object
+      required:
+        - user_id
+        - start
+        - end
+      properties:
+        user_id:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+
+    RecallByTagsRequest:
+      type: object
+      required:
+        - user_id
+        - tags
+      properties:
+        user_id:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        limit:
+          type: integer
+          default: 20
+
+    RecallByDateRequest:
+      type: object
+      required:
+        - user_id
+        - start
+        - end
+      properties:
+        user_id:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        limit:
+          type: integer
+          default: 20
+
+    MemoryStats:
+      type: object
+      properties:
+        total_memories:
+          type: integer
+        working_memory_count:
+          type: integer
+        session_memory_count:
+          type: integer
+        long_term_count:
+          type: integer
+        vector_index_count:
+          type: integer
+        graph_stats:
+          type: object
+          properties:
+            node_count:
+              type: integer
+            edge_count:
+              type: integer
+            avg_strength:
+              type: number
+              format: float
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        version:
+          type: string
+        uptime_seconds:
+          type: integer
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        details:
+          type: object
+
+paths:
+  # Health & Status
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # Core Memory Operations
+  /api/remember:
+    post:
+      tags: [Memory]
+      summary: Store a memory
+      description: |
+        Store a new memory with automatic embedding generation and indexing.
+        Memories are immediately available for recall.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RememberRequest'
+      responses:
+        '200':
+          description: Memory stored successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RememberResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/recall:
+    post:
+      tags: [Memory]
+      summary: Recall memories
+      description: |
+        Search for relevant memories using natural language.
+        Supports three retrieval modes:
+        - **semantic**: Pure vector similarity
+        - **associative**: Graph traversal with Hebbian-learned edges
+        - **hybrid**: Combined approach (recommended)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecallRequest'
+      responses:
+        '200':
+          description: Memories retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecallResponse'
+
+  /api/batch_remember:
+    post:
+      tags: [Memory]
+      summary: Store multiple memories at once
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchRememberRequest'
+      responses:
+        '200':
+          description: Batch operation complete
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchRememberResponse'
+
+  /api/context_summary:
+    post:
+      tags: [Context]
+      summary: Get categorized context summary
+      description: |
+        Returns a summary of recent memories organized by type.
+        Useful for session bootstrap and context injection.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContextSummaryRequest'
+      responses:
+        '200':
+          description: Context summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextSummaryResponse'
+
+  /api/relevant:
+    post:
+      tags: [Context]
+      summary: Proactive memory surfacing
+      description: |
+        Surface relevant memories based on current context.
+        Uses entity matching + semantic similarity.
+        Target latency: <30ms (typically <1ms).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProactiveContextRequest'
+      responses:
+        '200':
+          description: Relevant memories surfaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProactiveContextResponse'
+
+  # Recall Variants
+  /api/recall/tags:
+    post:
+      tags: [Recall]
+      summary: Recall memories by tags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecallByTagsRequest'
+      responses:
+        '200':
+          description: Memories matching tags
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecallResponse'
+
+  /api/recall/date:
+    post:
+      tags: [Recall]
+      summary: Recall memories by date range
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecallByDateRequest'
+      responses:
+        '200':
+          description: Memories in date range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecallResponse'
+
+  # Forget Operations
+  /api/forget/tags:
+    post:
+      tags: [Forget]
+      summary: Delete memories by tags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForgetByTagsRequest'
+      responses:
+        '200':
+          description: Memories deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count:
+                    type: integer
+
+  /api/forget/date:
+    post:
+      tags: [Forget]
+      summary: Delete memories by date range
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForgetByDateRequest'
+      responses:
+        '200':
+          description: Memories deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count:
+                    type: integer
+
+  # Memory Management
+  /api/memory/{memory_id}:
+    get:
+      tags: [Memory]
+      summary: Get a specific memory
+      parameters:
+        - name: memory_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Memory details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecallMemory'
+        '404':
+          description: Memory not found
+
+    delete:
+      tags: [Memory]
+      summary: Delete a specific memory
+      parameters:
+        - name: memory_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Memory deleted
+        '404':
+          description: Memory not found
+
+  /api/list/{user_id}:
+    get:
+      tags: [Memory]
+      summary: List all memories for a user
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: List of memories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  memories:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RecallMemory'
+                  total:
+                    type: integer
+
+  # Stats & Health
+  /api/users/{user_id}/stats:
+    get:
+      tags: [Stats]
+      summary: Get memory statistics for a user
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Memory statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryStats'
+
+  /api/index/verify:
+    post:
+      tags: [Admin]
+      summary: Verify vector index integrity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - user_id
+              properties:
+                user_id:
+                  type: string
+      responses:
+        '200':
+          description: Index health status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  healthy:
+                    type: boolean
+                  total_in_storage:
+                    type: integer
+                  indexed_count:
+                    type: integer
+                  orphaned_count:
+                    type: integer
+
+  /api/index/repair:
+    post:
+      tags: [Admin]
+      summary: Repair vector index (re-index orphaned memories)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - user_id
+              properties:
+                user_id:
+                  type: string
+      responses:
+        '200':
+          description: Repair complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repaired_count:
+                    type: integer
+                  failed_count:
+                    type: integer
+
+tags:
+  - name: Health
+    description: Service health and status
+  - name: Memory
+    description: Core memory operations (remember, recall)
+  - name: Context
+    description: Context management and proactive surfacing
+  - name: Recall
+    description: Specialized recall operations
+  - name: Forget
+    description: Memory deletion operations
+  - name: Stats
+    description: Statistics and metrics
+  - name: Admin
+    description: Administrative operations

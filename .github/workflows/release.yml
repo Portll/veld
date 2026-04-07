@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            veld_bin: veld.exe
+            veld_bin: veld.exe
+            veld_asset: veld-x86_64-windows.exe
+            veld_asset: veld-x86_64-windows.exe
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            veld_bin: veld
+            veld_bin: veld
+            veld_asset: veld-aarch64-macos
+            veld_asset: veld-aarch64-macos
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            veld_bin: veld
+            veld_bin: veld
+            veld_asset: veld-x86_64-macos
+            veld_asset: veld-x86_64-macos
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            veld_bin: veld
+            veld_bin: veld
+            veld_asset: veld-x86_64-linux
+            veld_asset: veld-x86_64-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # windows-latest ships LLVM at C:\Program Files\LLVM
+      - name: Set LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y clang libclang-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build
+        run: |
+          cargo build --release --bin veld --target ${{ matrix.target }}
+          cargo build --release --bin veld --target ${{ matrix.target }}
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.veld_bin }} ${{ matrix.veld_asset }}
+          cp target/${{ matrix.target }}/release/${{ matrix.veld_bin }} ${{ matrix.veld_asset }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            ${{ matrix.veld_asset }}
+            ${{ matrix.veld_asset }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  windows-installer:
+    name: Windows NSIS Installer
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-x86_64-pc-windows-msvc
+          path: build/windows/
+
+      - name: Rename binaries for NSIS
+        shell: bash
+        run: |
+          mv build/windows/veld-x86_64-windows.exe build/windows/veld.exe
+          mv build/windows/veld-x86_64-windows.exe build/windows/veld.exe
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build NSIS installer
+        uses: joncloud/makensis-action@v4
+        with:
+          script-file: scripts/installer.nsi
+          arguments: /DPRODUCT_VERSION=${{ steps.version.outputs.version }}
+
+      - name: Upload installer to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: scripts/veld-${{ steps.version.outputs.version }}-x86_64-windows-setup.exe

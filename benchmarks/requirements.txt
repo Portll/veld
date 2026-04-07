@@ -1,0 +1,10 @@
+# LoCoMo-MC10 Benchmark Dependencies
+datasets>=2.14.0
+tqdm>=4.65.0
+veld>=0.1.5
+
+# LLM Providers (install the one you need)
+openai>=1.0.0         # For OpenAI and OpenAI-compatible APIs (Baseten, Groq, Together)
+# anthropic>=0.18.0   # For Anthropic Claude (optional)
+# ollama>=0.1.0       # For Ollama local models (optional)
+# requests>=2.28.0    # For Baseten native API (optional)

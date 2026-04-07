@@ -1,0 +1,58 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "io.github.Portll/veld",
+  "description": "Cognitive memory for AI agents — semantic search, Hebbian learning, knowledge graphs.",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/Portll/veld/main/assets/logo.png",
+      "mimeType": "image/png",
+      "sizes": ["120x120"]
+    },
+    {
+      "src": "https://raw.githubusercontent.com/Portll/veld/main/assets/logo_32x32.png",
+      "mimeType": "image/png",
+      "sizes": ["32x32"]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/Portll/veld",
+    "source": "github",
+    "subfolder": "mcp-server"
+  },
+  "version": "0.4.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@veld/memory-mcp",
+      "version": "0.4.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "VELD_API_URL",
+          "description": "URL of the veld backend server",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "default": "http://127.0.0.1:3030"
+        },
+        {
+          "name": "VELD_API_KEY",
+          "description": "API key for authentication",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "VELD_USER_ID",
+          "description": "User ID for memory isolation",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "default": "default"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,222 @@
+{
+  "evaluation_type": "overlook",
+  "target": "Plan: Eval Infrastructure Hardening (intugest benchmark insights)",
+  "date": "2026-03-30",
+  "veld_version": "0.7.0",
+  "commit": "2052f54",
+
+  "paradigm": {
+    "domain": "ai/ml",
+    "stack": "Rust (core) + Python (benchmarks) + ONNX (ML)",
+    "maturity": "mature",
+    "risk_profile": "standard",
+    "team_pattern": "solo",
+    "stable": true
+  },
+
+  "weight_matrix": {
+    "D1_quality": 1.6, "D2_maintainability": 1.7, "D3_coverage": 1.5,
+    "D6_evidence": 1.4, "D9_error": 1.3, "D15_fractal": 1.7,
+    "D20_auth": 0.5, "D21_pii": 0.5
+  },
+
+  "dimensions": {
+    "cluster_a_intent": {
+      "D1_intent_clarity": {"raw": 0.90, "ema": 0.90, "trend": "stable"},
+      "D2_eval_depth": {"raw": 0.75, "ema": 0.75, "trend": "stable"},
+      "D3_coverage_breadth": {"raw": 0.65, "ema": 0.65, "trend": "under-target"},
+      "D4_phase_position": {"raw": 0.10, "ema": 0.10, "trend": "early"},
+      "D5_attention_balance": {"raw": 0.70, "ema": 0.70, "trend": "stable"}
+    },
+    "cluster_b_observation": {
+      "D6_evidence_density": {"raw": 0.80, "ema": 0.80, "trend": "strong"},
+      "D7_code_groundedness": {"raw": 0.85, "ema": 0.85, "trend": "strong"},
+      "D8_structural_groundedness": {"raw": 0.75, "ema": 0.75, "trend": "stable"},
+      "D9_error_coverage": {"raw": 0.45, "ema": 0.45, "trend": "spike-low"},
+      "D10_contract_coverage": {"raw": 0.35, "ema": 0.35, "trend": "spike-low"},
+      "D11_attack_surface": {"raw": 0.10, "ema": 0.10, "trend": "low-risk-domain"},
+      "D12_hazop_completion": {"raw": 0.30, "ema": 0.30, "trend": "minimal"},
+      "D13_fmea_completion": {"raw": 0.25, "ema": 0.25, "trend": "minimal"},
+      "D14_mirror_symmetry": {"raw": 0.50, "ema": 0.50, "trend": "half-checked"}
+    },
+    "cluster_c_pattern": {
+      "D15_fractal_consistency": {"raw": 0.80, "ema": 0.80, "trend": "strong"},
+      "D16_paradigm_stability": {"raw": 0.90, "ema": 0.90, "trend": "stable"},
+      "D17_sibling_consistency": {"raw": 0.55, "ema": 0.55, "trend": "spike-low"},
+      "D18_pattern_confidence": {"raw": 0.80, "ema": 0.80, "trend": "strong"},
+      "D19_scale_coverage": {"raw": 0.70, "ema": 0.70, "trend": "stable"}
+    },
+    "cluster_d_risk": {
+      "D20_auth_risk": {"raw": 0.48, "ema": 0.48, "trend": "n/a"},
+      "D21_pii_exposure": {"raw": 0.48, "ema": 0.48, "trend": "n/a"},
+      "D22_integration_fragility": {"raw": 0.55, "ema": 0.55, "trend": "fragile"}
+    },
+    "cluster_e_learning": {
+      "D23_session_novelty": {"raw": 0.85, "ema": 0.85, "trend": "high"},
+      "D24_pattern_confirmation": {"raw": 0.75, "ema": 0.75, "trend": "confirming"},
+      "D25_ratchet_candidates": {"raw": 0.70, "ema": 0.70, "trend": "3-candidates"},
+      "D26_cross_session_drift": {"raw": 0.60, "ema": 0.60, "trend": "moderate"},
+      "D27_seed_utilization": {"raw": 0.80, "ema": 0.80, "trend": "good"}
+    }
+  },
+
+  "spikes": [
+    {
+      "type": "absolute_drop",
+      "dimension": "D17_sibling_consistency",
+      "value": 0.55,
+      "threshold": 0.65,
+      "trigger": "locomo_api_benchmark.py is sibling of locomo_llm_judge.py with identical dataset. Plan adds 6 metrics to judge.py but zero to api_benchmark.py.",
+      "action": "Extract shared eval_metrics.py or deprecate api_benchmark.py"
+    },
+    {
+      "type": "absolute_drop",
+      "dimension": "D9_error_coverage",
+      "value": 0.45,
+      "threshold": 0.60,
+      "trigger": "LOCOMO memories stored via /api/remember bypass hook-based temporal fact extraction. /api/facts/temporal will return empty for benchmark memories.",
+      "action": "Add explicit fact extraction call or check valid_until on Memory objects in recall response"
+    },
+    {
+      "type": "absolute_drop",
+      "dimension": "D10_contract_coverage",
+      "value": 0.35,
+      "threshold": 0.50,
+      "trigger": "E6 cross-references 'GET /api/memory/{id}/feedback' — endpoint does not exist. Only POST /api/reinforce (write-only) exists.",
+      "action": "Drop cross-reference from E6 or add feedback query endpoint to Rust handlers"
+    },
+    {
+      "type": "cross_cluster",
+      "dimensions": ["D9", "D10", "D22"],
+      "cluster": "B+D (Observation + Risk)",
+      "trigger": "Triple-weak: error coverage + contract coverage + integration fragility. Plan designs from conceptual level without verifying API plumbing.",
+      "action": "Add Phase 0.5: API availability verification before implementation"
+    }
+  ],
+
+  "interrupts": [
+    {
+      "severity": "CRITICAL",
+      "anomaly": "E4 (Freshness-Stratified Recall) structurally void on LOCOMO dataset",
+      "trigger": "All 20 memories created in 28-day window. Every memory falls in Band B (7-30d). Stratification produces: Band A=0, Band B=20, Band C=0, Band D=0.",
+      "impact": "E4 would report single-band MRR with zero diagnostic value",
+      "fix": "Use LongMemEval data (multi-session, wider temporal spread) OR create dedicated freshness-test dataset"
+    },
+    {
+      "severity": "HIGH",
+      "anomaly": "E1 temporal facts won't exist for benchmark memories",
+      "trigger": "Temporal fact extraction is hook-triggered (PostToolUse), not API-triggered. Direct /api/remember calls bypass hooks.",
+      "impact": "Contradiction@K produces all-zero results — false assurance of no contamination",
+      "fix": "Add POST /api/facts/extract call after store_memory(), or check valid_until on Memory objects in recall response"
+    },
+    {
+      "severity": "HIGH",
+      "anomaly": "E6 cross-reference endpoint doesn't exist",
+      "trigger": "POST /api/reinforce is write-only. No GET endpoint to query per-memory feedback history.",
+      "impact": "E6 cross-reference design is impossible without Rust handler changes",
+      "fix": "Drop cross-reference or add GET /api/memory/{id}/feedback handler"
+    },
+    {
+      "severity": "MEDIUM",
+      "anomaly": "E5 partially redundant with existing judge rubric",
+      "trigger": "Existing judge uses 0-3 rubric where 3=fully answerable — already an answerability metric",
+      "impact": "New answerable@K metric duplicates existing signal unless separated into 2 passes",
+      "fix": "Split judge into evidence sufficiency pass (can you answer?) + correctness pass (is the answer right?)"
+    },
+    {
+      "severity": "LOW",
+      "anomaly": "Version bump inappropriate for eval-only changes",
+      "trigger": "Python benchmark scripts not in Cargo.toml build. Bumping Rust version for Python changes is misleading.",
+      "fix": "Skip Cargo.toml version bump for eval-only work"
+    }
+  ],
+
+  "a_star_priority": [
+    {"node": "Phase 2 API availability verification", "g": 0.8, "h": 0.9, "f": 1.7, "why": "Two broken APIs = silent false negatives in E1 and E6"},
+    {"node": "Sibling benchmark divergence", "g": 0.5, "h": 0.8, "f": 1.3, "why": "locomo_api_benchmark.py orphaned from metric additions"},
+    {"node": "Temporal fact extraction in benchmarks", "g": 0.7, "h": 0.6, "f": 1.3, "why": "Hook-based pipeline bypassed by direct API calls"},
+    {"node": "E4 freshness band distribution", "g": 0.3, "h": 0.7, "f": 1.0, "why": "All memories in Band B — structurally uninformative"},
+    {"node": "E3 noisy entity extraction boundary", "g": 0.4, "h": 0.5, "f": 0.9, "why": "analyze_query() on misspelled names — untested"}
+  ],
+
+  "improvement_surfaces": [
+    {
+      "id": "IS-1",
+      "issue": "E4 structurally void on LOCOMO dataset (all Band B)",
+      "severity": "CRITICAL",
+      "action": "Redesign: use LongMemEval OR create freshness-specific dataset with controlled age distribution",
+      "dimensions_affected": ["D3", "D9", "D14"]
+    },
+    {
+      "id": "IS-2",
+      "issue": "E1 temporal facts won't exist for benchmark memories",
+      "severity": "HIGH",
+      "action": "Add explicit fact extraction call OR check valid_until on Memory objects in recall response",
+      "dimensions_affected": ["D9", "D10", "D22"]
+    },
+    {
+      "id": "IS-3",
+      "issue": "E6 cross-reference endpoint doesn't exist",
+      "severity": "HIGH",
+      "action": "Drop cross-reference OR add GET feedback endpoint to Rust handlers",
+      "dimensions_affected": ["D10", "D22"]
+    },
+    {
+      "id": "IS-4",
+      "issue": "E5 partially redundant with existing judge rubric",
+      "severity": "MEDIUM",
+      "action": "Split judge into 2 passes: evidence sufficiency + answer correctness",
+      "dimensions_affected": ["D6", "D15"]
+    },
+    {
+      "id": "IS-5",
+      "issue": "Sibling benchmark divergence",
+      "severity": "MEDIUM",
+      "action": "Extract shared eval_metrics.py, import in both benchmark files",
+      "dimensions_affected": ["D17"]
+    },
+    {
+      "id": "IS-6",
+      "issue": "Version bump inappropriate for eval-only changes",
+      "severity": "LOW",
+      "action": "Skip Cargo.toml bump for eval-only work",
+      "dimensions_affected": ["D16"]
+    }
+  ],
+
+  "learning_candidates": [
+    {
+      "observation": "Benchmark scripts bypass hook-based pipelines — temporal fact extraction, feedback tracking, and proactive context don't fire",
+      "delta": 0.35,
+      "specificity": "high",
+      "applicable_to": "any future benchmark that stores memories via direct API calls"
+    },
+    {
+      "observation": "LOCOMO's 28-day memory window makes freshness stratification uninformative — need controlled age distribution for temporal metrics",
+      "delta": 0.30,
+      "specificity": "high",
+      "applicable_to": "any eval metric that depends on temporal spread"
+    },
+    {
+      "observation": "Plan designed from conceptual level (what SHOULD be measured) without verifying plumbing level (what CAN be measured) — need API availability check phase",
+      "delta": 0.40,
+      "specificity": "high",
+      "applicable_to": "all future intugest-to-plan conversions"
+    }
+  ],
+
+  "verdict": {
+    "plan_quality": "Good concept, flawed plumbing",
+    "score": "72/120",
+    "blockers": 1,
+    "high_risk": 2,
+    "required_revisions": [
+      "Add Phase 0.5: API plumbing verification (store test memory, check temporal facts, check feedback query)",
+      "Redesign E4: use LongMemEval or synthetic dataset with controlled age spread across all 4 bands",
+      "Fix E1: add explicit fact extraction call after store_memory(), or use valid_until from Memory objects",
+      "Fix E6: drop Hebbian cross-reference (no query endpoint) — LLM-judge-only misleading detection",
+      "Fix E5: split into 2-pass judge (evidence sufficiency + answer correctness) to differentiate from existing rubric",
+      "Drop Cargo.toml version bump"
+    ]
+  }
+}

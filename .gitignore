@@ -1,0 +1,112 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Memory data
+veld_data/
+*.db
+*.rocksdb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (keep example, ignore actual)
+veld_config.json
+.env
+!.env.example
+
+# Claude settings
+.claude/
+
+# Internal documentation (keep local only)
+COGNITIVE_ARCHITECTURE.md
+*_ARCHITECTURE.md
+literature/
+literature/
+
+# Paper (not for public release)
+paper/
+
+# Local-only legacy collateral
+/veld-internal/
+
+# ONNX Runtime binaries (downloaded per-platform during CI wheel builds)
+python/veld/lib/*.dll
+python/veld/lib/*.so
+python/veld/lib/*.dylib
+!python/veld/lib/__init__.py
+
+# Model files (downloaded during CI wheel builds)
+python/veld/models/minilm-l6/*.onnx
+python/veld/models/minilm-l6/*.json
+python/veld/models/bert-tiny-ner/*.onnx
+python/veld/models/bert-tiny-ner/*.json
+experiments/
+
+# Node.js
+node_modules/
+bun.lock
+package-lock.json
+yarn.lock
+
+# Coverage
+coverage/
+.coverage
+*.lcov
+htmlcov/
+
+# Temp/test directories
+.venv/
+test_*/
+release-test/
+temp_*/
+
+# Credentials (never commit)
+.mcpregistry_*
+*.token
+
+# Windows artifacts
+nul
+.vercel
+
+# Build number (auto-incremented per machine, see build.rs)
+.build_number
+
+# Local/temp files
+graph_temp.json
+pitch-deck-stata.md
+veld-market.csv
+benchmarks/locomo_test2.json
+seps/mcp-sep-mif.md
+plans/

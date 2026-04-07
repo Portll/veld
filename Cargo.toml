@@ -1,0 +1,376 @@
+[package]
+name = "veld"
+version = "0.7.7"
+edition = "2021"
+authors = ["Portll <john@portll.net>"]
+description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
+license = "BUSL-1.1"
+repository = "https://github.com/portll/veld"
+homepage = "https://github.com/portll/veld"
+readme = "README-rust.md"
+keywords = ["memory", "ai", "robotics", "zenoh", "cognitive"]
+categories = ["science", "database", "embedded"]
+exclude = [
+    "mcp-server/",
+    "python/",
+    "docker/",
+    "test_memory_db/",
+    "veld_data/",
+    "*.exe",
+    "*.tar.gz",
+    "*.dll",
+    "*.zip",
+    "*.whl",
+    "*.pdf",
+    "*.odt",
+    "*.html",
+    "!src/handlers/graph_view.html",
+    "*.py",
+    "*.log",
+    "*.json",
+    "!Cargo.lock",
+    "job_log.txt",
+    "macos_log.txt",
+    "full_log.txt",
+    "hook_*.txt",
+    ".mcp.json",
+    "nul",
+    "install_bun.ps1",
+    ".venv/",
+    ".claude/",
+    "assets/",
+    "benchmarks/",
+    "benchmark_report.json",
+    "bugs-remedies/",
+    "docker-compose.yml",
+    "Dockerfile",
+    "examples/",
+    "hooks/",
+    "marketing/",
+    "notebooks/",
+    "release-test/",
+    "seps/",
+    "skills/",
+    "test_*/",
+    "*.md",
+    "!README-rust.md",
+    "openapi.yaml",
+    "veld_logo_nobackground.png",
+    "veld_config.example.json",
+    "STPI_PITCH_DECK.md",
+    ".github/",
+    "pyproject.toml",
+    "C*facts_out.json",
+    "tui/",
+    "veld-telegram/",
+    "veld-todoist/",
+    "veld-whatsapp/",
+    "signature.JPG",
+    "start_server.bat",
+    "*.ts",
+    "*.patch",
+    "*.diff",
+    "*.png",
+    "!src/**",
+    "scripts/",
+    "clippy_output.txt",
+    "C*clippy_out.txt",
+    ".smithery/",
+    "drafts/",
+]
+
+[lib]
+name = "veld"
+path = "src/lib.rs"
+# rlib: for Rust library usage (tests, benchmarks, binary)
+# cdylib: for Python bindings (PyO3/maturin needs shared library)
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "veld"
+path = "src/cli.rs"
+
+[dependencies]
+# MCP Protocol
+rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+# Global allocator — replaces Windows default heap (eliminates segment doubling / commit bloat)
+mimalloc = "0.1"
+
+# Core
+anyhow = "1.0"
+thiserror = "2.0"
+dotenvy = "0.15"  # Load .env files
+
+# Async runtime & web server
+tokio = { version = "1.48", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }  # SSE event streaming (sync for BroadcastStream)
+futures = "0.3"  # Stream utilities for SSE
+axum = { version = "0.8", features = ["json", "ws"] }
+tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
+tower_governor = { version = "0.8", features = ["axum"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+form_urlencoded = "1"
+
+# Storage
+bincode = { version = "2", features = ["serde"] }
+bincode1 = { package = "bincode", version = "1.3" }  # Legacy format support for pre-2.0 memories
+rmp-serde = "1.3"  # MessagePack - binary format that supports serde tagged enums
+lz4 = "1.28"
+redb = { version = "2", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite slow store for gap topology queries (WAL mode)
+
+# Concurrency
+parking_lot = "0.12"
+dashmap = "6.1"
+moka = { version = "0.12", features = ["sync"] }  # Lock-free concurrent cache with LRU eviction
+
+# Utilities
+uuid = { version = "1.19", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+lru = "0.16.3"
+regex = "1.12"
+rust-stemmers = "1.2"  # Porter2 stemming for linguistic analysis
+dirs = "6.0"  # Platform-specific directory paths
+dateparser = "0.2"  # Safe natural language date parsing (returns Result, no panic)
+glob = "0.3"  # Pattern matching for file paths
+yake-rust = "1.0"  # Statistical keyword extraction (position, frequency, capitalization)
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Observability (P1.1)
+prometheus = "0.14"
+
+# Distributed Tracing (P1.6) - OPTIONAL (heavy, ~200 packages, not needed for edge)
+# NOTE: tracing-opentelemetry 0.28 requires opentelemetry 0.27
+tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry = { version = "0.27", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"], optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"], optional = true }
+
+# FFT for spectral analysis of access patterns (learned decay scales)
+rustfft = "6"
+
+# Vector operations (lightweight)
+ordered-float = "5.0"
+
+# Vector database (Vamana HNSW)
+memmap2 = "0.9"
+rand = "0.8"
+
+# ONNX Runtime for embeddings (MiniLM-L6-v2)
+# Using load-dynamic for runtime DLL loading (bundled in wheels)
+# CRT conflicts solved via .cargo/config.toml: -crt-static
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["load-dynamic", "half"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ndarray = "0.16"
+
+# Graph visualization
+petgraph = "0.8"
+
+# Full-text search (BM25)
+tantivy = "0.25"
+
+# Bloom filter
+bloomfilter = "3.0"
+
+# Base64 encoding
+base64 = "0.22"
+
+# Backup & Restore (P2) + Model checksum verification (P1)
+sha2 = "0.10"
+hex = "0.4"
+
+# MIF encryption (AES-256-GCM)
+aes-gcm = "0.10"
+
+# External integrations (SHO-40)
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+
+# Auto-download for models and ONNX runtime
+ureq = { version = "3.0", features = ["json"] }
+zip = { version = "7.0", default-features = false, features = ["deflate"] }
+flate2 = "1.1"
+tar = "0.4"
+
+# Python bindings (optional)
+# NOTE: pyo3 >= 0.24.1 required for RUSTSEC-2025-0020 (buffer overflow fix)
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
+numpy = { version = "0.24", optional = true }
+
+# PDF text extraction (optional — pulls in lopdf + unicode-normalization)
+pdf-extract = { version = "0.10", optional = true }
+
+# Zenoh transport for robotics (optional — pure Rust, zero C deps)
+# Enables pub/sub + request/reply integration with ROS2 via rmw_zenoh or zenoh-bridge-ros2dds
+zenoh = { version = "1.1", default-features = false, features = ["transport_tcp", "transport_udp"], optional = true }
+
+# LLM-based query parsing (optional - heavy dependency)
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+http-body-util = "0.1"
+tempfile = "3.24"
+
+[[bench]]
+name = "memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "graph_benchmarks"
+harness = false
+
+[[bench]]
+name = "adaptive_memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "cognitive_benchmarks"
+harness = false
+
+[[bench]]
+name = "ner_benchmarks"
+harness = false
+
+[[bench]]
+name = "pipeline_benchmarks"
+harness = false
+
+[[bench]]
+name = "associative_retrieval_benchmarks"
+harness = false
+
+[[bench]]
+name = "streaming_benchmarks"
+harness = false
+
+[[bench]]
+name = "relevance_benchmarks"
+harness = false
+
+[[bench]]
+name = "integration_benchmarks"
+harness = false
+
+[[bench]]
+name = "hebbian_benchmarks"
+harness = false
+
+[[bench]]
+name = "softmax_benchmarks"
+harness = false
+
+# =============================================================================
+# CARGO-BINSTALL — pre-built binary installation
+# =============================================================================
+# Users install with: cargo binstall veld
+# Falls back to cargo install if no pre-built binary matches.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/veld-x86_64-windows.exe"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/veld-aarch64-macos"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/veld-x86_64-macos"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/veld-x86_64-linux"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true  # Reduce binary size
+panic = "abort"
+
+[profile.bench]
+# Note: bench profile inherits from release by default
+# panic cannot be overridden when inheriting (Cargo limitation)
+# Criterion benchmarks work with panic = "abort" in release mode
+opt-level = 3
+lto = "thin"  # Faster build than full LTO for benchmarks
+
+# =============================================================================
+# FORTRESS PROFILE — Fractal obfuscation for distribution binaries
+# =============================================================================
+# Build: cargo build --profile fortress --features fortress
+# Result: stripped, monomorphized, no debug, no unwind, no readable strings
+[profile.fortress]
+inherits = "release"
+opt-level = 3           # Maximum optimization (destroys source structure)
+lto = "fat"             # Full cross-crate LTO (monomorphizes everything)
+codegen-units = 1       # Single codegen unit (LLVM sees entire program)
+strip = "symbols"       # Strip symbol table + debug info
+panic = "abort"         # Remove unwind tables (huge source of reverse info)
+overflow-checks = false # Remove overflow check branches (dead code elimination)
+debug = 0               # Zero debug info
+debug-assertions = false
+incremental = false     # Full rebuild every time (no incremental artifacts)
+
+[features]
+# Default: runtime targets the redb migration path, while legacy RocksDB remains
+# the active compatibility engine until the storage abstraction is landed.
+default = ["storage-redb"]
+
+# Backend selection scaffolding for the storage migration.
+storage-redb = ["dep:redb"]
+legacy-rocksdb = []
+
+# Python bindings for PyO3
+python = ["pyo3", "numpy"]
+
+# Optional: LLM-based query parser (future: requires API key)
+llm-parser = []
+
+# Optional: hosaka multi-tenant collective learning and auth binding.
+multi-tenant = []
+
+# Optional: Zenoh transport for robotics/ROS2 (pure Rust, cross-platform)
+zenoh = ["dep:zenoh"]
+
+# Optional: PDF text extraction for ingest and seed_project
+pdf = ["dep:pdf-extract"]
+
+# Fortress: fractal binary obfuscation for distribution
+# Eliminates ALL tracing, replaces error messages with codes,
+# custom panic handler, anti-debug, integrity checks.
+fortress = []
+
+# Optional: Distributed tracing for cloud/multi-node deployments (~200 extra packages)
+telemetry = [
+    "tracing-opentelemetry",
+    "opentelemetry",
+    "opentelemetry-otlp",
+    "opentelemetry_sdk"
+]
+
+
+# jemalloc replaces the system C allocator inside RocksDB's C++ code (not just Rust).
+# Without it, glibc/CRT malloc fragments heavily and never returns memory to the OS.
+# Confirmed fix by rust-rocksdb maintainer (zaidoon1) in facebook/rocksdb#12364.
+# PRs #989 (ran-openai) and #1026 (timothyg-stripe) fixed jemalloc linking in v0.24.0.
+# NOTE: rocksdb is currently unconditionally compiled on non-Windows.
+# TODO(v1.0): Gate behind legacy-rocksdb feature flag (138 source refs to cfg-gate)
+[target.'cfg(not(windows))'.dependencies]
+rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jemalloc"] }
+
+# jemalloc doesn't compile with MSVC — Windows uses default CRT allocator.
+# Fundamental fix requires facebook/rocksdb#14403 (custom allocator C API for mimalloc).
+[target.'cfg(windows)'.dependencies]
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+
+[workspace]
+# Standalone workspace - not part of parent kalki-v2

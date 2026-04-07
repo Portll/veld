@@ -1,0 +1,365 @@
+{
+  "evaluation_type": "bifocal_plus",
+  "target": "COMPLETENESS scoring signal — answer-bearing vs topic-related memory discrimination",
+  "date": "2026-03-28",
+  "augmentations": ["edge_walk", "fractal", "adversarial_challenge", "atam"],
+
+  "executive_summary": "REJECT the completeness signal as proposed. The cross-encoder at 12% blend ALREADY captures answer-bearing relevance via joint attention. The proposed syntactic parsing (SVO predicate detection) is architecturally expensive, fragile, and largely redundant with ms-marco-MiniLM-L-6-v2 which was TRAINED on question-answer relevance. The better path is increasing cross-encoder blend weight from 12% to 20-25%, which achieves the same effect with zero new code, zero new failure modes, and ~0ms additional latency.",
+
+  "risk_triage": {
+    "tier_1_full": [
+      "SVO Predicate Parser — novel NLP component, no existing infrastructure, high coupling to Entity extraction pipeline",
+      "Cross-encoder Blend Weight — core scoring formula, affects all 20 benchmark queries"
+    ],
+    "tier_2_standard": [
+      "OntologicalIntent integration — existing infrastructure, additive boost, well-gated",
+      "Answer-type matching logic — extends existing question_word_to_labels, bounded scope"
+    ],
+    "tier_3_light": [
+      "Signal attribution plumbing — mechanical, follows existing pattern"
+    ]
+  },
+
+  "phase_1_edge_walk_and_fractal": {
+    "boundary_1_query_to_intent": {
+      "edge_analysis": {
+        "data_crossing": "Query string -> OntologicalIntent (expected_labels, relation_types, confidence)",
+        "existing_coverage": "question_word_to_labels() already maps 'what database' -> [Database, Technology]. infer_ontological_intent() adds verb stems -> relation types. Both are present and functional.",
+        "gap": "OntologicalIntent knows WHAT TYPE to expect but not WHETHER a specific memory CONTAINS an answer of that type. This is the completeness gap.",
+        "hazop_MORE": "More type specificity would help: 'What database' correctly maps to Database. But 'What is the plan?' maps to nothing specific — completeness signal would be equally blind.",
+        "hazop_PART_OF": "Intent captures the question type but not the answer structure. Completeness adds the answer-structure half."
+      },
+      "fractal_analysis": {
+        "pattern": "All query classification stages (classify_query, infer_ontological_intent, detect_temporal_intent) follow the same transform: string -> structured intent. Completeness would ADD a new intent dimension rather than a new classification stage.",
+        "scale_consistency": "Consistent at macro (query -> intent), meso (word -> type mapping), micro (stem -> relation). Completeness would need to operate at the memory level, not query level — pattern BREAKS.",
+        "break_type": "Architectural asymmetry. All existing intent signals are query-side only. Completeness requires BOTH query-side intent AND memory-side structure analysis."
+      }
+    },
+
+    "boundary_2_intent_to_reranking_layer_4_9": {
+      "edge_analysis": {
+        "data_crossing": "OntologicalIntent.expected_labels + graph entity labels -> additive boost (0.15 per match, cap 0.40)",
+        "current_behavior": "Layer 4.9 checks: does this memory's episode have entity_refs with labels matching expected_labels? If yes, boost.",
+        "what_it_captures": "TYPE PRESENCE — the memory mentions an entity of the right type. For 'What database?' it checks: does this memory reference a Database-typed entity?",
+        "what_it_misses": "ANSWER POSITION — Memory A ('We switched to MongoDB') and Memory B ('The database migration was slow') BOTH reference Database-typed entities. Layer 4.9 boosts them equally. But A ANSWERS the question and B merely RELATES.",
+        "hazop_NO": "If no Database entity exists in the graph (NER extraction gap), Layer 4.9 is inert. This already happens — Entity extraction is not 100%.",
+        "hazop_REVERSE": "If the memory says 'We stopped using MongoDB' — still contains Database entity, still gets boosted. No polarity awareness."
+      },
+      "fractal_analysis": {
+        "siblings_at_same_scale": "Layer 4.5 (attribute boost), Layer 4.52 (experience-type boost), Layer 4.525 (entity overlap), Layer 4.53 (specificity penalty) — all are additive post-RRF adjustments. Pattern holds.",
+        "proposed_completeness_would_fit": "Yes, as a Layer 4.91 (post-ontological, pre-interference). Additive boost, gated by ontological confidence. Pattern-consistent.",
+        "but": "The information needed (is entity in predicate position?) is NOT available in the graph. EpisodeNode.entity_refs is a flat Vec<Uuid> — no SVO structure, no syntactic role. The data simply does not exist."
+      }
+    },
+
+    "boundary_3_cross_encoder_layer_5_3": {
+      "edge_analysis": {
+        "data_crossing": "Query text + memory content -> sigmoid(logit) blended at 88/12 with unified score",
+        "what_it_captures": "ms-marco-MiniLM-L-6-v2 was TRAINED on MS-MARCO question-passage pairs. Its entire purpose is distinguishing passages that ANSWER a question from those that merely mention the topic. This IS completeness scoring via learned attention patterns.",
+        "blend_weight": "12% — deliberately conservative. Enough to shift 1-3 positions. Comment says 'without overriding the multi-signal pipeline'.",
+        "hazop_LESS": "At 12%, the cross-encoder cannot overcome a 0.15+ score gap from other signals. If Layer 4.9 ontological boost + entity overlap + BM25 have already pushed a topic-related memory above an answer-bearing memory, 12% cross-encoder cannot flip them.",
+        "hazop_MORE": "At 25%, cross-encoder would dominate the top-3 ordering while still letting the multi-signal pipeline handle the broader candidate set. The cross-encoder already runs on the top rerank_budget candidates, so latency is unchanged."
+      },
+      "fractal_analysis": {
+        "pattern": "Layer 5.3 is the only signal that uses joint query-document encoding. All other signals are either query-only (intent, temporal), memory-only (recency, importance, elaboration), or keyword-overlap (BM25, entity overlap). Cross-encoder is architecturally unique.",
+        "scale_check": "At macro: cross-encoder represents the 'understanding' layer. At meso: it's a single blend coefficient. At micro: it's ONNX inference. Scale-consistent.",
+        "completeness_relationship": "Completeness IS what the cross-encoder does. Building a separate completeness signal is building a hand-crafted approximation of what the cross-encoder learns from data."
+      }
+    },
+
+    "boundary_4_proposed_svo_parser": {
+      "edge_analysis": {
+        "data_crossing": "Memory text -> (subject, verb, object) triples -> predicate position detection -> boolean 'entity is in answer position'",
+        "failure_modes": [
+          "SVO parsing in Rust without a dependency parser (spaCy, stanza) requires hand-crafted heuristics. No existing infrastructure in veld.",
+          "English SVO order is not universal even in English: passive voice ('MongoDB was chosen'), relative clauses ('the database, which is MongoDB'), copular constructions ('Our database is MongoDB').",
+          "Requires tokenization + POS tagging (exists in query_parser but not at document level) + dependency resolution (does not exist at all).",
+          "False positives: 'MongoDB caused problems' has MongoDB in subject position for 'What database?' but the answer is incidental.",
+          "False negatives: 'For the database layer we went with MongoDB' — MongoDB is in a prepositional phrase, not object position."
+        ],
+        "hazop_OTHER_THAN": "The parser would need to handle far more constructions than SVO: copular, existential, passive, relative clause, appositive. Each is a new rule.",
+        "hazop_LATE": "Parser errors compound. A POS tagging error propagates to SVO detection, which propagates to completeness scoring. Error rate multiplies."
+      },
+      "fractal_analysis": {
+        "pattern_match": "veld's NLP is POS-tagging + stemming + NER, all shallow. A dependency parser is a QUALITATIVE jump in complexity. Fractal pattern breaks at this boundary.",
+        "siblings": "No other component in the codebase requires syntactic structure. This would be the only one.",
+        "mirror_test": "If we added SVO parsing for completeness, would other layers benefit? Layer 4.92 (interference detection) uses text_similarity + semantic_opposition — no SVO needed. Layer 4.6 (interference scoring) uses content overlap — no SVO needed. The parser would be a single-use investment."
+      },
+
+      "fmea": [
+        {
+          "failure_mode": "SVO parser misidentifies predicate position in passive/copular sentences",
+          "severity": 7,
+          "probability": 9,
+          "detectability": 4,
+          "rpn": 252,
+          "note": "English passive voice ('MongoDB was chosen as our database') is extremely common in conversational memory. Hand-crafted parser would need dozens of pattern rules."
+        },
+        {
+          "failure_mode": "Completeness signal conflicts with cross-encoder, causing score oscillation",
+          "severity": 6,
+          "probability": 6,
+          "detectability": 5,
+          "rpn": 180,
+          "note": "Cross-encoder already scores answer-bearing passages higher. Adding completeness on top creates double-counting for good candidates and conflicting signals for edge cases."
+        },
+        {
+          "failure_mode": "POS tagging at document level is slow (query_parser POS tags ~10-50 word queries, not ~200 word memories)",
+          "severity": 5,
+          "probability": 7,
+          "detectability": 3,
+          "rpn": 105,
+          "note": "POS tagging runs on rerank_budget (20-30) memories * ~200 words each = 4000-6000 words per query. Current POS tagger is not optimized for this."
+        },
+        {
+          "failure_mode": "NER gap masks completeness signal (memory has answer but entity not extracted)",
+          "severity": 8,
+          "probability": 5,
+          "detectability": 6,
+          "rpn": 240,
+          "note": "If MiniLM NER doesn't extract 'MongoDB' as a Database entity, completeness check finds no answer-type entity regardless of SVO parsing. Single point of failure."
+        }
+      ]
+    }
+  },
+
+  "phase_2_fractal_and_atam": {
+    "core_pattern": "veld's retrieval pipeline is an additive multi-signal ensemble. Each layer contributes an independent signal that shifts rankings. The architecture's strength is that no single signal dominates — robustness through diversity.",
+    "macro_consistency": "11 retrieval layers + 5 post-retrieval layers. Each is additive, gated, bounded. Consistent.",
+    "meso_consistency": "Within RRF fusion (Layer 4), three channels (vector, BM25, graph) are weighted by density. Within unified scoring (Layer 5), 21+ signals are summed. Consistent.",
+    "micro_consistency": "Individual signals follow: compute_value -> gate_condition -> clamp -> add_to_score. Consistent.",
+
+    "proposed_completeness_breaks": {
+      "architectural": "Completeness requires BOTH query-side analysis (what answer type is expected) AND memory-side analysis (does the memory contain an entity in predicate position). No existing signal operates on both sides simultaneously except the cross-encoder.",
+      "dependency": "SVO parsing depends on POS tagging depends on tokenization depends on NER for entity-type matching. This is a 4-layer dependency chain. Existing signals have 0-1 layer dependencies.",
+      "uniqueness": "Would be the only signal that requires syntactic structure. All other signals are bag-of-words, graph-structural, or embedding-based."
+    },
+
+    "tradeoff_analysis": {
+      "completeness_signal_vs_cross_encoder_weight": {
+        "completeness_signal": {
+          "precision": "Potentially higher for well-structured SVO sentences",
+          "recall": "Poor — fails on passive voice, copular, relative clauses, compound sentences",
+          "cost": "New parser (~500-800 lines), new dependency chain, new failure modes, new test surface",
+          "latency": "POS tagging + SVO detection on 20-30 memories per query: estimated 5-15ms added",
+          "maintainability": "High ongoing cost — every new sentence pattern is a new rule",
+          "orthogonality": "LOW — cross-encoder already captures this signal via learned attention"
+        },
+        "increased_cross_encoder_weight": {
+          "precision": "High — model was trained specifically on question-answer relevance pairs",
+          "recall": "High — handles all sentence structures via learned attention, no hand-crafted rules",
+          "cost": "Change one constant: 0.12 -> 0.20 (1 line of code)",
+          "latency": "0ms added — cross-encoder already runs",
+          "maintainability": "Zero — model handles generalization",
+          "orthogonality": "N/A — this IS the signal, just amplified"
+        }
+      }
+    }
+  },
+
+  "phase_2_5_adversarial_challenge": {
+    "challenge_1": {
+      "claim": "Cross-encoder at 12% already captures completeness",
+      "adversary_scenario": "Query: 'What database are we using?' Memory 16 ranked #1 over Memory 3 (expected). The cross-encoder scores both but cannot flip the ranking because the score gap from other signals is >0.12.",
+      "evidence": "Benchmark data confirms: Q3 ('What database are we using?') has MRR 0.500. Memory 16 ranked first, Memory 3 ranked second. If cross-encoder captured completeness well, Memory 3 should rank first because it contains the answer.",
+      "resolution": "This confirms 12% is INSUFFICIENT weight, not that completeness is needed as a separate signal. At 12%, cross-encoder adds max ~0.12 score. If Memory 16 leads Memory 3 by >0.12 from BM25 + entity overlap + ontological boost, cross-encoder cannot flip it. Increasing to 20-25% would give it enough authority.",
+      "score_adjustment": "Adversary has grounded evidence. Cross-encoder claim reduced from 'already sufficient' to 'captures the signal but is under-weighted'."
+    },
+    "challenge_2": {
+      "claim": "SVO parsing is fragile and single-use",
+      "adversary_scenario": "What if we used a simpler heuristic instead of full SVO parsing? E.g., check if the memory contains a construction like 'X is Y' or 'switched to Y' or 'chose Y' where Y matches the expected entity type.",
+      "evidence": "This is essentially what Layer 0.5 (Attribute Query Detection) already does for 'What is X's Y?' patterns. It detects entity+attribute pairs via BM25 expansion + content matching. Extending this to general WH-queries would be duplicating Layer 0.5 logic with different trigger conditions.",
+      "resolution": "Simpler heuristic is already partially implemented as Layer 0.5. Generalizing it would be Layer 0.5 v2, not a new completeness signal. But even this generalization faces the same problems: pattern matching over natural language is brittle."
+    },
+    "challenge_3": {
+      "claim": "Increasing cross-encoder weight is sufficient",
+      "adversary_scenario": "What if increasing cross-encoder weight to 25% causes regressions on queries where the cross-encoder is wrong? The cross-encoder is a black-box neural model — it can produce false positives (high relevance for irrelevant memories).",
+      "evidence": "Current benchmark: MRR 0.867, R@10 0.919. Cross-encoder model is ms-marco-MiniLM-L-6-v2, trained on 500K+ relevance pairs. For conversational memory retrieval (not web search), domain mismatch is a real concern. However, the cross-encoder is already blended 70/30 with bi-encoder inside the reranker, providing a safety net.",
+      "resolution": "Valid concern. Recommendation: tune from 12% to 18% first (conservative), measure on full benchmark, then consider 22-25%. Stepwise tuning avoids regressions. Additionally, the existing 70/30 internal blend within CrossEncoderReranker provides protection against pure cross-encoder errors.",
+      "score_adjustment": "Raise caution on cross-encoder weight increase. Not a free lunch — needs empirical validation."
+    },
+    "challenge_4": {
+      "claim": "Completeness is not orthogonal to cross-encoder",
+      "adversary_scenario": "What if the cross-encoder is good at ORDERING answer-bearing vs topic-related memories within its candidates, but the 12% blend means its ordering gets overridden? In that case, completeness as a separate signal (even noisy) could provide corroboration that the cross-encoder score is correct, amplifying the signal.",
+      "evidence": "This is a signal correlation argument. If completeness and cross-encoder agree, the combined signal is stronger. But if they disagree (completeness parser errors vs cross-encoder correctness), the noise CANCELS signal. Given the FMEA analysis showing RPN 252 for SVO parser errors, the disagreement rate would be high enough to net negative.",
+      "resolution": "Correlation benefit is real but is better captured by simply increasing cross-encoder weight. The corroboration argument only holds if the completeness signal has >50% precision, which hand-crafted SVO parsing over varied natural language is unlikely to achieve."
+    }
+  },
+
+  "phase_3_scoring": {
+    "signal_under_evaluation": "COMPLETENESS as proposed (SVO predicate detection + entity-type matching)",
+    "scores": {
+      "correctness": {
+        "score": 4.0,
+        "evidence_code": "SVO parsing over natural language has well-documented fragility. Passive voice, copular constructions, relative clauses each require separate rules. No existing dependency parser in the codebase.",
+        "evidence_structural": "Architecturally introduces a qualitative jump in NLP complexity (shallow POS -> dependency parsing) that nothing else in the system requires."
+      },
+      "completeness": {
+        "score": 3.5,
+        "evidence_code": "Proposal handles only SVO active voice sentences. Passive ('MongoDB was chosen'), copular ('Our DB is MongoDB'), prepositional ('went with MongoDB') all unaddressed.",
+        "evidence_structural": "The signal depends on NER correctly extracting entity types AND POS tagger correctly identifying SVO structure. Compound failure probability."
+      },
+      "performance": {
+        "score": 5.5,
+        "evidence_code": "POS tagging on 20-30 memories x ~200 words each adds ~5-15ms per query. Current avg latency is 53ms, so this is 10-28% increase.",
+        "evidence_structural": "Added to the critical path between Layer 4.9 and Layer 5.3. Cannot be parallelized because it depends on graph entity lookups."
+      },
+      "robustness": {
+        "score": 3.5,
+        "evidence_code": "FMEA shows RPN 252 for SVO misidentification, RPN 240 for NER gap masking. Two failure modes above 200 threshold.",
+        "evidence_structural": "4-layer dependency chain (tokenization -> POS -> SVO -> type matching) means each layer's error rate multiplies."
+      },
+      "security": {
+        "score": 9.0,
+        "evidence_code": "No external calls, no user input injection vectors, pure compute on in-memory data.",
+        "evidence_structural": "Same isolation model as all other retrieval layers."
+      },
+      "data_integrity": {
+        "score": 8.0,
+        "evidence_code": "Additive boost only, cannot corrupt existing scores. Gated by ontological confidence, so silent when confidence is low.",
+        "evidence_structural": "Follows existing pattern: compute -> gate -> clamp -> add. Read-only access to graph."
+      },
+      "coherence": {
+        "score": 3.0,
+        "evidence_code": "Only signal requiring syntactic structure. All 20+ other signals are bag-of-words, graph-structural, or embedding-based. Introduces architectural heterogeneity.",
+        "evidence_structural": "Fractal pattern breaks: no sibling at same scale uses dependency parsing. Mirror test fails: no other layer would benefit from the parser."
+      },
+      "elasticity": {
+        "score": 4.0,
+        "evidence_code": "Each new sentence pattern requires a new SVO rule. Cannot generalize to languages or domains without rewriting the parser.",
+        "evidence_structural": "Compare to cross-encoder which handles new patterns via training data, not code changes."
+      },
+      "utility": {
+        "score": 3.0,
+        "evidence_code": "Benchmark analysis: 1 of 20 queries (Q3 'What database are we using?') clearly benefits. 3-4 queries MIGHT benefit if parser is accurate. 15+ queries see no benefit because they're not WH-type factoid queries.",
+        "evidence_structural": "Narrow applicability: only helps WH-factoid queries where answer-bearing and topic-related memories compete. Open-domain, multi-hop, and temporal queries are unaffected."
+      },
+      "cohesiveness": {
+        "score": 4.0,
+        "evidence_code": "Requires new module (SVO parser), new dependency on document-level POS tagging, new constant tuning. Does not leverage existing infrastructure well.",
+        "evidence_structural": "Cross-encoder weight increase leverages existing infrastructure perfectly — 1 line change."
+      },
+      "quality": {
+        "score": 3.5,
+        "evidence_code": "Hand-crafted NLP heuristics have known maintainability problems. Every new sentence pattern is a new rule. The codebase has avoided this explicitly (using learned embeddings instead).",
+        "evidence_structural": "Technical debt trajectory: rule-based parsers accumulate exceptions and special cases over time."
+      },
+      "ease_of_use": {
+        "score": 7.0,
+        "evidence_code": "From user perspective, transparent. From developer perspective, new test surface for SVO patterns.",
+        "evidence_structural": "No configuration changes needed. But debugging ranking issues becomes harder with another signal."
+      },
+      "total": 59.0,
+      "max": 120.0,
+      "blockers": ["completeness (3.5 near-blocker)", "coherence (3.0 BLOCKER)", "utility (3.0 BLOCKER)", "robustness (3.5 near-blocker)"]
+    }
+  },
+
+  "alternative_evaluation": {
+    "signal_under_evaluation": "INCREASE CROSS-ENCODER BLEND WEIGHT from 12% to 20%",
+    "scores": {
+      "correctness": 8.5,
+      "completeness": 8.0,
+      "performance": 9.5,
+      "robustness": 7.5,
+      "security": 9.0,
+      "data_integrity": 9.0,
+      "coherence": 9.5,
+      "elasticity": 9.0,
+      "utility": 6.5,
+      "cohesiveness": 9.5,
+      "quality": 8.5,
+      "ease_of_use": 9.5,
+      "total": 104.0,
+      "max": 120.0,
+      "blockers": [],
+      "notes": {
+        "correctness": "Proven model trained on 500K+ relevance pairs. 70/30 internal blend provides safety net.",
+        "completeness": "Handles all sentence structures via learned attention. No hand-crafted rules needed.",
+        "performance": "0ms additional latency. Cross-encoder already runs.",
+        "robustness": "Deducted for domain mismatch risk (MS-MARCO web search vs conversational memory). 70/30 internal blend mitigates.",
+        "utility": "Deducted because benefit is limited to queries where cross-encoder disagrees with other signals AND the disagreement is large enough to flip ranks. Not all 20 queries benefit.",
+        "cohesiveness": "1 constant change. Perfect architectural fit."
+      }
+    }
+  },
+
+  "orthogonality_analysis": {
+    "question": "Is completeness orthogonal to the cross-encoder?",
+    "answer": "NO. Completeness as defined (does the memory ANSWER the query vs merely RELATE) is exactly what the cross-encoder's joint attention mechanism captures. ms-marco-MiniLM-L-6-v2 was trained on MS-MARCO where relevance labels distinguish answer-bearing passages from topic-related passages. The cross-encoder IS the completeness signal, expressed through learned neural attention rather than hand-crafted SVO rules.",
+    "supporting_evidence": [
+      "MS-MARCO training data explicitly labels passages as relevant (contains the answer) vs not-relevant (merely mentions the topic). This is the exact same distinction completeness tries to capture.",
+      "Cross-encoder joint attention allows it to detect 'We switched to MongoDB' as answering 'What database?' because 'switched to' and 'database' interact through attention layers. No SVO parsing needed.",
+      "The 12% blend weight is an engineering choice, not a capability limitation. The signal IS captured; it's just under-amplified."
+    ],
+    "information_theoretic_argument": "If we model the ranking improvement as information, completeness-signal and cross-encoder carry the same information (answer-bearing vs topic-related). They are NOT independent dimensions. Adding completeness does not add new information — it adds a noisier copy of existing information. The correct fix is to amplify the cleaner signal (cross-encoder), not to add a noisy duplicate."
+  },
+
+  "is_12_percent_sufficient": {
+    "answer": "NO, 12% is not sufficient, but the fix is increasing the weight, not adding a new signal.",
+    "evidence": {
+      "q3_failure": "Q3 'What database are we using?' has MRR 0.500. Memory 16 (topic-related) outranks Memory 3 (answer-bearing). If cross-encoder correctly scores Memory 3 higher, a 12% blend max contribution of ~0.12 is insufficient to overcome the gap from BM25 + entity overlap + ontological boost.",
+      "q11_failure": "Q11 'Why did we change the database AND what was the impact?' has MRR 0.500. Memory 16 again outranks Memory 18. Same pattern: topic-related memory scores higher from keyword signals.",
+      "pattern": "Both failures involve Memory 16 outranking the expected answer memory. Memory 16 likely has high BM25 score (mentions 'database' prominently) and high entity overlap, but does not contain the specific answer."
+    },
+    "recommendation": "Increase cross-encoder blend from 12% to 18-22% in a stepwise manner. Validate each step against the full 20-query LOCOMO benchmark."
+  },
+
+  "simpler_alternative_analysis": {
+    "question": "Would increasing cross-encoder weight be simpler than building a completeness signal?",
+    "answer": "YES, by orders of magnitude.",
+    "comparison": {
+      "completeness_signal": {
+        "lines_of_code": "500-800 (SVO parser + integration + tests)",
+        "new_dependencies": "None external, but new internal dependency chain",
+        "new_failure_modes": 4,
+        "maintenance_burden": "Ongoing — new sentence patterns require new rules",
+        "regression_risk": "Moderate — additive signal, but parser errors can demote correct results",
+        "expected_mrr_improvement": "0.01-0.03 (narrow applicability to WH-factoid queries)",
+        "confidence_in_estimate": "Low (depends on parser accuracy)"
+      },
+      "cross_encoder_weight_increase": {
+        "lines_of_code": "1 (change 0.12 to 0.20 in recall.rs:2578)",
+        "new_dependencies": "None",
+        "new_failure_modes": 0,
+        "maintenance_burden": "None",
+        "regression_risk": "Low — stepwise tuning, 70/30 internal blend provides safety net",
+        "expected_mrr_improvement": "0.02-0.05 (affects all queries where cross-encoder disagrees with other signals)",
+        "confidence_in_estimate": "Moderate (model is proven, domain gap is manageable)"
+      }
+    }
+  },
+
+  "implementation_recommendation": {
+    "step_1": {
+      "action": "Increase cross-encoder blend from 12% to 18%",
+      "file": "src/memory/recall.rs",
+      "line": 2578,
+      "change": "let blended = base * 0.82 + ce_score * 0.18;",
+      "rationale": "Conservative increase. 18% gives cross-encoder enough authority to flip 1-2 position gaps without dominating."
+    },
+    "step_2": {
+      "action": "Run full LOCOMO benchmark to measure impact",
+      "expected_queries_improved": ["Q3 (What database)", "Q11 (Why change database AND impact)"],
+      "regression_watch": ["Q6 (temporal decisions — cross-encoder may not help temporal queries)", "Q10 (architecture change — recency signal may conflict)"]
+    },
+    "step_3": {
+      "action": "If MRR improves to 0.88+ with no regressions, consider 22% blend",
+      "rationale": "Diminishing returns above 25%. Cross-encoder domain gap (web search vs conversational memory) means it should complement, not replace, the multi-signal pipeline."
+    },
+    "do_not_build": "SVO predicate parser for completeness scoring. The ROI is negative: high cost, narrow utility, redundant with existing cross-encoder signal, and architecturally inconsistent with the codebase's shallow-NLP design philosophy."
+  },
+
+  "verdict": {
+    "completeness_signal": "REJECT",
+    "cross_encoder_weight_increase": "APPROVE (stepwise: 12% -> 18% -> validate -> optional 22%)",
+    "reasoning": [
+      "Completeness and cross-encoder capture the SAME information (answer-bearing vs topic-related). Not orthogonal.",
+      "12% blend is insufficient but the fix is amplification, not duplication.",
+      "SVO parsing introduces the only dependency parser in the codebase — architectural pattern break.",
+      "FMEA shows two failure modes above RPN 200 for the completeness signal.",
+      "Cross-encoder weight increase: 1 line of code, 0 new failure modes, 0ms latency, higher confidence in improvement.",
+      "Bifocal+ score: completeness signal 59/120 (2 BLOCKERS), cross-encoder increase 104/120 (0 blockers)."
+    ]
+  }
+}

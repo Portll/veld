@@ -1,0 +1,556 @@
+{
+  "feature": "Query-Type-Aware Retrieval (WH-Word Gravity)",
+  "date": "2026-03-29",
+  "build": "v0.5.0",
+  "commit": "5b5767b",
+  "target_files": [
+    "src/memory/query_parser.rs (infer_ontological_intent, question_word_to_labels)",
+    "src/memory/recall.rs (Layer 4.9 ontological re-ranking)",
+    "src/memory/graph_retrieval.rs (spread_single_direction ontological penalties)",
+    "src/constants.rs (ONTOLOGICAL_* constants)",
+    "src/graph_memory.rs (EntityLabel enum, matches_with_hierarchy)"
+  ],
+
+  "existing_system_analysis": {
+    "summary": "The proposed feature ALREADY EXISTS in two forms. The proposal is to strengthen it from additive boost to multiplicative penalty-and-boost.",
+    "layer_2_graph_traversal": {
+      "file": "src/memory/graph_retrieval.rs:294-339",
+      "mechanism": "During spreading activation, entities whose labels don't match ontological intent get ONTOLOGICAL_ENTITY_PENALTY=0.5x. Relations that don't match get ONTOLOGICAL_RELATION_PENALTY=0.4x.",
+      "strength": "Multiplicative penalty on activation spread. Already penalizes wrong types."
+    },
+    "layer_4_9_reranking": {
+      "file": "src/memory/recall.rs:1754-1815",
+      "mechanism": "Post-RRF additive boost of ONTOLOGICAL_RERANK_BOOST=0.08 per type-matching entity, capped at ONTOLOGICAL_RERANK_MAX=0.25.",
+      "strength": "Boost-only (asymmetric). Does NOT penalize non-matching types at this layer."
+    },
+    "gating": {
+      "confidence_gate": "ONTOLOGICAL_MIN_CONFIDENCE=0.3 (requires question word OR matching verb)",
+      "density_gate": "ONTOLOGICAL_DENSITY_THRESHOLD=8.0 (disabled for dense/young graphs)",
+      "budget": "rerank_budget = max_results * 2 (limits RocksDB reads)"
+    },
+    "wh_word_mapping": {
+      "file": "src/memory/query_parser.rs:3534-3723",
+      "coverage": "who->Person/Organization/Team, where->Location/Environment, when->Date/Event, how->context-dependent (Pipeline/Technology/Configuration/Concept), why->Event/Concept, what/which->20+ context-dependent branches",
+      "quality": "Comprehensive. Already handles imperative patterns (list/show/find) and comparative patterns."
+    }
+  },
+
+  "bifocal": {
+    "evaluation": "Bifocal+ Edge-Walk + Fractal Analysis",
+
+    "phase_0_risk_triage": {
+      "component_wh_word_detection": {
+        "tier": 3,
+        "reason": "Already exists in question_word_to_labels(). No new code needed. Pure constant tuning."
+      },
+      "component_weight_vector": {
+        "tier": 2,
+        "reason": "New data structure (weight map over EntityLabel), but shape mirrors existing expected_labels vec. Low novelty."
+      },
+      "component_multiplicative_reranking": {
+        "tier": 1,
+        "reason": "Changes core scoring math in Layer 4.9 (recall.rs:1754-1815). Converts additive boost to multiplicative penalty+boost. High coupling to final ranking. Wrong penalty strength = regression on ALL query types."
+      },
+      "component_multi_hop_primary_detection": {
+        "tier": 2,
+        "reason": "Query decomposition already exists (query_parser.rs:3806+). Detecting 'primary' wh-word in compound queries is linguistically ambiguous."
+      }
+    },
+
+    "phase_1_edge_walk_and_fractal": {
+      "wh_word_detection": {
+        "edge": {
+          "data_crossing": "query_text string -> question_word_to_labels() -> Vec<EntityLabel>",
+          "failure_modes": [
+            "Already handled: function exists with 20+ branches covering who/where/when/how/why/what/which + imperative + comparative patterns",
+            "Non-question queries: 'Tell me about Target' has no WH-word. Current system returns empty vec, correctly falling through."
+          ],
+          "contracts": "No new API needed. Existing OntologicalIntent struct carries the signal."
+        },
+        "fractal": {
+          "pattern": "WH-word -> entity type mapping is a standard IR pattern (TREC-8 question classification, Li & Roth 2002)",
+          "mirror_test": "HOLDS. Pattern is consistent at query level, entity level, and corpus level.",
+          "breaks": "None - this is a well-studied mapping."
+        },
+        "score": 8.5,
+        "verdict": "No work needed. Already implemented correctly."
+      },
+
+      "weight_vector_construction": {
+        "edge": {
+          "data_crossing": "Vec<EntityLabel> (binary: present/absent) -> HashMap<EntityLabel, f32> (weighted: 0.0-2.0)",
+          "failure_modes": [
+            "SEMANTIC REDUNDANCY: The current Vec<EntityLabel> already encodes priority through ordering. A weight vector adds expressiveness but the question is whether the NER labeling is reliable enough to exploit it.",
+            "WEIGHT CALIBRATION: What values? WHERE->Location:2.0 vs Location:1.5 is arbitrary without empirical data. The LOCOMO benchmark has 1540 questions but we haven't measured per-type accuracy.",
+            "COVERAGE GAP: EntityLabel has 20+ variants (Person, Organization, Location, Technology, Concept, Event, Date, Product, Skill, Keyword, Project, Task, Document, Repository, Service, Database, Metric, Configuration, Environment, Team, Module, Pipeline). Weight vector must handle ALL of them. Unweighted types default to... what? 1.0 (neutral) or 0.5 (suppressed)?"
+          ],
+          "contracts": "New type: struct QueryTypeWeights { weights: HashMap<EntityLabel, f32> } alongside existing OntologicalIntent"
+        },
+        "fractal": {
+          "pattern": "Weight vectors over type taxonomies appear in typed entity retrieval (Balog et al. 2011)",
+          "mirror_test": "PARTIAL. At entity level, weights are clean. At memory level, a memory typically has 3-5 entity refs of MIXED types. A memory about 'Meeting at Target with Sarah' has Location AND Person entities. The weight vector helps the Location but the multiplicative penalty on Person entities in a WHERE query would HARM this memory — which is exactly the right answer.",
+          "breaks": "CRITICAL BREAK: Multi-type memories. Most real memories reference multiple entity types. A penalty on non-target types penalizes memories that contain the target type PLUS others."
+        },
+        "hazop": {
+          "MORE_weight": "Over-penalizing non-target types pushes multi-entity memories below single-entity ones. 'I went to Target' (Location-only) beats 'Sarah and I went to Target to redeem the coupon' (Person+Location+Product) — the richer memory loses.",
+          "LESS_weight": "Under-penalizing (close to 1.0 for non-targets) makes the feature invisible. Need sufficient spread between target and non-target weights.",
+          "OTHER_THAN_flat": "Could weight by entity POSITION in memory (first-mentioned entity gets full weight) or by entity salience score (already stored per entity)."
+        },
+        "fmea": {
+          "failure": "Weight vector penalizes multi-entity memories that contain the correct type alongside irrelevant types, pushing precise single-entity answers above rich contextual answers",
+          "severity": 7, "probability": 7, "detectability": 4, "rpn": 196,
+          "mitigation": "Only penalize memories that have ZERO matching entity types. If any entity matches, apply boost proportional to match ratio (matching/total), not penalty."
+        },
+        "score": 5.2,
+        "verdict": "The weight vector concept is sound but naive multiplicative penalty fails on multi-type memories. The match-ratio approach (boost by fraction of matching entities) is safer."
+      },
+
+      "multiplicative_reranking_layer_4_9": {
+        "edge": {
+          "data_crossing": "fused_score (f32) x entity_type_weight (f32) -> adjusted_score (f32). Currently: fused_score += 0.08 * type_matches (additive). Proposed: fused_score *= weight_for_type (multiplicative).",
+          "failure_modes": [
+            "CRITICAL: Multiplicative penalty COMPOUNDS with other layers. Layer 2 already applies 0.5x penalty during graph traversal. If Layer 4.9 also applies 0.5x for non-matching types, memories get 0.25x total — too aggressive. The same information is penalized TWICE through different mechanisms.",
+            "SCORE DISTRIBUTION SHIFT: Current fused scores are calibrated for additive Layer 4.9. Switching to multiplicative changes the score distribution. RRF fusion (Layer 4) produces scores in [0.0, ~3.0]. Multiplicative 2.0x boost pushes to 6.0; multiplicative 0.3x penalty pushes to 0.9. The spread becomes enormous, overwhelming all other signals.",
+            "INTERACTION WITH LAYER 4.95 (dedup): Near-duplicate removal compares content prefixes. If multiplicative reranking dramatically reshuffles, dedup may remove the wrong duplicate.",
+            "INTERACTION WITH TEMPORAL BOOST (Layer 0.6, 4.55): Temporal queries already get entity-based boosting through temporal fact sources. Adding multiplicative type weighting on top may double-count."
+          ],
+          "contracts": "Must not change function signature. Internal scoring only."
+        },
+        "fractal": {
+          "pattern": "Multiplicative scoring is standard in learning-to-rank (BM25 is multiplicative). But veld uses RRF fusion which produces ADDITIVE scores.",
+          "mirror_test": "BREAKS. RRF fusion scores are NOT on a [0,1] scale — they're reciprocal-rank sums. Multiplying RRF scores by type weights mixes semantics. A memory at rank 1 from vector + rank 50 from BM25 has fused score ~1.02. Multiplying by 2.0 gives 2.04. A memory at rank 3 from both has fused score ~0.26. Even with 2.0x boost it's only 0.52. The multiplicative approach amplifies RRF rank artifacts, not true relevance.",
+          "breaks": "FUNDAMENTAL: Multiplicative reranking on RRF scores violates the rank-invariance property of RRF. RRF was designed so individual scores don't leak through — only ranks matter. Multiplying post-RRF destroys this."
+        },
+        "hazop": {
+          "REVERSE_regression": "Multiplicative penalty on WHERE queries demotes memories where the location is mentioned but the memory is primarily about a person (e.g., 'Sarah works at Target'). This is exactly the kind of memory that SHOULD surface for 'Where does Sarah work?' but would get penalized because Person entities outnumber Location.",
+          "PART_OF_queries": "Multi-hop queries decomposed into sub-queries: each sub-query gets its own wh-word. 'Where did X happen when Y did Z?' decomposes into WHERE sub-query + WHEN sub-query. The weight vectors CONFLICT — Location boost vs Date boost.",
+          "EARLY_activation": "If penalty is too strong, the correct memory drops out of the top-k before Layer 5 (recency) and Layer 5.5 (learned weights) can rescue it."
+        },
+        "fmea": {
+          "failure": "Multiplicative type penalty on post-RRF scores causes regression on multi-hop and multi-entity queries where the correct answer memory contains mixed entity types",
+          "severity": 9, "probability": 6, "detectability": 3, "rpn": 162,
+          "mitigation": "Keep additive approach. Increase ONTOLOGICAL_RERANK_BOOST from 0.08 to 0.15 and add a symmetric ONTOLOGICAL_RERANK_PENALTY of -0.05 for memories with ZERO matching entity types. Conservative, tunable, reversible."
+        },
+        "score": 3.8,
+        "verdict": "REJECT multiplicative approach. The RRF score semantics don't support multiplication. The double-counting with Layer 2 graph penalties is a correctness bug waiting to happen. The additive approach is correct — it just needs stronger constants."
+      },
+
+      "multi_hop_primary_detection": {
+        "edge": {
+          "data_crossing": "compound query string -> primary wh-word extraction -> single OntologicalIntent",
+          "failure_modes": [
+            "LINGUISTIC AMBIGUITY: 'Where did X happen when Y was doing Z?' — is 'where' or 'when' primary? English syntax says 'where' (main clause) but the user might actually want the temporal answer. No reliable automated parser exists for this.",
+            "DECOMPOSITION CONFLICT: Query decomposition (already implemented) splits compound queries into sub-queries each with their own intent. Adding primary detection CONTRADICTS this — decomposition says 'both matter', primary detection says 'one matters more'.",
+            "EXISTING HANDLING: decompose_query() in query_parser.rs already handles this by running independent vector searches per sub-query and merging with RRF. The sub-query approach is strictly more general."
+          ],
+          "contracts": "Would need to add primary_intent field to OntologicalIntent or QueryAnalysis"
+        },
+        "fractal": {
+          "pattern": "Question focus detection (Moldovan et al. 2003, TREC QA track)",
+          "mirror_test": "BREAKS at scale. Works for simple 2-clause queries, fails for 3+ clause ('Where did X go when Y happened because Z was...?'). Doesn't compose.",
+          "breaks": "Existing query decomposition is a better solution to this exact problem."
+        },
+        "score": 4.5,
+        "verdict": "Unnecessary. Query decomposition already solves multi-hop intent routing. Adding primary detection is redundant and conflicts with the decomposition architecture."
+      }
+    },
+
+    "phase_2_fractal_and_atam": {
+      "core_pattern": "Type-aware scoring: memories containing entities matching the query's expected type should rank higher.",
+      "macro_level": "The retrieval pipeline has 11 layers. Ontological intent already participates in 2 (Layer 2 graph traversal, Layer 4.9 reranking). The pattern is established and consistent.",
+      "meso_level": "Within Layer 4.9, the boost-only approach creates asymmetry: matching types are rewarded but non-matching types aren't penalized. The proposed fix (add penalties) is structurally sound but the multiplicative approach is wrong for RRF scores.",
+      "micro_level": "Constants (0.08 boost, 0.25 max) were chosen conservatively. The LOCOMO evidence suggests they're too conservative for location queries specifically.",
+      "tradeoffs": [
+        {
+          "quality_attribute": "Precision for typed queries (WHERE, WHO, WHEN)",
+          "opposing_attribute": "Recall for exploratory queries (WHAT, HOW, WHY)",
+          "analysis": "Stronger type weighting improves precision on queries with clear type expectations but WHAT/HOW/WHY queries have broad type expectations (Concept, Technology). Over-weighting types for these queries suppresses diverse results.",
+          "resolution": "Variable strength: strong for WHO/WHERE/WHEN (clear type target), weak for WHAT/HOW/WHY (broad type target)"
+        },
+        {
+          "quality_attribute": "Single-hop accuracy",
+          "opposing_attribute": "Multi-hop accuracy (current MRR 0.90)",
+          "analysis": "Multi-hop queries traverse multiple entity types by definition. Type penalties at Layer 4.9 punish the bridge memories that connect hops.",
+          "resolution": "Disable type penalty for decomposed queries (already have is_decomposed flag)"
+        }
+      ]
+    },
+
+    "phase_2_5_adversarial_challenge": {
+      "challenge_wh_detection_8_5": {
+        "attack": "Indirect questions: 'I need to find the place where I used my coupon'. No WH-word at sentence start, but clearly a WHERE query.",
+        "evidence": "Current question_word_to_labels() checks trimmed.starts_with('where '). This indirect form would return empty vec, getting zero ontological boost.",
+        "reduction": "8.5 -> 7.5. Indirect questions are common in conversational memory queries. The regex-based approach misses them.",
+        "mitigation_note": "imperative_object_to_labels() partially handles this via 'find' + object patterns, but only for specific objects, not for spatial intent."
+      }
+    },
+
+    "phase_3_scoring": {
+      "dimensions": {
+        "correctness": {
+          "score": 5.5,
+          "evidence_code": "WH-word mapping in question_word_to_labels() is correct and comprehensive. But the proposed multiplicative approach is mathematically wrong for RRF scores.",
+          "evidence_structural": "Pattern matches TREC question classification literature. However, the double-counting between Layer 2 and proposed Layer 4.9 penalty is a correctness violation."
+        },
+        "robustness": {
+          "score": 4.8,
+          "evidence_code": "ONTOLOGICAL_DENSITY_THRESHOLD=8.0 and ONTOLOGICAL_MIN_CONFIDENCE=0.3 provide gating. But no fallback for NER labeling errors — if a Location entity is mislabeled as Concept, the penalty fires incorrectly.",
+          "evidence_structural": "NER labeling pipeline is heuristic-based (not model-based). Error rate unknown. Weight vector amplifies NER errors."
+        },
+        "security": {
+          "score": 7.0,
+          "evidence_code": "No PII exposure. No external API calls. Pure internal scoring.",
+          "evidence_structural": "Query-type detection is regex-based, no injection risk."
+        },
+        "performance": {
+          "score": 7.5,
+          "evidence_code": "Layer 4.9 already has rerank_budget=max_results*2 limiting RocksDB reads. Weight vector lookup is O(1) HashMap.",
+          "evidence_structural": "No new I/O or model inference. Pure arithmetic on existing data."
+        },
+        "maintainability": {
+          "score": 6.5,
+          "evidence_code": "Constants are cleanly isolated in constants.rs with cross-reference table. OntologicalIntent struct is well-documented.",
+          "evidence_structural": "Adding weight vector means a new HashMap field, one more constant per EntityLabel variant, and documentation debt for each."
+        },
+        "data_integrity": {
+          "score": 5.0,
+          "evidence_code": "Type weights affect ranking but never modify stored data. Memories and entities are read-only during retrieval.",
+          "evidence_structural": "However, multiplicative scoring can cause score underflow (f32 precision) for heavily penalized memories, potentially creating NaN or inf in edge cases."
+        },
+        "testability": {
+          "score": 6.0,
+          "evidence_code": "LOCOMO benchmark provides 1540 questions with gold answers. Can measure per-type accuracy before and after.",
+          "evidence_structural": "Existing ontological metrics (ONTOLOGICAL_RERANK_BOOST_APPLIED histogram, ONTOLOGICAL_FALLBACK_TOTAL counter) provide observability."
+        },
+        "scalability": {
+          "score": 8.0,
+          "evidence_code": "O(1) weight lookup per entity, O(rerank_budget) total. No scaling concerns.",
+          "evidence_structural": "Feature is stateless — no additional storage, no background processing."
+        },
+        "compliance": {
+          "score": 8.0,
+          "evidence_code": "No PII handling changes. No external data flow.",
+          "evidence_structural": "Query-type detection operates on user query text already in memory."
+        },
+        "modularity": {
+          "score": 5.8,
+          "evidence_code": "OntologicalIntent already flows through 3 functions across 2 files. Adding weight vector extends this coupling.",
+          "evidence_structural": "Weight vector is tightly coupled to EntityLabel enum — any new variant requires weight calibration."
+        },
+        "usability": {
+          "score": 7.0,
+          "evidence_code": "Transparent to users. No API changes. Better results surface automatically.",
+          "evidence_structural": "No configuration needed. Weights are internal constants."
+        },
+        "documentation": {
+          "score": 6.0,
+          "evidence_code": "Existing Layer 4.9 has clear doc comments and academic references (Collins & Quillian 1969).",
+          "evidence_structural": "Constants table in constants.rs provides cross-referencing. Weight rationale would need documenting."
+        }
+      },
+      "total": 77.1,
+      "max": 120,
+      "percentage": "64.3%",
+      "blockers": ["Robustness at 4.8 is a YELLOW flag (close to 4.9 blocker threshold). NER labeling reliability is unquantified."]
+    },
+
+    "bifocal_verdict": {
+      "implement_as_proposed": false,
+      "implement_modified": true,
+      "modified_plan": "Do NOT switch to multiplicative scoring. Instead: (1) Increase ONTOLOGICAL_RERANK_BOOST from 0.08 to 0.15 for memories with matching entity types. (2) Add new ONTOLOGICAL_RERANK_PENALTY = -0.06 for memories with ZERO matching entity types (not just 'fewer matches'). (3) Skip penalty for decomposed queries (multi-hop). (4) Add per-WH-word confidence scaling: WHO/WHERE/WHEN get confidence 0.6+ (high precision expectation), WHAT/HOW/WHY get 0.3 (broad expectation). This is 4 constant changes and 1 conditional in Layer 4.9. No new types, no new files.",
+      "effort_hours": 3,
+      "risk": "low"
+    }
+  },
+
+  "overlook": {
+    "evaluation": "Overlook 27-Dimension Awareness Analysis",
+    "methodology": "5 clusters x 5-6 dimensions, spike detection, distortion check, coherence guard",
+
+    "cluster_1_technical_architecture": {
+      "dimensions": {
+        "system_coupling": {
+          "score": 6.2,
+          "finding": "OntologicalIntent flows through query_parser.rs -> recall.rs -> graph_retrieval.rs. Three files, two layers. Adding weight vector extends coupling to constants.rs (already coupled). Moderate."
+        },
+        "abstraction_integrity": {
+          "score": 4.5,
+          "finding": "DISTORTION DETECTED. The proposed feature treats RRF fusion scores as if they encode absolute relevance (suitable for multiplication). They don't — RRF scores encode RANK POSITION SUMS. This is a fundamental abstraction violation. The code at recall.rs:1765 does `fused.into_iter()` and treats scores as ordinal, but multiplicative weighting treats them as cardinal.",
+          "distortion": true
+        },
+        "data_model_fit": {
+          "score": 7.0,
+          "finding": "EntityLabel enum is comprehensive (20+ variants). Type hierarchy via matches_with_hierarchy() handles subsumption (Team matches Organization). Weight vector maps naturally to this."
+        },
+        "algorithm_soundness": {
+          "score": 5.0,
+          "finding": "Double-counting: Layer 2 spreads activation with ONTOLOGICAL_ENTITY_PENALTY=0.5x for wrong types. Layer 4.9 applies additional penalty. The same type-mismatch signal is counted twice through different mechanisms. This violates the independence assumption between layers."
+        },
+        "api_surface_stability": {
+          "score": 8.5,
+          "finding": "No API changes. RecallRequest/RecallResponse unchanged. Purely internal scoring adjustment."
+        },
+        "state_management": {
+          "score": 8.0,
+          "finding": "Stateless operation. Weight vector computed per-query, no persistence. No race conditions possible."
+        }
+      },
+      "cluster_score": 6.5
+    },
+
+    "cluster_2_data_and_quality": {
+      "dimensions": {
+        "ner_label_accuracy": {
+          "score": 3.5,
+          "finding": "SPIKE DETECTED. The entire feature's value proposition depends on EntityLabel accuracy. But entity labeling is done by heuristic NER (not model-based) during ingestion. A memory about 'Target' (the store) might be labeled as Keyword, not Location or Organization. The feature amplifies correct labels AND incorrect labels equally.",
+          "spike": true
+        },
+        "query_classification_coverage": {
+          "score": 7.5,
+          "finding": "question_word_to_labels() covers 7 WH-words, imperative patterns, and comparative patterns. ~85% of benchmark queries would match."
+        },
+        "benchmark_evidence": {
+          "score": 4.0,
+          "finding": "Single failure example cited ('Where did I redeem a $5 coupon?'). No systematic analysis of how many LOCOMO failures are caused by type mismatch vs other factors (semantic similarity, BM25 keyword miss, temporal confusion). The feature might fix 2 of 100 failures or 30 of 100."
+        },
+        "weight_calibration_basis": {
+          "score": 2.5,
+          "finding": "SPIKE DETECTED. No empirical basis for weight values. The proposal says 'WHERE -> Location:2.0, Organization:1.5, others:0.5' but these numbers are arbitrary. Without per-type recall analysis on LOCOMO, any weights are guesses.",
+          "spike": true
+        },
+        "regression_detection": {
+          "score": 6.5,
+          "finding": "LOCOMO benchmark (20 questions) runs in CI. Can detect regression. But 20 questions may not cover all entity type combinations."
+        }
+      },
+      "cluster_score": 4.8
+    },
+
+    "cluster_3_interaction_effects": {
+      "dimensions": {
+        "layer_2_interaction": {
+          "score": 4.0,
+          "finding": "Graph traversal already applies type penalties (0.5x per mismatched entity, 0.4x per mismatched relation). Adding Layer 4.9 penalty means wrong-type memories get penalized at BOTH graph expansion AND reranking. Compound effect: 0.5 * 0.5 = 0.25x for memories that enter through graph path. But memories entering through pure vector search only get Layer 4.9 penalty. This creates an inconsistency."
+        },
+        "layer_0_6_temporal_interaction": {
+          "score": 6.0,
+          "finding": "Temporal fact boost (Layer 0.6/4.55) and type weighting are orthogonal for most queries. But WHEN queries get both temporal boost AND type-matching boost, double-helping temporal memories. Not harmful but inefficient."
+        },
+        "layer_5_learned_weights_interaction": {
+          "score": 7.0,
+          "finding": "LearnedWeights in hybrid_search.rs adapts BM25/vector/graph blend per query. Type weighting is applied post-fusion, so learned weights are unaffected. Clean separation."
+        },
+        "query_decomposition_interaction": {
+          "score": 3.5,
+          "finding": "COHERENCE ISSUE. Decomposed queries split into sub-queries, each getting its own vector search. But ontological intent is computed on the ORIGINAL query, not sub-queries. Sub-query 'PostgreSQL' doesn't start with a WH-word, so it gets no type weighting even though the parent query 'Where did we deploy PostgreSQL?' is a WHERE query."
+        },
+        "attribute_query_interaction": {
+          "score": 6.5,
+          "finding": "Layer 0.5 attribute queries ('What is X's relationship status?') use BM25 with expanded synonyms. Type weighting is irrelevant here (attribute values aren't entity types). No conflict."
+        },
+        "dedup_interaction": {
+          "score": 7.0,
+          "finding": "Layer 4.95 dedup operates on content prefixes, unaffected by score changes. No interaction."
+        }
+      },
+      "cluster_score": 5.7
+    },
+
+    "cluster_4_operational_risk": {
+      "dimensions": {
+        "rollback_complexity": {
+          "score": 9.0,
+          "finding": "Constant changes only. Reverting 2-3 constants in constants.rs restores original behavior. Zero data migration."
+        },
+        "observability": {
+          "score": 8.0,
+          "finding": "Existing metrics: ONTOLOGICAL_RERANK_BOOST_APPLIED (histogram), ONTOLOGICAL_FALLBACK_TOTAL (counter), ONTOLOGICAL_DENSITY_SKIP_TOTAL (counter), ONTOLOGICAL_INTENT_CONFIDENCE (histogram). Sufficient to monitor impact."
+        },
+        "gradual_rollout": {
+          "score": 7.0,
+          "finding": "Can increase boost/penalty constants incrementally (0.08->0.10->0.12->0.15) with benchmark runs between each step."
+        },
+        "failure_blast_radius": {
+          "score": 6.5,
+          "finding": "Only affects queries with ontological intent confidence >= 0.3 AND graph density < 8.0. Conservative gating limits blast radius. But within that gate, ALL matching queries are affected."
+        },
+        "latency_impact": {
+          "score": 9.0,
+          "finding": "Zero additional I/O. Weight lookup is HashMap access on existing data. Sub-microsecond."
+        }
+      },
+      "cluster_score": 7.9
+    },
+
+    "cluster_5_strategic_alignment": {
+      "dimensions": {
+        "mrr_impact_estimate": {
+          "score": 4.5,
+          "finding": "Current MRR 0.88, target 0.93+. Feature might fix 2-5 type-specific failures in LOCOMO (WHERE/WHO misses). Each fix on 20-question benchmark = +0.05 MRR. Optimistic: +0.10-0.25 MRR improvement. But could regress multi-hop by -0.05-0.10 if penalty is too strong."
+        },
+        "effort_vs_alternatives": {
+          "score": 6.0,
+          "finding": "3 hours for constant tuning vs 20+ hours for cross-encoder (P1 plan). Best ROI of any current proposal IF the problem is actually type mismatch and not embedding quality."
+        },
+        "benchmark_coverage": {
+          "score": 5.0,
+          "finding": "LOCOMO has ~20 WHERE questions, ~15 WHO questions, ~30 WHEN questions. Small sample per type. Single improvements may be noise."
+        },
+        "architectural_direction": {
+          "score": 7.0,
+          "finding": "Aligns with existing ontological retrieval direction. No architectural drift. Strengthens existing pattern rather than introducing new one."
+        },
+        "user_visible_impact": {
+          "score": 5.5,
+          "finding": "Users asking 'Where did X happen?' get better answers. But this is a narrow scenario. Most memory queries are 'What was...', 'How did...', 'Tell me about...' where type weighting helps less."
+        }
+      },
+      "cluster_score": 5.6
+    },
+
+    "spikes": [
+      {
+        "dimension": "ner_label_accuracy",
+        "score": 3.5,
+        "impact": "Feature amplifies labeling errors. If Target is labeled Keyword instead of Location, WHERE queries get WORSE results. Garbage in, amplified garbage out.",
+        "recommendation": "Before strengthening type weighting, audit NER label distribution on LOCOMO dataset. If >15% of entities are mislabeled, fix NER first."
+      },
+      {
+        "dimension": "weight_calibration_basis",
+        "score": 2.5,
+        "impact": "No empirical data to set weights. Risk of overfitting to the one cited example.",
+        "recommendation": "Run per-type recall analysis on LOCOMO: for each WH-word type, measure current R@1/R@5/R@10. Then calibrate weights to the types with lowest recall."
+      }
+    ],
+
+    "distortions": [
+      {
+        "dimension": "abstraction_integrity",
+        "score": 4.5,
+        "issue": "Multiplicative scoring on RRF fusion scores violates the rank-invariance property that RRF was designed to provide. Treating RRF scores as cardinal relevance values is a category error.",
+        "correction": "Stay with additive scoring (current approach). RRF scores are designed for additive adjustments."
+      }
+    ],
+
+    "coherence_guard": {
+      "passed": false,
+      "violations": [
+        "Layer 2 and Layer 4.9 both apply type penalties independently, creating undocumented compound effect",
+        "Query decomposition uses original query's ontological intent, not sub-query intent",
+        "Proposed multiplicative approach contradicts RRF's rank-based score semantics"
+      ]
+    },
+
+    "overlook_verdict": {
+      "overall_score": 6.1,
+      "max": 10.0,
+      "implement": true,
+      "conditions": [
+        "Use ADDITIVE scoring only (increase boost, add penalty for zero-match, stay additive)",
+        "Audit NER label accuracy on LOCOMO before deploying",
+        "Document Layer 2 / Layer 4.9 compound effect explicitly in constants.rs",
+        "Skip penalty for decomposed (multi-hop) queries"
+      ]
+    }
+  },
+
+  "overloop": {
+    "evaluation": "Overloop Feedback-Iterate-Critique Cycle (3 iterations)",
+
+    "iteration_1": {
+      "proposal": "As described: weighted multiplicative scoring based on WH-word type. WHERE->Location:2.0, others:0.5. Convert Layer 4.9 from additive to multiplicative.",
+      "critique": [
+        "RRF scores are rank sums, not relevance values. Multiplying them by weights mixes rank-position artifacts with type signals. A memory at rank 1 from one source gets amplified disproportionately.",
+        "Double-counting with Layer 2 graph penalties. Same signal applied twice = overcorrection.",
+        "Multi-entity memories penalized: 'Sarah went to Target' has Person+Location. WHERE query penalizes the Person entity, harming a memory that contains the answer.",
+        "No empirical basis for weight values. The 2.0/0.5 split is a guess.",
+        "Multi-hop queries: decomposed sub-queries don't inherit parent's WH-word intent."
+      ],
+      "score": 3.5,
+      "verdict": "REJECT multiplicative approach. Fundamental incompatibility with RRF scoring."
+    },
+
+    "iteration_2": {
+      "proposal": "Revised: Keep additive scoring. Increase ONTOLOGICAL_RERANK_BOOST from 0.08 to 0.15. Add ONTOLOGICAL_RERANK_PENALTY = -0.06 for memories with ZERO matching entity types. Gate: only apply penalty when confidence >= 0.5 (require both WH-word AND verb match). Skip for decomposed queries.",
+      "critique": [
+        "BETTER: Additive on RRF scores is semantically correct. +0.15 boost is still modest relative to fused score range [0.0, ~3.0].",
+        "PENALTY THRESHOLD: -0.06 for zero-match is conservative. Could be -0.10 since these memories truly have no type signal.",
+        "CONFIDENCE GATE: 0.5 requires WH-word AND verb match. This is too restrictive — 'Where is Target?' has WH-word (0.4 confidence) but no verb match. Would get no penalty. Should gate at 0.4 for penalty, 0.3 for boost (asymmetric gating).",
+        "GAP: What about memories with no entity refs at all? get_episode() returning None or empty entity_refs should be neutral (no boost, no penalty), not penalized.",
+        "LAYER 2 INTERACTION: Increasing Layer 4.9 boost while Layer 2 penalty stays at 0.5x means type-matching memories get boosted in Layer 4.9 AND preferentially reach Layer 4.9 through graph expansion. The compound effect might over-boost type-matching memories for graph-dense entities.",
+        "GOOD: Skip for decomposed queries prevents multi-hop regression."
+      ],
+      "improvements": [
+        "Reduce penalty confidence gate from 0.5 to 0.4",
+        "Treat empty entity_refs as neutral (not penalized)",
+        "Consider reducing Layer 2 ONTOLOGICAL_ENTITY_PENALTY from 0.5 to 0.6 to compensate for stronger Layer 4.9"
+      ],
+      "score": 6.5,
+      "verdict": "CONDITIONAL ACCEPT. Sound approach, needs refinement on gating and Layer 2 interaction."
+    },
+
+    "iteration_3": {
+      "proposal": "Final: (A) ONTOLOGICAL_RERANK_BOOST: 0.08 -> 0.15. (B) New ONTOLOGICAL_RERANK_PENALTY: -0.08 for memories with zero matching entity types. (C) Penalty gate: confidence >= 0.4. Boost gate: stays at 0.3. (D) Empty entity_refs: neutral (skip). (E) Decomposed queries: skip penalty, keep boost. (F) Adjust ONTOLOGICAL_ENTITY_PENALTY from 0.5 to 0.6 in Layer 2 to compensate for stronger Layer 4.9. (G) Add metric: ONTOLOGICAL_RERANK_PENALTY_APPLIED histogram.",
+      "critique": [
+        "SOUND: Additive approach respects RRF semantics. Asymmetric gating (lower for boost, higher for penalty) is appropriate since penalties are riskier than boosts.",
+        "MEASURABLE: New histogram metric allows A/B comparison on LOCOMO.",
+        "REVERSIBLE: All changes are constant adjustments. Reverting 4 constants restores original behavior.",
+        "REMAINING RISK: NER label quality is still the bottleneck. If 'Target' is labeled as Keyword instead of Location/Organization, the boost won't fire and the penalty won't apply (the memory has entity refs, just wrong types). The feature simply won't help. It won't HURT, but it won't help either.",
+        "EFFORT: 3-4 hours. 2 constants in constants.rs, 15 lines in recall.rs for penalty logic, 5 lines for decomposition skip, 1 constant in graph_retrieval penalty, 10 lines for new metric. Plus benchmark run.",
+        "EXPECTED IMPACT: Fixes the cited Target/coupon example IF Target has a Location label in the knowledge graph. On LOCOMO overall: +0.05 to +0.15 MRR improvement on single-hop WHERE/WHO/WHEN queries. Neutral on multi-hop and WHAT/HOW/WHY."
+      ],
+      "improvements": [],
+      "score": 7.5,
+      "verdict": "ACCEPT. This is the right scoping. Conservative, additive, well-gated, measurable, reversible."
+    },
+
+    "convergence": {
+      "iterations_to_stable": 3,
+      "final_score": 7.5,
+      "key_refinements": [
+        "Multiplicative -> Additive scoring (iteration 1 -> 2)",
+        "Asymmetric confidence gating for boost vs penalty (iteration 2 -> 3)",
+        "Layer 2 penalty reduction to compensate for Layer 4.9 strengthening (iteration 2 -> 3)",
+        "Empty entity_refs treated as neutral (iteration 2 -> 3)"
+      ]
+    },
+
+    "overloop_verdict": {
+      "implement": true,
+      "final_plan": {
+        "changes": [
+          "constants.rs: ONTOLOGICAL_RERANK_BOOST 0.08 -> 0.15",
+          "constants.rs: new ONTOLOGICAL_RERANK_PENALTY = -0.08",
+          "constants.rs: new ONTOLOGICAL_PENALTY_MIN_CONFIDENCE = 0.4",
+          "constants.rs: ONTOLOGICAL_ENTITY_PENALTY 0.5 -> 0.6 (weaken Layer 2 to compensate)",
+          "recall.rs: Layer 4.9 add penalty branch for zero-match memories (skip if entity_refs.is_empty())",
+          "recall.rs: Layer 4.9 skip penalty when query was decomposed",
+          "metrics.rs: new ONTOLOGICAL_RERANK_PENALTY_APPLIED histogram"
+        ],
+        "files_touched": 3,
+        "lines_changed_estimate": 35
+      }
+    }
+  },
+
+  "verdict": {
+    "implement": true,
+    "implementation": "MODIFIED (not as originally proposed)",
+    "priority": "P2",
+    "effort_hours": 4,
+    "risk": "low",
+    "expected_impact": "+0.05 to +0.15 MRR on typed queries (WHERE/WHO/WHEN), neutral on others",
+    "rationale": "The feature addresses a real gap (asymmetric boost-only in Layer 4.9) but the proposed multiplicative approach is wrong for RRF scores. The modified plan (stronger additive boost + additive penalty for zero-match + compensating Layer 2 adjustment) is sound, conservative, reversible, and requires ~35 lines of code across 3 files. Priority P2 because: (1) the evidence is a single LOCOMO example, not systematic analysis, (2) NER label quality is unquantified and may be the actual bottleneck, (3) cross-encoder reranking (P1) would provide larger and more general improvements.",
+    "prerequisites": [
+      "Audit EntityLabel distribution on LOCOMO dataset to confirm NER labels are accurate enough for type weighting to help",
+      "Run per-WH-word-type recall analysis to quantify the actual gap"
+    ],
+    "rejection_reasons_for_original_proposal": [
+      "Multiplicative scoring violates RRF rank-invariance semantics",
+      "Double-counting with Layer 2 graph traversal penalties",
+      "Multi-entity memories incorrectly penalized",
+      "No empirical basis for weight values",
+      "Multi-hop primary WH-word detection is redundant with query decomposition"
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "veld": {
+      "command": "bun",
+      "args": ["run", "mcp-server/index.ts"],
+      "env": {
+        "VELD_API_KEY": "sk-veld-dev-local-testing-key"
+      }
+    }
+  }
+}

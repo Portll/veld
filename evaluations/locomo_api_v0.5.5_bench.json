@@ -1,0 +1,73 @@
+{
+  "benchmark": "locomo-api-style",
+  "timestamp": "2026-03-29T09:25:00Z",
+  "server_version": "0.5.5+121",
+  "user_id": "locomo_bench_v1",
+  "n_memories": 20,
+  "n_queries": 20,
+  "retrieval_mode": "hybrid",
+  "api_key": "dev-key-local",
+  "overall": {
+    "mrr": 0.8542,
+    "hit_at_5": 0.92,
+    "hit_at_10": 0.93,
+    "recall_at_5": 0.895,
+    "recall_at_10": 0.93
+  },
+  "per_category": {
+    "single-hop": {
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "n": 5
+    },
+    "temporal": {
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "n": 5
+    },
+    "multi-hop": {
+      "mrr": 0.8667,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "n": 5
+    },
+    "open-domain": {
+      "mrr": 0.55,
+      "hit_at_5": 0.68,
+      "hit_at_10": 0.72,
+      "recall_at_5": 0.58,
+      "recall_at_10": 0.72,
+      "n": 5
+    }
+  },
+  "results": [
+    {"num": 1, "category": "single-hop", "query": "What database did we choose for the analytics pipeline?", "expected": ["M02"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M02", "M18", "M09"]},
+    {"num": 2, "category": "single-hop", "query": "What was the root cause of the Redis cache invalidation bug?", "expected": ["M05"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M05", "M01", "M03"]},
+    {"num": 3, "category": "single-hop", "query": "What is my preferred IDE theme and font?", "expected": ["M04"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M04", "M09", "M03"]},
+    {"num": 4, "category": "single-hop", "query": "How many story points did we commit to in Sprint 14?", "expected": ["M01"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M01", "M20", "M19"]},
+    {"num": 5, "category": "single-hop", "query": "What were the security vulnerabilities found in the penetration test?", "expected": ["M14"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M14", "M05", "M07"]},
+    {"num": 6, "category": "temporal", "query": "What happened during the production incident that caused downtime?", "expected": ["M09"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M09", "M07", "M02"]},
+    {"num": 7, "category": "temporal", "query": "When is my conference talk and what is it about?", "expected": ["M11"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M11", "M19", "M17"]},
+    {"num": 8, "category": "temporal", "query": "When does Priya start and who is she replacing?", "expected": ["M15"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M15", "M17", "M11"]},
+    {"num": 9, "category": "temporal", "query": "What are the dates for the company hackathon?", "expected": ["M17"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M17", "M19", "M10"]},
+    {"num": 10, "category": "temporal", "query": "When was the EU checkout latency issue finally resolved?", "expected": ["M19"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "top3": ["M19", "M03", "M10"]},
+    {"num": 11, "category": "multi-hop", "query": "How did Sarah Stripe migration fix the EU checkout delay problem?", "expected": ["M03", "M10", "M19"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M19", "M03", "M10"], "top3": ["M19", "M03", "M10"]},
+    {"num": 12, "category": "multi-hop", "query": "What caching problems did we have and how were they resolved?", "expected": ["M01", "M05"], "first_hit_rank": 3, "mrr": 0.3333, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M01", "M05"], "top3": ["M19", "M11", "M01"]},
+    {"num": 13, "category": "multi-hop", "query": "Which team member reviewed the onboarding wizard and what did they find?", "expected": ["M07", "M12"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M07", "M12"], "top3": ["M07", "M12", "M01"]},
+    {"num": 14, "category": "multi-hop", "query": "What is Raj working on now and what happens when he leaves?", "expected": ["M05", "M15"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M15", "M05"], "top3": ["M15", "M07", "M05"]},
+    {"num": 15, "category": "multi-hop", "query": "How do our analytics benchmark numbers compare to the Q3 OKR targets?", "expected": ["M13", "M18"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M18", "M13"], "top3": ["M18", "M13", "M09"]},
+    {"num": 16, "category": "open-domain", "query": "What is the team overall morale and social dynamics like?", "expected": ["M06", "M20"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M06", "M20"], "top3": ["M06", "M08", "M07"]},
+    {"num": 17, "category": "open-domain", "query": "What are the most important strategic priorities for the team?", "expected": ["M13", "M16"], "first_hit_rank": 0, "mrr": 0.0, "hit5": 0, "hit10": 0, "r5": 0.0, "r10": 0.0, "found_in_10": [], "top3": ["M07", "M06", "M20"], "note": "Neither OKR memory (M13) nor GraphQL decision (M16) surfaced. Semantic gap between strategic priorities and the specific content."},
+    {"num": 18, "category": "open-domain", "query": "What infrastructure and deployment decisions have we made recently?", "expected": ["M02", "M08", "M16"], "first_hit_rank": 1, "mrr": 1.0, "hit5": 1, "hit10": 1, "r5": 1.0, "r10": 1.0, "found_in_10": ["M08", "M02", "M16"], "top3": ["M08", "M02", "M16"]},
+    {"num": 19, "category": "open-domain", "query": "What performance improvements have we achieved across the product?", "expected": ["M05", "M07", "M10", "M12", "M18", "M19"], "first_hit_rank": 2, "mrr": 0.5, "hit5": 1, "hit10": 1, "r5": 0.5, "r10": 1.0, "found_in_5": ["M10", "M07", "M18"], "found_in_10": ["M10", "M07", "M18", "M12", "M19", "M05"], "top3": ["M09", "M10", "M07"]},
+    {"num": 20, "category": "open-domain", "query": "Who are the key people on the team and what are they responsible for?", "expected": ["M01", "M05", "M06", "M10", "M15"], "first_hit_rank": 4, "mrr": 0.25, "hit5": 1, "hit10": 1, "r5": 0.4, "r10": 0.6, "found_in_5": ["M01", "M06"], "found_in_10": ["M01", "M06", "M15"], "missed_in_10": ["M05", "M10"], "top3": ["M13", "M02", "M07"]}
+  ]
+}

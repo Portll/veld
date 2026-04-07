@@ -1,0 +1,372 @@
+{
+  "evaluation": "Bifocal+ / Overwatch / Overloop(2→3) — P0-P4 Plan Evaluation",
+  "target": "FourEyes plan to close 14.5pp gap to Backboard.io 90%",
+  "date": "2026-03-28",
+  "build": "v0.5.0",
+  "constraint": "multi_hop >= 0.850 (currently 0.900)",
+
+  "phase_0_risk_triage": {
+    "P0_eval_methodology": {"tier": 2, "reason": "External API integration (GPT-4.1 judge), cost sensitivity (~$50-100 per full LOCOMO run), no code change to retrieval"},
+    "P1_cross_encoder":    {"tier": 1, "reason": "Core scoring path change, touches Layer 5.5, high coupling to embedding pipeline, novel model introduction"},
+    "P2_embedding_upgrade":{"tier": 1, "reason": "Fundamental infrastructure change, requires vector index rebuild, affects ALL retrieval, changes embedding dimension from 384→768"},
+    "P3_temporal_rebuild": {"tier": 1, "reason": "Architectural rebuild of weakest category, complex state (session maps, temporal facts, ordinal resolution), highest regression risk"},
+    "P4_learned_ranker":   {"tier": 1, "reason": "Replaces entire scoring architecture, novel tech (LambdaMART/MLP), requires training pipeline, highest complexity"}
+  },
+
+  "phase_1_edge_walk_and_fractal": {
+
+    "P0_run_full_locomo": {
+      "edge": {
+        "data_crossing": "1540 questions → veld retrieval API → retrieved memories → LLM answer generation → GPT-4.1 judge → J-score",
+        "failure_modes": [
+          "LOCOMO dataset format mismatch: the full dataset has different schema than our 20-query benchmark (multi-choice vs open-ended)",
+          "LLM answer quality depends heavily on prompt engineering for the context window",
+          "GPT-4.1 judge cost: ~1540 API calls × 2 (retrieve + judge) = ~3000 calls ≈ $50-100",
+          "Benchmark reproducibility: LLM answers are non-deterministic, scores vary ±2pp between runs"
+        ],
+        "contracts": "Need to implement: remember_batch → recall → format_context → llm_generate → judge_score pipeline"
+      },
+      "fractal": {
+        "pattern": "Evaluation pipeline mirrors Backboard's methodology",
+        "mirror_test": "HOLDS — all LOCOMO papers use this exact flow. Consistent at all scales.",
+        "breaks": "None — this is standardized methodology"
+      },
+      "hazop": {
+        "NO_generation": "Current state — measuring retrieval, not answers. The gap might be smaller or larger than 14.5pp on J-score",
+        "PART_OF_dataset": "Could run on 100-question subset first as validation before burning $100 on full run"
+      },
+      "score": 7.5,
+      "verdict": "Sound plan. Low risk, high information value. Should be P0 because everything else is optimization in the dark without it."
+    },
+
+    "P1_cross_encoder": {
+      "edge": {
+        "data_crossing": "20 candidate memories × query text → ms-marco model → relevance scores → reranked list",
+        "failure_modes": [
+          "CRITICAL: ms-marco-MiniLM-L-6-v2 is a SEQUENCE CLASSIFICATION model, not an embedding model. It takes (query, document) PAIRS and outputs a relevance score. The current encode_batch() API produces embeddings, not pair scores. The Embedder trait (fn encode(&self, text: &str) -> Vec<f32>) cannot express pair scoring.",
+          "Model size: ms-marco-MiniLM is ~85MB (not 22MB as claimed in FourEyes). Still fits in memory but doubles model footprint.",
+          "Latency: true cross-encoder requires N forward passes (one per candidate) vs 1 batch embed. 20 candidates × ~5ms each = ~100ms. This DOUBLES recall latency from 47ms to ~147ms.",
+          "ONNX compatibility: ms-marco models are PyTorch/HuggingFace. Need to export to ONNX with sequence-pair input format. Not all cross-encoder architectures export cleanly."
+        ],
+        "contracts": "Need NEW trait: CrossEncoder { fn score_pair(&self, query: &str, doc: &str) -> f32 }. Cannot reuse Embedder trait."
+      },
+      "fractal": {
+        "pattern": "Layer 5.5 already exists as bi-encoder rerank. Replacing with real cross-encoder preserves the layer contract.",
+        "mirror_test": "HOLDS at layer level (rerank step). BREAKS at API level (pair scoring vs embedding).",
+        "breaks": "The Embedder abstraction doesn't support pair scoring. This requires a new abstraction."
+      },
+      "hazop": {
+        "MORE_latency": "100ms cross-encoder on top of 47ms retrieval = 147ms total. Still under 200ms SLA but 3x current.",
+        "LESS_candidates": "Could rerank only top-10 instead of top-20 to halve latency: 10 × 5ms = 50ms.",
+        "OTHER_THAN_msmarco": "Could use a lighter cross-encoder like TinyBERT-msmarco (30MB, ~2ms/pair) as compromise.",
+        "REVERSE_regression": "Cross-encoder might rerank multi-hop results WORSE if it doesn't understand compound queries. ms-marco was trained on single-passage relevance, not multi-hop reasoning."
+      },
+      "fmea": {
+        "failure": "Cross-encoder downgrades multi-hop ranking because it scores each memory independently without seeing the query decomposition context",
+        "severity": 8, "probability": 5, "detectability": 3, "rpn": 120,
+        "mitigation": "Skip cross-encoder reranking when decomposed=true (multi-hop queries keep the decomposition-based ranking)"
+      },
+      "score": 6.8,
+      "verdict": "Good plan but implementation is harder than FourEyes suggests. Need new CrossEncoder trait, ONNX export, pair-scoring API. Must gate for decomposed queries to protect multi-hop. Realistic lift: +2-3pp, not +3-5pp."
+    },
+
+    "P2_embedding_upgrade": {
+      "edge": {
+        "data_crossing": "All stored memory embeddings (384-dim) become incompatible with new model (768-dim). Full re-embedding required.",
+        "failure_modes": [
+          "CRITICAL: Vector index (Vamana HNSW) is dimension-specific. Changing from 384 to 768 dims requires complete index rebuild. Every stored memory must be re-embedded. For production systems with 100K+ memories, this is hours of ONNX inference.",
+          "CRITICAL: Dimension constant is likely hardcoded in multiple places. Vamana index, query embedding, cross-encoder similarity, hybrid search — all assume 384 dims.",
+          "Model download: Nomic-embed is ~550MB ONNX (vs MiniLM's ~85MB). 6.5x storage increase.",
+          "Latency: 768-dim model is ~2-3x slower per encoding. Batch inference helps but encode() for single queries will be slower.",
+          "Memory: 768-dim vectors use 2x RAM for the HNSW index. At 100K memories: 384-dim = ~150MB, 768-dim = ~300MB."
+        ],
+        "contracts": "The Embedder trait is dimension-agnostic (returns Vec<f32>). Good. But Vamana index config, storage format, and any code that assumes 384 will break."
+      },
+      "fractal": {
+        "pattern": "Hot-swap embedding model. Standard pattern in production systems.",
+        "mirror_test": "BREAKS — no migration path exists. No dual-model support. No incremental re-embedding.",
+        "breaks": "Production systems need: (1) dual-index during migration, (2) background re-embedding, (3) dimension-aware queries. None exist."
+      },
+      "hazop": {
+        "MORE_dimensions": "768 dims captures more semantics but also more noise. Diminishing returns past ~512 dims for short texts.",
+        "LATE_migration": "If done after P1/P3/P4, those changes assume 384-dim embeddings. Doing P2 last means re-implementing P1/P3/P4 for new dims.",
+        "EARLY_migration": "If done first, all subsequent changes work with the better model. But blocks all other work during migration."
+      },
+      "fmea": {
+        "failure": "Dimension mismatch between stored memories and new model causes silent cosine similarity degradation (different dimension spaces)",
+        "severity": 9, "probability": 7, "detectability": 2, "rpn": 126,
+        "mitigation": "Add dimension validation at storage and retrieval boundaries. Reject queries when embedding dims don't match index dims."
+      },
+      "score": 5.5,
+      "verdict": "Highest lift potential but highest disruption. Should be done EARLY or NOT AT ALL for this cycle. The migration path is the blocker — need dual-index support or accept downtime. Realistic lift: +3-5pp but with 2-3 days of migration work."
+    },
+
+    "P3_temporal_rebuild": {
+      "edge": {
+        "data_crossing": "Query → temporal parser → session resolver → session-scoped retrieval → temporal scoring",
+        "failure_modes": [
+          "HIGH: Session-as-document requires generating session summaries. When are these generated? At storage time (latency hit on remember) or at retrieval time (latency hit on recall)? Background consolidation is the right answer but adds async complexity.",
+          "HIGH: Session detection depends on memory timestamps. Benchmark memories have identical timestamps (created in test). Production memories have real timestamps. The temporal pipeline must work in BOTH cases — session ordering by index when timestamps collide.",
+          "MEDIUM: 'last week' temporal slot filling requires knowing 'now'. The benchmark doesn't set a reference time. resolve_temporal_refs uses Utc::now() which is test-run-dependent.",
+          "MEDIUM: Relative temporal reasoning ('before the architecture change') requires event ordering, not just session ordering. Event ordering needs the knowledge graph — connecting temporal to graph creates cross-system coupling."
+        ],
+        "contracts": "Need: SessionSummarizer (generate summaries), SessionIndex (search sessions), TemporalSlotFiller (resolve relative time refs to absolute ranges)"
+      },
+      "fractal": {
+        "pattern": "Mirrors the entity pipeline: entity detection → entity index → entity-scoped retrieval → entity scoring",
+        "mirror_test": "PARTIALLY HOLDS — the pattern is right (detect → index → scope → score). But the entity pipeline took 6+ months to build. The temporal pipeline is being planned for one sprint.",
+        "breaks": "The entity pipeline benefits from the knowledge graph. The temporal pipeline needs its OWN graph (event ordering graph). This doesn't exist."
+      },
+      "hazop": {
+        "NO_session_summaries": "Without summaries, session-level retrieval is just 'boost all memories from session N'. This is what ordinal resolution already does. The lift comes from SUMMARIES, not just session scoping.",
+        "MORE_sessions": "Production systems with 1000+ memories might have 100+ sessions. Searching sessions requires its own index (BM25 over summaries). More infrastructure.",
+        "REVERSE_regression": "Session-scoped retrieval could HURT open-domain queries by over-constraining to one session. Open-domain queries need CROSS-session retrieval."
+      },
+      "fmea": {
+        "failure": "Session-scoped retrieval narrows candidate pool for open-domain queries, regressing from 0.900 to <0.800",
+        "severity": 8, "probability": 4, "detectability": 4, "rpn": 128,
+        "mitigation": "Only apply session scoping when temporal intent is detected. Open-domain queries bypass session scoping entirely."
+      },
+      "score": 6.2,
+      "verdict": "Right direction but underscoped. The FourEyes plan says 'rebuild temporal pipeline' but the actual work is: build session summarizer + session search index + temporal slot filler + event ordering graph + gated application. This is 3-4 weeks of work, not a sprint task. Recommend: decompose into P3a (session-order recency, 1 day) and P3b (full temporal rebuild, 3 weeks)."
+    },
+
+    "P4_learned_ranker": {
+      "edge": {
+        "data_crossing": "15 layer signals (RRF scores, entity overlap, BM25 match, temporal boost, etc.) → feature vector → LambdaMART/MLP → final score",
+        "failure_modes": [
+          "CRITICAL: Training data is 20 labeled queries × 60 memories = 1,200 query-doc pairs. LambdaMART needs 10K+ pairs for stable learning. 20 queries is NOT enough for cross-validation — you'll overfit to the benchmark.",
+          "CRITICAL: Feature extraction requires exposing all 15 layer scores as separate signals. Currently they're additively fused into one number. Need to refactor the entire fusion pipeline to produce a feature vector, not a scalar.",
+          "HIGH: Regression risk — if the learned ranker is worse than hand-tuned for ANY query type, there's no fallback. Need A/B framework to compare learned vs hand-tuned.",
+          "MEDIUM: LambdaMART needs a training target (relevance labels). The benchmark has binary relevance (expected vs not). Need graded relevance for LambdaMART to learn rank ordering."
+        ],
+        "contracts": "Need: FeatureExtractor (produce per-layer signals), RankerModel (trained scorer), ABFramework (compare rankers), TrainingPipeline (labeled data → model)"
+      },
+      "fractal": {
+        "pattern": "Replace hand-tuned constants with learned weights. Standard ML pattern.",
+        "mirror_test": "BREAKS — the rest of the codebase is hand-tuned with documented rationale (cognitive science references, boost magnitudes with justification). A learned ranker is a black box that breaks the cognitive-science narrative.",
+        "breaks": "The codebase tells a story: 'we model memory like the brain'. A learned ranker says 'we trained a model'. These are different stories. The cognitive framing is a brand asset."
+      },
+      "hazop": {
+        "NO_data": "20 queries is not enough. Need 200+ labeled queries minimum. Could use the full LOCOMO dataset (1540 questions) as training data — but then you can't use it for evaluation too.",
+        "LESS_interpretability": "Hand-tuned boosts are debuggable ('Layer 4.525 gave +0.20 for entity overlap'). Learned weights are not ('feature 7 has weight 0.342'). Debugging regressions becomes harder.",
+        "REVERSE_benefit": "If training data has bias (all benchmark queries are about a software project), the learned ranker will fail on other domains."
+      },
+      "fmea": {
+        "failure": "Learned ranker overfits to 20-query benchmark, fails catastrophically on production queries",
+        "severity": 9, "probability": 8, "detectability": 5, "rpn": 360,
+        "mitigation": "Do NOT implement until P0 provides 1540-query evaluation data. Use P0 data as training set, hold out 20% for validation. Only deploy if validation score > hand-tuned."
+      },
+      "score": 3.8,
+      "verdict": "PREMATURE. The plan has a data problem (20 queries cannot train a ranker), an evaluation problem (no A/B framework), and a narrative problem (breaks cognitive-science brand). Defer until P0 provides real evaluation data AND the additive architecture is proven to have hit a measurable ceiling. Current evidence: scores went from 64.3% to 75.5% with manual tuning — the ceiling hasn't been reached yet."
+    }
+  },
+
+  "phase_2_fractal_atam": {
+    "core_pattern": "Incremental capability addition: each P adds a new signal/capability to the retrieval pipeline",
+    "macro_consistency": "P0→P1→P2→P3 follows a logical dependency chain: measure → improve reranking → improve embeddings → improve temporal. P4 breaks the chain by replacing the architecture before maximizing it.",
+    "meso_breaks": [
+      {
+        "break": "P2 (embedding upgrade) is ordered P2 but has P0 dependency impact",
+        "detail": "If P2 changes embedding dims, P1's cross-encoder cosine similarity must be recalculated, P3's session summaries must be re-embedded, P4's feature space changes. P2 should be BEFORE P1 and P3, or deferred to a separate cycle.",
+        "classification": "ordering_break"
+      },
+      {
+        "break": "P4 contradicts the additive architecture P1-P3 assume",
+        "detail": "P1 adds a cross-encoder boost. P3 adds session-scoped scoring. Both are additive layers. P4 replaces the additive stack with a learned ranker. If P4 is the end goal, P1 and P3 are throwaway work.",
+        "classification": "strategic_contradiction"
+      }
+    ],
+    "tradeoffs": [
+      {
+        "pair": ["P1 latency", "P1 accuracy"],
+        "description": "Cross-encoder adds ~100ms latency for +2-3pp accuracy. Acceptable tradeoff at <200ms total but closes the door on real-time use cases.",
+        "sensitivity": "Can be mitigated by reducing rerank pool from 20 to 10 (50ms instead of 100ms, ~80% of the accuracy gain)"
+      },
+      {
+        "pair": ["P3 temporal accuracy", "P3 open-domain regression"],
+        "description": "Session scoping improves temporal +10-15pp but risks constraining open-domain to one session. Must be gated on temporal intent.",
+        "sensitivity": "Binary: either the gate works (no regression) or it doesn't (regression). Test thoroughly."
+      }
+    ]
+  },
+
+  "phase_2_5_adversarial": {
+    "challenges": [
+      {
+        "target": "P0 score 7.5 — 'high information value'",
+        "attack": "The full LOCOMO dataset uses GPT-4 as judge, which costs money and is non-deterministic. Your 20-query retrieval benchmark is reproducible, free, and deterministic. Running P0 gives you ONE data point that may vary ±2pp between runs. You'd need 5+ runs to get a stable estimate, costing $250-500.",
+        "revised": 7.0,
+        "note": "Still worth doing but budget and variance should be planned for"
+      },
+      {
+        "target": "P1 claimed lift '+3-5pp'",
+        "attack": "FourEyes cited ms-marco-MiniLM as '22MB, <20ms'. It's actually ~85MB and requires N separate forward passes (not batch). At 20 candidates, latency is ~100ms, not <20ms. The lift assumes the cross-encoder improves ranking on ALL query types, but ms-marco was trained on single-passage MSMARCO, not multi-hop or temporal queries. Realistic lift on multi-hop: 0pp (may actually hurt). Realistic lift on single-hop: +3-5pp. Realistic lift on temporal: +1-2pp. Overall: +1.5-3pp, not +3-5pp.",
+        "revised_lift": "+1.5-3pp",
+        "note": "Still worth doing but expectations should be lowered"
+      },
+      {
+        "target": "P3 claimed lift '+10-15pp on temporal'",
+        "attack": "The benchmark has 5 temporal queries. Statistical CI at N=5 is ±0.35 MRR. A +10-15pp claim needs at least 30 temporal queries to be statistically significant. Even if the pipeline is perfect, you can't measure a 10pp improvement with N=5. Furthermore, the Bifocal audit found Q9 is a dataset quality issue (GT-2 CRITICAL), meaning 1 of 5 temporal queries will NEVER score well regardless of pipeline changes. Effective N=4.",
+        "revised_lift": "+5-10pp measurable (real lift may be higher but unmeasurable at N=5)",
+        "note": "Must expand temporal query set to 15+ before claiming temporal improvement"
+      }
+    ]
+  },
+
+  "overwatch_three_body_systems": [
+    {
+      "system": "P1 × P2 × multi-hop",
+      "bodies": ["cross-encoder model", "embedding model", "query decomposition"],
+      "interaction": "If P2 changes embedding dims to 768, the cross-encoder (P1) must also use 768-dim embeddings for cosine similarity to be meaningful. But ms-marco-MiniLM produces 384-dim output. You'd need a DIFFERENT cross-encoder for 768-dim embeddings. P1 and P2 are coupled through dimension compatibility. Meanwhile, query decomposition (which drives multi-hop) creates multiple sub-query embeddings — if P2 makes each embedding 2x larger, decomposition uses 2x more memory per query.",
+      "stability": "UNSTABLE — changing P2 invalidates P1's model choice"
+    },
+    {
+      "system": "P3 × temporal MRR × open-domain MRR",
+      "bodies": ["session scoping", "temporal precision", "open-domain recall"],
+      "interaction": "Session scoping (P3) improves temporal by constraining to the right session. But open-domain queries like 'Summarize the project' need ALL sessions. If the temporal gate (has_any_temporal_intent) has a false positive, open-domain queries get session-scoped and regress. The gate sensitivity creates a three-body: tighter gate = better open-domain but worse temporal recall (misses temporal queries). Looser gate = better temporal but worse open-domain (over-scoping).",
+      "stability": "CONDITIONALLY STABLE — stable if temporal intent detection has <5% false positive rate"
+    },
+    {
+      "system": "P4 × P1 × hand-tuned boosts",
+      "bodies": ["learned ranker", "cross-encoder signal", "15 additive boosts"],
+      "interaction": "If P4 replaces the boost stack, P1's cross-encoder becomes a feature input to the ranker rather than a scoring override. But if P1 is implemented as an additive boost (current plan), then P4 must learn to incorporate it differently than P1 intended. Building P1 as a boost then P4 as a ranker means P1's design is throwaway.",
+      "stability": "UNSTABLE — P1 and P4 are architecturally contradictory when sequenced"
+    }
+  ],
+
+  "overloop_2_iteration": {
+    "iteration_1_original_plan": {
+      "sequence": "P0 → P1 → P2 → P3 → P4",
+      "score": 6.2,
+      "problems": [
+        "P2 before P1 would be better (dimension compatibility)",
+        "P4 contradicts P1 and P3",
+        "P3 is underscoped (weeks of work disguised as a sprint task)",
+        "20-query benchmark can't measure P3's temporal improvement"
+      ]
+    },
+    "iteration_2_revised_plan": {
+      "sequence": "P0 → P3a → P1 → P3b → (P2 as separate cycle) → (P4 deferred)",
+      "changes": [
+        "P3 decomposed: P3a (session-order recency, 1 day) fixes Q5/Q8 without architectural rebuild",
+        "P1 moved after P3a because cross-encoder needs working temporal baseline",
+        "P2 deferred to separate cycle because dimension change is disruptive",
+        "P4 deferred until P0 provides training data AND additive architecture ceiling is proven",
+        "P3b (full temporal rebuild) is a multi-week project, separate planning"
+      ],
+      "score": 7.8,
+      "expected_outcomes": {
+        "P0": "True J-score baseline. Know the real gap. ~2 days.",
+        "P3a": "Session-order recency: temporal MRR 0.650 → 0.750+. ~1 day.",
+        "P1": "Cross-encoder: overall +1.5-3pp. ~3 days (new trait + ONNX export + gating).",
+        "total_cycle": "~6 days → composite 78-80% → gap to Backboard narrows to 10-12pp",
+        "multi_hop_guard": "P1 gated on decomposed=false → multi-hop stays at 0.900"
+      }
+    }
+  },
+
+  "overloop_3_stress_test": {
+    "question": "Does Overloop(3) improve or regress the Overloop(2) plan?",
+    "iteration_3_refinements": [
+      {
+        "refinement": "P3a should also fix the benchmark before measuring P1",
+        "detail": "The Bifocal audit found GT-2 (Q9 temporal query is under-specified) and SCORE-1 (composite formula comment/code mismatch). If we fix the benchmark first, P3a's temporal improvement is measurable. If we don't, N=4 effective temporal queries makes any improvement statistically invisible.",
+        "impact": "IMPROVES — fixing benchmark before measuring is essential for valid optimization"
+      },
+      {
+        "refinement": "P1 cross-encoder should use the SAME model dimension as the embedder",
+        "detail": "If we keep MiniLM-L6-v2 (384-dim), then ms-marco-MiniLM-L-6-v2 (also 384-dim) is the right cross-encoder. If we later upgrade embeddings (P2), we'd need a matching cross-encoder. By keeping P2 deferred, P1's model choice is stable.",
+        "impact": "NEUTRAL — confirms Overloop(2) was right to defer P2"
+      },
+      {
+        "refinement": "Add a regression gate to the plan itself",
+        "detail": "Before each change ships: run LOCOMO benchmark, assert multi_hop MRR >= 0.850 AND no category drops > 0.150 from current baseline. If assertion fails, revert and investigate. This is a CI-level guard, not just a plan note.",
+        "impact": "IMPROVES — makes regression protection explicit and automated"
+      },
+      {
+        "refinement": "P0 can be parallelized with P3a",
+        "detail": "P0 (full LOCOMO evaluation) is an external measurement — it doesn't change code. P3a (session-order recency) is a code change. They can run in parallel. This saves 1-2 days on the critical path.",
+        "impact": "IMPROVES — reduces cycle time from 6 days to 4-5 days"
+      },
+      {
+        "refinement": "Consider skipping P1 entirely if P0 shows retrieval is already sufficient",
+        "detail": "If P0 reveals that the retrieval→answer J-score gap is small (retrieval is already good enough), then the cross-encoder (P1) has lower ROI than improving answer generation quality. P0's result should inform whether P1 or answer generation tuning is the better next step.",
+        "impact": "IMPROVES — makes P1 conditional on P0's findings rather than assumed"
+      }
+    ],
+    "overloop_3_verdict": {
+      "improves_or_regresses": "IMPROVES",
+      "final_plan": "P0 || P3a → benchmark_fix → P1 (conditional on P0) → P3b (separate cycle)",
+      "final_score": 8.2,
+      "rationale": "Overloop(3) adds: benchmark fix, regression gate, parallelization, P1 conditionality. Each refinement either reduces risk or reduces cycle time. No refinement contradicts Overloop(2). The plan converged — Overloop(4) would not produce meaningful improvement."
+    }
+  },
+
+  "phase_3_scoring": {
+    "dimensions": {
+      "correctness":     {"score": 7.0, "evidence": "Plan addresses the right gaps (temporal, reranking, evaluation). Overloop(2) fixed ordering issues. P4 correctly deferred."},
+      "robustness":      {"score": 6.5, "evidence": "Regression gate added in Overloop(3). Multi-hop protected by decomposed=false gating. But P3 temporal gate sensitivity is untested."},
+      "performance":     {"score": 6.0, "evidence": "Cross-encoder adds ~100ms. Manageable but 3x current. No latency regression from P3a (session-order lookup is O(1) in cached session map)."},
+      "security":        {"score": 8.0, "evidence": "No new attack surface. LLM calls in P0 are read-only evaluation, not user-facing. Cross-encoder is local inference."},
+      "data_integrity":  {"score": 7.5, "evidence": "No storage format changes in P3a or P1. P2 (deferred) would change storage format. Good decision to defer."},
+      "maintainability": {"score": 6.0, "evidence": "P1 adds new CrossEncoder trait. P3a adds session-order logic to existing Layer 5.9. Both are incremental. P4 (deferred) would have hurt maintainability."},
+      "scalability":     {"score": 6.5, "evidence": "Session map is cached (O(1) lookup). Cross-encoder is O(N) in rerank pool size (configurable). No scaling concerns for P3a/P1."},
+      "testability":     {"score": 5.5, "evidence": "LOCOMO benchmark is the primary test. But N=5 per category makes measurement noisy. Overloop(3) recommends benchmark expansion."},
+      "compliance":      {"score": 8.0, "evidence": "No PII, no auth changes, no compliance-relevant modifications."},
+      "observability":   {"score": 6.0, "evidence": "Existing tracing covers all layers. Cross-encoder would need its own tracing. Regression gate needs CI integration."},
+      "extensibility":   {"score": 7.0, "evidence": "CrossEncoder trait is a clean extension point. Session-order recency extends existing L5.9. Both follow existing patterns."},
+      "usability":       {"score": 7.0, "evidence": "No user-facing API changes. Cross-encoder is transparent to callers. Session-order recency is invisible."}
+    },
+    "total_score": 81.0,
+    "max_score": 120.0,
+    "percentage": "67.5%",
+    "blockers": "None — all critical dimensions above 4.9"
+  },
+
+  "nine_dimension_matrix": {
+    "quality":      {"score": 7.0, "notes": "Overloop(3) plan is well-reasoned, grounded in code, addresses right gaps"},
+    "completeness": {"score": 6.0, "notes": "Temporal rebuild (P3b) is underscoped. Benchmark expansion not planned. Answer generation (P0) is measurement, not capability."},
+    "performance":  {"score": 6.0, "notes": "Cross-encoder latency is the main concern. Mitigated by pool size reduction."},
+    "utility":      {"score": 7.5, "notes": "Expected outcome: 78-80% composite in 4-5 days. High ROI."},
+    "coherence":    {"score": 8.0, "notes": "Overloop(3) has clean dependency chain with no contradictions. P4 correctly deferred."},
+    "cohesiveness": {"score": 7.5, "notes": "All changes serve one goal (close Backboard gap) via different mechanisms."},
+    "elasticity":   {"score": 6.5, "notes": "P1 is conditional on P0. P3b is separately planned. Plan adapts to new information."},
+    "function":     {"score": 7.0, "notes": "Each priority has clear expected lift with grounded evidence."},
+    "ease_of_use":  {"score": 7.5, "notes": "No user-facing changes. All improvements are invisible to callers."}
+  },
+
+  "regression_guard": {
+    "mechanism": "Before each change ships, run LOCOMO benchmark and assert:",
+    "assertions": [
+      "multi_hop MRR >= 0.850",
+      "No category drops > 0.150 from baseline",
+      "Overall MRR >= previous run (monotonically improving)",
+      "Absence violations do not increase by more than 2"
+    ],
+    "baseline": {
+      "single_hop": 0.900, "temporal": 0.650, "multi_hop": 0.900, "open_domain": 0.900,
+      "overall_mrr": 0.837, "composite": 75.5
+    },
+    "implementation": "Add #[test] fn locomo_regression_gate() that fails if any assertion is violated. Run in CI on every PR to dev."
+  },
+
+  "final_plan": {
+    "sprint_1_week_1": {
+      "parallel_track_A": "P0: Run full LOCOMO with LLM answer generation (2 days setup + $100 budget)",
+      "parallel_track_B": "P3a: Session-order recency in Layer 5.9 (1 day) + benchmark fixes (Q9 expected set, composite formula, 1 day)",
+      "gate": "Run regression test after P3a. Assert multi_hop >= 0.850."
+    },
+    "sprint_1_week_2": {
+      "conditional_on_P0": "If P0 shows retrieval gap > 5pp: implement P1 (cross-encoder, 3 days). If P0 shows retrieval is sufficient: implement answer generation tuning instead.",
+      "gate": "Run regression test after P1. Assert multi_hop >= 0.850."
+    },
+    "sprint_2": {
+      "P3b": "Full temporal rebuild (session summaries, session search index, temporal slot filler). 2-3 weeks.",
+      "P2": "Embedding upgrade if P3b ceiling is reached. Separate planning."
+    },
+    "deferred": {
+      "P4": "Learned ranker. Requires 200+ labeled queries from P0 + expanded benchmark. Not before Sprint 3."
+    }
+  }
+}

@@ -1,0 +1,897 @@
+//! Configuration management for Veld
+//!
+//! All configurable parameters in one place with environment variable overrides.
+//! Follows the principle: sensible defaults, configurable in production.
+
+use std::env;
+use std::path::PathBuf;
+use tracing::info;
+
+/// Legacy storage directory name used in versions <= 0.1.80.
+const LEGACY_STORAGE_DIR: &str = "veld_data";
+
+/// Requested storage backend.
+///
+/// `redb` is the default target for the storage migration, but the current
+/// build still resolves to the legacy RocksDB runtime until the abstraction
+/// layer is landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBackend {
+    Redb,
+    RocksDb,
+}
+
+impl StorageBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redb => "redb",
+            Self::RocksDb => "rocksdb",
+        }
+    }
+
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::RocksDb)
+    }
+}
+
+impl std::fmt::Display for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StorageBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "redb" => Ok(Self::Redb),
+            "rocksdb" | "rocks" | "legacy-rocksdb" => Ok(Self::RocksDb),
+            other => Err(format!(
+                "unsupported storage backend '{other}' (expected 'redb' or 'rocksdb')"
+            )),
+        }
+    }
+}
+
+pub const fn default_requested_storage_backend() -> StorageBackend {
+    StorageBackend::Redb
+}
+
+pub const fn effective_storage_backend_for_current_build(
+    requested: StorageBackend,
+) -> StorageBackend {
+    match requested {
+        StorageBackend::Redb => StorageBackend::RocksDb,
+        StorageBackend::RocksDb => StorageBackend::RocksDb,
+    }
+}
+
+/// Returns the platform-appropriate default storage path.
+///
+/// Resolution order:
+/// 1. If `./veld_data` exists in the cwd (legacy location), use it and warn.
+///    This preserves data for users upgrading from <= 0.1.80.
+/// 2. Otherwise, use the platform data directory:
+///    - Linux: `~/.local/share/veld/`
+///    - macOS: `~/Library/Application Support/veld/`
+///    - Windows: `C:\Users\<user>\AppData\Roaming\veld\`
+/// 3. Falls back to `./veld_data` only if the home directory cannot be determined.
+pub fn default_storage_path() -> PathBuf {
+    let legacy_path = PathBuf::from(LEGACY_STORAGE_DIR);
+    if legacy_path.exists() && legacy_path.is_dir() {
+        eprintln!(
+            "[veld] Found legacy data at ./{LEGACY_STORAGE_DIR}/ in the current directory. \
+             Using it for backward compatibility. To migrate, move it to the platform default \
+             and unset VELD_MEMORY_PATH. See: https://github.com/Portll/veld/issues/89"
+        );
+        return legacy_path;
+    }
+
+    dirs::data_dir()
+        .map(|p| p.join("veld"))
+        .unwrap_or_else(|| PathBuf::from(LEGACY_STORAGE_DIR))
+}
+
+/// Returns true when the server is bound only to the local machine.
+pub fn is_local_bind_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// CORS configuration
+#[derive(Debug, Clone)]
+pub struct CorsConfig {
+    /// Allowed origins (empty = allow all in development)
+    pub allowed_origins: Vec<String>,
+    /// Reject all cross-origin requests, used as a production safety fallback.
+    pub deny_all: bool,
+    /// Allowed HTTP methods
+    pub allowed_methods: Vec<String>,
+    /// Allowed headers
+    pub allowed_headers: Vec<String>,
+    /// Whether to allow credentials
+    pub allow_credentials: bool,
+    /// Max age for preflight cache (seconds)
+    pub max_age_seconds: u64,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            allowed_origins: Vec::new(), // Development default: permissive unless production safety checks override it.
+            deny_all: false,
+            allowed_methods: vec![
+                "GET".to_string(),
+                "POST".to_string(),
+                "PUT".to_string(),
+                "DELETE".to_string(),
+                "OPTIONS".to_string(),
+            ],
+            allowed_headers: vec![
+                "Content-Type".to_string(),
+                "Authorization".to_string(),
+                "X-Request-ID".to_string(),
+            ],
+            allow_credentials: false,
+            max_age_seconds: 86400, // 24 hours
+        }
+    }
+}
+
+impl CorsConfig {
+    /// Load from environment variables with production safety checks
+    ///
+    /// In production mode (VELD_ENV=production), deny all cross-origin requests
+    /// unless VELD_CORS_ORIGINS is explicitly configured.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        let mut cors_origins_configured = false;
+
+        if let Ok(origins) = env::var("VELD_CORS_ORIGINS") {
+            config.allowed_origins = origins
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cors_origins_configured = !config.allowed_origins.is_empty();
+        }
+
+        if let Ok(methods) = env::var("VELD_CORS_METHODS") {
+            config.allowed_methods = methods
+                .split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Ok(headers) = env::var("VELD_CORS_HEADERS") {
+            config.allowed_headers = headers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+
+        if let Ok(val) = env::var("VELD_CORS_CREDENTIALS") {
+            config.allow_credentials = val.to_lowercase() == "true" || val == "1";
+        }
+
+        if let Ok(val) = env::var("VELD_CORS_MAX_AGE") {
+            if let Ok(n) = val.parse() {
+                config.max_age_seconds = n;
+            }
+        }
+
+        // Safety check: deny all in production if CORS origins are not configured.
+        // Warn in development unless suppressed with VELD_CORS_WARN=false.
+        let is_production = env::var("VELD_ENV")
+            .map(|v| {
+                let v = v.to_lowercase();
+                v == "production" || v == "prod"
+            })
+            .unwrap_or(false);
+
+        let cors_warn_suppressed = env::var("VELD_CORS_WARN")
+            .map(|v| v.to_lowercase() == "false" || v == "0")
+            .unwrap_or(false);
+
+        if !cors_origins_configured {
+            if is_production {
+                config.deny_all = true;
+                if !cors_warn_suppressed {
+                    tracing::error!(
+                        "PRODUCTION SAFETY: VELD_CORS_ORIGINS is not set. Rejecting all cross-origin requests until it is configured."
+                    );
+                }
+            } else if !cors_warn_suppressed {
+                tracing::warn!(
+                    "CORS allows all origins in development (no VELD_CORS_ORIGINS set). \
+                     Set VELD_CORS_WARN=false to suppress this warning."
+                );
+            }
+        }
+
+        config
+    }
+
+    /// Check if any origin restrictions are configured
+    pub fn is_restricted(&self) -> bool {
+        self.deny_all || !self.allowed_origins.is_empty()
+    }
+
+    /// Convert to tower-http CorsLayer
+    pub fn to_layer(&self) -> tower_http::cors::CorsLayer {
+        use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+
+        let mut layer = CorsLayer::new();
+
+        // Configure allowed origins
+        if self.deny_all {
+            layer = layer.allow_origin(AllowOrigin::list(Vec::<axum::http::HeaderValue>::new()));
+        } else if self.allowed_origins.is_empty() {
+            // Intentionally permissive in development when no origins are configured.
+            layer = layer.allow_origin(Any);
+        } else {
+            // Parse configured origins, tracking failures
+            let mut valid_origins = Vec::new();
+            let mut invalid_origins = Vec::new();
+
+            for origin_str in &self.allowed_origins {
+                match origin_str.parse::<axum::http::HeaderValue>() {
+                    Ok(origin) => valid_origins.push(origin),
+                    Err(_) => invalid_origins.push(origin_str.clone()),
+                }
+            }
+
+            // Log any invalid origins
+            for invalid in &invalid_origins {
+                tracing::warn!("CORS: Invalid origin '{}' - skipping", invalid);
+            }
+
+            if valid_origins.is_empty() {
+                // All configured origins failed to parse - this is a config error
+                // Do NOT fall back to permissive - that would be a security hole
+                tracing::error!(
+                    "CORS: All {} configured origin(s) failed to parse. \
+                     Rejecting all cross-origin requests. Fix VELD_CORS_ORIGINS.",
+                    self.allowed_origins.len()
+                );
+                // Use an impossible origin to effectively deny all CORS
+                layer =
+                    layer.allow_origin(AllowOrigin::list(Vec::<axum::http::HeaderValue>::new()));
+            } else {
+                if !invalid_origins.is_empty() {
+                    tracing::info!(
+                        "CORS: Using {} valid origin(s), {} invalid skipped",
+                        valid_origins.len(),
+                        invalid_origins.len()
+                    );
+                }
+                layer = layer.allow_origin(AllowOrigin::list(valid_origins));
+            }
+        }
+
+        // Configure allowed methods
+        let methods: Vec<axum::http::Method> = self
+            .allowed_methods
+            .iter()
+            .filter_map(|m| m.parse().ok())
+            .collect();
+        if methods.is_empty() {
+            layer = layer.allow_methods(Any);
+        } else {
+            layer = layer.allow_methods(methods);
+        }
+
+        // Configure allowed headers
+        let headers: Vec<axum::http::HeaderName> = self
+            .allowed_headers
+            .iter()
+            .filter_map(|h| h.parse().ok())
+            .collect();
+        if headers.is_empty() {
+            layer = layer.allow_headers(Any);
+        } else {
+            layer = layer.allow_headers(headers);
+        }
+
+        // Configure credentials
+        if self.allow_credentials {
+            layer = layer.allow_credentials(true);
+        }
+
+        // Configure max age
+        layer = layer.max_age(std::time::Duration::from_secs(self.max_age_seconds));
+
+        layer
+    }
+}
+
+/// Server configuration loaded from environment with defaults
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Server host address (default: 127.0.0.1)
+    /// Set to 0.0.0.0 for Docker or network-accessible deployments
+    pub host: String,
+
+    /// Server port (default: 3030)
+    pub port: u16,
+
+    /// Storage path for the selected storage backend.
+    pub storage_path: PathBuf,
+
+    /// Backend requested by config/CLI. `redb` is the default target.
+    pub requested_storage_backend: StorageBackend,
+
+    /// Backend actually used by the current build/runtime.
+    pub effective_storage_backend: StorageBackend,
+
+    /// Maximum users to keep in memory LRU cache (default: 1000)
+    pub max_users_in_memory: usize,
+
+    /// Maximum audit log entries per user (default: 10000)
+    pub audit_max_entries_per_user: usize,
+
+    /// Audit log rotation check interval (default: 100)
+    pub audit_rotation_check_interval: usize,
+
+    /// Audit log retention days (default: 30)
+    pub audit_retention_days: u64,
+
+    /// Rate limit: requests per second (default: 4000 - LLM-friendly)
+    pub rate_limit_per_second: u64,
+
+    /// Rate limit: burst size (default: 8000 - allows rapid agent bursts)
+    pub rate_limit_burst: u32,
+
+    /// Maximum concurrent requests (default: 200)
+    pub max_concurrent_requests: usize,
+
+    /// Request timeout in seconds (default: 60)
+    /// Requests exceeding this duration are terminated with 408 status
+    pub request_timeout_secs: u64,
+
+    /// Whether running in production mode
+    pub is_production: bool,
+
+    /// Enable multi-tenant collective learning and auth binding integration.
+    pub multi_tenant_mode: bool,
+
+    /// Directory for shared collective state when multi-tenant mode is enabled.
+    pub collective_store_dir: PathBuf,
+
+    /// CORS configuration
+    pub cors: CorsConfig,
+
+    /// Memory maintenance interval in seconds (default: 300 = 5 minutes)
+    /// Controls how often consolidation and activation decay run
+    pub maintenance_interval_secs: u64,
+
+    /// Activation decay factor per maintenance cycle (default: 0.95)
+    /// Memories lose 5% activation each cycle: A_new = A_old * 0.95
+    pub activation_decay_factor: f32,
+
+    /// Backup configuration
+    /// Automatic backup interval in seconds (default: 86400 = 24 hours)
+    /// Set to 0 to disable automatic backups
+    pub backup_interval_secs: u64,
+
+    /// Maximum backups to keep per user (default: 7)
+    /// Older backups are automatically purged
+    pub backup_max_count: usize,
+
+    /// Whether backups are enabled (default: true in production, false in dev)
+    pub backup_enabled: bool,
+
+    /// Maximum entities extracted per memory for graph insertion (default: 10)
+    /// Caps the number of NER/tag/regex entities to prevent O(n²) edge explosion
+    /// in the knowledge graph. 10 entities → max 45 co-occurrence edges.
+    pub max_entities_per_memory: usize,
+
+    /// Log-periodic fractal decay scales in days (default: [7.0, 30.0, 365.0])
+    /// Controls resonance frequencies in the power-law decay function.
+    /// Weekly/monthly/yearly rhythms by default; override via VELD_LOG_PERIODIC_SCALES
+    /// env var (comma-separated, e.g. "14.0,60.0,365.0" for biweekly/bimonthly/yearly)
+    pub log_periodic_scales: Vec<f64>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 3030,
+            storage_path: default_storage_path(),
+            requested_storage_backend: default_requested_storage_backend(),
+            effective_storage_backend: effective_storage_backend_for_current_build(
+                default_requested_storage_backend(),
+            ),
+            max_users_in_memory: 1000,
+            audit_max_entries_per_user: 10_000,
+            audit_rotation_check_interval: 100,
+            audit_retention_days: 30,
+            rate_limit_per_second: 4000,
+            rate_limit_burst: 8000,
+            max_concurrent_requests: 200,
+            request_timeout_secs: 60,
+            is_production: false,
+            multi_tenant_mode: false,
+            collective_store_dir: default_storage_path().join("collective"),
+            cors: CorsConfig::default(),
+            maintenance_interval_secs: 3600, // 1 hour (aligns with biological consolidation timescales)
+            activation_decay_factor: 0.98, // 2% decay per cycle → 62% retained after 24hr, near-zero at 30 days
+            backup_interval_secs: 86400,   // 24 hours
+            backup_max_count: 7,           // Keep 7 backups (1 week of daily backups)
+            backup_enabled: false,         // Disabled by default, auto-enabled in production
+            max_entities_per_memory: 10,   // Cap entities per memory (10 → max 45 edges)
+            log_periodic_scales: vec![7.0, 30.0, 365.0], // Weekly, monthly, yearly resonance
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Load configuration from environment variables with defaults
+    #[allow(clippy::field_reassign_with_default)] // Environment overrides require mutable config
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        // Check production mode first
+        config.is_production = env::var("VELD_ENV")
+            .map(|v| {
+                let v = v.to_lowercase();
+                v == "production" || v == "prod"
+            })
+            .unwrap_or(false);
+
+        // Host (bind address)
+        if let Ok(val) = env::var("VELD_HOST") {
+            config.host = val;
+        }
+
+        // Port
+        if let Ok(val) = env::var("VELD_PORT") {
+            if let Ok(port) = val.parse() {
+                config.port = port;
+            }
+        }
+
+        // Storage path
+        if let Ok(val) = env::var("VELD_MEMORY_PATH") {
+            config.storage_path = PathBuf::from(val);
+        }
+        config.collective_store_dir = config.storage_path.join("collective");
+
+        if let Ok(val) = env::var("VELD_COLLECTIVE_STORE_DIR") {
+            config.collective_store_dir = PathBuf::from(val);
+        }
+
+        if let Ok(val) = env::var("VELD_MULTI_TENANT") {
+            config.multi_tenant_mode = val.eq_ignore_ascii_case("true") || val == "1";
+        }
+
+        // Requested storage backend
+        if let Ok(val) = env::var("VELD_STORAGE_BACKEND") {
+            match val.parse::<StorageBackend>() {
+                Ok(backend) => {
+                    config.requested_storage_backend = backend;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "VELD_STORAGE_BACKEND='{}' ignored: {}. Using default target {}.",
+                        val,
+                        err,
+                        default_requested_storage_backend()
+                    );
+                }
+            }
+        }
+
+        config.effective_storage_backend =
+            effective_storage_backend_for_current_build(config.requested_storage_backend);
+
+        // Max users in memory
+        if let Ok(val) = env::var("VELD_MAX_USERS") {
+            if let Ok(n) = val.parse::<usize>() {
+                config.max_users_in_memory = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "VELD_MAX_USERS=0 is invalid (would evict every user), clamped to 1"
+                    );
+                }
+            }
+        }
+
+        // Audit settings
+        if let Ok(val) = env::var("VELD_AUDIT_MAX_ENTRIES") {
+            if let Ok(n) = val.parse::<usize>() {
+                config.audit_max_entries_per_user = n.max(100);
+                if n < 100 {
+                    tracing::warn!(
+                        "VELD_AUDIT_MAX_ENTRIES={} is below minimum, clamped to 100",
+                        n
+                    );
+                }
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_AUDIT_RETENTION_DAYS") {
+            if let Ok(n) = val.parse() {
+                config.audit_retention_days = n;
+            }
+        }
+
+        let rate_limit_explicit = env::var("VELD_RATE_LIMIT").is_ok();
+
+        // Rate limiting
+        if let Ok(val) = env::var("VELD_RATE_LIMIT") {
+            if let Ok(n) = val.parse() {
+                config.rate_limit_per_second = n;
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_RATE_BURST") {
+            if let Ok(n) = val.parse() {
+                config.rate_limit_burst = n;
+            }
+        }
+
+        if !config.is_production && is_local_bind_host(&config.host) && !rate_limit_explicit {
+            config.rate_limit_per_second = 0;
+        }
+
+        // Concurrency
+        if let Ok(val) = env::var("VELD_MAX_CONCURRENT") {
+            if let Ok(n) = val.parse::<usize>() {
+                config.max_concurrent_requests = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "VELD_MAX_CONCURRENT=0 is invalid (would reject all requests), clamped to 1"
+                    );
+                }
+            }
+        }
+
+        // Request timeout
+        if let Ok(val) = env::var("VELD_REQUEST_TIMEOUT") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.request_timeout_secs = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "VELD_REQUEST_TIMEOUT=0 is invalid (would instant-timeout all requests), clamped to 1"
+                    );
+                }
+            }
+        }
+
+        // CORS configuration
+        config.cors = CorsConfig::from_env();
+
+        // Memory maintenance settings
+        if let Ok(val) = env::var("VELD_MAINTENANCE_INTERVAL") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.maintenance_interval_secs = n.max(10);
+                if n < 10 {
+                    tracing::warn!(
+                        "VELD_MAINTENANCE_INTERVAL={} is below minimum (would cause CPU spin-loop), clamped to 10",
+                        n
+                    );
+                }
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_ACTIVATION_DECAY") {
+            if let Ok(n) = val.parse::<f32>() {
+                if !n.is_finite() {
+                    tracing::warn!(
+                        "VELD_ACTIVATION_DECAY={} is not finite, using default {}",
+                        val,
+                        config.activation_decay_factor
+                    );
+                } else {
+                    let clamped = n.clamp(0.5, 0.99);
+                    if (clamped - n).abs() > f32::EPSILON {
+                        tracing::warn!(
+                            "VELD_ACTIVATION_DECAY={} clamped to {} (valid range: 0.5–0.99)",
+                            n,
+                            clamped
+                        );
+                    }
+                    config.activation_decay_factor = clamped;
+                }
+            }
+        }
+
+        // Backup configuration
+        if let Ok(val) = env::var("VELD_BACKUP_INTERVAL") {
+            if let Ok(n) = val.parse::<u64>() {
+                if n == 0 {
+                    tracing::warn!(
+                        "VELD_BACKUP_INTERVAL=0 — backups will run every maintenance cycle"
+                    );
+                }
+                config.backup_interval_secs = n;
+            }
+        }
+
+        if let Ok(val) = env::var("VELD_BACKUP_MAX_COUNT") {
+            if let Ok(n) = val.parse::<usize>() {
+                config.backup_max_count = n.max(1);
+                if n == 0 {
+                    tracing::warn!(
+                        "VELD_BACKUP_MAX_COUNT=0 is invalid (would keep no backups), clamped to 1"
+                    );
+                }
+            }
+        }
+
+        // Auto-enable backups in production mode unless explicitly disabled
+        if let Ok(val) = env::var("VELD_BACKUP_ENABLED") {
+            config.backup_enabled = val.to_lowercase() == "true" || val == "1";
+        } else if config.is_production {
+            // Auto-enable in production
+            config.backup_enabled = true;
+        }
+
+        // Entity extraction cap
+        if let Ok(val) = env::var("VELD_MAX_ENTITIES") {
+            if let Ok(n) = val.parse::<usize>() {
+                let clamped = n.clamp(1, 50);
+                if clamped != n {
+                    tracing::warn!(
+                        "VELD_MAX_ENTITIES={} clamped to {} (valid range: 1–50)",
+                        n,
+                        clamped
+                    );
+                }
+                config.max_entities_per_memory = clamped;
+            }
+        }
+
+        // Log-periodic decay scales (comma-separated floats, e.g. "14.0,60.0,365.0")
+        if let Ok(val) = env::var("VELD_LOG_PERIODIC_SCALES") {
+            let parsed: Vec<f64> = val
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .filter(|&v| (1.0..=730.0).contains(&v))
+                .collect();
+            if parsed.is_empty() {
+                tracing::warn!(
+                    "VELD_LOG_PERIODIC_SCALES='{}' — no valid scales (need ≥1 float in 1.0–730.0), using defaults",
+                    val
+                );
+            } else {
+                tracing::info!(
+                    "Log-periodic scales overridden: {:?} (default: [7.0, 30.0, 365.0])",
+                    parsed
+                );
+                config.log_periodic_scales = parsed;
+            }
+        }
+
+        config
+    }
+
+    /// Log the current configuration
+    pub fn log(&self) {
+        info!("📋 Configuration:");
+        info!(
+            "   Mode: {}",
+            if self.is_production {
+                "PRODUCTION"
+            } else {
+                "Development"
+            }
+        );
+        info!("   Port: {}", self.port);
+        info!("   Storage: {:?}", self.storage_path);
+        if self.requested_storage_backend == self.effective_storage_backend {
+            info!("   Backend: {}", self.effective_storage_backend);
+        } else {
+            info!(
+                "   Backend: requested {}, running {} (compatibility path)",
+                self.requested_storage_backend,
+                self.effective_storage_backend
+            );
+        }
+        info!("   Max users in memory: {}", self.max_users_in_memory);
+        if self.rate_limit_per_second > 0 {
+            info!(
+                "   Rate limit: {} req/sec (burst: {})",
+                self.rate_limit_per_second, self.rate_limit_burst
+            );
+        } else {
+            info!("   Rate limit: disabled");
+        }
+        info!("   Max concurrent: {}", self.max_concurrent_requests);
+        info!("   Request timeout: {}s", self.request_timeout_secs);
+        info!("   Audit retention: {} days", self.audit_retention_days);
+        if self.cors.is_restricted() {
+            if self.cors.deny_all {
+                info!("   CORS: deny-all (set VELD_CORS_ORIGINS to allow browsers)");
+            } else {
+                info!("   CORS origins: {:?}", self.cors.allowed_origins);
+            }
+        } else {
+            info!("   CORS: Permissive (development default)");
+        }
+        info!(
+            "   Maintenance interval: {}s (decay factor: {:.2})",
+            self.maintenance_interval_secs, self.activation_decay_factor
+        );
+        if self.backup_enabled {
+            let interval_hours = self.backup_interval_secs / 3600;
+            info!(
+                "   Backup: enabled (every {}h, keep {})",
+                interval_hours, self.backup_max_count
+            );
+        } else {
+            info!("   Backup: disabled");
+        }
+    }
+}
+
+/// Environment variable documentation
+#[allow(unused)] // Public API - available for CLI help output
+pub fn print_env_help() {
+    println!("Veld Configuration Environment Variables:");
+    println!();
+    println!("  VELD_ENV              - Set to 'production' or 'prod' for production mode");
+    println!(
+        "  VELD_HOST             - Bind address (default: 127.0.0.1, use 0.0.0.0 for Docker)"
+    );
+    println!("  VELD_PORT             - Server port (default: 3030)");
+    println!("  VELD_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/veld/)");
+    println!("  VELD_STORAGE_BACKEND  - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
+    println!("  VELD_API_KEYS         - Comma-separated API keys (required in production)");
+    println!("  VELD_DEV_API_KEY      - Development API key (required in dev if VELD_API_KEYS not set)");
+    println!("  VELD_ENCRYPTION_KEY   - 32-byte field-encryption key (required for encrypted-at-rest production)");
+    println!("  VELD_MAX_USERS        - Max users in memory LRU (default: 1000)");
+    println!("  VELD_RATE_LIMIT       - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
+    println!("  VELD_RATE_BURST       - Burst size (default: 8000)");
+    println!("  VELD_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
+    println!("  VELD_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
+    println!("  VELD_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
+    println!("  VELD_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");
+    println!();
+    println!("Integration APIs:");
+    println!("  LINEAR_API_URL         - Linear GraphQL API URL (default: https://api.linear.app/graphql)");
+    println!("  LINEAR_WEBHOOK_SECRET  - Linear webhook signing secret for HMAC verification");
+    println!("  GITHUB_API_URL         - GitHub REST API URL (default: https://api.github.com)");
+    println!("  GITHUB_WEBHOOK_SECRET  - GitHub webhook secret for HMAC verification");
+    println!();
+    println!("CORS Configuration:");
+    println!("  VELD_CORS_ORIGINS     - Comma-separated allowed origins (required in production for browser access)");
+    println!("  VELD_CORS_METHODS     - Comma-separated allowed methods (default: GET,POST,PUT,DELETE,OPTIONS)");
+    println!("  VELD_CORS_HEADERS     - Comma-separated allowed headers (default: Content-Type,Authorization,X-Request-ID)");
+    println!("  VELD_CORS_CREDENTIALS - Allow credentials true/false (default: false)");
+    println!("  VELD_CORS_MAX_AGE     - Preflight cache seconds (default: 86400)");
+    println!();
+    println!("Backup Configuration:");
+    println!("  VELD_BACKUP_ENABLED   - Enable automatic backups true/false (default: auto in production)");
+    println!("  VELD_BACKUP_INTERVAL  - Backup interval in seconds (default: 86400 = 24 hours)");
+    println!("  VELD_BACKUP_MAX_COUNT - Max backups to keep per user (default: 7)");
+    println!();
+    println!("  RUST_LOG               - Log level (e.g., info, debug, trace)");
+    println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn test_default_config() {
+        let config = ServerConfig::default();
+        assert_eq!(config.port, 3030);
+        assert_eq!(config.max_users_in_memory, 1000);
+        assert!(!config.is_production);
+        assert_eq!(config.requested_storage_backend, StorageBackend::Redb);
+        assert_eq!(config.effective_storage_backend, StorageBackend::RocksDb);
+    }
+
+    #[test]
+    fn test_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("VELD_PORT", "8080");
+        env::set_var("VELD_MAX_USERS", "500");
+        env::set_var("VELD_STORAGE_BACKEND", "rocksdb");
+
+        let config = ServerConfig::from_env();
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.max_users_in_memory, 500);
+        assert_eq!(config.requested_storage_backend, StorageBackend::RocksDb);
+        assert_eq!(config.effective_storage_backend, StorageBackend::RocksDb);
+
+        env::remove_var("VELD_PORT");
+        env::remove_var("VELD_MAX_USERS");
+        env::remove_var("VELD_STORAGE_BACKEND");
+    }
+
+    #[test]
+    fn test_local_dev_disables_rate_limit_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("VELD_RATE_LIMIT");
+        env::remove_var("VELD_HOST");
+        env::remove_var("VELD_ENV");
+
+        let config = ServerConfig::from_env();
+        assert_eq!(config.rate_limit_per_second, 0);
+    }
+
+    #[test]
+    fn test_explicit_rate_limit_override_is_preserved_locally() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("VELD_RATE_LIMIT", "4000");
+        env::remove_var("VELD_HOST");
+        env::remove_var("VELD_ENV");
+
+        let config = ServerConfig::from_env();
+        assert_eq!(config.rate_limit_per_second, 4000);
+
+        env::remove_var("VELD_RATE_LIMIT");
+    }
+
+    #[test]
+    fn test_cors_default_is_permissive() {
+        let cors = CorsConfig::default();
+        assert!(!cors.is_restricted());
+        assert!(cors.allowed_origins.is_empty());
+        assert!(!cors.deny_all);
+        assert!(!cors.allowed_methods.is_empty());
+        assert!(!cors.allowed_headers.is_empty());
+    }
+
+    #[test]
+    fn test_production_without_cors_origins_denies_all() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("VELD_ENV", "production");
+        env::remove_var("VELD_CORS_ORIGINS");
+
+        let cors = CorsConfig::from_env();
+        assert!(cors.deny_all);
+        assert!(cors.is_restricted());
+
+        env::remove_var("VELD_ENV");
+    }
+
+    #[test]
+    fn test_production_with_cors_origins_is_restricted_but_not_deny_all() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("VELD_ENV", "production");
+        env::set_var("VELD_CORS_ORIGINS", "https://app.example.com");
+
+        let cors = CorsConfig::from_env();
+        assert!(!cors.deny_all);
+        assert!(cors.is_restricted());
+        assert_eq!(cors.allowed_origins, vec!["https://app.example.com".to_string()]);
+
+        env::remove_var("VELD_ENV");
+        env::remove_var("VELD_CORS_ORIGINS");
+    }
+
+    #[test]
+    fn test_cors_with_origins_is_restricted() {
+        let cors = CorsConfig {
+            allowed_origins: vec!["https://example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(cors.is_restricted());
+    }
+
+    #[test]
+    fn test_cors_to_layer_permissive() {
+        let cors = CorsConfig::default();
+        let _layer = cors.to_layer(); // Should not panic
+    }
+
+    #[test]
+    fn test_cors_to_layer_restricted() {
+        let cors = CorsConfig {
+            allowed_origins: vec!["https://example.com".to_string()],
+            ..Default::default()
+        };
+        let _layer = cors.to_layer(); // Should not panic
+    }
+}

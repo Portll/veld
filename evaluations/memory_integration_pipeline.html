@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>veld Memory Integration Pipeline</title>
+<style>
+  :root {
+    --bg: #081018;
+    --bg2: #0d1721;
+    --panel: rgba(11, 20, 30, 0.86);
+    --panel2: rgba(17, 29, 41, 0.92);
+    --line: rgba(140, 180, 220, 0.16);
+    --line-strong: rgba(140, 180, 220, 0.32);
+    --text: #e7eff9;
+    --muted: #93a7bc;
+    --glow: 0 24px 80px rgba(0, 0, 0, 0.42);
+    --ingest: #f97352;
+    --store: #52b6ff;
+    --retrieve: #94d82d;
+    --feedback: #ff5d73;
+    --maintain: #9b8cff;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background:
+      radial-gradient(circle at 10% 10%, rgba(82, 182, 255, 0.12), transparent 24%),
+      radial-gradient(circle at 90% 14%, rgba(249, 115, 82, 0.14), transparent 22%),
+      radial-gradient(circle at 16% 88%, rgba(155, 140, 255, 0.12), transparent 28%),
+      linear-gradient(180deg, var(--bg) 0%, #060c13 100%);
+    color: var(--text);
+    font-family: "SF Mono", "Fira Code", Menlo, Consolas, monospace;
+  }
+
+  body {
+    padding: 22px;
+  }
+
+  .frame {
+    max-width: 1580px;
+    margin: 0 auto;
+    display: grid;
+    gap: 18px;
+  }
+
+  .panel {
+    background: linear-gradient(180deg, rgba(14, 24, 36, 0.94), rgba(9, 16, 24, 0.94));
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    box-shadow: var(--glow);
+    overflow: hidden;
+  }
+
+  .hero {
+    display: grid;
+    grid-template-columns: 1.2fr 0.95fr;
+    gap: 18px;
+    padding: 22px;
+  }
+
+  .eyebrow {
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(32px, 5vw, 64px);
+    line-height: 0.95;
+    letter-spacing: -0.04em;
+  }
+
+  .intro {
+    color: #bfd0e3;
+    font-size: 15px;
+    line-height: 1.7;
+    max-width: 78ch;
+    margin-top: 16px;
+  }
+
+  .chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 18px;
+  }
+
+  .chip,
+  .hero a.link-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(20, 32, 45, 0.82);
+    color: var(--text);
+    text-decoration: none;
+    font-size: 12px;
+  }
+
+  .hero-side {
+    display: grid;
+    gap: 12px;
+  }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .stat-card {
+    padding: 16px;
+    border-radius: 18px;
+    background: rgba(20, 32, 45, 0.88);
+    border: 1px solid var(--line);
+  }
+
+  .stat-card .label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+
+  .stat-card .value {
+    margin-top: 6px;
+    font-size: 26px;
+    font-weight: 700;
+  }
+
+  .stat-card p {
+    margin: 8px 0 0;
+    color: #b5c6d8;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .hero-note {
+    padding: 16px;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(22, 36, 51, 0.92), rgba(13, 22, 32, 0.92));
+    color: #c5d4e4;
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .toolbar {
+    padding: 14px 18px;
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .toolbar .left,
+  .toolbar .right {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .toolbar button,
+  .toolbar a {
+    appearance: none;
+    background: rgba(18, 29, 42, 0.88);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 9px 14px;
+    cursor: pointer;
+    text-decoration: none;
+    font: 600 12px/1.2 inherit;
+    transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+  }
+
+  .toolbar button:hover,
+  .toolbar button.active,
+  .toolbar a:hover {
+    transform: translateY(-1px);
+    border-color: var(--line-strong);
+    background: rgba(26, 41, 58, 0.96);
+  }
+
+  .scene-panel {
+    padding: 20px;
+  }
+
+  .scene-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    align-items: end;
+    margin-bottom: 16px;
+  }
+
+  .scene-head h2,
+  .detail-head h2,
+  .surface-head h2 {
+    margin: 0;
+    font-size: 18px;
+  }
+
+  .scene-head p,
+  .detail-head p,
+  .surface-head p {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .scene {
+    min-height: 500px;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background:
+      linear-gradient(180deg, rgba(7, 13, 21, 0.94), rgba(8, 13, 20, 0.94)),
+      repeating-linear-gradient(90deg, transparent 0, transparent 120px, rgba(255,255,255,0.02) 120px, rgba(255,255,255,0.02) 121px),
+      repeating-linear-gradient(180deg, transparent 0, transparent 120px, rgba(255,255,255,0.02) 120px, rgba(255,255,255,0.02) 121px);
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 28px 24px 46px;
+  }
+
+  .space {
+    min-width: 1320px;
+    display: flex;
+    gap: 26px;
+    align-items: stretch;
+    height: 100%;
+  }
+
+  .space-lane {
+    flex: 1 0 250px;
+    min-width: 250px;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: 16px;
+    transition: opacity 160ms ease, transform 160ms ease;
+  }
+
+  .space-lane.dim,
+  .detail-section.dim,
+  .surface-card.dim {
+    opacity: 0.22;
+  }
+
+  .space-label {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .space-label h3 {
+    margin: 0;
+    font-size: 16px;
+  }
+
+  .space-label span {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+  }
+
+  .space-stack {
+    position: relative;
+    padding: 18px 0 8px;
+    transform-style: preserve-3d;
+    transform: perspective(1800px) rotateX(24deg) rotateZ(-8deg);
+    transform-origin: center top;
+  }
+
+  .space-stack::before {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    top: 20px;
+    bottom: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: 16px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.18));
+    box-shadow: 0 24px 40px rgba(0, 0, 0, 0.28);
+  }
+
+  .space-node {
+    position: relative;
+    z-index: 1;
+    margin: 0 18px 14px;
+    min-height: 98px;
+    border-radius: 16px;
+    padding: 16px 16px 14px;
+    border: 1px solid rgba(255,255,255,0.09);
+    background: linear-gradient(180deg, rgba(255,255,255,0.14), rgba(255,255,255,0.05));
+    box-shadow: 0 16px 24px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    transform: translateZ(calc(var(--depth) * 10px)) translateY(calc(var(--depth) * -4px)) translateX(calc(var(--depth) * 2px));
+    overflow: hidden;
+  }
+
+  .space-node::before {
+    content: "";
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: -12px;
+    height: 16px;
+    border-radius: 0 0 12px 12px;
+    background: linear-gradient(180deg, rgba(22, 35, 49, 0.88), rgba(7, 12, 18, 0.98));
+    transform: skewX(-28deg);
+    opacity: 0.88;
+    filter: blur(0.2px);
+  }
+
+  .space-node::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+    opacity: 0.65;
+  }
+
+  .space-node strong,
+  .space-node span {
+    position: relative;
+    z-index: 1;
+    display: block;
+  }
+
+  .space-node strong {
+    font-size: 13px;
+    line-height: 1.35;
+    max-width: 20ch;
+    text-wrap: balance;
+  }
+
+  .space-node span {
+    margin-top: 7px;
+    color: rgba(231, 239, 249, 0.74);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+
+  .detail-panel,
+  .surface-panel {
+    padding: 20px;
+  }
+
+  .detail-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+  }
+
+  .detail-section,
+  .surface-card {
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: linear-gradient(180deg, rgba(17, 27, 40, 0.92), rgba(11, 18, 27, 0.92));
+    padding: 16px;
+    transition: opacity 160ms ease, transform 160ms ease;
+  }
+
+  .detail-section:hover,
+  .surface-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--line-strong);
+  }
+
+  .detail-kicker {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    box-shadow: 0 0 18px currentColor;
+  }
+
+  .detail-kicker span {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+  }
+
+  .detail-section h3,
+  .surface-card h3 {
+    margin: 0;
+    font-size: 18px;
+  }
+
+  .section-summary,
+  .surface-card p {
+    margin: 10px 0 0;
+    color: #b7c8da;
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .stage-grid {
+    display: grid;
+    gap: 12px;
+    margin-top: 14px;
+  }
+
+  .stage-card {
+    border-radius: 16px;
+    border: 1px solid rgba(143, 176, 214, 0.12);
+    background: rgba(10, 17, 27, 0.72);
+    padding: 14px;
+  }
+
+  .stage-head,
+  .compat-head {
+    display: flex;
+    gap: 10px;
+    align-items: start;
+    justify-content: space-between;
+  }
+
+  .stage-card h4 {
+    margin: 0;
+    font-size: 14px;
+  }
+
+  .status-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 5px 9px;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    white-space: nowrap;
+  }
+
+  .status-live {
+    color: #bff2ca;
+    background: rgba(45, 122, 77, 0.22);
+    border-color: rgba(87, 201, 130, 0.24);
+  }
+
+  .status-conditional {
+    color: #ffe7a1;
+    background: rgba(164, 109, 17, 0.22);
+    border-color: rgba(255, 202, 92, 0.24);
+  }
+
+  .status-compat {
+    color: #cde6ff;
+    background: rgba(41, 89, 156, 0.22);
+    border-color: rgba(91, 157, 255, 0.24);
+  }
+
+  .status-deprecated {
+    color: #ffc4cf;
+    background: rgba(145, 43, 69, 0.22);
+    border-color: rgba(255, 111, 144, 0.24);
+  }
+
+  .stage-card p {
+    margin: 8px 0 0;
+    color: #b7c8da;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .anchor-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .anchor-list a {
+    color: #d9ecff;
+    text-decoration: none;
+    border: 1px solid rgba(143, 176, 214, 0.14);
+    background: rgba(17, 28, 41, 0.85);
+    border-radius: 999px;
+    padding: 7px 10px;
+    font-size: 11px;
+    line-height: 1.25;
+  }
+
+  .anchor-list a:hover {
+    border-color: rgba(143, 176, 214, 0.32);
+  }
+
+  .surface-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+  }
+
+  .compat-panel {
+    padding: 20px;
+  }
+
+  .compat-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+  }
+
+  .compat-card {
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: linear-gradient(180deg, rgba(17, 27, 40, 0.92), rgba(11, 18, 27, 0.92));
+    padding: 16px;
+  }
+
+  .compat-card p {
+    margin: 10px 0 0;
+    color: #b7c8da;
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .space-status {
+    margin-top: 8px;
+    display: inline-flex;
+  }
+
+  .foot {
+    padding: 0 20px 20px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.65;
+  }
+
+  @media (max-width: 1200px) {
+    .hero,
+    .detail-grid,
+    .surface-grid,
+    .compat-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  @media (max-width: 720px) {
+    body {
+      padding: 12px;
+    }
+
+    .hero,
+    .scene-panel,
+    .detail-panel,
+    .surface-panel {
+      padding: 16px;
+    }
+
+    .stat-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .scene {
+      min-height: 400px;
+      padding: 22px 16px 38px;
+    }
+
+    .space {
+      min-width: 1120px;
+    }
+
+    .space-stack {
+      transform: perspective(1800px) rotateX(18deg) rotateZ(-5deg);
+    }
+  }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <section class="panel hero">
+      <div>
+        <p class="eyebrow">veld / anchored system surface</p>
+        <h1>Memory Integration Pipeline</h1>
+        <p class="intro">
+          This view maps the operational loop that actually shapes behavior in veld: experience arrives through remember,
+          streaming, or import paths; it is normalized into canonical memory and graph structures; retrieval produces attributions;
+          reinforcement feeds those attributions back into importance and hybrid weights; maintenance converts repeated episodic traces
+          into slower semantic structure.
+        </p>
+        <div class="chip-row">
+          <span class="chip">/api/remember</span>
+          <span class="chip">/api/recall</span>
+          <span class="chip">/api/proactive_context</span>
+          <span class="chip">/api/reinforce</span>
+          <span class="chip">facts + replay + decay + migration</span>
+          <a class="link-chip" href="reinforcement_feedback_loop.html">open reinforcement loop page</a>
+        </div>
+      </div>
+      <div class="hero-side">
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="label">Pipeline Lanes</div>
+            <div class="value">5</div>
+            <p>Ingest, storage, retrieval, feedback, and maintenance are represented as separate but coupled surfaces.</p>
+          </div>
+          <div class="stat-card">
+            <div class="label">Stage Anchors</div>
+            <div class="value">22</div>
+            <p>Every stage below cites exact source locations so the visualization can be inspected against the implementation.</p>
+          </div>
+          <div class="stat-card">
+            <div class="label">Primary Loop</div>
+            <div class="value">Recall</div>
+            <p>Ranking state is persistent. Retrieval stores attribution, then feedback shifts future blend weights and salience.</p>
+          </div>
+          <div class="stat-card">
+            <div class="label">Secondary Loop</div>
+            <div class="value">Consolidate</div>
+            <p>Fact extraction, replay, decay, and migration reshape what remains durable after repeated access.</p>
+          </div>
+        </div>
+        <div class="hero-note">
+          The top surface is intentionally denser and darker to align with the existing evaluation visuals. It is not a raw call graph dump.
+          It is a code-anchored systems view: enough abstraction to see the loop, enough exactness to jump back into the implementation.
+        </div>
+      </div>
+    </section>
+
+    <section class="panel toolbar">
+      <div class="left" id="filters"></div>
+      <div class="right">
+        <a href="pipeline_visualization.html">retrieval gate chain</a>
+        <a href="multihop_scoring_pipeline.html">multi-hop scoring trace</a>
+      </div>
+    </section>
+
+    <section class="panel scene-panel">
+      <div class="scene-head">
+        <div>
+          <h2>Depth Surface</h2>
+          <p>Each slab is a stage. The z-stacked geometry shows where experience gets compressed into fewer, more consequential state transitions.</p>
+        </div>
+        <div class="chip">filter lanes to isolate one loop</div>
+      </div>
+      <div class="scene">
+        <div class="space" id="space"></div>
+      </div>
+    </section>
+
+    <section class="panel detail-panel">
+      <div class="detail-head">
+        <h2>Exact Stage Anchors</h2>
+        <p>Every stage card lists exact file-and-line anchors used to build this surface. The links open the source file; the line marker is in the label.</p>
+      </div>
+      <div class="detail-grid" id="details"></div>
+    </section>
+
+    <section class="panel surface-panel">
+      <div class="surface-head">
+        <h2>Why The Loop Matters</h2>
+        <p>The system does not remember by only storing text. Durable behavior emerges from interaction between canonical memory, graph structure, retrieval state, and maintenance.</p>
+      </div>
+      <div class="surface-grid" id="surfaces"></div>
+    </section>
+
+    <section class="panel compat-panel">
+      <div class="surface-head">
+        <h2>Compatibility Surface</h2>
+        <p>These items are intentionally outside the active memory loop. They are aliases or deprecated compatibility seams that exist for clients, migration, or staged cleanup.</p>
+      </div>
+      <div class="compat-grid" id="compat"></div>
+    </section>
+
+    <div class="foot panel">
+      Source anchors included here come from the current memory core, recall and reinforcement handlers, GraphMemory, streaming ingestion, replay, temporal facts, and storage fallback paths.
+      The emphasis is on integration seams: where one subsystem changes the effective behavior of another.
+    </div>
+  </div>
+
+  <script>
+    const LANES = [
+      {
+        key: 'ingest',
+        title: 'Ingest',
+        accent: 'var(--ingest)',
+        summary: 'Entry points converge into the shared remember path before any graph or search structure is updated.',
+        stages: [
+          {
+            title: 'External entry points',
+            status: 'live',
+            short: 'remember, streaming, import',
+            blurb: 'HTTP remember, streaming extraction, and MIF import all feed experience payloads into the memory core.',
+            anchors: [
+              { label: 'src/handlers/remember.rs:303 remember', href: '../src/handlers/remember.rs' },
+              { label: 'src/streaming.rs:710 StreamingMemoryExtractor', href: '../src/streaming.rs' },
+              { label: 'src/mif/import.rs:242 import_graph_entities', href: '../src/mif/import.rs' },
+              { label: 'src/mif/import.rs:279 import_graph_relationships', href: '../src/mif/import.rs' }
+            ]
+          },
+          {
+            title: 'Normalization and deferred variants',
+            status: 'live',
+            short: 'shared remember core',
+            blurb: 'Remember, deferred remember, and agent-aware remember all funnel through the same normalized write path.',
+            anchors: [
+              { label: 'src/memory/mod.rs:899 remember_deferred', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:913 remember_impl', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:1511 remember_with_agent_impl', href: '../src/memory/mod.rs' }
+            ]
+          },
+          {
+            title: 'Idempotency guard',
+            status: 'live',
+            short: 'content hash lookup',
+            blurb: 'Content hash lookup blocks duplicate inserts before the system spends work on embedding, persistence, or graph projection.',
+            anchors: [
+              { label: 'src/memory/mod.rs:925 get_by_content_hash', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:1522 get_by_content_hash (agent path)', href: '../src/memory/mod.rs' }
+            ]
+          }
+        ]
+      },
+      {
+        key: 'store',
+        title: 'Storage + Index',
+        accent: 'var(--store)',
+        summary: 'The canonical memory is embedded, persisted, pushed into caches and indexes, then projected into graph structures.',
+        stages: [
+          {
+            title: 'Embedding and cache seam',
+            status: 'live',
+            short: 'content-cache before write',
+            blurb: 'Embedding work is cached on content hash, including deferred finalization paths that fill in the heavy vector later.',
+            anchors: [
+              { label: 'src/memory/mod.rs:842 sha256_hash content cache', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:944 cached embedding reuse', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:1269 deferred embedding finalize path', href: '../src/memory/mod.rs' }
+            ]
+          },
+          {
+            title: 'Tiered memory store',
+            status: 'live',
+            short: 'working, session, long-term',
+            blurb: 'The same remember implementation coordinates immediate-tier state and durable long-term storage.',
+            anchors: [
+              { label: 'src/memory/mod.rs:913 remember_impl', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:1496 remember_with_agent', href: '../src/memory/mod.rs' }
+            ]
+          },
+          {
+            title: 'Hybrid search projection',
+            status: 'live',
+            short: 'vector plus BM25 fusion',
+            blurb: 'The memory is made retrievable by both vector search and BM25, with the hybrid engine acting as the future fusion seam.',
+            anchors: [
+              { label: 'src/memory/mod.rs:627 HybridSearchEngine::new', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/hybrid_search.rs:1041 search_with_dynamic_weights', href: '../src/memory/hybrid_search.rs' },
+              { label: 'src/memory/retrieval.rs:867 search_ids', href: '../src/memory/retrieval.rs' }
+            ]
+          },
+          {
+            title: 'Graph integration',
+            status: 'live',
+            short: 'edges and coactivation substrate',
+            blurb: 'Experience is also projected into GraphMemory, where relationships and directional coactivation become later retrieval and reinforcement substrate.',
+            anchors: [
+              { label: 'src/memory/mod.rs:1713 add_relationship', href: '../src/memory/mod.rs' },
+              { label: 'src/graph_memory.rs:2416 add_relationship', href: '../src/graph_memory.rs' },
+              { label: 'src/graph_memory.rs:3956 record_memory_coactivation', href: '../src/graph_memory.rs' }
+            ]
+          }
+        ]
+      },
+      {
+        key: 'retrieve',
+        title: 'Retrieval',
+        accent: 'var(--retrieve)',
+        summary: 'Recall generates candidate sets, fuses signals, and saves attribution state that can be reused later during reinforcement.',
+        stages: [
+          {
+            title: 'Query analysis and proactive context',
+            status: 'live',
+            short: 'strip noise, parse intent',
+            blurb: 'Proactive context and recall strip noise, inspect context, and decide which retrieval branches should fire.',
+            anchors: [
+              { label: 'src/handlers/recall.rs:930 proactive_context', href: '../src/handlers/recall.rs' },
+              { label: 'src/memory/recall.rs:400 temporal fact lookup', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/recall.rs:664 query_cache lookup', href: '../src/memory/recall.rs' }
+            ]
+          },
+          {
+            title: 'Candidate fetch across sources',
+            status: 'live',
+            short: 'tiers, graph, facts, hybrid',
+            blurb: 'Vector search, graph spreading, BM25 fusion, and temporal fact sourcing all compete to place memories into the candidate pool.',
+            anchors: [
+              { label: 'src/memory/recall.rs:1111 sub-query search_ids', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/recall.rs:1384 search_with_dynamic_weights', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/recall.rs:1507 temporal fact boost', href: '../src/memory/recall.rs' }
+            ]
+          },
+          {
+            title: 'Attribution snapshot',
+            status: 'live',
+            short: 'signals persisted for later',
+            blurb: 'Winning memories carry a signal attribution snapshot, which becomes the fallback supervision source for later reinforce calls.',
+            anchors: [
+              { label: 'src/memory/recall.rs:3628 last_signal_attributions write', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/mod.rs:816 last_signal_attributions accessor', href: '../src/memory/mod.rs' }
+            ]
+          }
+        ]
+      },
+      {
+        key: 'feedback',
+        title: 'Feedback',
+        accent: 'var(--feedback)',
+        summary: 'Helpful and misleading outcomes update both memory salience and the retrieval blend itself.',
+        stages: [
+          {
+            title: 'Implicit feedback capture',
+            status: 'conditional',
+            short: 'followup and tool-action signals',
+            blurb: 'Proactive context can process previous response, user followup, and tool actions before the next retrieval is even generated.',
+            anchors: [
+              { label: 'src/handlers/recall.rs:1001 pending feedback processing', href: '../src/handlers/recall.rs' },
+              { label: 'src/memory/feedback.rs:964 process_implicit_feedback_with_semantics', href: '../src/memory/feedback.rs' },
+              { label: 'src/memory/feedback.rs:1059 compute_tool_usage_signal', href: '../src/memory/feedback.rs' },
+              { label: 'src/memory/feedback.rs:1080 negative followup penalty', href: '../src/memory/feedback.rs' }
+            ]
+          },
+          {
+            title: 'Explicit reinforce endpoint',
+            status: 'live',
+            short: 'optional scoring_signals',
+            blurb: 'The explicit endpoint can carry per-memory scoring signals, otherwise the system falls back to the most recent attribution snapshot.',
+            anchors: [
+              { label: 'src/handlers/recall.rs:2443 reinforce_recall_with_signals', href: '../src/handlers/recall.rs' },
+              { label: 'src/memory/recall.rs:3919 reinforce_recall_with_signals', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/recall.rs:4079 attribution fallback read', href: '../src/memory/recall.rs' }
+            ]
+          },
+          {
+            title: 'Hebbian reinforcement and blend learning',
+            status: 'live',
+            short: 'graph plus hybrid weights',
+            blurb: 'Reinforcement boosts or decays memory importance, records coactivation, and updates learned BM25/vector/graph weights.',
+            anchors: [
+              { label: 'src/memory/recall.rs:3945 record_memory_coactivation from reinforce', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/recall.rs:4112 update_weights_from_feedback', href: '../src/memory/recall.rs' },
+              { label: 'src/memory/hybrid_search.rs:871 update_weights_from_feedback', href: '../src/memory/hybrid_search.rs' },
+              { label: 'src/metrics.rs:416 HEBBIAN_REINFORCE_TOTAL', href: '../src/metrics.rs' }
+            ]
+          }
+        ]
+      },
+      {
+        key: 'maintain',
+        title: 'Maintenance',
+        accent: 'var(--maintain)',
+        summary: 'Long-term behavior is stabilized by fact extraction, replay, decay, and legacy migration rather than by retrieval alone.',
+        stages: [
+          {
+            title: 'Temporal and semantic fact extraction',
+            status: 'live',
+            short: 'episodic residue into facts',
+            blurb: 'The system extracts temporal and semantic facts from episodic memories, then records those events for later introspection.',
+            anchors: [
+              { label: 'src/memory/mod.rs:1089 temporal fact extraction during remember', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:1821 extract and store temporal facts', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/mod.rs:5337 store facts in the fact store', href: '../src/memory/mod.rs' },
+              { label: 'src/memory/introspection.rs:79 FactExtracted', href: '../src/memory/introspection.rs' }
+            ]
+          },
+          {
+            title: 'Replay and consolidation',
+            status: 'conditional',
+            short: 'rest-like strengthening',
+            blurb: 'Replay identifies salient memories, replays them in batches, and produces memory and edge boosts that fold back into graph structure.',
+            anchors: [
+              { label: 'src/memory/replay.rs:87 should_replay', href: '../src/memory/replay.rs' },
+              { label: 'src/memory/replay.rs:100 identify_replay_candidates', href: '../src/memory/replay.rs' },
+              { label: 'src/memory/replay.rs:161 execute_replay', href: '../src/memory/replay.rs' },
+              { label: 'src/memory/introspection.rs:138 MemoryReplayed', href: '../src/memory/introspection.rs' }
+            ]
+          },
+          {
+            title: 'Decay and fallback migration',
+            status: 'conditional',
+            short: 'trim noise, preserve compatibility',
+            blurb: 'Maintenance also weakens stale traces and upgrades legacy on-disk payloads into the current fast representation while exposing telemetry.',
+            anchors: [
+              { label: 'src/memory/maintenance.rs:705 temporal fact decay', href: '../src/memory/maintenance.rs' },
+              { label: 'src/memory/storage.rs:745 deserialize_with_fallback', href: '../src/memory/storage.rs' },
+              { label: 'src/memory/storage.rs:784 deserialize_legacy_fallback', href: '../src/memory/storage.rs' },
+              { label: 'src/memory/storage.rs:2807 migrate_legacy', href: '../src/memory/storage.rs' },
+              { label: 'src/metrics.rs:356 LEGACY_FALLBACK_FAMILY_TOTAL', href: '../src/metrics.rs' }
+            ]
+          }
+        ]
+      }
+    ];
+
+    const SURFACES = [
+      {
+        key: 'store',
+        title: 'Memory Object',
+        text: 'The canonical memory record carries importance, confidence, context, timestamps, and access count across ingest, retrieval, and maintenance. Without this portable object, the other loops cannot converge on the same state.'
+      },
+      {
+        key: 'retrieve',
+        title: 'Retrieval State',
+        text: 'The retrieval stack stores more than search results. It stores attribution, query caches, and learned blend state. That means ranking quality can compound rather than reset every request.'
+      },
+      {
+        key: 'maintain',
+        title: 'Graph + Facts',
+        text: 'GraphMemory, semantic facts, temporal facts, and replay events are the slower residue of repeated episodic evidence. They let the system preserve structure instead of only preserving strings.'
+      }
+    ];
+
+    const COMPAT_SURFACES = [
+      {
+        title: '/api/context_status',
+        status: 'compat',
+        text: 'Internal callers now use /api/context/status. This alias remains only as an external compatibility edge pending one release-cycle audit.',
+        anchors: [
+          { label: 'src/handlers/router.rs:46 context_status alias', href: '../src/handlers/router.rs' },
+          { label: 'tui/src/main.rs:681 TUI consumer', href: '../tui/src/main.rs' },
+          { label: 'tui/src/stream.rs:607 TUI consumer', href: '../tui/src/stream.rs' }
+        ]
+      },
+      {
+        title: '/api/todos/list',
+        status: 'compat',
+        text: 'Internal callers now use /api/todos. This alias is down to external compatibility only and can be dropped after one external client audit.',
+        anchors: [
+          { label: 'src/handlers/router.rs:308 todos/list alias', href: '../src/handlers/router.rs' },
+          { label: 'tui/src/stream.rs:237 TUI consumer', href: '../tui/src/stream.rs' },
+          { label: 'veld-todoist/src/veld.ts:50 todoist consumer', href: '../veld-todoist/src/veld.ts' }
+        ]
+      },
+      {
+        title: '/api/backups and /api/backups/purge',
+        status: 'compat',
+        text: 'Internal MCP callers now use /api/backup/list and /api/backup/purge. The aliases remain only for external compatibility and older clients.',
+        anchors: [
+          { label: 'src/handlers/router.rs:194 backups alias', href: '../src/handlers/router.rs' },
+          { label: 'src/handlers/router.rs:197 backups/purge alias', href: '../src/handlers/router.rs' },
+          { label: 'mcp-server/index.ts:2340 MCP consumer', href: '../mcp-server/index.ts' }
+        ]
+      }
+    ];
+
+    const filtersRoot = document.getElementById('filters');
+    const spaceRoot = document.getElementById('space');
+    const detailRoot = document.getElementById('details');
+    const surfacesRoot = document.getElementById('surfaces');
+    const compatRoot = document.getElementById('compat');
+
+    const STATUS_META = {
+      live: { label: 'live', className: 'status-live' },
+      conditional: { label: 'conditional', className: 'status-conditional' },
+      compat: { label: 'compat alias', className: 'status-compat' },
+      deprecated: { label: 'deprecated stub', className: 'status-deprecated' }
+    };
+
+    function statusPill(status) {
+      const meta = STATUS_META[status] || STATUS_META.live;
+      return `<span class="status-pill ${meta.className}">${meta.label}</span>`;
+    }
+
+    let activeFilter = 'all';
+
+    function renderFilters() {
+      const items = [{ key: 'all', title: 'Show all lanes' }, ...LANES.map((lane) => ({ key: lane.key, title: lane.title }))];
+      const buttons = items.map((item) => {
+        const active = item.key === activeFilter ? 'active' : '';
+        return `<button class="${active}" data-filter="${item.key}">${item.title}</button>`;
+      }).join('');
+      const usedStatuses = new Set(['live', 'conditional']);
+      COMPAT_SURFACES.forEach((item) => usedStatuses.add(item.status));
+      const legend = [...usedStatuses].map((key) => statusPill(key)).join('');
+      filtersRoot.innerHTML = `${buttons}<div class="status-legend">${legend}</div>`;
+      filtersRoot.querySelectorAll('[data-filter]').forEach((button) => {
+        button.addEventListener('click', () => {
+          activeFilter = button.dataset.filter;
+          renderAll();
+        });
+      });
+    }
+
+    function laneVisible(key) {
+      return activeFilter === 'all' || activeFilter === key;
+    }
+
+    function renderScene() {
+      spaceRoot.innerHTML = LANES.map((lane) => {
+        const dim = laneVisible(lane.key) ? '' : 'dim';
+        const nodes = lane.stages.map((stage, index) => `
+          <div class="space-node" style="--depth:${lane.stages.length - index}; border-color:${lane.accent};">
+            <strong>${stage.title}</strong>
+            <span>${stage.short}</span>
+            <span class="space-status">${statusPill(stage.status)}</span>
+          </div>
+        `).join('');
+        return `
+          <div class="space-lane ${dim}" data-lane="${lane.key}">
+            <div class="space-label">
+              <h3 style="color:${lane.accent}">${lane.title}</h3>
+              <span>${String(lane.stages.length).padStart(2, '0')} stages</span>
+            </div>
+            <div class="space-stack">${nodes}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderDetails() {
+      detailRoot.innerHTML = LANES.map((lane) => {
+        const dim = laneVisible(lane.key) ? '' : 'dim';
+        const stages = lane.stages.map((stage) => {
+          const anchors = stage.anchors.map((anchor) => `<a href="${anchor.href}">${anchor.label}</a>`).join('');
+          return `
+            <div class="stage-card">
+              <div class="stage-head">
+                <h4>${stage.title}</h4>
+                ${statusPill(stage.status)}
+              </div>
+              <p>${stage.blurb}</p>
+              <div class="anchor-list">${anchors}</div>
+            </div>
+          `;
+        }).join('');
+        return `
+          <section class="detail-section ${dim}" data-lane="${lane.key}">
+            <div class="detail-kicker">
+              <div class="swatch" style="color:${lane.accent}; background:${lane.accent};"></div>
+              <span>${lane.title}</span>
+            </div>
+            <h3>${lane.title}</h3>
+            <p class="section-summary">${lane.summary}</p>
+            <div class="stage-grid">${stages}</div>
+          </section>
+        `;
+      }).join('');
+    }
+
+    function renderSurfaces() {
+      surfacesRoot.innerHTML = SURFACES.map((item) => {
+        const lane = LANES.find((entry) => entry.key === item.key);
+        const dim = laneVisible(item.key) || activeFilter === 'all' ? '' : 'dim';
+        return `
+          <article class="surface-card ${dim}" data-lane="${item.key}">
+            <div class="detail-kicker">
+              <div class="swatch" style="color:${lane.accent}; background:${lane.accent};"></div>
+              <span>${lane.title}</span>
+            </div>
+            <h3>${item.title}</h3>
+            <p>${item.text}</p>
+          </article>
+        `;
+      }).join('');
+    }
+
+    function renderCompat() {
+      compatRoot.innerHTML = COMPAT_SURFACES.map((item) => {
+        const anchors = item.anchors.map((anchor) => `<a href="${anchor.href}">${anchor.label}</a>`).join('');
+        return `
+          <article class="compat-card">
+            <div class="compat-head">
+              <h3>${item.title}</h3>
+              ${statusPill(item.status)}
+            </div>
+            <p>${item.text}</p>
+            <div class="anchor-list">${anchors}</div>
+          </article>
+        `;
+      }).join('');
+    }
+
+    function renderAll() {
+      renderFilters();
+      renderScene();
+      renderDetails();
+      renderSurfaces();
+      renderCompat();
+    }
+
+    renderAll();
+  </script>
+</body>
+</html>

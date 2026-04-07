@@ -1,0 +1,1094 @@
+"""Python client for Veld with auto-start server
+
+Production-grade client with:
+- Typed exceptions for precise error handling
+- Automatic retry with exponential backoff
+- Connection pooling
+- Timeout handling
+"""
+
+import atexit
+import logging
+import os
+import platform
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+logger = logging.getLogger("veld")
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+_LEGACY_STORAGE_DIR = "veld_data"
+
+
+def _extract(data: Dict[str, Any], key: str, default: Any = None) -> Any:
+    """Extract key from API response dict, warning if absent."""
+    if key not in data:
+        logger.warning("Expected key '%s' missing from API response", key)
+        return default
+    return data[key]
+
+
+def _default_storage_path() -> str:
+    """Return platform-appropriate default storage path with legacy migration.
+
+    If ./veld_data exists in the cwd (legacy layout from <= 0.1.80),
+    use it for backward compatibility. Otherwise, use the platform data dir.
+    """
+    legacy = Path(_LEGACY_STORAGE_DIR)
+    if legacy.exists() and legacy.is_dir():
+        return str(legacy)
+
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(base, "veld")
+    elif system == "Darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "veld")
+    else:
+        base = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
+        return os.path.join(base, "veld")
+
+
+# ==============================================================================
+# Exception Hierarchy
+# ==============================================================================
+
+class VeldError(Exception):
+    """Base exception for all Veld errors."""
+    pass
+
+
+class VeldConnectionError(VeldError):
+    """Failed to connect to the Veld server."""
+    pass
+
+
+class VeldAuthenticationError(VeldError):
+    """Authentication failed (invalid or missing API key)."""
+    pass
+
+
+class VeldValidationError(VeldError):
+    """Request validation failed (invalid input)."""
+
+    def __init__(self, message: str, field: Optional[str] = None):
+        super().__init__(message)
+        self.field = field
+
+
+class VeldNotFoundError(VeldError):
+    """Requested resource (memory, user, entity) not found."""
+
+    def __init__(self, resource_type: str, resource_id: str):
+        super().__init__(f"{resource_type} not found: {resource_id}")
+        self.resource_type = resource_type
+        self.resource_id = resource_id
+
+
+class VeldRateLimitError(VeldError):
+    """Rate limit exceeded. Retry after the specified time."""
+
+    def __init__(self, retry_after: Optional[int] = None):
+        msg = f"Rate limit exceeded. Retry after {retry_after}s" if retry_after else "Rate limit exceeded"
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+class VeldServerError(VeldError):
+    """Server-side error (5xx status codes)."""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(f"Server error ({status_code}): {message}")
+        self.status_code = status_code
+
+
+def _handle_response_error(response: requests.Response, context: str = "request") -> None:
+    """Convert HTTP errors to typed exceptions."""
+    if response.ok:
+        return
+
+    status = response.status_code
+
+    try:
+        body = response.json()
+        message = body.get("error", body.get("message", response.text))
+    except Exception:
+        message = response.text or f"HTTP {status}"
+
+    if status == 401:
+        raise VeldAuthenticationError(f"Authentication failed: {message}")
+    elif status == 404:
+        raise VeldNotFoundError("resource", context)
+    elif status == 422 or status == 400:
+        raise VeldValidationError(message)
+    elif status == 429:
+        retry_after = response.headers.get("Retry-After")
+        raise VeldRateLimitError(int(retry_after) if retry_after else None)
+    elif status >= 500:
+        raise VeldServerError(status, message)
+    else:
+        raise VeldError(f"Request failed ({status}): {message}")
+
+
+@dataclass
+class Experience:
+    """Experience to store in memory"""
+
+    content: str
+    experience_type: str = "conversation"  # conversation, decision, error, learning, discovery, pattern, context, task
+    entities: List[str] = field(default_factory=list)
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "experience_type": self.experience_type.capitalize(),
+            "content": self.content,
+            "context": None,
+            "entities": self.entities,
+            "metadata": self.metadata,
+            "embeddings": None,
+            "related_memories": [],
+            "causal_chain": [],
+            "outcomes": []
+        }
+
+
+@dataclass
+class MemoryStats:
+    """Memory system statistics"""
+
+    total_memories: int
+    working_memory_count: int
+    session_memory_count: int
+    longterm_memory_count: int
+
+
+class Memory:
+    """Production-grade memory client with auto-start server
+
+    Usage:
+        memory = Memory(user_id="alice")
+        memory.add("I love Python", experience_type="learning")
+        results = memory.search("Python programming")
+
+    With API key authentication:
+        memory = Memory(user_id="alice", api_key="your-api-key")
+
+    Error handling:
+        try:
+            memory.add("test")
+        except VeldValidationError as e:
+            print(f"Invalid input: {e}")
+        except VeldAuthenticationError:
+            print("Invalid API key")
+        except VeldRateLimitError as e:
+            time.sleep(e.retry_after or 60)
+    """
+
+    def __init__(
+        self,
+        user_id: str = "default",
+        port: int = 3030,
+        storage_path: Optional[str] = None,
+        auto_start: bool = True,
+        api_key: Optional[str] = None,
+        timeout: float = 30.0,
+        max_retries: int = 3,
+    ):
+        """Initialize memory client
+
+        Args:
+            user_id: Unique identifier for this user (enables multi-user isolation)
+            port: Port for the memory server (default: 3030)
+            storage_path: Path to store memory data (default: platform data dir)
+            auto_start: Automatically start server if not running (default: True)
+            api_key: API key for authentication (optional, uses env VELD_API_KEY if not set)
+            timeout: Request timeout in seconds (default: 30)
+            max_retries: Maximum number of retry attempts (default: 3)
+        """
+        self.user_id = user_id
+        self.port = port
+        self.base_url = f"http://localhost:{port}"
+        self.storage_path = storage_path or _default_storage_path()
+        self.timeout = timeout
+
+        # API Key - required for authentication
+        self.api_key = api_key or os.environ.get("VELD_API_KEY")
+        if not self.api_key:
+            raise VeldAuthenticationError(
+                "VELD_API_KEY not set. "
+                "Pass api_key parameter or set VELD_API_KEY environment variable. "
+                "For local development, use the same key set in VELD_DEV_API_KEY on the server."
+            )
+
+        self._server_process = None
+
+        # Configure session with retry logic and connection pooling
+        self._session = requests.Session()
+
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        )
+
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=20,
+        )
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+        # Set default headers
+        self._session.headers.update({
+            "Content-Type": "application/json",
+            "X-API-Key": self.api_key,
+        })
+
+        if auto_start:
+            self._ensure_server_running()
+
+    def _ensure_server_running(self):
+        """Start server if not already running"""
+        # Check if server is already running
+        try:
+            response = requests.get(f"{self.base_url}/health", timeout=1)
+            if response.status_code == 200:
+                return  # Server already running
+        except requests.exceptions.RequestException:
+            pass
+
+        # Start server
+        logger.info("Starting Veld server...")
+        self._start_server()
+
+        # Wait for server to be ready
+        max_retries = 30
+        for i in range(max_retries):
+            try:
+                response = requests.get(f"{self.base_url}/health", timeout=1)
+                if response.status_code == 200:
+                    logger.info("Veld server ready")
+                    return
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(0.5)
+
+        raise RuntimeError("Failed to start Veld server")
+
+    def _start_server(self):
+        """Start the Rust server binary"""
+        # Find binary path
+        binary_name = self._get_binary_name()
+        binary_path = self._find_binary(binary_name)
+
+        if not binary_path or not binary_path.exists():
+            raise RuntimeError(
+                f"Veld binary not found: {binary_name}\n"
+                "Please ensure the binary is built or installed correctly."
+            )
+
+        # Set environment variables
+        env = os.environ.copy()
+        env["VELD_MEMORY_PORT"] = str(self.port)
+        env["VELD_MEMORY_PATH"] = self.storage_path
+        env["RUST_LOG"] = "veld=info"
+
+        # Start server process
+        self._server_process = subprocess.Popen(
+            [str(binary_path)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        # Register cleanup on exit
+        atexit.register(self._stop_server)
+
+    def _get_binary_name(self) -> str:
+        """Get platform-specific binary name"""
+        system = platform.system().lower()
+        if system == "windows":
+            return "veld.exe"
+        elif system == "darwin":
+            return "veld-darwin"
+        else:
+            return "veld"
+
+    def _find_binary(self, binary_name: str) -> Optional[Path]:
+        """Find binary in common locations"""
+        # Check in package directory (for pip install)
+        package_dir = Path(__file__).parent.parent
+        bin_dir = package_dir / "bin"
+
+        if (bin_dir / binary_name).exists():
+            return bin_dir / binary_name
+
+        # Check in cargo target directory (for development)
+        cargo_target = Path("../../target/release") / binary_name
+        if cargo_target.exists():
+            return cargo_target
+
+        # Check in PATH
+        import shutil
+        binary_in_path = shutil.which(binary_name)
+        if binary_in_path:
+            return Path(binary_in_path)
+
+        return None
+
+    def _stop_server(self):
+        """Stop the server process"""
+        if self._server_process:
+            self._server_process.terminate()
+            try:
+                self._server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._server_process.kill()
+
+    def add(
+        self,
+        content: str,
+        experience_type: str = "conversation",
+        entities: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, str]] = None
+    ) -> str:
+        """Add a memory
+
+        Args:
+            content: The content to remember
+            experience_type: Type of experience (conversation, decision, error, learning, etc.)
+            entities: Named entities in the content
+            metadata: Additional metadata
+
+        Returns:
+            Memory ID
+
+        Raises:
+            VeldValidationError: If content is empty or invalid
+            VeldAuthenticationError: If API key is invalid
+            VeldRateLimitError: If rate limit is exceeded
+            VeldServerError: If server encounters an error
+        """
+        # Build tags from entities and metadata
+        tags = list(entities or [])
+        if metadata and "tags" in metadata:
+            # Support comma-separated tags in metadata
+            tags.extend([t.strip() for t in metadata["tags"].split(",") if t.strip()])
+
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/remember",
+                json={
+                    "user_id": self.user_id,
+                    "content": content,
+                    "memory_type": experience_type.capitalize(),
+                    "tags": tags
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+        except requests.exceptions.Timeout as e:
+            raise VeldError(f"Request timed out: {e}") from e
+
+        _handle_response_error(response, context="add memory")
+        data = response.json()
+        if "id" not in data:
+            raise VeldError(f"Unexpected response: missing 'id' field")
+        return data["id"]
+
+    def search(
+        self,
+        query: Optional[str] = None,
+        query_embedding: Optional[List[float]] = None,
+        limit: int = 10,
+        importance_threshold: Optional[float] = None
+    ) -> List[dict]:
+        """Search memories
+
+        Args:
+            query: Text query (keyword search)
+            query_embedding: Query embedding vector for semantic search
+            limit: Maximum number of results
+            importance_threshold: Minimum importance score (0.0 - 1.0)
+
+        Returns:
+            List of matching memories
+
+        Raises:
+            VeldValidationError: If neither query nor query_embedding provided
+            VeldAuthenticationError: If API key is invalid
+            VeldRateLimitError: If rate limit is exceeded
+
+        Examples:
+            # Keyword search
+            results = memory.search(query="Python programming")
+
+            # Semantic search (user provides embedding)
+            embedding = model.encode("favorite languages")
+            results = memory.search(query_embedding=embedding.tolist())
+
+            # Hybrid search (both keyword and semantic)
+            results = memory.search(
+                query="Python",
+                query_embedding=embedding.tolist()
+            )
+        """
+        if query is None and query_embedding is None:
+            raise VeldValidationError("Must provide either query or query_embedding", field="query")
+
+        try:
+            # Note: query_embedding parameter is deprecated - use query text instead
+            if query_embedding is not None:
+                import warnings
+                warnings.warn("query_embedding parameter is deprecated. Use query text instead.", DeprecationWarning)
+
+            response = self._session.post(
+                f"{self.base_url}/api/recall",
+                json={
+                    "user_id": self.user_id,
+                    "query": query or "",
+                    "limit": limit,
+                    "mode": "hybrid"
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+        except requests.exceptions.Timeout as e:
+            raise VeldError(f"Request timed out: {e}") from e
+
+        _handle_response_error(response, context="search")
+        return _extract(response.json(), "memories", [])
+
+    def stats(self) -> MemoryStats:
+        """Get memory statistics
+
+        Returns:
+            MemoryStats object with counts for each memory tier
+
+        Raises:
+            VeldAuthenticationError: If API key is invalid
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/api/users/{self.user_id}/stats",
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context=f"stats for user {self.user_id}")
+        data = response.json()
+        return MemoryStats(
+            total_memories=data.get("total_memories", 0),
+            working_memory_count=data.get("working_memory_count", 0),
+            session_memory_count=data.get("session_memory_count", 0),
+            longterm_memory_count=data.get("long_term_memory_count", 0),
+        )
+
+    def get(self, memory_id: str) -> dict:
+        """Get specific memory by ID
+
+        Args:
+            memory_id: UUID of the memory
+
+        Returns:
+            Memory object
+
+        Raises:
+            VeldNotFoundError: If memory doesn't exist
+            VeldValidationError: If memory_id is invalid
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/api/memory/{memory_id}",
+                params={"user_id": self.user_id},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context=f"memory {memory_id}")
+        return response.json()
+
+    def get_all(
+        self,
+        limit: int = 100,
+        importance_threshold: Optional[float] = None
+    ) -> List[dict]:
+        """Get all memories for this user
+
+        Args:
+            limit: Maximum number of memories
+            importance_threshold: Minimum importance score
+
+        Returns:
+            List of memories
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/memories",
+                json={
+                    "user_id": self.user_id,
+                    "limit": limit,
+                    "importance_threshold": importance_threshold
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="get all memories")
+        return _extract(response.json(), "memories", [])
+
+    def update(
+        self,
+        memory_id: str,
+        content: str,
+        embeddings: Optional[List[float]] = None
+    ) -> None:
+        """Update existing memory
+
+        Args:
+            memory_id: UUID of memory to update
+            content: New content
+            embeddings: New embedding vector (optional)
+
+        Raises:
+            VeldNotFoundError: If memory doesn't exist
+            VeldValidationError: If content is invalid
+        """
+        try:
+            response = self._session.put(
+                f"{self.base_url}/api/memory/{memory_id}",
+                json={
+                    "user_id": self.user_id,
+                    "content": content,
+                    "embeddings": embeddings
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context=f"update memory {memory_id}")
+
+    def delete(self, memory_id: str) -> None:
+        """Delete specific memory
+
+        Args:
+            memory_id: UUID of memory to delete
+
+        Raises:
+            VeldNotFoundError: If memory doesn't exist
+        """
+        try:
+            response = self._session.delete(
+                f"{self.base_url}/api/memory/{memory_id}",
+                params={"user_id": self.user_id},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context=f"delete memory {memory_id}")
+
+    def history(self, memory_id: Optional[str] = None) -> List[dict]:
+        """Get audit trail of memory changes
+
+        Args:
+            memory_id: Optional - filter by specific memory
+
+        Returns:
+            List of history events
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/memories/history",
+                json={
+                    "user_id": self.user_id,
+                    "memory_id": memory_id
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="history")
+        return _extract(response.json(), "events", [])
+
+    def forget_me(self) -> None:
+        """Delete all memories for this user (GDPR compliance)
+
+        Raises:
+            VeldAuthenticationError: If API key is invalid
+        """
+        try:
+            response = self._session.delete(
+                f"{self.base_url}/api/users/{self.user_id}",
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context=f"delete user {self.user_id}")
+        logger.info("All memories deleted for user: %s", self.user_id)
+
+    def forget_by_age(self, days: int) -> int:
+        """Delete memories older than specified days
+
+        Args:
+            days: Delete memories older than this many days
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete memories older than 30 days
+            count = memory.forget_by_age(30)
+            print(f"Deleted {count} old memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/age",
+                json={"user_id": self.user_id, "days_old": days},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by age")
+        return _extract(response.json(), "forgotten_count", 0)
+
+    def forget_by_importance(self, threshold: float) -> int:
+        """Delete memories below importance threshold
+
+        Args:
+            threshold: Delete memories with importance below this value (0.0-1.0)
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete unimportant memories
+            count = memory.forget_by_importance(0.3)
+            print(f"Deleted {count} low-importance memories")
+        """
+        if not 0.0 <= threshold <= 1.0:
+            raise VeldValidationError("threshold must be between 0.0 and 1.0", field="threshold")
+
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/importance",
+                json={"user_id": self.user_id, "threshold": threshold},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by importance")
+        return _extract(response.json(), "forgotten_count", 0)
+
+    def forget_by_pattern(self, pattern: str) -> int:
+        """Delete memories matching a regex pattern
+
+        Args:
+            pattern: Regex pattern to match against memory content
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete all memories containing "test"
+            count = memory.forget_by_pattern(r"test.*")
+            print(f"Deleted {count} test memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/pattern",
+                json={"user_id": self.user_id, "pattern": pattern},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by pattern")
+        return _extract(response.json(), "forgotten_count", 0)
+
+    def forget_by_tags(self, tags: List[str]) -> int:
+        """Delete memories matching any of the specified tags
+
+        Args:
+            tags: List of tags to match (OR logic)
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete all temporary memories
+            count = memory.forget_by_tags(["temp", "draft"])
+            print(f"Deleted {count} tagged memories")
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/tags",
+                json={"user_id": self.user_id, "tags": tags},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by tags")
+        return _extract(response.json(), "forgotten_count", 0)
+
+    def forget_by_date(self, start: str, end: str) -> int:
+        """Delete memories within a date range
+
+        Args:
+            start: Start date (ISO 8601 format, e.g., '2024-01-01T00:00:00Z')
+            end: End date (ISO 8601 format, e.g., '2024-12-31T23:59:59Z')
+
+        Returns:
+            Number of memories deleted
+
+        Examples:
+            # Delete memories from January 2024
+            count = memory.forget_by_date(
+                "2024-01-01T00:00:00Z",
+                "2024-01-31T23:59:59Z"
+            )
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/forget/date",
+                json={"user_id": self.user_id, "start": start, "end": end},
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="forget by date")
+        return _extract(response.json(), "forgotten_count", 0)
+
+    def batch_remember(
+        self,
+        memories: List[Dict[str, any]],
+        extract_entities: bool = True,
+        create_edges: bool = True
+    ) -> Dict[str, any]:
+        """Store multiple memories in a single request (SHO-83)
+
+        Efficient bulk ingestion with NER extraction and knowledge graph edges.
+        Supports partial success - some memories can fail while others succeed.
+
+        Args:
+            memories: List of memory dicts, each with:
+                - content (str, required): The content to remember
+                - memory_type (str, optional): Type (Decision, Learning, Observation, etc.)
+                - tags (list, optional): Tags for categorization
+                - created_at (str, optional): ISO 8601 timestamp
+            extract_entities: Whether to extract entities using NER (default: True)
+            create_edges: Whether to create knowledge graph edges (default: True)
+
+        Returns:
+            Dict with:
+                - created (int): Number of successfully created memories
+                - failed (int): Number of failed memories
+                - memory_ids (list): IDs of successfully created memories
+                - errors (list): Details of failed items [{index, error}, ...]
+
+        Examples:
+            result = memory.batch_remember([
+                {"content": "User prefers dark mode", "memory_type": "Decision"},
+                {"content": "API rate limit is 100/min", "memory_type": "Learning"},
+                {"content": "Meeting at 3pm", "tags": ["calendar"]}
+            ])
+            print(f"Created {result['created']} memories")
+            if result['errors']:
+                for err in result['errors']:
+                    print(f"  Failed item {err['index']}: {err['error']}")
+
+            # Disable entity extraction for faster bulk import
+            result = memory.batch_remember(memories, extract_entities=False)
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/remember/batch",
+                json={
+                    "user_id": self.user_id,
+                    "memories": memories,
+                    "options": {
+                        "extract_entities": extract_entities,
+                        "create_edges": create_edges
+                    }
+                },
+                timeout=self.timeout * 2  # Double timeout for batch
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="batch remember")
+        return response.json()
+
+    def visualize(self, open_browser: bool = True) -> str:
+        """Open memory visualization dashboard in browser
+
+        Args:
+            open_browser: Automatically open browser (default: True)
+
+        Returns:
+            URL of the visualization dashboard
+        """
+        url = f"{self.base_url}/static/index.html?user_id={self.user_id}"
+        if open_browser:
+            import webbrowser
+            webbrowser.open(url)
+        return url
+
+    def graph_stats(self) -> dict:
+        """Get memory graph statistics
+
+        Returns:
+            Dict with node/edge counts per memory tier
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/api/visualization/{self.user_id}/stats",
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="graph stats")
+        return response.json()
+
+    def export_graph(self, format: str = "dot") -> str:
+        """Export memory graph in specified format
+
+        Args:
+            format: Export format ('dot' for Graphviz)
+
+        Returns:
+            Graph data as string
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/api/visualization/{self.user_id}/dot",
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="export graph")
+        return response.text
+
+    def recall(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> List[dict]:
+        """Semantic search - find memories similar to the query
+
+        This is the primary retrieval method using vector similarity search.
+        Use this for natural language queries like "What did we decide about X?"
+
+        Args:
+            query: Natural language search query
+            limit: Maximum number of results (default: 5)
+
+        Returns:
+            List of matching memories with similarity scores
+
+        Examples:
+            # Find memories about Python
+            results = memory.recall("Python programming decisions")
+
+            # Get more results
+            results = memory.recall("error handling patterns", limit=10)
+        """
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/recall",
+                json={
+                    "user_id": self.user_id,
+                    "query": query,
+                    "limit": limit,
+                    "mode": "hybrid"
+                },
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+        except requests.exceptions.Timeout as e:
+            raise VeldError(f"Request timed out: {e}") from e
+
+        _handle_response_error(response, context="recall")
+        return _extract(response.json(), "memories", [])
+
+    def remember(
+        self,
+        content: str,
+        memory_type: str = "Observation",
+        tags: Optional[List[str]] = None
+    ) -> str:
+        """Store a memory (alias for add with simplified interface)
+
+        This is the primary storage method for LLM agents.
+
+        Args:
+            content: The content to remember
+            memory_type: One of: Observation, Decision, Learning, Error,
+                        Discovery, Pattern, Context, Task
+            tags: Optional tags for categorization
+
+        Returns:
+            Memory ID
+
+        Examples:
+            # Store a decision
+            memory.remember("Use PostgreSQL for the database", memory_type="Decision")
+
+            # Store a learning
+            memory.remember("Async/await is faster than threads for I/O",
+                          memory_type="Learning",
+                          tags=["python", "performance"])
+        """
+        return self.add(
+            content=content,
+            experience_type=memory_type,
+            metadata={"tags": ",".join(tags)} if tags else {}
+        )
+
+    def context_summary(
+        self,
+        include_decisions: bool = True,
+        include_learnings: bool = True,
+        include_context: bool = True,
+        max_items: int = 5
+    ) -> dict:
+        """Get a condensed summary of recent learnings, decisions, and context
+
+        Use this at the start of a session to quickly understand what
+        you've learned before. Returns memories organized by type.
+
+        Args:
+            include_decisions: Include recent decisions (default: True)
+            include_learnings: Include recent learnings (default: True)
+            include_context: Include project context (default: True)
+            max_items: Maximum items per category (default: 5)
+
+        Returns:
+            Dict with categorized memories:
+            {
+                "total_memories": 42,
+                "context": [...],
+                "decisions": [...],
+                "learnings": [...],
+                "patterns": [...],
+                "errors": [...]
+            }
+
+        Examples:
+            # Get full context summary
+            summary = memory.context_summary()
+            print(f"Total: {summary['total_memories']} memories")
+            for decision in summary['decisions']:
+                print(f"  - {decision['content'][:80]}")
+
+            # Just get decisions
+            summary = memory.context_summary(
+                include_learnings=False,
+                include_context=False
+            )
+        """
+        # Fetch all memories
+        memories = self.get_all(limit=500)
+
+        # Categorize by type
+        context = []
+        decisions = []
+        learnings = []
+        patterns = []
+        errors = []
+
+        for m in memories:
+            # Handle both nested experience format and flat format
+            exp = m.get("experience", {})
+            # Check memory_type first (new format), then experience.experience_type (legacy)
+            exp_type = m.get("memory_type") or exp.get("memory_type") or exp.get("experience_type", "Observation")
+            content = m.get("content") or exp.get("content", "")
+
+            item = {
+                "id": m.get("id", ""),
+                "content": content,
+                "created_at": m.get("created_at", "")
+            }
+
+            if exp_type == "Context" and include_context:
+                context.append(item)
+            elif exp_type == "Decision" and include_decisions:
+                decisions.append(item)
+            elif exp_type == "Learning" and include_learnings:
+                learnings.append(item)
+            elif exp_type == "Pattern":
+                patterns.append(item)
+            elif exp_type == "Error":
+                errors.append(item)
+
+        return {
+            "total_memories": len(memories),
+            "context": context[:max_items],
+            "decisions": decisions[:max_items],
+            "learnings": learnings[:max_items],
+            "patterns": patterns[:max_items],
+            "errors": errors[:min(3, max_items)]  # Limit errors
+        }
+
+    def brain_state(self) -> dict:
+        """Get brain state visualization data
+
+        Returns memories organized by cognitive tier (working, session, long-term)
+        with activation levels.
+
+        Returns:
+            Dict with:
+            {
+                "working_memory": [...],
+                "session_memory": [...],
+                "longterm_memory": [...],
+                "stats": {
+                    "total_memories": 42,
+                    "avg_activation": 0.65,
+                    ...
+                }
+            }
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/api/brain/{self.user_id}",
+                timeout=self.timeout
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise VeldConnectionError(f"Failed to connect to server: {e}") from e
+
+        _handle_response_error(response, context="brain state")
+        return response.json()
+
+    def __enter__(self):
+        """Context manager support"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup on context exit"""
+        self._stop_server()

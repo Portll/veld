@@ -1,0 +1,206 @@
+{
+  "evaluation_type": "intugest",
+  "mode": "external",
+  "timestamp": "2026-03-30T00:00:00Z",
+  "source": {
+    "title": "Your RAG Benchmark Is Lying to You and I Have the Numbers to Prove It",
+    "author": "Longjumping-Unit-420 (Candlekeep)",
+    "platform": "Reddit /r/LocalLLaMA (showcase)",
+    "repo": "github.com/BansheeEmperor/candlekeep"
+  },
+  "objective": "Never forget information we should remember — zero information loss",
+  "extracted_concepts": [
+    {
+      "id": "C1",
+      "name": "Context prefixing at ingestion",
+      "description": "Prepend document title + description to every chunk BEFORE embedding. Same content in different contexts embeds differently. Zero query-time cost.",
+      "evidence": "MRR -0.042, nDCG -0.144 when removed (largest single-technique impact)"
+    },
+    {
+      "id": "C2",
+      "name": "Semantic chunk expansion",
+      "description": "Return adjacent chunks around matches, gated by query-embedding similarity.",
+      "evidence": "+17.9pp content match, zero MRR change. Similarity-weighted expansion cuts noise by 22%."
+    },
+    {
+      "id": "C3",
+      "name": "Query-type-aware thresholding",
+      "description": "Lexical queries score lower on vector similarity. Relax threshold for lexical, keep strict for semantic.",
+      "evidence": "+16.3% MRR, +33.3% HR@5 on lexical queries"
+    },
+    {
+      "id": "C4",
+      "name": "Content completeness over rank position",
+      "description": "Agents read everything returned. Position 1 with a fragment is worse than position 2 with full context.",
+      "evidence": "Naive reranker beats on MRR but loses graded nDCG by 50%. LangChain MRR 0.535, nDCG 0.202."
+    },
+    {
+      "id": "C5",
+      "name": "Score distribution drift",
+      "description": "Corpus growth shifts score distributions. Threshold calibrated at N memories over-filters at 10N.",
+      "evidence": "BEIR validation showed 44% nDCG drop on different domain corpus"
+    },
+    {
+      "id": "C6",
+      "name": "BM25 anchoring against semantic drift",
+      "description": "Multi-hop follow-ups drift into paraphrases. BM25 grounds to specific terms.",
+      "evidence": "Already implemented in veld via hybrid search"
+    },
+    {
+      "id": "C7",
+      "name": "Agent-side decomposition > tool-side",
+      "description": "Don't implement inside the tool what the agent already does.",
+      "evidence": "Already partially applicable — veld has internal decomposition for non-agent callers"
+    }
+  ],
+  "bifocal_pass": {
+    "edge_walk": {
+      "boundary_1": {
+        "name": "Embedding Input ↔ Context Metadata",
+        "location": "retrieval.rs:771-819 vs mod.rs:1243",
+        "issue": "extract_searchable_text() appends context; deferred embed_and_index() uses raw content only. Two different embedding paths produce inconsistent similarity scores.",
+        "data_crossing": "RichContext fields → embedding input string → chunk boundaries → vector space",
+        "failure_mode": "Early chunks of long memories embed without context. Layer 3.5 brute-force uses worse embeddings than Vamana index."
+      },
+      "boundary_2": {
+        "name": "Query Classification ↔ Relevance Thresholds",
+        "location": "query_parser.rs:691 → constants.rs:61 + relevance.rs:151",
+        "issue": "Query type is computed but never propagates to threshold selection.",
+        "failure_mode": "Lexical attribute queries like 'What is SHO-72?' pass through same threshold as semantic queries."
+      },
+      "boundary_3": {
+        "name": "Decay Function ↔ Retrieval Eligibility",
+        "location": "decay.rs:120-186 + constants.rs:48 + constants.rs:61",
+        "issue": "IMPORTANCE_FLOOR (0.05) × max_confidence (1.0) = 0.05 < ABSTENTION_THRESHOLD (0.1). Every decayed memory is permanently hidden.",
+        "failure_mode": "Permanent forgetting trap — contradicts the stated design intent of IMPORTANCE_FLOOR."
+      }
+    },
+    "fractal_analysis": {
+      "context_differentiation": {
+        "macro_graph": "Strong — entity labels distinguish types",
+        "meso_retrieval": "Strong — query-type routing adapts strategy",
+        "micro_embedding": "BROKEN — all content embeds without origin context"
+      },
+      "threshold_adaptation": {
+        "graph_edges": "Strong — density-adaptive thresholds",
+        "rrf_weights": "Strong — density-weighted fusion",
+        "relevance_gates": "BROKEN — static thresholds"
+      }
+    }
+  },
+  "overlook_pass": {
+    "shifted_dimensions": [
+      {"dimension": "D3: Content Completeness", "current": "unmeasured", "post": "measured", "delta": "HIGH", "spike": true},
+      {"dimension": "D5: Embedding Discriminativeness", "current": 0.65, "post": 0.82, "delta": 0.17, "spike": true},
+      {"dimension": "D8: Query Adaptivity", "current": 0.70, "post": 0.85, "delta": 0.15, "spike": false},
+      {"dimension": "D11: Decay-Retrieval Coherence", "current": 0.40, "post": 0.85, "delta": 0.45, "spike": true},
+      {"dimension": "D14: Temporal Stability", "current": 0.60, "post": 0.80, "delta": 0.20, "spike": false},
+      {"dimension": "D17: Embedding Path Consistency", "current": 0.50, "post": 0.90, "delta": 0.40, "spike": true}
+    ]
+  },
+  "supernova_pass": {
+    "axes": [
+      {
+        "name": "Information-Theoretic",
+        "finding": "Embedding entropy bottleneck: context-free chunks carry zero bits about origin. Context prefixing saves ~2.3 bits per chunk (log(5) for typical project diversity)."
+      },
+      {
+        "name": "Temporal Dynamics",
+        "finding": "IMPORTANCE_FLOOR × ABSTENTION_THRESHOLD creates temporal black hole. Unlike human brain's spontaneous reactivation, digital system has no cue-driven recovery for sub-threshold memories.",
+        "severity": "CRITICAL — correctness bug"
+      },
+      {
+        "name": "Graph-Topological",
+        "finding": "Graph connectivity provides alternative retrieval path that bypasses vector similarity, but NOT abstention. Strong graph evidence should override decay-based filtering."
+      },
+      {
+        "name": "Adversarial Robustness",
+        "finding": "Self-induced forgetting via score distribution drift. Static threshold against growing corpus is adversarial to retention."
+      },
+      {
+        "name": "Phenomenological",
+        "finding": "Finding the right memory ≠ returning sufficient information. No mechanism to detect 'correct but insufficient' — system measures relevance, not sufficiency."
+      }
+    ]
+  },
+  "application_map": [
+    {
+      "id": "APP-1",
+      "concept": "C1",
+      "name": "Context-Prefix Embedding",
+      "file": "src/memory/retrieval.rs",
+      "function": "extract_searchable_text()",
+      "line": 771,
+      "dimensions": ["D5 +0.17", "D3 +0.05"],
+      "delta": "Disambiguates same-content-different-context memories. ~-0.04 cosine between previously-identical chunks.",
+      "effort": "low",
+      "priority": "P2"
+    },
+    {
+      "id": "APP-2",
+      "concept": "C1 + bifocal",
+      "name": "Unified Embedding Path",
+      "file": "src/memory/mod.rs",
+      "function": "embed_and_index()",
+      "line": 1243,
+      "dimensions": ["D17 +0.40"],
+      "delta": "Layer 3.5 brute-force cosine uses consistent enriched embeddings. Eliminates score inconsistency between deferred and indexed paths.",
+      "effort": "trivial",
+      "priority": "P1"
+    },
+    {
+      "id": "APP-3",
+      "concept": "Supernova Axis 2",
+      "name": "Fix Importance Floor ↔ Abstention Trap",
+      "file": "src/constants.rs",
+      "function": "IMPORTANCE_FLOOR",
+      "line": 48,
+      "dimensions": ["D11 +0.45"],
+      "delta": "Decayed memories remain retrievable when query similarity is high. Largest 'never forget' improvement.",
+      "effort": "trivial",
+      "priority": "P0"
+    },
+    {
+      "id": "APP-4",
+      "concept": "C3",
+      "name": "Query-Type Adaptive Thresholds",
+      "file": "src/memory/recall.rs",
+      "function": "Layer 5.7 confidence gating",
+      "line": 2807,
+      "dimensions": ["D8 +0.15"],
+      "delta": "Prevents filtering of lexical-identifier matches. Expected +15% hit rate on identifier queries.",
+      "effort": "medium",
+      "priority": "P2"
+    },
+    {
+      "id": "APP-5",
+      "concept": "C5",
+      "name": "Drift-Adaptive Abstention",
+      "file": "src/relevance.rs",
+      "function": "new: calibrate_abstention_threshold()",
+      "line": 62,
+      "dimensions": ["D14 +0.20"],
+      "delta": "Auto-adjusts threshold as corpus grows. Prevents gradual silent over-filtering.",
+      "effort": "medium-high",
+      "priority": "P3"
+    },
+    {
+      "id": "APP-6",
+      "concept": "Supernova Axis 3",
+      "name": "Graph-Connected Memory Insurance",
+      "file": "src/memory/recall.rs",
+      "function": "Layer 5.7 confidence gating",
+      "line": 2807,
+      "dimensions": ["D11 +0.15", "D3 +0.05"],
+      "delta": "Memories found via graph traversal with activation > 0.3 bypass abstention. Graph evidence overrides decay.",
+      "effort": "low",
+      "priority": "P1"
+    }
+  ],
+  "priority_order": [
+    {"priority": "P0", "apps": ["APP-3"], "rationale": "Correctness bug — decayed memories permanently hidden"},
+    {"priority": "P1", "apps": ["APP-2", "APP-6"], "rationale": "Trivial/low effort, eliminate inconsistency and graph-abstention conflict"},
+    {"priority": "P2", "apps": ["APP-1", "APP-4"], "rationale": "Higher impact but require re-embedding or new classifier"},
+    {"priority": "P3", "apps": ["APP-5"], "rationale": "Long-term insurance, critical at scale"}
+  ]
+}

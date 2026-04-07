@@ -1,0 +1,573 @@
+{
+  "evaluation_metadata": {
+    "date": "2026-03-29",
+    "evaluator": "Claude Code (Haiku 4.5)",
+    "methodology": "Bifocal+ (edge-walk + fractal analysis)",
+    "project": "veld",
+    "upgrade": "MiniLM-L6-v2 (384-dim) → Nomic-embed-text-v1.5 (768-dim)",
+    "mteb_improvement": "+9.1 points",
+    "scope": "Complete change inventory and migration strategy"
+  },
+
+  "summary": {
+    "overview": "Upgrade from all-MiniLM-L6-v2 (384-dimensional embeddings) to Nomic-embed-text-v1.5 (768-dimensional, +9.1 MTEB score). The dimension change is currently hardcoded in 11 locations. Migration requires sequential and parallel changes with careful handling of existing vector indices.",
+    "impact": "Medium complexity. The dimension is used in vector algebra (dot product, pooling), index construction, and caching. Cross-encoder (ms-marco-MiniLM-L-6-v2) is independent and does not require changes unless future upgrade to cross-encoder is planned.",
+    "risk_level": "Low-medium. No breaking API changes. Backward compatibility requires index versioning or detection mechanism.",
+    "estimated_effort": "4-6 hours for implementation + testing + verification"
+  },
+
+  "current_architecture": {
+    "embedder": {
+      "model": "sentence-transformers/all-MiniLM-L6-v2",
+      "dimension": 384,
+      "output_form": "L2-normalized float32 vectors",
+      "implementation": "ONNX Runtime with lazy loading",
+      "fallback": "Simplified hash-based embedder (same dimension: 384)"
+    },
+    "vector_index": {
+      "type": "Vamana (approximate nearest neighbor)",
+      "config_location": "src/vector_db/vamana.rs line 85",
+      "dimension_hardcoded": true,
+      "memory_mapped": true,
+      "dimension_in_file_format": "Stored in index metadata, must match at load time"
+    },
+    "caching": {
+      "query_cache": "2000 entries, 384-dim",
+      "content_cache": "2000 entries, 384-dim",
+      "entity_cache": "10000 entries, 384-dim (mentioned in constants)",
+      "locations": [
+        "src/memory/mod.rs:660 (query_cache)",
+        "src/memory/mod.rs:661 (content_cache)",
+        "src/constants.rs:137-139 (ENTITY_EMBEDDING_CACHE_MAX)"
+      ]
+    },
+    "cross_encoder": {
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "status": "INDEPENDENT - does not use embedder dimension, does not need changes"
+    }
+  },
+
+  "changes_required": {
+    "phase_1_preparation": {
+      "description": "Create new model directory structure and download Nomic weights",
+      "changes": [
+        {
+          "id": "P1.1",
+          "file": "src/embeddings/downloader.rs",
+          "line": 25,
+          "type": "Add new constants",
+          "from": "const MODEL_ONNX_URL and others for MiniLM only",
+          "to": "Add Nomic-embed-text-v1.5 URLs alongside MiniLM URLs",
+          "detail": "Add: NOMIC_MODEL_URL, NOMIC_MODEL_QUANTIZED_URL, NOMIC_TOKENIZER_URL (from HuggingFace pinned commit)",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P1.2",
+          "file": "src/embeddings/downloader.rs",
+          "line": 43,
+          "type": "Add new checksums",
+          "from": "Only MiniLM checksums in ModelChecksums struct",
+          "to": "Add NOMIC_QUANTIZED_MODEL, NOMIC_FULL_MODEL, NOMIC_TOKENIZER checksums",
+          "detail": "New const values: NOMIC_QUANTIZED_MODEL, NOMIC_FULL_MODEL, NOMIC_TOKENIZER",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P1.3",
+          "file": "src/embeddings/downloader.rs",
+          "line": 99,
+          "type": "Add new model directory getter",
+          "from": "get_models_dir() returns 'minilm-l6' only",
+          "to": "Add get_nomic_models_dir() returning 'nomic-v1.5'",
+          "detail": "New function: pub fn get_nomic_models_dir() -> PathBuf",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P1.4",
+          "file": "src/embeddings/downloader.rs",
+          "line": 362,
+          "type": "Add Nomic download function",
+          "from": "download_models() handles only MiniLM",
+          "to": "Add download_nomic_models() with same pattern",
+          "detail": "New public fn: download_nomic_models(progress: Option<ProgressCallback>) -> Result<PathBuf>",
+          "breaking": false,
+          "dependencies": "P1.1, P1.2, P1.3"
+        }
+      ]
+    },
+
+    "phase_2_embedder_abstraction": {
+      "description": "Make embedding dimension configurable instead of hardcoded to 384",
+      "changes": [
+        {
+          "id": "P2.1",
+          "file": "src/embeddings/mod.rs",
+          "line": 48,
+          "type": "Update Embedder trait",
+          "from": "trait Embedder has dimension(&self) -> usize (returns hardcoded 384)",
+          "to": "dimension() already exists as method - trait is ready for multiple dimensions",
+          "detail": "No code change needed. Trait already supports dynamic dimension via dimension() method.",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P2.2",
+          "file": "src/embeddings/minilm.rs",
+          "line": 209,
+          "type": "Make dimension configurable",
+          "from": "struct MiniLMEmbedder { dimension: usize } with hardcoded 384 assignment at lines 427, 478",
+          "to": "Read dimension from config or model introspection during initialization",
+          "detail": "Add to EmbeddingConfig: pub expected_dimension: Option<usize> (default: Some(384)). In MiniLMEmbedder::new(), validate output shape matches expected_dimension.",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P2.3",
+          "file": "src/embeddings/minilm.rs",
+          "line": 103,
+          "type": "Update EmbeddingConfig struct",
+          "from": "struct EmbeddingConfig { model_path, tokenizer_path, max_length, use_quantized, embed_timeout_ms }",
+          "to": "Add expected_dimension field for validation",
+          "detail": "pub struct EmbeddingConfig { ... pub expected_dimension: Option<usize> }. Update Default::default() and from_env() to set Some(384).",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P2.4",
+          "file": "src/embeddings/minilm.rs",
+          "line": 425,
+          "type": "Change dimension initialization",
+          "from": "dimension: 384 hardcoded in new()",
+          "to": "dimension: config.expected_dimension.unwrap_or(384)",
+          "detail": "Both new() and new_simplified() use config-based dimension",
+          "breaking": false,
+          "dependencies": "P2.2, P2.3"
+        }
+      ]
+    },
+
+    "phase_3_switch_embedders": {
+      "description": "Create NomicEmbedder struct and add factory for model selection",
+      "changes": [
+        {
+          "id": "P3.1",
+          "file": "src/embeddings/mod.rs",
+          "line": 16,
+          "type": "Add new module",
+          "from": "pub mod minilm;",
+          "to": "pub mod nomic; (new module)",
+          "detail": "Create src/embeddings/nomic.rs with NomicEmbedder struct",
+          "breaking": false,
+          "dependencies": "P1.4"
+        },
+        {
+          "id": "P3.2",
+          "file": "src/embeddings/nomic.rs",
+          "type": "Create new file",
+          "template": "Copy minilm.rs structure, change dimension to 768, update model loading for Nomic weights",
+          "detail": "New NomicEmbedder struct with same interface as MiniLMEmbedder. Update: model paths, max_length (if different), dimension = 768.",
+          "breaking": false,
+          "dependencies": "P1.4"
+        },
+        {
+          "id": "P3.3",
+          "file": "src/embeddings/mod.rs",
+          "line": 15,
+          "type": "Add embedder factory",
+          "from": "No embedder selection logic",
+          "to": "pub enum EmbedderModel { MiniLM, Nomic }. pub fn create_embedder(model: EmbedderModel, config: ...) -> Result<Arc<dyn Embedder>>",
+          "detail": "Factory pattern for selecting embedder. Can be controlled by env var VELD_EMBEDDER=minilm|nomic (default: minilm for backward compat).",
+          "breaking": false,
+          "dependencies": "P2.1, P3.1, P3.2"
+        }
+      ]
+    },
+
+    "phase_4_vector_index_updates": {
+      "description": "Update Vamana index to support multiple dimensions, add version detection",
+      "changes": [
+        {
+          "id": "P4.1",
+          "file": "src/vector_db/vamana.rs",
+          "line": 85,
+          "type": "Index metadata versioning",
+          "from": "VamanaConfig { dimension: 384 } hardcoded at construction",
+          "to": "Store dimension in index metadata header for validation at load time",
+          "detail": "Index file format v2: prepend 4-byte magic + 4-byte version + 4-byte dimension before existing data. On load, validate dimension matches config or embedder.dimension().",
+          "breaking": true,
+          "backward_compat": "v1 indices (no version header) default to dimension=384. Detect by file size.",
+          "dependencies": "None"
+        },
+        {
+          "id": "P4.2",
+          "file": "src/vector_db/vamana.rs",
+          "line": 70,
+          "type": "Update VamanaConfig",
+          "from": "pub dimension: usize = 384",
+          "to": "pub dimension: usize (no default - require explicit value from embedder)",
+          "detail": "Modify VamanaConfig::default() to not hardcode 384. Pass embedder.dimension() when constructing index.",
+          "breaking": false,
+          "dependencies": "P2.1"
+        },
+        {
+          "id": "P4.3",
+          "file": "src/memory/retrieval.rs",
+          "line": 171,
+          "type": "Use embedder dimension",
+          "from": "VamanaConfig { dimension: 384 ... }",
+          "to": "VamanaConfig { dimension: embedder.dimension() ... }",
+          "detail": "Pass embedder.dimension() instead of hardcoded 384",
+          "breaking": false,
+          "dependencies": "P2.1, P4.2"
+        }
+      ]
+    },
+
+    "phase_5_memory_system_updates": {
+      "description": "Update MemorySystem to use embedder from central location",
+      "changes": [
+        {
+          "id": "P5.1",
+          "file": "src/memory/mod.rs",
+          "line": 448,
+          "type": "Embedder initialization",
+          "from": "MiniLMEmbedder::new(EmbeddingConfig::default()) hardcoded at line 450",
+          "to": "Use factory: create_embedder(EmbedderModel::from_env(), config)?",
+          "detail": "Use embeddings::create_embedder() factory (from P3.3) controlled by VELD_EMBEDDER env var",
+          "breaking": false,
+          "dependencies": "P3.3"
+        },
+        {
+          "id": "P5.2",
+          "file": "src/memory/mod.rs",
+          "line": 182,
+          "type": "Cache size documentation",
+          "from": "Comments hardcode ~15MB for 384-dim embeddings",
+          "to": "Update comments to mention dimension-dependent size calculation",
+          "detail": "Change: '~15MB for 384-dim embeddings' to '~15MB per 384-dim entries (scales with dimension)'",
+          "breaking": false,
+          "dependencies": "None"
+        }
+      ]
+    },
+
+    "phase_6_constants_documentation": {
+      "description": "Update hardcoded dimension references in constants and comments",
+      "changes": [
+        {
+          "id": "P6.1",
+          "file": "src/constants.rs",
+          "line": 125,
+          "type": "Update documentation",
+          "from": "Comments mention 384 dimensions for MiniLM-L6-v2",
+          "to": "Clarify this is model-specific and dimension varies by embedder",
+          "detail": "Add comment explaining ENTITY_EMBEDDING_CACHE_MAX uses current embedder dimension, not hardcoded 384",
+          "breaking": false,
+          "dependencies": "None"
+        },
+        {
+          "id": "P6.2",
+          "file": "src/memory/storage.rs",
+          "line": 2990,
+          "type": "Update multimodality documentation",
+          "from": "// Text: 384-dim MiniLM (current)",
+          "to": "// Text: configurable dim (MiniLM 384, Nomic 768)",
+          "detail": "Update Modality::Text dimension() method to call embedder.dimension() instead of returning 384",
+          "breaking": false,
+          "dependencies": "P2.1"
+        },
+        {
+          "id": "P6.3",
+          "file": "src/memory/storage.rs",
+          "line": 3026,
+          "type": "Update Modality enum",
+          "from": "Modality::Text => 384, // MiniLM-L6-v2",
+          "to": "Modality::Text => get_text_embedder_dimension(), // Dynamic based on VELD_EMBEDDER",
+          "detail": "Create helper fn get_text_embedder_dimension() that reads from embedder trait or config",
+          "breaking": false,
+          "dependencies": "P2.1, P3.3"
+        },
+        {
+          "id": "P6.4",
+          "file": "src/embeddings/mod.rs",
+          "line": 4,
+          "type": "Update module documentation",
+          "from": "//! Uses ONNX Runtime with MiniLM-L6-v2 for 384-dimensional embeddings.",
+          "to": "//! Uses ONNX Runtime with configurable embedder (MiniLM-L6-v2: 384-dim or Nomic-embed-text-v1.5: 768-dim).",
+          "breaking": false,
+          "dependencies": "None"
+        }
+      ]
+    },
+
+    "phase_7_tests_and_assertions": {
+      "description": "Update hardcoded dimension assertions in tests",
+      "changes": [
+        {
+          "id": "P7.1",
+          "file": "src/embeddings/minilm.rs",
+          "line": 997,
+          "type": "Update test assertions",
+          "from": "assert_eq!(embedding.len(), 384);",
+          "to": "assert_eq!(embedding.len(), embedder.dimension());",
+          "detail": "Change both lines 997 and 1021 to use embedder.dimension() instead of hardcoded 384",
+          "breaking": false,
+          "dependencies": "P2.1"
+        },
+        {
+          "id": "P7.2",
+          "file": "src/embeddings/nomic.rs",
+          "type": "Add new test module",
+          "detail": "Mirror test_encode() and test_encode_batch() from minilm.rs, verifying dimension=768",
+          "breaking": false,
+          "dependencies": "P3.2"
+        }
+      ]
+    }
+  },
+
+  "migration_strategy": {
+    "backward_compatibility": {
+      "approach": "Detect and migrate indices",
+      "mechanism": "Index file versioning with dimension header",
+      "steps": [
+        "Indices created with MiniLM have no version header; on first load with new code, detect as v0 and assume dimension=384",
+        "Indices created with Nomic have explicit version header (v1) with dimension embedded",
+        "On mismatch, refuse to load with clear error message directing user to re-embed and rebuild index",
+        "Provide migration helper: veld rebuild-index --from-embedder minilm --to-embedder nomic"
+      ],
+      "data_loss": "None - original memories preserved, only vector indices must be rebuilt",
+      "rollback": "Keep MiniLM model and code path available, revert VELD_EMBEDDER env var"
+    },
+
+    "execution_order": {
+      "sequential_must_follow": [
+        ["P1.1", "P1.2", "P1.3"],
+        ["P1.4"],
+        ["P2.2", "P2.3", "P2.4"],
+        ["P3.1", "P3.2", "P3.3"],
+        ["P4.1", "P4.2", "P4.3"],
+        ["P5.1", "P5.2"],
+        ["P6.1 through P6.4"],
+        ["P7.1", "P7.2"]
+      ],
+      "parallel_safe": [
+        "P1.1 and P1.2 and P1.3 (all independent additions)",
+        "P2.2 and P2.3 (same file, no conflict)",
+        "P6.1 through P6.4 (documentation updates only)"
+      ],
+      "critical_dependencies": {
+        "P1.4": ["P1.1", "P1.2", "P1.3"],
+        "P3.3": ["P3.1", "P3.2"],
+        "P4.3": ["P4.2"],
+        "P5.1": ["P3.3"]
+      }
+    },
+
+    "rollout_phases": {
+      "phase_0_branch": "Create feature branch: feature/nomic-upgrade",
+      "phase_1_merge": "Implement P1 (download support) - no runtime changes yet, fully backward compatible",
+      "phase_2_merge": "Implement P2, P3 (abstractions) - add factory pattern but default to MiniLM",
+      "phase_3_merge": "Implement P4, P5, P6, P7 - complete infrastructure. VELD_EMBEDDER=minilm by default",
+      "phase_4_test": "Integration testing: create indices with both embedders, verify dimension handling",
+      "phase_5_enable": "Set VELD_EMBEDDER=nomic as default in main branch after full testing",
+      "phase_6_deprecate": "In v2.0, mark minilm as deprecated; in v3.0, remove it entirely"
+    }
+  },
+
+  "architectural_improvements": {
+    "make_dimension_configurable": {
+      "benefit": "Future model swaps (e.g., to 1024-dim or other models) require only addition of new embedder, not code refactoring",
+      "implementation": "Already done in P2 - EmbeddingConfig::expected_dimension. Dimension flows from embedder.dimension() trait method.",
+      "additional_step": "Create EmbedderRegistry<name -> Box<dyn Embedder>> to support multiple registered embedders at runtime"
+    },
+
+    "backward_compatibility_mechanism": {
+      "approach": "Index format versioning with dimension detection",
+      "benefits": [
+        "Users can keep existing indices using MiniLM while selectively upgrading to Nomic for new indices",
+        "Clear error on dimension mismatch prevents silent embedding corruption",
+        "Migration helper allows gradual transition"
+      ],
+      "cost": "4-8 bytes per index file for version header + 1-2 dimension validation checks per index load"
+    },
+
+    "cross_encoder_independence": {
+      "finding": "Cross-encoder (ms-marco-MiniLM-L-6-v2) is completely independent from bi-encoder dimension",
+      "implication": "No changes required to cross_encoder.rs or cross-encoder download URLs",
+      "future_upgrade_path": "When/if cross-encoder is upgraded (e.g., to ms-marco-mDPR), it follows the same pattern as bi-encoder upgrade"
+    }
+  },
+
+  "testing_strategy": {
+    "unit_tests": [
+      "Test EmbeddingConfig::expected_dimension validation",
+      "Test MiniLMEmbedder with mocked 768-dim output (should accept if configured)",
+      "Test NomicEmbedder produces 768-dim embeddings",
+      "Test dimension() trait method returns correct value for each embedder",
+      "Test VamanaIndex with multiple dimensions (384, 768, 1024)",
+      "Test index file versioning (v0 -> v1 migration detection)"
+    ],
+    "integration_tests": [
+      "Create MemorySystem with MiniLM, store 100 memories, build index",
+      "Switch to Nomic embedder, attempt to load index (should fail with helpful error)",
+      "Rebuild index with Nomic embedder, verify search quality",
+      "Compare search results: MiniLM index vs Nomic index (expect better recall with Nomic)",
+      "Test hybrid_search with both embedders",
+      "Test cache eviction and hit rates with different embedder dimensions"
+    ],
+    "performance_benchmarks": [
+      "Measure encode() latency: MiniLM vs Nomic (expect Nomic ~10-15% slower due to 2x dimension)",
+      "Measure batch_encode() throughput: both embedders with batch size 32",
+      "Measure vector search latency: Vamana with 384-dim vs 768-dim (expect ~2x higher)",
+      "Measure index file size: MiniLM indices vs Nomic indices (expect ~2x larger)",
+      "Measure cache memory usage: both embedders at max capacity"
+    ]
+  },
+
+  "quality_gates": {
+    "before_merge": [
+      "All unit tests pass",
+      "Backward compatibility: old MiniLM indices load with clear error and recovery message",
+      "Dimension detection: loads index and verifies dimension matches embedder",
+      "No embedding corruption: verified via hash of embeddings before/after"
+    ],
+    "before_release": [
+      "Integration tests pass: full memory lifecycle with both embedders",
+      "Search quality: Nomic indices show >= +5 points improvement in retrieval recall",
+      "Performance acceptable: Nomic encode latency < 50ms, batch throughput >= 1000 docs/sec",
+      "Documentation complete: README, ARCHITECTURE, migration guide"
+    ],
+    "before_default_switch": [
+      "User feedback: at least 5 test users confirm Nomic improves their workflows",
+      "No regressions: cross-encoder reranking still works identically",
+      "Migration path tested: users can selectively upgrade indices at their own pace"
+    ]
+  },
+
+  "file_locations_summary": {
+    "files_with_384_hardcoded": {
+      "src/embeddings/minilm.rs": [
+        { "line": 3, "context": "Doc comment: 384-dimensional sentence embeddings" },
+        { "line": 427, "context": "dimension: 384 initialization in new()" },
+        { "line": 478, "context": "dimension: 384 initialization in new_simplified()" },
+        { "line": 997, "context": "Test assertion: assert_eq!(embedding.len(), 384)" },
+        { "line": 1021, "context": "Test assertion: assert_eq!(emb.len(), 384)" }
+      ],
+      "src/vector_db/vamana.rs": [
+        { "line": 85, "context": "dimension: 384 in VamanaConfig::default()" }
+      ],
+      "src/memory/retrieval.rs": [
+        { "line": 173, "context": "dimension: 384 in VamanaConfig construction" }
+      ],
+      "src/memory/storage.rs": [
+        { "line": 2991, "context": "Comment: Text: 384-dim MiniLM (current)" },
+        { "line": 3026, "context": "Modality::Text => 384 hardcoded" }
+      ],
+      "src/constants.rs": [
+        { "line": 137, "context": "Comment: At 384 dimensions × 4 bytes" },
+        { "line": 227, "context": "Comment: Embeddings (384 dims): 1.5KB" }
+      ]
+    },
+    "files_with_minilm_references": {
+      "src/embeddings/mod.rs": [
+        { "line": 4, "context": "Doc: Uses ONNX Runtime with MiniLM-L6-v2" }
+      ],
+      "src/embeddings/downloader.rs": [
+        { "line": 29, "context": "MODEL_ONNX_URL for all-MiniLM-L6-v2" },
+        { "line": 30, "context": "MODEL_QUANTIZED_URL for all-MiniLM-L6-v2" },
+        { "line": 32, "context": "TOKENIZER_URL for all-MiniLM-L6-v2" },
+        { "line": 100, "context": "get_models_dir() returns minilm-l6" }
+      ],
+      "src/memory/mod.rs": [
+        { "line": 177, "context": "Arc<crate::embeddings::minilm::MiniLMEmbedder>" },
+        { "line": 450, "context": "MiniLMEmbedder::new()" }
+      ],
+      "src/embeddings/cross_encoder.rs": [
+        { "line": 1, "context": "Doc: Cross-encoder reranker using ms-marco-MiniLM-L-6-v2" },
+        { "line": 120, "context": "Comment: uses ms-marco-MiniLM-L-6-v2 cross-encoder" }
+      ],
+      "src/memory/hybrid_search.rs": [
+        { "line": 673, "context": "embedder: Arc<MiniLMEmbedder>" }
+      ]
+    }
+  },
+
+  "recommendations": {
+    "priority_1_critical": [
+      "P1.4 (download support) - enables testing with actual Nomic weights",
+      "P2.2-P2.4 (configurable dimension) - foundation for all other changes",
+      "P4.1-P4.3 (index versioning) - prevents silent corruption on dimension mismatch"
+    ],
+    "priority_2_important": [
+      "P3.3 (embedder factory) - enables runtime selection of embedder",
+      "P5.1 (use factory) - switches from hardcoded MiniLM to configurable"
+    ],
+    "priority_3_quality": [
+      "P6 (documentation) - prevents future developers from re-hardcoding",
+      "P7 (tests) - ensures correctness with new dimensions"
+    ],
+    "optional_enhancements": [
+      "Create EmbedderRegistry for registering multiple embedders at runtime",
+      "Add CLI tool: veld embedder switch --from minilm --to nomic",
+      "Add metrics: embedding dimension in prometheus output",
+      "Add health check: verify embedder dimension matches index dimension at startup"
+    ]
+  },
+
+  "risks_and_mitigations": {
+    "risk_1_dimension_mismatch": {
+      "description": "Querying with wrong dimension embeddings against index creates silent failures or corrupted results",
+      "severity": "High",
+      "mitigation": "P4.1 - add version header to index with embedded dimension. Refuse to load on mismatch."
+    },
+    "risk_2_cache_invalidation": {
+      "description": "Embedding cache contains 384-dim vectors; switching to Nomic invalidates all cached entries",
+      "severity": "Low",
+      "mitigation": "Caches are bounded LRU; clear on embedder switch. No data loss, just cache miss storm.",
+      "impact": "First 1000 queries slower after switch, then back to normal"
+    },
+    "risk_3_modality_confusion": {
+      "description": "Modality::Text dimension() returns hardcoded 384; confuses multimodal search",
+      "severity": "Medium",
+      "mitigation": "P6.3 - make Modality::Text dimension dynamic. Add test for multimodal search with Nomic."
+    },
+    "risk_4_cross_encoder_mismatch": {
+      "description": "If someone upgrades cross-encoder without understanding independence, might try to sync dimensions",
+      "severity": "Low",
+      "mitigation": "Document clearly that cross-encoder is independent. Add comment in cross_encoder.rs explaining this."
+    }
+  },
+
+  "success_criteria": {
+    "must_have": [
+      "Nomic embeddings produce 768-dim vectors",
+      "Vamana index correctly stores and retrieves with 768-dim vectors",
+      "Search recall improves by at least +5% over MiniLM (due to +9.1 MTEB)",
+      "No backward compatibility break: MiniLM indices can still be used with old code or migrated with helper",
+      "Performance acceptable: encode() latency < 50ms, search latency < 100ms for 10M vectors"
+    ],
+    "should_have": [
+      "Dimension fully configurable, not hardcoded anywhere in logic",
+      "Clear documentation of migration path for users",
+      "Ability to run both embedders simultaneously (for A/B testing)",
+      "CLI helper for index rebuilding"
+    ],
+    "nice_to_have": [
+      "EmbedderRegistry for future embedders without code changes",
+      "Metrics dashboard showing embedder dimension in use",
+      "Performance comparison: MiniLM vs Nomic for typical queries"
+    ]
+  },
+
+  "estimated_timeline": {
+    "phase_1_implementation": "2-3 hours (P1-P4)",
+    "phase_2_integration_testing": "1-2 hours (verify dual-embedder operation)",
+    "phase_3_performance_benchmarking": "1 hour (measure latency and recall)",
+    "phase_4_documentation": "0.5-1 hour (README, migration guide)",
+    "phase_5_review_and_polish": "0.5-1 hour (code review, final adjustments)",
+    "total_estimated": "5-8 hours"
+  }
+}

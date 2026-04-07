@@ -1,0 +1,285 @@
+//! Self-Editing Agent Context Blocks
+//!
+//! Named key-value blocks that agents can read and write. Unlike memories
+//! (append-only with recall), context blocks are mutable state with a fixed
+//! key that gets overwritten — inspired by Letta's core architecture.
+//!
+//! Storage uses the shared RocksDB with a dedicated column family, keyed as
+//! `{user_id}:{block_key}` for efficient per-user prefix scans.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Column family name for context blocks
+pub const CF_CONTEXT_BLOCKS: &str = "context_blocks";
+
+/// Default maximum token budget for a single context block
+const DEFAULT_MAX_TOKENS: usize = 2000;
+
+/// A named, mutable context block that agents can read and write.
+///
+/// Unlike episodic memories which are append-only, context blocks are
+/// keyed state that persists across sessions and can be freely overwritten.
+/// Typical uses: persona, user profile, project state, running summaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextBlock {
+    /// Block identifier (e.g., "persona", "user_profile", "project_state")
+    pub key: String,
+    /// The block content (agent-editable)
+    pub content: String,
+    /// Size limit for this block (approximate token budget)
+    pub max_tokens: usize,
+    /// When this block was last updated
+    pub updated_at: DateTime<Utc>,
+    /// Monotonically increasing version, incremented on each write
+    pub version: u32,
+}
+
+/// Storage for agent context blocks, backed by a shared RocksDB instance.
+pub struct ContextBlockStore {
+    db: Arc<DB>,
+}
+
+impl ContextBlockStore {
+    /// Column family descriptors required by the ContextBlockStore.
+    /// The caller must include these when opening the shared DB.
+    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
+        let mut cf_opts = Options::default();
+        cf_opts.create_if_missing(true);
+        cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        vec![ColumnFamilyDescriptor::new(CF_CONTEXT_BLOCKS, cf_opts)]
+    }
+
+    /// Create a new context block store backed by the given shared DB.
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+
+    fn cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_CONTEXT_BLOCKS)
+            .expect("context_blocks CF must exist in shared DB")
+    }
+
+    /// Build the RocksDB key for a given user + block key.
+    fn db_key(user_id: &str, block_key: &str) -> String {
+        format!("{user_id}:{block_key}")
+    }
+
+    /// Retrieve a single context block by key.
+    pub fn get(&self, user_id: &str, block_key: &str) -> Result<Option<ContextBlock>> {
+        let key = Self::db_key(user_id, block_key);
+        match self.db.get_cf(self.cf(), key.as_bytes())? {
+            Some(data) => {
+                let (block, _): (ContextBlock, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())
+                        .context("Failed to deserialize context block")?;
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Create or update a context block. Returns the resulting block.
+    ///
+    /// If the block already exists, its content is replaced, version is
+    /// incremented, and `updated_at` is set to now. If `max_tokens` is
+    /// `None` on a new block, the default (2000) is used; on an existing
+    /// block, the previous value is preserved.
+    pub fn set(
+        &self,
+        user_id: &str,
+        block_key: &str,
+        content: &str,
+        max_tokens: Option<usize>,
+    ) -> Result<ContextBlock> {
+        let key = Self::db_key(user_id, block_key);
+        let now = Utc::now();
+
+        // Load existing block to preserve version and max_tokens if not specified
+        let existing = self.get(user_id, block_key)?;
+
+        let block = match existing {
+            Some(prev) => ContextBlock {
+                key: block_key.to_string(),
+                content: content.to_string(),
+                max_tokens: max_tokens.unwrap_or(prev.max_tokens),
+                updated_at: now,
+                version: prev.version.saturating_add(1),
+            },
+            None => ContextBlock {
+                key: block_key.to_string(),
+                content: content.to_string(),
+                max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+                updated_at: now,
+                version: 1,
+            },
+        };
+
+        let value = bincode::serde::encode_to_vec(&block, bincode::config::standard())
+            .context("Failed to serialize context block")?;
+        self.db
+            .put_cf(self.cf(), key.as_bytes(), &value)
+            .context("Failed to write context block to RocksDB")?;
+
+        tracing::debug!(
+            user_id = user_id,
+            block_key = block_key,
+            version = block.version,
+            content_len = block.content.len(),
+            "Context block updated"
+        );
+
+        Ok(block)
+    }
+
+    /// List all context blocks for a user.
+    pub fn list(&self, user_id: &str) -> Result<Vec<ContextBlock>> {
+        let prefix = format!("{user_id}:");
+        let mut blocks = Vec::new();
+
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.cf(), prefix.as_bytes());
+
+        for item in iter {
+            let (key, value) = item.context("Failed to iterate context blocks")?;
+            let key_str = String::from_utf8_lossy(&key);
+
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+
+            if let Ok((block, _)) = bincode::serde::decode_from_slice::<ContextBlock, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                blocks.push(block);
+            }
+        }
+
+        // Sort by key for deterministic ordering
+        blocks.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(blocks)
+    }
+
+    /// Delete a context block. Returns `true` if the block existed.
+    pub fn delete(&self, user_id: &str, block_key: &str) -> Result<bool> {
+        let key = Self::db_key(user_id, block_key);
+        let existed = self.db.get_cf(self.cf(), key.as_bytes())?.is_some();
+
+        if existed {
+            self.db
+                .delete_cf(self.cf(), key.as_bytes())
+                .context("Failed to delete context block from RocksDB")?;
+            tracing::debug!(
+                user_id = user_id,
+                block_key = block_key,
+                "Context block deleted"
+            );
+        }
+
+        Ok(existed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_test_db() -> (Arc<DB>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+
+        let cfs = ContextBlockStore::cf_descriptors();
+        let db = DB::open_cf_descriptors(&db_opts, tmp.path(), cfs).unwrap();
+        (Arc::new(db), tmp)
+    }
+
+    #[test]
+    fn test_set_and_get() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+
+        let block = store.set("user1", "persona", "You are a helpful assistant.", None).unwrap();
+        assert_eq!(block.key, "persona");
+        assert_eq!(block.version, 1);
+        assert_eq!(block.max_tokens, DEFAULT_MAX_TOKENS);
+
+        let retrieved = store.get("user1", "persona").unwrap().unwrap();
+        assert_eq!(retrieved.content, "You are a helpful assistant.");
+        assert_eq!(retrieved.version, 1);
+    }
+
+    #[test]
+    fn test_version_increment() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+
+        store.set("user1", "state", "v1 content", None).unwrap();
+        let block = store.set("user1", "state", "v2 content", None).unwrap();
+        assert_eq!(block.version, 2);
+        assert_eq!(block.content, "v2 content");
+
+        let block = store.set("user1", "state", "v3 content", None).unwrap();
+        assert_eq!(block.version, 3);
+    }
+
+    #[test]
+    fn test_max_tokens_preserved() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+
+        store.set("user1", "x", "content", Some(500)).unwrap();
+        // Update without specifying max_tokens — should preserve 500
+        let block = store.set("user1", "x", "new content", None).unwrap();
+        assert_eq!(block.max_tokens, 500);
+
+        // Explicit override
+        let block = store.set("user1", "x", "newer", Some(1000)).unwrap();
+        assert_eq!(block.max_tokens, 1000);
+    }
+
+    #[test]
+    fn test_list() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+
+        store.set("user1", "alpha", "a", None).unwrap();
+        store.set("user1", "beta", "b", None).unwrap();
+        store.set("user2", "gamma", "c", None).unwrap();
+
+        let user1_blocks = store.list("user1").unwrap();
+        assert_eq!(user1_blocks.len(), 2);
+        assert_eq!(user1_blocks[0].key, "alpha");
+        assert_eq!(user1_blocks[1].key, "beta");
+
+        let user2_blocks = store.list("user2").unwrap();
+        assert_eq!(user2_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_delete() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+
+        store.set("user1", "temp", "data", None).unwrap();
+        assert!(store.delete("user1", "temp").unwrap());
+        assert!(!store.delete("user1", "temp").unwrap());
+        assert!(store.get("user1", "temp").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_nonexistent() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+
+        assert!(store.get("user1", "missing").unwrap().is_none());
+    }
+}

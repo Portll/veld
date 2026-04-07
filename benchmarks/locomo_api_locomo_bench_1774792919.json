@@ -1,0 +1,806 @@
+{
+  "benchmark": "locomo-api",
+  "timestamp": "2026-03-29T14:02:03.671716+00:00",
+  "server_version": "0.5.5+121",
+  "user_id": "locomo_bench_1774792919",
+  "n_memories": 20,
+  "n_queries": 20,
+  "metrics": {
+    "overall_mrr": 0.8958333333333334,
+    "overall_hit_at_5": 0.95,
+    "overall_hit_at_10": 1.0,
+    "overall_recall_at_5": 0.8683333333333334,
+    "overall_recall_at_10": 0.9716666666666667
+  },
+  "per_category": {
+    "single-hop": {
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "n": 5
+    },
+    "temporal": {
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "n": 5
+    },
+    "multi-hop": {
+      "mrr": 0.9,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "n": 5
+    },
+    "open-domain": {
+      "mrr": 0.6833333333333333,
+      "hit_at_5": 0.8,
+      "hit_at_10": 1.0,
+      "recall_at_5": 0.47333333333333333,
+      "recall_at_10": 0.8866666666666667,
+      "n": 5
+    }
+  },
+  "results": [
+    {
+      "index": 1,
+      "category": "single-hop",
+      "query": "What database did we choose for the analytics pipeline?",
+      "expected_tags": [
+        "M02"
+      ],
+      "returned_tags": [
+        "M02",
+        "M18",
+        "M09",
+        "M08",
+        "M16",
+        "M20",
+        "M19",
+        "M10",
+        "M03",
+        "M12"
+      ],
+      "returned_scores": [
+        0.832,
+        0.8598,
+        0.7358,
+        0.622,
+        0.606,
+        0.578,
+        0.508,
+        0.3876,
+        0.314,
+        0.24580002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 2,
+      "category": "single-hop",
+      "query": "What was the root cause of the Redis cache invalidation bug?",
+      "expected_tags": [
+        "M05"
+      ],
+      "returned_tags": [
+        "M05",
+        "M01",
+        "M03",
+        "M09",
+        "M19",
+        "M20",
+        "M02",
+        "M16",
+        "M18",
+        "M08"
+      ],
+      "returned_scores": [
+        0.874,
+        0.804,
+        0.734,
+        0.6658,
+        0.64800006,
+        0.578,
+        0.4139968,
+        0.39600003,
+        0.3698,
+        0.20200002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 3,
+      "category": "single-hop",
+      "query": "What is my preferred IDE theme and font?",
+      "expected_tags": [
+        "M04"
+      ],
+      "returned_tags": [
+        "M04",
+        "M20",
+        "M16",
+        "M09",
+        "M19",
+        "M17",
+        "M18",
+        "M11",
+        "M15",
+        "M14"
+      ],
+      "returned_scores": [
+        0.874,
+        0.85800004,
+        0.746,
+        0.6658,
+        0.64800006,
+        0.578,
+        0.50979996,
+        0.3858,
+        0.36800003,
+        0.29980004
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 4,
+      "category": "single-hop",
+      "query": "How many story points did we commit to in Sprint 14?",
+      "expected_tags": [
+        "M01"
+      ],
+      "returned_tags": [
+        "M01",
+        "M20",
+        "M19",
+        "M18",
+        "M15",
+        "M13",
+        "M03",
+        "M05",
+        "M10",
+        "M12"
+      ],
+      "returned_scores": [
+        0.874,
+        0.85800004,
+        0.78800005,
+        0.7198,
+        0.64800006,
+        0.5798,
+        0.454,
+        0.38400003,
+        0.3176,
+        0.24580002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 5,
+      "category": "single-hop",
+      "query": "What were the security vulnerabilities found in the penetration test?",
+      "expected_tags": [
+        "M14"
+      ],
+      "returned_tags": [
+        "M14",
+        "M20",
+        "M05",
+        "M07",
+        "M19",
+        "M18",
+        "M16",
+        "M15",
+        "M10",
+        "M09"
+      ],
+      "returned_scores": [
+        0.92980003,
+        0.85800004,
+        0.734,
+        0.66400003,
+        0.64800006,
+        0.5798,
+        0.46599996,
+        0.43800002,
+        0.3176,
+        0.24580002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 6,
+      "category": "temporal",
+      "query": "What happened during the production incident that caused downtime?",
+      "expected_tags": [
+        "M09"
+      ],
+      "returned_tags": [
+        "M09",
+        "M07",
+        "M16",
+        "M20",
+        "M02",
+        "M08",
+        "M19",
+        "M18",
+        "M15",
+        "M13"
+      ],
+      "returned_scores": [
+        0.8758,
+        0.804,
+        0.746,
+        0.718,
+        0.5539968,
+        0.482,
+        0.508,
+        0.43980002,
+        0.36800003,
+        0.29980004
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 7,
+      "category": "temporal",
+      "query": "When is my conference talk and what is it about?",
+      "expected_tags": [
+        "M11"
+      ],
+      "returned_tags": [
+        "M11",
+        "M20",
+        "M19",
+        "M17",
+        "M18",
+        "M16",
+        "M15",
+        "M14",
+        "M09",
+        "M13"
+      ],
+      "returned_scores": [
+        0.8758,
+        0.85800004,
+        0.78800005,
+        0.718,
+        0.64980006,
+        0.536,
+        0.508,
+        0.43980002,
+        0.3158,
+        0.29980004
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 8,
+      "category": "temporal",
+      "query": "When does Priya start and who is she replacing?",
+      "expected_tags": [
+        "M15"
+      ],
+      "returned_tags": [
+        "M15",
+        "M20",
+        "M19",
+        "M17",
+        "M18",
+        "M16",
+        "M11",
+        "M14",
+        "M09",
+        "M10"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.85800004,
+        0.78800005,
+        0.718,
+        0.64980006,
+        0.536,
+        0.4558,
+        0.43980002,
+        0.3158,
+        0.24760002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 9,
+      "category": "temporal",
+      "query": "What are the dates for the company hackathon?",
+      "expected_tags": [
+        "M17"
+      ],
+      "returned_tags": [
+        "M17",
+        "M19",
+        "M16",
+        "M20",
+        "M10",
+        "M15",
+        "M07",
+        "M13"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.84050006,
+        0.71279037,
+        0.66550004,
+        0.5276,
+        0.49050003,
+        0.34900004,
+        0.31730002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 10,
+      "category": "temporal",
+      "query": "When was the EU checkout latency issue finally resolved?",
+      "expected_tags": [
+        "M19"
+      ],
+      "returned_tags": [
+        "M19",
+        "M03",
+        "M10",
+        "M13",
+        "M14",
+        "M18",
+        "M20",
+        "M16",
+        "M09",
+        "M15"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.804,
+        0.7376,
+        0.7198,
+        0.64980006,
+        0.5798,
+        0.508,
+        0.39779043,
+        0.3158,
+        0.29800004
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 11,
+      "category": "multi-hop",
+      "query": "How did Sarah's Stripe migration fix the EU checkout delay problem?",
+      "expected_tags": [
+        "M19",
+        "M10",
+        "M03"
+      ],
+      "returned_tags": [
+        "M19",
+        "M03",
+        "M10",
+        "M01",
+        "M20",
+        "M05",
+        "M06",
+        "M18",
+        "M16",
+        "M15"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.804,
+        0.7376,
+        0.6660976,
+        0.64800006,
+        0.4840976,
+        0.454,
+        0.43980002,
+        0.3277904,
+        0.29800004
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 12,
+      "category": "multi-hop",
+      "query": "What caching problems did we have and how were they resolved?",
+      "expected_tags": [
+        "M05",
+        "M01"
+      ],
+      "returned_tags": [
+        "M19",
+        "M01",
+        "M15",
+        "M20",
+        "M05",
+        "M18",
+        "M16",
+        "M09",
+        "M03",
+        "M10"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.8060976,
+        0.78800005,
+        0.718,
+        0.55409765,
+        0.5798,
+        0.4677904,
+        0.3858,
+        0.314,
+        0.24760002
+      ],
+      "mrr": 0.5,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 13,
+      "category": "multi-hop",
+      "query": "Which team member reviewed the onboarding wizard and what did they find?",
+      "expected_tags": [
+        "M12",
+        "M07"
+      ],
+      "returned_tags": [
+        "M07",
+        "M12",
+        "M01",
+        "M13",
+        "M20",
+        "M15",
+        "M06",
+        "M08",
+        "M14",
+        "M19"
+      ],
+      "returned_scores": [
+        0.874,
+        0.8058,
+        0.73609763,
+        0.7198,
+        0.64800006,
+        0.578,
+        0.454,
+        0.342,
+        0.3698,
+        0.29800004
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 14,
+      "category": "multi-hop",
+      "query": "What is Raj working on now and what happens when he leaves?",
+      "expected_tags": [
+        "M05",
+        "M15"
+      ],
+      "returned_tags": [
+        "M15",
+        "M07",
+        "M05",
+        "M19",
+        "M01",
+        "M03",
+        "M20",
+        "M18",
+        "M16",
+        "M09"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.804,
+        0.69409764,
+        0.718,
+        0.59609765,
+        0.52400005,
+        0.508,
+        0.39806354,
+        0.3277904,
+        0.24580002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 15,
+      "category": "multi-hop",
+      "query": "How do our analytics benchmark numbers compare to the Q3 OKR targets?",
+      "expected_tags": [
+        "M18",
+        "M13"
+      ],
+      "returned_tags": [
+        "M18",
+        "M13",
+        "M09",
+        "M02",
+        "M16",
+        "M20",
+        "M19",
+        "M15",
+        "M10",
+        "M03"
+      ],
+      "returned_scores": [
+        0.88806355,
+        0.8598,
+        0.6941019,
+        0.6239968,
+        0.60779047,
+        0.578,
+        0.508,
+        0.43800002,
+        0.3176,
+        0.24400005
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 16,
+      "category": "open-domain",
+      "query": "What is the team's overall morale and social dynamics like?",
+      "expected_tags": [
+        "M20",
+        "M06"
+      ],
+      "returned_tags": [
+        "M06",
+        "M20",
+        "M13",
+        "M15",
+        "M19",
+        "M07",
+        "M08",
+        "M18",
+        "M16",
+        "M10"
+      ],
+      "returned_scores": [
+        0.874,
+        0.85800004,
+        0.78980005,
+        0.718,
+        0.64800006,
+        0.52400005,
+        0.412,
+        0.39806354,
+        0.3277904,
+        0.24760002
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 17,
+      "category": "open-domain",
+      "query": "What are the most important strategic priorities for the team?",
+      "expected_tags": [
+        "M16",
+        "M13"
+      ],
+      "returned_tags": [
+        "M20",
+        "M15",
+        "M07",
+        "M06",
+        "M08",
+        "M13",
+        "M19",
+        "M18",
+        "M16",
+        "M09"
+      ],
+      "returned_scores": [
+        0.92800003,
+        0.85800004,
+        0.734,
+        0.66400003,
+        0.55200005,
+        0.5798,
+        0.508,
+        0.39806354,
+        0.3277904,
+        0.20410195
+      ],
+      "mrr": 0.16666666666666666,
+      "hit_at_5": 0.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 18,
+      "category": "open-domain",
+      "query": "What infrastructure and deployment decisions have we made recently?",
+      "expected_tags": [
+        "M08",
+        "M02",
+        "M16"
+      ],
+      "returned_tags": [
+        "M08",
+        "M20",
+        "M19",
+        "M16",
+        "M18",
+        "M02",
+        "M15",
+        "M13",
+        "M17",
+        "M09"
+      ],
+      "returned_scores": [
+        0.832,
+        0.85800004,
+        0.78800005,
+        0.6777904,
+        0.6080636,
+        0.4839968,
+        0.46822718,
+        0.43980002,
+        0.36800003,
+        0.20410195
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 0.6666666666666666,
+      "recall_at_10": 1.0
+    },
+    {
+      "index": 19,
+      "category": "open-domain",
+      "query": "What performance improvements have we achieved across the product?",
+      "expected_tags": [
+        "M18",
+        "M12",
+        "M10",
+        "M05",
+        "M19",
+        "M07"
+      ],
+      "returned_tags": [
+        "M18",
+        "M09",
+        "M10",
+        "M07",
+        "M20",
+        "M03",
+        "M12",
+        "M19",
+        "M16",
+        "M15"
+      ],
+      "returned_scores": [
+        0.88806355,
+        0.7641019,
+        0.7376,
+        0.66400003,
+        0.64800006,
+        0.52400005,
+        0.4558,
+        0.43800002,
+        0.3277904,
+        0.25822723
+      ],
+      "mrr": 1.0,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 0.5,
+      "recall_at_10": 0.8333333333333334
+    },
+    {
+      "index": 20,
+      "category": "open-domain",
+      "query": "Who are the key people on the team and what are they responsible for?",
+      "expected_tags": [
+        "M06",
+        "M01",
+        "M10",
+        "M05",
+        "M15"
+      ],
+      "returned_tags": [
+        "M13",
+        "M20",
+        "M02",
+        "M15",
+        "M07",
+        "M01",
+        "M06",
+        "M08",
+        "M18",
+        "M19"
+      ],
+      "returned_scores": [
+        0.92980003,
+        0.85800004,
+        0.6939968,
+        0.6782272,
+        0.59400004,
+        0.5260976,
+        0.454,
+        0.34399682,
+        0.32806355,
+        0.29800004
+      ],
+      "mrr": 0.25,
+      "hit_at_5": 1.0,
+      "hit_at_10": 1.0,
+      "recall_at_5": 0.2,
+      "recall_at_10": 0.6
+    }
+  ]
+}

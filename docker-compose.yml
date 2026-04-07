@@ -1,0 +1,31 @@
+services:
+  veld:
+    build: .
+    image: ghcr.io/portll/veld:latest
+    container_name: veld
+    ports:
+      - "3030:3030"
+    environment:
+      - RUST_LOG=info
+      - VELD_HOST=0.0.0.0
+      - VELD_PORT=3030
+      - VELD_MEMORY_PATH=/data
+    volumes:
+      - veld-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3030/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - veld-network
+
+volumes:
+  veld-data:
+    driver: local
+
+networks:
+  veld-network:
+    driver: bridge

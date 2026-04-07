@@ -1,0 +1,986 @@
+//! Hebbian Learning Tests
+//!
+//! Tests for the Hebbian feedback loop:
+//! - "Neurons that fire together wire together"
+//! - Reinforcement from task outcomes
+//! - Association strengthening between co-retrieved memories
+//! - Importance boost/decay based on helpfulness
+//! - NER integration for entity extraction
+
+use std::sync::Arc;
+
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::graph_memory::GraphMemory;
+use veld::memory::{
+    Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalOutcome,
+};
+use tempfile::TempDir;
+
+/// Create fallback NER instance for testing
+fn setup_fallback_ner() -> NeuralNer {
+    let config = NerConfig::default();
+    NeuralNer::new_fallback(config)
+}
+
+/// Create test memory system
+fn setup_memory_system() -> (MemorySystem, TempDir) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config = MemoryConfig {
+        storage_path: temp_dir.path().to_path_buf(),
+        working_memory_size: 100,
+        session_memory_size_mb: 50,
+        max_heap_per_user_mb: 200,
+        auto_compress: false,
+        compression_age_days: 30,
+        importance_threshold: 0.7,
+    };
+
+    let mut memory_system =
+        MemorySystem::new(config, None).expect("Failed to create memory system");
+
+    // Wire up GraphMemory for Hebbian association tests
+    let graph_path = temp_dir.path().join("graph");
+    let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
+    memory_system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
+        graph_memory,
+    )));
+
+    (memory_system, temp_dir)
+}
+
+/// Create experience with specified content
+fn create_experience(content: &str) -> Experience {
+    Experience {
+        content: content.to_string(),
+        experience_type: ExperienceType::Observation,
+        ..Default::default()
+    }
+}
+
+/// Create experience with NER-extracted entities
+fn create_experience_with_ner(content: &str, ner: &NeuralNer) -> Experience {
+    let entities = ner.extract(content).unwrap_or_default();
+    let entity_names: Vec<String> = entities.iter().map(|e| e.text.clone()).collect();
+    Experience {
+        content: content.to_string(),
+        experience_type: ExperienceType::Observation,
+        entities: entity_names,
+        ..Default::default()
+    }
+}
+
+// =============================================================================
+// RETRIEVAL TRACKING TESTS
+// =============================================================================
+
+#[test]
+fn test_retrieve_returns_memories() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record some memories
+    memory
+        .remember(
+            create_experience("Robot detected obstacle at entrance"),
+            None,
+        )
+        .unwrap();
+    memory
+        .remember(create_experience("Drone completed patrol route"), None)
+        .unwrap();
+
+    // Retrieve
+    let query = Query {
+        query_text: Some("obstacle detection".to_string()),
+        max_results: 5,
+        ..Default::default()
+    };
+
+    let results = memory.recall(&query).unwrap();
+    assert!(!results.is_empty(), "Should find relevant memories");
+}
+
+#[test]
+fn test_retrieve_multiple_related() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record related memories
+    for i in 0..10 {
+        memory
+            .remember(
+                create_experience(&format!("Warehouse section {} inventory check complete", i)),
+                None,
+            )
+            .unwrap();
+    }
+
+    let query = Query {
+        query_text: Some("warehouse inventory".to_string()),
+        max_results: 10,
+        ..Default::default()
+    };
+
+    let results = memory.recall(&query).unwrap();
+    assert!(results.len() >= 5, "Should find multiple related memories");
+}
+
+// =============================================================================
+// REINFORCEMENT OUTCOME TESTS
+// =============================================================================
+
+#[test]
+fn test_reinforce_helpful_boosts_importance() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memory
+    let id = memory
+        .remember(
+            create_experience("Critical safety procedure: always check battery before flight"),
+            None,
+        )
+        .unwrap();
+
+    // Get initial importance
+    let initial = memory.get_memory(&id).unwrap();
+    let initial_importance = initial.importance();
+
+    // Reinforce as helpful
+    let ids = vec![id];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    assert!(
+        stats.importance_boosts > 0,
+        "Should have boosted importance"
+    );
+
+    // Check importance increased
+    let after = memory.get_memory(&ids[0]).unwrap();
+    assert!(
+        after.importance() > initial_importance,
+        "Importance should increase after helpful feedback"
+    );
+}
+
+#[test]
+fn test_reinforce_misleading_decays_importance() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memory with high importance
+    let id = memory
+        .remember(
+            Experience {
+                content: "Outdated procedure that no longer applies".to_string(),
+                experience_type: ExperienceType::Decision,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+    // Get initial importance
+    let initial = memory.get_memory(&id).unwrap();
+    let initial_importance = initial.importance();
+
+    // Reinforce as misleading
+    let ids = vec![id];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Misleading)
+        .unwrap();
+
+    assert!(
+        stats.importance_decays > 0,
+        "Should have decayed importance"
+    );
+
+    // Check importance decreased
+    let after = memory.get_memory(&ids[0]).unwrap();
+    assert!(
+        after.importance() < initial_importance,
+        "Importance should decrease after misleading feedback"
+    );
+}
+
+#[test]
+fn test_reinforce_neutral_no_change() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memory
+    let id = memory
+        .remember(
+            create_experience("General observation about warehouse"),
+            None,
+        )
+        .unwrap();
+
+    // Get initial importance
+    let initial = memory.get_memory(&id).unwrap();
+    let _initial_importance = initial.importance();
+
+    // Reinforce as neutral
+    let ids = vec![id];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Neutral)
+        .unwrap();
+
+    // Check stats
+    assert_eq!(stats.importance_boosts, 0, "Neutral should not boost");
+    assert_eq!(stats.importance_decays, 0, "Neutral should not decay");
+}
+
+// =============================================================================
+// ASSOCIATION STRENGTHENING TESTS (Fire Together Wire Together)
+// =============================================================================
+
+#[test]
+fn test_co_retrieval_strengthens_association() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record related memories
+    let id1 = memory
+        .remember(
+            create_experience("Battery level monitoring is critical for drone safety"),
+            None,
+        )
+        .unwrap();
+    let id2 = memory
+        .remember(
+            create_experience("Low battery triggers automatic return to base"),
+            None,
+        )
+        .unwrap();
+
+    // Reinforce both together as helpful
+    let ids = vec![id1, id2];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    assert!(
+        stats.associations_strengthened > 0,
+        "Should strengthen association between co-retrieved memories"
+    );
+}
+
+#[test]
+fn test_repeated_co_retrieval_increases_strength() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record related memories
+    let id1 = memory
+        .remember(
+            create_experience("Obstacle A detected at north entrance"),
+            None,
+        )
+        .unwrap();
+    let id2 = memory
+        .remember(create_experience("Obstacle A is a forklift"), None)
+        .unwrap();
+
+    let ids = vec![id1, id2];
+
+    // Reinforce multiple times
+    let stats1 = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+    let stats2 = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+    let stats3 = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    // All should strengthen associations
+    assert!(stats1.associations_strengthened > 0);
+    assert!(stats2.associations_strengthened > 0);
+    assert!(stats3.associations_strengthened > 0);
+}
+
+#[test]
+fn test_single_memory_no_associations() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    let id = memory
+        .remember(create_experience("Single isolated memory"), None)
+        .unwrap();
+
+    let ids = vec![id];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    // Single memory can't have associations with itself
+    assert_eq!(
+        stats.associations_strengthened, 0,
+        "Single memory has no associations"
+    );
+}
+
+#[test]
+fn test_many_co_retrieved_associations() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record many related memories
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        let id = memory
+            .remember(
+                create_experience(&format!("Mission log entry {}: patrol sector {}", i, i)),
+                None,
+            )
+            .unwrap();
+        ids.push(id);
+    }
+
+    // Reinforce all together
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    // Should have many associations (n*(n-1)/2 for n=10 = 45)
+    // But capped at 20 due to MAX_COACTIVATION_SIZE
+    assert!(
+        stats.associations_strengthened > 0,
+        "Should strengthen associations"
+    );
+}
+
+// =============================================================================
+// REINFORCEMENT STATS TESTS
+// =============================================================================
+
+#[test]
+fn test_reinforcement_stats_counts() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memories
+    let id1 = memory
+        .remember(create_experience("Memory 1"), None)
+        .unwrap();
+    let id2 = memory
+        .remember(create_experience("Memory 2"), None)
+        .unwrap();
+    let id3 = memory
+        .remember(create_experience("Memory 3"), None)
+        .unwrap();
+
+    let ids = vec![id1, id2, id3];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    assert_eq!(stats.memories_processed, 3, "Should process all memories");
+}
+
+#[test]
+fn test_reinforcement_empty_ids() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    let ids: Vec<veld::memory::MemoryId> = vec![];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    assert_eq!(stats.memories_processed, 0);
+    assert_eq!(stats.associations_strengthened, 0);
+    assert_eq!(stats.importance_boosts, 0);
+    assert_eq!(stats.importance_decays, 0);
+}
+
+#[test]
+fn test_reinforcement_invalid_ids() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Create random IDs that don't exist
+    let ids = vec![
+        veld::memory::MemoryId(veld::uuid::Uuid::new_v4()),
+        veld::memory::MemoryId(veld::uuid::Uuid::new_v4()),
+    ];
+
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    // memories_processed counts input IDs, not found memories
+    // This is by design - the function accepts any IDs and silently skips non-existent ones
+    assert_eq!(stats.memories_processed, 2);
+    // But importance boosts should be 0 since no actual memories were found
+    assert_eq!(stats.importance_boosts, 0);
+}
+
+// =============================================================================
+// HEBBIAN LEARNING FORMULA TESTS
+// =============================================================================
+
+#[test]
+fn test_importance_boost_formula() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Create memory with known importance
+    let id = memory
+        .remember(
+            Experience {
+                content: "Test content".to_string(),
+                experience_type: ExperienceType::Observation,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+    let before = memory.get_memory(&id).unwrap();
+    let before_importance = before.importance();
+
+    // Reinforce as helpful
+    memory
+        .reinforce_recall(&[id.clone()], RetrievalOutcome::Helpful)
+        .unwrap();
+
+    let after = memory.get_memory(&id).unwrap();
+    let after_importance = after.importance();
+
+    // Verify boost occurred
+    assert!(after_importance > before_importance);
+
+    // Verify boost is reasonable (not too extreme)
+    let delta = after_importance - before_importance;
+    assert!(
+        delta > 0.0 && delta < 0.5,
+        "Boost should be moderate, got {}",
+        delta
+    );
+}
+
+#[test]
+fn test_importance_decay_formula() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Create memory with high importance
+    let id = memory
+        .remember(
+            Experience {
+                content: "High importance memory".to_string(),
+                experience_type: ExperienceType::Decision,
+                entities: vec!["critical".to_string()],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+    let before = memory.get_memory(&id).unwrap();
+    let before_importance = before.importance();
+
+    // Reinforce as misleading
+    memory
+        .reinforce_recall(&[id.clone()], RetrievalOutcome::Misleading)
+        .unwrap();
+
+    let after = memory.get_memory(&id).unwrap();
+    let after_importance = after.importance();
+
+    // Verify decay occurred
+    assert!(after_importance < before_importance);
+
+    // Verify decay is reasonable
+    let delta = before_importance - after_importance;
+    assert!(
+        delta > 0.0 && delta < 0.5,
+        "Decay should be moderate, got {}",
+        delta
+    );
+}
+
+// =============================================================================
+// LONG-TERM POTENTIATION (LTP) TESTS
+// =============================================================================
+
+#[test]
+fn test_ltp_after_multiple_reinforcements() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    let id1 = memory
+        .remember(create_experience("Pattern A observation"), None)
+        .unwrap();
+    let id2 = memory
+        .remember(create_experience("Pattern A confirmation"), None)
+        .unwrap();
+
+    // Get initial importance
+    let initial1 = memory.get_memory(&id1).unwrap().importance();
+    let initial2 = memory.get_memory(&id2).unwrap().importance();
+
+    let ids = vec![id1.clone(), id2.clone()];
+
+    // Reinforce many times to trigger LTP (threshold is typically 3-5)
+    // Each reinforcement adds +5% importance (clamped to 1.0)
+    for _ in 0..10 {
+        memory
+            .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+            .unwrap();
+    }
+
+    // After LTP, associations should be very strong
+    // This is tested by checking the memories have higher importance
+    let mem1 = memory.get_memory(&id1).unwrap();
+    let mem2 = memory.get_memory(&id2).unwrap();
+
+    // Importance should have increased significantly after many reinforcements
+    // With 10 reinforcements at +5% each, importance increases by 0.5 (capped at 1.0)
+    assert!(
+        mem1.importance() > initial1,
+        "Repeated helpful feedback should increase importance (was {}, now {})",
+        initial1,
+        mem1.importance()
+    );
+    assert!(
+        mem2.importance() > initial2,
+        "Repeated helpful feedback should increase importance (was {}, now {})",
+        initial2,
+        mem2.importance()
+    );
+
+    // Verify significant boost: 10 reinforcements × HEBBIAN_BOOST_HELPFUL (0.025) = 0.25
+    let expected_boost = 0.2; // Conservative: at least 0.2 of the theoretical 0.25
+    assert!(
+        mem1.importance() >= initial1 + expected_boost || mem1.importance() >= 0.95,
+        "Importance should boost significantly: {} + {} vs {}",
+        initial1,
+        expected_boost,
+        mem1.importance()
+    );
+}
+
+// =============================================================================
+// INTEGRATION WITH RETRIEVAL TESTS
+// =============================================================================
+
+#[test]
+fn test_retrieve_then_reinforce_cycle() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memories
+    for i in 0..20 {
+        memory
+            .remember(
+                create_experience(&format!("Warehouse zone {} status: operational", i)),
+                None,
+            )
+            .unwrap();
+    }
+
+    // Retrieve some memories
+    let query = Query {
+        query_text: Some("warehouse zone status".to_string()),
+        max_results: 5,
+        ..Default::default()
+    };
+
+    let results = memory.recall(&query).unwrap();
+    assert!(!results.is_empty());
+
+    // Collect IDs from results
+    let ids: Vec<_> = results.iter().map(|m| m.id.clone()).collect();
+
+    // Reinforce
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    assert!(stats.memories_processed > 0);
+}
+
+#[test]
+fn test_reinforced_memories_rank_higher() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record several memories about the same topic
+    let id_target = memory
+        .remember(
+            create_experience("Target memory: critical safety protocol"),
+            None,
+        )
+        .unwrap();
+
+    for i in 0..10 {
+        memory
+            .remember(
+                create_experience(&format!("Background memory {} about safety", i)),
+                None,
+            )
+            .unwrap();
+    }
+
+    // Reinforce the target memory multiple times
+    for _ in 0..5 {
+        memory
+            .reinforce_recall(&[id_target.clone()], RetrievalOutcome::Helpful)
+            .unwrap();
+    }
+
+    // Retrieve and check if target ranks highly
+    let query = Query {
+        query_text: Some("safety protocol".to_string()),
+        max_results: 5,
+        ..Default::default()
+    };
+
+    let results = memory.recall(&query).unwrap();
+
+    // Target should be in top results due to higher importance
+    let target_found = results.iter().any(|m| m.id == id_target);
+    assert!(
+        target_found,
+        "Reinforced memory should appear in top results"
+    );
+}
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+#[test]
+fn test_reinforce_same_memory_twice() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    let id = memory
+        .remember(create_experience("Duplicate test"), None)
+        .unwrap();
+
+    // Pass same ID twice
+    let ids = vec![id.clone(), id.clone()];
+    let stats = memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    // Should deduplicate or handle gracefully
+    assert!(stats.memories_processed <= 2);
+}
+
+#[test]
+fn test_alternating_feedback() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    let id = memory
+        .remember(create_experience("Alternating feedback test"), None)
+        .unwrap();
+
+    // Alternate helpful and misleading
+    memory
+        .reinforce_recall(&[id.clone()], RetrievalOutcome::Helpful)
+        .unwrap();
+    memory
+        .reinforce_recall(&[id.clone()], RetrievalOutcome::Misleading)
+        .unwrap();
+    memory
+        .reinforce_recall(&[id.clone()], RetrievalOutcome::Helpful)
+        .unwrap();
+    memory
+        .reinforce_recall(&[id.clone()], RetrievalOutcome::Misleading)
+        .unwrap();
+
+    // Memory should still exist and be valid - get_memory returns Result<Memory>, success means it exists
+    let mem = memory.get_memory(&id);
+    assert!(
+        mem.is_ok(),
+        "Memory should still exist after alternating feedback"
+    );
+}
+
+#[test]
+fn test_high_volume_reinforcement() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record many memories
+    let mut ids = Vec::new();
+    for i in 0..100 {
+        let id = memory
+            .remember(
+                create_experience(&format!("High volume memory {}", i)),
+                None,
+            )
+            .unwrap();
+        ids.push(id);
+    }
+
+    // Reinforce in batches
+    for chunk in ids.chunks(10) {
+        let chunk_ids: Vec<_> = chunk.to_vec();
+        let stats = memory
+            .reinforce_recall(&chunk_ids, RetrievalOutcome::Helpful)
+            .unwrap();
+        assert!(stats.memories_processed > 0);
+    }
+}
+
+// =============================================================================
+// HEBBIAN GRAPH PERSISTENCE TESTS
+// =============================================================================
+
+/// Test helper to create config for persistence tests
+fn create_persistence_config(temp_dir: &tempfile::TempDir) -> MemoryConfig {
+    MemoryConfig {
+        storage_path: temp_dir.path().to_path_buf(),
+        working_memory_size: 100,
+        session_memory_size_mb: 50,
+        max_heap_per_user_mb: 200,
+        auto_compress: false,
+        compression_age_days: 30,
+        importance_threshold: 0.7,
+    }
+}
+
+/// Create a MemorySystem with GraphMemory wired up (for persistence tests)
+fn create_system_with_graph(config: MemoryConfig) -> MemorySystem {
+    let graph_path = config.storage_path.join("graph");
+    let mut system = MemorySystem::new(config, None).expect("Failed to create memory system");
+    let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
+    system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
+        graph_memory,
+    )));
+    system
+}
+
+#[test]
+fn test_hebbian_graph_persists_across_restart() {
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config = create_persistence_config(&temp_dir);
+
+    let id1;
+    let id2;
+
+    // Phase 1: Create memories and form associations
+    {
+        let mut memory = create_system_with_graph(config.clone());
+
+        id1 = memory
+            .remember(create_experience("Hebbian persistence test memory A"), None)
+            .unwrap();
+        id2 = memory
+            .remember(create_experience("Hebbian persistence test memory B"), None)
+            .unwrap();
+
+        // Strengthen association by co-retrieval
+        let ids = vec![id1.clone(), id2.clone()];
+        for _ in 0..5 {
+            memory
+                .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+                .unwrap();
+        }
+
+        // Get graph stats before drop
+        let stats = memory.graph_stats();
+        assert!(
+            stats.edge_count > 0,
+            "Should have formed edges: {}",
+            stats.edge_count
+        );
+    }
+    // System dropped - simulates restart
+
+    // Phase 2: Verify graph persisted
+    {
+        let memory = create_system_with_graph(config);
+
+        // Verify memories exist
+        let mem1 = memory.get_memory(&id1).expect("Memory 1 should exist");
+        let mem2 = memory.get_memory(&id2).expect("Memory 2 should exist");
+        assert!(mem1.experience.content.contains("memory A"));
+        assert!(mem2.experience.content.contains("memory B"));
+
+        // Verify graph stats
+        let stats = memory.graph_stats();
+        // Memory coactivation creates edges between memory UUIDs (not entity nodes)
+        assert!(
+            stats.edge_count > 0,
+            "Edges should persist after restart: {}",
+            stats.edge_count
+        );
+    }
+}
+
+#[test]
+fn test_hebbian_edge_strength_persists() {
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config = create_persistence_config(&temp_dir);
+
+    let id1;
+    let id2;
+    let avg_strength_before;
+
+    // Phase 1: Create strong associations
+    {
+        let mut memory = create_system_with_graph(config.clone());
+
+        id1 = memory
+            .remember(create_experience("Edge strength test A"), None)
+            .unwrap();
+        id2 = memory
+            .remember(create_experience("Edge strength test B"), None)
+            .unwrap();
+
+        // Strengthen many times to increase edge strength
+        let ids = vec![id1.clone(), id2.clone()];
+        for _ in 0..10 {
+            memory
+                .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+                .unwrap();
+        }
+
+        let stats = memory.graph_stats();
+        avg_strength_before = stats.avg_strength;
+        assert!(
+            avg_strength_before > 0.5,
+            "Edge strength should be high after reinforcement: {}",
+            avg_strength_before
+        );
+    }
+
+    // Phase 2: Verify strength persisted
+    {
+        let memory = create_system_with_graph(config);
+
+        let stats = memory.graph_stats();
+        let avg_strength_after = stats.avg_strength;
+
+        assert!(
+            (avg_strength_after - avg_strength_before).abs() < 0.01,
+            "Edge strength should persist: {} vs {} (diff: {})",
+            avg_strength_after,
+            avg_strength_before,
+            (avg_strength_after - avg_strength_before).abs()
+        );
+    }
+}
+
+#[test]
+fn test_coactivation_during_retrieve_forms_edges() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record memories
+    let id1 = memory
+        .remember(
+            create_experience("Coactivation test: robot navigation"),
+            None,
+        )
+        .unwrap();
+    let id2 = memory
+        .remember(
+            create_experience("Coactivation test: robot obstacle avoidance"),
+            None,
+        )
+        .unwrap();
+
+    // Verify no edges initially
+    let stats_before = memory.graph_stats();
+    let edges_before = stats_before.edge_count;
+
+    // Retrieve both memories together (should auto-coactivate)
+    let query = Query {
+        query_text: Some("robot navigation obstacle".to_string()),
+        max_results: 10,
+        ..Default::default()
+    };
+    let results = memory.recall(&query).unwrap();
+
+    // If both memories were returned, edges should form
+    let both_returned = results.iter().any(|m| m.id == id1) && results.iter().any(|m| m.id == id2);
+
+    if both_returned {
+        let stats_after = memory.graph_stats();
+        assert!(
+            stats_after.edge_count > edges_before,
+            "Edges should form after co-retrieval: {} > {}",
+            stats_after.edge_count,
+            edges_before
+        );
+    }
+}
+
+#[test]
+fn test_ltp_persists_across_restart() {
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config = create_persistence_config(&temp_dir);
+
+    let id1;
+    let id2;
+
+    // Phase 1: Create LTP by many co-activations
+    {
+        let mut memory = create_system_with_graph(config.clone());
+
+        id1 = memory
+            .remember(create_experience("LTP persistence test A"), None)
+            .unwrap();
+        id2 = memory
+            .remember(create_experience("LTP persistence test B"), None)
+            .unwrap();
+
+        // Reinforce many times to trigger LTP (threshold typically 5-10)
+        let ids = vec![id1.clone(), id2.clone()];
+        for _ in 0..15 {
+            memory
+                .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+                .unwrap();
+        }
+
+        let stats = memory.graph_stats();
+        assert!(
+            stats.potentiated_count > 0 || stats.avg_strength > 0.8,
+            "Should have potentiated edges or high strength after many reinforcements"
+        );
+    }
+
+    // Phase 2: Verify LTP persisted
+    {
+        let memory = create_system_with_graph(config);
+
+        let stats = memory.graph_stats();
+        // Either potentiated edges persist, or strength is high
+        assert!(
+            stats.potentiated_count > 0 || stats.avg_strength > 0.7,
+            "LTP should persist: potentiated={}, avg_strength={}",
+            stats.potentiated_count,
+            stats.avg_strength
+        );
+    }
+}
+
+#[test]
+fn test_graph_stats_accuracy() {
+    let (mut memory, _temp) = setup_memory_system();
+
+    // Record several memories
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let id = memory
+            .remember(
+                create_experience(&format!("Graph stats test memory {}", i)),
+                None,
+            )
+            .unwrap();
+        ids.push(id);
+    }
+
+    // Form associations between all pairs
+    memory
+        .reinforce_recall(&ids, RetrievalOutcome::Helpful)
+        .unwrap();
+
+    let stats = memory.graph_stats();
+
+    // Memory coactivation creates edges between memory UUIDs (not entity nodes),
+    // so node_count may be 0. Edge count = C(5,2) = 10 pairs.
+    assert!(
+        stats.edge_count >= 5,
+        "Should have multiple edges from coactivation: {}",
+        stats.edge_count
+    );
+
+    // Strength should be positive
+    assert!(
+        stats.avg_strength > 0.0,
+        "Average edge strength should be positive: {}",
+        stats.avg_strength
+    );
+}
