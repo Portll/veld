@@ -27,6 +27,18 @@ pub struct ErrorResponse {
     pub request_id: Option<String>,
 }
 
+/// Sanitize an ID string for safe inclusion in error messages and logs.
+///
+/// Strips control characters and characters that could enable log injection.
+/// Keeps alphanumeric characters, dashes, and underscores only.
+/// Truncates to 64 characters to prevent log bloat.
+fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect()
+}
+
 /// Application error types with proper categorization
 #[derive(Debug)]
 pub enum AppError {
@@ -178,7 +190,7 @@ impl AppError {
                 format!("Content too large: {size} bytes (max: {max} bytes)")
             }
             Self::AmbiguousMemoryId { prefix, count } => {
-                format!("Ambiguous memory ID prefix '{prefix}': matches {count} memories. Use a longer prefix or full UUID.")
+                format!("Ambiguous memory ID prefix '{}': matches {count} memories. Use a longer prefix or full UUID.", sanitize_id(prefix))
             }
             Self::ResourceLimit {
                 resource,
@@ -187,12 +199,12 @@ impl AppError {
             } => {
                 format!("Resource limit exceeded for {resource}: current={current} MB, limit={limit} MB")
             }
-            Self::MemoryNotFound(id) => format!("Memory not found: {id}"),
-            Self::UserNotFound(id) => format!("User not found: {id}"),
-            Self::TodoNotFound(id) => format!("Todo not found: {id}"),
-            Self::ProjectNotFound(id) => format!("Project not found: {id}"),
-            Self::ContextBlockNotFound(key) => format!("Context block not found: {key}"),
-            Self::MemoryAlreadyExists(id) => format!("Memory already exists: {id}"),
+            Self::MemoryNotFound(id) => format!("Memory not found: {}", sanitize_id(id)),
+            Self::UserNotFound(id) => format!("User not found: {}", sanitize_id(id)),
+            Self::TodoNotFound(id) => format!("Todo not found: {}", sanitize_id(id)),
+            Self::ProjectNotFound(id) => format!("Project not found: {}", sanitize_id(id)),
+            Self::ContextBlockNotFound(key) => format!("Context block not found: {}", sanitize_id(key)),
+            Self::MemoryAlreadyExists(id) => format!("Memory already exists: {}", sanitize_id(id)),
             Self::StorageError(msg) => format!("Storage error: {msg}"),
             Self::DatabaseError(msg) => format!("Database error: {msg}"),
             Self::SerializationError(msg) => format!("Serialization error: {msg}"),
@@ -248,7 +260,29 @@ impl From<anyhow::Error> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let body = self.to_response();
+        let code = self.code().to_string();
+        let full_message = self.message();
+
+        // For 500 errors: log full internal details server-side only.
+        // Return a generic message to the client to avoid leaking filesystem
+        // paths, RocksDB internals, or lock details in HTTP responses.
+        let client_message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(
+                error_code = %code,
+                error_detail = %full_message,
+                "Internal server error"
+            );
+            "Internal server error".to_string()
+        } else {
+            full_message
+        };
+
+        let body = ErrorResponse {
+            code,
+            message: client_message,
+            details: None,
+            request_id: None,
+        };
 
         (status, Json(body)).into_response()
     }

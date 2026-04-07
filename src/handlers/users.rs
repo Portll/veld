@@ -4,6 +4,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
+    http::HeaderMap,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
@@ -70,11 +71,23 @@ pub async fn delete_user(
     authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<DeleteUserResponse>, AppError> {
+    let caller_id = authenticated_user
+        .as_ref()
+        .map(|e| e.user_id.as_str())
+        .unwrap_or("<unauthenticated>");
     let user_id = resolve_request_user_id(
         Some(&user_id),
         authenticated_user.as_ref().map(|extension| &extension.0),
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+
+    tracing::info!(
+        audit = "delete_user",
+        caller = %caller_id,
+        target_user = %user_id,
+        "User deletion requested"
+    );
+
     state.forget_user(&user_id).map_err(AppError::Internal)?;
 
     Ok(Json(DeleteUserResponse {
@@ -85,6 +98,40 @@ pub async fn delete_user(
 }
 
 /// GET /api/users - List all users
-pub async fn list_users(State(state): State<AppState>) -> Json<Vec<String>> {
-    Json(state.list_users())
+///
+/// This endpoint enumerates all tenant IDs. Access is restricted to requests
+/// presenting the designated admin API key (`VELD_ADMIN_KEY` env var). If
+/// `VELD_ADMIN_KEY` is not configured the endpoint is accessible to any
+/// authenticated caller (development mode).
+pub async fn list_users(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, AppError> {
+    // Admin gate: if VELD_ADMIN_KEY is set, the request must supply that exact key.
+    if let Ok(admin_key) = std::env::var("VELD_ADMIN_KEY") {
+        let provided_key = headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided_key != admin_key.as_str() {
+            return Err(AppError::InvalidInput {
+                field: "authorization".to_string(),
+                reason: "Admin access required to enumerate tenants".to_string(),
+            });
+        }
+    }
+
+    let caller_id = authenticated_user
+        .as_ref()
+        .map(|e| e.user_id.as_str())
+        .unwrap_or("<unauthenticated>");
+
+    tracing::info!(
+        audit = "list_users",
+        caller = %caller_id,
+        "Tenant list enumerated"
+    );
+
+    Ok(Json(state.list_users()))
 }

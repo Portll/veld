@@ -136,7 +136,7 @@ const SLOW_REQUEST_THRESHOLD_SECS: f64 = 30.0;
 /// P1.3: Middleware to track HTTP request latency and counts
 pub async fn track_metrics(req: Request, next: Next) -> Result<Response, StatusCode> {
     let start = Instant::now();
-    let method = req.method().to_string();
+    let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_string();
 
     // Process request

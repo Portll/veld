@@ -49,6 +49,10 @@ pub fn build_public_routes(state: AppState) -> Router {
         // Webhooks moved to protected routes (rate limiting required)
         // =================================================================
         // GRAPH VISUALIZATION (PUBLIC - HTML VIEWER ONLY)
+        // Intentionally unauthenticated: serves only a static HTML shell
+        // with no memory data. Dynamic data loads via authenticated API calls
+        // from the client side. Move behind auth if the HTML itself becomes
+        // sensitive (e.g., embeds user-specific content).
         // =================================================================
         .route("/graph/view", get(visualization::graph_view))
         // =================================================================

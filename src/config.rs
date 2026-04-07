@@ -534,6 +534,9 @@ impl ServerConfig {
             }
         }
 
+        // Rate limiting is disabled on localhost in dev mode for convenience.
+        // Risk: a compromised local process or SSRF can exhaust memory without limit.
+        // Set VELD_RATE_LIMIT explicitly (or use production mode) to enable limiting.
         if !config.is_production && is_local_bind_host(&config.host) && !rate_limit_explicit {
             config.rate_limit_per_second = 0;
         }

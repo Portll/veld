@@ -29,7 +29,7 @@ pub(crate) fn default_dev_api_key() -> String {
     static KEY: OnceLock<String> = OnceLock::new();
     KEY.get_or_init(|| {
         let key = format!("sk-veld-dev-{}", uuid::Uuid::new_v4().simple());
-        tracing::warn!("Auto-generated dev API key: {key}");
+        tracing::warn!("Auto-generated dev API key: {}...", &key[..12]);
         tracing::warn!("Set VELD_API_KEYS or VELD_DEV_API_KEY to use a stable key.");
         key
     })
@@ -47,6 +47,9 @@ pub fn is_production_mode() -> bool {
 ///
 /// Returns true when VELD_HIDE_DEV_KEY=true (opt-in).
 /// In production mode, always returns true regardless of the env var.
+/// Note: dev API keys are never included in HTTP responses; this function
+/// is retained for test coverage of the env var parsing logic.
+#[cfg(test)]
 fn should_hide_dev_key() -> bool {
     if is_production_mode() {
         return true;
@@ -86,7 +89,6 @@ pub fn log_security_status() {
             tracing::warn!("║  No API keys configured. Using default dev key.              ║");
             tracing::warn!("║  DEPRECATION: Default dev key will be removed in v0.2.0.     ║");
             tracing::warn!("║  Set VELD_DEV_API_KEY or VELD_API_KEYS to override.        ║");
-            tracing::warn!("║  Set VELD_HIDE_DEV_KEY=true to hide key from error msgs.    ║");
         }
         tracing::warn!("║                                                                ║");
         tracing::warn!("║  For production, set:                                          ║");
@@ -130,30 +132,19 @@ impl IntoResponse for AuthError {
             AuthError::MissingApiKey => {
                 if is_prod {
                     "Missing X-API-Key header".to_string()
-                } else if should_hide_dev_key() {
-                    "Missing X-API-Key header. Set VELD_DEV_API_KEY or VELD_API_KEYS. \
-                     See docs for setup."
-                        .to_string()
                 } else {
-                    format!(
-                        "Missing X-API-Key header. Set the header in your request. \
-                         The server accepts keys from VELD_API_KEYS (comma-separated) \
-                         or VELD_DEV_API_KEY.\nDefault dev key: '{}'",
-                        default_dev_api_key()
-                    )
+                    "Missing X-API-Key header. Set VELD_DEV_API_KEY or VELD_API_KEYS. \
+                     See server logs for the dev API key."
+                        .to_string()
                 }
             }
             AuthError::InvalidApiKey => {
                 if is_prod {
                     "Invalid API key".to_string()
-                } else if should_hide_dev_key() {
-                    "Invalid API key. Check VELD_DEV_API_KEY or VELD_API_KEYS.".to_string()
                 } else {
-                    format!(
-                        "Invalid API key.\nExpected a key from VELD_API_KEYS or \
-                         VELD_DEV_API_KEY.\nDefault dev key: '{}'",
-                        default_dev_api_key()
-                    )
+                    "Invalid API key. Check VELD_DEV_API_KEY or VELD_API_KEYS. \
+                     See server logs for the dev API key."
+                        .to_string()
                 }
             }
             AuthError::NotConfigured => {
@@ -172,10 +163,15 @@ impl IntoResponse for AuthError {
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks
+/// Constant-time string comparison to prevent timing attacks.
 ///
 /// Compares all bytes of both strings to prevent length-based timing leaks.
 /// The comparison time is constant regardless of where differences occur.
+///
+/// Timing invariant: we iterate `max(len_a, len_b)` times unconditionally,
+/// using 0 as a padding byte for out-of-bounds indices. The accumulator is
+/// `u32` (not `u8`) to avoid wrapping at 256 — a `u8` result would falsely
+/// treat strings whose length difference is a multiple of 256 as equal.
 fn constant_time_compare(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -719,7 +715,7 @@ mod tests {
     async fn missing_key_dev_message_includes_help() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
-        // Not production → should include env var names in message
+        // Not production → should include env var names and server-log hint, but NOT the key
         let resp = AuthError::MissingApiKey.into_response();
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
         let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
@@ -732,8 +728,12 @@ mod tests {
             "Should mention VELD_DEV_API_KEY"
         );
         assert!(
-            parsed.message.contains(&default_dev_api_key()),
-            "Should show the default dev key"
+            !parsed.message.contains(&default_dev_api_key()),
+            "Must not expose the dev key in the response body"
+        );
+        assert!(
+            parsed.message.contains("server logs"),
+            "Should direct user to server logs for the key"
         );
         clear_auth_env();
     }
@@ -750,8 +750,12 @@ mod tests {
             "Should mention VELD_API_KEYS"
         );
         assert!(
-            parsed.message.contains(&default_dev_api_key()),
-            "Should show the default dev key"
+            !parsed.message.contains(&default_dev_api_key()),
+            "Must not expose the dev key in the response body"
+        );
+        assert!(
+            parsed.message.contains("server logs"),
+            "Should direct user to server logs for the key"
         );
         clear_auth_env();
     }

@@ -3,7 +3,7 @@
 # Enriches context based on what user is asking
 
 VELD_API_URL="${VELD_API_URL:-http://127.0.0.1:3030}"
-VELD_API_KEY="${VELD_API_KEY:-sk-veld-dev-local-testing-key}"
+VELD_API_KEY="${VELD_API_KEY:?VELD_API_KEY is not set. Set it to your veld API key (see server logs on startup).}"
 VELD_USER_ID="${VELD_USER_ID:-claude-code}"
 
 # Read hook input from stdin

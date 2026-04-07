@@ -189,6 +189,7 @@ hex = "0.4"
 
 # MIF encryption (AES-256-GCM)
 aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 # External integrations (SHO-40)
 hmac = "0.12"

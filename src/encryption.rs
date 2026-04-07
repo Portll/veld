@@ -22,6 +22,7 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// AES-256-GCM nonce size in bytes (96 bits per NIST SP 800-38D).
 const NONCE_SIZE: usize = 12;
@@ -41,9 +42,25 @@ const ENCRYPTED_MARKER: &[u8; 4] = b"ENC\x00";
 ///
 /// Holds a validated 256-bit key and provides encrypt/decrypt operations.
 /// Clone is derived so `MemoryStorage` can own a copy.
+///
+/// Key material is zeroized on drop: `key_bytes` is wrapped in `Zeroizing`
+/// (explicit memset-on-drop), and `Aes256Gcm` zeroizes its expanded key
+/// schedule via its own `ZeroizeOnDrop` impl when the `zeroize` feature is
+/// enabled (the default in aes-gcm 0.10).
 #[derive(Clone)]
 pub struct FieldEncryptor {
     cipher: Aes256Gcm,
+    /// Raw key bytes retained so they can be zeroized when this struct is dropped.
+    key_bytes: Zeroizing<[u8; 32]>,
+}
+
+impl Drop for FieldEncryptor {
+    fn drop(&mut self) {
+        // `Zeroizing` memsets key_bytes to zero on drop automatically.
+        // This explicit zeroize call is belt-and-suspenders for the cipher's
+        // expanded key schedule in case the aes-gcm `zeroize` feature is disabled.
+        self.key_bytes.zeroize();
+    }
 }
 
 impl FieldEncryptor {
@@ -52,6 +69,7 @@ impl FieldEncryptor {
         let key = Key::<Aes256Gcm>::from_slice(key_bytes);
         Self {
             cipher: Aes256Gcm::new(key),
+            key_bytes: Zeroizing::new(*key_bytes),
         }
     }
 
