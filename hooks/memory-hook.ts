@@ -64,6 +64,17 @@ interface ProactiveContextResponse {
 
 const HOOK_TIMEOUT_MS = 5000;
 
+/** Regex for detecting secrets that must not be stored in memory */
+const SECRET_PATTERN = /(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36,}|AKIA[A-Z0-9]{16}|Bearer\s+[A-Za-z0-9._\-]{20,}|password\s*[=:]\s*\S+)/i;
+
+function containsSecrets(text: string): boolean {
+  return SECRET_PATTERN.test(text);
+}
+
+/** Per-session boost counter: skip implicit reinforcement after 3 boosts per memory ID */
+const sessionBoostCount = new Map<string, number>();
+const MAX_IMPLICIT_BOOSTS = 3;
+
 /** Backend availability tracking for degradation signaling */
 let backendDown = false;
 let lastSuccessfulContext: string | null = null;
@@ -245,15 +256,30 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
   // Drain pending tool actions for feedback attribution
   const toolActions = pendingToolActions.splice(0, pendingToolActions.length);
 
-  // Build feedback payload from previous cycle
+  // Build feedback payload from previous cycle, capping per-memory implicit boosts
   const feedbackPayload: Record<string, unknown> = {};
   if (lastProactiveOutput) {
     feedbackPayload.previous_response = lastProactiveOutput;
     feedbackPayload.user_followup = context.slice(0, 1000);
   }
   if (lastSurfacedMemoryIds.length > 0) {
-    feedbackPayload.surfaced_memory_ids = lastSurfacedMemoryIds;
+    // Only include IDs that haven't been reinforced too many times this session
+    const eligibleIds = lastSurfacedMemoryIds.filter((id) => {
+      const count = sessionBoostCount.get(id) ?? 0;
+      return count < MAX_IMPLICIT_BOOSTS;
+    });
+    if (eligibleIds.length > 0) {
+      feedbackPayload.surfaced_memory_ids = eligibleIds;
+      // Increment boost counters for these IDs
+      for (const id of eligibleIds) {
+        sessionBoostCount.set(id, (sessionBoostCount.get(id) ?? 0) + 1);
+      }
+    }
   }
+
+  // When the backend is down, disable auto_ingest — stale context must not be
+  // re-ingested as ground truth when the backend recovers.
+  const effectiveAutoIngest = autoIngest && !backendDown;
 
   const response = (await callBrain("/api/proactive_context", {
     user_id: VELD_USER_ID,
@@ -262,7 +288,7 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
     semantic_threshold: 0.6,
     entity_match_weight: 0.3,
     recency_weight: 0.2,
-    auto_ingest: autoIngest,
+    auto_ingest: effectiveAutoIngest,
     // FIX-05: Propagate episode + emotional context to auto-ingested memories
     episode_id: sessionEpisodeId,
     sequence_number: episodeSequenceNumber,
@@ -273,7 +299,8 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
   })) as ProactiveContextResponse | null;
 
   if (!response) {
-    // Backend unreachable — serve stale cache with age warning
+    // Backend unreachable — serve stale cache with age warning.
+    // Do NOT update lastProactiveOutput so stale content is never fed back as feedback.
     if (lastSuccessfulContext && lastContextTimestamp > 0) {
       const ageMinutes = Math.round((Date.now() - lastContextTimestamp) / 60_000);
       return `⚠️ Memory offline (${ageMinutes}m stale cache):\n${lastSuccessfulContext}`;
@@ -453,6 +480,8 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
         content = `Created/wrote ${filePath} (${fileContent.length} chars)`;
       }
 
+      if (containsSecrets(content)) return;
+
       const emotion = classifyEmotion("FileAccess", true, filePath);
       const seq = ++episodeSequenceNumber;
       const resp = await callBrain("/api/remember", {
@@ -474,11 +503,13 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
 
     // Store errors/failures for learning
     if (isErrorOutput(toolOutput)) {
+      const bashContent = `Command failed: ${command?.slice(0, 100)} → ${toolOutput.slice(0, 200)}`;
+      if (containsSecrets(bashContent)) return;
       const emotion = classifyEmotion("Error", false, toolOutput);
       const seq = ++episodeSequenceNumber;
       const resp = await callBrain("/api/remember", {
         user_id: VELD_USER_ID,
-        content: `Command failed: ${command?.slice(0, 100)} → ${toolOutput.slice(0, 200)}`,
+        content: bashContent,
         memory_type: "Error",
         tags: ["tool:Bash", "error"],
         source_type: "system",
@@ -590,13 +621,16 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
     const url = (toolInput?.url as string) || "";
     if (url && toolOutput) {
       const content = `Fetched ${url}: ${toolOutput.slice(0, 200)}`;
+      if (containsSecrets(content)) return;
+      let urlHostname: string;
+      try { urlHostname = new URL(url).hostname; } catch { urlHostname = url.slice(0, 100); }
       const emotion = classifyEmotion("Discovery", true, content);
       const seq = ++episodeSequenceNumber;
       const resp = await callBrain("/api/remember", {
         user_id: VELD_USER_ID,
         content,
         memory_type: "Context",
-        tags: ["tool:WebFetch", `url:${new URL(url).hostname}`],
+        tags: ["tool:WebFetch", `url:${urlHostname}`],
         source_type: "system",
         credibility: 0.6,
         episode_id: sessionEpisodeId,
@@ -887,7 +921,8 @@ async function main(): Promise<void> {
 if (import.meta.main) {
   try {
     await main();
-  } catch {
-    // Silent — hooks must not crash Claude Code
+  } catch (e) {
+    // Log but do not rethrow — hooks must not crash Claude Code
+    console.error("[veld] Hook error:", e);
   }
 }

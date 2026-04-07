@@ -129,15 +129,25 @@ const TOKEN_BUDGET = parseInt(process.env.VELD_TOKEN_BUDGET || "100000", 10);
 const ALERT_THRESHOLD = parseFloat(process.env.VELD_ALERT_THRESHOLD || "0.9");
 const tokenTracker = new TokenTracker(TOKEN_BUDGET, ALERT_THRESHOLD);
 
-// Streaming ingestion settings
-const STREAM_ENABLED = process.env.VELD_STREAM !== "false"; // enabled by default
-const STREAM_MIN_CONTENT_LENGTH = 50; // minimum content length to stream
+// Runtime configuration — all values are overridable via environment variables
+const CONFIG = {
+  // Streaming ingestion
+  streamEnabled: process.env.VELD_STREAM !== "false",
+  streamMinContentLength: parseInt(process.env.VELD_STREAM_MIN_LENGTH || "50", 10),
+  streamReconnectMaxDelay: parseInt(process.env.VELD_STREAM_RECONNECT_MAX_MS || "60000", 10),
+  streamBufferMax: parseInt(process.env.VELD_STREAM_BUFFER_MAX || "100", 10),
+  // Proactive surfacing
+  proactiveSurfacing: process.env.VELD_PROACTIVE !== "false",
+  proactiveMinContextLength: parseInt(process.env.VELD_PROACTIVE_MIN_LENGTH || "30", 10),
+  maxContextLength: parseInt(process.env.VELD_MAX_CONTEXT_LENGTH || "4000", 10),
+};
 
-// Proactive surfacing settings
-// When enabled, relevant memories are automatically surfaced with tool responses
-const PROACTIVE_SURFACING = process.env.VELD_PROACTIVE !== "false"; // enabled by default
-const PROACTIVE_MIN_CONTEXT_LENGTH = 30; // minimum context length to trigger surfacing
-const MAX_CONTEXT_LENGTH = 4000; // max chars sent to backend (MiniLM truncates at ~256 tokens anyway)
+// Keep flat aliases so existing references continue to compile
+const STREAM_ENABLED = CONFIG.streamEnabled;
+const STREAM_MIN_CONTENT_LENGTH = CONFIG.streamMinContentLength;
+const PROACTIVE_SURFACING = CONFIG.proactiveSurfacing;
+const PROACTIVE_MIN_CONTEXT_LENGTH = CONFIG.proactiveMinContextLength;
+const MAX_CONTEXT_LENGTH = CONFIG.maxContextLength;
 
 /**
  * Strip system scaffolding from context before sending to the memory backend.
@@ -178,11 +188,11 @@ let streamSocket: WebSocket | null = null;
 let streamConnecting = false;
 let streamReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let streamReconnectDelay = 1000; // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 60s
-const STREAM_RECONNECT_MAX_DELAY = 60_000;
+const STREAM_RECONNECT_MAX_DELAY = CONFIG.streamReconnectMaxDelay;
 
 // Buffer for messages while reconnecting
 const streamBuffer: string[] = [];
-const MAX_BUFFER_SIZE = 100;
+const MAX_BUFFER_SIZE = CONFIG.streamBufferMax;
 let streamHandshakeComplete = false;
 
 // Connect to streaming endpoint
@@ -525,7 +535,8 @@ async function apiCall<T>(
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => "Unknown error");
-        throw new Error(`API error ${response.status}: ${errorText}`);
+        console.error(`API error ${response.status}: ${errorText}`);
+        throw new Error(`API error ${response.status}`);
       }
 
       return (await response.json()) as T;
@@ -550,12 +561,10 @@ async function apiCall<T>(
   // Provide helpful error message
   const errMsg = lastError?.message || "Unknown error";
   if (errMsg.includes("ECONNREFUSED") || errMsg.includes("fetch failed")) {
-    throw new Error(
-      `Cannot connect to Veld server at ${API_URL}. ` +
-        `Start the server with: veld`,
-    );
+    throw new Error("Cannot connect to Veld server. Start the server with: veld");
   }
-  throw new Error(`Failed after ${RETRY_ATTEMPTS} attempts: ${errMsg}`);
+  console.error(`Request failed after ${RETRY_ATTEMPTS} attempts: ${errMsg}`);
+  throw new Error("Connection failed. Is the veld server running?");
 }
 
 // Check if server is available
@@ -573,6 +582,21 @@ async function isServerAvailable(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// Cached health check — avoids a round-trip on every single MCP tool call
+const HEALTH_CHECK_TTL_MS = 5000;
+let _healthCheckTimestamp = 0;
+let _healthCheckResult = false;
+
+async function checkServerAvailable(): Promise<boolean> {
+  const now = Date.now();
+  if (now - _healthCheckTimestamp < HEALTH_CHECK_TTL_MS) {
+    return _healthCheckResult;
+  }
+  _healthCheckResult = await isServerAvailable();
+  _healthCheckTimestamp = now;
+  return _healthCheckResult;
 }
 
 // Create MCP server
@@ -1570,14 +1594,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Auto-capture context from tool arguments (non-blocking)
   autoStreamContext(name, args as Record<string, unknown>);
 
-  // Check server availability first
-  const serverUp = await isServerAvailable();
+  // Check server availability first (cached with 5s TTL)
+  const serverUp = await checkServerAvailable();
   if (!serverUp) {
     return {
       content: [
         {
           type: "text",
-          text: `Memory server unavailable at ${API_URL}. Please ensure veld is running.\n\nTo start: cd veld && cargo run`,
+          text: "Memory server unavailable. Check that veld is running.\n\nTo start: cd veld && cargo run",
         },
       ],
       isError: true,
