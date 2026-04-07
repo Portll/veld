@@ -565,7 +565,11 @@ fn print_per_query_detail(evaluations: &[QueryEvaluation]) {
         println!(
             "    Q: \"{}\"",
             if eval.query_text.len() > 70 {
-                format!("{}...", &eval.query_text[..67])
+                let mut end = 67usize;
+                while end > 0 && !eval.query_text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &eval.query_text[..end])
             } else {
                 eval.query_text.clone()
             }

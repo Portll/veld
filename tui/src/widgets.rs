@@ -2,8 +2,8 @@
 
 use crate::logo::{ELEPHANT, ELEPHANT_GRADIENT, GRASS_SUFFIX, VELD_GRADIENT, VELD_TEXT};
 use crate::types::{
-    AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiFileMemory, TuiPriority,
-    TuiProject, TuiTodo, TuiTodoStatus, ViewMode, VERSION,
+    truncate_safe, AppState, DisplayEvent, FocusPanel, SearchMode, SearchResult, TuiFileMemory,
+    TuiPriority, TuiProject, TuiTodo, TuiTodoStatus, ViewMode, VERSION,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -677,11 +677,7 @@ fn render_search_result_item(
     let mut lines = Vec::new();
 
     // Line 1: Type + Score + ID + Time
-    let short_id = if result.id.len() > 8 {
-        &result.id[..8]
-    } else {
-        &result.id
-    };
+    let short_id = truncate_safe(&result.id, 8);
     let time_ago = {
         let now = chrono::Utc::now();
         let elapsed = (now - result.created_at).num_seconds();
@@ -1199,8 +1195,12 @@ fn render_codebase_input(f: &mut Frame, area: Rect, state: &AppState) {
     let path = &state.codebase_input_path;
 
     // Show end of path if too long (so user sees what they're typing)
-    let display_path = if path.len() > visible_width {
-        format!("...{}", &path[path.len() - visible_width + 3..])
+    let display_path = if path.chars().count() > visible_width {
+        let tail_chars = visible_width.saturating_sub(3);
+        let char_count = path.chars().count();
+        let skip = char_count.saturating_sub(tail_chars);
+        let start = path.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0);
+        format!("...{}", &path[start..])
     } else {
         path.clone()
     };
@@ -1622,7 +1622,7 @@ fn render_file_preview(f: &mut Frame, area: Rect, state: &AppState) {
 
         // Truncate long lines for display
         let display_line = if line.len() > (popup_width as usize - line_num_width - 8) {
-            format!("{}...", &line[..popup_width as usize - line_num_width - 11])
+            format!("{}...", truncate_safe(line, popup_width as usize - line_num_width - 11))
         } else {
             line.clone()
         };
@@ -4396,7 +4396,7 @@ fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
     let has_project = todo.project_name.is_some();
     let max_content_len = if has_project { 14 } else { 24 }; // Reduced to make room for ID
     let content = if todo.content.len() > max_content_len {
-        format!("{}…", &todo.content[..max_content_len])
+        format!("{}…", truncate_safe(&todo.content, max_content_len))
     } else {
         todo.content.clone()
     };
@@ -4405,7 +4405,7 @@ fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
     // Project name (if any)
     if let Some(project) = &todo.project_name {
         let short_project = if project.len() > 12 {
-            format!("{}…", &project[..12])
+            format!("{}…", truncate_safe(project, 12))
         } else {
             project.clone()
         };
@@ -4425,7 +4425,7 @@ fn render_todo_line(todo: &TuiTodo) -> Line<'static> {
         }
     } else if let Some(blocked) = &todo.blocked_on {
         let short_blocked = if blocked.len() > 12 {
-            format!("{}…", &blocked[..12])
+            format!("{}…", truncate_safe(blocked, 12))
         } else {
             blocked.clone()
         };
@@ -5458,7 +5458,7 @@ fn render_river_event_selectable(
     }
     if let Some(id) = &event.event.memory_id {
         meta.push(Span::styled(
-            format!("id:{}", &id[..8.min(id.len())]),
+            format!("id:{}", truncate_safe(id, 8)),
             Style::default().fg(border_color).bg(bg),
         ));
     }
@@ -5547,7 +5547,7 @@ fn render_river_event(f: &mut Frame, area: Rect, event: &DisplayEvent) {
     }
     if let Some(id) = &event.event.memory_id {
         meta.push(Span::styled(
-            format!("id:{}", &id[..8.min(id.len())]),
+            format!("id:{}", truncate_safe(id, 8)),
             Style::default().fg(Color::DarkGray),
         ));
     }

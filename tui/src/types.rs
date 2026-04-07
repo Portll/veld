@@ -2093,12 +2093,8 @@ impl AppState {
                     MemoryOperationType::GraphUpdate,
                     &format!(
                         "{} → {}",
-                        event.from_id.as_deref().unwrap_or("?")
-                            [..8.min(event.from_id.as_ref().map(|s| s.len()).unwrap_or(1))]
-                            .to_string(),
-                        event.to_id.as_deref().unwrap_or("?")
-                            [..8.min(event.to_id.as_ref().map(|s| s.len()).unwrap_or(1))]
-                            .to_string()
+                        truncate_safe(event.from_id.as_deref().unwrap_or("?"), 8),
+                        truncate_safe(event.to_id.as_deref().unwrap_or("?"), 8)
                     ),
                     None,
                 );
@@ -2223,7 +2219,7 @@ impl AppState {
 
     fn add_graph_node(&mut self, id: String, content: String, memory_type: String) {
         let short_id = if id.len() > 8 {
-            id[..8].to_string()
+            truncate_safe(&id, 8).to_string()
         } else {
             id.clone()
         };
@@ -2235,7 +2231,7 @@ impl AppState {
             id,
             short_id,
             content: if content.len() > 40 {
-                format!("{}...", &content[..37])
+                format!("{}...", truncate_safe(&content, 37))
             } else {
                 content
             },
@@ -3101,4 +3097,17 @@ pub struct LineageTrace {
     pub nodes: HashMap<String, LineageNode>,
     pub path: Vec<String>,
     pub depth: usize,
+}
+
+/// Truncate a string to at most `max_bytes` bytes while respecting UTF-8 char boundaries.
+/// If the string is shorter than `max_bytes`, it is returned unchanged.
+pub fn truncate_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

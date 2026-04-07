@@ -703,7 +703,14 @@ fn test_cross_domain_retrieval() {
     for r in &results {
         println!(
             "    • {}",
-            &r.experience.content[..60.min(r.experience.content.len())]
+            {
+                let s = &r.experience.content;
+                let mut end = 60usize.min(s.len());
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &s[..end]
+            }
         );
     }
 
