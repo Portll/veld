@@ -582,13 +582,12 @@ async fn run_shutdown_cleanup(manager: AppState) {
         Ok(()) => info!("Server shutdown complete"),
         Err(_) => {
             error!(
-                "Graceful shutdown timed out after {}s; returning to allow normal process exit. \
-                 RocksDB WAL may not have been fully flushed.",
+                "Graceful shutdown timed out after {}s; aborting process. \
+                 Cleanup tasks did not complete within the deadline, and continuing \
+                 risks an indefinite hang. RocksDB WAL may not have been fully flushed.",
                 GRACEFUL_SHUTDOWN_TIMEOUT_SECS
             );
-            // Do not call process::exit() — it skips all destructors and risks
-            // RocksDB WAL corruption. Return here and let the async runtime
-            // unwind normally, giving Drop impls the opportunity to flush.
+            std::process::abort();
         }
     }
 }

@@ -205,18 +205,35 @@ impl AppError {
             Self::ProjectNotFound(id) => format!("Project not found: {}", sanitize_id(id)),
             Self::ContextBlockNotFound(key) => format!("Context block not found: {}", sanitize_id(key)),
             Self::MemoryAlreadyExists(id) => format!("Memory already exists: {}", sanitize_id(id)),
-            Self::StorageError(msg) => format!("Storage error: {msg}"),
-            Self::DatabaseError(msg) => format!("Database error: {msg}"),
-            Self::SerializationError(msg) => format!("Serialization error: {msg}"),
-            Self::ConcurrencyError(msg) => format!("Concurrency error: {msg}"),
+            Self::StorageError(msg) => {
+                tracing::error!(error = %msg, "Storage error");
+                "Internal server error".to_string()
+            }
+            Self::DatabaseError(msg) => {
+                tracing::error!(error = %msg, "Database error");
+                "Internal server error".to_string()
+            }
+            Self::SerializationError(msg) => {
+                tracing::error!(error = %msg, "Serialization error");
+                "Internal server error".to_string()
+            }
+            Self::ConcurrencyError(msg) => {
+                tracing::error!(error = %msg, "Concurrency error");
+                "Internal server error".to_string()
+            }
             Self::LockPoisoned { resource, details } => {
-                format!("Lock poisoned on resource '{resource}': {details}")
+                tracing::error!(resource = %resource, details = %details, "Lock poisoned");
+                "Internal server error".to_string()
             }
             Self::LockAcquisitionFailed { resource, reason } => {
-                format!("Failed to acquire lock on '{resource}': {reason}")
+                tracing::error!(resource = %resource, reason = %reason, "Lock acquisition failed");
+                "Internal server error".to_string()
             }
             Self::ServiceUnavailable(msg) => format!("Service unavailable: {msg}"),
-            Self::Internal(err) => format!("Internal error: {err}"),
+            Self::Internal(err) => {
+                tracing::error!(error = %err, "Internal error");
+                "Internal server error".to_string()
+            }
         }
     }
 

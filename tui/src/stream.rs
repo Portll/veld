@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::types::{
-    AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiFileMemory, TuiPriority,
-    TuiProject, TuiTodo, TuiTodoComment, TuiTodoCommentType, TuiTodoStatus,
+    truncate_safe, AppState, GraphEdge, GraphNode, MemoryEvent, TodoStats, TuiFileMemory,
+    TuiPriority, TuiProject, TuiTodo, TuiTodoComment, TuiTodoCommentType, TuiTodoStatus,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -414,7 +414,7 @@ impl MemoryStream {
                         .sort_by(|a, b| b.1.cmp(&a.1));
                     state.entity_stats.top_entities.truncate(10);
                     let short_id = if mem.id.len() > 8 {
-                        mem.id[..8].to_string()
+                        truncate_safe(&mem.id, 8).to_string()
                     } else {
                         mem.id.clone()
                     };
@@ -496,7 +496,7 @@ impl MemoryStream {
             }
             for (i, star) in valid_stars.iter().enumerate() {
                 let short_id = if star.id.len() > 8 {
-                    star.id[..8].to_string()
+                    truncate_safe(&star.id, 8).to_string()
                 } else {
                     star.id.clone()
                 };
@@ -1127,7 +1127,7 @@ pub async fn fetch_lineage_trace(
             LineageNode {
                 id: node_id.clone(),
                 short_id: node_id.chars().take(8).collect(),
-                content_preview: format!("Memory {}", &node_id[..8.min(node_id.len())]),
+                content_preview: format!("Memory {}", truncate_safe(&node_id, 8)),
                 memory_type: "Unknown".to_string(),
             },
         );
@@ -1142,7 +1142,7 @@ pub async fn fetch_lineage_trace(
                 short_id: trace_resp.root.chars().take(8).collect(),
                 content_preview: format!(
                     "Root {}",
-                    &trace_resp.root[..8.min(trace_resp.root.len())]
+                    truncate_safe(&trace_resp.root, 8)
                 ),
                 memory_type: "Unknown".to_string(),
             },
@@ -1258,7 +1258,7 @@ pub async fn fetch_lineage_with_details(
                 LineageNode {
                     id: node_id.clone(),
                     short_id: node_id.chars().take(8).collect(),
-                    content_preview: format!("Memory {}", &node_id[..8.min(node_id.len())]),
+                    content_preview: format!("Memory {}", truncate_safe(&node_id, 8)),
                     memory_type: "Unknown".to_string(),
                 },
             );
@@ -1349,7 +1349,7 @@ async fn fetch_memory_info(
 
     // Find matching memory
     for mem in recall_resp.memories {
-        if mem.id == memory_id || mem.id.starts_with(&memory_id[..8.min(memory_id.len())]) {
+        if mem.id == memory_id || mem.id.starts_with(truncate_safe(&memory_id, 8)) {
             return Ok(Some(LineageNode {
                 id: mem.id.clone(),
                 short_id: mem.id.chars().take(8).collect(),

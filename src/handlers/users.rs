@@ -81,11 +81,11 @@ pub async fn delete_user(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    tracing::info!(
+    tracing::warn!(
         audit = "delete_user",
         caller = %caller_id,
         target_user = %user_id,
-        "User deletion requested"
+        "audit: delete_user requested by authenticated caller"
     );
 
     state.forget_user(&user_id).map_err(AppError::Internal)?;
@@ -127,10 +127,10 @@ pub async fn list_users(
         .map(|e| e.user_id.as_str())
         .unwrap_or("<unauthenticated>");
 
-    tracing::info!(
+    tracing::warn!(
         audit = "list_users",
         caller = %caller_id,
-        "Tenant list enumerated"
+        "audit: list_users enumeration by authenticated caller"
     );
 
     Ok(Json(state.list_users()))

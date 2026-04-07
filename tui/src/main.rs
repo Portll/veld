@@ -2845,7 +2845,7 @@ async fn fetch_graph_data(
             // Filter out short/meaningless names
             if name.len() >= 3 && !name.chars().all(|c| c.is_lowercase()) {
                 let short_id = if id.len() > 8 {
-                    id[..8].to_string()
+                    types::truncate_safe(&id, 8).to_string()
                 } else {
                     id.clone()
                 };

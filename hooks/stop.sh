@@ -3,7 +3,7 @@
 # Stores the interaction when Claude finishes responding
 
 VELD_API_URL="${VELD_API_URL:-http://127.0.0.1:3030}"
-VELD_API_KEY="${VELD_API_KEY:-sk-veld-dev-local-testing-key}"
+VELD_API_KEY="${VELD_API_KEY:-}"
 VELD_USER_ID="${VELD_USER_ID:-claude-code}"
 
 # Read hook input from stdin (JSON with stop_hook_active, etc.)
@@ -14,6 +14,10 @@ STOP_REASON=$(echo "$INPUT" | jq -r '.stop_reason // "end_turn"')
 
 # Get the transcript if available (from environment or temp file)
 TRANSCRIPT_FILE="${CLAUDE_TRANSCRIPT_FILE:-}"
+
+if [ -z "$VELD_API_KEY" ]; then
+    exit 0
+fi
 
 if [ -n "$TRANSCRIPT_FILE" ] && [ -f "$TRANSCRIPT_FILE" ]; then
     # Parse last exchange from transcript
