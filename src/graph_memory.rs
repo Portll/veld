@@ -2428,9 +2428,12 @@ impl GraphMemory {
                     return Ok(Some(edge));
                 }
                 // Edge was deleted but pair index is stale — clean up and fall through
-                let _ = self
+                if let Err(e) = self
                     .db
-                    .delete_cf(self.entity_pair_index_cf(), key.as_bytes());
+                    .delete_cf(self.entity_pair_index_cf(), key.as_bytes())
+                {
+                    tracing::warn!("Failed to clean stale pair index entry: {e}");
+                }
             }
         }
 
@@ -2444,7 +2447,12 @@ impl GraphMemory {
                 || (edge.from_entity == *entity_b && edge.to_entity == *entity_a)
             {
                 // Backfill pair index for this legacy edge
-                let _ = self.index_entity_pair(entity_a, entity_b, &edge.uuid);
+                if let Err(e) = self.index_entity_pair(entity_a, entity_b, &edge.uuid) {
+                    tracing::warn!(
+                        "Failed to backfill pair index for legacy edge {}: {e}",
+                        edge.uuid
+                    );
+                }
                 return Ok(Some(edge));
             }
         }
@@ -2482,6 +2490,14 @@ impl GraphMemory {
     /// "neurons that fire together, wire together" - repeated co-occurrence
     /// strengthens the same synapse rather than creating parallel connections.
     pub fn add_relationship(&self, mut edge: RelationshipEdge) -> Result<Uuid> {
+        // Acquire synapse lock to prevent TOCTOU race: two concurrent callers can both
+        // pass find_relationship_between_typed (both see None) and then both insert a new
+        // edge, creating duplicates. Serializing here ensures find+create is atomic.
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in add_relationship"))?;
+
         // Check for existing relationship between these entities WITH SAME TYPE
         // Different relation types (e.g. WorksWith vs PartOf) are distinct edges
         if let Some(mut existing) = self.find_relationship_between_typed(
@@ -2532,9 +2548,15 @@ impl GraphMemory {
                 edge.uuid,
                 e
             );
-            let _ = self
+            if let Err(del_err) = self
                 .db
-                .delete_cf(self.relationships_cf(), edge.uuid.as_bytes());
+                .delete_cf(self.relationships_cf(), edge.uuid.as_bytes())
+            {
+                tracing::warn!(
+                    "Rollback delete failed for relationship {}: {del_err}",
+                    edge.uuid
+                );
+            }
             self.relationship_count.fetch_sub(1, Ordering::Relaxed);
             return Err(e);
         }

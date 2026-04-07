@@ -813,7 +813,12 @@ pub async fn recall(
                     let boost =
                         crate::constants::RECONSOLIDATION_BOOST * relevance_score;
                     mem.boost_importance(boost);
-                    let _ = guard.update_memory(&mem);
+                    if let Err(e) = guard.update_memory(&mem) {
+                        tracing::debug!(
+                            "Reconsolidation importance boost failed for {}: {e}",
+                            mem.id.0
+                        );
+                    }
                     metrics::RECONSOLIDATION_TOTAL.inc();
                 }
             })

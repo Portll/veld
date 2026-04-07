@@ -23,6 +23,12 @@ use crate::validation;
 /// Application state type alias
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 
+/// Per-user consolidation locks. Prevents concurrent consolidation runs for the same
+/// user from double-strengthening edges or duplicating work.
+static CONSOLIDATION_LOCKS: std::sync::LazyLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
 // =============================================================================
 // SEMANTIC CONSOLIDATION
 // =============================================================================
@@ -54,6 +60,25 @@ pub async fn consolidate_memories(
     // This survives HTTP timeout cancellation — the work always completes.
     tokio::task::spawn(async move {
         let op_start = std::time::Instant::now();
+
+        // Guard against concurrent consolidation for the same user — concurrent runs
+        // can double-strengthen edges and waste resources. Skip if already running.
+        let lock_arc = {
+            let entry = CONSOLIDATION_LOCKS
+                .entry(user_id.clone())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+            entry.clone()
+        };
+        let _consolidation_guard = match lock_arc.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::info!(
+                    user_id = %user_id,
+                    "Consolidation already in progress, skipping"
+                );
+                return;
+            }
+        };
 
         let memory = match state_clone.get_user_earth(&user_id) {
             Ok(m) => m,
@@ -121,7 +146,14 @@ pub async fn consolidate_memories(
                         edges_strengthened += count;
                         if !promotion_boosts.is_empty() {
                             let memory_guard = memory.read();
-                            let _ = memory_guard.apply_edge_promotion_boosts(&promotion_boosts);
+                            if let Err(e) =
+                                memory_guard.apply_edge_promotion_boosts(&promotion_boosts)
+                            {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    "Failed to apply edge promotion boosts: {e}"
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -153,7 +185,9 @@ pub async fn consolidate_memories(
         // Direction 2: Lazy decay — flush opportunistic pruning queue
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
             let graph_guard = graph.read();
-            let _ = graph_guard.flush_pending_maintenance();
+            if let Err(e) = graph_guard.flush_pending_maintenance() {
+                tracing::warn!(user_id = %user_id, "Failed to flush pending maintenance: {e}");
+            }
         }
 
         // Step 3.5: Dream replay — random memory pair comparison discovers
@@ -424,6 +458,24 @@ pub async fn sleep_phase_consolidation(
         let op_start = std::time::Instant::now();
         tracing::info!(user_id = %user_id, replay_multiplier, "Sleep-phase consolidation starting");
 
+        // Guard against concurrent consolidation runs for the same user.
+        let lock_arc = {
+            let entry = CONSOLIDATION_LOCKS
+                .entry(user_id.clone())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+            entry.clone()
+        };
+        let _consolidation_guard = match lock_arc.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::info!(
+                    user_id = %user_id,
+                    "Sleep-phase consolidation already in progress, skipping"
+                );
+                return;
+            }
+        };
+
         let memory = match state_clone.get_user_earth(&user_id) {
             Ok(m) => m,
             Err(e) => {
@@ -491,7 +543,14 @@ pub async fn sleep_phase_consolidation(
                             tracing::debug!(user_id = %user_id, count, "Sleep-phase: edges strengthened");
                             if !promotion_boosts.is_empty() {
                                 let memory_guard = memory.read();
-                                let _ = memory_guard.apply_edge_promotion_boosts(&promotion_boosts);
+                                if let Err(e) =
+                                    memory_guard.apply_edge_promotion_boosts(&promotion_boosts)
+                                {
+                                    tracing::warn!(
+                                        user_id = %user_id,
+                                        "Sleep-phase: failed to apply edge promotion boosts: {e}"
+                                    );
+                                }
                             }
                         }
                         Err(e) => tracing::debug!("Sleep-phase edge boost failed: {e}"),
@@ -505,7 +564,12 @@ pub async fn sleep_phase_consolidation(
                     let graph_guard = graph.read();
                     for mem_id_str in &maint.replay_memory_ids {
                         if let Ok(uuid) = uuid::Uuid::parse_str(mem_id_str) {
-                            let _ = graph_guard.strengthen_episode_entity_edges(&uuid);
+                            if let Err(e) = graph_guard.strengthen_episode_entity_edges(&uuid) {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    "Sleep-phase: entity edge strengthening failed for {uuid}: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -515,7 +579,12 @@ pub async fn sleep_phase_consolidation(
         // Phase 5: Flush pending maintenance (opportunistic edge pruning)
         if let Ok(graph) = state_clone.get_user_graph(&user_id) {
             let graph_guard = graph.read();
-            let _ = graph_guard.flush_pending_maintenance();
+            if let Err(e) = graph_guard.flush_pending_maintenance() {
+                tracing::warn!(
+                    user_id = %user_id,
+                    "Sleep-phase: failed to flush pending maintenance: {e}"
+                );
+            }
         }
 
         // Phase 6: Dream replay with enlarged batch
