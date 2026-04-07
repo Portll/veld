@@ -1,3 +1,6 @@
 
 # Downloaded server binaries (managed by postinstall)
 bin/
+
+# Compiled MCP server binaries
+dist/

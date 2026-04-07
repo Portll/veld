@@ -1,4 +1,4 @@
-# Veld / Veld installer for Windows
+# Veld installer for Windows
 # Usage: irm https://raw.githubusercontent.com/Portll/veld/main/scripts/install.ps1 | iex
 #
 # Environment variables:
@@ -62,7 +62,7 @@ function Get-Binary {
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "Veld / Veld Installer" -ForegroundColor White -BackgroundColor DarkCyan
+Write-Host "Veld Installer" -ForegroundColor White -BackgroundColor DarkCyan
 Write-Host ""
 
 # Check architecture
@@ -81,15 +81,15 @@ New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 try {
     # Download binaries
     $veldPath  = Get-Binary "veld-x86_64-windows.exe" "veld.exe"
-    $veldPath = Get-Binary "veld-x86_64-windows.exe" "veld.exe"
+    $mcpPath   = Get-Binary "veld-mcp-windows-x64.exe" "veld-mcp.exe"
 
     # Install
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Copy-Item $veldPath  (Join-Path $InstallDir "veld.exe")  -Force
-    Copy-Item $veldPath (Join-Path $InstallDir "veld.exe") -Force
+    Copy-Item $veldPath  (Join-Path $InstallDir "veld.exe")     -Force
+    Copy-Item $mcpPath   (Join-Path $InstallDir "veld-mcp.exe") -Force
 
-    Write-Ok "Installed veld.exe  -> $InstallDir\veld.exe"
-    Write-Ok "Installed veld.exe -> $InstallDir\veld.exe"
+    Write-Ok "Installed veld.exe     -> $InstallDir\veld.exe"
+    Write-Ok "Installed veld-mcp.exe -> $InstallDir\veld-mcp.exe"
 } finally {
     Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
 }

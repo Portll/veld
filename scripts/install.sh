@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Veld / Veld installer
+# Veld installer
 # Usage: curl -sSf https://raw.githubusercontent.com/Portll/veld/main/scripts/install.sh | bash
 #
 # Environment variables:
@@ -85,21 +85,25 @@ build_asset_names() {
     case "${PLATFORM}" in
         windows)
             VELD_ASSET="veld-x86_64-windows.exe"
-            VELD_ASSET="veld-x86_64-windows.exe"
+            MCP_ASSET="veld-mcp-windows-x64.exe"
             VELD_BIN="veld.exe"
-            VELD_BIN="veld.exe"
+            MCP_BIN="veld-mcp.exe"
             ;;
         macos)
             VELD_ASSET="veld-${ARCH}-macos"
-            VELD_ASSET="veld-${ARCH}-macos"
+            local mcp_arch="${ARCH/x86_64/x64}"
+            mcp_arch="${mcp_arch/aarch64/arm64}"
+            MCP_ASSET="veld-mcp-darwin-${mcp_arch}"
             VELD_BIN="veld"
-            VELD_BIN="veld"
+            MCP_BIN="veld-mcp"
             ;;
         linux)
             VELD_ASSET="veld-${ARCH}-linux"
-            VELD_ASSET="veld-${ARCH}-linux"
+            local mcp_arch="${ARCH/x86_64/x64}"
+            mcp_arch="${mcp_arch/aarch64/arm64}"
+            MCP_ASSET="veld-mcp-linux-${mcp_arch}"
             VELD_BIN="veld"
-            VELD_BIN="veld"
+            MCP_BIN="veld-mcp"
             ;;
     esac
 
@@ -127,10 +131,10 @@ install_binaries() {
     trap 'rm -rf "$tmpdir"' EXIT
 
     download "${BASE_URL}/${VELD_ASSET}" "${tmpdir}/${VELD_BIN}"
-    download "${BASE_URL}/${VELD_ASSET}" "${tmpdir}/${VELD_BIN}"
+    download "${BASE_URL}/${MCP_ASSET}" "${tmpdir}/${MCP_BIN}"
 
     # Verify downloads are not HTML error pages
-    for bin in "${tmpdir}/${VELD_BIN}" "${tmpdir}/${VELD_BIN}"; do
+    for bin in "${tmpdir}/${VELD_BIN}" "${tmpdir}/${MCP_BIN}"; do
         if [ ! -f "$bin" ] || [ ! -s "$bin" ]; then
             err "Download failed: $(basename "$bin") is empty"
         fi
@@ -140,11 +144,11 @@ install_binaries() {
     done
 
     cp "${tmpdir}/${VELD_BIN}" "${INSTALL_DIR}/${VELD_BIN}"
-    cp "${tmpdir}/${VELD_BIN}" "${INSTALL_DIR}/${VELD_BIN}"
-    chmod +x "${INSTALL_DIR}/${VELD_BIN}" "${INSTALL_DIR}/${VELD_BIN}"
+    cp "${tmpdir}/${MCP_BIN}" "${INSTALL_DIR}/${MCP_BIN}"
+    chmod +x "${INSTALL_DIR}/${VELD_BIN}" "${INSTALL_DIR}/${MCP_BIN}"
 
-    ok "Installed veld  → ${INSTALL_DIR}/${VELD_BIN}"
-    ok "Installed veld → ${INSTALL_DIR}/${VELD_BIN}"
+    ok "Installed veld     → ${INSTALL_DIR}/${VELD_BIN}"
+    ok "Installed veld-mcp → ${INSTALL_DIR}/${MCP_BIN}"
 }
 
 # ─── PATH setup ─────────────────────────────────────────────────────────────
@@ -187,7 +191,7 @@ setup_path() {
             return
         fi
 
-        printf '\n# Veld / Veld\n%s\n' "$line" >> "$profile_file"
+        printf '\n# Veld\n%s\n' "$line" >> "$profile_file"
         ok "Added ${INSTALL_DIR} to PATH in ${profile_file}"
         warn "Restart your shell or run: source ${profile_file}"
     fi
@@ -206,7 +210,7 @@ post_install() {
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 main() {
-    printf "\n${BOLD}Veld / Veld Installer${NC}\n\n"
+    printf "\n${BOLD}Veld Installer${NC}\n\n"
 
     detect_platform
     resolve_version

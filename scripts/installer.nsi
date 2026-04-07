@@ -1,10 +1,10 @@
-; Veld / Veld NSIS Installer
+; Veld NSIS Installer
 ; Build: makensis scripts\installer.nsi
 ; Requires: NSIS 3.x (https://nsis.sourceforge.io)
 ;
 ; Before building, place these files in build\windows\:
 ;   veld.exe
-;   veld.exe
+;   veld-mcp.exe
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
@@ -33,7 +33,7 @@ ShowUnInstDetails show
 ; ─── MUI settings ───────────────────────────────────────────────────────────
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Welcome to Veld ${PRODUCT_VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "Veld is a persistent cognitive memory system for AI agents.$\r$\n$\r$\nThis will install the Veld server and Veld CLI to your computer.$\r$\n$\r$\nClick Next to continue."
+!define MUI_WELCOMEPAGE_TEXT "Veld is a persistent cognitive memory system for AI agents.$\r$\n$\r$\nThis will install the Veld CLI and MCP server to your computer.$\r$\n$\r$\nClick Next to continue."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\bin\veld.exe"
 !define MUI_FINISHPAGE_RUN_PARAMETERS "init"
 !define MUI_FINISHPAGE_RUN_TEXT "Run first-time setup (veld init)"
@@ -61,7 +61,7 @@ Section "Veld Core" SEC_CORE
 
     ; Copy binaries — CI places these in build\windows\ before running makensis
     File "..\..\build\windows\veld.exe"
-    File "..\..\build\windows\veld.exe"
+    File "..\..\build\windows\veld-mcp.exe"
 
     ; Create uninstaller
     SetOutPath "$INSTDIR"
@@ -134,7 +134,7 @@ FunctionEnd
 Section "Uninstall"
     ; Remove binaries
     Delete "$INSTDIR\bin\veld.exe"
-    Delete "$INSTDIR\bin\veld.exe"
+    Delete "$INSTDIR\bin\veld-mcp.exe"
     RMDir "$INSTDIR\bin"
 
     ; Remove Start Menu

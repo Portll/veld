@@ -19,30 +19,30 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             veld_bin: veld.exe
-            veld_bin: veld.exe
             veld_asset: veld-x86_64-windows.exe
-            veld_asset: veld-x86_64-windows.exe
+            mcp_target: bun-windows-x64
+            mcp_asset: veld-mcp-windows-x64.exe
 
           - os: macos-latest
             target: aarch64-apple-darwin
             veld_bin: veld
-            veld_bin: veld
             veld_asset: veld-aarch64-macos
-            veld_asset: veld-aarch64-macos
+            mcp_target: bun-darwin-arm64
+            mcp_asset: veld-mcp-darwin-arm64
 
           - os: macos-latest
             target: x86_64-apple-darwin
             veld_bin: veld
-            veld_bin: veld
             veld_asset: veld-x86_64-macos
-            veld_asset: veld-x86_64-macos
+            mcp_target: bun-darwin-x64
+            mcp_asset: veld-mcp-darwin-x64
 
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             veld_bin: veld
-            veld_bin: veld
             veld_asset: veld-x86_64-linux
-            veld_asset: veld-x86_64-linux
+            mcp_target: bun-linux-x64
+            mcp_asset: veld-mcp-linux-x64
 
     steps:
       - uses: actions/checkout@v4
@@ -71,16 +71,23 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-
 
-      - name: Build
+      - name: Build Rust binary
+        run: cargo build --release --bin veld --target ${{ matrix.target }}
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build MCP server binary
+        working-directory: mcp-server
         run: |
-          cargo build --release --bin veld --target ${{ matrix.target }}
-          cargo build --release --bin veld --target ${{ matrix.target }}
+          bun install --frozen-lockfile
+          bun build index.ts --compile --target=${{ matrix.mcp_target }} --outfile dist/${{ matrix.mcp_asset }}
 
       - name: Stage artifacts
         shell: bash
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.veld_bin }} ${{ matrix.veld_asset }}
-          cp target/${{ matrix.target }}/release/${{ matrix.veld_bin }} ${{ matrix.veld_asset }}
+          cp mcp-server/dist/${{ matrix.mcp_asset }} ${{ matrix.mcp_asset }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -88,7 +95,7 @@ jobs:
           name: binaries-${{ matrix.target }}
           path: |
             ${{ matrix.veld_asset }}
-            ${{ matrix.veld_asset }}
+            ${{ matrix.mcp_asset }}
 
   release:
     name: Publish GitHub Release
@@ -127,7 +134,7 @@ jobs:
         shell: bash
         run: |
           mv build/windows/veld-x86_64-windows.exe build/windows/veld.exe
-          mv build/windows/veld-x86_64-windows.exe build/windows/veld.exe
+          mv build/windows/veld-mcp-windows-x64.exe build/windows/veld-mcp.exe
 
       - name: Extract version
         id: version
