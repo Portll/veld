@@ -164,6 +164,7 @@ pub async fn prompt_gen(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.goal, false).map_validation_err("goal")?;
     validation::validate_max_results(req.max_memories).map_validation_err("max_memories")?;
+    validation::validate_entities(&req.resolve_entities).map_validation_err("resolve_entities")?;
 
     let op_start = std::time::Instant::now();
 
@@ -539,6 +540,7 @@ pub async fn resolve_entity(
     Json(req): Json<EntityResolveRequest>,
 ) -> Result<Json<EntityResolveResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_entities(&req.names).map_validation_err("names")?;
 
     let graph_memory = state
         .get_user_graph(&req.user_id)
@@ -585,18 +587,17 @@ pub struct EntityResolveResponse {
 /// POST /api/entity/set-attribute — Set a structured attribute on an entity.
 /// This is how you make entities "exact" — store DOB, email, coordinates, etc.
 ///
-/// NOTE: GraphMemory does not expose an `update_entity` method. This endpoint
-/// works around that by reading the entity, modifying it, and writing it back
-/// via `add_entity` which merges into the existing entity by name. The attribute
-/// is set on the entity before the merge so it persists.
-// TODO: Add a dedicated `update_entity` method to GraphMemory for atomic
-// attribute updates without the side effects of add_entity (mention_count bump,
-// salience recalculation).
+/// Implemented by reading the entity, setting the attribute, and writing it back
+/// via `add_entity` (which merges by name). This increments `mention_count` as a
+/// side effect of the merge path — acceptable for attribute writes on active entities.
 pub async fn set_entity_attribute(
     State(state): State<AppState>,
     Json(req): Json<SetAttributeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_entity(&req.entity_name).map_validation_err("entity_name")?;
+    validation::validate_content(&req.key, false).map_validation_err("key")?;
+    validation::validate_content(&req.value, false).map_validation_err("value")?;
 
     let graph_memory = state
         .get_user_graph(&req.user_id)
@@ -649,18 +650,14 @@ pub struct SetAttributeRequest {
 }
 
 /// POST /api/entity/merge — Merge two entities into one canonical entity.
-/// All edges from the source are redirected to the target.
-///
-/// NOTE: GraphMemory does not expose a dedicated `merge_entity_edges` method.
-/// This implementation manually redirects relationships from the source entity
-/// to the target entity using `get_entity_relationships` and `add_relationship`.
-// TODO: Add a dedicated `merge_entity_edges` method to GraphMemory for atomic
-// edge migration, and a `delete_entity` call to clean up the source after merge.
+/// All edges from the source are redirected to the target, then the source is deleted.
 pub async fn merge_entities(
     State(state): State<AppState>,
     Json(req): Json<MergeEntitiesRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_entity(&req.source_name).map_validation_err("source_name")?;
+    validation::validate_entity(&req.target_name).map_validation_err("target_name")?;
 
     let graph_memory = state
         .get_user_graph(&req.user_id)
@@ -735,16 +732,6 @@ pub async fn merge_entities(
             edges_moved += 1;
         }
 
-        // Mark source as merged by adding a "merged_into" attribute.
-        // Re-add source with the merged_into marker via add_entity.
-        let mut source_marked = source.clone();
-        source_marked
-            .attributes
-            .insert("merged_into".to_string(), target.uuid.to_string());
-        graph_guard
-            .add_entity(source_marked)
-            .map_err(|e| AppError::Internal(e))?;
-
         // Update target: merge attributes from source (target wins on conflict),
         // and record source name as an alias.
         let mut target_updated = target.clone();
@@ -768,6 +755,11 @@ pub async fn merge_entities(
             .add_entity(target_updated)
             .map_err(|e| AppError::Internal(e))?;
 
+        // Delete the source entity now that all edges have been redirected to target.
+        graph_guard
+            .delete_entity(&source.uuid)
+            .map_err(|e| AppError::Internal(e))?;
+
         Ok::<_, AppError>(serde_json::json!({
             "source": source_name,
             "target": target_name,
@@ -789,18 +781,17 @@ pub struct MergeEntitiesRequest {
 }
 
 /// POST /api/entity/alias — Add an alias for an entity.
-/// When this alias is encountered in future text, it resolves to the canonical entity.
-///
-/// NOTE: GraphMemory does not expose an `add_name_alias` method for registering
-/// arbitrary aliases in the name index. This endpoint stores the alias in the
-/// entity's attributes but cannot register it in the name→UUID index directly.
-// TODO: Add `add_name_alias(&self, uuid: &Uuid, alias: &str)` to GraphMemory
-// to register aliases in the name index for O(1) lookup resolution.
+/// The alias is stored in the entity's `aliases` attribute and is used by
+/// `find_entity_by_name`'s fuzzy/substring matching to surface the canonical entity.
+/// For exact O(1) alias lookup, resubmit the alias as a new memory mention so the
+/// entity extraction pipeline can index it in the name graph.
 pub async fn add_entity_alias(
     State(state): State<AppState>,
     Json(req): Json<AddAliasRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_entity(&req.entity_name).map_validation_err("entity_name")?;
+    validation::validate_entity(&req.alias).map_validation_err("alias")?;
 
     let graph_memory = state
         .get_user_graph(&req.user_id)
