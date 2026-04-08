@@ -63,6 +63,9 @@ pub mod ab_testing;
 // External dimension push (graph topological health — Sleight integration)
 pub mod external_dimensions;
 
+// Prompt generation (end-to-end context assembly) and entity resolution
+pub mod prompt_gen;
+
 // Test utilities (compiled only in test builds)
 #[cfg(test)]
 pub mod test_helpers;

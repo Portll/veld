@@ -13,8 +13,8 @@ use std::sync::Arc;
 use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, compression, consolidation, context_blocks, crud, external_dimensions, facts,
-    files, gap_analysis, graph, health, ingest, integrations, lineage, mif, recall, remember,
-    search, seed, sessions, todos, users, visualization, webhooks,
+    files, gap_analysis, graph, health, ingest, integrations, lineage, mif, prompt_gen, recall,
+    remember, search, seed, sessions, todos, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -109,6 +109,15 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/context", post(recall::proactive_context)) // OpenAPI alias
         .route("/api/relevant", post(recall::surface_relevant))
         .route("/api/reinforce", post(recall::reinforce_feedback))
+        // =================================================================
+        // PROMPT GENERATION & ENTITY RESOLUTION
+        // =================================================================
+        .route("/api/prompt/gen", post(prompt_gen::prompt_gen))
+        .route("/api/prompt/generate", post(prompt_gen::prompt_gen)) // alias
+        .route("/api/entity/resolve", post(prompt_gen::resolve_entity))
+        .route("/api/entity/attribute", post(prompt_gen::set_entity_attribute))
+        .route("/api/entity/merge", post(prompt_gen::merge_entities))
+        .route("/api/entity/alias", post(prompt_gen::add_entity_alias))
         // =================================================================
         // MEMORY CRUD OPERATIONS
         // =================================================================
