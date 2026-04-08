@@ -751,8 +751,8 @@ impl PendingFeedback {
 // SIGNAL EXTRACTION
 // =============================================================================
 
-/// Extract entities from text using simple word extraction
-/// TODO: Use NER model for better extraction
+/// Extract entities from text using heuristic word extraction.
+/// Splits on non-alphanumeric boundaries and returns words longer than 2 characters.
 pub fn extract_entities_simple(text: &str) -> HashSet<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric() && c != '_')
