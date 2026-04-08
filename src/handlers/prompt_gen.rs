@@ -164,6 +164,9 @@ pub async fn prompt_gen(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_content(&req.goal, false).map_validation_err("goal")?;
     validation::validate_max_results(req.max_memories).map_validation_err("max_memories")?;
+    validation::validate_max_results(req.max_facts).map_validation_err("max_facts")?;
+    validation::validate_max_results(req.max_entities).map_validation_err("max_entities")?;
+    validation::validate_max_results(req.max_todos).map_validation_err("max_todos")?;
     validation::validate_entities(&req.resolve_entities).map_validation_err("resolve_entities")?;
 
     let op_start = std::time::Instant::now();
