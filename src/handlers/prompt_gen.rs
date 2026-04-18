@@ -216,6 +216,7 @@ pub async fn prompt_gen(
             "associative" => RetrievalMode::Associative,
             "temporal" => RetrievalMode::Temporal,
             "causal" => RetrievalMode::Causal,
+            "spreading_activation" | "graph" => RetrievalMode::SpreadingActivation,
             _ => RetrievalMode::Hybrid,
         };
 

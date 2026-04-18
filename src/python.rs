@@ -761,6 +761,7 @@ impl PyMemorySystem {
             "hybrid" => RetrievalMode::Hybrid,
             "causal" => RetrievalMode::Causal,
             "associative" => RetrievalMode::Associative,
+            "spreading_activation" | "graph" => RetrievalMode::SpreadingActivation,
             "spatial" => RetrievalMode::Spatial,
             "mission" => RetrievalMode::Mission,
             "action_outcome" => RetrievalMode::ActionOutcome,

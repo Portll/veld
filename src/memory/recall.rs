@@ -236,6 +236,16 @@ impl super::MemorySystem {
         let recall_start = std::time::Instant::now();
 
         // ===========================================================================
+        // SPREADING ACTIVATION MODE (V5 toroid closure)
+        // ===========================================================================
+        // When mode=SpreadingActivation, bypass the 11-layer pipeline entirely and
+        // use the dedicated graph_retrieval::spreading_activation_retrieve algorithm.
+        // This implements Anderson & Pirolli (1984) with density-dependent weights.
+        if matches!(query.retrieval_mode, RetrievalMode::SpreadingActivation) {
+            return self.spreading_activation_recall(query_text, query);
+        }
+
+        // ===========================================================================
         // TEMPORAL EXTRACTION (TEMPR approach from Hindsight - 89.6% on LoCoMo)
         // ===========================================================================
         // Key insight: Temporal filtering is critical for multi-hop retrieval accuracy.
@@ -3659,6 +3669,115 @@ impl super::MemorySystem {
                 }
             }
         }
+
+        Ok(memories)
+    }
+
+    /// Spreading activation recall: graph-driven memory retrieval (V5 toroid closure)
+    ///
+    /// Uses the dedicated Anderson & Pirolli (1984) spreading activation algorithm
+    /// with density-dependent weights (SHO-26). This is a separate retrieval path
+    /// from the 11-layer pipeline — it trusts the knowledge graph as the primary
+    /// signal rather than vector similarity + BM25 fusion.
+    ///
+    /// The episode_to_memory closure resolves graph episodes to full memory objects
+    /// by checking working -> session -> long-term tiers.
+    fn spreading_activation_recall(
+        &self,
+        query_text: &str,
+        query: &Query,
+    ) -> Result<Vec<SharedMemory>> {
+        let graph = self
+            .graph_memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SpreadingActivation mode requires a knowledge graph"))?;
+        let graph_guard = graph.read();
+
+        // Compute graph density for weight selection
+        let stats = graph_guard.stats();
+        let total_memories = {
+            let s = self.stats.read();
+            s.total_memories
+        };
+        let graph_density = if total_memories > 0 {
+            Some(stats.relationship_count as f32 / total_memories as f32)
+        } else {
+            None
+        };
+
+        // Pre-compute query classification and ontological intent
+        let query_type = query_parser::classify_query(query_text);
+        let query_analysis = query_parser::analyze_query(query_text);
+        let ontological_intent = query_parser::infer_ontological_intent(query_text, &query_analysis);
+
+        // Build episode-to-memory resolver: working -> session -> long-term
+        let working_ref = &self.working_memory;
+        let session_ref = &self.session_memory;
+        let lt_ref = &self.long_term_memory;
+
+        let episode_to_memory_fn =
+            |episode: &crate::graph_memory::EpisodicNode| -> Result<Option<SharedMemory>> {
+                let target_id = MemoryId(episode.uuid);
+
+                // Check working memory first (highest activation)
+                {
+                    let working = working_ref.read();
+                    if let Some(mem) = working
+                        .all_memories()
+                        .into_iter()
+                        .find(|m| m.id == target_id)
+                    {
+                        return Ok(Some(mem));
+                    }
+                }
+
+                // Check session memory
+                {
+                    let session = session_ref.read();
+                    if let Some(mem) = session
+                        .all_memories()
+                        .into_iter()
+                        .find(|m| m.id == target_id)
+                    {
+                        return Ok(Some(mem));
+                    }
+                }
+
+                // Fall back to long-term storage
+                match lt_ref.get(&target_id) {
+                    Ok(memory) => Ok(Some(Arc::new(memory))),
+                    Err(_) => Ok(None),
+                }
+            };
+
+        let (activated_memories, retrieval_stats) =
+            crate::memory::graph_retrieval::spreading_activation_retrieve_with_stats(
+                query_text,
+                query,
+                &graph_guard,
+                self.embedder.as_ref(),
+                graph_density,
+                Some(&query_type),
+                Some(&ontological_intent),
+                episode_to_memory_fn,
+            )?;
+
+        tracing::info!(
+            mode = "spreading_activation",
+            results = activated_memories.len(),
+            graph_density = ?graph_density,
+            query_type = ?query_type,
+            entities_activated = retrieval_stats.entities_activated,
+            graph_time_us = retrieval_stats.graph_time_us,
+            "recall [spreading_activation] complete"
+        );
+
+        // Extract SharedMemory from ActivatedMemory, preserving score ordering
+        let memories: Vec<SharedMemory> = activated_memories
+            .into_iter()
+            .take(query.max_results)
+            .map(|am| am.memory)
+            .collect();
 
         Ok(memories)
     }

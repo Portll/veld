@@ -1054,6 +1054,9 @@ impl RetrievalEngine {
             RetrievalMode::Causal => self.causal_search(query, limit)?,
             RetrievalMode::Associative => self.associative_search(query, limit)?,
             RetrievalMode::Hybrid => self.hybrid_search(query, limit)?,
+            // SpreadingActivation is handled at MemorySystem level (graph_retrieval module).
+            // If it reaches RetrievalEngine, fall back to hybrid vector search.
+            RetrievalMode::SpreadingActivation => self.hybrid_search(query, limit)?,
             // Robotics-specific modes
             RetrievalMode::Spatial => self.spatial_search(query, limit)?,
             RetrievalMode::Mission => self.mission_search(query, limit)?,

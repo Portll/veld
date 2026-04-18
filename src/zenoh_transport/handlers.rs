@@ -1381,6 +1381,7 @@ fn parse_retrieval_mode(mode: &str) -> RetrievalMode {
         "associative" => RetrievalMode::Associative,
         "temporal" => RetrievalMode::Temporal,
         "causal" => RetrievalMode::Causal,
+        "spreading_activation" | "graph" => RetrievalMode::SpreadingActivation,
         "spatial" => RetrievalMode::Spatial,
         "mission" => RetrievalMode::Mission,
         "action_outcome" => RetrievalMode::ActionOutcome,

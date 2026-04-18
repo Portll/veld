@@ -2877,11 +2877,12 @@ pub enum CompetitionMode {
 /// Retrieval modes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetrievalMode {
-    Similarity,  // Vector similarity search
-    Temporal,    // Time-based retrieval
-    Causal,      // Cause-effect chains
-    Associative, // Related memories
-    Hybrid,      // Combination of methods
+    Similarity,          // Vector similarity search
+    Temporal,            // Time-based retrieval
+    Causal,              // Cause-effect chains
+    Associative,         // Related memories
+    Hybrid,              // Combination of methods
+    SpreadingActivation, // Graph spreading activation (Anderson & Pirolli 1984)
     // === Robotics-Specific Modes ===
     Spatial,       // Geo-location based retrieval
     Mission,       // Mission context retrieval

@@ -4,9 +4,7 @@
 ;
 ; Before building, place these files in build\windows\:
 ;   veld.exe
-;   veld-mcp.exe
-
-!include "MUI2.nsh"
+;   veld-mcp.eh"
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
 

@@ -79,7 +79,70 @@ Persistent cognitive memory best practices. Activated when storing decisions, le
 ### orchestrate
 Multi-agent parallel execution with todo-driven task graphs. Activated for "orchestrate", "break down work", "coordinate subtasks", "multi-agent" requests.
 
-## Workflow
+---
+
+## Sleight — Cognitive Evaluation Framework
+
+You also have access to **Sleight**, a cognitive evaluation framework that uses Veld for persistent memory. Sleight surfaces blind spots, scores plans, and detects structural gaps through topological data analysis.
+
+### Sleight Tools — Registered Switches
+
+#### Plan Evaluation
+| Tool | When | Switch |
+|------|------|--------|
+| `bifocal_plan` | Evaluate a plan across 12 dimensions (quality, maintainability, etc.) | ON |
+| `bifocal_feat` | Generate + evaluate a structured plan from a feature description | ON |
+| `provision_plan` | Generate implementation spec and provision task tree into Conductor | ON |
+
+#### Analysis & Scoring
+| Tool | When | Switch |
+|------|------|--------|
+| `overwatch` | Full evaluation pass — bifocal + 9-dimension knowledge-graph matrix | ON |
+| `eval_matrix` | 9-dimension matrix (Density, Coherence, Recency, Integration, Isotropy, Closure, Bridging, Depth, Confidence) | ON |
+| `meta_audit` | Meta-analysis of evaluation tool usage — detects stalls, rumination | ON |
+
+#### Veld Memory Integration
+| Tool | When | Switch |
+|------|------|--------|
+| `get_thoughts` | Active thoughts from Veld's gap analysis (structural insights, golden features, fractal patterns) | ON |
+| `get_persistence` | Persistent homology analysis (Betti numbers, topological features) | ON |
+| `get_mapper` | Mapper visualization data (clusters, connections, flare points) | ON |
+
+#### Advanced Gap Detection
+| Tool | When | Switch |
+|------|------|--------|
+| `get_planet_x` | Detect missing concepts from void convergence (void rings, orbit gaps, gravitational lensing) | ON |
+| `get_three_body` | Detect dimension triads where improving one degrades others — Nash equilibrium trade-offs | ON |
+
+#### Improvement & Verification
+| Tool | When | Switch |
+|------|------|--------|
+| `overloop` | Feedback-iterate-critique loop — harvests feedback, classifies improvements, critiques for value | ON |
+| `rebreaker` | Adversarial regression verification — re-attacks after remediation to verify fixes | ON |
+| `code_tda` | Topological data analysis on Rust/TypeScript/Python — dependency graphs + persistent homology | ON |
+
+### When to Use Sleight
+
+- **Before implementing a plan**: Call `bifocal_plan` or `bifocal_feat` to score it and surface gaps
+- **After significant changes**: Call `overwatch` for a full evaluation pass
+- **When something feels off**: Call `meta_audit` to check if you're stalling or ruminating
+- **For structural analysis**: Call `code_tda` on changed files to detect architectural issues
+- **To verify fixes**: Call `rebreaker` after remediation to confirm findings are closed
+- **To improve iteratively**: Call `overloop` to harvest feedback and generate targeted improvements
+- **To detect hidden concepts**: Call `get_planet_x` when the knowledge graph has unexplained voids
+- **To find trade-off conflicts**: Call `get_three_body` when improving one area degrades another
+
+### Combined Veld + Sleight Workflow
+
+1. **Start**: `proactive_context` (Veld) — load relevant memories
+2. **Plan**: `bifocal_feat` (Sleight) — generate and score the plan
+3. **Work**: Use Veld `remember` for decisions and `recall` for context
+4. **Evaluate**: `overwatch` (Sleight) — full dimensional analysis
+5. **Iterate**: `overloop` (Sleight) — feedback-driven improvements
+6. **Verify**: `rebreaker` (Sleight) — confirm prior issues are resolved
+7. **Store**: `remember` (Veld) — persist learnings for future sessions
+
+--- Workflow
 
 1. **Start of conversation**: Call `proactive_context` with the user's first message to load relevant context.
 2. **During work**: Use `remember` for important decisions, learnings, errors, and discoveries. Use `recall` when you need past context.

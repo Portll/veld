@@ -129,6 +129,7 @@ pub async fn multimodal_search(
         "causal" => memory::RetrievalMode::Causal,
         "associative" => memory::RetrievalMode::Associative,
         "hybrid" => memory::RetrievalMode::Hybrid,
+        "spreading_activation" | "graph" => memory::RetrievalMode::SpreadingActivation,
         "spatial" => memory::RetrievalMode::Spatial,
         "mission" => memory::RetrievalMode::Mission,
         "action_outcome" => memory::RetrievalMode::ActionOutcome,

@@ -66,25 +66,132 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
 
 /// Readiness probe - indicates if service can handle traffic.
 /// Returns 503 if core shared storage was not initialized successfully.
-/// This intentionally avoids lazy per-user initialization so a public probe
-/// cannot create user state or trigger heavyweight model/network work.
-pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let users_in_cache = state.users_in_cache();
+///
+/// Optional `?user_id=X` parameter for per-user readiness (V8 toroid closure).
+/// When provided, reports per-user cache residency, memory stats, and vector
+/// index health. Only checks already-cached users — never triggers lazy
+/// initialization from a public probe.
+pub async fn health_ready(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let ready = state.is_ready();
-
-    let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     let status_str = if ready { "ready" } else { "not_ready" };
 
-    (
-        status_code,
-        Json(serde_json::json!({
-            "status": status_str,
-            "version": env!("VELD_VERSION_FULL"),
-            "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
-            "users_in_cache": users_in_cache,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        })),
-    )
+    // Per-user readiness check (V8)
+    if let Some(user_id) = params.get("user_id") {
+        let cached_users = state.list_cached_users();
+        let is_cached = cached_users.contains(user_id);
+        let exists_on_disk = state.list_users().contains(user_id);
+
+        if !is_cached {
+            // User not in cache — report without triggering lazy init
+            return (
+                status_code,
+                Json(serde_json::json!({
+                    "status": status_str,
+                    "user_id": user_id,
+                    "user_ready": false,
+                    "cached": false,
+                    "exists_on_disk": exists_on_disk,
+                    "reason": if exists_on_disk {
+                        "user exists but is not loaded in cache"
+                    } else {
+                        "user does not exist"
+                    },
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                })),
+            );
+        }
+
+        // User is cached — safe to read stats without triggering init
+        match state.get_user_earth(user_id) {
+            Ok(memory) => {
+                if let Some(guard) = memory.try_read() {
+                    let stats = guard.stats();
+                    let index_health = guard.index_health();
+                    let graph_stats = if let Some(graph) = state.get_user_graph(user_id).ok() {
+                        let g = graph.read();
+                        let gs = g.stats();
+                        serde_json::json!({
+                            "entity_count": gs.entity_count,
+                            "relationship_count": gs.relationship_count,
+                            "episode_count": gs.episode_count
+                        })
+                    } else {
+                        serde_json::json!(null)
+                    };
+
+                    (
+                        status_code,
+                        Json(serde_json::json!({
+                            "status": status_str,
+                            "user_id": user_id,
+                            "user_ready": true,
+                            "cached": true,
+                            "memory_stats": {
+                                "total_memories": stats.total_memories,
+                                "working_memory_count": stats.working_memory_count,
+                                "session_memory_count": stats.session_memory_count,
+                                "long_term_memory_count": stats.long_term_memory_count,
+                                "vector_index_count": stats.vector_index_count,
+                            },
+                            "index_health": {
+                                "total_vectors": index_health.total_vectors,
+                                "incremental_inserts": index_health.incremental_inserts,
+                                "deleted_count": index_health.deleted_count,
+                                "deletion_ratio": index_health.deletion_ratio,
+                                "needs_rebuild": index_health.needs_rebuild,
+                                "needs_compaction": index_health.needs_compaction,
+                            },
+                            "graph_stats": graph_stats,
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })),
+                    )
+                } else {
+                    // Lock contention — user is cached but busy
+                    (
+                        status_code,
+                        Json(serde_json::json!({
+                            "status": status_str,
+                            "user_id": user_id,
+                            "user_ready": true,
+                            "cached": true,
+                            "reason": "memory system is locked (concurrent operation in progress)",
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })),
+                    )
+                }
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "user_id": user_id,
+                    "error": e.to_string(),
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                })),
+            ),
+        }
+    } else {
+        // System-level readiness (original behavior)
+        let users_in_cache = state.users_in_cache();
+        (
+            status_code,
+            Json(serde_json::json!({
+                "status": status_str,
+                "version": env!("VELD_VERSION_FULL"),
+                "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
+                "users_in_cache": users_in_cache,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        )
+    }
 }
 
 /// Vector index health endpoint - provides Vamana index statistics per user
