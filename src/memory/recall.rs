@@ -22,6 +22,10 @@ use crate::memory::types::*;
 use crate::memory::wavelet_sessions;
 use crate::metrics::{EMBEDDING_CACHE_QUERY, EMBEDDING_CACHE_QUERY_SIZE};
 
+/// Fraction of semantic_w used for secondary Vamana RRF signal.
+/// Secondary is a refinement signal, not a replacement for primary vector search.
+const SECONDARY_RRF_WEIGHT_RATIO: f32 = 0.5;
+
 impl super::MemorySystem {
     /// Search and retrieve relevant memories (zero-copy with Arc<Memory>)
     ///
@@ -1022,6 +1026,7 @@ impl super::MemorySystem {
             competition_mode: query.competition_mode,
             rrf_k: query.rrf_k,
             rerank_count: query.rerank_count,
+            dual_index: query.dual_index,
         };
 
         // ===========================================================================
@@ -1114,6 +1119,7 @@ impl super::MemorySystem {
                     competition_mode: query.competition_mode,
                     rrf_k: query.rrf_k,
                     rerank_count: query.rerank_count,
+                    dual_index: query.dual_index,
                 };
 
                 let sub_results =
@@ -1486,6 +1492,35 @@ impl super::MemorySystem {
             // Hybrid (BM25+vector) results: pure RRF with density weight
             for (r, (id, _)) in hybrid_ids.iter().enumerate() {
                 *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (k + (r + 1) as f32);
+            }
+
+            // Secondary Vamana (768d) results: 4th RRF signal
+            // RRF is rank-based, so score scale differences between 384d/768d spaces
+            // don't matter. Weight is split from semantic_w to avoid inflating total.
+            let use_dual = query.dual_index.unwrap_or(true);
+            if use_dual {
+                if let Some(ref sec_emb) = query_embedding_secondary {
+                    match self.retriever.search_ids_secondary(sec_emb, query.max_results * 8) {
+                        Ok(sec_results) if !sec_results.is_empty() => {
+                            // Use fraction of semantic weight for secondary — it's a refinement
+                            // signal, not a replacement for primary vector search
+                            let sec_w = semantic_w * SECONDARY_RRF_WEIGHT_RATIO;
+                            for (r, (id, _)) in sec_results.iter().enumerate() {
+                                *fused.entry(id.clone()).or_insert(0.0) +=
+                                    sec_w / (k + (r + 1) as f32);
+                            }
+                            tracing::debug!(
+                                "Layer 4 RRF: secondary Vamana added {} results (w={:.2})",
+                                sec_results.len(),
+                                sec_w
+                            );
+                        }
+                        Ok(_) => {} // Empty results — secondary index may be unpopulated
+                        Err(e) => {
+                            tracing::warn!("Secondary Vamana search failed (non-fatal): {}", e);
+                        }
+                    }
+                }
             }
 
             // ===========================================================================
@@ -3694,7 +3729,7 @@ impl super::MemorySystem {
         let graph_guard = graph.read();
 
         // Compute graph density for weight selection
-        let stats = graph_guard.stats();
+        let stats = graph_guard.get_stats().unwrap_or_default();
         let total_memories = {
             let s = self.stats.read();
             s.total_memories

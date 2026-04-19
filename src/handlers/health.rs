@@ -117,7 +117,7 @@ pub async fn health_ready(
                     let index_health = guard.index_health();
                     let graph_stats = if let Some(graph) = state.get_user_graph(user_id).ok() {
                         let g = graph.read();
-                        let gs = g.stats();
+                        let gs = g.get_stats().unwrap_or_default();
                         serde_json::json!({
                             "entity_count": gs.entity_count,
                             "relationship_count": gs.relationship_count,
@@ -148,6 +148,14 @@ pub async fn health_ready(
                                 "deletion_ratio": index_health.deletion_ratio,
                                 "needs_rebuild": index_health.needs_rebuild,
                                 "needs_compaction": index_health.needs_compaction,
+                                "secondary": index_health.secondary.as_ref().map(|s| serde_json::json!({
+                                    "total_vectors": s.total_vectors,
+                                    "incremental_inserts": s.incremental_inserts,
+                                    "deleted_count": s.deleted_count,
+                                    "deletion_ratio": s.deletion_ratio,
+                                    "needs_rebuild": s.needs_rebuild,
+                                    "needs_compaction": s.needs_compaction,
+                                })),
                             },
                             "graph_stats": graph_stats,
                             "timestamp": chrono::Utc::now().to_rfc3339()
@@ -258,6 +266,11 @@ pub async fn health_index(
                     } else {
                         0.0
                     },
+                    "secondary": health.secondary.as_ref().map(|s| serde_json::json!({
+                        "total_vectors": s.total_vectors,
+                        "needs_rebuild": s.needs_rebuild,
+                        "deletion_ratio": s.deletion_ratio,
+                    })),
                     "timestamp": chrono::Utc::now().to_rfc3339()
                 })),
             )

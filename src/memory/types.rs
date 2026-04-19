@@ -2478,6 +2478,13 @@ pub struct Query {
     /// Higher = more precise but slower. When None, uses config default.
     pub rerank_count: Option<usize>,
 
+    /// Whether to include secondary Vamana index results in RRF fusion.
+    /// When `true` (or `None` with secondary available), secondary 768d results
+    /// are fused as a 4th RRF signal alongside graph, hybrid, and linguistic.
+    /// Set to `false` to disable secondary index participation per-query.
+    #[serde(default)]
+    pub dual_index: Option<bool>,
+
     // === Result Control ===
     pub max_results: usize,
     pub retrieval_mode: RetrievalMode,
@@ -2565,6 +2572,7 @@ impl Default for Query {
             competition_mode: None,
             rrf_k: None,
             rerank_count: None,
+            dual_index: None,
             max_results: DEFAULT_MAX_RESULTS,
             retrieval_mode: RetrievalMode::Hybrid,
             offset: 0,
