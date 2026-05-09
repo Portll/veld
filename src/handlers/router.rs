@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, compression, consolidation, context_blocks, crud, external_dimensions, facts,
-    files, gap_analysis, graph, health, ingest, integrations, lineage, mif, recall, remember,
-    search, seed, sessions, todos, users, visualization, webhooks,
+    ab_testing, admin, compression, consolidation, context_blocks, crud, external_dimensions,
+    facts, files, gap_analysis, graph, health, ingest, integrations, lineage, mif, recall,
+    remember, search, seed, sessions, todos, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -51,6 +51,17 @@ pub fn build_public_routes(state: AppState) -> Router {
         // GRAPH VISUALIZATION (PUBLIC - HTML VIEWER ONLY)
         // =================================================================
         .route("/graph/view", get(visualization::graph_view))
+        // =================================================================
+        // ADMIN OPERATIONAL ENDPOINTS
+        //
+        // Mounted on the public router specifically so a stuck rate limiter
+        // can never block its own recovery. The endpoint enforces its own
+        // separate auth via X-Admin-API-Key + VELD_ADMIN_API_KEY env var.
+        // =================================================================
+        .route(
+            "/api/admin/reset-rate-limit",
+            post(admin::reset_rate_limit),
+        )
         // =================================================================
         // STATE
         // =================================================================

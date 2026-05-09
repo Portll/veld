@@ -114,6 +114,8 @@ axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
 tower_governor = { version = "0.8", features = ["axum"] }
+governor = "0.10"  # Direct GCRA limiter handle (used by ResettableRateLimit for admin-reset support)
+subtle = "2.6"  # Constant-time equality for admin API key compare
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
