@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 use tower::ServiceBuilder;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::timeout::TimeoutLayer;
 use tracing::{error, info, warn};
 
@@ -17,6 +16,7 @@ use crate::{
     auth,
     config::{env_var_is_set, promote_env_aliases, ServerConfig, StorageBackend},
     embeddings::minilm::pre_init_ort_runtime,
+    rate_limit_governance::{RateLimitGovernanceLayer, ResetHandle},
     roots::{AppState, RootsRuntime},
     metrics, middleware,
 };
@@ -216,24 +216,35 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    // Configure rate limiting (0 = disabled, for localhost/embedded use)
+    // Configure rate limiting (0 = disabled, for localhost/embedded use).
+    //
+    // We use the in-tree `rate_limit_governance` layer (which delegates the GCRA
+    // decision to the `governor` crate) instead of `tower_governor::GovernorLayer`
+    // so we can:
+    //   1. cap the reported `Wait for {N}s` value at `burst_size * cell_interval`,
+    //      preventing the runaway-wait_time class of bug;
+    //   2. atomically swap the inner `Arc<RateLimiter>` from an admin endpoint
+    //      to recover from a stuck bucket without a process restart.
     let rate_limit_enabled = server_config.rate_limit_per_second > 0;
-    let governor_layer = if rate_limit_enabled {
-        let rps = server_config.rate_limit_per_second.max(1);
-        let cell_interval = std::time::Duration::from_nanos(1_000_000_000 / rps);
-        let governor_conf = GovernorConfigBuilder::default()
-            .period(cell_interval)
-            .burst_size(server_config.rate_limit_burst)
-            .finish()
-            .expect("Failed to build governor rate limiter configuration");
+    let (rate_limit_layer, reset_handle) = if rate_limit_enabled {
+        let rps = server_config.rate_limit_per_second;
+        let burst = server_config.rate_limit_burst;
+        let cell_interval = std::time::Duration::from_nanos(1_000_000_000 / rps.max(1));
+        let handle = ResetHandle::new(rps, burst);
         info!(
-            "Rate limiting: {} req/sec (cell interval: {:?}), burst of {}",
-            server_config.rate_limit_per_second, cell_interval, server_config.rate_limit_burst
+            "Rate limiting: enabled rps={} burst={} (cell interval: {:?}, wait_time cap: {}s)",
+            rps,
+            burst,
+            cell_interval,
+            handle.cap_secs()
         );
-        Some(GovernorLayer::new(governor_conf))
+        (
+            Some(RateLimitGovernanceLayer::new(handle.clone())),
+            Some(handle),
+        )
     } else {
-        info!("Rate limiting: disabled (SHODH_RATE_LIMIT=0)");
-        None
+        info!("Rate limiting: disabled");
+        (None, None)
     };
 
     // Build CORS layer
@@ -269,15 +280,25 @@ async fn async_main() -> Result<()> {
         }),
     );
 
-    let protected_routes = if let Some(governor) = governor_layer {
+    let protected_routes = if let Some(rate_limit) = rate_limit_layer {
         runtime
             .protected_routes()
             .layer(axum::middleware::from_fn(auth::auth_middleware))
-            .layer(governor)
+            .layer(rate_limit)
     } else {
         runtime
             .protected_routes()
             .layer(axum::middleware::from_fn(auth::auth_middleware))
+    };
+
+    // Build public routes. If a ResetHandle exists, inject it via Extension so
+    // /api/admin/reset-rate-limit can swap the inner limiter. The public routes
+    // are intentionally NOT rate-limited (a stuck bucket would otherwise block
+    // its own recovery — the admin endpoint enforces its own auth).
+    let public_routes = if let Some(handle) = reset_handle.clone() {
+        public_routes.layer(axum::Extension(handle))
+    } else {
+        public_routes
     };
 
     // Combine routes with global middleware
