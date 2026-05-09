@@ -54,6 +54,9 @@ pub mod files;
 // Background processing
 pub mod consolidation;
 
+// Admin operational endpoints (rate-limit reset, etc.)
+pub mod admin;
+
 // Context blocks (Letta-style mutable agent state)
 pub mod context_blocks;
 
