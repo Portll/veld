@@ -572,7 +572,8 @@ impl SpannIndex {
             .map(|(i, c)| (i, self.compute_distance(query, c)))
             .collect();
 
-        partition_distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Tie-break by partition index keeps probe selection deterministic across runs (RH-10).
+        partition_distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let probe_partitions: Vec<usize> = partition_distances
             .iter()
             .take(self.config.num_probes)
@@ -658,9 +659,9 @@ impl SpannIndex {
             }
         }
 
-        // Convert heap to sorted results (smallest distance first)
+        // Convert heap to sorted results (smallest distance first), tie-break by id (RH-10)
         let mut results: Vec<(u32, f32)> = heap.into_iter().map(|(d, id)| (id, d.0)).collect();
-        results.sort_by(|a, b| a.1.total_cmp(&b.1));
+        results.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
         Ok(results)
     }

@@ -183,9 +183,13 @@ impl RetrievalEngine {
     ) -> Result<Self> {
         let storage_path = storage.path().to_path_buf();
 
-        // Initialize primary Vamana index optimized for 10M+ memories per user
+        // Initialize primary Vamana index optimized for 10M+ memories per user.
+        // Dimension follows the active primary embedder (Nomic 768d / Matryoshka,
+        // or MiniLM 384d fallback) — never hardcoded, or a model swap silently
+        // corrupts the index.
+        let primary_dim = embedder.primary_dimension();
         let vamana_config = VamanaConfig {
-            dimension: 384,        // MiniLM dimension
+            dimension: primary_dim,
             max_degree: 32,        // Increased for better recall at scale
             search_list_size: 100, // 2x for better accuracy with 10M vectors
             alpha: 1.2,
@@ -244,6 +248,131 @@ impl RetrievalEngine {
         Ok(engine)
     }
 
+    /// Re-embed stored vectors when the primary embedding dimension changes.
+    ///
+    /// Triggered by promoting Nomic to primary, or by changing `VELD_NOMIC_DIM`.
+    /// A marker file (`.veld_embedding_dim`) records the dimension the corpus was
+    /// last embedded at; when it differs from the active embedder, every memory
+    /// whose primary embedding has the wrong length is re-embedded from content
+    /// and persisted.
+    ///
+    /// Properties:
+    /// - **Idempotent**: a matching marker short-circuits in O(1).
+    /// - **Crash-resumable**: the marker advances only after a clean pass; the
+    ///   per-memory length check skips already-migrated memories on retry.
+    /// - **Reuses vectors**: an old Nomic `embeddings_secondary` already at the
+    ///   target length is promoted in place instead of re-running ONNX.
+    fn migrate_embeddings_if_dimension_changed(&self) -> Result<()> {
+        let target = self.embedder.primary_dimension();
+        let marker = self.storage_path.join(".veld_embedding_dim");
+
+        let recorded: Option<usize> = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        if recorded == Some(target) {
+            return Ok(()); // corpus already at the active dimension
+        }
+
+        let ids = self.storage.get_all_ids()?;
+        if ids.is_empty() {
+            // Fresh / empty store — just record the dimension.
+            let _ = std::fs::write(&marker, target.to_string());
+            return Ok(());
+        }
+
+        info!(
+            "Embedding dimension change detected (was {:?}, now {}d) — checking {} memories",
+            recorded,
+            target,
+            ids.len()
+        );
+
+        // Stale persisted indices must not be loaded against the new dimension.
+        let _ = std::fs::remove_file(self.storage_path.join("vector_index").join(VAMANA_INDEX_FILE));
+        let _ = std::fs::remove_file(
+            self.storage_path
+                .join("secondary_vector_index")
+                .join(SECONDARY_VAMANA_INDEX_FILE),
+        );
+
+        let mut reembedded = 0usize;
+        let mut reused = 0usize;
+        let mut unchanged = 0usize;
+        let mut failed = 0usize;
+
+        for id in &ids {
+            let mut memory = match self.storage.get(id) {
+                Ok(m) => m,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+
+            // Already the correct length — nothing to do (keeps retries cheap).
+            let needs_migration =
+                matches!(&memory.experience.embeddings, Some(e) if e.len() != target);
+            if !needs_migration {
+                unchanged += 1;
+                continue;
+            }
+
+            // Prefer an existing secondary embedding already at the target length
+            // (installs that ran the old Nomic secondary have one for free).
+            let new_emb = match &memory.experience.embeddings_secondary {
+                Some(sec) if sec.len() == target => {
+                    reused += 1;
+                    sec.clone()
+                }
+                _ => match self.embedder.encode(&memory.experience.content) {
+                    Ok(e) if e.len() == target => {
+                        reembedded += 1;
+                        e
+                    }
+                    Ok(e) => {
+                        warn!(
+                            "Re-embed for {} produced {}d, expected {}d — skipping",
+                            id.0,
+                            e.len(),
+                            target
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Re-embed failed for {}: {}", id.0, e);
+                        failed += 1;
+                        continue;
+                    }
+                },
+            };
+
+            memory.experience.embeddings = Some(new_emb);
+            if let Err(e) = self.storage.update(&memory) {
+                warn!("Failed to persist re-embedded memory {}: {}", id.0, e);
+                failed += 1;
+            }
+        }
+
+        // Advance the marker only after a clean pass — a crash or failure leaves
+        // it stale so the next startup resumes the remaining memories.
+        if failed == 0 {
+            let _ = std::fs::write(&marker, target.to_string());
+        } else {
+            warn!(
+                "Embedding migration finished with {} failures — marker not advanced, will retry next startup",
+                failed
+            );
+        }
+
+        info!(
+            "Embedding migration: {} re-embedded, {} reused from secondary, {} already correct, {} failed",
+            reembedded, reused, unchanged, failed
+        );
+
+        Ok(())
+    }
+
     /// Initialize Vamana index from persisted file or rebuild from RocksDB
     ///
     /// INSTANT STARTUP ARCHITECTURE:
@@ -254,6 +383,14 @@ impl RetrievalEngine {
     /// The .vamana file is a cache that can be regenerated.
     fn rebuild_from_rocksdb(&self) -> Result<()> {
         let start_time = std::time::Instant::now();
+
+        // MIGRATION: if the primary embedding dimension changed (Nomic promoted
+        // to primary, or VELD_NOMIC_DIM changed), re-embed stored vectors before
+        // any index load/rebuild so the corpus and index dimensions agree.
+        if let Err(e) = self.migrate_embeddings_if_dimension_changed() {
+            warn!("Embedding dimension migration failed (rebuilding best-effort): {e}");
+        }
+
         let mut primary_loaded_from_file = false;
 
         // Try instant startup from persisted Vamana file
@@ -368,6 +505,18 @@ impl RetrievalEngine {
 
         if sec_vamana_path.exists() {
             match VamanaIndex::load_from_file(&sec_vamana_path) {
+                // Dimension guard: only adopt a persisted secondary index whose
+                // dimension matches the current secondary embedder.
+                Ok(loaded_index)
+                    if self.embedder.secondary_dimension()
+                        != Some(loaded_index.config.dimension) =>
+                {
+                    warn!(
+                        "Persisted secondary Vamana dimension {} != expected {:?}, rebuilding",
+                        loaded_index.config.dimension,
+                        self.embedder.secondary_dimension()
+                    );
+                }
                 Ok(mut loaded_index) => {
                     // Restore search_list_size to runtime config
                     loaded_index.config.search_list_size = 100;
@@ -571,6 +720,19 @@ impl RetrievalEngine {
                 return Ok(false);
             }
         };
+
+        // Dimension guard: a persisted index from a different embedding model
+        // (e.g. a pre-Nomic-promotion 384d file) must never be adopted against
+        // the current embedder. Migration deletes such files, but this is the
+        // defensive backstop if one survives.
+        let expected_dim = self.embedder.primary_dimension();
+        if loaded_index.config.dimension != expected_dim {
+            warn!(
+                "Persisted Vamana dimension {} != active embedder dimension {}, will rebuild",
+                loaded_index.config.dimension, expected_dim
+            );
+            return Ok(false);
+        }
 
         let loaded_count = loaded_index.len();
 
@@ -1166,7 +1328,7 @@ impl RetrievalEngine {
             embedding.clone()
         } else if let Some(query_text) = &query.query_text {
             self.embedder
-                .encode(query_text)
+                .encode_for_query(query_text)
                 .context("Failed to generate query embedding")?
         } else {
             tracing::warn!("Empty query in search_ids: no query_text or query_embedding provided");
@@ -1258,7 +1420,8 @@ impl RetrievalEngine {
                 (id, agg)
             })
             .collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
+        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         memory_ids.truncate(limit);
 
         Ok(memory_ids)
@@ -1306,8 +1469,9 @@ impl RetrievalEngine {
             }
         }
 
+        // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1));
+        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         memory_ids.truncate(limit);
 
         Ok(memory_ids)
@@ -1371,9 +1535,10 @@ impl RetrievalEngine {
             }
         }
 
-        // Convert to vec and sort by similarity descending (highest first)
+        // Convert to vec and sort by similarity descending (highest first).
+        // Tie-break by MemoryId for deterministic rank order across runs/CPUs (RH-10).
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
-        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1));
+        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         memory_ids.truncate(limit);
 
         Ok(memory_ids)
@@ -1407,7 +1572,7 @@ impl RetrievalEngine {
             embedding.clone()
         } else if let Some(query_text) = &query.query_text {
             self.embedder
-                .encode(query_text)
+                .encode_for_query(query_text)
                 .context("Failed to generate query embedding")?
         } else {
             tracing::warn!(
@@ -1509,10 +1674,12 @@ impl RetrievalEngine {
                     .as_ref()
                     .and_then(|c| c.episode.sequence_number)
                     .unwrap_or(0);
-                seq_a.cmp(&seq_b)
+                // Tie-break by MemoryId so memories without sequence_number sort stably (RH-10).
+                seq_a.cmp(&seq_b).then_with(|| a.id.cmp(&b.id))
             });
         } else {
-            memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            // Newest first; tie-break by MemoryId on identical timestamps (RH-10).
+            memories.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
         }
 
         memories.truncate(limit);
@@ -1611,7 +1778,12 @@ impl RetrievalEngine {
             })
             .collect();
 
-        sorted.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // Score desc → recency desc → MemoryId asc for deterministic ranking (RH-10).
+        sorted.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then_with(|| b.1.created_at.cmp(&a.1.created_at))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
 
         Ok(sorted.into_iter().take(limit).map(|(_, m)| m).collect())
     }
@@ -1654,7 +1826,11 @@ impl RetrievalEngine {
                 Some(geo) => geo_filter.haversine_distance(geo[0], geo[1]),
                 None => f64::MAX,
             };
-            dist_a.total_cmp(&dist_b)
+            // Tie-break: recency desc, then MemoryId asc — deterministic across runs (RH-10).
+            dist_a
+                .total_cmp(&dist_b)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         memories.truncate(limit);
@@ -1681,8 +1857,8 @@ impl RetrievalEngine {
         // Apply additional filters
         memories.retain(|m| self.matches_filters(m, query));
 
-        // Sort by timestamp (chronological order for mission replay)
-        memories.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        // Sort by timestamp (chronological order for mission replay), tie-break by id (RH-10).
+        memories.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
 
         memories.truncate(limit);
         Ok(memories)
@@ -1713,7 +1889,11 @@ impl RetrievalEngine {
         memories.sort_by(|a, b| {
             let reward_a = a.experience.reward.unwrap_or(0.0);
             let reward_b = b.experience.reward.unwrap_or(0.0);
-            reward_b.total_cmp(&reward_a)
+            // Tie-break: recency desc, then MemoryId asc — deterministic across runs (RH-10).
+            reward_b
+                .total_cmp(&reward_a)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         memories.truncate(limit);

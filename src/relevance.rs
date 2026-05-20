@@ -915,7 +915,13 @@ impl RelevanceEngine {
             .collect();
 
         // Sort by relevance score (descending)
-        results.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+        // Score desc → recency desc → id asc — deterministic when scores collide (RH-10).
+        results.sort_by(|a, b| {
+            b.relevance_score
+                .total_cmp(&a.relevance_score)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         // Quality-based filtering: only return memories above minimum relevance
         // This prevents returning low-quality matches just to fill max_results
@@ -1115,7 +1121,13 @@ impl RelevanceEngine {
             )
             .collect();
 
-        results.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+        // Score desc → recency desc → id asc — deterministic when scores collide (RH-10).
+        results.sort_by(|a, b| {
+            b.relevance_score
+                .total_cmp(&a.relevance_score)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         // Quality-based filtering: only return memories above minimum relevance
         const MIN_RELEVANCE_SCORE: f32 = 0.25;
@@ -1317,7 +1329,9 @@ impl RelevanceEngine {
                 if !candidate_ids.is_empty() {
                     // Sort by score descending and take top candidates
                     let mut sorted_candidates: Vec<_> = candidate_ids.into_iter().collect();
-                    sorted_candidates.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+                    // Score desc; tie-break by id asc for deterministic candidate selection (RH-10).
+                    sorted_candidates
+                        .sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
 
                     for (memory_id, (score, matched)) in
                         sorted_candidates.into_iter().take(max_candidates)

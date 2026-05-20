@@ -683,9 +683,13 @@ impl VamanaIndex {
         let storage = self.vectors.read(); // Hold lock for entire prune operation
         let node_slice = Self::get_slice_from_storage(&storage, node_id)?;
 
-        // Sort candidates by distance (NaN values sort to end)
+        // Sort candidates by distance (NaN values sort to end), tie-break by id for determinism (RH-10)
         let mut sorted_candidates = candidates.to_vec();
-        sorted_candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        sorted_candidates.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         // Pre-load all candidate vectors to avoid repeated storage lookups
         // This trades memory for CPU - worth it for the O(n²) inner loop
@@ -836,6 +840,17 @@ impl VamanaIndex {
 
     /// Add a single vector (incremental indexing) - OPTIMIZED
     pub fn add_vector(&mut self, vector: Vec<f32>) -> Result<u32> {
+        // Dimension guard: a mismatched vector would silently corrupt the index
+        // (distance computation strides by config.dimension; the only other check
+        // is a debug_assert that is compiled out in release builds). Reject it.
+        if vector.len() != self.config.dimension {
+            anyhow::bail!(
+                "add_vector: vector dimension {} does not match index dimension {}",
+                vector.len(),
+                self.config.dimension
+            );
+        }
+
         let current_count = self.num_vectors.load(std::sync::atomic::Ordering::Acquire);
         let id = current_count as u32;
 
@@ -931,8 +946,8 @@ impl VamanaIndex {
                         })
                         .collect();
 
-                    // Sort by distance (lower = closer for all metrics)
-                    neighbor_distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    // Sort by distance (lower = closer for all metrics), tie-break by id (RH-10)
+                    neighbor_distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
                     // Keep only max_degree closest neighbors
                     graph[neighbor_id as usize].neighbors = neighbor_distances
@@ -1167,7 +1182,7 @@ impl VamanaIndex {
             distances.push((id, dist));
         }
 
-        distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+        distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         distances.truncate(k);
 
         Ok(distances)
@@ -1618,7 +1633,12 @@ impl Eq for SearchCandidate {}
 
 impl Ord for SearchCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.distance.total_cmp(&other.distance)
+        // Stable tie-break by id: equal-distance candidates keep a deterministic
+        // rank order across runs and machines, instead of flipping based on float
+        // accumulation order (RH-10 determinism).
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.id.cmp(&other.id))
     }
 }
 
