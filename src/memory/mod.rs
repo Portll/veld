@@ -481,50 +481,81 @@ impl MemorySystem {
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         let storage_path = config.storage_path.clone();
 
-        // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine
-        // Dual-embedder: primary (MiniLM 384d, always) + optional secondary (Nomic 768d)
-        let embedding_config = crate::embeddings::minilm::EmbeddingConfig::default();
-        let primary = Arc::new(
-            crate::embeddings::minilm::MiniLMEmbedder::new(embedding_config)
-                .context("Failed to initialize MiniLM embedder (ONNX model)")?,
-        );
+        // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
+        //
+        // PRIMARY embedder: Nomic-embed-text-v1.5 (768d, Matryoshka-truncatable
+        // via VELD_NOMIC_DIM) is the preferred primary. It falls back to MiniLM
+        // (384d) only when the Nomic ONNX model cannot run as a real (non-simplified)
+        // model — a simplified hash-mode Nomic is worse than a real MiniLM.
+        let primary: Arc<dyn crate::embeddings::Embedder> = {
+            let want_nomic = crate::embeddings::are_nomic_models_downloaded()
+                || crate::embeddings::auto_download_models_enabled();
 
-        // Secondary embedder: try HTTP API first (LM Studio/Ollama), then local ONNX
-        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = {
-            // Option 1: HTTP-backed Nomic via LM Studio / Ollama / vLLM
-            let http_config = crate::embeddings::http_embedder::HttpEmbedderConfig::from_env();
-            let http_embedder = crate::embeddings::http_embedder::HttpEmbedder::new(http_config);
-            if http_embedder.is_available() {
-                tracing::info!(
-                    "Nomic via HTTP API at {} — dual-embedder active",
-                    std::env::var("VELD_EMBEDDING_API_URL")
-                        .unwrap_or_else(|_| "http://127.0.0.1:1234".into())
-                );
-                Some(Arc::new(http_embedder))
-            }
-            // Option 2: Local ONNX Nomic model
-            else if crate::embeddings::are_nomic_models_downloaded() {
+            let nomic_primary: Option<Arc<dyn crate::embeddings::Embedder>> = if want_nomic {
                 match crate::embeddings::nomic::NomicEmbedder::new(
                     crate::embeddings::nomic::NomicConfig::from_env(),
                 ) {
-                    Ok(nomic) => {
-                        tracing::info!("Nomic-embed-text-v1.5 ONNX loaded (768d) — dual-embedder active");
-                        Some(Arc::new(nomic))
+                    Ok(n) if !n.is_simplified() => {
+                        tracing::info!(
+                            "Primary embedder: Nomic-embed-text-v1.5 ONNX ({}d)",
+                            n.dimension()
+                        );
+                        Some(Arc::new(n) as Arc<dyn crate::embeddings::Embedder>)
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "Nomic available only in simplified mode — using MiniLM as primary"
+                        );
+                        None
                     }
                     Err(e) => {
-                        tracing::warn!("Nomic ONNX init failed, MiniLM only: {e}");
+                        tracing::warn!("Nomic init failed ({e}) — using MiniLM as primary");
                         None
                     }
                 }
             } else {
-                tracing::info!("No secondary embedder available — MiniLM only (384d)");
+                tracing::info!(
+                    "Nomic model not present — using MiniLM as primary (384d). \
+                     Set VELD_AUTO_DOWNLOAD_MODELS=true to enable Nomic."
+                );
+                None
+            };
+
+            match nomic_primary {
+                Some(p) => p,
+                None => {
+                    let embedding_config = crate::embeddings::minilm::EmbeddingConfig::default();
+                    Arc::new(
+                        crate::embeddings::minilm::MiniLMEmbedder::new(embedding_config)
+                            .context("Failed to initialize MiniLM embedder (ONNX model)")?,
+                    ) as Arc<dyn crate::embeddings::Embedder>
+                }
+            }
+        };
+
+        // SECONDARY embedder (optional): a remote / cluster model for dual-index
+        // competitive retrieval. The local Nomic ONNX model is the PRIMARY now,
+        // so it is not re-used here — the secondary slot is for HTTP / Zenoh peers.
+        let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = {
+            // HTTP-backed embedder via LM Studio / Ollama / vLLM
+            let http_config = crate::embeddings::http_embedder::HttpEmbedderConfig::from_env();
+            let http_embedder = crate::embeddings::http_embedder::HttpEmbedder::new(http_config);
+            if http_embedder.is_available() {
+                tracing::info!(
+                    "Secondary embedder: HTTP API at {}",
+                    std::env::var("VELD_EMBEDDING_API_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:1234".into())
+                );
+                Some(Arc::new(http_embedder))
+            } else {
                 None
             }
         };
 
-        // Option 3: Zenoh-routed embedder (cluster peer)
-        // Caches the Zenoh session (expensive) but retries peer discovery every 30s
-        // so that late-joining peers are detected without requiring a restart.
+        // Zenoh-routed embedder (cluster peer) — fills the secondary slot when no
+        // HTTP secondary is configured. Caches the Zenoh session (expensive) but
+        // retries peer discovery every 30s so late-joining peers are detected
+        // without requiring a restart.
         #[cfg(feature = "zenoh")]
         struct ZenohEmbedderCache {
             /// The embedder instance (session is expensive, reuse it)
@@ -1036,7 +1067,7 @@ impl MemorySystem {
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
-        self.remember_impl(experience, created_at, false)
+        self.remember_impl(experience, created_at, None, false)
     }
 
     /// Store a new memory WITHOUT embedding generation or vector indexing (fast path).
@@ -1049,8 +1080,9 @@ impl MemorySystem {
         &self,
         experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
+        external_id: Option<String>,
     ) -> Result<MemoryId> {
-        self.remember_impl(experience, created_at, true)
+        self.remember_impl(experience, created_at, external_id, true)
     }
 
     /// Internal implementation shared by `remember()` and `remember_deferred()`.
@@ -1063,6 +1095,7 @@ impl MemorySystem {
         &self,
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
+        external_id: Option<String>,
         defer_embedding: bool,
     ) -> Result<MemoryId> {
         // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
@@ -1127,15 +1160,27 @@ impl MemorySystem {
 
         // Create memory entry (zero-copy with Arc)
         // CRITICAL: Move experience instead of clone to avoid 2-10KB allocation
-        let memory = Arc::new(Memory::new(
-            memory_id.clone(),
-            experience, // Move ownership (zero-cost)
-            importance,
-            None,       // agent_id
-            None,       // run_id
-            None,       // actor_id
-            created_at, // Use provided timestamp or Utc::now() if None
-        ));
+        let memory = Arc::new(match external_id {
+            Some(eid) => Memory::new_with_external_id(
+                memory_id.clone(),
+                experience,
+                importance,
+                eid,
+                None, // agent_id
+                None, // run_id
+                None, // actor_id
+                created_at,
+            ),
+            None => Memory::new(
+                memory_id.clone(),
+                experience,
+                importance,
+                None,       // agent_id
+                None,       // run_id
+                None,       // actor_id
+                created_at,
+            ),
+        });
 
         // FIX-R2: Compute elaboration score at encoding time.
         // Measures how contextualized this memory is (S-rep=0.0 vs C-rep=1.0).
@@ -1642,7 +1687,7 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<MemoryId> {
-        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, false)
+        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, None, false)
     }
 
     /// Fast-path variant of `remember_with_agent` — skips content embedding,
@@ -1653,8 +1698,9 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<String>,
         run_id: Option<String>,
+        external_id: Option<String>,
     ) -> Result<MemoryId> {
-        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, true)
+        self.remember_with_agent_impl(experience, created_at, agent_id, run_id, external_id, true)
     }
 
     fn remember_with_agent_impl(
@@ -1663,6 +1709,7 @@ impl MemorySystem {
         created_at: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<String>,
         run_id: Option<String>,
+        external_id: Option<String>,
         defer_embedding: bool,
     ) -> Result<MemoryId> {
         // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
@@ -1708,15 +1755,27 @@ impl MemorySystem {
         }
 
         // Create memory with agent context
-        let memory = Arc::new(Memory::new(
-            memory_id.clone(),
-            experience,
-            importance,
-            agent_id,
-            run_id,
-            None, // actor_id
-            created_at,
-        ));
+        let memory = Arc::new(match external_id {
+            Some(eid) => Memory::new_with_external_id(
+                memory_id.clone(),
+                experience,
+                importance,
+                eid,
+                agent_id,
+                run_id,
+                None, // actor_id
+                created_at,
+            ),
+            None => Memory::new(
+                memory_id.clone(),
+                experience,
+                importance,
+                agent_id,
+                run_id,
+                None, // actor_id
+                created_at,
+            ),
+        });
 
         // FIX-R2: Compute elaboration score at encoding time
         memory.set_elaboration_score(Self::compute_elaboration_score(&memory));
@@ -2415,9 +2474,20 @@ impl MemorySystem {
         self.embedder.as_ref()
     }
 
-    /// Compute embedding for arbitrary text (for external use like prospective memory)
+    /// Compute embedding for arbitrary text (for external use like prospective memory).
+    ///
+    /// This is the *document* side. For search input use `compute_query_embedding`
+    /// so asymmetric models (Nomic) apply the query-specific transform.
     pub fn compute_embedding(&self, text: &str) -> Result<Vec<f32>> {
         self.embedder.encode(text)
+    }
+
+    /// Compute a *query* embedding for arbitrary text (retrieval side).
+    ///
+    /// Honors the embedder's document/query asymmetry — Nomic prepends
+    /// `search_query: `; symmetric models behave identically to `compute_embedding`.
+    pub fn compute_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        self.embedder.encode_for_query(text)
     }
 
     /// Get all memories across all tiers for graph-aware retrieval

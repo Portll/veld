@@ -714,8 +714,9 @@ impl CrossEncoderReranker {
             return Ok(Vec::new());
         }
 
-        // Always compute bi-encoder scores (fast, used for blending or fallback)
-        let query_embedding = self.embedder.encode(query)?;
+        // Always compute bi-encoder scores (fast, used for blending or fallback).
+        // Query side uses encode_for_query so asymmetric models apply the query prefix.
+        let query_embedding = self.embedder.encode_for_query(query)?;
         let mut bi_scores: Vec<f32> = Vec::with_capacity(candidates.len());
         for (_, content, _) in &candidates {
             let doc_embedding = self.embedder.encode(content)?;

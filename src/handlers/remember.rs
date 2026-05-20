@@ -486,16 +486,17 @@ pub async fn remember(
         let created_at = req.created_at;
         let agent_id = req.agent_id.clone();
         let run_id = req.run_id.clone();
+        let external_id = req.external_id.clone();
 
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
             // Fast path: persist + BM25 only (~10ms), embedding deferred to background
             if agent_id.is_some() || run_id.is_some() {
                 memory_guard.remember_with_agent_deferred(
-                    exp_clone, created_at, agent_id, run_id,
+                    exp_clone, created_at, agent_id, run_id, external_id,
                 )
             } else {
-                memory_guard.remember_deferred(exp_clone, created_at)
+                memory_guard.remember_deferred(exp_clone, created_at, external_id)
             }
         })
         .await

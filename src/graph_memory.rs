@@ -5370,7 +5370,7 @@ pub struct GraphTraversal {
 }
 
 /// Graph statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GraphStats {
     pub entity_count: usize,
     pub relationship_count: usize,

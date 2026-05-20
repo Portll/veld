@@ -17,13 +17,15 @@
     }
   },
   "embeddings": {
-    "provider": "minilm",
-    "model_path": "/path/to/models/minilm-l6/model_quantized.onnx",
-    "tokenizer_path": "/path/to/models/minilm-l6/tokenizer.json",
-    "dimension": 384,
-    "max_length": 256,
+    "provider": "nomic",
+    "model_path": "/path/to/models/nomic-embed-v1.5/model_quantized.onnx",
+    "tokenizer_path": "/path/to/models/nomic-embed-v1.5/tokenizer.json",
+    "dimension": 768,
+    "matryoshka_dimension": 768,
+    "max_length": 512,
     "use_quantized": true,
-    "fallback_to_simplified": true
+    "fallback_to_simplified": true,
+    "_comment": "Primary embedder is Nomic-embed-text-v1.5 (768d). matryoshka_dimension truncates output to 64|128|256|512|768 (env: VELD_NOMIC_DIM) — 512 keeps ~99% quality at 2/3 the storage. If the Nomic model is absent, veld falls back to MiniLM (384d)."
   },
   "vector_index": {
     "type": "vamana_hnsw",

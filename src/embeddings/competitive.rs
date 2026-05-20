@@ -1,28 +1,29 @@
 //! Competitive dual-embedder architecture
 //!
-//! Runs two embedding models in competition: a primary model (MiniLM 384d, always
-//! available) and an optional secondary model (e.g., Nomic 768d). At encoding time
-//! both models produce embeddings; at retrieval time both index paths are queried
-//! and the best match wins.
+//! Holds a **primary** embedder (the default — Nomic-embed-text-v1.5 768d when
+//! available, MiniLM 384d as fallback) and an **optional secondary** embedder
+//! (HTTP / cluster model). When a secondary is present both index paths are
+//! queried at retrieval time and the best match wins.
 //!
 //! # Design
-//! - **Backward compatible**: Implements `Embedder` trait using the primary model,
-//!   so existing code continues to work unchanged.
-//! - **Graceful degradation**: If the secondary model is unavailable (not downloaded,
-//!   fails to load), the system silently falls back to primary-only mode.
-//! - **Dual storage**: Callers use `encode_dual` to get embeddings from both models,
-//!   storing them in separate fields / indices.
+//! - **Polymorphic primary**: `primary` is `Arc<dyn Embedder>`, so the concrete
+//!   model is chosen at construction time (Nomic preferred, MiniLM fallback).
+//! - **Trait delegation**: the `Embedder` impl delegates to the primary model,
+//!   so existing call sites are unchanged.
+//! - **Graceful degradation**: if the secondary model is unavailable, the system
+//!   runs primary-only.
+//! - **Dual storage**: callers use `encode_dual` to get embeddings from both
+//!   models, storing them in separate fields / indices.
 //!
-//! # Future work
-//! - The secondary slot is typed as `Arc<dyn Embedder>` so any model that implements
-//!   the `Embedder` trait can be plugged in (Nomic, BGE, GTE, etc.)
+//! # Notes
+//! - Both slots are `Arc<dyn Embedder>`, so any `Embedder` impl can be plugged in
+//!   (Nomic, MiniLM, BGE, GTE, HTTP, Zenoh, …).
 //! - Retrieval merging (max-score union across two Vamana indices) lives in the
 //!   retrieval layer, not here.
 
 use anyhow::Result;
 use std::sync::Arc;
 
-use super::minilm::MiniLMEmbedder;
 use super::Embedder;
 
 type DualEmbeddingBatch = (Vec<Vec<f32>>, Option<Vec<Vec<f32>>>);
@@ -33,9 +34,10 @@ type DualEmbeddingBatch = (Vec<Vec<f32>>, Option<Vec<Vec<f32>>>);
 /// secondary embedder that can be a different model / dimensionality. Both models
 /// run independently; there is no mixing or concatenation of their outputs.
 pub struct CompetitiveEmbedder {
-    /// Primary model: MiniLM 384d. Always available.
-    primary: Arc<MiniLMEmbedder>,
-    /// Secondary model: any Embedder impl (e.g., Nomic 768d). Optional.
+    /// Primary model: the default embedder (Nomic 768d when available, MiniLM
+    /// 384d fallback). Always present. Dimension is read via `primary.dimension()`.
+    primary: Arc<dyn Embedder>,
+    /// Secondary model: any Embedder impl (HTTP / cluster). Optional.
     secondary: Option<Arc<dyn Embedder>>,
     /// Cached secondary dimension (avoids repeated vtable calls).
     secondary_dim: Option<usize>,
@@ -44,9 +46,9 @@ pub struct CompetitiveEmbedder {
 impl CompetitiveEmbedder {
     /// Create a new competitive embedder.
     ///
-    /// - `primary` is required and always used (backward-compatible path).
+    /// - `primary` is required and always used (the trait-delegation path).
     /// - `secondary` is optional; pass `None` for single-model mode.
-    pub fn new(primary: Arc<MiniLMEmbedder>, secondary: Option<Arc<dyn Embedder>>) -> Self {
+    pub fn new(primary: Arc<dyn Embedder>, secondary: Option<Arc<dyn Embedder>>) -> Self {
         let secondary_dim = secondary.as_ref().map(|e| e.dimension());
         Self {
             primary,
@@ -56,7 +58,7 @@ impl CompetitiveEmbedder {
     }
 
     /// Create a primary-only competitive embedder (no secondary model).
-    pub fn primary_only(primary: Arc<MiniLMEmbedder>) -> Self {
+    pub fn primary_only(primary: Arc<dyn Embedder>) -> Self {
         Self {
             primary,
             secondary: None,
@@ -151,7 +153,7 @@ impl CompetitiveEmbedder {
     }
 
     /// Get a reference to the primary embedder.
-    pub fn primary_embedder(&self) -> &Arc<MiniLMEmbedder> {
+    pub fn primary_embedder(&self) -> &Arc<dyn Embedder> {
         &self.primary
     }
 
@@ -170,6 +172,12 @@ impl CompetitiveEmbedder {
 impl Embedder for CompetitiveEmbedder {
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         self.encode_primary(text)
+    }
+
+    /// Query-side encode — delegates to the primary model's query path so
+    /// asymmetric models (Nomic) apply the `search_query: ` prefix.
+    fn encode_for_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.primary.encode_for_query(text)
     }
 
     fn dimension(&self) -> usize {

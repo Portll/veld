@@ -1015,7 +1015,7 @@ pub fn spreading_activation_retrieve_with_stats(
 
     // Generate query embedding once (for semantic scoring)
     let embedding_start = Instant::now();
-    let query_embedding = embedder.encode(query_text)?;
+    let query_embedding = embedder.encode_for_query(query_text)?;
     stats.embedding_time_us = embedding_start.elapsed().as_micros() as u64;
 
     let now = chrono::Utc::now();

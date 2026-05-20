@@ -76,11 +76,25 @@ pub(crate) fn neural_ner_enabled() -> bool {
 
 /// Trait for embedding generation
 pub trait Embedder: Send + Sync {
-    /// Generate embedding for text
+    /// Generate embedding for text.
+    ///
+    /// This is the *document* side of an asymmetric model — content being
+    /// stored/indexed. Symmetric models (e.g. MiniLM) treat documents and
+    /// queries identically; see `encode_for_query` for the query side.
     fn encode(&self, text: &str) -> Result<Vec<f32>>;
 
     /// Get embedding dimension
     fn dimension(&self) -> usize;
+
+    /// Encode text as a *query* embedding (retrieval side).
+    ///
+    /// Asymmetric models (e.g. Nomic, which prepends `search_query: `) override
+    /// this to apply the query-specific transform. The default delegates to
+    /// `encode`, which is correct for symmetric models. Always use this for
+    /// search queries so the document/query asymmetry is honored end-to-end.
+    fn encode_for_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.encode(text)
+    }
 
     /// Encode text and report whether the result is a degraded fallback.
     /// Returns (embedding, is_degraded). Default: delegates to encode(), reports healthy.

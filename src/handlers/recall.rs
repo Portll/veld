@@ -399,7 +399,7 @@ pub async fn recall(
 
             // 1. Compute query embedding (reused for prospective + recall + todo search)
             let query_embedding_opt = memory_guard
-                .compute_embedding(&query_for_recall)
+                .compute_query_embedding(&query_for_recall)
                 .ok();
 
             // 2. Semantic prospective matching (fixes C5: was keyword-only)
@@ -1264,7 +1264,7 @@ pub async fn proactive_context(
     let memory_for_embedding = memory_system.clone();
     let embedding_task = tokio::task::spawn_blocking(move || {
         let memory_guard = memory_for_embedding.read();
-        match memory_guard.compute_embedding(&context_for_embedding) {
+        match memory_guard.compute_query_embedding(&context_for_embedding) {
             Ok(emb) => (emb, true),
             Err(e) => {
                 tracing::warn!("proactive_context: embedding computation failed: {e}, skipping embedding-dependent operations");

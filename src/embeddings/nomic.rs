@@ -1,10 +1,18 @@
 //! Nomic-embed-text-v1.5 embedding model using ONNX Runtime
 //!
-//! Generates 768-dimensional sentence embeddings with Matryoshka representation learning.
+//! Generates sentence embeddings with Matryoshka representation learning (MRL).
 //! Model: nomic-ai/nomic-embed-text-v1.5
 //!
+//! # Matryoshka dimensions
+//! The model is MRL-trained at a native width of 768. Because information is
+//! front-loaded, any prefix of length {64, 128, 256, 512, 768} — re-normalized —
+//! is a usable embedding. The exposed dimension is set via `VELD_NOMIC_DIM`
+//! (default 768). 512 retains ~99% of 768's quality at 2/3 the storage and a
+//! faster search; 256 retains ~97-98%. Truncating *down* is free (one model,
+//! one download); it is the runtime fidelity knob for the product.
+//!
 //! Key differences from MiniLM:
-//! - 768-dimensional embeddings (vs 384)
+//! - 768-dimensional embeddings by default (vs 384), truncatable via MRL
 //! - Requires task-specific prefixes: "search_document: " for documents, "search_query: " for queries
 //! - Supports up to 8192 tokens (we default to 512 for edge efficiency)
 //! - Uses rotary position embeddings (RoPE)
@@ -17,6 +25,7 @@
 //! Configuration via environment variables:
 //! - VELD_NOMIC_MODEL_PATH: Base path to model files (default: ~/.cache/veld/models/nomic-embed-v1.5)
 //! - VELD_NOMIC_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
+//! - VELD_NOMIC_DIM: Matryoshka output dimension — 64|128|256|512|768 (default: 768)
 //! - VELD_LAZY_LOAD: Set to "false" to load model at startup (default: true)
 //! - VELD_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, 2 elsewhere)
 
@@ -33,6 +42,48 @@ use super::Embedder;
 /// Nomic task prefixes for asymmetric embedding
 const SEARCH_DOCUMENT_PREFIX: &str = "search_document: ";
 const SEARCH_QUERY_PREFIX: &str = "search_query: ";
+
+/// Native hidden size of nomic-embed-text-v1.5.
+///
+/// This is the ONNX output width and the stride used for mean-pooling. It is
+/// fixed by the model and is deliberately NOT the same value as the exposed
+/// embedding dimension (`NomicEmbedder::dimension`): when Matryoshka truncation
+/// is active the model still emits 768-wide rows which we pool, then truncate.
+const NOMIC_NATIVE_DIM: usize = 768;
+
+/// Valid Matryoshka output dimensions for nomic-embed-text-v1.5.
+///
+/// The model was trained with MRL, so any prefix of these lengths — re-normalized
+/// — is a usable embedding. A `VELD_NOMIC_DIM` value outside this set is rejected
+/// (with a warning) and the native dimension is used instead.
+const NOMIC_VALID_DIMS: [usize; 5] = [64, 128, 256, 512, 768];
+
+/// Resolve and validate the configured Matryoshka output dimension.
+fn resolve_output_dim() -> usize {
+    match std::env::var("VELD_NOMIC_DIM") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(d) if NOMIC_VALID_DIMS.contains(&d) => d,
+            Ok(d) => {
+                tracing::warn!(
+                    "VELD_NOMIC_DIM={} is not a valid Matryoshka dimension {:?}; using {}",
+                    d,
+                    NOMIC_VALID_DIMS,
+                    NOMIC_NATIVE_DIM
+                );
+                NOMIC_NATIVE_DIM
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "VELD_NOMIC_DIM={:?} is not a number; using {}",
+                    raw,
+                    NOMIC_NATIVE_DIM
+                );
+                NOMIC_NATIVE_DIM
+            }
+        },
+        Err(_) => NOMIC_NATIVE_DIM,
+    }
+}
 
 /// Lazily initialized ONNX session and tokenizer for Nomic
 struct LazyNomicModel {
@@ -109,6 +160,11 @@ pub struct NomicConfig {
 
     /// Timeout for embedding generation in milliseconds
     pub embed_timeout_ms: u64,
+
+    /// Matryoshka output dimension — one of {64, 128, 256, 512, 768}.
+    /// The model always emits 768; embeddings are truncated to this length and
+    /// re-normalized. Defaults to `NOMIC_NATIVE_DIM` (768, no truncation).
+    pub output_dim: usize,
 }
 
 impl Default for NomicConfig {
@@ -172,6 +228,7 @@ impl NomicConfig {
             max_length: 512,
             use_quantized,
             embed_timeout_ms,
+            output_dim: resolve_output_dim(),
         }
     }
 
@@ -183,6 +240,7 @@ impl NomicConfig {
             max_length: 512,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            output_dim: resolve_output_dim(),
         }
     }
 }
@@ -337,10 +395,10 @@ impl NomicEmbedder {
         }
 
         let embedder = Self {
+            dimension: config.output_dim,
             config: config.clone(),
             lazy_model: OnceLock::new(),
             simplified_mode: false,
-            dimension: 768,
         };
 
         if !lazy_load {
@@ -387,11 +445,40 @@ impl NomicEmbedder {
         tracing::warn!("    Tokenizer: {:?}", config.tokenizer_path);
 
         Ok(Self {
+            dimension: config.output_dim,
             config,
             lazy_model: OnceLock::new(),
             simplified_mode: true,
-            dimension: 768,
         })
+    }
+
+    /// Whether this embedder is running in simplified (hash-based, non-semantic)
+    /// mode because ONNX Runtime or the model files were unavailable.
+    ///
+    /// Used by embedder selection to decide whether Nomic is fit to be the
+    /// primary embedder, or whether to fall back to MiniLM's real ONNX path.
+    pub fn is_simplified(&self) -> bool {
+        self.simplified_mode
+    }
+
+    /// Apply Matryoshka truncation: keep the first `self.dimension` components
+    /// of a native-width (768) embedding and re-normalize to unit length.
+    ///
+    /// A no-op when `self.dimension == NOMIC_NATIVE_DIM`. MRL guarantees the
+    /// truncated-and-renormalized prefix is itself a valid embedding.
+    fn apply_matryoshka(&self, mut full: Vec<f32>) -> Vec<f32> {
+        if full.len() <= self.dimension {
+            return full;
+        }
+        full.truncate(self.dimension);
+        if !Self::normalize(&mut full) {
+            tracing::warn!(
+                "Matryoshka truncation to {}d produced a zero/NaN norm; returning zero vector",
+                self.dimension
+            );
+            full.iter_mut().for_each(|v| *v = 0.0);
+        }
+        full
     }
 
     /// Encode text as a document embedding (prepends "search_document: " prefix)
@@ -736,14 +823,16 @@ impl NomicEmbedder {
         let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
         let (_shape, output_data) = output_tensor;
 
-        // Mean pooling over sequence dimension
-        let mut pooled = vec![0.0; self.dimension];
+        // Mean pooling over sequence dimension.
+        // Pooling uses NOMIC_NATIVE_DIM (768) — the model's true output width and
+        // row stride — NOT self.dimension, which may be a smaller Matryoshka size.
+        let mut pooled = vec![0.0; NOMIC_NATIVE_DIM];
         let mut mask_sum = 0.0;
 
         for (seq_idx, &att) in attention.iter().enumerate() {
             if att == 1 {
                 for (dim_idx, pooled_val) in pooled.iter_mut().enumerate() {
-                    let idx = seq_idx * self.dimension + dim_idx;
+                    let idx = seq_idx * NOMIC_NATIVE_DIM + dim_idx;
                     *pooled_val += output_data[idx];
                 }
                 mask_sum += 1.0;
@@ -771,7 +860,8 @@ impl NomicEmbedder {
             }
         }
 
-        Ok(pooled)
+        // Matryoshka: truncate to the configured dimension and re-normalize.
+        Ok(self.apply_matryoshka(pooled))
     }
 
     /// Generate embeddings for multiple texts in a single ONNX batch
@@ -848,17 +938,19 @@ impl NomicEmbedder {
         let mut results = Vec::with_capacity(batch_size);
 
         for batch_idx in 0..batch_size {
-            let mut pooled = vec![0.0; self.dimension];
+            // Pool at NOMIC_NATIVE_DIM (the model's row stride), truncate after.
+            let mut pooled = vec![0.0; NOMIC_NATIVE_DIM];
             let mut mask_sum = 0.0;
 
-            let batch_offset = batch_idx * max_length * self.dimension;
+            let batch_offset = batch_idx * max_length * NOMIC_NATIVE_DIM;
             let attention_offset = batch_idx * max_length;
 
             for seq_idx in 0..max_length {
                 if attention_masks[attention_offset + seq_idx] == 1 {
-                    for (dim_idx, pooled_val) in pooled.iter_mut().enumerate().take(self.dimension)
+                    for (dim_idx, pooled_val) in
+                        pooled.iter_mut().enumerate().take(NOMIC_NATIVE_DIM)
                     {
-                        let idx = batch_offset + seq_idx * self.dimension + dim_idx;
+                        let idx = batch_offset + seq_idx * NOMIC_NATIVE_DIM + dim_idx;
                         *pooled_val += output_data[idx];
                     }
                     mask_sum += 1.0;
@@ -884,7 +976,8 @@ impl NomicEmbedder {
                 }
             }
 
-            results.push(pooled);
+            // Matryoshka: truncate to the configured dimension and re-normalize.
+            results.push(self.apply_matryoshka(pooled));
         }
 
         Ok(results)
@@ -892,11 +985,17 @@ impl NomicEmbedder {
 }
 
 impl Embedder for NomicEmbedder {
-    /// Default encode uses "search_document: " prefix.
-    ///
-    /// For query embeddings, use `encode_query()` directly.
+    /// Default encode uses the "search_document: " prefix (content being stored).
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         self.encode_document(text)
+    }
+
+    /// Query-side encode uses the "search_query: " prefix. Honoring Nomic's
+    /// document/query asymmetry is worth a few MTEB points of retrieval quality.
+    fn encode_for_query(&self, text: &str) -> Result<Vec<f32>> {
+        // `self.encode_query` resolves to the inherent method (the trait method
+        // is named `encode_for_query`), so this is not recursive.
+        self.encode_query(text)
     }
 
     fn dimension(&self) -> usize {
@@ -939,6 +1038,7 @@ mod tests {
             max_length: 512,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            output_dim: NOMIC_NATIVE_DIM,
         };
         let embedder = NomicEmbedder::new_simplified(config).unwrap();
         assert_eq!(embedder.dimension(), 768);
@@ -952,6 +1052,7 @@ mod tests {
             max_length: 512,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            output_dim: NOMIC_NATIVE_DIM,
         };
         let embedder = NomicEmbedder::new_simplified(config).unwrap();
 
@@ -973,6 +1074,7 @@ mod tests {
             max_length: 512,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            output_dim: NOMIC_NATIVE_DIM,
         };
         let embedder = NomicEmbedder::new_simplified(config).unwrap();
 
@@ -994,6 +1096,7 @@ mod tests {
             max_length: 512,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            output_dim: NOMIC_NATIVE_DIM,
         };
         let embedder = NomicEmbedder::new_simplified(config).unwrap();
 
@@ -1014,6 +1117,7 @@ mod tests {
             max_length: 512,
             use_quantized: true,
             embed_timeout_ms: 5000,
+            output_dim: NOMIC_NATIVE_DIM,
         };
         let embedder = NomicEmbedder::new_simplified(config).unwrap();
 
@@ -1046,5 +1150,71 @@ mod tests {
         // NaN and Inf should be replaced with 0.0 before normalization
         NomicEmbedder::normalize(&mut embedding);
         assert!(!embedding.iter().any(|x| x.is_nan() || x.is_infinite()));
+    }
+
+    #[test]
+    fn test_resolve_output_dim_validation() {
+        // NOMIC_VALID_DIMS is the authoritative MRL dimension set.
+        assert_eq!(NOMIC_VALID_DIMS, [64, 128, 256, 512, 768]);
+        assert_eq!(NOMIC_NATIVE_DIM, 768);
+    }
+
+    #[test]
+    fn test_matryoshka_truncation_and_renormalization() {
+        // Build a 512d embedder and verify apply_matryoshka shrinks + renormalizes
+        // a native-width (768) vector. Done via apply_matryoshka directly because
+        // the ONNX path needs model files.
+        for &dim in &[256usize, 512, 768] {
+            let config = NomicConfig {
+                model_path: PathBuf::from("dummy.onnx"),
+                tokenizer_path: PathBuf::from("dummy.json"),
+                max_length: 512,
+                use_quantized: true,
+                embed_timeout_ms: 5000,
+                output_dim: dim,
+            };
+            let embedder = NomicEmbedder::new_simplified(config).unwrap();
+            assert_eq!(embedder.dimension(), dim);
+
+            // A non-trivial native-width vector.
+            let mut full: Vec<f32> = (0..NOMIC_NATIVE_DIM).map(|i| (i as f32) * 0.013 + 1.0).collect();
+            NomicEmbedder::normalize(&mut full);
+
+            let truncated = embedder.apply_matryoshka(full.clone());
+            assert_eq!(truncated.len(), dim, "truncated to configured dimension");
+
+            // Result must be unit-normalized.
+            let norm: f32 = truncated.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5, "truncated embedding must be re-normalized");
+
+            // The truncated vector is the renormalized prefix of the original.
+            if dim < NOMIC_NATIVE_DIM {
+                let prefix_norm: f32 =
+                    full[..dim].iter().map(|x| x * x).sum::<f32>().sqrt();
+                for (t, f) in truncated.iter().zip(full[..dim].iter()) {
+                    assert!((t - f / prefix_norm).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplified_mode_honors_output_dim() {
+        // In simplified (hash) mode the embedder emits vectors directly at the
+        // configured Matryoshka dimension — no truncation pass needed.
+        let config = NomicConfig {
+            model_path: PathBuf::from("dummy.onnx"),
+            tokenizer_path: PathBuf::from("dummy.json"),
+            max_length: 512,
+            use_quantized: true,
+            embed_timeout_ms: 5000,
+            output_dim: 256,
+        };
+        let embedder = NomicEmbedder::new_simplified(config).unwrap();
+        assert!(embedder.is_simplified());
+        let emb = embedder.encode("hello matryoshka").unwrap();
+        assert_eq!(emb.len(), 256);
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
     }
 }

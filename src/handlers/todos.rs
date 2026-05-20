@@ -1161,7 +1161,7 @@ pub async fn list_todos(
             let query_embedding: Vec<f32> = tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_system.read();
                 memory_guard
-                    .compute_embedding(&query_clone)
+                    .compute_query_embedding(&query_clone)
                     .unwrap_or_default()
             })
             .await

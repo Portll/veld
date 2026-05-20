@@ -2482,7 +2482,6 @@ pub struct Query {
     /// When `true` (or `None` with secondary available), secondary 768d results
     /// are fused as a 4th RRF signal alongside graph, hybrid, and linguistic.
     /// Set to `false` to disable secondary index participation per-query.
-    #[serde(default)]
     pub dual_index: Option<bool>,
 
     // === Result Control ===

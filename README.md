@@ -14,7 +14,7 @@
   <a href="https://www.npmjs.com/package/@veld/memory-mcp"><img src="https://img.shields.io/npm/v/@veld/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/veld/"><img src="https://img.shields.io/pypi/v/veld.svg" alt="PyPI"></a>
   <a href="https://hub.docker.com/r/varunveld/veld"><img src="https://img.shields.io/docker/pulls/varunveld/veld.svg?logo=docker" alt="Docker"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg" alt="License"></a>
   <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
 
@@ -454,7 +454,7 @@ memory.example.com {
 
 ## License
 
-Apache 2.0
+Business Source License 1.1 (BUSL-1.1)
 
 ---
 
