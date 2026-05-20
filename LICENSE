@@ -3,7 +3,7 @@ Business Source License 1.1
 Parameters
 
 Licensor:             Portll
-Licensed Work:        veld (Portll fork) v0.2.0
+Licensed Work:        veld (Portll fork) v0.7.7
                       The Licensed Work is (c) 2025-2026 Portll
 Additional Use Grant: You may use the Licensed Work for non-commercial and
                       non-institutional purposes. "Non-commercial" means use
@@ -14,10 +14,11 @@ Additional Use Grant: You may use the Licensed Work for non-commercial and
                       organized body with more than five (5) employees or
                       contractors.
 
-                      The original upstream author (Portll / veld-rag)
+                      The original upstream author, shodh-rag
+                      (https://github.com/varun29ankuS/shodh-memory),
                       retains all rights to their original contributions,
                       which remain available under the Apache License 2.0 at
-                      the upstream repository. Contributions from the upstream
+                      that upstream repository. Contributions from the upstream
                       author to this Licensed Work are accepted only as
                       technical fixes (bug fixes, security patches, build and
                       CI fixes, performance improvements, documentation
@@ -25,7 +26,7 @@ Additional Use Grant: You may use the Licensed Work for non-commercial and
                       upstream author require a separate written agreement
                       with the Licensor.
 
-Change Date:          2036-03-27
+Change Date:          2030-03-27
 Change License:       Apache License, Version 2.0
 
 License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
