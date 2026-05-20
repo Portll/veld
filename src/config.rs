@@ -98,6 +98,101 @@ pub fn is_local_bind_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// Path to the Veld `config.toml`, the file written by `veld init`.
+///
+/// Always `<platform config dir>/veld/config.toml` (e.g. `~/.config/veld/config.toml`
+/// on Linux, `%APPDATA%\veld\config.toml` on Windows). Falls back to `./.veld/config.toml`
+/// when the platform config directory cannot be determined. This must stay in lockstep
+/// with the path `veld init` writes to.
+pub fn config_file_path() -> PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("veld"))
+        .unwrap_or_else(|| PathBuf::from(".veld"))
+        .join("config.toml")
+}
+
+/// Bridges `config.toml` into the process environment.
+///
+/// `veld init` writes a `config.toml` with the generated API key, host, and port,
+/// but every other part of Veld is configured from environment variables. This reads
+/// that file once at startup and exports each recognized setting as its `VELD_*`
+/// variable — but only when the variable is not already set, so an explicit
+/// environment variable always wins.
+///
+/// Precedence (highest first): environment variable → `config.toml` → built-in default.
+///
+/// Call once at process start, before `clap` parsing and `ServerConfig::from_env()`.
+/// A missing file is silently ignored; a malformed file is reported and ignored —
+/// neither aborts startup. The API key value is never logged.
+pub fn load_config_file_into_env() {
+    let path = config_file_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            eprintln!(
+                "[veld] Could not read config file {}: {err}. Using environment and defaults.",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    let table = match toml::from_str::<toml::Table>(&raw) {
+        Ok(table) => table,
+        Err(err) => {
+            eprintln!(
+                "[veld] Config file {} is not valid TOML: {err}. Using environment and defaults.",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    // config.toml key → environment variable. Only these keys are bridged; any other
+    // key in the file is ignored so the file format stays forward-compatible.
+    const MAPPING: &[(&str, &str)] = &[
+        ("api_key", "VELD_API_KEY"),
+        ("host", "VELD_HOST"),
+        ("port", "VELD_PORT"),
+        ("storage", "VELD_MEMORY_PATH"),
+        ("mcp", "VELD_MCP_ENABLED"),
+    ];
+
+    let mut applied: Vec<&str> = Vec::new();
+    for (file_key, env_key) in MAPPING {
+        // An explicit environment variable always overrides the config file.
+        if env::var_os(env_key).is_some() {
+            continue;
+        }
+        let Some(value) = table.get(*file_key) else {
+            continue;
+        };
+        let rendered = match value {
+            toml::Value::String(s) => s.clone(),
+            toml::Value::Integer(n) => n.to_string(),
+            toml::Value::Boolean(b) => b.to_string(),
+            other => {
+                eprintln!(
+                    "[veld] Ignoring config key '{file_key}': unsupported value type {}.",
+                    other.type_str()
+                );
+                continue;
+            }
+        };
+        if rendered.trim().is_empty() {
+            continue;
+        }
+        env::set_var(env_key, rendered);
+        applied.push(*file_key);
+    }
+
+    if !applied.is_empty() {
+        // Key names only — the API key value is never written to the log.
+        eprintln!("[veld] Loaded {} from {}", applied.join(", "), path.display());
+    }
+}
+
 /// CORS configuration
 #[derive(Debug, Clone)]
 pub struct CorsConfig {

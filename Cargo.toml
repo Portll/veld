@@ -101,6 +101,7 @@ mimalloc = "0.1"
 anyhow = "1.0"
 thiserror = "2.0"
 dotenvy = "0.15"  # Load .env files
+toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
 
 # Async runtime & web server
 tokio = { version = "1.48", features = ["full"] }

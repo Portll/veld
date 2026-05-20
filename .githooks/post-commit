@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Veld post-commit hook — sync the commit message into agent memory.
+# Runs after the commit is created; never blocks or fails it.
+set -u
+
+veld_bin="$(command -v veld 2>/dev/null || true)"
+if [ -z "$veld_bin" ]; then
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+    for candidate in \
+        "$repo_root/target/release/veld" "$repo_root/target/release/veld.exe" \
+        "$repo_root/target/debug/veld"   "$repo_root/target/debug/veld.exe"; do
+        if [ -x "$candidate" ]; then veld_bin="$candidate"; break; fi
+    done
+fi
+
+[ -n "$veld_bin" ] && "$veld_bin" hook commit || true

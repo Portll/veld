@@ -9,6 +9,7 @@
 //!   veld doctor              - Diagnose common issues
 //!   veld hook session-start  - Output session start hook JSON
 //!   veld hook prompt <msg>   - Output prompt submit hook JSON
+//!   veld hook commit         - Sync the latest git commit into Veld memory
 //!   veld claude [args...]    - Launch Claude Code with Veld memory
 //!   veld version             - Print version and build info
 
@@ -129,6 +130,16 @@ enum Commands {
         /// User ID for Veld operations
         #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
         user_id: String,
+
+        /// Whether the MCP component is enabled. Set to false to disable
+        /// `veld serve` centrally (config.toml `mcp = false`, or VELD_MCP_ENABLED=false).
+        #[arg(
+            long = "mcp-enabled",
+            env = "VELD_MCP_ENABLED",
+            default_value_t = true,
+            action = clap::ArgAction::Set
+        )]
+        mcp_enabled: bool,
     },
 
     /// First-time setup — create config, generate API key, download models
@@ -219,6 +230,25 @@ enum HookType {
         #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
         user_id: String,
     },
+
+    /// Git post-commit hook — sync the latest commit message into Veld memory
+    Commit {
+        /// API URL for the Veld server
+        #[arg(long, env = "VELD_API_URL", default_value = "http://127.0.0.1:3030")]
+        api_url: String,
+
+        /// API key for authentication
+        #[arg(
+            long,
+            env = "VELD_API_KEY",
+            default_value = "sk-veld-dev-local-testing-key"
+        )]
+        api_key: String,
+
+        /// User ID for Veld operations
+        #[arg(long, env = "VELD_USER_ID", default_value = "claude-code")]
+        user_id: String,
+    },
 }
 
 // =============================================================================
@@ -229,6 +259,10 @@ enum HookType {
 async fn main() -> Result<()> {
     #[cfg(feature = "fortress")]
     veld::fortress::init();
+
+    // Bridge config.toml (written by `veld init`) into the environment before clap
+    // parses `env = ...` args and before ServerConfig/auth read the environment.
+    veld::config::load_config_file_into_env();
 
     let cli = Cli::parse();
 
@@ -278,7 +312,16 @@ async fn main() -> Result<()> {
             api_url,
             api_key,
             user_id,
+            mcp_enabled,
         } => {
+            if !mcp_enabled {
+                eprintln!("Veld MCP component is disabled — not starting `veld serve`.");
+                eprintln!(
+                    "  Enable it with `mcp = true` in config.toml or VELD_MCP_ENABLED=true."
+                );
+                return Ok(());
+            }
+
             eprintln!("Starting veld MCP server...");
             eprintln!("  API URL: {}", api_url);
             eprintln!("  User ID: {}", user_id);
@@ -329,6 +372,14 @@ async fn main() -> Result<()> {
                 user_id,
             } => {
                 handle_prompt_submit(&api_url, &api_key, &user_id, &message);
+            }
+
+            HookType::Commit {
+                api_url,
+                api_key,
+                user_id,
+            } => {
+                handle_commit(&api_url, &api_key, &user_id);
             }
         },
 
@@ -442,10 +493,12 @@ fn handle_init() -> Result<()> {
              api_key = \"{api_key}\"\n\
              host = \"127.0.0.1\"\n\
              port = 3030\n\
-             # storage = \"{}\"  # Uncomment to override default\n",
+             # storage = \"{}\"  # Uncomment to override default\n\
+             # mcp = true  # Set to false to disable the Veld MCP component (`veld serve`)\n",
             storage.display()
         );
         std::fs::write(&config_path, config_content)?;
+        restrict_config_permissions(&config_path);
         eprintln!("  ✓ Config created: {}", config_path.display());
         eprintln!("  ✓ API key generated: {}", api_key);
     }
@@ -677,13 +730,31 @@ fn config_directory() -> PathBuf {
 }
 
 fn generate_api_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    // Simple deterministic key — good enough for local dev, user can change later
-    format!("sk-veld-{:x}", timestamp)
+    // Random 128-bit key. A timestamp-derived key is guessable within the window
+    // the user ran `veld init`; this matches auth::default_dev_api_key().
+    format!("sk-veld-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Restrict the config file to owner-only access on Unix.
+///
+/// `config.toml` holds the API key in plaintext; world-readable permissions would
+/// expose it to other local users. On Windows the per-user `%APPDATA%` directory is
+/// already ACL-scoped to the user, so no action is needed there.
+fn restrict_config_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "  ⚠ Could not restrict permissions on {}: {err}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 // =============================================================================
@@ -744,8 +815,25 @@ struct BlockingApiClient {
 
 impl BlockingApiClient {
     fn new(base_url: String, api_key: String) -> Self {
+        Self::with_timeout(base_url, api_key, None)
+    }
+
+    /// Construct a client with an optional request timeout. Hooks that must not
+    /// hang a developer's workflow (e.g. the git post-commit hook) set a timeout.
+    fn with_timeout(
+        base_url: String,
+        api_key: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
+        let mut builder = reqwest::blocking::Client::builder();
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
-            client: reqwest::blocking::Client::new(),
+            client,
             base_url,
             api_key,
         }
@@ -1009,6 +1097,121 @@ fn handle_prompt_submit(api_url: &str, api_key: &str, user_id: &str, message: &s
         output_hook("UserPromptSubmit", &context_parts.join("\n"));
     } else {
         output_hook("UserPromptSubmit", "");
+    }
+}
+
+/// Latest commit metadata gathered from `git`.
+struct CommitInfo {
+    short_hash: String,
+    author: String,
+    message: String,
+    branch: String,
+    repo: String,
+    files: String,
+}
+
+/// Read the HEAD commit via `git`. Returns `None` when the current directory is
+/// not a git repository or `git` is unavailable — the caller treats that as
+/// "nothing to sync" rather than an error.
+fn read_head_commit() -> Option<CommitInfo> {
+    fn git(args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git").args(args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    // Unit-separator (\x1f) delimited so the message body can contain newlines,
+    // quotes, or any other text without breaking the parse.
+    let raw = git(&["log", "-1", "--format=%h%x1f%an%x1f%B"])?;
+    let mut parts = raw.splitn(3, '\u{1f}');
+    let short_hash = parts.next()?.to_string();
+    let author = parts.next()?.to_string();
+    let message = parts.next()?.trim().to_string();
+    if short_hash.is_empty() {
+        return None;
+    }
+
+    let branch =
+        git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let files =
+        git(&["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).unwrap_or_default();
+    let repo = git(&["rev-parse", "--show-toplevel"])
+        .and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some(CommitInfo {
+        short_hash,
+        author,
+        message,
+        branch,
+        repo,
+        files,
+    })
+}
+
+/// Git post-commit hook — sync the latest commit message into Veld memory.
+///
+/// Reads HEAD via `git` and stores it as a memory through `/api/remember`.
+/// Never fails the surrounding commit: a missing server or absent repo is
+/// reported to stderr and swallowed. Uses a short request timeout so a slow or
+/// unreachable server cannot hang the developer's `git commit`.
+fn handle_commit(api_url: &str, api_key: &str, user_id: &str) {
+    let Some(commit) = read_head_commit() else {
+        // Not a git repo, or git unavailable — nothing to sync.
+        return;
+    };
+
+    let files_section = if commit.files.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nFiles changed:\n{}", commit.files)
+    };
+    let content = format!(
+        "Git commit {} on branch {} of {} by {}\n\n{}{}",
+        commit.short_hash,
+        commit.branch,
+        commit.repo,
+        commit.author,
+        commit.message,
+        files_section
+    );
+
+    let client = BlockingApiClient::with_timeout(
+        api_url.to_string(),
+        api_key.to_string(),
+        Some(std::time::Duration::from_secs(10)),
+    );
+
+    let result: Result<RememberResponse> = client.post(
+        "/api/remember",
+        &RememberRequest {
+            user_id: user_id.to_string(),
+            content,
+            memory_type: None,
+            tags: Some(vec![
+                "git".to_string(),
+                "commit".to_string(),
+                commit.repo.clone(),
+                commit.branch.clone(),
+            ]),
+        },
+    );
+
+    match result {
+        Ok(resp) => eprintln!(
+            "[veld] Synced commit {} to memory ({})",
+            commit.short_hash, resp.id
+        ),
+        Err(err) => eprintln!(
+            "[veld] Commit {} not synced — is the Veld server running? ({err})",
+            commit.short_hash
+        ),
     }
 }
 
