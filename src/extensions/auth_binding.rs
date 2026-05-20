@@ -29,7 +29,24 @@ impl KeyUserBindings {
         let path = path.as_ref().to_path_buf();
         let bindings = if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            let records: Vec<KeyBinding> = serde_json::from_str(&data).unwrap_or_default();
+            // An empty file is a legitimate "no bindings yet" state; only a
+            // non-empty file that fails to parse is treated as corrupt. A corrupt
+            // file must NOT silently degrade to empty bindings — that would
+            // disable tenant isolation (every key would run unbound).
+            let records: Vec<KeyBinding> = if data.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(&data).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "key-user bindings file {} is corrupt: {error}. Refusing \
+                             to continue (empty bindings would disable tenant isolation).",
+                            path.display()
+                        ),
+                    )
+                })?
+            };
             records
                 .into_iter()
                 .map(|binding| (binding.key_hash.clone(), binding))
@@ -93,5 +110,10 @@ pub fn validate_api_key_with_user(
     bindings: &KeyUserBindings,
 ) -> Result<Option<String>, AuthError> {
     validate_api_key(plaintext_key)?;
-    Ok(bindings.lookup_user(plaintext_key))
+    // Multi-tenant: a valid key with no binding is a misconfiguration, not a
+    // superuser. Reject it (fail-closed) so it cannot impersonate any user_id.
+    match bindings.lookup_user(plaintext_key) {
+        Some(user_id) => Ok(Some(user_id)),
+        None => Err(AuthError::InvalidApiKey),
+    }
 }

@@ -289,17 +289,23 @@ fn validate_api_key_with_optional_binding(plaintext_key: &str) -> Result<Option<
         return Ok(None);
     }
 
-    if let Some(path) = key_user_bindings_path() {
-        match KeyUserBindings::open(&path) {
-            Ok(bindings) => return validate_api_key_with_user(plaintext_key, &bindings),
-            Err(error) => {
-                tracing::warn!(path = ?path, error = %error, "Failed to load key-user bindings; falling back to plain API key validation");
-            }
+    // Multi-tenant mode: every request MUST resolve to a bound user. Any failure
+    // to load or match a binding fails closed rather than granting unbound access.
+    let Some(path) = key_user_bindings_path() else {
+        tracing::error!(
+            "Multi-tenant mode enabled but no key-user bindings path is configured — \
+             rejecting request (fail-closed)"
+        );
+        return Err(AuthError::NotConfigured);
+    };
+
+    match KeyUserBindings::open(&path) {
+        Ok(bindings) => validate_api_key_with_user(plaintext_key, &bindings),
+        Err(error) => {
+            tracing::error!(path = ?path, error = %error, "Multi-tenant mode: cannot load key-user bindings — rejecting request (fail-closed)");
+            Err(AuthError::NotConfigured)
         }
     }
-
-    validate_api_key(plaintext_key)?;
-    Ok(None)
 }
 
 #[cfg(feature = "multi-tenant")]
@@ -1069,6 +1075,49 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["code"], "BOUND_USER_MISMATCH");
+
+        clear_auth_env();
+    }
+
+    #[cfg(feature = "multi-tenant")]
+    #[tokio::test]
+    async fn auth_middleware_rejects_unbound_key_in_multi_tenant_mode() {
+        use axum::routing::post;
+        use axum::Router;
+        use tempfile::NamedTempFile;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        env::set_var("VELD_API_KEYS", "valid-but-unbound-key");
+        env::set_var("VELD_MULTI_TENANT", "true");
+
+        // Bindings file exists but does NOT contain the request's key.
+        let bindings_file = NamedTempFile::new().unwrap();
+        let bindings = KeyUserBindings::open(bindings_file.path()).unwrap();
+        bindings
+            .register("some-other-key", "alice", Some("test"))
+            .unwrap();
+        env::set_var(KEY_USER_BINDINGS_PATH_ENV, bindings_file.path());
+
+        let app = Router::new()
+            .route("/api/remember", post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(auth_middleware));
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/remember")
+            .header("content-type", "application/json")
+            .header("x-api-key", "valid-but-unbound-key")
+            .body(Body::from(r#"{"content":"hello"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "A valid key with no tenant binding must be rejected in multi-tenant mode"
+        );
 
         clear_auth_env();
     }

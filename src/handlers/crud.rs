@@ -492,19 +492,20 @@ pub async fn update_memory(
 #[tracing::instrument(skip(state), fields(memory_id = %memory_id))]
 pub async fn delete_memory(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(memory_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<DeleteMemoryResponse>, AppError> {
-    let user_id = params
-        .get("user_id")
-        .ok_or_else(|| AppError::InvalidInput {
-            field: "user_id".to_string(),
-            reason: "user_id required".to_string(),
-        })?;
+    // SEC: resolve user_id against the authenticated tenant binding so a
+    // multi-tenant caller cannot delete another tenant's memory via ?user_id=.
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
 
-    validation::validate_user_id(user_id).map_validation_err("user_id")?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state.get_user_earth(user_id).map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
     let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -515,7 +516,7 @@ pub async fn delete_memory(
         .forget(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
 
-    state.log_event(user_id, "DELETE", &resolved_id_str, "Memory deleted");
+    state.log_event(&user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
     state.emit_event(MemoryEvent {
         event_type: "DELETE".to_string(),
@@ -1080,19 +1081,20 @@ pub struct MemoryHealthResponse {
 /// into which memories are fragile, consolidated, or degraded.
 pub async fn get_memory_health(
     State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
     Path(memory_id_str): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<MemoryHealthResponse>, AppError> {
-    let user_id = params
-        .get("user_id")
-        .ok_or_else(|| AppError::InvalidInput {
-            field: "user_id".to_string(),
-            reason: "user_id query parameter required".to_string(),
-        })?;
-    validation::validate_user_id(user_id).map_validation_err("user_id")?;
+    // SEC: resolve user_id against the tenant binding (see delete_memory) so a
+    // multi-tenant caller cannot read another tenant's memory health via ?user_id=.
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(user_id)
+        .get_user_earth(&user_id)
         .map_err(AppError::Internal)?;
 
     let mem = {
