@@ -1649,12 +1649,18 @@ pub async fn proactive_context(
             let trigger_id = memory_ids[0];
             let coactivated_ids: Vec<uuid::Uuid> = memory_ids[1..].to_vec();
             tokio::task::spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = tokio::task::spawn_blocking(move || {
                     let graph_guard = graph.write();
-                    let _ =
-                        graph_guard.record_memory_coactivation(&trigger_id, &coactivated_ids);
+                    if let Err(e) =
+                        graph_guard.record_memory_coactivation(&trigger_id, &coactivated_ids)
+                    {
+                        tracing::warn!("record_memory_coactivation failed: {e}");
+                    }
                 })
-                .await;
+                .await
+                {
+                    tracing::warn!("record_memory_coactivation task panicked: {e}");
+                }
             });
         }
     }
@@ -1724,7 +1730,7 @@ pub async fn proactive_context(
                 let response_text_owned = response_text.to_string();
                 let memory = memory_system.clone();
                 tokio::task::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
                         let memory_guard = memory.read();
                         let segmenter = SegmentationEngine::new();
                         let segments =
@@ -1744,10 +1750,15 @@ pub async fn proactive_context(
                                 ],
                                 ..Default::default()
                             };
-                            let _ = memory_guard.remember(experience, None);
+                            if let Err(e) = memory_guard.remember(experience, None) {
+                                tracing::warn!("auto-ingest remember failed: {e}");
+                            }
                         }
                     })
-                    .await;
+                    .await
+                    {
+                        tracing::warn!("auto-ingest task panicked: {e}");
+                    }
                 });
             }
         }

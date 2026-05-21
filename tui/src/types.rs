@@ -1321,7 +1321,7 @@ impl TuiTodo {
             format!("{}-{}", prefix, self.seq_num)
         } else {
             // Fallback to old style for legacy todos
-            format!("SHO-{}", &self.id[..4.min(self.id.len())])
+            format!("SHO-{}", truncate_safe(&self.id, 4))
         }
     }
 

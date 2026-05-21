@@ -2441,6 +2441,12 @@ impl GraphMemory {
         // This path is only hit for edges created before the pair index existed.
         // Once all old edges are either strengthened (which updates the index) or
         // pruned, this path becomes dead code.
+        // PERF-11: Track slow-path hits to measure migration progress (plan removal once zero).
+        tracing::debug!(
+            entity_a = %entity_a,
+            entity_b = %entity_b,
+            "find_relationship_between: pair index miss, falling back to O(n) linear scan"
+        );
         let edges_a = self.get_entity_relationships(entity_a)?;
         for edge in edges_a {
             if (edge.from_entity == *entity_a && edge.to_entity == *entity_b)
@@ -4453,7 +4459,9 @@ impl GraphMemory {
 
             // Enforce degree cap on affected entities
             for entity_uuid in &entities_to_prune {
-                let _ = self.prune_entity_if_over_degree(entity_uuid);
+                if let Err(e) = self.prune_entity_if_over_degree(entity_uuid) {
+                    tracing::warn!("prune_entity_if_over_degree failed for {entity_uuid}: {e}");
+                }
             }
 
             tracing::debug!(

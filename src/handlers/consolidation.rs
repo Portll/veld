@@ -592,7 +592,7 @@ pub async fn sleep_phase_consolidation(
             let memory_clone = memory.clone();
             let graph_arc = state_clone.get_user_graph(&user_id).ok();
             let uid = user_id.clone();
-            let _ = tokio::task::spawn_blocking(move || -> usize {
+            if let Err(e) = tokio::task::spawn_blocking(move || -> usize {
                 use crate::constants::{
                     DREAM_REPLAY_EDGE_CONFIDENCE, DREAM_REPLAY_PAIR_COUNT,
                     DREAM_REPLAY_SIMILARITY_CEILING, DREAM_REPLAY_SIMILARITY_THRESHOLD,
@@ -680,7 +680,9 @@ pub async fn sleep_phase_consolidation(
 
                 tracing::info!(user_id = %uid, pairs_evaluated = pair_count, edges_created = created, "Sleep-phase dream replay complete");
                 created
-            }).await;
+            }).await {
+                tracing::warn!(user_id = %user_id, "Sleep-phase dream replay task panicked: {e}");
+            }
         }
 
         // Phase 7: Gap analysis
