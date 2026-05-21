@@ -10,6 +10,7 @@
 pub mod compression;
 pub mod context;
 pub mod context_blocks;
+pub mod facets;
 pub mod facts;
 pub mod feedback;
 pub mod files;
