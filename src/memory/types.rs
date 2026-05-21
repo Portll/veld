@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub use super::facets::{RecordKind, RepositoryContext};
 use crate::constants::{
     DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
     RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
@@ -293,6 +294,11 @@ pub struct RichContext {
     /// Enables temporal ordering and event segmentation within conversations
     #[serde(default)]
     pub episode: EpisodeContext,
+
+    /// Repository context — version-control identity (W3). New field; older
+    /// serialized contexts deserialize with a default (empty) RepositoryContext.
+    #[serde(default)]
+    pub repository: RepositoryContext,
 
     /// Parent context (for hierarchical context)
     pub parent: Option<Box<RichContext>>,
@@ -1204,6 +1210,11 @@ pub struct Memory {
     pub id: MemoryId,
     pub experience: Experience,
 
+    /// What kind of record this is — memory / plan / prompt / learning (W3).
+    /// One core record, several lifecycles; retrieval stays unified. Legacy
+    /// and default: `RecordKind::Memory`.
+    pub kind: RecordKind,
+
     // Mutable metadata protected by Mutex for zero-copy updates
     metadata: Arc<parking_lot::Mutex<MemoryMetadata>>,
 
@@ -1280,6 +1291,7 @@ impl Clone for Memory {
         Self {
             id: self.id.clone(),
             experience: self.experience.clone(),
+            kind: self.kind,
             // Deep copy: create new Arc with cloned inner data
             metadata: Arc::new(parking_lot::Mutex::new(self.metadata.lock().clone())),
             created_at: self.created_at,
@@ -1317,6 +1329,7 @@ impl Memory {
         Self {
             id,
             experience,
+            kind: RecordKind::Memory,
             metadata: Arc::new(parking_lot::Mutex::new(MemoryMetadata {
                 importance,
                 access_count: 0,
@@ -1429,6 +1442,8 @@ impl Memory {
             version,
             history,
             related_todo_ids,
+            // Legacy memories predate RecordKind — all are plain memories.
+            kind: RecordKind::Memory,
             // Legacy memories don't have hierarchy - default to root
             parent_id: None,
             // Legacy memories aren't expired

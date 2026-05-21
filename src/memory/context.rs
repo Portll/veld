@@ -41,6 +41,7 @@ impl ContextBuilder {
                 emotional: EmotionalContext::default(),
                 source: SourceContext::default(),
                 episode: EpisodeContext::default(),
+                repository: Default::default(),
                 parent: None,
                 embeddings: None,
                 decay_rate: 0.1, // Default decay
