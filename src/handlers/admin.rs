@@ -39,7 +39,7 @@ pub const ADMIN_API_KEY_ENV: &str = "VELD_ADMIN_API_KEY";
 ///
 /// - `VELD_ADMIN_API_KEY` env var unset → 503 `{"error":"admin_key_not_configured"}`
 /// - `X-Admin-API-Key` header missing or wrong → 401 `{"error":"unauthorized"}`
-/// - Valid → 204 No Content (with WARN log including caller IP and key prefix)
+/// - Valid → 204 No Content (with WARN log of the caller IP — no key material)
 ///
 /// ## Why a separate key (and not regular API key)
 ///
@@ -115,11 +115,11 @@ pub async fn reset_rate_limit(
     }
 
     // 4) Authenticated — perform the reset and audit-log.
+    //    The audit trail is the caller IP; no key material (not even a prefix)
+    //    is logged — a partial admin key in logs still narrows a brute force.
     handle.reset();
-    let key_prefix: String = configured_key.chars().take(8).collect();
     tracing::warn!(
         caller_ip = %peer.ip(),
-        key_prefix = %key_prefix,
         "rate-limit state reset by admin endpoint"
     );
 
