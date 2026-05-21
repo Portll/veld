@@ -1,0 +1,267 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-check:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version consistency across packages
+        run: |
+          # Extract versions from all package files
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          NPM_VERSION=$(grep '"version"' mcp-server/package.json | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
+          PYPI_VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          normalize_core() {
+            python3 - "$1" <<'PY'
+import re
+import sys
+
+version = sys.argv[1].strip()
+match = re.match(r"^(\d+\.\d+\.\d+)", version)
+print(match.group(1) if match else version)
+PY
+          }
+          CARGO_CORE=$(normalize_core "$CARGO_VERSION")
+          NPM_CORE=$(normalize_core "$NPM_VERSION")
+          PYPI_CORE=$(normalize_core "$PYPI_VERSION")
+
+          echo "Cargo.toml version: $CARGO_VERSION"
+          echo "package.json version: $NPM_VERSION"
+          echo "pyproject.toml version: $PYPI_VERSION"
+          echo "Normalized Cargo core: $CARGO_CORE"
+          echo "Normalized npm core: $NPM_CORE"
+          echo "Normalized PyPI core: $PYPI_CORE"
+
+          # Check all normalized release cores match. This allows branch-local
+          # prerelease markers like Cargo/npm `-unstable` and PyPI `.dev0`.
+          if [ "$CARGO_CORE" != "$NPM_CORE" ] || [ "$CARGO_CORE" != "$PYPI_CORE" ]; then
+            echo "::error::Version core mismatch detected!"
+            echo "  Cargo.toml:     $CARGO_VERSION ($CARGO_CORE)"
+            echo "  package.json:   $NPM_VERSION ($NPM_CORE)"
+            echo "  pyproject.toml: $PYPI_VERSION ($PYPI_CORE)"
+            exit 1
+          fi
+
+          echo "✓ All normalized version cores match: $CARGO_CORE"
+          echo "### Version Check" >> $GITHUB_STEP_SUMMARY
+          echo "Normalized package version core: **$CARGO_CORE**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Raw Version |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cargo | $CARGO_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| npm | $NPM_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| PyPI | $PYPI_VERSION |" >> $GITHUB_STEP_SUMMARY
+
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+      - name: Run Clippy
+        run: |
+          cargo clippy --all-targets -- -W clippy::all 2>&1 | tee clippy-output.txt
+          WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
+          echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Warnings | $WARNINGS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | Passed |" >> $GITHUB_STEP_SUMMARY
+
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      - name: Install LLVM (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install llvm
+          LLVM_PREFIX=$(brew --prefix llvm)
+          echo "LLVM_CONFIG_PATH=$LLVM_PREFIX/bin/llvm-config" >> $GITHUB_ENV
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_PREFIX/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> $GITHUB_ENV
+
+      - name: Set LIBCLANG_PATH (Windows)
+        if: matrix.os == 'windows-latest'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: Build Release
+        run: cargo build --release
+
+      - name: Display build info (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          VELD_SIZE=$(ls -lh target/release/veld 2>/dev/null | awk '{print $5}' || echo "N/A")
+          MEERKAT_SIZE=$(ls -lh target/release/meerkat 2>/dev/null | awk '{print $5}' || echo "N/A")
+          echo "### Build Results (${{ matrix.os }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| veld | $VELD_SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| meerkat | $MEERKAT_SIZE |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Display build info (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $veld = Get-Item target/release/veld.exe -ErrorAction SilentlyContinue
+          $meerkat = Get-Item target/release/meerkat.exe -ErrorAction SilentlyContinue
+          $veldSize = if ($veld) { "{0:N2} MB" -f ($veld.Length / 1MB) } else { "N/A" }
+          $meerkatSize = if ($meerkat) { "{0:N2} MB" -f ($meerkat.Length / 1MB) } else { "N/A" }
+          "### Build Results (${{ matrix.os }})" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "| Binary | Size |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "|--------|------|" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "| veld.exe | $veldSize |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "| meerkat.exe | $meerkatSize |" | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload binary (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: veld-linux
+          path: |
+            target/release/veld
+            target/release/meerkat
+          if-no-files-found: ignore
+
+      - name: Upload binary (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: veld-macos
+          path: |
+            target/release/veld
+            target/release/meerkat
+          if-no-files-found: ignore
+
+      - name: Upload binary (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: veld-windows
+          path: |
+            target/release/veld.exe
+            target/release/meerkat.exe
+          if-no-files-found: ignore
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      - name: Run all tests
+        run: |
+          cargo test --no-fail-fast 2>&1 | tee test-output.txt
+
+      - name: Generate test summary
+        if: always()
+        run: |
+          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | tail -1 || echo "0")
+          FAILED=$(grep -oP '\d+(?= failed)' test-output.txt | tail -1 || echo "0")
+          IGNORED=$(grep -oP '\d+(?= ignored)' test-output.txt | tail -1 || echo "0")
+
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Passed | $PASSED |" >> $GITHUB_STEP_SUMMARY
+          echo "| Failed | $FAILED |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ignored | $IGNORED |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$FAILED" != "0" ]; then
+            echo "### Failed Tests" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -A 5 "FAILED" test-output.txt >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [version-check, format, clippy, build, test]
+    if: always()
+    steps:
+      - name: Generate final summary
+        run: |
+          echo "# CI Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          version_icon="${{ needs.version-check.result == 'success' && '✅' || '❌' }}"
+          format_icon="${{ needs.format.result == 'success' && '✅' || '❌' }}"
+          clippy_icon="${{ needs.clippy.result == 'success' && '✅' || '❌' }}"
+          build_icon="${{ needs.build.result == 'success' && '✅' || '❌' }}"
+          test_icon="${{ needs.test.result == 'success' && '✅' || '❌' }}"
+
+          echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | $format_icon ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Clippy | $clippy_icon ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | $build_icon ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | $test_icon ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.version-check.result }}" == "success" && \
+                "${{ needs.format.result }}" == "success" && \
+                "${{ needs.clippy.result }}" == "success" && \
+                "${{ needs.build.result }}" == "success" && \
+                "${{ needs.test.result }}" == "success" ]]; then
+            echo "### All critical checks passed" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "### Some checks failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
