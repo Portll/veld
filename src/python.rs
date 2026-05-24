@@ -2118,19 +2118,25 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, PyOb
         dict.insert("compressed".to_string(), memory.compressed.into_py(py));
 
         // Robotics fields
-        if let Some(ref robot_id) = memory.experience.robot_id {
-            dict.insert("robot_id".to_string(), robot_id.clone().into_py(py));
+        if let Some(robot_id) = memory.experience.resolved_robot_id() {
+            dict.insert("robot_id".to_string(), robot_id.to_string().into_py(py));
         }
-        if let Some(ref mission_id) = memory.experience.mission_id {
-            dict.insert("mission_id".to_string(), mission_id.clone().into_py(py));
+        if let Some(mission_id) = memory.experience.resolved_mission_id() {
+            dict.insert("mission_id".to_string(), mission_id.to_string().into_py(py));
         }
-        if let Some(ref geo) = memory.experience.geo_location {
-            dict.insert("geo_location".to_string(), geo.to_vec().into_py(py));
+        // Geo: keep the legacy 3-element [lat, lon, alt] shape. When the
+        // facet (`Place::Geo { alt: None }`) has no altitude, surface 0.0
+        // so length-3 Python consumers keep working.
+        if let Some((lat, lon, alt)) = memory.experience.resolved_geo() {
+            dict.insert(
+                "geo_location".to_string(),
+                vec![lat, lon, alt.unwrap_or(0.0)].into_py(py),
+            );
         }
         if let Some(ref pos) = memory.experience.local_position {
             dict.insert("position".to_string(), pos.to_vec().into_py(py));
         }
-        if let Some(heading) = memory.experience.heading {
+        if let Some(heading) = memory.experience.resolved_heading() {
             dict.insert("heading".to_string(), heading.into_py(py));
         }
         if let Some(ref action_type) = memory.experience.action_type {
@@ -2177,8 +2183,8 @@ fn memory_to_dict(_py: Python, memory: &Memory) -> PyResult<HashMap<String, PyOb
         if let Some(ref weather) = memory.experience.weather {
             dict.insert("weather".to_string(), weather.clone().into_py(py));
         }
-        if let Some(ref terrain) = memory.experience.terrain_type {
-            dict.insert("terrain_type".to_string(), terrain.clone().into_py(py));
+        if let Some(terrain) = memory.experience.resolved_terrain_type() {
+            dict.insert("terrain_type".to_string(), terrain.to_string().into_py(py));
         }
         if let Some(ref lighting) = memory.experience.lighting {
             dict.insert("lighting".to_string(), lighting.clone().into_py(py));

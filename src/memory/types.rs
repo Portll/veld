@@ -1194,6 +1194,23 @@ impl Experience {
         }
         self.mission_id.as_deref()
     }
+
+    /// Resolved terrain — prefers a `Place::Named` with the `"terrain:"`
+    /// prefix in `WhereFacet.places` over the legacy `terrain_type` flat
+    /// field. Matches the prefix the migrator writes
+    /// (`Place::Named { label: format!("terrain:{t}") }`).
+    pub fn resolved_terrain_type(&self) -> Option<&str> {
+        if let Some(ctx) = &self.context {
+            for place in &ctx.place.places {
+                if let Place::Named { label } = place {
+                    if let Some(t) = label.strip_prefix("terrain:") {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        self.terrain_type.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -1324,6 +1341,36 @@ mod w3_migration_tests {
         });
         exp.context = Some(ctx);
         assert_eq!(exp.resolved_robot_id(), Some("facet-robot"));
+    }
+
+    #[test]
+    fn resolved_terrain_type_prefers_facet_via_terrain_prefix() {
+        let mut exp = Experience {
+            terrain_type: Some("flat-terrain".into()),
+            ..Default::default()
+        };
+        // No context — falls back to flat.
+        assert_eq!(exp.resolved_terrain_type(), Some("flat-terrain"));
+        // Migrate populates Place::Named { label: "terrain:flat-terrain" } —
+        // facet read returns the same value.
+        exp.migrate_robotics_to_facets();
+        assert_eq!(exp.resolved_terrain_type(), Some("flat-terrain"));
+        // Override the facet with a different terrain — accessor returns it.
+        if let Some(ctx) = exp.context.as_mut() {
+            ctx.place.places.clear();
+            ctx.place.places.push(Place::Named {
+                label: "terrain:indoor".into(),
+            });
+        }
+        assert_eq!(exp.resolved_terrain_type(), Some("indoor"));
+        // A Place::Named without the "terrain:" prefix is ignored.
+        if let Some(ctx) = exp.context.as_mut() {
+            ctx.place.places.clear();
+            ctx.place.places.push(Place::Named {
+                label: "other:something".into(),
+            });
+        }
+        assert_eq!(exp.resolved_terrain_type(), Some("flat-terrain"));
     }
 }
 
@@ -3026,31 +3073,31 @@ impl Query {
 
         // === Robotics Filters ===
 
-        // Robot ID filter
+        // Robot ID filter — reads via resolved_robot_id so the W3 WhoFacet
+        // (SelfAgent role) and the legacy flat field are both honored.
         if let Some(robot_id) = &self.robot_id {
-            if memory.experience.robot_id.as_ref() != Some(robot_id) {
+            if memory.experience.resolved_robot_id() != Some(robot_id.as_str()) {
                 return false;
             }
         }
 
-        // Mission ID filter
+        // Mission ID filter — reads via resolved_mission_id (WhyFacet goal_stack
+        // first entry, or the legacy flat field).
         if let Some(mission_id) = &self.mission_id {
-            if memory.experience.mission_id.as_ref() != Some(mission_id) {
+            if memory.experience.resolved_mission_id() != Some(mission_id.as_str()) {
                 return false;
             }
         }
 
-        // Geo filter (spatial)
-        // geo_location is [lat, lon, alt] array
+        // Geo filter (spatial) — reads via resolved_geo so both Place::Geo
+        // (W3 WhereFacet) and the legacy flat geo_location are considered.
         if let Some(geo_filter) = &self.geo_filter {
-            if let Some(geo) = &memory.experience.geo_location {
-                let lat = geo[0];
-                let lon = geo[1];
+            if let Some((lat, lon, _alt)) = memory.experience.resolved_geo() {
                 if !geo_filter.contains(lat, lon) {
                     return false;
                 }
             } else {
-                // No geo_location on memory, and we have a geo filter = no match
+                // No spatial data on memory, and we have a geo filter = no match
                 return false;
             }
         }
@@ -3124,9 +3171,10 @@ impl Query {
             }
         }
 
-        // Terrain type filter
+        // Terrain type filter — reads via resolved_terrain_type so both the
+        // W3 Place::Named "terrain:<t>" facet and the legacy flat field match.
         if let Some(terrain_type) = &self.terrain_type {
-            if memory.experience.terrain_type.as_ref() != Some(terrain_type) {
+            if memory.experience.resolved_terrain_type() != Some(terrain_type.as_str()) {
                 return false;
             }
         }
