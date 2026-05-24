@@ -3753,6 +3753,7 @@ impl GraphMemory {
     /// Pattern: vec![(WorksAt, true), (LocatedIn, true)]
     ///
     /// Returns all entities that match the pattern starting from start_uuid.
+    #[allow(dead_code)]
     pub fn match_pattern(
         &self,
         start_uuid: &Uuid,
@@ -3890,6 +3891,7 @@ impl GraphMemory {
     ///
     /// Pattern: Vec of (relation_type, is_outgoing) tuples
     /// Returns: All complete pattern matches with their paths.
+    #[allow(dead_code)]
     pub fn find_pattern_matches(
         &self,
         pattern: &[(RelationType, bool)],
@@ -5108,6 +5110,7 @@ impl GraphMemory {
     ///
     /// Returns L3-tier edges where both endpoints are PII-clean.
     /// Each tuple: (from_name, to_name, strength, relation_type).
+    #[allow(dead_code)]
     pub fn export_collective_edges(
         &self,
     ) -> Result<Vec<(String, String, f32, String)>> {

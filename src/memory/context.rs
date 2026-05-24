@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Context Management - Building and merging rich contexts
 
 use super::types::*;

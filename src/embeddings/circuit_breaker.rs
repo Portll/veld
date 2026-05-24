@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Circuit breaker pattern for embedding service resilience
 //!
 //! Implements a production-grade circuit breaker to prevent cascading failures

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Proactive Context Injection System
 //!
 //! Implements truly proactive memory injection - surfacing relevant memories
