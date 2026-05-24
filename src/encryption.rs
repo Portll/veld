@@ -22,7 +22,7 @@
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 /// AES-256-GCM nonce size in bytes (96 bits per NIST SP 800-38D).
 const NONCE_SIZE: usize = 12;

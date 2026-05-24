@@ -2965,6 +2965,7 @@ mod tests {
             needs_compaction: false,
             rebuild_threshold: 500,
             deletion_ratio_threshold: 0.2,
+            secondary: None,
         };
 
         assert_eq!(health.total_vectors, 1000);
