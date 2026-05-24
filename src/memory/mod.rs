@@ -1099,6 +1099,11 @@ impl MemorySystem {
         external_id: Option<String>,
         defer_embedding: bool,
     ) -> Result<MemoryId> {
+        // W3.2d: migrate any flat robotics/decision fields into the W3 facets
+        // so new memories carry both representations through the transition.
+        // No-op when no flat fields are populated.
+        experience.migrate_robotics_to_facets();
+
         // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
         // If identical content already exists, return the existing MemoryId instead of
         // creating a duplicate. Catches all duplication paths: timeout retries, auto_ingest,
@@ -1713,6 +1718,9 @@ impl MemorySystem {
         external_id: Option<String>,
         defer_embedding: bool,
     ) -> Result<MemoryId> {
+        // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
+        experience.migrate_robotics_to_facets();
+
         // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
         if let Some(existing_id) = self
             .long_term_memory
@@ -4575,6 +4583,9 @@ impl MemorySystem {
                     experience.temporal_refs.push(temp_ref.date.to_string());
                 }
             }
+
+            // W3.2d: migrate any flat robotics/decision fields into the W3 facets.
+            experience.migrate_robotics_to_facets();
 
             // Create memory with external_id
             let memory = Arc::new(Memory::new_with_external_id(
