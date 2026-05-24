@@ -30,3 +30,23 @@ If you discover a security vulnerability in Veld - Agentic Memory, please report
 - Disclose publicly before a fix is available
 
 We appreciate responsible disclosure.
+
+## Secure-by-Default Posture
+
+All behavior-changing security controls ship **secure by default**. Operators who need to restore previous behavior must opt in explicitly with an environment variable.
+
+| Environment Variable | Default | Effect when changed |
+|---|---|---|
+| `VELD_ALLOW_UNSIGNED_WEBHOOKS` | `false` | Set to `true` to process webhooks when no `*_WEBHOOK_SECRET` is configured (not recommended). Default rejects with 503. |
+| `VELD_PUBLIC_RATE_LIMIT` | `true` | Set to `false` to exempt non-probe public routes from rate limiting. Probe routes (`/health*`) are never rate-limited regardless. |
+| `VELD_METRICS_PUBLIC` | `false` | Set to `true` to expose `/metrics` without authentication (for unauthenticated Prometheus scrapers). Default requires `Authorization: Bearer <key>`. |
+| `VELD_ENFORCE_HTTPS` | `false` | Set to `true` to reject insecure `http://` overrides for `LINEAR_API_URL`/`GITHUB_API_URL` (falls back to the compiled-in HTTPS default). Default warns only. |
+| `VELD_ADMIN_API_KEY` | unset | Set to a secret string to enable `/api/admin/*` endpoints. These endpoints use a separate key from `VELD_API_KEYS` — a leaked user key does not grant admin access. |
+
+### Webhook Security
+
+Webhook handlers perform HMAC-SHA256 signature verification. A missing or invalid signature is rejected with 401. When no `*_WEBHOOK_SECRET` is configured, webhooks are rejected by default (503) to prevent unauthenticated memory poisoning. Override with `VELD_ALLOW_UNSIGNED_WEBHOOKS=true` only in trusted environments.
+
+### Rate Limiting
+
+Public routes are rate-limited by default (per-IP token bucket). Kubernetes liveness/readiness probes (`/health*`) are served from a separate router that is never rate-limited, so a saturated public rate limit cannot block pod health checks.

@@ -501,7 +501,10 @@ async function apiCall<T>(
 ): Promise<T> {
   let lastError: Error | null = null;
 
-  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+  // Only retry idempotent reads — writes must not be retried to prevent duplicates
+  const maxAttempts = method === "GET" ? RETRY_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(
@@ -549,7 +552,7 @@ async function apiCall<T>(
       }
 
       // Log retry attempt
-      if (attempt < RETRY_ATTEMPTS) {
+      if (attempt < maxAttempts) {
         console.error(
           `Attempt ${attempt} failed: ${lastError.message}. Retrying in ${RETRY_DELAY_MS}ms...`,
         );
@@ -563,7 +566,7 @@ async function apiCall<T>(
   if (errMsg.includes("ECONNREFUSED") || errMsg.includes("fetch failed")) {
     throw new Error("Cannot connect to Veld server. Start the server with: veld");
   }
-  console.error(`Request failed after ${RETRY_ATTEMPTS} attempts: ${errMsg}`);
+  console.error(`Request failed after ${maxAttempts} attempts: ${errMsg}`);
   throw new Error("Connection failed. Is the veld server running?");
 }
 
@@ -599,11 +602,30 @@ async function checkServerAvailable(): Promise<boolean> {
   return _healthCheckResult;
 }
 
+// Read version from package.json so the MCP handshake reflects the real version
+function resolveVersion(): string {
+  const candidates = [
+    path.join(__dirname, "..", "package.json"),
+    path.join(__dirname, "package.json"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(candidate, "utf8")) as {
+        version?: string;
+      };
+      if (pkg.version) return pkg.version;
+    } catch {
+      // try next candidate
+    }
+  }
+  return "unknown";
+}
+
 // Create MCP server
 const server = new Server(
   {
     name: "veld",
-    version: "0.7.7",
+    version: resolveVersion(),
   },
   {
     capabilities: {

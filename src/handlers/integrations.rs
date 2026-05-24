@@ -50,12 +50,17 @@ pub async fn linear_webhook(
             });
         }
         (false, _) => {
-            if state.server_config().is_production {
+            let allow_unsigned = std::env::var("VELD_ALLOW_UNSIGNED_WEBHOOKS")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false);
+            if allow_unsigned {
+                tracing::warn!("VELD_ALLOW_UNSIGNED_WEBHOOKS=true: processing unsigned linear webhook (insecure override active)");
+            } else {
+                tracing::error!("LINEAR_WEBHOOK_SECRET not configured — rejecting unsigned webhook. Set VELD_ALLOW_UNSIGNED_WEBHOOKS=true to override.");
                 return Err(AppError::ServiceUnavailable(
                     "Webhook secret not configured".to_string(),
                 ));
             }
-            tracing::warn!("No LINEAR_WEBHOOK_SECRET configured, skipping signature verification");
         }
     }
 
@@ -271,12 +276,17 @@ pub async fn github_webhook(
             });
         }
         (false, _) => {
-            if state.server_config().is_production {
+            let allow_unsigned = std::env::var("VELD_ALLOW_UNSIGNED_WEBHOOKS")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false);
+            if allow_unsigned {
+                tracing::warn!("VELD_ALLOW_UNSIGNED_WEBHOOKS=true: processing unsigned github webhook (insecure override active)");
+            } else {
+                tracing::error!("GITHUB_WEBHOOK_SECRET not configured — rejecting unsigned webhook. Set VELD_ALLOW_UNSIGNED_WEBHOOKS=true to override.");
                 return Err(AppError::ServiceUnavailable(
                     "Webhook secret not configured".to_string(),
                 ));
             }
-            tracing::warn!("No GITHUB_WEBHOOK_SECRET configured, skipping signature verification");
         }
     }
 

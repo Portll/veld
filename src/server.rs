@@ -252,8 +252,13 @@ async fn async_main() -> Result<()> {
     let requested_storage_backend = server_config.requested_storage_backend.to_string();
     let effective_storage_backend = server_config.effective_storage_backend.to_string();
 
+    let metrics_public = server_config.metrics_public;
+    let public_rate_limit = server_config.public_rate_limit;
+
     // Build routes using handlers module
-    let public_routes = runtime.public_routes().route(
+    let probe_routes = runtime.probe_routes();
+
+    let public_routes = runtime.public_routes(metrics_public).route(
         "/",
         axum::routing::get(move || {
             let requested_storage_backend = requested_storage_backend.clone();
@@ -279,30 +284,43 @@ async fn async_main() -> Result<()> {
         }),
     );
 
-    let protected_routes = if let Some(rate_limit) = rate_limit_layer {
+    // Protected routes: always rate-limited when rate limiting is enabled
+    let protected_routes = if let Some(ref rate_limit) = rate_limit_layer {
         runtime
-            .protected_routes()
+            .protected_routes(metrics_public)
             .layer(axum::middleware::from_fn(auth::auth_middleware))
-            .layer(rate_limit)
+            .layer(rate_limit.clone())
     } else {
         runtime
-            .protected_routes()
+            .protected_routes(metrics_public)
             .layer(axum::middleware::from_fn(auth::auth_middleware))
     };
 
-    // Build public routes. If a ResetHandle exists, inject it via Extension so
-    // /api/admin/reset-rate-limit can swap the inner limiter. The public routes
-    // are intentionally NOT rate-limited (a stuck bucket would otherwise block
-    // its own recovery — the admin endpoint enforces its own auth).
-    let public_routes = if let Some(handle) = reset_handle.clone() {
-        public_routes.layer(axum::Extension(handle))
+    // Public routes: rate-limited when rate limiting is enabled AND public_rate_limit=true.
+    // The admin reset endpoint is always mounted on public routes so a stuck limiter can
+    // never block its own recovery. If a ResetHandle exists, inject it via Extension.
+    let public_routes = if let Some(ref handle) = reset_handle {
+        public_routes.layer(axum::Extension(handle.clone()))
+    } else {
+        public_routes
+    };
+    let public_routes = if rate_limit_enabled && public_rate_limit {
+        if let Some(rate_limit) = rate_limit_layer {
+            public_routes.layer(rate_limit)
+        } else {
+            public_routes
+        }
     } else {
         public_routes
     };
 
+    // Probe routes: never rate-limited regardless of config
+    // (Kubernetes must always be able to determine liveness/readiness)
+
     // Combine routes with global middleware
     let request_timeout = std::time::Duration::from_secs(server_config.request_timeout_secs);
     let app = axum::Router::new()
+        .merge(probe_routes)
         .merge(public_routes)
         .merge(protected_routes)
         .layer(

@@ -21,6 +21,10 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Backstop timeout for model downloads (10 minutes).
+const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
 /// URLs for MiniLM model files (hosted on HuggingFace)
 /// Full model is 90MB, quantized is 23MB - we download quantized for edge devices
@@ -345,7 +349,12 @@ fn download_file_with_checksum(
     }
 
     // Use ureq for simple HTTP downloads (blocking, no async runtime needed)
-    let response = ureq::get(url)
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
+        .build()
+        .new_agent();
+    let response = agent
+        .get(url)
         .call()
         .context(format!("Failed to download from {url}"))?;
 

@@ -449,6 +449,16 @@ pub struct ServerConfig {
     /// Whether running in production mode
     pub is_production: bool,
 
+    /// Apply rate limiting to public (non-probe) routes.
+    /// Default: true. Set VELD_PUBLIC_RATE_LIMIT=false to exempt public routes.
+    /// Health probe routes (/health*) are never rate-limited regardless.
+    pub public_rate_limit: bool,
+
+    /// Expose /metrics without authentication.
+    /// Default: false (protected by API key). Set VELD_METRICS_PUBLIC=true for
+    /// unauthenticated Prometheus scraping (e.g. in a private network scraper).
+    pub metrics_public: bool,
+
     /// Enable multi-tenant collective learning and auth binding integration.
     pub multi_tenant_mode: bool,
 
@@ -509,6 +519,8 @@ impl Default for ServerConfig {
             max_concurrent_requests: 200,
             request_timeout_secs: 60,
             is_production: false,
+            public_rate_limit: true,
+            metrics_public: false,
             multi_tenant_mode: false,
             collective_store_dir: default_storage_path().join("collective"),
             cors: CorsConfig::default(),
@@ -639,6 +651,22 @@ impl ServerConfig {
                 production = config.is_production,
                 "Rate limiting auto-disabled: localhost+dev detected"
             );
+        }
+
+        // Public route rate limiting (default: on)
+        if env::var("VELD_PUBLIC_RATE_LIMIT")
+            .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+            .unwrap_or(false)
+        {
+            config.public_rate_limit = false;
+        }
+
+        // Metrics exposure (default: protected)
+        if env::var("VELD_METRICS_PUBLIC")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+        {
+            config.metrics_public = true;
         }
 
         // Concurrency
@@ -854,6 +882,18 @@ pub fn print_env_help() {
     println!("  VELD_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
     println!("  VELD_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
     println!("  VELD_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");
+    println!();
+    println!("Security — secure-by-default overrides:");
+    println!("  VELD_ALLOW_UNSIGNED_WEBHOOKS - Allow webhooks when no *_WEBHOOK_SECRET is set (default: false).");
+    println!("                                 False = reject unsigned webhooks with 503. True = warn and process.");
+    println!("  VELD_PUBLIC_RATE_LIMIT       - Apply rate limiting to non-probe public routes (default: true).");
+    println!("                                 Set to false to exempt public routes (probe routes are never limited).");
+    println!("  VELD_METRICS_PUBLIC          - Expose /metrics without authentication (default: false).");
+    println!("                                 True = /metrics is public (for unauthenticated Prometheus scrapers).");
+    println!("  VELD_ADMIN_API_KEY           - API key for /api/admin/* endpoints (separate from VELD_API_KEYS).");
+    println!("                                 Required to use admin operations such as rate-limit reset.");
+    println!("  VELD_ENFORCE_HTTPS           - Reject insecure HTTP overrides for integration API URLs (default: false).");
+    println!("                                 True = non-localhost http:// overrides fall back to the secure default.");
     println!();
     println!("Integration APIs:");
     println!("  LINEAR_API_URL         - Linear GraphQL API URL (default: https://api.linear.app/graphql)");

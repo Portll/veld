@@ -252,7 +252,10 @@ impl GitHubWebhook {
         // GitHub signature format: "sha256=<hex>"
         let expected_sig = signature.strip_prefix("sha256=").unwrap_or(signature);
 
-        let expected_bytes = hex::decode(expected_sig).context("Invalid signature format")?;
+        let expected_bytes = match hex::decode(expected_sig) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // non-hex input → signature mismatch, not a server error
+        };
 
         Ok(mac.verify_slice(&expected_bytes).is_ok())
     }

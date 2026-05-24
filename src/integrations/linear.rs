@@ -214,7 +214,10 @@ impl LinearWebhook {
         // Linear signature format: "sha256=<hex>"
         let expected_sig = signature.strip_prefix("sha256=").unwrap_or(signature);
 
-        let expected_bytes = hex::decode(expected_sig).context("Invalid signature format")?;
+        let expected_bytes = match hex::decode(expected_sig) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // non-hex input → signature mismatch, not a server error
+        };
 
         Ok(mac.verify_slice(&expected_bytes).is_ok())
     }
@@ -425,26 +428,12 @@ impl LinearClient {
     ) -> Result<Vec<LinearIssueData>> {
         let limit = limit.unwrap_or(250);
 
-        // Build filter
-        let mut filters = Vec::new();
-        if let Some(tid) = team_id {
-            filters.push(format!(r#"team: {{ id: {{ eq: "{}" }} }}"#, tid));
-        }
-        if let Some(after) = updated_after {
-            filters.push(format!(r#"updatedAt: {{ gte: "{}" }}"#, after));
-        }
-
-        let filter_str = if filters.is_empty() {
-            String::new()
-        } else {
-            format!("filter: {{ {} }}", filters.join(", "))
-        };
-
-        let query = format!(
-            r#"
-            query {{
-                issues(first: {}, {}) {{
-                    nodes {{
+        // Parameterized query — filter values go in `variables`, never concatenated into
+        // the query string, preventing GraphQL injection via team_id or updated_after.
+        let query = r#"
+            query Issues($first: Int!, $filter: IssueFilter) {
+                issues(first: $first, filter: $filter) {
+                    nodes {
                         id
                         identifier
                         title
@@ -458,61 +447,82 @@ impl LinearClient {
                         canceledAt
                         dueDate
                         estimate
-                        state {{
+                        state {
                             id
                             name
                             color
                             type
-                        }}
-                        assignee {{
+                        }
+                        assignee {
                             id
                             name
                             email
-                        }}
-                        creator {{
+                        }
+                        creator {
                             id
                             name
                             email
-                        }}
-                        labels {{
-                            nodes {{
+                        }
+                        labels {
+                            nodes {
                                 id
                                 name
                                 color
-                            }}
-                        }}
-                        team {{
+                            }
+                        }
+                        team {
                             id
                             name
                             key
-                        }}
-                        project {{
+                        }
+                        project {
                             id
                             name
-                        }}
-                        cycle {{
+                        }
+                        cycle {
                             id
                             name
                             number
-                        }}
-                        parent {{
+                        }
+                        parent {
                             id
                             identifier
                             title
-                        }}
-                    }}
-                }}
-            }}
-        "#,
-            limit, filter_str
-        );
+                        }
+                    }
+                }
+            }
+        "#;
+
+        // Build filter object — structured values, never string-interpolated
+        let filter = if team_id.is_some() || updated_after.is_some() {
+            let mut f = serde_json::Map::new();
+            if let Some(tid) = team_id {
+                f.insert(
+                    "team".to_string(),
+                    serde_json::json!({ "id": { "eq": tid } }),
+                );
+            }
+            if let Some(after) = updated_after {
+                f.insert(
+                    "updatedAt".to_string(),
+                    serde_json::json!({ "gte": after }),
+                );
+            }
+            serde_json::Value::Object(f)
+        } else {
+            serde_json::Value::Null
+        };
 
         let response = self
             .client
             .post(&self.api_url)
             .header("Authorization", &self.api_key)
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "query": query }))
+            .json(&serde_json::json!({
+                "query": query,
+                "variables": { "first": limit, "filter": filter }
+            }))
             .send()
             .await
             .context("Failed to send request to Linear API")?;

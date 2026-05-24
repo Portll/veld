@@ -12,7 +12,8 @@ use axum::Router;
 
 pub use crate::config::{ServerConfig, StorageBackend};
 pub use crate::handlers::{
-    build_protected_routes, build_public_routes, build_router, AppState, MultiUserMemoryManager,
+    build_probe_routes, build_protected_routes, build_public_routes, build_router, AppState,
+    MultiUserMemoryManager,
 };
 pub use crate::server::ServerRunConfig;
 
@@ -54,18 +55,23 @@ impl RootsRuntime {
         self.manager
     }
 
+    /// Build the Kubernetes probe routes (never rate-limited).
+    pub fn probe_routes(&self) -> Router {
+        build_probe_routes(self.state())
+    }
+
     /// Build the public routes for this runtime.
-    pub fn public_routes(&self) -> Router {
-        build_public_routes(self.state())
+    pub fn public_routes(&self, metrics_public: bool) -> Router {
+        build_public_routes(self.state(), metrics_public)
     }
 
     /// Build the protected routes for this runtime.
-    pub fn protected_routes(&self) -> Router {
-        build_protected_routes(self.state())
+    pub fn protected_routes(&self, metrics_public: bool) -> Router {
+        build_protected_routes(self.state(), metrics_public)
     }
 
     /// Build the full router for this runtime.
-    pub fn router(&self) -> Router {
-        build_router(self.state())
+    pub fn router(&self, metrics_public: bool) -> Router {
+        build_router(self.state(), metrics_public)
     }
 }

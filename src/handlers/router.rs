@@ -22,24 +22,32 @@ pub type AppState = Arc<MultiUserMemoryManager>;
 
 /// Build the public routes (no authentication required)
 ///
-/// These routes must always be accessible for:
-/// - Health checks (Kubernetes probes)
-/// - Metrics (Prometheus scraping)
-/// - Context status (local Claude Code status line script)
-/// - External webhooks (have their own signature verification)
-pub fn build_public_routes(state: AppState) -> Router {
+/// Build Kubernetes probe routes — never rate-limited, always public.
+/// These four paths must remain unconditionally accessible so orchestrators
+/// can always determine liveness/readiness even under a saturated rate limiter.
+pub fn build_probe_routes(state: AppState) -> Router {
     Router::new()
-        // =================================================================
-        // HEALTH & KUBERNETES PROBES
-        // =================================================================
         .route("/health", get(health::health))
         .route("/health/live", get(health::health_live))
         .route("/health/ready", get(health::health_ready))
         .route("/health/index", get(health::health_index))
+        .with_state(state)
+}
+
+/// Build public (unauthenticated) routes.
+///
+/// These routes are optionally rate-limited (controlled by `VELD_PUBLIC_RATE_LIMIT`
+/// in `ServerConfig`). Health probes are split into `build_probe_routes()` so
+/// they stay accessible even when public-route rate limiting is enabled.
+///
+/// `/metrics` placement is controlled by `ServerConfig::metrics_public`:
+///   - false (default): mounted under protected routes, requires API key.
+///   - true: mounted here, rate-limited when `public_rate_limit` is true.
+pub fn build_public_routes(state: AppState, metrics_public: bool) -> Router {
+    let r = Router::new()
         // =================================================================
-        // METRICS (PROMETHEUS)
+        // METRICS (PROMETHEUS) — public only when VELD_METRICS_PUBLIC=true
         // =================================================================
-        .route("/metrics", get(health::metrics_endpoint))
         // =================================================================
         // CONTEXT STATUS (GET only - status reads remain public)
         // =================================================================
@@ -65,19 +73,35 @@ pub fn build_public_routes(state: AppState) -> Router {
         .route(
             "/api/admin/reset-rate-limit",
             post(admin::reset_rate_limit),
-        )
-        // =================================================================
-        // STATE
-        // =================================================================
-        .with_state(state)
+        );
+
+    let r = if metrics_public {
+        r.route("/metrics", get(health::metrics_endpoint))
+    } else {
+        r
+    };
+
+    r.with_state(state)
 }
 
 /// Build the protected API routes (authentication required)
 ///
 /// These routes require API key authentication and are rate-limited.
 /// The auth middleware and rate limiter should be applied by the caller.
-pub fn build_protected_routes(state: AppState) -> Router {
-    Router::new()
+///
+/// When `metrics_public` is false (default), `/metrics` is mounted here so
+/// Prometheus scraping requires a valid API key.
+pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
+    let r = Router::new();
+
+    // /metrics — protected by default, public when VELD_METRICS_PUBLIC=true
+    let r = if !metrics_public {
+        r.route("/metrics", get(health::metrics_endpoint))
+    } else {
+        r
+    };
+
+    r
         // =================================================================
         // CONTEXT SSE + STATUS (auth required — SSE leaks session/token/task info)
         // =================================================================
@@ -519,13 +543,14 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Build the complete router with both public and protected routes
+/// Build the complete router with probe, public and protected routes.
 ///
 /// Note: This function does NOT apply auth middleware or rate limiting.
-/// The caller (main.rs) should apply those layers as needed.
-pub fn build_router(state: AppState) -> Router {
-    let public = build_public_routes(state.clone());
-    let protected = build_protected_routes(state);
+/// The caller (server.rs) applies those layers to the appropriate sub-routers.
+pub fn build_router(state: AppState, metrics_public: bool) -> Router {
+    let probes = build_probe_routes(state.clone());
+    let public = build_public_routes(state.clone(), metrics_public);
+    let protected = build_protected_routes(state, metrics_public);
 
-    Router::new().merge(public).merge(protected)
+    Router::new().merge(probes).merge(public).merge(protected)
 }

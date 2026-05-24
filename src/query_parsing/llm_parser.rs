@@ -429,13 +429,14 @@ fn extract_json(output: &str) -> String {
     if let Some(start) = cleaned.find('{') {
         let mut depth = 0;
         let mut end = start;
-        for (i, c) in cleaned[start..].chars().enumerate() {
+        // char_indices gives (byte_offset, char) — safe for multi-byte content
+        for (byte_offset, c) in cleaned[start..].char_indices() {
             match c {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = start + i + 1;
+                        end = start + byte_offset + c.len_utf8();
                         break;
                     }
                 }
@@ -451,8 +452,10 @@ fn extract_json(output: &str) -> String {
 /// Simple stemming using rust_stemmers
 fn stem_word(word: &str) -> String {
     use rust_stemmers::{Algorithm, Stemmer};
-    let stemmer = Stemmer::create(Algorithm::English);
-    stemmer.stem(&word.to_lowercase()).to_string()
+    thread_local! {
+        static STEMMER: Stemmer = Stemmer::create(Algorithm::English);
+    }
+    STEMMER.with(|s| s.stem(&word.to_lowercase()).to_string())
 }
 
 /// Parse entity type string
