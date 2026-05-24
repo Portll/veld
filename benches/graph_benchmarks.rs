@@ -54,6 +54,7 @@ fn create_entity(
         name_embedding: None,
         salience,
         is_proper_noun: is_proper,
+        pii_classification: Default::default(),
     }
 }
 

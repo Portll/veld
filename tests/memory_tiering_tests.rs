@@ -43,6 +43,7 @@ fn setup_memory_system(working_size: usize, session_mb: usize) -> (MemorySystem,
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: working_size,
         session_memory_size_mb: session_mb,
         max_heap_per_user_mb: 200,
@@ -231,6 +232,7 @@ fn test_longterm_persistence() {
     {
         let config = MemoryConfig {
             storage_path: db_path.clone(),
+            collective_store_dir: None,
             working_memory_size: 2, // Small to trigger promotion to long-term
             session_memory_size_mb: 10,
             max_heap_per_user_mb: 200,
@@ -285,6 +287,7 @@ fn test_longterm_persistence() {
     {
         let config = MemoryConfig {
             storage_path: db_path.clone(),
+            collective_store_dir: None,
             working_memory_size: 5,
             session_memory_size_mb: 10,
             max_heap_per_user_mb: 200,

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Veld Monitor",
+  "version": "0.1.0",
+  "identifier": "net.portll.veld.monitor",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Veld Monitor",
+        "width": 720,
+        "height": 560,
+        "minWidth": 480,
+        "minHeight": 360,
+        "resizable": true,
+        "visible": false,
+        "decorations": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "icon": []
+  }
+}

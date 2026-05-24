@@ -1,0 +1,30 @@
+[package]
+name = "veld-status-tui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Portll <john@portll.net>"]
+description = "Lightweight terminal status monitor for a Veld server"
+license = "BUSL-1.1"
+
+[[bin]]
+name = "veld-status"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+parking_lot = "0.12"
+ratatui = "0.28"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+veld-status-core = { path = "../status-core" }
+veld-status-widget = { path = "../status-widget" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[workspace]

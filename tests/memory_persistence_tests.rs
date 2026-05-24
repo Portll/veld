@@ -47,6 +47,7 @@ fn create_experience_with_ner(content: &str, ner: &NeuralNer) -> Experience {
 fn create_test_config(temp_dir: &TempDir) -> MemoryConfig {
     MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 500,

@@ -68,8 +68,8 @@ impl TestHarness {
     ///
     /// Mirrors `main.rs`: auth middleware wraps only the protected routes.
     pub fn router(&self) -> Router {
-        let public = build_public_routes(self.manager.clone());
-        let protected = build_protected_routes(self.manager.clone())
+        let public = build_public_routes(self.manager.clone(), false);
+        let protected = build_protected_routes(self.manager.clone(), false)
             .layer(axum::middleware::from_fn(crate::auth::auth_middleware));
         Router::new().merge(public).merge(protected)
     }

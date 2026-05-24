@@ -1,0 +1,14 @@
+[package]
+name = "veld-status-widget"
+version = "0.1.0"
+edition = "2021"
+authors = ["Portll <john@portll.net>"]
+description = "Ratatui rendering primitives for Veld status surfaces"
+license = "BUSL-1.1"
+
+[dependencies]
+ratatui = "0.28"
+chrono = { version = "0.4", features = ["serde"] }
+veld-status-core = { path = "../status-core" }
+
+[workspace]

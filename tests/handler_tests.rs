@@ -65,8 +65,8 @@ impl Harness {
 
     fn app(&self) -> Router {
         // Mirror main.rs: auth middleware only wraps protected routes.
-        let public = build_public_routes(self.mgr.clone());
-        let protected = build_protected_routes(self.mgr.clone()).layer(axum::middleware::from_fn(
+        let public = build_public_routes(self.mgr.clone(), false);
+        let protected = build_protected_routes(self.mgr.clone(), false).layer(axum::middleware::from_fn(
             veld::auth::auth_middleware,
         ));
         Router::new().merge(public).merge(protected)

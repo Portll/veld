@@ -140,6 +140,7 @@ fn setup_memory_system(working_size: usize) -> (MemorySystem, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: working_size,
         session_memory_size_mb: 100,
         max_heap_per_user_mb: 500,

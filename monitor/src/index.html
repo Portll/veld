@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Veld Monitor</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header id="header">
+      <span id="dot" class="dot unknown"></span>
+      <span id="state-label">probing…</span>
+      <span id="base-url" class="muted"></span>
+      <span class="spacer"></span>
+      <span id="rtt" class="muted">— ms</span>
+      <span id="uptime" class="muted">—</span>
+      <span id="version" class="muted">—</span>
+    </header>
+    <main>
+      <section class="card" id="card-memory">
+        <h2>Memory</h2>
+        <div class="grid" id="memory-grid"></div>
+        <div class="index-stripe" id="index-stripe"></div>
+      </section>
+      <section class="card" id="card-todos">
+        <h2>Todos</h2>
+        <div class="grid" id="todos-grid"></div>
+      </section>
+      <section class="card" id="card-sessions">
+        <h2>Sessions</h2>
+        <div class="sessions" id="sessions-list">
+          <p class="muted">no active Claude Code sessions</p>
+        </div>
+      </section>
+      <section class="card wide" id="card-activity">
+        <h2>Activity</h2>
+        <ul class="activity" id="activity-list">
+          <li class="muted">waiting for events…</li>
+        </ul>
+      </section>
+    </main>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

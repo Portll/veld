@@ -41,6 +41,7 @@ fn create_experience_with_ner(content: &str, ner: &NeuralNer) -> Experience {
 fn create_test_config(temp_dir: &TempDir) -> MemoryConfig {
     MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 500,
@@ -753,6 +754,7 @@ fn test_sho49_no_duplicates_in_retrieve() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 500,
@@ -912,6 +914,7 @@ fn test_sho50_high_importance_updates_session_count() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 500,

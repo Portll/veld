@@ -46,6 +46,7 @@ fn create_experience_with_ner(content: &str, ner: &NeuralNer) -> Experience {
 fn create_test_config(temp_dir: &TempDir) -> MemoryConfig {
     MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 500,
@@ -405,6 +406,7 @@ fn test_brutal_exceed_working_memory() {
     let temp_dir = TempDir::new().expect("Failed");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 10, // Very small working memory
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 500,
@@ -1043,6 +1045,7 @@ fn test_brutal_cache_eviction_integrity() {
     let temp_dir = TempDir::new().expect("Failed");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 5,    // Tiny cache - forces frequent eviction
         session_memory_size_mb: 1, // Small session cache
         max_heap_per_user_mb: 500,

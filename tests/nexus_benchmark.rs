@@ -271,6 +271,7 @@ fn benchmark_nexus_dataset_v2() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 128,
         session_memory_size_mb: 64,
         max_heap_per_user_mb: 512,

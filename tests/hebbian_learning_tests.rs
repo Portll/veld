@@ -27,6 +27,7 @@ fn setup_memory_system() -> (MemorySystem, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 200,
@@ -721,6 +722,7 @@ fn test_high_volume_reinforcement() {
 fn create_persistence_config(temp_dir: &tempfile::TempDir) -> MemoryConfig {
     MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
+        collective_store_dir: None,
         working_memory_size: 100,
         session_memory_size_mb: 50,
         max_heap_per_user_mb: 200,
