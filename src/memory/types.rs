@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub use super::facets::{EngramBinding, Place, RecordKind, WhereFacet, WhoFacet, WhyFacet};
+pub use super::facets::{
+    ContentKind, EngramBinding, Place, RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet,
+    WhyFacet,
+};
 use crate::constants::{
     DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
     RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
@@ -1229,6 +1232,17 @@ pub struct Memory {
     /// and default: `RecordKind::Memory`.
     pub kind: RecordKind,
 
+    /// WHAT facet — content with explicit gist/verbatim separation (W3.2c).
+    /// During the transition `experience.content` is still the primary
+    /// content; `verbatim` / `gist` are filled in by encoding/consolidation.
+    /// See `docs/neuroscience-5w-memory-design.md`.
+    pub what: WhatFacet,
+
+    /// WHEN facet — encoding/event time + TCM drift vector (W3.2c).
+    /// `encoded_at` mirrors `created_at` during the transition; `event_time`
+    /// is the separately-encoded time the described event actually happened.
+    pub when: WhenFacet,
+
     // Mutable metadata protected by Mutex for zero-copy updates
     metadata: Arc<parking_lot::Mutex<MemoryMetadata>>,
 
@@ -1306,6 +1320,8 @@ impl Clone for Memory {
             id: self.id.clone(),
             experience: self.experience.clone(),
             kind: self.kind,
+            what: self.what.clone(),
+            when: self.when.clone(),
             // Deep copy: create new Arc with cloned inner data
             metadata: Arc::new(parking_lot::Mutex::new(self.metadata.lock().clone())),
             created_at: self.created_at,
@@ -1344,6 +1360,15 @@ impl Memory {
             id,
             experience,
             kind: RecordKind::Memory,
+            // WHAT defaults are neutral; content lives in experience.content
+            // until the encoding pipeline populates verbatim/gist.
+            what: WhatFacet::default(),
+            // WHEN: encoded_at mirrors created_at so retrieval has a temporal
+            // anchor even before the encoding pipeline fills event_time/drift.
+            when: WhenFacet {
+                encoded_at: Some(now),
+                ..WhenFacet::default()
+            },
             metadata: Arc::new(parking_lot::Mutex::new(MemoryMetadata {
                 importance,
                 access_count: 0,
@@ -1458,6 +1483,13 @@ impl Memory {
             related_todo_ids,
             // Legacy memories predate RecordKind — all are plain memories.
             kind: RecordKind::Memory,
+            // Legacy memories predate WhatFacet/WhenFacet (W3.2c). Defaults are
+            // safe; encoded_at mirrors created_at so the temporal anchor exists.
+            what: WhatFacet::default(),
+            when: WhenFacet {
+                encoded_at: Some(created_at),
+                ..WhenFacet::default()
+            },
             // Legacy memories don't have hierarchy - default to root
             parent_id: None,
             // Legacy memories aren't expired

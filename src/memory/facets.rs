@@ -25,6 +25,7 @@
 //! WHAT and WHEN are slated to fold into the minimal core rather than become
 //! separate facets.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -400,6 +401,127 @@ pub struct WFacetMask {
     pub why: bool,
 }
 
+// =============================================================================
+// WHAT — content with gist/verbatim separation (W3.2c, in the minimal core)
+// =============================================================================
+
+/// The WHAT of an engram — content with explicit gist/verbatim separation so
+/// consolidation can semanticize without destroying the engram.
+///
+/// During the transition `Memory.experience.content` remains the primary
+/// content; `verbatim` and `gist` are populated by encoding/consolidation as
+/// they roll out. Unlike WHERE/WHO/WHY/binding, this facet is on the *core*
+/// — every memory has content.
+/// See `docs/neuroscience-5w-memory-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WhatFacet {
+    /// Original surface form. May be shed as the memory ages (hippocampal
+    /// detail loss).
+    pub verbatim: Option<String>,
+    /// Abstracted summary; survives consolidation. Becomes the primary
+    /// content once the engram semanticizes.
+    pub gist: Option<String>,
+    /// Type of content. Will eventually replace `ExperienceType` as the
+    /// WHAT discriminant.
+    pub content_kind: ContentKind,
+    /// Content salience, 0.0–1.0. Distinct from emotional arousal.
+    pub content_salience: f32,
+    /// Abstraction level: 0.0 = raw episode, 1.0 = fully semanticized schema.
+    /// Increments during consolidation as `verbatim` is shed.
+    pub abstraction_level: f32,
+}
+
+/// Coarse content kind. Will eventually replace the existing `ExperienceType`
+/// enum as the WHAT discriminant once migration completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    /// Default — a recorded observation.
+    #[default]
+    Observation,
+    /// A decision made.
+    Decision,
+    /// A distilled insight (mirrors `RecordKind::Learning`).
+    Learning,
+    /// An action taken.
+    Action,
+    /// A reflection or meta-thought.
+    Reflection,
+    /// Conversational exchange.
+    Conversation,
+    /// Code or code-related artifact.
+    Code,
+    /// Document content.
+    Document,
+    /// Anything else.
+    Other,
+}
+
+// =============================================================================
+// WHEN — encoding/event time + TCM drift vector (W3.2c, in the minimal core)
+// =============================================================================
+
+/// The WHEN of an engram — encoding time, event time, ordinal position, and a
+/// Temporal Context Model (TCM) drift vector for graded contiguity.
+///
+/// `encoded_at` mirrors `Memory.created_at` during the transition so the facet
+/// is self-contained for indexing. `event_time` is the *separately-encoded*
+/// time at which the described event actually happened. Like `WhatFacet`, this
+/// is on the minimal core (every memory has a time).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WhenFacet {
+    /// When Veld stored this engram.
+    pub encoded_at: Option<DateTime<Utc>>,
+    /// When the described event actually happened — distinct from encoding.
+    pub event_time: Option<TimeSpan>,
+    /// Ordinal position within the episode.
+    pub episode_ordinal: Option<u32>,
+    /// Temporal Context Model drift vector — a low-dim slowly-drifting state
+    /// captured at encoding. Cosine distance between two engrams' drift
+    /// vectors = subjective-time proximity. Graded contiguity signal that
+    /// replaces brittle `episode_id` equality at retrieval.
+    pub context_drift: Vec<f32>,
+    /// Detected recurrence pattern (e.g. "every Monday standup").
+    pub recurrence: Option<RecurrencePattern>,
+}
+
+/// A bounded time interval with precision metadata.
+///
+/// Does not derive `Default` — there is no neutral "default time". Use
+/// `Option<TimeSpan>` to express absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeSpan {
+    /// Interval start.
+    pub start: DateTime<Utc>,
+    /// Interval end. `None` = point-in-time.
+    pub end: Option<DateTime<Utc>>,
+    /// Granularity of the reference: was it `"2026"`, `"May 2026"`, an instant?
+    pub precision: TimePrecision,
+}
+
+/// Granularity of a time reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TimePrecision {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    #[default]
+    Instant,
+}
+
+/// A detected recurrence pattern. Free-form for now; structured RRULE-style
+/// fields can be added later without breaking existing data.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecurrencePattern {
+    /// e.g. `"weekly"`, `"daily"`, `"monthly"`.
+    pub period: Option<String>,
+    /// Free-form description of the recurrence rule.
+    pub description: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +698,55 @@ mod tests {
         assert!(!json.contains("where_"));
         let back: WFacetMask = serde_json::from_str(&json).unwrap();
         assert!(back.where_);
+    }
+
+    #[test]
+    fn what_facet_defaults_neutral() {
+        let w = WhatFacet::default();
+        assert!(w.verbatim.is_none());
+        assert!(w.gist.is_none());
+        assert_eq!(w.content_kind, ContentKind::Observation);
+        assert_eq!(w.content_salience, 0.0);
+        assert_eq!(w.abstraction_level, 0.0);
+    }
+
+    #[test]
+    fn content_kind_serde_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ContentKind::Conversation).unwrap(),
+            "\"conversation\""
+        );
+        let back: ContentKind = serde_json::from_str("\"reflection\"").unwrap();
+        assert_eq!(back, ContentKind::Reflection);
+    }
+
+    #[test]
+    fn time_precision_defaults_to_instant() {
+        assert_eq!(TimePrecision::default(), TimePrecision::Instant);
+    }
+
+    #[test]
+    fn when_facet_round_trip_preserves_temporal_anchors() {
+        let now = chrono::Utc::now();
+        let w = WhenFacet {
+            encoded_at: Some(now),
+            event_time: Some(TimeSpan {
+                start: now,
+                end: None,
+                precision: TimePrecision::Hour,
+            }),
+            episode_ordinal: Some(3),
+            context_drift: vec![0.1, 0.2, 0.3],
+            recurrence: None,
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        let back: WhenFacet = serde_json::from_str(&json).unwrap();
+        assert!(back.encoded_at.is_some());
+        assert_eq!(back.episode_ordinal, Some(3));
+        assert_eq!(back.context_drift.len(), 3);
+        assert!(matches!(
+            back.event_time.unwrap().precision,
+            TimePrecision::Hour
+        ));
     }
 }
