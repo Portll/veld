@@ -737,6 +737,91 @@ impl LegacyMemoryFlatV2 {
     }
 }
 
+/// Legacy MemoryFlat from before W3.4 (kind / what / when were appended).
+/// Matches the MemoryFlat schema as it existed prior to the W3.4 extension —
+/// every field through `fragment_demotion` is identical. Tried BEFORE
+/// `LegacyMemoryFlatV2` so data that was written with `parent_id` / `valid_until`
+/// / metadata calibration still preserves them (V2 would silently drop them).
+#[derive(Deserialize)]
+struct LegacyMemoryFlatV3 {
+    id: MemoryId,
+    experience: Experience,
+    importance: f32,
+    access_count: u32,
+    created_at: DateTime<Utc>,
+    last_accessed: DateTime<Utc>,
+    compressed: bool,
+    tier: MemoryTier,
+    entity_refs: Vec<EntityRef>,
+    activation: f32,
+    last_retrieval_id: Option<uuid::Uuid>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    actor_id: Option<String>,
+    temporal_relevance: f32,
+    score: Option<f32>,
+    external_id: Option<String>,
+    version: u32,
+    history: Vec<MemoryRevision>,
+    #[serde(default)]
+    related_todo_ids: Vec<TodoId>,
+    #[serde(default)]
+    parent_id: Option<MemoryId>,
+    #[serde(default)]
+    anchored: bool,
+    #[serde(default)]
+    calibrated_confidence: Option<f32>,
+    #[serde(default)]
+    confidence_alpha: Option<f32>,
+    #[serde(default)]
+    confidence_beta: Option<f32>,
+    #[serde(default)]
+    valid_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    access_history: Option<Vec<DateTime<Utc>>>,
+    #[serde(default)]
+    elaboration_score: Option<f32>,
+    #[serde(default)]
+    fragment_demotion: Option<f32>,
+}
+
+impl LegacyMemoryFlatV3 {
+    /// V3 → current: rebuilds the memory via `from_legacy` (which sets the W3
+    /// facets to defaults — legacy rows are plain memories with mirror-of-
+    /// `created_at` `encoded_at`), then restores the V3-era pub fields
+    /// `parent_id` / `valid_until` that `from_legacy` doesn't carry.
+    /// Metadata-only fields (anchored, confidence calibration, access_history,
+    /// elaboration_score, fragment_demotion) get the same defaults the V2
+    /// fallback uses today — acceptable migration loss on this narrow window.
+    fn into_memory(self) -> Memory {
+        let mut mem = Memory::from_legacy(
+            self.id,
+            self.experience,
+            self.importance,
+            self.access_count,
+            self.created_at,
+            self.last_accessed,
+            self.compressed,
+            self.tier,
+            self.entity_refs,
+            self.activation,
+            self.last_retrieval_id,
+            self.agent_id,
+            self.run_id,
+            self.actor_id,
+            self.temporal_relevance,
+            self.score,
+            self.external_id,
+            self.version,
+            self.history,
+            self.related_todo_ids,
+        );
+        mem.parent_id = self.parent_id;
+        mem.valid_until = self.valid_until;
+        mem
+    }
+}
+
 /// Try deserializing with multiple format fallbacks
 /// Supports bincode 2.x (current), MessagePack, and bincode 1.x (legacy) wire formats
 ///
@@ -789,6 +874,22 @@ fn deserialize_legacy_fallback(
     // Collect all errors for debugging
     let mut errors: Vec<(&str, String)> = Vec::new();
     errors.push(("bincode2 Memory", first_error.to_string()));
+
+    // Try the prior-current schema (pre-W3.4 — before kind/what/when were
+    // appended to MemoryFlat). Tried first in the fallback chain so data
+    // written between "parent_id added" and "W3.4" preserves parent_id /
+    // valid_until rather than falling lossy to V2.
+    match bincode::serde::decode_from_slice::<LegacyMemoryFlatV3, _>(
+        data,
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+    ) {
+        Ok((legacy, _)) => {
+            tracing::debug!("Migrated memory from bincode 2.x pre-W3.4 format");
+            record_branch("bincode2_legacy_flat_v3");
+            return Ok((legacy.into_memory(), true));
+        }
+        Err(e) => errors.push(("bincode2 LegacyMemoryFlatV3", e.to_string())),
+    }
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes

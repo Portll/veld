@@ -2097,6 +2097,15 @@ struct MemoryFlat {
     // Fragment demotion factor (FIX-R2)
     #[serde(default)]
     fragment_demotion: Option<f32>,
+    // W3 facets (W3.1 kind, W3.2c what/when) — appended at end to preserve
+    // positional bincode compatibility with prior-current data. Legacy data
+    // missing these fields is caught by LegacyMemoryFlatV3 in storage.rs.
+    #[serde(default)]
+    kind: RecordKind,
+    #[serde(default)]
+    what: WhatFacet,
+    #[serde(default)]
+    when: WhenFacet,
 }
 
 impl Serialize for Memory {
@@ -2158,6 +2167,10 @@ impl Serialize for Memory {
             } else {
                 None
             },
+            // W3 facets — durable through bincode (W3.4)
+            kind: self.kind,
+            what: self.what.clone(),
+            when: self.when.clone(),
         };
         flat.serialize(serializer)
     }
@@ -2173,6 +2186,10 @@ impl<'de> Deserialize<'de> for Memory {
         Ok(Memory {
             id: flat.id,
             experience: flat.experience,
+            // W3 facets — restored from disk (W3.4)
+            kind: flat.kind,
+            what: flat.what,
+            when: flat.when,
             metadata: Arc::new(parking_lot::Mutex::new(MemoryMetadata {
                 importance: flat.importance,
                 access_count: flat.access_count,
