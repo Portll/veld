@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "veld"
-version = "0.7.9"
+version = "0.7.10"
 description = "Local-first AI memory system for robotics, drones, and edge AI - 100% offline capable"
 authors = [{name = "Veld Team", email = "john@portll.net"}]
 license = {text = "BUSL-1.1"}

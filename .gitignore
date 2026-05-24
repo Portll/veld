@@ -1,7 +1,11 @@
 # Rust
 /target/
+**/target/
 **/*.rs.bk
 *.pdb
+
+# Tauri generated schemas (build artifacts)
+**/gen/schemas/
 
 # Python
 __pycache__/

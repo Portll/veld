@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
+# Veld pre-commit hook.
+# 1. Secret scan (must pass).
+# 2. Auto-bump the patch version unless this commit already touches a version
+#    file (in which case the author is bumping deliberately).
+#
+# Set VELD_NO_BUMP=1 to skip the bump for a single commit.
 
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-exec "$repo_root/scripts/check-secrets.sh" --staged
+"$repo_root/scripts/check-secrets.sh" --staged
+
+if [[ "${VELD_NO_BUMP:-0}" == "1" ]]; then
+    exit 0
+fi
+
+version_files=(
+    "Cargo.toml"
+    "mcp-server/package.json"
+    "pyproject.toml"
+)
+
+staged="$(git diff --cached --name-only)"
+for vf in "${version_files[@]}"; do
+    if grep -qxF "$vf" <<<"$staged"; then
+        # Author already touched a version file — assume they bumped intentionally.
+        exit 0
+    fi
+done
+
+exec "$repo_root/scripts/bump-version.sh" patch --stage

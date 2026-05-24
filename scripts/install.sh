@@ -43,9 +43,11 @@ detect_platform() {
         *) err "Unsupported architecture: $(uname -m)" ;;
     esac
 
-    # Windows x86_64 only for now
+    # Windows ARM64 release artifacts are not built (bun-windows-arm64 unsupported).
+    # The veld binary itself cross-compiles fine — build manually if needed:
+    #   cargo build --release --target aarch64-pc-windows-msvc
     if [ "$os" = "windows" ] && [ "$arch" != "x86_64" ]; then
-        err "Windows ARM64 binaries are not yet available"
+        err "Windows ${arch} prebuilt binaries unavailable. Build from source: cargo build --release --target aarch64-pc-windows-msvc"
     fi
 
     PLATFORM="${os}"

@@ -44,6 +44,13 @@ jobs:
             mcp_target: bun-linux-x64
             mcp_asset: veld-mcp-linux-x64
 
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            veld_bin: veld
+            veld_asset: veld-aarch64-linux
+            mcp_target: bun-linux-arm64
+            mcp_asset: veld-mcp-linux-arm64
+
     steps:
       - uses: actions/checkout@v4
 

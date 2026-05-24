@@ -68,7 +68,7 @@ Write-Host ""
 # Check architecture
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 if ($arch -ne "X64") {
-    Write-Err "Unsupported architecture: $arch. Only x86_64 Windows binaries are available."
+    Write-Err "Unsupported architecture: $arch. Windows ARM64 prebuilt binaries are not published (bun-windows-arm64 unsupported by the MCP server build). Build from source: cargo build --release --target aarch64-pc-windows-msvc"
 }
 Write-Info "Detected platform: x86_64-windows"
 
