@@ -138,6 +138,48 @@ pub enum Place {
     Url { href: String },
     /// A free-form named place when nothing else fits.
     Named { label: String },
+    /// A position in a named local cartesian frame (robot frame, site
+    /// frame, floor plan, etc.). Absorbs the legacy
+    /// `Experience.local_position` flat field — the migrator emits
+    /// `frame: "robot"` for that source.
+    LocalFrame {
+        /// Frame identifier — e.g. `"robot"`, `"site"`, `"floor:1"`.
+        frame: String,
+        x: f32,
+        y: f32,
+        z: f32,
+        /// Pose orientation in this frame, when known.
+        orientation: Option<Orientation>,
+    },
+    /// A geographic fix with full GPS/INS metadata — for callers that
+    /// have it. `Place::Geo` stays the simple-case variant; `GeoFix` is
+    /// the rich one. `resolved_geo()` reads both.
+    GeoFix {
+        lat: f64,
+        lon: f64,
+        alt: Option<f64>,
+        /// Horizontal accuracy in meters (95th percentile / HDOP-derived).
+        accuracy_m: Option<f32>,
+        /// Speed over ground (m/s).
+        speed_m_s: Option<f32>,
+        /// Course over ground (degrees, true north).
+        course_deg: Option<f32>,
+        /// When the fix was taken — distinct from `WhenFacet.encoded_at`.
+        captured_at: Option<DateTime<Utc>>,
+    },
+}
+
+/// Full 3-axis orientation in a [`Place::LocalFrame`]. Angles in degrees.
+///
+/// - **pitch** — rotation about the lateral (Y) axis (nose up / down).
+/// - **roll**  — rotation about the longitudinal (X) axis (banking).
+/// - **yaw**   — rotation about the vertical (Z) axis (heading; matches
+///   the simple-case `WhereFacet.heading` when only yaw is meaningful).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct Orientation {
+    pub pitch: f32,
+    pub roll: f32,
+    pub yaw: f32,
 }
 
 /// Lifecycle status of a [`PlanFacet`].

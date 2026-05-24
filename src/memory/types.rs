@@ -1058,6 +1058,7 @@ impl Experience {
     /// the flat surface for now.
     pub fn migrate_robotics_to_facets(&mut self) {
         let needs_context = self.geo_location.is_some()
+            || self.local_position.is_some()
             || self.heading.is_some()
             || self.terrain_type.is_some()
             || self.robot_id.is_some()
@@ -1099,6 +1100,27 @@ impl Experience {
                 .any(|p| matches!(p, Place::Named { label: l } if l == &label));
             if !already {
                 ctx.place.places.push(Place::Named { label });
+            }
+        }
+        // local_position → Place::LocalFrame { frame: "robot", x, y, z }.
+        // The legacy flat field carries no frame identifier; "robot" is the
+        // convention since `local_position` historically meant the robot's
+        // body frame. Orientation is left None — the flat field has no
+        // pitch/roll, only heading (carried separately on WhereFacet).
+        if let Some([x, y, z]) = self.local_position {
+            let already_local = ctx
+                .place
+                .places
+                .iter()
+                .any(|p| matches!(p, Place::LocalFrame { frame, .. } if frame == "robot"));
+            if !already_local {
+                ctx.place.places.push(Place::LocalFrame {
+                    frame: "robot".into(),
+                    x,
+                    y,
+                    z,
+                    orientation: None,
+                });
             }
         }
 
@@ -1155,8 +1177,12 @@ impl Experience {
     pub fn resolved_geo(&self) -> Option<(f64, f64, Option<f64>)> {
         if let Some(ctx) = &self.context {
             for place in &ctx.place.places {
-                if let Place::Geo { lat, lon, alt } = place {
-                    return Some((*lat, *lon, *alt));
+                // Both Place::Geo (simple case) and Place::GeoFix (rich GPS
+                // metadata) carry the same canonical (lat, lon, alt) triple.
+                match place {
+                    Place::Geo { lat, lon, alt } => return Some((*lat, *lon, *alt)),
+                    Place::GeoFix { lat, lon, alt, .. } => return Some((*lat, *lon, *alt)),
+                    _ => {}
                 }
             }
         }
@@ -1193,6 +1219,20 @@ impl Experience {
             }
         }
         self.mission_id.as_deref()
+    }
+
+    /// Resolved local-frame position — scans `WhereFacet.places` for the
+    /// first `Place::LocalFrame` and returns `(frame, x, y, z)`. Falls back
+    /// to the legacy `local_position` flat field with `frame = "robot"`.
+    pub fn resolved_local_position(&self) -> Option<(&str, f32, f32, f32)> {
+        if let Some(ctx) = &self.context {
+            for place in &ctx.place.places {
+                if let Place::LocalFrame { frame, x, y, z, .. } = place {
+                    return Some((frame.as_str(), *x, *y, *z));
+                }
+            }
+        }
+        self.local_position.map(|[x, y, z]| ("robot", x, y, z))
     }
 
     /// Resolved terrain — prefers a `Place::Named` with the `"terrain:"`
