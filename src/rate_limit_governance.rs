@@ -51,10 +51,15 @@ type KeyedLimiter =
 /// cell-interval calculation so the GCRA decision matches the previous wiring.
 fn build_quota(rps: u64, burst: u32) -> Quota {
     let rps = rps.max(1);
-    let cell_interval = Duration::from_nanos(1_000_000_000 / rps);
+    // Clamp so the cell interval is never zero — even if rps exceeds
+    // 1_000_000_000 (absurd but possible via VELD_RATE_LIMIT), give a 1ns
+    // cell. Without this guard `1_000_000_000 / rps` truncates to 0 and
+    // `Quota::with_period(ZERO)` panics — startup crash on bad env config.
+    let cell_nanos = (1_000_000_000 / rps).max(1);
+    let cell_interval = Duration::from_nanos(cell_nanos);
     let burst = NonZeroU32::new(burst.max(1)).expect("burst >= 1 enforced above");
     Quota::with_period(cell_interval)
-        .expect("cell interval is non-zero")
+        .expect("cell interval is non-zero (clamped above)")
         .allow_burst(burst)
 }
 

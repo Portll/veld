@@ -18,6 +18,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::rate_limit_governance::ResetHandle;
@@ -88,25 +89,18 @@ pub async fn reset_rate_limit(
         }
     };
 
-    // 3) Constant-time compare via `subtle`. Equal-length normalisation: if
-    //    lengths differ, force a no-match WITHOUT short-circuiting (the
-    //    `bool::from(... .ct_eq(...))` would already early-return on length
-    //    mismatch in `subtle`'s slice impl, so we add a length check + dummy
-    //    compare to keep timing flat).
-    let configured_bytes = configured_key.as_bytes();
-    let provided_bytes = provided.as_bytes();
-    let len_match = configured_bytes.len() == provided_bytes.len();
-    // Always compare a fixed-length buffer so the compare cost doesn't leak
-    // length information. If lengths differ, compare provided to itself
-    // (always equal), then explicitly fail via `len_match`.
-    let bytes_eq = if len_match {
-        bool::from(configured_bytes.ct_eq(provided_bytes))
-    } else {
-        let _ = bool::from(provided_bytes.ct_eq(provided_bytes));
-        false
-    };
+    // 3) Fixed-buffer constant-time compare. Hash both keys to 32-byte
+    //    SHA-256 digests and `ct_eq` those. The earlier length-equal-then-
+    //    `ct_eq` dance still leaked whether a guessed key length matched
+    //    the configured length via the dummy compare's size; hashing
+    //    eliminates the timing-length oracle entirely. The only attack
+    //    surface that remains is brute-force on the configured key itself,
+    //    which `VELD_ADMIN_API_KEY` length / entropy controls.
+    let configured_hash: [u8; 32] = Sha256::digest(configured_key.as_bytes()).into();
+    let provided_hash: [u8; 32] = Sha256::digest(provided.as_bytes()).into();
+    let bytes_eq = bool::from(configured_hash.ct_eq(&provided_hash));
 
-    if !(len_match && bytes_eq) {
+    if !bytes_eq {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "unauthorized"})),

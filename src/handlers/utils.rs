@@ -310,6 +310,16 @@ pub fn resolve_request_user_id(
     if let Some(authenticated_user) = authenticated_user {
         if let Some(request_user_id) = request_user_id {
             if request_user_id != authenticated_user.user_id {
+                // Audit cross-tenant isolation probes — previously the
+                // rejection was invisible to ops, leaving no signal that an
+                // attacker (or a buggy caller) was trying user IDs other
+                // than the one its API key is bound to.
+                tracing::warn!(
+                    audit = "cross_tenant_rejected",
+                    authenticated = %authenticated_user.user_id,
+                    requested = %request_user_id,
+                    "request user_id does not match the authenticated tenant binding"
+                );
                 return Err(AppError::InvalidInput {
                     field: "user_id".to_string(),
                     reason: "does not match the authenticated tenant binding".to_string(),
