@@ -7,9 +7,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub use super::facets::{
-    AgentRef, AgentRole, CausalLink, CausalRelation, ContentKind, EngramBinding, GoalRef, Place,
-    Prediction, RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet, WhyFacet,
+    AgentRef, AgentRole, CausalLink, ContentKind, EngramBinding, GoalRef, Place, Prediction,
+    RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet, WhyFacet,
 };
+use super::facets::CausalRelation;
 use crate::constants::{
     DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
     RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
@@ -819,6 +820,21 @@ pub struct Experience {
     // =========================================================================
     // NOTE: skip_serializing_if REMOVED - breaks bincode binary format
     // Binary formats like bincode are positional and require all fields to be present
+    //
+    // ─── W3.2d migration status ──────────────────────────────────────────
+    // These flat fields are now MIRRORED into the W3 facets when a memory
+    // is persisted (see Experience::migrate_robotics_to_facets). New code
+    // should prefer the facets:
+    //   - geo_location / heading / terrain_type → context.place (WhereFacet)
+    //   - robot_id                              → context.who   (WhoFacet)
+    //   - mission_id / causal_chain / predicted_outcome / prediction_accurate
+    //                                           → context.why   (WhyFacet)
+    // For reads, use the resolved_* accessors on Experience — they return
+    // facet data when present and fall back to these flat fields otherwise.
+    // The flat fields stay through one release for backward compatibility,
+    // then retire. Fields with no clean 5-W mapping (action_type,
+    // decision_context, sensor_data, weather, lighting, …) stay flat for now.
+    // ────────────────────────────────────────────────────────────────────
     /// Robot/drone identifier for multi-agent systems
     #[serde(default)]
     pub robot_id: Option<String>,
