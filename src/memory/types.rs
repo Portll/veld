@@ -7,8 +7,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub use super::facets::{
-    AgentRef, AgentRole, CausalLink, ContentKind, EngramBinding, GoalRef, Place, Prediction,
-    RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet, WhyFacet,
+    AgentRef, AgentRole, CausalLink, ContentKind, EngramBinding, GoalRef, Orientation, Place,
+    Prediction, RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet, WhyFacet,
 };
 use super::facets::CausalRelation;
 use crate::constants::{
