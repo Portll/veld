@@ -1816,14 +1816,16 @@ impl RetrievalEngine {
         // Apply additional filters
         memories.retain(|m| self.matches_filters(m, query));
 
-        // Sort by distance (closest first)
+        // Sort by distance (closest first). Read via resolved_geo so both
+        // Place::Geo (W3 WhereFacet) and the legacy flat geo_location field
+        // count toward the sort distance.
         memories.sort_by(|a, b| {
-            let dist_a = match a.experience.geo_location {
-                Some(geo) => geo_filter.haversine_distance(geo[0], geo[1]),
+            let dist_a = match a.experience.resolved_geo() {
+                Some((lat, lon, _alt)) => geo_filter.haversine_distance(lat, lon),
                 None => f64::MAX,
             };
-            let dist_b = match b.experience.geo_location {
-                Some(geo) => geo_filter.haversine_distance(geo[0], geo[1]),
+            let dist_b = match b.experience.resolved_geo() {
+                Some((lat, lon, _alt)) => geo_filter.haversine_distance(lat, lon),
                 None => f64::MAX,
             };
             // Tie-break: recency desc, then MemoryId asc — deterministic across runs (RH-10).

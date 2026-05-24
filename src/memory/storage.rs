@@ -1569,25 +1569,26 @@ impl MemoryStorage {
 
         // === Robotics Indices ===
 
-        // Index by robot_id (for multi-robot systems)
-        if let Some(ref robot_id) = memory.experience.robot_id {
+        // Index by robot_id (for multi-robot systems). Read via
+        // resolved_robot_id so the W3 WhoFacet SelfAgent indexes too.
+        if let Some(robot_id) = memory.experience.resolved_robot_id() {
             let robot_key = format!("robot:{}:{}", robot_id, memory.id.0);
             batch.put_cf(idx, robot_key.as_bytes(), b"1");
         }
 
-        // Index by mission_id (for mission context retrieval)
-        if let Some(ref mission_id) = memory.experience.mission_id {
+        // Index by mission_id (for mission context retrieval). Read via
+        // resolved_mission_id so the W3 WhyFacet goal_stack first entry counts.
+        if let Some(mission_id) = memory.experience.resolved_mission_id() {
             let mission_key = format!("mission:{}:{}", mission_id, memory.id.0);
             batch.put_cf(idx, mission_key.as_bytes(), b"1");
         }
 
-        // Index by geo_location (for spatial queries) using geohash
-        // Key format: geo:GEOHASH:memory_id (geohash at precision 10 = ~1.2m x 60cm)
-        // Geohash enables efficient prefix-based spatial queries
-        if let Some(geo) = memory.experience.geo_location {
-            let lat = geo[0];
-            let lon = geo[1];
-            // Use precision 10 for warehouse-level accuracy (~1.2m cells)
+        // Index by geo_location (for spatial queries) using geohash.
+        // Key format: geo:GEOHASH:memory_id (geohash precision 10 = ~1.2m x 60cm).
+        // Read via resolved_geo so both Place::Geo (W3) and the legacy flat
+        // field are indexed.
+        if let Some((lat, lon, _alt)) = memory.experience.resolved_geo() {
+            // Precision 10 — warehouse-level accuracy (~1.2m cells).
             let geohash = super::types::geohash_encode(lat, lon, 10);
             let geo_key = format!("geo:{}:{}", geohash, memory.id.0);
             batch.put_cf(idx, geo_key.as_bytes(), b"1");
@@ -1843,21 +1844,21 @@ impl MemoryStorage {
             }
         }
 
-        // Robot index
-        if let Some(ref robot_id) = memory.experience.robot_id {
+        // Robot index — must mirror update_indices's resolved_robot_id read.
+        if let Some(robot_id) = memory.experience.resolved_robot_id() {
             let robot_key = format!("robot:{}:{}", robot_id, id.0);
             batch.delete_cf(idx, robot_key.as_bytes());
         }
 
-        // Mission index
-        if let Some(ref mission_id) = memory.experience.mission_id {
+        // Mission index — must mirror update_indices's resolved_mission_id read.
+        if let Some(mission_id) = memory.experience.resolved_mission_id() {
             let mission_key = format!("mission:{}:{}", mission_id, id.0);
             batch.delete_cf(idx, mission_key.as_bytes());
         }
 
-        // Geo index
-        if let Some(geo) = memory.experience.geo_location {
-            let geohash = super::types::geohash_encode(geo[0], geo[1], 10);
+        // Geo index — must mirror update_indices's resolved_geo read.
+        if let Some((lat, lon, _alt)) = memory.experience.resolved_geo() {
+            let geohash = super::types::geohash_encode(lat, lon, 10);
             let geo_key = format!("geo:{}:{}", geohash, id.0);
             batch.delete_cf(idx, geo_key.as_bytes());
         }
