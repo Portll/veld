@@ -1019,6 +1019,298 @@ impl Default for Experience {
     }
 }
 
+impl Experience {
+    /// Migrate flat robotics / decision fields into the W3 facets (W3.2d).
+    ///
+    /// Populates `context.place` / `context.who` / `context.why` from the
+    /// legacy flat fields, idempotently — only sets facet members that are
+    /// currently empty or absent. Creates `context` if `None`. Does *not*
+    /// mutate the flat fields; they continue to round-trip until a future
+    /// release removes them.
+    ///
+    /// Mappings:
+    /// - `geo_location` (lat, lon, alt) → `Place::Geo`
+    /// - `heading` → `WhereFacet.heading`
+    /// - `terrain_type` → `Place::Named { label: "terrain:<t>" }`
+    /// - `robot_id` → `WhoFacet.agents` with `AgentRole::SelfAgent`
+    /// - `mission_id` → `WhyFacet.goal_stack` first entry
+    /// - `causal_chain` → `WhyFacet.causes` (each as `CausalRelation::Caused`)
+    /// - `predicted_outcome` / `prediction_accurate` → `WhyFacet.prediction`
+    ///
+    /// Fields with no clean 5-W mapping (action_type, decision_context,
+    /// sensor_data, weather, lighting, alternatives_considered, …) stay on
+    /// the flat surface for now.
+    pub fn migrate_robotics_to_facets(&mut self) {
+        let needs_context = self.geo_location.is_some()
+            || self.heading.is_some()
+            || self.terrain_type.is_some()
+            || self.robot_id.is_some()
+            || self.mission_id.is_some()
+            || !self.causal_chain.is_empty()
+            || self.predicted_outcome.is_some()
+            || self.prediction_accurate.is_some();
+        if !needs_context {
+            return;
+        }
+        let ctx = self
+            .context
+            .get_or_insert_with(|| crate::memory::context::ContextBuilder::new().build());
+
+        // WHERE: geo + heading + terrain.
+        if let Some([lat, lon, alt]) = self.geo_location {
+            let already_geo = ctx
+                .place
+                .places
+                .iter()
+                .any(|p| matches!(p, Place::Geo { .. }));
+            if !already_geo {
+                ctx.place.places.push(Place::Geo {
+                    lat,
+                    lon,
+                    alt: Some(alt),
+                });
+            }
+        }
+        if ctx.place.heading.is_none() {
+            ctx.place.heading = self.heading;
+        }
+        if let Some(t) = &self.terrain_type {
+            let label = format!("terrain:{t}");
+            let already = ctx
+                .place
+                .places
+                .iter()
+                .any(|p| matches!(p, Place::Named { label: l } if l == &label));
+            if !already {
+                ctx.place.places.push(Place::Named { label });
+            }
+        }
+
+        // WHO: robot_id as SelfAgent.
+        if let Some(rid) = &self.robot_id {
+            let already = ctx
+                .who
+                .agents
+                .iter()
+                .any(|a| a.name == *rid && a.role == AgentRole::SelfAgent);
+            if !already {
+                ctx.who.agents.push(AgentRef {
+                    entity_id: None,
+                    name: rid.clone(),
+                    role: AgentRole::SelfAgent,
+                });
+            }
+        }
+
+        // WHY: mission goal, prediction, causal chain.
+        if let Some(mid) = &self.mission_id {
+            let already = ctx.why.goal_stack.iter().any(|g| g.id == *mid);
+            if !already {
+                ctx.why.goal_stack.push(GoalRef {
+                    id: mid.clone(),
+                    label: None,
+                });
+            }
+        }
+        if ctx.why.prediction.is_none()
+            && (self.predicted_outcome.is_some() || self.prediction_accurate.is_some())
+        {
+            ctx.why.prediction = Some(Prediction {
+                expected: self.predicted_outcome.clone(),
+                observed: None,
+                accurate: self.prediction_accurate,
+            });
+        }
+        for cause_id in &self.causal_chain {
+            let already = ctx.why.causes.iter().any(|c| c.other == *cause_id);
+            if !already {
+                ctx.why.causes.push(CausalLink {
+                    other: cause_id.clone(),
+                    relation: CausalRelation::Caused,
+                    confidence: 1.0,
+                    inferred: false,
+                });
+            }
+        }
+    }
+
+    /// Resolved spatial coordinates — prefers a `Place::Geo` in
+    /// `context.place.places` over the legacy `geo_location` flat field.
+    pub fn resolved_geo(&self) -> Option<(f64, f64, Option<f64>)> {
+        if let Some(ctx) = &self.context {
+            for place in &ctx.place.places {
+                if let Place::Geo { lat, lon, alt } = place {
+                    return Some((*lat, *lon, *alt));
+                }
+            }
+        }
+        self.geo_location.map(|[lat, lon, alt]| (lat, lon, Some(alt)))
+    }
+
+    /// Resolved heading — prefers `WhereFacet.heading` over the flat field.
+    pub fn resolved_heading(&self) -> Option<f32> {
+        self.context
+            .as_ref()
+            .and_then(|c| c.place.heading)
+            .or(self.heading)
+    }
+
+    /// Resolved robot identifier — prefers the first `AgentRef` with
+    /// `AgentRole::SelfAgent` over the legacy `robot_id` flat field.
+    pub fn resolved_robot_id(&self) -> Option<&str> {
+        if let Some(ctx) = &self.context {
+            for agent in &ctx.who.agents {
+                if agent.role == AgentRole::SelfAgent {
+                    return Some(agent.name.as_str());
+                }
+            }
+        }
+        self.robot_id.as_deref()
+    }
+
+    /// Resolved mission identifier — prefers the first
+    /// `WhyFacet.goal_stack` entry over the legacy `mission_id` flat field.
+    pub fn resolved_mission_id(&self) -> Option<&str> {
+        if let Some(ctx) = &self.context {
+            if let Some(g) = ctx.why.goal_stack.first() {
+                return Some(g.id.as_str());
+            }
+        }
+        self.mission_id.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod w3_migration_tests {
+    use super::*;
+
+    #[test]
+    fn migrate_populates_place_geo_from_geo_location() {
+        let mut exp = Experience {
+            geo_location: Some([37.7749, -122.4194, 10.0]),
+            heading: Some(180.0),
+            ..Default::default()
+        };
+        exp.migrate_robotics_to_facets();
+        let ctx = exp.context.as_ref().expect("context created");
+        let geo = ctx
+            .place
+            .places
+            .iter()
+            .find(|p| matches!(p, Place::Geo { .. }))
+            .expect("Place::Geo present");
+        if let Place::Geo { lat, lon, alt } = geo {
+            assert!((lat - 37.7749).abs() < 1e-9);
+            assert!((lon - (-122.4194)).abs() < 1e-9);
+            assert_eq!(*alt, Some(10.0));
+        }
+        assert_eq!(ctx.place.heading, Some(180.0));
+        // Flat fields are not mutated.
+        assert!(exp.geo_location.is_some());
+        assert_eq!(exp.heading, Some(180.0));
+    }
+
+    #[test]
+    fn migrate_populates_who_robot_id_as_self_agent() {
+        let mut exp = Experience {
+            robot_id: Some("drone-007".into()),
+            ..Default::default()
+        };
+        exp.migrate_robotics_to_facets();
+        let ctx = exp.context.as_ref().unwrap();
+        assert_eq!(ctx.who.agents.len(), 1);
+        assert_eq!(ctx.who.agents[0].name, "drone-007");
+        assert_eq!(ctx.who.agents[0].role, AgentRole::SelfAgent);
+    }
+
+    #[test]
+    fn migrate_populates_why_prediction_and_causal_chain() {
+        let cause = MemoryId(Uuid::new_v4());
+        let mut exp = Experience {
+            mission_id: Some("survey-alpha".into()),
+            predicted_outcome: Some("success".into()),
+            prediction_accurate: Some(true),
+            causal_chain: vec![cause.clone()],
+            ..Default::default()
+        };
+        exp.migrate_robotics_to_facets();
+        let ctx = exp.context.as_ref().unwrap();
+        assert_eq!(ctx.why.goal_stack[0].id, "survey-alpha");
+        let pred = ctx.why.prediction.as_ref().unwrap();
+        assert_eq!(pred.expected.as_deref(), Some("success"));
+        assert_eq!(pred.accurate, Some(true));
+        assert_eq!(ctx.why.causes.len(), 1);
+        assert_eq!(ctx.why.causes[0].other, cause);
+        assert_eq!(ctx.why.causes[0].relation, CausalRelation::Caused);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let mut exp = Experience {
+            geo_location: Some([1.0, 2.0, 3.0]),
+            robot_id: Some("robo".into()),
+            causal_chain: vec![MemoryId(Uuid::new_v4())],
+            ..Default::default()
+        };
+        exp.migrate_robotics_to_facets();
+        let first_places = exp.context.as_ref().unwrap().place.places.len();
+        let first_agents = exp.context.as_ref().unwrap().who.agents.len();
+        let first_causes = exp.context.as_ref().unwrap().why.causes.len();
+        exp.migrate_robotics_to_facets();
+        let ctx = exp.context.as_ref().unwrap();
+        assert_eq!(ctx.place.places.len(), first_places);
+        assert_eq!(ctx.who.agents.len(), first_agents);
+        assert_eq!(ctx.why.causes.len(), first_causes);
+    }
+
+    #[test]
+    fn migrate_is_no_op_when_flat_fields_empty() {
+        let mut exp = Experience::default();
+        exp.migrate_robotics_to_facets();
+        // No context is created since nothing needed migrating.
+        assert!(exp.context.is_none());
+    }
+
+    #[test]
+    fn resolved_geo_prefers_facet_over_flat_field() {
+        let mut exp = Experience {
+            geo_location: Some([10.0, 20.0, 0.0]),
+            ..Default::default()
+        };
+        // No context yet — falls back to flat.
+        assert_eq!(exp.resolved_geo(), Some((10.0, 20.0, Some(0.0))));
+        exp.migrate_robotics_to_facets();
+        assert_eq!(exp.resolved_geo(), Some((10.0, 20.0, Some(0.0))));
+        // Override the facet to verify it is read first.
+        if let Some(ctx) = exp.context.as_mut() {
+            ctx.place.places.clear();
+            ctx.place.places.push(Place::Geo {
+                lat: 50.0,
+                lon: 60.0,
+                alt: Some(70.0),
+            });
+        }
+        assert_eq!(exp.resolved_geo(), Some((50.0, 60.0, Some(70.0))));
+    }
+
+    #[test]
+    fn resolved_robot_id_prefers_facet() {
+        let mut exp = Experience {
+            robot_id: Some("flat-robot".into()),
+            ..Default::default()
+        };
+        assert_eq!(exp.resolved_robot_id(), Some("flat-robot"));
+        let mut ctx = crate::memory::context::ContextBuilder::new().build();
+        ctx.who.agents.push(AgentRef {
+            entity_id: None,
+            name: "facet-robot".into(),
+            role: AgentRole::SelfAgent,
+        });
+        exp.context = Some(ctx);
+        assert_eq!(exp.resolved_robot_id(), Some("facet-robot"));
+    }
+}
+
 /// Mutable metadata for memory (interior mutability)
 /// Separated from immutable core data to enable zero-copy updates via Arc<Memory>
 #[derive(Debug, Clone, Serialize, Deserialize)]
