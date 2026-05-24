@@ -129,7 +129,7 @@ fn create_rich_context(project_id: Option<String>, code_ctx: Option<CodeContext>
         emotional: Default::default(),
         source: Default::default(),
         episode: Default::default(),
-        repository: Default::default(),
+        place: Default::default(),
         parent: None,
         embeddings: None,
         decay_rate: 0.1,

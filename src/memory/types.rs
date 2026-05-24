@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub use super::facets::{RecordKind, RepositoryContext};
+pub use super::facets::{Place, RecordKind, WhereFacet};
 use crate::constants::{
     DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
     RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
@@ -295,10 +295,12 @@ pub struct RichContext {
     #[serde(default)]
     pub episode: EpisodeContext,
 
-    /// Repository context — version-control identity (W3). New field; older
-    /// serialized contexts deserialize with a default (empty) RepositoryContext.
+    /// Spatial / locational facet — the WHERE of an engram (W3, layered
+    /// `Place` model). Absorbs the first-pass `RepositoryContext` as
+    /// `Place::Repo`. Older serialized contexts deserialize with an empty
+    /// default. See `docs/neuroscience-5w-memory-design.md`.
     #[serde(default)]
-    pub repository: RepositoryContext,
+    pub place: WhereFacet,
 
     /// Parent context (for hierarchical context)
     pub parent: Option<Box<RichContext>>,

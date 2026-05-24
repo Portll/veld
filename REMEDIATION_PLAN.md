@@ -75,6 +75,13 @@ Shrink `Experience`/`Memory`/`Query`; move domain data into typed facets attache
 when relevant, so adding a domain never grows the core type. See the design section
 below. Scaffold landed in `src/memory/facets.rs`.
 
+**2026-05-21 revision.** Refined by the neuroscience-driven 5-W design
+([docs/neuroscience-5w-memory-design.md](docs/neuroscience-5w-memory-design.md)):
+the first-pass `RepositoryContext` has been absorbed as `Place::Repo` inside a
+new layered `WhereFacet`. WHAT and WHEN will fold into the minimal core;
+WHERE / WHO / WHY / EngramBinding become the optional facets. Subsequent W3
+steps assume the 5-W layout.
+
 ### W5 — Log-structured projection layer (cross-store consistency)
 Veld already treats RocksDB as truth and Vamana/BM25/SQLite as rebuildable projections.
 Formalize it: a durable, checksummed intent-log; projections are checkpointed and

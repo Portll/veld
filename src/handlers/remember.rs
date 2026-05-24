@@ -279,7 +279,7 @@ pub fn build_rich_context(
         emotional,
         source,
         episode,
-        repository: Default::default(),
+        place: Default::default(),
         conversation: Default::default(),
         user: Default::default(),
         project: Default::default(),
