@@ -1,5 +1,5 @@
 {
-  "$schema": "https://claude.ai/settings-schema.json",
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "allow": [
       "mcp__veld-memory"
@@ -20,7 +20,7 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": {},
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -32,7 +32,7 @@
     ],
     "UserPromptSubmit": [
       {
-        "matcher": {},
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -44,81 +44,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": {
-          "tool_name": ["Edit", "Write", "MultiEdit"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Bash"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Read"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Task"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Search", "Grep", "Glob"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["WebFetch"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PreToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["NotebookEdit"]
-        },
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -130,93 +56,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": {
-          "tool_name": ["Edit", "Write", "MultiEdit"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Bash"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Read"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Task"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["TodoRead", "TodoWrite"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["Search", "Grep", "Glob", "ListFiles", "LS"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["WebFetch"]
-        },
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun run hooks/memory-hook.ts PostToolUse",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": {
-          "tool_name": ["NotebookEdit"]
-        },
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -228,7 +68,7 @@
     ],
     "SubagentStop": [
       {
-        "matcher": {},
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -240,7 +80,7 @@
     ],
     "Stop": [
       {
-        "matcher": {},
+        "matcher": "",
         "hooks": [
           {
             "type": "command",

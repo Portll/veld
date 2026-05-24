@@ -26,6 +26,7 @@
 //! separate facets.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::types::MemoryId;
 
@@ -197,6 +198,208 @@ pub struct LearningFacet {
     pub confidence: f32,
 }
 
+// =============================================================================
+// WHO — provenance + agent identity (W3.3)
+// =============================================================================
+
+/// The WHO of an engram — source-monitoring provenance plus the agents involved.
+///
+/// Splits the two dissociable senses identified in
+/// `docs/neuroscience-5w-memory-design.md`: provenance (which channel told us
+/// this, with what credibility) and agent identity (the persons in this engram
+/// and their roles relative to the self).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WhoFacet {
+    /// Source-monitoring channel. Subsumes the first-pass `SourceContext`.
+    pub provenance: Provenance,
+    /// Persons / agents present in this engram with their roles.
+    pub agents: Vec<AgentRef>,
+}
+
+/// Source-monitoring metadata: where the information came from, how credibly,
+/// and through how many hops.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Provenance {
+    /// The source channel kind (e.g. `"user"`, `"tool"`, `"github_webhook"`).
+    pub source_kind: Option<String>,
+    /// Identifier of the source within its kind.
+    pub source_id: Option<String>,
+    /// Operator-assigned credibility weight, 0.0–1.0. Feeds retrieval ranking.
+    pub credibility: f32,
+    /// Whether this engram has been independently verified.
+    pub verified: bool,
+    /// Structured relay chain — each hop the information passed through.
+    pub chain: Vec<ProvenanceHop>,
+}
+
+/// One hop in a provenance chain.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProvenanceHop {
+    pub source_kind: Option<String>,
+    pub source_id: Option<String>,
+    pub credibility: Option<f32>,
+}
+
+/// A reference to an agent (person, organization, self) in an engram.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRef {
+    /// Link to the graph Person/Organization entity, when known.
+    pub entity_id: Option<Uuid>,
+    /// Human-readable name.
+    pub name: String,
+    /// Role this agent plays in the engram.
+    pub role: AgentRole,
+}
+
+/// How an agent participates in an engram. Self / Author / Subject / Audience /
+/// Mentioned are dissociable in episodic memory (distinct social-brain
+/// mPFC/TPJ functions) and must not be collapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    /// The self — this agent/assistant. mPFC self-referential marker.
+    SelfAgent,
+    /// Produced or asserted the content.
+    Author,
+    /// What the content is about — the neutral default.
+    #[default]
+    Subject,
+    /// To whom the content was addressed.
+    Audience,
+    /// A third party merely mentioned.
+    Mentioned,
+}
+
+// =============================================================================
+// WHY — goals, causal links, event-model boundaries (W3.3)
+// =============================================================================
+
+/// The WHY of an engram — goals served, typed causal links, the event model
+/// active at encoding, and prediction / boundary signals.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WhyFacet {
+    /// Goals served by this engram, immediate goal first, nesting up.
+    pub goal_stack: Vec<GoalRef>,
+    /// Typed causal links to other memories (replaces the bare
+    /// `causal_chain: Vec<MemoryId>`).
+    pub causes: Vec<CausalLink>,
+    /// The active event model at encoding — Event Segmentation Theory's
+    /// "what is happening and why" frame.
+    pub event_model: Option<String>,
+    /// Did this engram open a new event? Why did the boundary fire?
+    pub boundary: Option<BoundaryCause>,
+    /// Prediction at encoding and whether it held — schema-violation signal.
+    pub prediction: Option<Prediction>,
+    /// Identifier of the schema this engram instantiates (vmPFC schema slot).
+    pub schema_id: Option<String>,
+}
+
+/// A reference to a goal a record served.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GoalRef {
+    /// Stable identifier — a Plan record id, or a free-form name until goals
+    /// get a first-class record kind.
+    pub id: String,
+    /// Optional human-readable label.
+    pub label: Option<String>,
+}
+
+/// A typed causal link between this engram and another memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalLink {
+    /// The other memory.
+    pub other: MemoryId,
+    /// The kind of causal relation.
+    pub relation: CausalRelation,
+    /// Confidence in this link, 0.0–1.0.
+    pub confidence: f32,
+    /// Was this link observed or inferred? Inferred links are weaker evidence
+    /// at retrieval — the source-monitoring discipline applied to Veld's own
+    /// inferences.
+    pub inferred: bool,
+}
+
+/// Kinds of causal relation between memories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalRelation {
+    /// Strictly caused.
+    #[default]
+    Caused,
+    /// Triggered without strictly causing.
+    Triggered,
+    /// Made possible.
+    Enabled,
+    /// Prevented.
+    Prevented,
+    /// Provided motivation.
+    Motivated,
+}
+
+/// Why a new event boundary fired at this engram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryCause {
+    /// A new goal opened.
+    GoalChange,
+    /// An expectation was violated — Event Segmentation Theory's trigger.
+    PredictionError,
+    /// WHERE shifted significantly.
+    LocationChange,
+    /// WHO shifted.
+    AgentChange,
+    /// A long idle gap.
+    TemporalGap,
+}
+
+/// A prediction made at encoding and its observed outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Prediction {
+    /// What was predicted.
+    pub expected: Option<String>,
+    /// What was observed.
+    pub observed: Option<String>,
+    /// Whether the prediction held — `None` if not yet evaluated.
+    pub accurate: Option<bool>,
+}
+
+// =============================================================================
+// CONJUNCTIVE BINDING — the hippocampal-index analogue (W3.3)
+// =============================================================================
+
+/// Cross-facet binding strength + presence — the hippocampal-index analogue.
+///
+/// The hippocampus does not store the five W's; it stores a sparse conjunctive
+/// code that points at them. `EngramBinding` records *that* an engram's W's are
+/// bound, *which* are present and reliable, and *how confidently* — so a
+/// partially-reconstructed engram never presents a confabulated conjunction as
+/// a real memory.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EngramBinding {
+    /// Stable hash over the engram's W-anchors (who_id, where_id, when_bucket,
+    /// why_id). Collision = candidate duplicate / reconsolidation target.
+    pub conjunctive_key: Option<String>,
+    /// Recollection strength of the binding itself, 0.0 = gist only, 1.0 = full
+    /// episodic detail. Decays faster than the W-facets it binds — models
+    /// hippocampal-dependent detail loss while neocortical gist persists.
+    pub binding_strength: f32,
+    /// Which W-facets carry usable data for this engram.
+    pub present: WFacetMask,
+}
+
+/// Which W-facets are populated and reliable for an engram. Serialized as an
+/// object of bools so adding a sixth W later doesn't break existing data.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct WFacetMask {
+    pub what: bool,
+    /// `where` is a Rust keyword — field name is escaped, JSON key is `where`.
+    #[serde(rename = "where")]
+    pub where_: bool,
+    pub when: bool,
+    pub who: bool,
+    pub why: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +491,90 @@ mod tests {
         let back: WhereFacet = serde_json::from_str(&json).unwrap();
         assert_eq!(back.places.len(), 2);
         assert_eq!(back.conceptual_anchors, w.conceptual_anchors);
+    }
+
+    #[test]
+    fn agent_role_defaults_to_subject() {
+        assert_eq!(AgentRole::default(), AgentRole::Subject);
+    }
+
+    #[test]
+    fn who_facet_round_trip() {
+        let w = WhoFacet {
+            provenance: Provenance {
+                source_kind: Some("user".into()),
+                source_id: Some("john".into()),
+                credibility: 0.9,
+                verified: true,
+                chain: vec![],
+            },
+            agents: vec![AgentRef {
+                entity_id: None,
+                name: "John".into(),
+                role: AgentRole::Author,
+            }],
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        let back: WhoFacet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agents.len(), 1);
+        assert_eq!(back.agents[0].role, AgentRole::Author);
+        assert!(back.provenance.verified);
+    }
+
+    #[test]
+    fn why_facet_with_causal_link_round_trip() {
+        let other = MemoryId(Uuid::new_v4());
+        let why = WhyFacet {
+            goal_stack: vec![GoalRef {
+                id: "ship-w3".into(),
+                label: Some("ship W3".into()),
+            }],
+            causes: vec![CausalLink {
+                other,
+                relation: CausalRelation::Triggered,
+                confidence: 0.8,
+                inferred: true,
+            }],
+            event_model: Some("planning the next step".into()),
+            boundary: Some(BoundaryCause::GoalChange),
+            prediction: None,
+            schema_id: None,
+        };
+        let json = serde_json::to_string(&why).unwrap();
+        let back: WhyFacet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.goal_stack.len(), 1);
+        assert_eq!(back.causes.len(), 1);
+        assert_eq!(back.causes[0].relation, CausalRelation::Triggered);
+        assert!(back.causes[0].inferred);
+        assert_eq!(back.boundary, Some(BoundaryCause::GoalChange));
+    }
+
+    #[test]
+    fn engram_binding_defaults_are_inert() {
+        let b = EngramBinding::default();
+        assert!(b.conjunctive_key.is_none());
+        assert_eq!(b.binding_strength, 0.0);
+        assert!(!b.present.what);
+        assert!(!b.present.where_);
+        assert!(!b.present.when);
+        assert!(!b.present.who);
+        assert!(!b.present.why);
+    }
+
+    #[test]
+    fn wfacet_mask_serializes_where_with_rust_keyword_safe_alias() {
+        let m = WFacetMask {
+            what: true,
+            where_: true,
+            when: false,
+            who: false,
+            why: false,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        // The escaped `where_` Rust field serializes to JSON `"where"`.
+        assert!(json.contains("\"where\":true"));
+        assert!(!json.contains("where_"));
+        let back: WFacetMask = serde_json::from_str(&json).unwrap();
+        assert!(back.where_);
     }
 }

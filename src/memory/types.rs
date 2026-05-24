@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub use super::facets::{Place, RecordKind, WhereFacet};
+pub use super::facets::{EngramBinding, Place, RecordKind, WhereFacet, WhoFacet, WhyFacet};
 use crate::constants::{
     DEFAULT_MAX_RESULTS, IMPORTANCE_FLOOR, RECENCY_FULL_DAYS, RECENCY_HIGH_DAYS,
     RECENCY_HIGH_WEIGHT, RECENCY_LOW_WEIGHT, RECENCY_MEDIUM_DAYS, RECENCY_MEDIUM_WEIGHT,
@@ -301,6 +301,18 @@ pub struct RichContext {
     /// default. See `docs/neuroscience-5w-memory-design.md`.
     #[serde(default)]
     pub place: WhereFacet,
+
+    /// Provenance + agent identity — the WHO of an engram (W3.3 facet).
+    #[serde(default)]
+    pub who: WhoFacet,
+
+    /// Goals + typed causal links + event-model — the WHY of an engram (W3.3).
+    #[serde(default)]
+    pub why: WhyFacet,
+
+    /// Conjunctive binding — cross-W presence + binding strength (W3.3).
+    #[serde(default)]
+    pub binding: EngramBinding,
 
     /// Parent context (for hierarchical context)
     pub parent: Option<Box<RichContext>>,

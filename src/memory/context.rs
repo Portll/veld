@@ -43,6 +43,9 @@ impl ContextBuilder {
                 source: SourceContext::default(),
                 episode: EpisodeContext::default(),
                 place: Default::default(),
+                who: Default::default(),
+                why: Default::default(),
+                binding: Default::default(),
                 parent: None,
                 embeddings: None,
                 decay_rate: 0.1, // Default decay
