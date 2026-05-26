@@ -1238,6 +1238,102 @@ pub async fn anchor_memory(
     }))
 }
 
+/// Request body for the tier-move endpoint.
+#[derive(Debug, Deserialize)]
+pub struct TierMoveRequest {
+    pub user_id: String,
+    pub memory_id: String,
+    /// One of: "working", "session", "longterm" / "long_term", "archive"
+    pub target_tier: String,
+}
+
+/// Response for tier-move operations.
+#[derive(Debug, Serialize)]
+pub struct TierMoveResponse {
+    pub success: bool,
+    pub memory_id: String,
+    pub previous_tier: String,
+    pub current_tier: String,
+}
+
+fn parse_memory_tier(s: &str) -> Result<memory::MemoryTier, AppError> {
+    match s.to_lowercase().replace('_', "").as_str() {
+        "working" | "hot" => Ok(memory::MemoryTier::Working),
+        "session" => Ok(memory::MemoryTier::Session),
+        "longterm" | "long" => Ok(memory::MemoryTier::LongTerm),
+        "archive" | "cold" => Ok(memory::MemoryTier::Archive),
+        other => Err(AppError::InvalidInput {
+            field: "target_tier".to_string(),
+            reason: format!(
+                "Unknown tier '{other}' — expected working / session / longterm / archive"
+            ),
+        }),
+    }
+}
+
+fn tier_to_str(tier: memory::MemoryTier) -> &'static str {
+    match tier {
+        memory::MemoryTier::Working => "working",
+        memory::MemoryTier::Session => "session",
+        memory::MemoryTier::LongTerm => "longterm",
+        memory::MemoryTier::Archive => "archive",
+    }
+}
+
+/// POST /api/memory/tier — Agent-initiated tier move.
+///
+/// Lets the agent explicitly promote a memory back to the working tier
+/// (hot context) or push it down to archive. Differs from automatic
+/// promotion/demotion (which only moves one step) by jumping directly to
+/// the target tier.
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, memory_id = %req.memory_id, target = %req.target_tier))]
+pub async fn move_memory_tier(
+    State(state): State<AppState>,
+    Json(req): Json<TierMoveRequest>,
+) -> Result<Json<TierMoveResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let uuid = uuid::Uuid::parse_str(&req.memory_id).map_err(|_| AppError::InvalidInput {
+        field: "memory_id".to_string(),
+        reason: "Invalid UUID format".to_string(),
+    })?;
+    let memory_id = memory::MemoryId(uuid);
+    let target_tier = parse_memory_tier(&req.target_tier)?;
+
+    let memory_sys = state
+        .get_user_earth(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let mid = memory_id.clone();
+    let previous_tier = tokio::task::spawn_blocking(move || {
+        let guard = memory_sys.read();
+        guard.move_to_tier(&mid, target_tier)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    state.emit_event(MemoryEvent {
+        event_type: "TIER_MOVE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: req.user_id.clone(),
+        memory_id: Some(req.memory_id.clone()),
+        content_preview: None,
+        memory_type: Some(tier_to_str(target_tier).to_string()),
+        importance: None,
+        count: None,
+        entities: None,
+        results: None,
+    });
+
+    Ok(Json(TierMoveResponse {
+        success: true,
+        memory_id: req.memory_id,
+        previous_tier: tier_to_str(previous_tier).to_string(),
+        current_tier: tier_to_str(target_tier).to_string(),
+    }))
+}
+
 fn parse_experience_type(type_str: &str) -> Result<ExperienceType, AppError> {
     match type_str.to_lowercase().as_str() {
         "observation" => Ok(ExperienceType::Observation),

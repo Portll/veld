@@ -3956,6 +3956,82 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Agent-initiated tier move. Updates the persistent record's `tier`
+    /// field and adjusts hot-cache (working/session) membership to match.
+    /// Returns the previous tier so callers can audit the transition.
+    ///
+    /// Long-term storage is the source of truth — every memory has a row
+    /// there regardless of tier. Working/session are Arc caches for
+    /// frequently-accessed memories; this method ensures cache membership
+    /// matches the new tier:
+    ///   - `Working` → present only in `working_memory`
+    ///   - `Session` → present only in `session_memory`
+    ///   - `LongTerm` / `Archive` → not cached (long-term only)
+    ///
+    /// Unlike automatic promotion/demotion (which moves one tier at a time),
+    /// this method jumps directly to the target tier.
+    pub fn move_to_tier(
+        &self,
+        memory_id: &MemoryId,
+        target_tier: MemoryTier,
+    ) -> Result<MemoryTier> {
+        let mut memory = self.long_term_memory.get(memory_id)?;
+        let previous_tier = memory.tier;
+
+        if previous_tier == target_tier {
+            return Ok(previous_tier);
+        }
+
+        memory.tier = target_tier;
+        self.long_term_memory.update(&memory)?;
+
+        let shared = Arc::new(memory);
+
+        {
+            let mut wm = self.working_memory.write();
+            if wm.contains(memory_id) {
+                let _ = wm.remove(memory_id);
+            }
+        }
+        {
+            let mut sm = self.session_memory.write();
+            if sm.contains(memory_id) {
+                let _ = sm.remove(memory_id);
+            }
+        }
+
+        match target_tier {
+            MemoryTier::Working => {
+                let _ = self.working_memory.write().add_shared(Arc::clone(&shared));
+            }
+            MemoryTier::Session => {
+                let _ = self.session_memory.write().add_shared(Arc::clone(&shared));
+            }
+            MemoryTier::LongTerm | MemoryTier::Archive => {
+                // long-term storage is the canonical home; no cache entry needed
+            }
+        }
+
+        tracing::info!(
+            memory_id = %memory_id.0,
+            from = ?previous_tier,
+            to = ?target_tier,
+            "Agent-initiated tier move"
+        );
+
+        Ok(previous_tier)
+    }
+
+    /// Toggle the `anchored` flag on a memory and persist. Anchored memories
+    /// resist automatic decay below `ANCHOR_IMPORTANCE_FLOOR` and are skipped
+    /// during compression — used by agents to pin critical facts.
+    pub fn set_memory_anchor(&self, memory_id: &MemoryId, anchored: bool) -> Result<()> {
+        let memory = self.long_term_memory.get(memory_id)?;
+        memory.set_anchored(anchored);
+        self.update_memory(&memory)?;
+        Ok(())
+    }
+
     /// Get children of a memory
     pub fn get_memory_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
         self.long_term_memory.get_children(parent_id)
