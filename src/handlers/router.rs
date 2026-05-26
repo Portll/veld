@@ -20,11 +20,50 @@ use super::{
 /// Application state type alias
 pub type AppState = Arc<MultiUserMemoryManager>;
 
-/// Build the public routes (no authentication required)
+/// Structural circuit breaker — the **complete** list of paths reachable
+/// without API-key authentication. `build_probe_routes` and
+/// `build_public_routes` are derived from these consts; the
+/// `public_router_has_no_per_user_handlers` test asserts no handler mounted
+/// here reads `?user_id=` for per-tenant data.
 ///
-/// Build Kubernetes probe routes — never rate-limited, always public.
-/// These four paths must remain unconditionally accessible so orchestrators
-/// can always determine liveness/readiness even under a saturated rate limiter.
+/// Adding a path here must be a deliberate decision — if a future contributor
+/// adds a route to one of these builders without updating the const, the
+/// `public_router_paths_match_const` test fails. If the new route reads
+/// `?user_id=`, the structural test fails. That stops the next
+/// `health_ready`/`health_index` slip.
+///
+/// `/metrics` is conditionally public via `ServerConfig::metrics_public` and is
+/// listed in `METRICS_PATH_IF_PUBLIC`; it is not in `PUBLIC_PATHS` because its
+/// presence depends on runtime config.
+pub const PROBE_PATHS: &[&str] = &[
+    "/health",
+    "/health/live",
+    "/health/ready",
+    "/health/index",
+];
+
+/// Non-probe public paths (no authentication required). See `PROBE_PATHS` for
+/// the security contract and `public_router_has_no_per_user_handlers` for the
+/// enforcement test.
+pub const PUBLIC_PATHS: &[&str] = &[
+    "/api/context/status",
+    "/api/context_status",
+    "/graph/view",
+    "/api/admin/reset-rate-limit",
+];
+
+/// `/metrics` is mounted on the public router only when
+/// `ServerConfig::metrics_public` is true; otherwise it lives behind auth.
+pub const METRICS_PATH_IF_PUBLIC: &str = "/metrics";
+
+/// Build the public Kubernetes probe routes — never rate-limited, always
+/// public. These four paths must remain unconditionally accessible so
+/// orchestrators can always determine liveness/readiness even under a
+/// saturated rate limiter.
+///
+/// **Security contract:** none of these handlers may read `?user_id=` for
+/// per-tenant data. Per-user readiness/index live on the authenticated
+/// `/api/health/*` routes (see `build_protected_routes`).
 pub fn build_probe_routes(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
@@ -45,38 +84,23 @@ pub fn build_probe_routes(state: AppState) -> Router {
 ///   - true: mounted here, rate-limited when `public_rate_limit` is true.
 pub fn build_public_routes(state: AppState, metrics_public: bool) -> Router {
     let r = Router::new()
-        // =================================================================
-        // METRICS (PROMETHEUS) — public only when VELD_METRICS_PUBLIC=true
-        // =================================================================
-        // =================================================================
         // CONTEXT STATUS (GET only - status reads remain public)
-        // =================================================================
         .route("/api/context/status", get(health::get_context_status))
         .route("/api/context_status", get(health::get_context_status)) // TUI GET alias
-        // SSE moved to protected routes (was leaking session/token/task info without auth)
-        // Webhooks moved to protected routes (rate limiting required)
-        // =================================================================
-        // GRAPH VISUALIZATION (PUBLIC - HTML VIEWER ONLY)
-        // Intentionally unauthenticated: serves only a static HTML shell
-        // with no memory data. Dynamic data loads via authenticated API calls
-        // from the client side. Move behind auth if the HTML itself becomes
-        // sensitive (e.g., embeds user-specific content).
-        // =================================================================
+        // GRAPH VISUALIZATION (HTML viewer only — no memory data in the
+        // static shell; dynamic data loads via authenticated API calls).
         .route("/graph/view", get(visualization::graph_view))
-        // =================================================================
-        // ADMIN OPERATIONAL ENDPOINTS
-        //
-        // Mounted on the public router specifically so a stuck rate limiter
-        // can never block its own recovery. The endpoint enforces its own
-        // separate auth via X-Admin-API-Key + VELD_ADMIN_API_KEY env var.
-        // =================================================================
+        // ADMIN OPERATIONAL ENDPOINTS — mounted on the public router so a
+        // stuck rate limiter can never block its own recovery. The endpoint
+        // enforces its own separate auth via X-Admin-API-Key +
+        // VELD_ADMIN_API_KEY env var (handlers/admin.rs).
         .route(
             "/api/admin/reset-rate-limit",
             post(admin::reset_rate_limit),
         );
 
     let r = if metrics_public {
-        r.route("/metrics", get(health::metrics_endpoint))
+        r.route(METRICS_PATH_IF_PUBLIC, get(health::metrics_endpoint))
     } else {
         r
     };
@@ -102,6 +126,13 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
     };
 
     r
+        // =================================================================
+        // PER-USER HEALTH (auth required — tenant-bound via
+        // resolve_request_user_id; replaces the leaked ?user_id= branches
+        // formerly on the public probes)
+        // =================================================================
+        .route("/api/health/ready", get(health::health_ready_user))
+        .route("/api/health/index", get(health::health_index_user))
         // =================================================================
         // CONTEXT SSE + STATUS (auth required — SSE leaks session/token/task info)
         // =================================================================
@@ -553,4 +584,154 @@ pub fn build_router(state: AppState, metrics_public: bool) -> Router {
     let protected = build_protected_routes(state, metrics_public);
 
     Router::new().merge(probes).merge(public).merge(protected)
+}
+
+#[cfg(test)]
+mod public_router_structural_guard {
+    //! Structural circuit breaker (REMEDIATION_PLAN.md W2 / A3).
+    //!
+    //! These tests don't drive the router — they read this file as source and
+    //! assert two invariants:
+    //!
+    //!   1. `build_probe_routes` and `build_public_routes` route exactly the
+    //!      paths declared in `PROBE_PATHS` / `PUBLIC_PATHS` (+
+    //!      `METRICS_PATH_IF_PUBLIC` when `metrics_public`). A drifted const
+    //!      means a route was added to one builder without updating the
+    //!      const — which is exactly how `health_index` ended up as the
+    //!      unfixed twin of `health_ready`.
+    //!
+    //!   2. The handler bodies in `health.rs` for the public probes never
+    //!      read `params.get("user_id")`. If a future contributor reintroduces
+    //!      a `?user_id=` branch on a public probe (as commit a8f1299 did to
+    //!      `health_ready`), this test fails before the leak can ship.
+    //!
+    //! Source-text assertions over reflection: axum's `Router` does not expose
+    //! its route table for inspection, and adding a runtime registry would be
+    //! a larger change than the structural rule warrants.
+    use super::*;
+
+    fn router_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers/router.rs"))
+            .expect("read router.rs")
+    }
+
+    fn health_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers/health.rs"))
+            .expect("read health.rs")
+    }
+
+    fn extract_routed_paths(source: &str, fn_name: &str) -> Vec<String> {
+        // Locate the function body and harvest the first string literal of
+        // every `.route("…", …)` call inside it. Cheap, deterministic, and
+        // doesn't need a real parser.
+        let fn_sig = format!("pub fn {}(", fn_name);
+        let start = source
+            .find(&fn_sig)
+            .unwrap_or_else(|| panic!("function `{}` not found in router.rs", fn_name));
+        let after = &source[start..];
+        // Walk braces to find the matching close.
+        let body_start = after.find('{').expect("function body opening brace");
+        let mut depth = 0i32;
+        let mut body_end = body_start;
+        for (i, ch) in after[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &after[body_start..=body_end];
+
+        let mut paths = Vec::new();
+        let mut rest = body;
+        while let Some(idx) = rest.find(".route(") {
+            rest = &rest[idx + ".route(".len()..];
+            let q1 = rest.find('"').expect("opening quote in .route call");
+            let after_q1 = &rest[q1 + 1..];
+            let q2 = after_q1.find('"').expect("closing quote in .route call");
+            paths.push(after_q1[..q2].to_string());
+            rest = &after_q1[q2 + 1..];
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    #[test]
+    fn probe_router_paths_match_const() {
+        let mut declared: Vec<String> = PROBE_PATHS.iter().map(|s| s.to_string()).collect();
+        declared.sort();
+        let routed = extract_routed_paths(&router_source(), "build_probe_routes");
+        assert_eq!(
+            routed, declared,
+            "PROBE_PATHS drifted from build_probe_routes — update one to match the other"
+        );
+    }
+
+    #[test]
+    fn public_router_paths_match_const() {
+        // We can't easily run the const-list comparison while also handling
+        // the conditional `/metrics` branch, so check both shapes by parsing
+        // the function once and treating `METRICS_PATH_IF_PUBLIC` as the only
+        // permitted extra path.
+        let routed = extract_routed_paths(&router_source(), "build_public_routes");
+        let mut declared: Vec<String> = PUBLIC_PATHS.iter().map(|s| s.to_string()).collect();
+        declared.push(METRICS_PATH_IF_PUBLIC.to_string());
+        declared.sort();
+        assert_eq!(
+            routed, declared,
+            "PUBLIC_PATHS (+ METRICS_PATH_IF_PUBLIC) drifted from build_public_routes — \
+             update one to match the other"
+        );
+    }
+
+    #[test]
+    fn public_router_has_no_per_user_handlers() {
+        // The public probe handlers must not read `?user_id=`. We check the
+        // four named handlers in PROBE_PATHS (mapped 1:1 to health.rs fns).
+        const PUBLIC_PROBE_HANDLERS: &[&str] = &[
+            "pub async fn health(",
+            "pub async fn health_live(",
+            "pub async fn health_ready(",
+            "pub async fn health_index(",
+        ];
+        let src = health_source();
+        for sig in PUBLIC_PROBE_HANDLERS {
+            let start = src.find(sig).unwrap_or_else(|| {
+                panic!("public probe handler `{}` not found in health.rs", sig)
+            });
+            // Walk braces to find the matching close of THIS function only.
+            let after = &src[start..];
+            let body_start = after.find('{').expect("function body opening brace");
+            let mut depth = 0i32;
+            let mut body_end = body_start;
+            for (i, ch) in after[body_start..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            body_end = body_start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body = &after[body_start..=body_end];
+            assert!(
+                !body.contains("\"user_id\""),
+                "public probe handler `{}` references \"user_id\" — per-tenant data \
+                 must not be reachable on the public router. Move it behind auth on \
+                 the /api/health/* protected route.",
+                sig.trim_end_matches('(')
+            );
+        }
+    }
 }

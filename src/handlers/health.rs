@@ -3,7 +3,7 @@
 //! Kubernetes probes, metrics, and system health endpoints.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -12,6 +12,9 @@ use std::collections::HashMap;
 
 use super::state::MultiUserMemoryManager;
 use super::types::{ContextStatus, MemoryEvent};
+use super::utils::resolve_request_user_id;
+use crate::auth::AuthenticatedUser;
+use crate::errors::AppError;
 use crate::metrics;
 
 /// Application state type alias
@@ -64,16 +67,18 @@ pub async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Readiness probe - indicates if service can handle traffic.
+/// Readiness probe — system-level only. **PUBLIC, unauthenticated.**
+///
 /// Returns 503 if core shared storage was not initialized successfully.
 ///
-/// Optional `?user_id=X` parameter for per-user readiness (V8 toroid closure).
-/// When provided, reports per-user cache residency, memory stats, and vector
-/// index health. Only checks already-cached users — never triggers lazy
-/// initialization from a public probe.
+/// Per-user readiness lives on the authenticated `/api/health/ready` route
+/// (see `health_ready_user`). The previous `?user_id=` branch leaked
+/// per-tenant cache residency, existence-on-disk, and memory/graph stats to
+/// any unauthenticated caller. The structural rule is: nothing on the public
+/// router reads `?user_id=` for per-tenant data — see `PUBLIC_PATHS` in
+/// `router.rs` and the `public_router_has_no_per_user_handlers` test.
 pub async fn health_ready(
     State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let ready = state.is_ready();
     let status_code = if ready {
@@ -83,207 +88,217 @@ pub async fn health_ready(
     };
     let status_str = if ready { "ready" } else { "not_ready" };
 
-    // Per-user readiness check (V8)
-    if let Some(user_id) = params.get("user_id") {
-        let cached_users = state.list_cached_users();
-        let is_cached = cached_users.contains(user_id);
-        let exists_on_disk = state.list_users().contains(user_id);
+    let users_in_cache = state.users_in_cache();
+    (
+        status_code,
+        Json(serde_json::json!({
+            "status": status_str,
+            "version": env!("VELD_VERSION_FULL"),
+            "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
+            "users_in_cache": users_in_cache,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })),
+    )
+}
 
-        if !is_cached {
-            // User not in cache — report without triggering lazy init
-            return (
-                status_code,
-                Json(serde_json::json!({
-                    "status": status_str,
-                    "user_id": user_id,
-                    "user_ready": false,
-                    "cached": false,
-                    "exists_on_disk": exists_on_disk,
-                    "reason": if exists_on_disk {
-                        "user exists but is not loaded in cache"
-                    } else {
-                        "user does not exist"
-                    },
-                    "timestamp": chrono::Utc::now().to_rfc3339()
-                })),
-            );
-        }
+/// Per-user readiness probe — **authenticated**. Tenant binding is enforced
+/// via `resolve_request_user_id` (same pattern as `delete_memory`), so a
+/// multi-tenant caller cannot probe another tenant via `?user_id=`.
+///
+/// Only checks already-cached users — never triggers lazy initialisation,
+/// which would let a caller spin up arbitrary RocksDB instances by probing.
+pub async fn health_ready_user(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
 
-        // User is cached — safe to read stats without triggering init
-        match state.get_user_earth(user_id) {
-            Ok(memory) => {
-                if let Some(guard) = memory.try_read() {
-                    let stats = guard.stats();
-                    let index_health = guard.index_health();
-                    let graph_stats = if let Some(graph) = state.get_user_graph(user_id).ok() {
-                        let g = graph.read();
-                        let gs = g.get_stats().unwrap_or_default();
-                        serde_json::json!({
-                            "entity_count": gs.entity_count,
-                            "relationship_count": gs.relationship_count,
-                            "episode_count": gs.episode_count
-                        })
-                    } else {
-                        serde_json::json!(null)
-                    };
-
-                    (
-                        status_code,
-                        Json(serde_json::json!({
-                            "status": status_str,
-                            "user_id": user_id,
-                            "user_ready": true,
-                            "cached": true,
-                            "memory_stats": {
-                                "total_memories": stats.total_memories,
-                                "working_memory_count": stats.working_memory_count,
-                                "session_memory_count": stats.session_memory_count,
-                                "long_term_memory_count": stats.long_term_memory_count,
-                                "vector_index_count": stats.vector_index_count,
-                            },
-                            "index_health": {
-                                "total_vectors": index_health.total_vectors,
-                                "incremental_inserts": index_health.incremental_inserts,
-                                "deleted_count": index_health.deleted_count,
-                                "deletion_ratio": index_health.deletion_ratio,
-                                "needs_rebuild": index_health.needs_rebuild,
-                                "needs_compaction": index_health.needs_compaction,
-                                "secondary": index_health.secondary.as_ref().map(|s| serde_json::json!({
-                                    "total_vectors": s.total_vectors,
-                                    "incremental_inserts": s.incremental_inserts,
-                                    "deleted_count": s.deleted_count,
-                                    "deletion_ratio": s.deletion_ratio,
-                                    "needs_rebuild": s.needs_rebuild,
-                                    "needs_compaction": s.needs_compaction,
-                                })),
-                            },
-                            "graph_stats": graph_stats,
-                            "timestamp": chrono::Utc::now().to_rfc3339()
-                        })),
-                    )
-                } else {
-                    // Lock contention — user is cached but busy
-                    (
-                        status_code,
-                        Json(serde_json::json!({
-                            "status": status_str,
-                            "user_id": user_id,
-                            "user_ready": true,
-                            "cached": true,
-                            "reason": "memory system is locked (concurrent operation in progress)",
-                            "timestamp": chrono::Utc::now().to_rfc3339()
-                        })),
-                    )
-                }
-            }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "user_id": user_id,
-                    "error": e.to_string(),
-                    "timestamp": chrono::Utc::now().to_rfc3339()
-                })),
-            ),
-        }
+    let ready = state.is_ready();
+    let status_code = if ready {
+        StatusCode::OK
     } else {
-        // System-level readiness (original behavior)
-        let users_in_cache = state.users_in_cache();
-        (
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let status_str = if ready { "ready" } else { "not_ready" };
+
+    let cached_users = state.list_cached_users();
+    let is_cached = cached_users.contains(&user_id);
+    let exists_on_disk = state.list_users().contains(&user_id);
+
+    if !is_cached {
+        return Ok((
             status_code,
             Json(serde_json::json!({
                 "status": status_str,
-                "version": env!("VELD_VERSION_FULL"),
-                "effective_storage_backend": state.server_config().effective_storage_backend.as_str(),
-                "users_in_cache": users_in_cache,
+                "user_id": user_id,
+                "user_ready": false,
+                "cached": false,
+                "exists_on_disk": exists_on_disk,
+                "reason": if exists_on_disk {
+                    "user exists but is not loaded in cache"
+                } else {
+                    "user does not exist"
+                },
                 "timestamp": chrono::Utc::now().to_rfc3339()
             })),
-        )
+        ));
     }
-}
 
-/// Vector index health endpoint - provides Vamana index statistics per user
-pub async fn health_index(
-    State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let user_id = match params.get("user_id") {
-        Some(id) => id.clone(),
-        None => {
-            // Return aggregate stats across currently cached users only.
-            // list_users() returns filesystem directories; get_user_earth() would
-            // open RocksDB for every user on disk, wasting FDs and memory.
-            let users: Vec<(String, crate::memory::retrieval::IndexHealth)> = {
-                let mut results = Vec::new();
-                for user_id in state.list_cached_users() {
-                    if let Ok(memory) = state.get_user_earth(&user_id) {
-                        let guard = memory.read();
-                        results.push((user_id, guard.index_health()));
-                    }
-                }
-                results
-            };
-
-            let total_vectors: usize = users.iter().map(|(_, h)| h.total_vectors).sum();
-            let total_incremental: usize = users.iter().map(|(_, h)| h.incremental_inserts).sum();
-            let needs_rebuild: Vec<&str> = users
-                .iter()
-                .filter(|(_, h)| h.needs_rebuild)
-                .map(|(id, _)| id.as_str())
-                .collect();
-
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "users_checked": users.len(),
-                    "total_vectors": total_vectors,
-                    "total_incremental_inserts": total_incremental,
-                    "users_needing_rebuild": needs_rebuild,
-                    "rebuild_threshold": crate::vector_db::vamana::REBUILD_THRESHOLD,
-                    "timestamp": chrono::Utc::now().to_rfc3339()
-                })),
-            );
-        }
+    let memory = state
+        .get_user_earth(&user_id)
+        .map_err(AppError::Internal)?;
+    let Some(guard) = memory.try_read() else {
+        return Ok((
+            status_code,
+            Json(serde_json::json!({
+                "status": status_str,
+                "user_id": user_id,
+                "user_ready": true,
+                "cached": true,
+                "reason": "memory system is locked (concurrent operation in progress)",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            })),
+        ));
     };
 
-    // Get health for specific user
-    match state.get_user_earth(&user_id) {
-        Ok(memory) => {
-            let guard = memory.read();
-            let health = guard.index_health();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "user_id": user_id,
-                    "total_vectors": health.total_vectors,
-                    "incremental_inserts": health.incremental_inserts,
-                    "needs_rebuild": health.needs_rebuild,
-                    "rebuild_threshold": health.rebuild_threshold,
-                    "degradation_percent": if health.rebuild_threshold > 0 {
-                        (health.incremental_inserts as f64 / health.rebuild_threshold as f64 * 100.0).min(100.0)
-                    } else {
-                        0.0
-                    },
-                    "secondary": health.secondary.as_ref().map(|s| serde_json::json!({
-                        "total_vectors": s.total_vectors,
-                        "needs_rebuild": s.needs_rebuild,
-                        "deletion_ratio": s.deletion_ratio,
-                    })),
-                    "timestamp": chrono::Utc::now().to_rfc3339()
+    let stats = guard.stats();
+    let index_health = guard.index_health();
+    let graph_stats = if let Ok(graph) = state.get_user_graph(&user_id) {
+        let g = graph.read();
+        let gs = g.get_stats().unwrap_or_default();
+        serde_json::json!({
+            "entity_count": gs.entity_count,
+            "relationship_count": gs.relationship_count,
+            "episode_count": gs.episode_count
+        })
+    } else {
+        serde_json::json!(null)
+    };
+
+    Ok((
+        status_code,
+        Json(serde_json::json!({
+            "status": status_str,
+            "user_id": user_id,
+            "user_ready": true,
+            "cached": true,
+            "memory_stats": {
+                "total_memories": stats.total_memories,
+                "working_memory_count": stats.working_memory_count,
+                "session_memory_count": stats.session_memory_count,
+                "long_term_memory_count": stats.long_term_memory_count,
+                "vector_index_count": stats.vector_index_count,
+            },
+            "index_health": {
+                "total_vectors": index_health.total_vectors,
+                "incremental_inserts": index_health.incremental_inserts,
+                "deleted_count": index_health.deleted_count,
+                "deletion_ratio": index_health.deletion_ratio,
+                "needs_rebuild": index_health.needs_rebuild,
+                "needs_compaction": index_health.needs_compaction,
+                "secondary": index_health.secondary.as_ref().map(|s| serde_json::json!({
+                    "total_vectors": s.total_vectors,
+                    "incremental_inserts": s.incremental_inserts,
+                    "deleted_count": s.deleted_count,
+                    "deletion_ratio": s.deletion_ratio,
+                    "needs_rebuild": s.needs_rebuild,
+                    "needs_compaction": s.needs_compaction,
                 })),
-            )
+            },
+            "graph_stats": graph_stats,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })),
+    ))
+}
+
+/// Vector index health — aggregate-only. **PUBLIC, unauthenticated.**
+///
+/// Reports totals across currently-cached users without naming any of them.
+/// The per-user branch (and the raw internal error body it leaked on the
+/// failure path) has been moved behind auth in `health_index_user`. Same
+/// disclosure class as the readiness probe: enumerating cached user IDs and
+/// returning rebuild-threshold ratios is per-tenant metadata.
+pub async fn health_index(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Read health across cached users only — never trigger lazy init from a
+    // public probe (otherwise every probe opens RocksDB for every on-disk
+    // user, exhausting FDs).
+    let mut total_vectors: usize = 0;
+    let mut total_incremental: usize = 0;
+    let mut users_checked: usize = 0;
+    let mut users_needing_rebuild: usize = 0;
+    for user_id in state.list_cached_users() {
+        if let Ok(memory) = state.get_user_earth(&user_id) {
+            let guard = memory.read();
+            let h = guard.index_health();
+            total_vectors += h.total_vectors;
+            total_incremental += h.incremental_inserts;
+            if h.needs_rebuild {
+                users_needing_rebuild += 1;
+            }
+            users_checked += 1;
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "status": "error",
-                "error": e.to_string(),
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            })),
-        ),
     }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "users_checked": users_checked,
+            "total_vectors": total_vectors,
+            "total_incremental_inserts": total_incremental,
+            "users_needing_rebuild_count": users_needing_rebuild,
+            "rebuild_threshold": crate::vector_db::vamana::REBUILD_THRESHOLD,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })),
+    )
+}
+
+/// Per-user vector index health — **authenticated**. Same tenant-binding
+/// pattern as `delete_memory`: `resolve_request_user_id` rejects a `?user_id=`
+/// that does not match the API key's tenant binding.
+pub async fn health_index_user(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+
+    let memory = state
+        .get_user_earth(&user_id)
+        .map_err(AppError::Internal)?;
+    let guard = memory.read();
+    let health = guard.index_health();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "user_id": user_id,
+            "total_vectors": health.total_vectors,
+            "incremental_inserts": health.incremental_inserts,
+            "needs_rebuild": health.needs_rebuild,
+            "rebuild_threshold": health.rebuild_threshold,
+            "degradation_percent": if health.rebuild_threshold > 0 {
+                (health.incremental_inserts as f64 / health.rebuild_threshold as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            },
+            "secondary": health.secondary.as_ref().map(|s| serde_json::json!({
+                "total_vectors": s.total_vectors,
+                "needs_rebuild": s.needs_rebuild,
+                "deletion_ratio": s.deletion_ratio,
+            })),
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        })),
+    ))
 }
 
 /// Prometheus metrics endpoint for observability
