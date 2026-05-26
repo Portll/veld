@@ -1,6 +1,6 @@
 [package]
 name = "veld"
-version = "0.7.16"
+version = "0.7.17"
 edition = "2021"
 authors = ["Portll <john@portll.net>"]
 description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."

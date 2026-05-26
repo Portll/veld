@@ -1,6 +1,6 @@
 {
   "name": "@veld/memory-mcp",
-  "version": "0.7.16",
+  "version": "0.7.17",
   "mcpName": "io.github.Portll/veld",
   "description": "Persistent cognitive memory for AI agents — semantic search, knowledge graph, Hebbian learning. MCP server for Claude, Cursor, and Codex.",
   "type": "module",

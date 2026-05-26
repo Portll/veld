@@ -16,6 +16,7 @@
 //! - `VELD_LAZY_LOAD=false` - Load model at startup
 //! - `VELD_ONNX_THREADS=N` - Set ONNX intra-op thread count (default: 1 on macOS ARM64, 2 elsewhere)
 
+pub mod alignment;
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod competitive;
@@ -55,6 +56,12 @@ pub use circuit_breaker::{
 
 // Re-export competitive embedder
 pub use competitive::CompetitiveEmbedder;
+
+// Re-export alignment scaffolding (Phase 1)
+pub use alignment::{
+    read_alignment_file, resolve_alignment_path, save_alignment, unix_ts_now, Alignment,
+    AlignmentHeader, AlignmentPairId, IdentityAlignment,
+};
 
 fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
