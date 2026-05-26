@@ -348,6 +348,158 @@ pub static LEGACY_FALLBACK_BRANCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
 });
 
 // ============================================================================
+// Intent Log Metrics (W5)
+// ============================================================================
+
+/// Intent log append operations
+pub static INTENT_LOG_APPEND_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_intent_log_append_total",
+            "Total intent log append operations",
+        ),
+        &["result"], // result: "ok", "payload_too_large", "io_error"
+    )
+    .expect("INTENT_LOG_APPEND_TOTAL metric must be valid at compile time")
+});
+
+/// Intent log append duration
+pub static INTENT_LOG_APPEND_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "veld_intent_log_append_duration_seconds",
+        "Intent log append duration",
+    ).buckets(vec![
+        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    ]))
+    .expect("INTENT_LOG_APPEND_DURATION metric must be valid at compile time")
+});
+
+/// Intent log sync (fsync) operations
+pub static INTENT_LOG_SYNC_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_intent_log_sync_total",
+            "Total intent log sync (fsync) operations",
+        ),
+        &["result"], // result: "ok", "io_error"
+    )
+    .expect("INTENT_LOG_SYNC_TOTAL metric must be valid at compile time")
+});
+
+/// Intent log sync duration
+pub static INTENT_LOG_SYNC_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "veld_intent_log_sync_duration_seconds",
+        "Intent log sync (fsync) duration",
+    ).buckets(vec![
+        0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+    ]))
+    .expect("INTENT_LOG_SYNC_DURATION metric must be valid at compile time")
+});
+
+/// Corrupt-tail truncation events
+pub static INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_intent_log_truncate_corrupt_tail_total",
+        "Total intent log corrupt-tail truncation events",
+    )
+    .expect("INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL metric must be valid at compile time")
+});
+
+/// Next LSN that will be assigned by the intent log
+pub static INTENT_LOG_NEXT_LSN: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "veld_intent_log_next_lsn",
+        "LSN that will be assigned to the next intent log append",
+    )
+    .expect("INTENT_LOG_NEXT_LSN metric must be valid at compile time")
+});
+
+/// Durable end offset of the intent log (file size in bytes)
+pub static INTENT_LOG_DURABLE_END_OFFSET_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "veld_intent_log_durable_end_offset_bytes",
+        "Byte offset after the last durable intent log frame",
+    )
+    .expect("INTENT_LOG_DURABLE_END_OFFSET_BYTES metric must be valid at compile time")
+});
+
+/// Projection apply operations
+pub static PROJECTION_APPLY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_projection_apply_total",
+            "Total projection apply operations",
+        ),
+        &["projection", "result"], // result: "ok", "error"
+    )
+    .expect("PROJECTION_APPLY_TOTAL metric must be valid at compile time")
+});
+
+/// Projection apply duration (labelled per projection)
+pub static PROJECTION_APPLY_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "veld_projection_apply_duration_seconds",
+            "Projection apply duration (labelled per projection)",
+        )
+        .buckets(vec![
+            0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+        ]),
+        &["projection"],
+    )
+    .expect("PROJECTION_APPLY_DURATION metric must be valid at compile time")
+});
+
+/// Records applied during replay (per projection)
+pub static PROJECTION_REPLAY_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_projection_replay_records_total",
+            "Total records applied to a projection during replay",
+        ),
+        &["projection"],
+    )
+    .expect("PROJECTION_REPLAY_RECORDS_TOTAL metric must be valid at compile time")
+});
+
+/// Checkpoint persist operations (per projection)
+pub static CHECKPOINT_PERSIST_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "veld_checkpoint_persist_total",
+            "Total projection checkpoint persist operations",
+        ),
+        &["projection", "result"], // result: "ok", "error"
+    )
+    .expect("CHECKPOINT_PERSIST_TOTAL metric must be valid at compile time")
+});
+
+/// Last persisted checkpoint LSN per projection
+pub static PROJECTION_CHECKPOINT_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "veld_projection_checkpoint_lsn",
+            "Last persisted checkpoint LSN per projection",
+        ),
+        &["projection"],
+    )
+    .expect("PROJECTION_CHECKPOINT_LSN metric must be valid at compile time")
+});
+
+/// Projection replay lag in records (next_lsn - checkpoint_lsn)
+pub static PROJECTION_LAG_RECORDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "veld_projection_lag_records",
+            "How far a projection lags the head of the intent log, in records",
+        ),
+        &["projection"],
+    )
+    .expect("PROJECTION_LAG_RECORDS metric must be valid at compile time")
+});
+
+// ============================================================================
 // Error Metrics
 // ============================================================================
 
@@ -697,6 +849,30 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(ROCKSDB_OPS_TOTAL, "ROCKSDB_OPS_TOTAL");
     register!(ROCKSDB_OPS_DURATION, "ROCKSDB_OPS_DURATION");
     register!(LEGACY_FALLBACK_BRANCH_TOTAL, "LEGACY_FALLBACK_BRANCH_TOTAL");
+
+    // Intent log metrics (W5)
+    register!(INTENT_LOG_APPEND_TOTAL, "INTENT_LOG_APPEND_TOTAL");
+    register!(INTENT_LOG_APPEND_DURATION, "INTENT_LOG_APPEND_DURATION");
+    register!(INTENT_LOG_SYNC_TOTAL, "INTENT_LOG_SYNC_TOTAL");
+    register!(INTENT_LOG_SYNC_DURATION, "INTENT_LOG_SYNC_DURATION");
+    register!(
+        INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL,
+        "INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL"
+    );
+    register!(INTENT_LOG_NEXT_LSN, "INTENT_LOG_NEXT_LSN");
+    register!(
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES,
+        "INTENT_LOG_DURABLE_END_OFFSET_BYTES"
+    );
+    register!(PROJECTION_APPLY_TOTAL, "PROJECTION_APPLY_TOTAL");
+    register!(PROJECTION_APPLY_DURATION, "PROJECTION_APPLY_DURATION");
+    register!(
+        PROJECTION_REPLAY_RECORDS_TOTAL,
+        "PROJECTION_REPLAY_RECORDS_TOTAL"
+    );
+    register!(CHECKPOINT_PERSIST_TOTAL, "CHECKPOINT_PERSIST_TOTAL");
+    register!(PROJECTION_CHECKPOINT_LSN, "PROJECTION_CHECKPOINT_LSN");
+    register!(PROJECTION_LAG_RECORDS, "PROJECTION_LAG_RECORDS");
 
     // Error metrics
     register!(ERRORS_TOTAL, "ERRORS_TOTAL");

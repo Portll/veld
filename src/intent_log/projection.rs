@@ -25,6 +25,11 @@
 
 use std::error::Error;
 
+use crate::metrics::{
+    Timer, CHECKPOINT_PERSIST_TOTAL, PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL,
+    PROJECTION_CHECKPOINT_LSN, PROJECTION_LAG_RECORDS, PROJECTION_REPLAY_RECORDS_TOTAL,
+};
+
 use super::{IntentLog, IntentLogError, IntentRecord, Lsn};
 
 /// Trait implemented by every store that derives its state from the intent
@@ -86,10 +91,23 @@ pub fn replay<P: Projection>(
     projection: &mut P,
     persist_every: Option<u64>,
 ) -> Result<u64, ReplayError> {
+    let projection_name = projection.name().to_string();
     let resume_at = projection
         .checkpoint()
         .map(Lsn::next)
         .unwrap_or(Lsn::ZERO);
+    let head_lsn = log.next_lsn();
+
+    // INFO-level span around the whole replay driver loop, with structured
+    // fields the dashboards can lift.
+    let span = tracing::info_span!(
+        "projection.replay",
+        projection = %projection_name,
+        resume_at = resume_at.0,
+        head_lsn = head_lsn.0,
+        applied = tracing::field::Empty,
+    );
+    let _guard = span.enter();
 
     let mut applied = 0u64;
     let mut last_persisted_at = 0u64;
@@ -99,38 +117,119 @@ pub fn replay<P: Projection>(
         if record.lsn < resume_at {
             continue;
         }
-        projection
-            .apply(&record)
-            .map_err(|e| ReplayError::ProjectionFailed {
-                projection: projection.name().to_string(),
-                lsn: record.lsn,
-                source: Box::new(e),
-            })?;
+        let timer = Timer::new(
+            PROJECTION_APPLY_DURATION
+                .with_label_values(&[projection_name.as_str()]),
+        );
+        let apply_result = projection.apply(&record);
+        drop(timer);
+        match apply_result {
+            Ok(()) => {
+                PROJECTION_APPLY_TOTAL
+                    .with_label_values(&[projection_name.as_str(), "ok"])
+                    .inc();
+                PROJECTION_REPLAY_RECORDS_TOTAL
+                    .with_label_values(&[projection_name.as_str()])
+                    .inc();
+            }
+            Err(e) => {
+                PROJECTION_APPLY_TOTAL
+                    .with_label_values(&[projection_name.as_str(), "error"])
+                    .inc();
+                tracing::error!(
+                    projection = %projection_name,
+                    lsn = record.lsn.0,
+                    error = %e,
+                    "projection apply failed during replay",
+                );
+                return Err(ReplayError::ProjectionFailed {
+                    projection: projection_name,
+                    lsn: record.lsn,
+                    source: Box::new(e),
+                });
+            }
+        }
         applied += 1;
 
         if let Some(n) = persist_every {
             if applied - last_persisted_at >= n {
-                projection
-                    .persist_checkpoint()
-                    .map_err(|e| ReplayError::ProjectionFailed {
-                        projection: projection.name().to_string(),
+                if let Err(e) = projection.persist_checkpoint() {
+                    CHECKPOINT_PERSIST_TOTAL
+                        .with_label_values(&[projection_name.as_str(), "error"])
+                        .inc();
+                    tracing::error!(
+                        projection = %projection_name,
+                        lsn = record.lsn.0,
+                        error = %e,
+                        "checkpoint persist failed during replay",
+                    );
+                    return Err(ReplayError::ProjectionFailed {
+                        projection: projection_name,
                         lsn: record.lsn,
                         source: Box::new(e),
-                    })?;
+                    });
+                }
+                CHECKPOINT_PERSIST_TOTAL
+                    .with_label_values(&[projection_name.as_str(), "ok"])
+                    .inc();
+                publish_checkpoint_gauges(
+                    projection_name.as_str(),
+                    projection.checkpoint(),
+                    head_lsn,
+                );
                 last_persisted_at = applied;
             }
         }
     }
 
-    projection
-        .persist_checkpoint()
-        .map_err(|e| ReplayError::ProjectionFailed {
-            projection: projection.name().to_string(),
+    if let Err(e) = projection.persist_checkpoint() {
+        CHECKPOINT_PERSIST_TOTAL
+            .with_label_values(&[projection_name.as_str(), "error"])
+            .inc();
+        tracing::error!(
+            projection = %projection_name,
+            lsn = projection.checkpoint().map(|l| l.0).unwrap_or(0),
+            error = %e,
+            "checkpoint persist failed at end of replay",
+        );
+        return Err(ReplayError::ProjectionFailed {
+            projection: projection_name,
             lsn: projection.checkpoint().unwrap_or(Lsn::ZERO),
             source: Box::new(e),
-        })?;
+        });
+    }
+    CHECKPOINT_PERSIST_TOTAL
+        .with_label_values(&[projection_name.as_str(), "ok"])
+        .inc();
+    publish_checkpoint_gauges(
+        projection_name.as_str(),
+        projection.checkpoint(),
+        head_lsn,
+    );
 
+    tracing::Span::current().record("applied", applied);
     Ok(applied)
+}
+
+/// Publish (or refresh) the `veld_projection_checkpoint_lsn` and
+/// `veld_projection_lag_records` gauges for one projection. Centralised so
+/// every callsite produces the same shape of metric labels.
+fn publish_checkpoint_gauges(projection: &str, checkpoint: Option<Lsn>, head_lsn: Lsn) {
+    let checkpoint_lsn = checkpoint.map(|l| l.0).unwrap_or(0);
+    PROJECTION_CHECKPOINT_LSN
+        .with_label_values(&[projection])
+        .set(checkpoint_lsn as i64);
+    // Lag = head_lsn - (checkpoint_lsn + 1) records still to apply, clamped
+    // to zero. When checkpoint is None we have not applied anything yet, so
+    // lag is the full head value.
+    let next_to_apply = match checkpoint {
+        Some(l) => l.0.saturating_add(1),
+        None => 0,
+    };
+    let lag = head_lsn.0.saturating_sub(next_to_apply);
+    PROJECTION_LAG_RECORDS
+        .with_label_values(&[projection])
+        .set(lag as i64);
 }
 
 #[cfg(test)]
@@ -377,6 +476,84 @@ mod tests {
         // Persist still ran once on clean exit so the (None) checkpoint is
         // explicitly recorded.
         assert_eq!(proj.persisted_checkpoint, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Minimal observability smoke test: after one successful append + one
+    /// successful apply (via replay), the relevant Prometheus counters have
+    /// advanced and the checkpoint gauge matches the applied LSN.
+    #[test]
+    fn metrics_advance_after_one_append_and_one_apply() {
+        use crate::metrics::{
+            INTENT_LOG_APPEND_TOTAL, INTENT_LOG_SYNC_TOTAL, PROJECTION_APPLY_TOTAL,
+            PROJECTION_CHECKPOINT_LSN, PROJECTION_REPLAY_RECORDS_TOTAL,
+        };
+
+        // Use a unique projection name so the counters are not polluted by
+        // other tests running in the same process.
+        let projection_name = format!("metric-smoke-{}", std::process::id());
+
+        let append_before = INTENT_LOG_APPEND_TOTAL.with_label_values(&["ok"]).get();
+        let sync_before = INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).get();
+        let apply_before = PROJECTION_APPLY_TOTAL
+            .with_label_values(&[projection_name.as_str(), "ok"])
+            .get();
+        let replay_before = PROJECTION_REPLAY_RECORDS_TOTAL
+            .with_label_values(&[projection_name.as_str()])
+            .get();
+
+        let path = tmp_log_path("metrics_smoke");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"observe-me").unwrap();
+            log.sync().unwrap();
+        }
+
+        let log = IntentLog::open(&path).unwrap();
+        let mut proj = VecProjection::new(&projection_name);
+        let applied = replay(&log, &mut proj, None).unwrap();
+        assert_eq!(applied, 1);
+
+        let append_after = INTENT_LOG_APPEND_TOTAL.with_label_values(&["ok"]).get();
+        let sync_after = INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).get();
+        let apply_after = PROJECTION_APPLY_TOTAL
+            .with_label_values(&[projection_name.as_str(), "ok"])
+            .get();
+        let replay_after = PROJECTION_REPLAY_RECORDS_TOTAL
+            .with_label_values(&[projection_name.as_str()])
+            .get();
+
+        assert!(
+            append_after >= append_before + 1,
+            "intent_log_append_total{{result=ok}} did not advance: {} -> {}",
+            append_before,
+            append_after
+        );
+        assert!(
+            sync_after >= sync_before + 1,
+            "intent_log_sync_total{{result=ok}} did not advance: {} -> {}",
+            sync_before,
+            sync_after
+        );
+        assert!(
+            apply_after >= apply_before + 1,
+            "projection_apply_total{{result=ok}} did not advance: {} -> {}",
+            apply_before,
+            apply_after
+        );
+        assert!(
+            replay_after >= replay_before + 1,
+            "projection_replay_records_total did not advance: {} -> {}",
+            replay_before,
+            replay_after
+        );
+
+        // Checkpoint gauge should match the only applied LSN (0).
+        let cp_lsn = PROJECTION_CHECKPOINT_LSN
+            .with_label_values(&[projection_name.as_str()])
+            .get();
+        assert_eq!(cp_lsn, 0, "checkpoint gauge should reflect last applied lsn");
+
         let _ = std::fs::remove_file(&path);
     }
 }
