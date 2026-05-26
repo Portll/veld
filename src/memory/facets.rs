@@ -175,7 +175,7 @@ pub enum Place {
 /// - **roll**  — rotation about the longitudinal (X) axis (banking).
 /// - **yaw**   — rotation about the vertical (Z) axis (heading; matches
 ///   the simple-case `WhereFacet.heading` when only yaw is meaningful).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct Orientation {
     pub pitch: f32,
     pub roll: f32,

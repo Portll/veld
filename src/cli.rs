@@ -921,7 +921,6 @@ struct RememberRequest {
 #[derive(Deserialize)]
 struct RememberResponse {
     id: String,
-    message: String,
 }
 
 #[derive(Serialize)]
@@ -1414,8 +1413,8 @@ impl VeldMcpServer {
 
         match result {
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Stored memory: {} ({})",
-                resp.id, resp.message
+                "Stored memory: {}",
+                resp.id
             ))])),
             Err(e) => Err(McpError {
                 code: ErrorCode::INTERNAL_ERROR,
@@ -1842,5 +1841,31 @@ async fn handle_claude_launch(port: u16, args: Vec<String>) -> Result<()> {
         cmd.args(&args);
         let status = cmd.status()?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the server's `/api/remember` response shape is `{id, success}`
+    /// (see `handlers::remember::RememberResponse`). An earlier CLI mirror
+    /// required `message` instead of `success`, which made the post-commit hook
+    /// emit "error decoding response body" on every commit. Keep this test in
+    /// lockstep with the server's response struct.
+    #[test]
+    fn remember_response_deserializes_server_shape() {
+        // Exact shape the server emits today.
+        let body = r#"{"id":"mem-abc123","success":true}"#;
+        let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(resp.id, "mem-abc123");
+    }
+
+    #[test]
+    fn remember_response_tolerates_extra_fields() {
+        // Future server additions must not break the hook.
+        let body = r#"{"id":"mem-xyz","success":true,"message":"ok","latency_ms":42}"#;
+        let resp: RememberResponse = serde_json::from_str(body).expect("must deserialize");
+        assert_eq!(resp.id, "mem-xyz");
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "veld"
-version = "0.7.15"
+version = "0.7.16"
 edition = "2021"
 authors = ["Portll <john@portll.net>"]
 description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
@@ -90,6 +90,18 @@ crate-type = ["rlib", "cdylib"]
 name = "veld"
 path = "src/cli.rs"
 
+[[bin]]
+name = "alignment-collect"
+path = "src/bin/alignment_collect.rs"
+
+[[bin]]
+name = "alignment-fit"
+path = "src/bin/alignment_fit.rs"
+
+[[bin]]
+name = "alignment-eval"
+path = "src/bin/alignment_eval.rs"
+
 [dependencies]
 # MCP Protocol
 rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
@@ -162,6 +174,15 @@ rustfft = "6"
 
 # Vector operations (lightweight)
 ordered-float = "5.0"
+
+# Linear algebra for embedding alignment (SVD, ridge regression)
+nalgebra = { version = "0.33", default-features = false, features = ["std", "matrixmultiply"] }
+
+# Parallel iterators (alignment fit/eval batch encoding)
+rayon = "1.10"
+
+# Filesystem walker for alignment corpus assembly
+walkdir = "2"
 
 # Vector database (Vamana HNSW)
 memmap2 = "0.9"
