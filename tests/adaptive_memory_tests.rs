@@ -514,6 +514,10 @@ fn test_semantic_fact_structure() {
         created_at: Utc::now(),
         last_reinforced: Utc::now(),
         fact_type: FactType::Preference,
+        valid_from: None,
+        valid_until: None,
+        superseded_by: None,
+        supersedes: Vec::new(),
     };
 
     assert_eq!(fact.id, "fact_001");
@@ -537,6 +541,10 @@ fn test_reinforce_fact_increases_confidence() {
         created_at: Utc::now(),
         last_reinforced: Utc::now() - Duration::days(1),
         fact_type: FactType::Pattern,
+        valid_from: None,
+        valid_until: None,
+        superseded_by: None,
+        supersedes: Vec::new(),
     };
 
     let initial_confidence = fact.confidence;
@@ -568,6 +576,10 @@ fn test_reinforce_fact_adds_source() {
         created_at: Utc::now(),
         last_reinforced: Utc::now(),
         fact_type: FactType::Pattern,
+        valid_from: None,
+        valid_until: None,
+        superseded_by: None,
+        supersedes: Vec::new(),
     };
 
     let memory = create_memory("Evidence", ExperienceType::Learning, vec!["test"], 0.5);
@@ -593,6 +605,10 @@ fn test_should_decay_fact_old_unreinforced() {
         created_at: Utc::now() - Duration::days(365),
         last_reinforced: Utc::now() - Duration::days(100),
         fact_type: FactType::Pattern,
+        valid_from: None,
+        valid_until: None,
+        superseded_by: None,
+        supersedes: Vec::new(),
     };
 
     assert!(consolidator.should_decay_fact(&old_fact));
@@ -612,6 +628,10 @@ fn test_should_not_decay_high_confidence_fact() {
         created_at: Utc::now() - Duration::days(30),
         last_reinforced: Utc::now() - Duration::days(30),
         fact_type: FactType::Definition,
+        valid_from: None,
+        valid_until: None,
+        superseded_by: None,
+        supersedes: Vec::new(),
     };
 
     assert!(!consolidator.should_decay_fact(&strong_fact));

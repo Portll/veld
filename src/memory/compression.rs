@@ -550,6 +550,13 @@ impl Default for CompressionStats {
 /// As memories age, specific episodes ("yesterday I debugged the auth module")
 /// consolidate into semantic knowledge ("the auth module uses JWT tokens").
 /// This mimics how human memory transitions from episodic to semantic.
+///
+/// # Bi-temporal validity
+///
+/// `valid_from` / `valid_until` track world-time validity. A fact is "currently
+/// valid" when `valid_until` is `None` or in the future. Contradicting facts
+/// invalidate older facts by setting `valid_until` on the old fact and recording
+/// the lineage in `superseded_by` / `supersedes`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticFact {
     /// Unique identifier
@@ -570,6 +577,24 @@ pub struct SemanticFact {
     pub last_reinforced: chrono::DateTime<chrono::Utc>,
     /// Category of fact (preference, capability, relationship, procedure)
     pub fact_type: FactType,
+    /// When this fact became true in the world. `None` is treated as
+    /// `created_at` by the store at first read. Set explicitly when the
+    /// observation has a knowable start time.
+    #[serde(default)]
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this fact stopped being true. `None` = currently valid.
+    /// Set by `detect_and_resolve_contradictions` when a newer contradicting
+    /// fact supersedes this one.
+    #[serde(default)]
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// ID of the fact that superseded this one (back-pointer for audit).
+    /// Only meaningful when `valid_until` is `Some`.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// IDs of facts that this fact replaced (forward-pointer for audit).
+    /// Populated on a *new* fact when it invalidates one or more older facts.
+    #[serde(default)]
+    pub supersedes: Vec<String>,
 }
 
 /// Types of semantic facts
@@ -751,6 +776,10 @@ impl SemanticConsolidator {
                     created_at: now,
                     last_reinforced: now,
                     fact_type,
+                    valid_from: Some(now),
+                    valid_until: None,
+                    superseded_by: None,
+                    supersedes: Vec::new(),
                 };
 
                 result.new_fact_ids.push(fact.id.clone());
@@ -1466,6 +1495,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_reinforced: chrono::Utc::now() - chrono::Duration::days(10),
             fact_type: FactType::Pattern,
+            valid_from: None,
+            valid_until: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
         };
         let memory = create_test_memory("reinforcing memory", 0.7);
 
@@ -1491,6 +1524,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_reinforced: chrono::Utc::now(),
             fact_type: FactType::Pattern,
+            valid_from: None,
+            valid_until: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
         };
         assert!(!consolidator.should_decay_fact(&recent_fact));
 
@@ -1504,6 +1541,10 @@ mod tests {
             created_at: chrono::Utc::now() - chrono::Duration::days(365),
             last_reinforced: chrono::Utc::now() - chrono::Duration::days(100),
             fact_type: FactType::Pattern,
+            valid_from: None,
+            valid_until: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
         };
         assert!(consolidator.should_decay_fact(&old_fact));
     }
