@@ -19,12 +19,45 @@
 //! field is forward-compatible — older binaries skip records they don't
 //! recognise without crashing, and newer binaries deserialise older
 //! records by filling in defaults. A breaking change (renaming a field,
-//! changing a type) requires a `format_version` bump in the log header,
-//! which we will add when the first such change comes up.
+//! changing a type) requires both a `format_version` bump on the log
+//! header (see [`super::header::IntentLogHeader`]) AND a per-record
+//! `schema_version` bump, with a migration arm registered in
+//! [`super::migrations::migrate_payload`].
+//!
+//! Every variant carries a `schema_version: Option<u16>`. A `None` value
+//! is interpreted as version 0 (the pre-versioning shape this code was
+//! born with). A `Some(v)` value that this binary does not recognise
+//! returns a [`PayloadError::UnknownSchemaVersion`] — the caller is
+//! expected to run the bytes through `migrate_payload` before trying to
+//! decode again.
 
 use serde::{Deserialize, Serialize};
 
+use super::migrations::MigrationError;
 use super::{IntentLog, IntentLogError, IntentRecord, Lsn};
+
+/// Schema version assigned to a payload variant the *current* binary
+/// produces. Encoded as `Option<u16>` on every variant; `None` and
+/// `Some(0)` are wire-equivalent and mean "the original shape, before
+/// per-record versioning existed".
+///
+/// Bumping this is a deliberate operator action: every existing
+/// `IntentPayload` decode site continues to work because `Option`
+/// defaults to `None`, but `migrate_payload` must learn the new arm
+/// before the bump lands.
+pub const CURRENT_PAYLOAD_SCHEMA_VERSION: u16 = 1;
+
+/// Set of schema versions this binary can decode without migration.
+/// Anything outside this set returns an [`PayloadError::UnknownSchemaVersion`]
+/// from [`decode`]. The implicit `None` / `Some(0)` legacy version is
+/// always accepted regardless of what is in this list.
+pub const KNOWN_PAYLOAD_SCHEMA_VERSIONS: &[u16] = &[0, 1];
+
+/// Resolve the effective version for an `Option<u16> schema_version`
+/// field — `None` is the legacy pre-versioning shape (== 0).
+fn effective_version(v: Option<u16>) -> u16 {
+    v.unwrap_or(0)
+}
 
 /// Every state-changing operation that must be journaled before it lands
 /// in any projection. The current variants cover the core memory CRUD; we
@@ -44,11 +77,17 @@ pub enum IntentPayload {
         /// opaque bytes here so changes to the `Memory` schema don't
         /// require updating `IntentPayload`.
         memory_bincode: Vec<u8>,
+        /// Schema version of the variant's wire shape. `None` is the
+        /// pre-versioning shape (== 0). See module-level docs.
+        #[serde(default)]
+        schema_version: Option<u16>,
     },
     /// An existing memory was deleted.
     Forget {
         user_id: String,
         memory_id: String,
+        #[serde(default)]
+        schema_version: Option<u16>,
     },
     /// An existing memory was edited in place. Same opaque-bytes pattern
     /// as `Remember`.
@@ -56,12 +95,16 @@ pub enum IntentPayload {
         user_id: String,
         memory_id: String,
         memory_bincode: Vec<u8>,
+        #[serde(default)]
+        schema_version: Option<u16>,
     },
     /// An existing memory was anchored (decay-resistant boost).
     Anchor {
         user_id: String,
         memory_id: String,
         importance: f32,
+        #[serde(default)]
+        schema_version: Option<u16>,
     },
 }
 
@@ -89,6 +132,17 @@ impl IntentPayload {
             IntentPayload::Anchor { memory_id, .. } => memory_id,
         }
     }
+
+    /// Schema version of this variant's wire shape. `None` is the
+    /// pre-versioning legacy shape; treat it as `0` for comparisons.
+    pub fn schema_version(&self) -> Option<u16> {
+        match self {
+            IntentPayload::Remember { schema_version, .. } => *schema_version,
+            IntentPayload::Forget { schema_version, .. } => *schema_version,
+            IntentPayload::Update { schema_version, .. } => *schema_version,
+            IntentPayload::Anchor { schema_version, .. } => *schema_version,
+        }
+    }
 }
 
 /// Errors raised when encoding/decoding typed payloads.
@@ -100,6 +154,21 @@ pub enum PayloadError {
     Decode(String),
     #[error("intent log error: {0}")]
     Log(#[from] IntentLogError),
+    /// The payload decoded into a known variant but carries a
+    /// `schema_version` this binary does not recognise. The caller is
+    /// expected to either upgrade the binary or pipe the bytes through
+    /// [`super::migrations::migrate_payload`] before re-decoding.
+    #[error(
+        "unknown payload schema_version: {found} (this binary knows {known:?})"
+    )]
+    UnknownSchemaVersion {
+        found: u16,
+        known: &'static [u16],
+    },
+    /// A migration step failed while decoding an older payload shape.
+    /// Wraps [`MigrationError`] verbatim so the caller can match on it.
+    #[error("payload migration failed: {0}")]
+    Migration(#[from] MigrationError),
 }
 
 /// Bincode configuration used for every payload. Pinned so the same bytes
@@ -120,9 +189,25 @@ pub fn encode(payload: &IntentPayload) -> Result<Vec<u8>, PayloadError> {
 }
 
 /// Decode bytes back into a typed payload.
+///
+/// After bincode produces the typed variant, this function checks the
+/// `schema_version` field against [`KNOWN_PAYLOAD_SCHEMA_VERSIONS`]. If
+/// the version is not in the set, returns
+/// [`PayloadError::UnknownSchemaVersion`] — the caller is expected to
+/// run the raw bytes through [`super::migrations::migrate_payload`] and
+/// retry, or to surface the error to the operator if no migration path
+/// exists yet.
 pub fn decode(bytes: &[u8]) -> Result<IntentPayload, PayloadError> {
-    let (payload, _consumed) = bincode::serde::decode_from_slice(bytes, bincode_cfg())
-        .map_err(|e| PayloadError::Decode(e.to_string()))?;
+    let (payload, _consumed): (IntentPayload, usize) =
+        bincode::serde::decode_from_slice(bytes, bincode_cfg())
+            .map_err(|e| PayloadError::Decode(e.to_string()))?;
+    let effective = effective_version(payload.schema_version());
+    if !KNOWN_PAYLOAD_SCHEMA_VERSIONS.contains(&effective) {
+        return Err(PayloadError::UnknownSchemaVersion {
+            found: effective,
+            known: KNOWN_PAYLOAD_SCHEMA_VERSIONS,
+        });
+    }
     Ok(payload)
 }
 
@@ -160,11 +245,14 @@ mod tests {
     }
 
     #[test]
-    fn remember_round_trip() {
+    fn remember_round_trip_with_schema_version_absent() {
+        // `schema_version: None` is the wire-equivalent of the legacy
+        // pre-versioning shape. Round-trip must reconstruct it identically.
         let original = IntentPayload::Remember {
             user_id: "alice".to_string(),
             memory_id: "mem-42".to_string(),
             memory_bincode: vec![0xde, 0xad, 0xbe, 0xef],
+            schema_version: None,
         };
         let bytes = encode(&original).unwrap();
         let restored = decode(&bytes).unwrap();
@@ -172,10 +260,27 @@ mod tests {
     }
 
     #[test]
+    fn remember_round_trip_with_schema_version_present() {
+        // Caller asserts schema version 1; round-trip preserves that
+        // assertion and decode accepts it (1 is in the known set).
+        let original = IntentPayload::Remember {
+            user_id: "alice".to_string(),
+            memory_id: "mem-42".to_string(),
+            memory_bincode: vec![0xde, 0xad, 0xbe, 0xef],
+            schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        let bytes = encode(&original).unwrap();
+        let restored = decode(&bytes).unwrap();
+        assert_eq!(original, restored);
+        assert_eq!(restored.schema_version(), Some(CURRENT_PAYLOAD_SCHEMA_VERSION));
+    }
+
+    #[test]
     fn forget_round_trip() {
         let original = IntentPayload::Forget {
             user_id: "bob".to_string(),
             memory_id: "mem-99".to_string(),
+            schema_version: None,
         };
         let bytes = encode(&original).unwrap();
         assert_eq!(decode(&bytes).unwrap(), original);
@@ -187,6 +292,7 @@ mod tests {
             user_id: "carol".to_string(),
             memory_id: "mem-7".to_string(),
             importance: 0.83,
+            schema_version: None,
         };
         let bytes = encode(&original).unwrap();
         assert_eq!(decode(&bytes).unwrap(), original);
@@ -198,6 +304,7 @@ mod tests {
             user_id: "dan".to_string(),
             memory_id: "mem-11".to_string(),
             memory_bincode: vec![1, 2, 3, 4, 5],
+            schema_version: None,
         };
         let bytes = encode(&original).unwrap();
         assert_eq!(decode(&bytes).unwrap(), original);
@@ -209,9 +316,34 @@ mod tests {
             user_id: "alice".to_string(),
             memory_id: "mem-1".to_string(),
             memory_bincode: vec![],
+            schema_version: None,
         };
         assert_eq!(p.user_id(), "alice");
         assert_eq!(p.memory_id(), "mem-1");
+        assert_eq!(p.schema_version(), None);
+    }
+
+    #[test]
+    fn unknown_schema_version_returns_structured_error() {
+        // Construct a payload that *claims* schema_version 999, then
+        // round-trip it through encode/decode. The decoder must surface
+        // a structured UnknownSchemaVersion error rather than silently
+        // accept the bytes.
+        let claimed_future = IntentPayload::Anchor {
+            user_id: "u".to_string(),
+            memory_id: "m".to_string(),
+            importance: 0.5,
+            schema_version: Some(999),
+        };
+        let bytes = encode(&claimed_future).unwrap();
+        let err = decode(&bytes).unwrap_err();
+        match err {
+            PayloadError::UnknownSchemaVersion { found, known } => {
+                assert_eq!(found, 999);
+                assert_eq!(known, KNOWN_PAYLOAD_SCHEMA_VERSIONS);
+            }
+            other => panic!("expected UnknownSchemaVersion, got {other:?}"),
+        }
     }
 
     #[test]
@@ -225,6 +357,7 @@ mod tests {
                     user_id: "u".into(),
                     memory_id: "m-0".into(),
                     memory_bincode: b"first".to_vec(),
+                    schema_version: None,
                 },
             )
             .unwrap();
@@ -233,6 +366,7 @@ mod tests {
                 &IntentPayload::Forget {
                     user_id: "u".into(),
                     memory_id: "m-1".into(),
+                    schema_version: None,
                 },
             )
             .unwrap();
@@ -242,6 +376,7 @@ mod tests {
                     user_id: "u".into(),
                     memory_id: "m-0".into(),
                     importance: 0.95,
+                    schema_version: None,
                 },
             )
             .unwrap();
