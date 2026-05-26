@@ -54,6 +54,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+pub mod checkpoint_store;
+pub mod projection;
+pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
+pub use projection::{replay, Projection, ReplayError};
+
 /// A log sequence number — the position assigned to a record at append time.
 ///
 /// LSNs are monotonically increasing within one log file. They are *not*
