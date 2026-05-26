@@ -283,6 +283,7 @@ pub fn build_rich_context(
         who: Default::default(),
         why: Default::default(),
         binding: Default::default(),
+        session: Default::default(),
         conversation: Default::default(),
         user: Default::default(),
         project: Default::default(),

@@ -25,6 +25,8 @@
 //! WHAT and WHEN are slated to fold into the minimal core rather than become
 //! separate facets.
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -564,6 +566,67 @@ pub struct RecurrencePattern {
     pub description: Option<String>,
 }
 
+// =============================================================================
+// AGENT SESSION — worktree / branch / agent identity at encoding time
+// =============================================================================
+
+/// Records which agent was operating from which git worktree/branch at the
+/// moment a memory was written.
+///
+/// This is the source-of-truth for "who ran what, where, and when" in the
+/// worktree-per-agent topology the project is moving toward: one git worktree
+/// per agent×branch, with windows and config auto-derived from the branch
+/// name. Veld needs to capture that identity at encoding so memories can later
+/// be filtered, attributed, and visualised by agent or by branch — and so the
+/// planned branch-aware tooling (worktree viewer, branch-scoped recall, the
+/// git viewer) has a reliable provenance axis to query.
+///
+/// `AgentSession` is intentionally separate from [`WhoFacet`]. `WhoFacet` is
+/// about *who is named in the engram* (the social-brain axis). `AgentSession`
+/// is about *which physical agent process* recorded the engram — a host /
+/// runtime identity that exists even for a memory that has no human subjects
+/// at all. Both can coexist on the same record.
+///
+/// All fields are `Option`-typed and `#[serde(default)]` so older records
+/// (written before this facet existed) deserialize cleanly to an empty
+/// session, and so partial captures (e.g. branch known, worktree path not
+/// yet probed) round-trip without losing the fields that *were* captured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentSession {
+    /// Absolute path of the active worktree this agent was running in.
+    #[serde(default)]
+    pub worktree_path: Option<PathBuf>,
+    /// Git branch checked out in that worktree.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Chat-brand identity of the agent — e.g. `"Claude"`, `"Copilot"`,
+    /// `"Cursor"`. Deliberately the *agentic-chat* brand rather than the
+    /// launcher binary (`claude-code` / `claude-cli` / Claude Desktop all
+    /// collapse to `"Claude"`) so the same conversation identity reads the
+    /// same across surfaces. Populated by auto-detecting the parent process
+    /// at session start: when the parent is a known chat launcher (`code`
+    /// with a Claude/Copilot extension active, the Claude binaries, `cursor`,
+    /// etc.) the brand follows. The binary / launcher slug is the fallback
+    /// when detection is ambiguous.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// VS Code window id when the agent is running inside a VS Code window.
+    /// Lets the planned viewer disambiguate concurrent windows on the same
+    /// worktree.
+    #[serde(default)]
+    pub vscode_window_id: Option<String>,
+    /// When this agent session began — distinct from the engram's
+    /// `encoded_at`. Multiple memories recorded in one session share this
+    /// timestamp, which is what makes per-session filtering possible.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Path of the main worktree (the original clone) when this session is
+    /// running in a sibling/linked worktree. Anchors a child worktree back to
+    /// its parent so a branch-aware tool can group siblings.
+    #[serde(default)]
+    pub parent_repo: Option<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,5 +853,66 @@ mod tests {
             back.event_time.unwrap().precision,
             TimePrecision::Hour
         ));
+    }
+
+    #[test]
+    fn agent_session_default_bincode_round_trip() {
+        // Every field None — the shape that lands on every existing record
+        // before any agent-identity probe has run. Must round-trip cleanly
+        // through the project's chosen binary format.
+        let session = AgentSession::default();
+        let bytes =
+            bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
+        let (back, _): (AgentSession, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, session);
+        assert!(back.worktree_path.is_none());
+        assert!(back.branch.is_none());
+        assert!(back.agent_id.is_none());
+        assert!(back.vscode_window_id.is_none());
+        assert!(back.started_at.is_none());
+        assert!(back.parent_repo.is_none());
+    }
+
+    #[test]
+    fn agent_session_populated_bincode_round_trip() {
+        let started_at = chrono::Utc::now();
+        let session = AgentSession {
+            worktree_path: Some(PathBuf::from(
+                "/c/Repositories/Portll/veld/.claude/worktrees/agent-abc",
+            )),
+            branch: Some("feat/agent-session-facet".into()),
+            agent_id: Some("claude-code".into()),
+            vscode_window_id: Some("window-42".into()),
+            started_at: Some(started_at),
+            parent_repo: Some(PathBuf::from("/c/Repositories/Portll/veld")),
+        };
+        let bytes =
+            bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
+        let (back, _): (AgentSession, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, session);
+    }
+
+    #[test]
+    fn agent_session_json_round_trip_for_wire_shape() {
+        // JSON is the externally-visible shape (MCP / HTTP / hook payloads).
+        // Lock the round-trip and confirm the field names land where callers
+        // expect them.
+        let started_at = chrono::Utc::now();
+        let session = AgentSession {
+            worktree_path: Some(PathBuf::from("/repo/wt")),
+            branch: Some("main".into()),
+            agent_id: Some("vscode-copilot".into()),
+            vscode_window_id: Some("vscode-1".into()),
+            started_at: Some(started_at),
+            parent_repo: Some(PathBuf::from("/repo")),
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"branch\":\"main\""));
+        assert!(json.contains("\"agent_id\":\"vscode-copilot\""));
+        assert!(json.contains("\"vscode_window_id\":\"vscode-1\""));
+        let back: AgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, session);
     }
 }

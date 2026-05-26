@@ -7,8 +7,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub use super::facets::{
-    AgentRef, AgentRole, CausalLink, ContentKind, EngramBinding, GoalRef, Orientation, Place,
-    Prediction, RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet, WhyFacet,
+    AgentRef, AgentRole, AgentSession, CausalLink, ContentKind, EngramBinding, GoalRef,
+    Orientation, Place, Prediction, RecordKind, WhatFacet, WhenFacet, WhereFacet, WhoFacet,
+    WhyFacet,
 };
 use super::facets::CausalRelation;
 use crate::constants::{
@@ -317,6 +318,14 @@ pub struct RichContext {
     /// Conjunctive binding — cross-W presence + binding strength (W3.3).
     #[serde(default)]
     pub binding: EngramBinding,
+
+    /// Agent-session identity — which agent recorded this engram, from which
+    /// worktree/branch, when. Source-of-truth for the worktree-per-agent
+    /// topology and the planned branch-aware tooling (worktree viewer,
+    /// branch-scoped recall). Defaults to empty so pre-W3.5 records
+    /// deserialize cleanly.
+    #[serde(default)]
+    pub session: AgentSession,
 
     /// Parent context (for hierarchical context)
     pub parent: Option<Box<RichContext>>,

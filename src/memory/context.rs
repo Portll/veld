@@ -46,6 +46,7 @@ impl ContextBuilder {
                 who: Default::default(),
                 why: Default::default(),
                 binding: Default::default(),
+                session: Default::default(),
                 parent: None,
                 embeddings: None,
                 decay_rate: 0.1, // Default decay

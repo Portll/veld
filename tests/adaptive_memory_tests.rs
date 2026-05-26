@@ -134,6 +134,7 @@ fn create_rich_context(project_id: Option<String>, code_ctx: Option<CodeContext>
         who: Default::default(),
         why: Default::default(),
         binding: Default::default(),
+        session: Default::default(),
         parent: None,
         embeddings: None,
         decay_rate: 0.1,
