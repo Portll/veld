@@ -190,6 +190,9 @@ base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
 
+# Intent log frame checksums (W5 — log-structured projection layer)
+crc32fast = "1.4"
+
 # MIF encryption (AES-256-GCM)
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
