@@ -126,6 +126,38 @@ impl ResetHandle {
     pub fn cap_secs(&self) -> u64 {
         self.cap_secs
     }
+
+    /// Drop per-key state for peers that have replenished to full burst
+    /// capacity. Without this sweep the `DefaultKeyedStateStore` grows one
+    /// entry per distinct peer IP forever (memory leak proportional to the
+    /// cardinality of source IPs that have ever made a request). At public
+    /// scale this is unbounded.
+    ///
+    /// Safe to call concurrently with normal request handling — governor's
+    /// keyed store handles internal locking. Idiomatic governor pattern.
+    pub fn retain_recent(&self) {
+        self.current_limiter().retain_recent();
+    }
+
+    /// Spawn a background tokio task that calls [`retain_recent`] on a fixed
+    /// interval. The task aborts when the returned `JoinHandle` is dropped.
+    /// Called once at server startup; the handle is held by the server's
+    /// shutdown machinery.
+    pub fn spawn_keyed_store_sweeper(
+        &self,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate tick — at t=0 the store is empty.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                this.retain_recent();
+            }
+        })
+    }
 }
 
 /// Tower `Layer` that wires a [`ResetHandle`] into an axum service stack.
@@ -373,6 +405,33 @@ mod tests {
             wrapped_429s,
             raw_rejections
         );
+    }
+
+    #[tokio::test]
+    async fn retain_recent_does_not_panic_on_empty_store() {
+        // Fresh limiter, no traffic — retain_recent must be a no-op.
+        let h = ResetHandle::new(10, 5);
+        h.retain_recent();
+    }
+
+    #[tokio::test]
+    async fn retain_recent_after_traffic_is_safe() {
+        // Exercise enough peers to populate the keyed store, then sweep.
+        // We assert it doesn't panic and that subsequent requests still work
+        // (sweeper must not invalidate the limiter's structural state).
+        let h = ResetHandle::new(10, 5);
+        let app = test_router(h.clone());
+        for octet in 1u8..=10 {
+            let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, octet));
+            let _ = app.clone().oneshot(req_with_peer(ip)).await;
+        }
+        h.retain_recent();
+        // Limiter still serves requests post-sweep.
+        let resp = app
+            .oneshot(req_with_peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

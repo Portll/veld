@@ -230,8 +230,13 @@ async fn async_main() -> Result<()> {
         let burst = server_config.rate_limit_burst;
         let cell_interval = std::time::Duration::from_nanos(1_000_000_000 / rps.max(1));
         let handle = ResetHandle::new(rps, burst);
+        // Sweep the keyed-store every 5 minutes to drop per-IP entries that
+        // have replenished to full burst. Without this the DashMap inside
+        // governor grows one entry per distinct peer IP that has ever made a
+        // request — unbounded at public scale.
+        let _sweeper = handle.spawn_keyed_store_sweeper(std::time::Duration::from_secs(300));
         info!(
-            "Rate limiting: enabled rps={} burst={} (cell interval: {:?}, wait_time cap: {}s)",
+            "Rate limiting: enabled rps={} burst={} (cell interval: {:?}, wait_time cap: {}s, keyed-store sweep: 300s)",
             rps,
             burst,
             cell_interval,
@@ -713,6 +718,34 @@ fn log_production_security_warnings(config: &ServerConfig) {
         warn!(
             "PRODUCTION WARNING: rate limiting is disabled (VELD_RATE_LIMIT=0)."
         );
+    }
+
+    // TLS posture: Veld does not terminate TLS itself. Binding to a non-local
+    // interface in production means the operator must have a TLS-terminating
+    // reverse proxy in front (nginx/Caddy/ALB/Cloudflare) — otherwise API
+    // keys, memory content, and webhook payloads cross the wire in plaintext.
+    //
+    // Operators who have such a proxy can set `VELD_TLS_ACK=true` to silence
+    // this warning. Localhost binds never warn because the loopback interface
+    // is not a network attacker's vantage point.
+    if !crate::config::is_local_bind_host(&config.host) {
+        let tls_ack = std::env::var("VELD_TLS_ACK")
+            .map(|v| {
+                let lower = v.trim().to_ascii_lowercase();
+                lower == "true" || lower == "1" || lower == "yes"
+            })
+            .unwrap_or(false);
+        if !tls_ack {
+            warn!(
+                bind = %config.host,
+                "PRODUCTION WARNING: Veld does not terminate TLS. Bind host '{}' is not \
+                 a loopback interface — API keys and memory content will cross the wire \
+                 in plaintext unless a TLS-terminating reverse proxy (nginx/Caddy/ALB/\
+                 Cloudflare) is in front of this process. Set VELD_TLS_ACK=true to \
+                 acknowledge and silence this warning.",
+                config.host
+            );
+        }
     }
 }
 
