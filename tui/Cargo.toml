@@ -34,6 +34,11 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 dirs = "6.0"
 
+# Git read-only operations for the in-TUI git viewer tab
+# vendored-libgit2 keeps the build self-contained on Windows/macOS/Linux
+# without requiring a system libgit2 install.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+
 [profile.release]
 opt-level = "z"
 lto = true

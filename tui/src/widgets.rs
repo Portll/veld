@@ -482,6 +482,7 @@ pub fn render_main(f: &mut Frame, area: Rect, state: &AppState) {
         ViewMode::Projects => render_projects_view(f, area, state),
         ViewMode::ActivityLogs => render_activity_logs(f, area, state),
         ViewMode::GraphMap => render_graph_map(f, area, state),
+        ViewMode::Git => crate::tabs::git::render(f, area, state),
     }
 
     // View transition overlay - renders on top of content
@@ -6629,6 +6630,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         ViewMode::Projects => "Projects",
         ViewMode::ActivityLogs => "Activity",
         ViewMode::GraphMap => "Graph",
+        ViewMode::Git => "Git",
     };
 
     // Check for error message
@@ -6784,6 +6786,13 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
         ),
         Span::styled("activity ", Style::default().fg(Color::DarkGray)),
         Span::styled(
+            "G ",
+            Style::default()
+                .fg(Color::Rgb(255, 200, 150))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("git ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
             "j/k ",
             Style::default()
                 .fg(Color::Rgb(255, 200, 150))
@@ -6802,6 +6811,23 @@ pub fn render_footer(f: &mut Frame, area: Rect, state: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("zoom ", Style::default().fg(Color::DarkGray)),
+        ]);
+    } else if matches!(state.view_mode, ViewMode::Git) {
+        keys.extend([
+            Span::styled(
+                "r ",
+                Style::default()
+                    .fg(Color::Rgb(255, 200, 150))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("refresh ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Tab ",
+                Style::default()
+                    .fg(Color::Rgb(255, 200, 150))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("pane ", Style::default().fg(Color::DarkGray)),
         ]);
     }
 

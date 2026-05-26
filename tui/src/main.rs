@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 
 mod logo;
 mod stream;
+mod tabs;
 mod types;
 mod widgets;
 
@@ -51,6 +52,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::Projects => "Projects",
         ViewMode::ActivityLogs => "Activity",
         ViewMode::GraphMap => "Graph",
+        ViewMode::Git => "Git",
     };
 
     format!("🦣 Veld - {}", view_name)
@@ -1784,10 +1786,37 @@ async fn run_tui(
                         KeyCode::Char('2') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('3') => g.set_view(ViewMode::ActivityLogs),
                         KeyCode::Char('4') => g.set_view(ViewMode::GraphMap),
+                        KeyCode::Char('5') => {
+                            g.set_view(ViewMode::Git);
+                            if g.git_state.is_none() && !g.git_refreshing {
+                                g.git_refreshing = true;
+                                drop(g);
+                                spawn_git_refresh(Arc::clone(&state), None);
+                                continue;
+                            }
+                        }
                         KeyCode::Char('d') => g.set_view(ViewMode::Dashboard),
                         KeyCode::Char('p') => g.set_view(ViewMode::Projects),
                         KeyCode::Char('a') => g.set_view(ViewMode::ActivityLogs),
                         KeyCode::Char('g') => g.set_view(ViewMode::GraphMap),
+                        KeyCode::Char('G') => {
+                            g.set_view(ViewMode::Git);
+                            if g.git_state.is_none() && !g.git_refreshing {
+                                g.git_refreshing = true;
+                                drop(g);
+                                spawn_git_refresh(Arc::clone(&state), None);
+                                continue;
+                            }
+                        }
+                        KeyCode::Char('r') if matches!(g.view_mode, ViewMode::Git) => {
+                            if !g.git_refreshing {
+                                g.git_refreshing = true;
+                                let branch = tabs::git::selected_branch_name(&g);
+                                drop(g);
+                                spawn_git_refresh(Arc::clone(&state), branch);
+                                continue;
+                            }
+                        }
                         KeyCode::Char('t') => g.toggle_theme(),
                         KeyCode::Char('e') => g.toggle_expand_sections(),
                         KeyCode::F(5) => {
@@ -2249,6 +2278,9 @@ async fn run_tui(
                                 g.toggle_detail_column();
                             } else if matches!(g.view_mode, ViewMode::GraphMap) {
                                 g.toggle_graph_map_focus();
+                            } else if matches!(g.view_mode, ViewMode::Git) {
+                                // Tab cycles panes inside the Git tab.
+                                tabs::git::cycle_pane(&mut g);
                             } else {
                                 g.cycle_view();
                             }
@@ -2269,6 +2301,7 @@ async fn run_tui(
                                 FocusPanel::Right => g.right_panel_up(),
                                 FocusPanel::Detail => g.detail_scroll_up(),
                             },
+                            ViewMode::Git => tabs::git::move_up(&mut g),
                             _ => g.scroll_up(),
                         },
                         KeyCode::Down | KeyCode::Char('j') => match g.view_mode {
@@ -2322,6 +2355,7 @@ async fn run_tui(
                                     }
                                 }
                             }
+                            ViewMode::Git => tabs::git::move_down(&mut g),
                             _ => g.scroll_down(),
                         },
                         KeyCode::Left => {
@@ -2524,6 +2558,29 @@ async fn run_tui(
         if last_tick.elapsed() >= tick_rate {
             let mut g = state.lock().await;
             g.tick();
+
+            // Git tab: auto-refresh every 5s while the tab is visible,
+            // and also refresh whenever the selected branch differs
+            // from the branch currently loaded into recent_commits.
+            if matches!(g.view_mode, ViewMode::Git) && !g.git_refreshing {
+                let needs_refresh = match g.git_state.as_ref() {
+                    None => true,
+                    Some(snap) => snap.last_refreshed.elapsed() >= GIT_AUTO_REFRESH,
+                };
+                let selected_branch = tabs::git::selected_branch_name(&g);
+                let branch_changed = match (&g.git_commits_for_branch, &selected_branch) {
+                    (Some(a), Some(b)) => a != b,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if needs_refresh || branch_changed {
+                    g.git_refreshing = true;
+                    drop(g);
+                    spawn_git_refresh(Arc::clone(&state), selected_branch);
+                    last_tick = Instant::now();
+                    continue;
+                }
+            }
 
             // Check if debounced search should execute
             if g.should_execute_search() {
@@ -2990,6 +3047,45 @@ fn parse_recall_response(data: serde_json::Value) -> Result<Vec<types::SearchRes
         });
     }
     Ok(results)
+}
+
+/// Auto-refresh interval for the Git tab.
+const GIT_AUTO_REFRESH: Duration = Duration::from_secs(5);
+
+/// Kick off a background refresh of `AppState::git_state`. Sets
+/// `git_refreshing = true` synchronously and returns; the spawned task
+/// writes results back. Caller must already hold the lock.
+fn spawn_git_refresh(state: Arc<Mutex<types::AppState>>, branch: Option<String>) {
+    let start_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    tokio::spawn(async move {
+        // Heavy git2 work — run on a blocking thread so the async
+        // runtime stays responsive.
+        let result = tokio::task::spawn_blocking(move || {
+            types::GitState::from_repo(&start_path, branch.as_deref())
+        })
+        .await;
+
+        let mut g = state.lock().await;
+        g.git_refreshing = false;
+        match result {
+            Ok(Ok(snapshot)) => {
+                g.git_commits_for_branch = snapshot
+                    .branches
+                    .get(g.git_selected_branch)
+                    .cloned()
+                    .or_else(|| snapshot.current_branch.clone());
+                g.git_state = Some(snapshot);
+                g.git_error = None;
+                tabs::git::clamp_selections(&mut g);
+            }
+            Ok(Err(e)) => {
+                g.git_error = Some(format!("{}", e));
+            }
+            Err(join_err) => {
+                g.git_error = Some(format!("refresh task panicked: {}", join_err));
+            }
+        }
+    });
 }
 
 fn ui(f: &mut Frame, state: &AppState) {

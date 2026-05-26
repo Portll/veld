@@ -434,6 +434,69 @@ pub enum ViewMode {
     Projects,
     ActivityLogs,
     GraphMap,
+    Git,
+}
+
+/// Which pane is focused inside the Git tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitPane {
+    #[default]
+    Worktrees,
+    Branches,
+    Commits,
+}
+
+impl GitPane {
+    pub fn next(self) -> Self {
+        match self {
+            GitPane::Worktrees => GitPane::Branches,
+            GitPane::Branches => GitPane::Commits,
+            GitPane::Commits => GitPane::Worktrees,
+        }
+    }
+}
+
+/// Information about a single sibling worktree.
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    /// Filesystem path to the worktree.
+    pub path: String,
+    /// Display name (typically the directory name).
+    pub name: String,
+    /// Current branch checked out in that worktree, if any.
+    pub branch: Option<String>,
+    /// Whether this is the active worktree the TUI is running inside.
+    pub is_active: bool,
+}
+
+/// Information about a single commit.
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    /// Short OID string (7 chars).
+    pub short_oid: String,
+    /// First line of the commit message.
+    pub subject: String,
+    /// Author name.
+    pub author: String,
+    /// Authored timestamp.
+    pub time: chrono::DateTime<chrono::Utc>,
+    /// Number of files changed vs first parent (or 0 for root commit).
+    pub files_changed: usize,
+}
+
+/// Snapshot of git state surfaced by the Git tab.
+#[derive(Debug, Clone)]
+pub struct GitState {
+    /// Current branch in the active worktree (None if detached HEAD).
+    pub current_branch: Option<String>,
+    /// All local branches in the repo (sorted alphabetically).
+    pub branches: Vec<String>,
+    /// Sibling worktrees plus the main one. Includes the active worktree.
+    pub worktrees: Vec<WorktreeInfo>,
+    /// Up to 50 most recent commits on the currently selected branch.
+    pub recent_commits: Vec<CommitInfo>,
+    /// When this snapshot was produced — used to show staleness in the UI.
+    pub last_refreshed: Instant,
 }
 
 /// Which panel is focused in Projects view
@@ -1639,6 +1702,23 @@ pub struct AppState {
     pub codebase_input_project_id: Option<String>,
     /// Scroll offset for rich event detail panel (recall/proactive_context results)
     pub event_detail_scroll: usize,
+    /// Latest snapshot of git state for the Git tab.
+    pub git_state: Option<GitState>,
+    /// Last error from a git refresh attempt, if any.
+    pub git_error: Option<String>,
+    /// True while a background git refresh is in flight.
+    pub git_refreshing: bool,
+    /// Which pane is focused inside the Git tab.
+    pub git_focus: GitPane,
+    /// Selected index in the worktree list.
+    pub git_selected_worktree: usize,
+    /// Selected index in the branch list.
+    pub git_selected_branch: usize,
+    /// Selected index in the commit list.
+    pub git_selected_commit: usize,
+    /// Branch name whose commits are currently loaded into recent_commits.
+    /// Used to detect when the selection changes and we need a fresh fetch.
+    pub git_commits_for_branch: Option<String>,
 }
 
 /// Claude Code context session status
@@ -1755,6 +1835,14 @@ impl AppState {
             codebase_input_path: String::new(),
             codebase_input_project_id: None,
             event_detail_scroll: 0,
+            git_state: None,
+            git_error: None,
+            git_refreshing: false,
+            git_focus: GitPane::default(),
+            git_selected_worktree: 0,
+            git_selected_branch: 0,
+            git_selected_commit: 0,
+            git_commits_for_branch: None,
         }
     }
 
@@ -1955,7 +2043,8 @@ impl AppState {
             ViewMode::Dashboard => ViewMode::Projects,
             ViewMode::Projects => ViewMode::ActivityLogs,
             ViewMode::ActivityLogs => ViewMode::GraphMap,
-            ViewMode::GraphMap => ViewMode::Dashboard,
+            ViewMode::GraphMap => ViewMode::Git,
+            ViewMode::Git => ViewMode::Dashboard,
         };
         self.set_view(new_mode);
     }
