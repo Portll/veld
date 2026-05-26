@@ -1024,14 +1024,19 @@ pub async fn restore_backup(
 
     let user_id = req.user_id.clone();
     let all_restored = state
-        .restore_user_backup(&user_id, req.backup_id)
+        .restore_user_backup_with_options(&user_id, req.backup_id, req.max_lsn)
         .map_err(AppError::Internal)?;
 
     state.log_event(
         &user_id,
         "BACKUP_RESTORED",
         &format!("backup_{}", req.backup_id.unwrap_or(0)),
-        &format!("Restored {} stores: {:?}", all_restored.len(), all_restored),
+        &format!(
+            "Restored {} stores: {:?} (max_lsn={:?})",
+            all_restored.len(),
+            all_restored,
+            req.max_lsn
+        ),
     );
 
     Ok(Json(RestoreBackupResponse {

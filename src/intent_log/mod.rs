@@ -461,8 +461,19 @@ impl IntentLog {
     pub fn truncate_corrupt_tail(&mut self) -> Result<u64, IntentLogError> {
         self.writer.flush()?;
         let target = self.durable_end_offset;
-        self.writer.get_ref().set_len(target)?;
-        self.writer.get_ref().sync_data()?;
+
+        // On Windows, an append-mode handle lacks FILE_WRITE_DATA so
+        // `set_len` returns ERROR_ACCESS_DENIED. Use a transient
+        // read+write handle to perform the truncate, then resume our
+        // own append handle. Cross-platform — POSIX behaves identically.
+        let trunc_handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        trunc_handle.set_len(target)?;
+        trunc_handle.sync_data()?;
+        drop(trunc_handle);
+
         // Reopen so BufWriter's seek matches the new EOF.
         let file = OpenOptions::new().read(true).append(true).open(&self.path)?;
         self.writer = BufWriter::new(file);
@@ -473,6 +484,99 @@ impl IntentLog {
             "intent log truncated corrupt tail",
         );
         Ok(target)
+    }
+
+    /// Truncate the file so the last surviving frame is the one with LSN
+    /// `max_lsn` (inclusive). All frames after that frame are discarded.
+    /// Used by the backup point-in-time-restore (PITR) path to roll the log
+    /// back to a known position.
+    ///
+    /// Returns the new file length in bytes.
+    ///
+    /// Errors:
+    /// - Returns [`IntentLogError::Io`] if the underlying file can't be
+    ///   read or resized.
+    /// - Returns [`IntentLogError::CrcMismatch`] / [`IntentLogError::TruncatedFrame`]
+    ///   if a corrupt frame is encountered *before* `max_lsn`. In that
+    ///   case the file is left untouched — PITR refuses to truncate
+    ///   through corruption because that would silently lose data the
+    ///   caller didn't ask to drop.
+    /// - Returns [`IntentLogError::Io`] (NotFound) if `max_lsn` is greater
+    ///   than every LSN actually present in the file.
+    pub fn truncate_to_lsn(&mut self, max_lsn: Lsn) -> Result<u64, IntentLogError> {
+        // Flush any buffered append so the on-disk image is what we scan.
+        self.writer.flush()?;
+
+        // Walk frames in a scoped block so the scanner's read handle is
+        // dropped before we attempt the truncate. Windows refuses
+        // `set_len` while another read handle is open against the same
+        // file, even though POSIX is happy with it.
+        let (last_good_offset, _highest_seen) = {
+            let mut iter = IntentLogIter::open(&self.path)?;
+            let mut last_good_offset = 0u64;
+            let mut found = false;
+            let mut highest_seen: Option<Lsn> = None;
+            loop {
+                match iter.next() {
+                    None => break,
+                    Some(Ok(rec)) => {
+                        highest_seen = Some(rec.lsn);
+                        let frame_end = iter.current_offset();
+                        if rec.lsn == max_lsn {
+                            last_good_offset = frame_end;
+                            found = true;
+                            break;
+                        }
+                        if rec.lsn.0 > max_lsn.0 {
+                            // Walked past target without finding an exact match.
+                            // The caller's max_lsn is between frames, which is
+                            // not allowed — LSNs are dense.
+                            return Err(IntentLogError::Io(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "max_lsn={} is not present in intent log (highest seen so far: {})",
+                                    max_lsn.0, rec.lsn.0
+                                ),
+                            )));
+                        }
+                    }
+                    Some(Err(e)) => return Err(e),
+                }
+            }
+            if !found {
+                return Err(IntentLogError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "max_lsn={} not found in intent log (highest LSN present: {})",
+                        max_lsn.0,
+                        highest_seen.map(|l| l.0 as i128).unwrap_or(-1),
+                    ),
+                )));
+            }
+            (last_good_offset, highest_seen)
+            // `iter` dropped here, releasing its read handle.
+        };
+
+        // Drop our own append-mode writer before truncating: on Windows
+        // a handle opened with append(true) lacks FILE_WRITE_DATA, so
+        // calling `set_len` on it returns ERROR_ACCESS_DENIED. Reopen
+        // with read+write so the truncate succeeds, then reattach the
+        // append handle afterwards.
+        let trunc_handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        trunc_handle.set_len(last_good_offset)?;
+        trunc_handle.sync_data()?;
+        drop(trunc_handle);
+
+        // Reopen so BufWriter's append position matches the new EOF, and
+        // refresh the in-memory tail bookkeeping.
+        let file = OpenOptions::new().read(true).append(true).open(&self.path)?;
+        self.writer = BufWriter::new(file);
+        self.durable_end_offset = last_good_offset;
+        self.next_lsn = max_lsn.next();
+        Ok(last_good_offset)
     }
 }
 
@@ -494,6 +598,19 @@ pub struct IntentLogIter {
 }
 
 impl IntentLogIter {
+    /// Open a read-only iterator over the frames in `path`. This is
+    /// exposed so external tooling (e.g. the backup engine) can scan a
+    /// freshly-restored log file end-to-end without needing to construct
+    /// a full `IntentLog`. Use `IntentLog::iter()` for the in-process
+    /// case where you already have a log handle open.
+    ///
+    /// Auto-detects header presence: a versioned log skips past the
+    /// 36-byte header; a legacy log starts at offset 0.
+    pub fn open_for_scan(path: &Path) -> Result<Self, IntentLogError> {
+        let mode = LogMode::probe(path)?;
+        Self::open(path, mode.frame_region_start())
+    }
+
     fn open(path: &Path, start_offset: u64) -> Result<Self, IntentLogError> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start_offset))?;
@@ -942,6 +1059,55 @@ mod tests {
         let huge = vec![0u8; MAX_PAYLOAD_BYTES + 1];
         let err = log.append(&huge).unwrap_err();
         assert!(matches!(err, IntentLogError::PayloadTooLarge { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncate_to_lsn_keeps_inclusive_frame() {
+        let path = tmp_log_path("trunc_lsn");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"frame-0").unwrap(); // lsn 0
+            log.append(b"frame-1").unwrap(); // lsn 1
+            log.append(b"frame-2").unwrap(); // lsn 2
+            log.append(b"frame-3").unwrap(); // lsn 3
+            log.sync().unwrap();
+        }
+        let mut log = IntentLog::open(&path).unwrap();
+        let new_len = log.truncate_to_lsn(Lsn(1)).unwrap();
+        // Verify only frames 0 and 1 remain, in order.
+        let records: Vec<_> = log
+            .iter()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].lsn, Lsn(0));
+        assert_eq!(records[0].payload, b"frame-0");
+        assert_eq!(records[1].lsn, Lsn(1));
+        assert_eq!(records[1].payload, b"frame-1");
+        // File length matches reported truncation.
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), new_len);
+        // Next append continues from lsn 2.
+        let lsn = log.append(b"after-pitr").unwrap();
+        assert_eq!(lsn, Lsn(2));
+        log.sync().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncate_to_lsn_missing_target_errors() {
+        let path = tmp_log_path("trunc_lsn_missing");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"only-frame").unwrap();
+            log.sync().unwrap();
+        }
+        let mut log = IntentLog::open(&path).unwrap();
+        // max_lsn beyond what's present must error.
+        let err = log.truncate_to_lsn(Lsn(99)).unwrap_err();
+        assert!(matches!(err, IntentLogError::Io(_)));
         let _ = std::fs::remove_file(&path);
     }
 
