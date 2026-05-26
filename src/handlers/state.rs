@@ -1987,6 +1987,14 @@ impl MultiUserMemoryManager {
         vec![("shared".to_string(), std::sync::Arc::clone(&self.shared_db))]
     }
 
+    /// Default location of the W5 intent log directory for this server
+    /// instance: `<base_path>/intent_log/`. The path is conventional —
+    /// callers that need a different layout can call the lower-level
+    /// `VeldBackupEngine` methods directly.
+    fn intent_log_default_dir(&self) -> std::path::PathBuf {
+        self.base_path.join("intent_log")
+    }
+
     pub fn create_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
@@ -2004,16 +2012,20 @@ impl MultiUserMemoryManager {
                 let graph_guard = graph_lock.as_ref().map(|graph| graph.read());
                 let graph_db_ref = graph_guard.as_ref().map(|graph| graph.get_db());
 
-                if store_refs.is_empty() && graph_db_ref.is_none() {
-                    self.backup_engine.create_backup(&db, user_id)
-                } else {
-                    self.backup_engine.create_comprehensive_backup_with_graph(
-                        &db,
-                        user_id,
-                        &store_refs,
-                        graph_db_ref,
-                    )
-                }
+                // Always attempt to include the intent log; the backup
+                // engine no-ops cleanly when the dir doesn't exist (W5
+                // not yet active for this install).
+                let intent_log_dir = self.intent_log_default_dir();
+                let intent_log_spec =
+                    crate::backup::IntentLogBackupSpec::with_default_log_name(intent_log_dir);
+
+                self.backup_engine.create_comprehensive_backup_with_intent_log(
+                    &db,
+                    user_id,
+                    &store_refs,
+                    graph_db_ref,
+                    Some(&intent_log_spec),
+                )
             }
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup creation yet",
@@ -2057,20 +2069,42 @@ impl MultiUserMemoryManager {
         user_id: &str,
         backup_id: Option<u32>,
     ) -> Result<Vec<String>> {
+        self.restore_user_backup_with_options(user_id, backup_id, None)
+    }
+
+    /// Restore a user's backup with optional point-in-time-restore.
+    ///
+    /// `max_lsn` (if set) truncates the restored intent log so that the
+    /// final on-disk frame has `lsn == max_lsn`. Frames with higher LSNs
+    /// in the archive are dropped.
+    pub fn restore_user_backup_with_options(
+        &self,
+        user_id: &str,
+        backup_id: Option<u32>,
+        max_lsn: Option<u64>,
+    ) -> Result<Vec<String>> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
                 let memory_db_path = self.base_path.join(user_id).join("storage");
                 let graph_path = self.base_path.join(user_id).join("graph").join("graph");
+                let intent_log_dir = self.intent_log_default_dir();
 
                 self.evict_user(user_id);
 
                 let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
-                let restored_stores = self.backup_engine.restore_comprehensive_backup(
-                    user_id,
-                    backup_id,
-                    &memory_db_path,
-                    &secondary_restore_paths,
-                )?;
+                let intent_log_spec =
+                    crate::backup::IntentLogBackupSpec::with_default_log_name(intent_log_dir);
+                let restore_opts = crate::backup::RestoreOptions { max_lsn };
+                let restored_stores = self
+                    .backup_engine
+                    .restore_comprehensive_backup_with_intent_log(
+                        user_id,
+                        backup_id,
+                        &memory_db_path,
+                        &secondary_restore_paths,
+                        Some(&intent_log_spec),
+                        &restore_opts,
+                    )?;
 
                 let resolved_backup_id = backup_id.unwrap_or_else(|| {
                     self.backup_engine

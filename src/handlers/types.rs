@@ -639,6 +639,12 @@ pub struct RestoreBackupRequest {
     pub user_id: String,
     #[serde(default)]
     pub backup_id: Option<u32>,
+    /// Point-in-time-restore (PITR). When set, the restored intent log
+    /// is truncated so the final surviving frame has `lsn == max_lsn`.
+    /// Frames in the archive with higher LSNs are dropped on disk.
+    /// No effect on the main RocksDB restore.
+    #[serde(default)]
+    pub max_lsn: Option<u64>,
 }
 
 #[derive(Serialize)]
