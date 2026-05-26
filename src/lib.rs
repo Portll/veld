@@ -46,6 +46,7 @@ pub mod similarity;
 pub mod storage;
 pub mod streaming;
 pub mod tracing_setup;
+pub mod user_auth;
 pub mod validation;
 pub mod vector_db;
 

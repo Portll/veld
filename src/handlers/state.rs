@@ -239,6 +239,11 @@ pub struct MultiUserMemoryManager {
 
     /// Capabilities for the effective backend in the current runtime.
     storage_capabilities: StorageCapabilities,
+
+    /// Phase C user-auth runtime. `Some` iff `VELD_USER_AUTH_ENABLED` was
+    /// truthy at server startup. Handlers gate on this — when `None`, the
+    /// /api/user_auth/* surface returns 404.
+    pub user_auth_runtime: Option<crate::user_auth::runtime::UserAuthRuntime>,
 }
 
 impl MultiUserMemoryManager {
@@ -460,6 +465,44 @@ impl MultiUserMemoryManager {
         let storage_capabilities =
             StorageCapabilities::for_backend(server_config.effective_storage_backend);
 
+        // Phase C — initialise the user-auth runtime only when the feature
+        // flag was truthy at startup. The shared DB already declared the
+        // user_auth CF in `open_legacy_shared_db` under the same flag, so
+        // construction here just wraps the existing handle.
+        let user_auth_runtime = if crate::user_auth::feature_enabled() {
+            match crate::user_auth::store::UserAuthStore::new(shared_stores.shared_db.clone()) {
+                Ok(store) => {
+                    let field_encryptor = match crate::encryption::FieldEncryptor::from_env() {
+                        Ok(encryptor) => encryptor,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "VELD_ENCRYPTION_KEY present but malformed; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
+                            );
+                            None
+                        }
+                    };
+                    info!(
+                        encryption = field_encryptor.is_some(),
+                        "user-auth runtime initialised (VELD_USER_AUTH_ENABLED=true)"
+                    );
+                    Some(crate::user_auth::runtime::UserAuthRuntime::new(
+                        store,
+                        field_encryptor,
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "VELD_USER_AUTH_ENABLED=true but UserAuthStore failed to open; surface remains disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let manager = Self {
             user_earths,
             audit_logs: Arc::new(DashMap::new()),
@@ -502,6 +545,7 @@ impl MultiUserMemoryManager {
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
             storage_capabilities,
+            user_auth_runtime,
         };
 
         info!("Running initial audit log rotation...");
@@ -611,6 +655,14 @@ impl MultiUserMemoryManager {
             CF_AUDIT,
             Self::shared_store_cf_options(),
         ));
+
+        // Phase C user auth: conditionally declare the user_auth CF. When
+        // VELD_USER_AUTH_ENABLED is unset, the CF is never created on disk —
+        // satisfies the spec requirement that disabling the flag leaves no
+        // footprint.
+        if crate::user_auth::feature_enabled() {
+            cfs.push(crate::user_auth::store::cf_descriptor());
+        }
 
         Ok(Arc::new(
             rocksdb::DB::open_cf_descriptors(&db_opts, &shared_db_path, cfs)

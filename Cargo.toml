@@ -218,6 +218,13 @@ crc32fast = "1.4"
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 
+# User auth (Phase C) — Argon2id password + recovery code hashing and RFC 6238 TOTP.
+# `argon2` provides parameterised Argon2id and constant-time verification using `subtle`.
+# `totp-rs` 5.x pins SHA-1 by default (RFC 6238 baseline) and supports
+# `otpauth://` provisioning URIs without pulling in QR/serde extras.
+argon2 = "0.5"
+totp-rs = { version = "5.6", default-features = false, features = ["otpauth"] }
+
 # External integrations (SHO-40)
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
