@@ -54,6 +54,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::metrics::{
+    Timer, INTENT_LOG_APPEND_DURATION, INTENT_LOG_APPEND_TOTAL,
+    INTENT_LOG_DURABLE_END_OFFSET_BYTES, INTENT_LOG_NEXT_LSN, INTENT_LOG_SYNC_DURATION,
+    INTENT_LOG_SYNC_TOTAL, INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL,
+};
+
 pub mod checkpoint_store;
 pub mod journal;
 pub mod payload;
@@ -146,6 +152,11 @@ impl IntentLog {
             .create(true)
             .open(&path)?;
 
+        // Publish the head-of-log gauges so dashboards see a value immediately
+        // after process start, without waiting for the first append.
+        INTENT_LOG_NEXT_LSN.set(next_lsn.0 as i64);
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(durable_end as i64);
+
         Ok(Self {
             path,
             writer: BufWriter::new(file),
@@ -157,12 +168,33 @@ impl IntentLog {
     /// Append a record. Returns the LSN assigned to it. Writes go through a
     /// `BufWriter` — call `sync` for durability before returning to a caller
     /// that requires the record to survive a crash.
+    #[tracing::instrument(
+        level = "info",
+        name = "intent_log.append",
+        skip(self, payload),
+        fields(
+            lsn = self.next_lsn.0,
+            payload_len = payload.len(),
+        ),
+    )]
     pub fn append(&mut self, payload: &[u8]) -> Result<Lsn, IntentLogError> {
+        let _timer = Timer::new(INTENT_LOG_APPEND_DURATION.clone());
+
         if payload.len() > MAX_PAYLOAD_BYTES {
-            return Err(IntentLogError::PayloadTooLarge {
+            INTENT_LOG_APPEND_TOTAL
+                .with_label_values(&["payload_too_large"])
+                .inc();
+            let err = IntentLogError::PayloadTooLarge {
                 size: payload.len(),
                 limit: MAX_PAYLOAD_BYTES,
-            });
+            };
+            tracing::error!(
+                error = %err,
+                payload_len = payload.len(),
+                limit = MAX_PAYLOAD_BYTES,
+                "intent log append rejected: payload too large",
+            );
+            return Err(err);
         }
 
         let lsn = self.next_lsn;
@@ -174,21 +206,58 @@ impl IntentLog {
         hasher.update(payload);
         let crc = hasher.finalize();
 
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&lsn.0.to_le_bytes())?;
-        self.writer.write_all(payload)?;
-        self.writer.write_all(&crc.to_le_bytes())?;
+        if let Err(e) = (|| -> io::Result<()> {
+            self.writer.write_all(&len.to_le_bytes())?;
+            self.writer.write_all(&lsn.0.to_le_bytes())?;
+            self.writer.write_all(payload)?;
+            self.writer.write_all(&crc.to_le_bytes())?;
+            Ok(())
+        })() {
+            INTENT_LOG_APPEND_TOTAL
+                .with_label_values(&["io_error"])
+                .inc();
+            tracing::error!(
+                error = %e,
+                lsn = lsn.0,
+                "intent log append failed: I/O error",
+            );
+            return Err(IntentLogError::Io(e));
+        }
 
         self.next_lsn = lsn.next();
         self.durable_end_offset += (FRAME_HEADER_BYTES + payload.len() + FRAME_TRAILER_BYTES) as u64;
+
+        INTENT_LOG_APPEND_TOTAL.with_label_values(&["ok"]).inc();
+        INTENT_LOG_NEXT_LSN.set(self.next_lsn.0 as i64);
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(self.durable_end_offset as i64);
+
         Ok(lsn)
     }
 
     /// Flush the BufWriter and fsync the file. After this returns, every
     /// frame `append`-ed since the last `sync` is durable.
+    #[tracing::instrument(
+        level = "info",
+        name = "intent_log.sync",
+        skip(self),
+        fields(
+            next_lsn = self.next_lsn.0,
+            durable_end_offset = self.durable_end_offset,
+        ),
+    )]
     pub fn sync(&mut self) -> Result<(), IntentLogError> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        let _timer = Timer::new(INTENT_LOG_SYNC_DURATION.clone());
+        if let Err(e) = self.writer.flush() {
+            INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
+            tracing::error!(error = %e, "intent log sync failed: flush error");
+            return Err(IntentLogError::Io(e));
+        }
+        if let Err(e) = self.writer.get_ref().sync_data() {
+            INTENT_LOG_SYNC_TOTAL.with_label_values(&["io_error"]).inc();
+            tracing::error!(error = %e, "intent log sync failed: fsync error");
+            return Err(IntentLogError::Io(e));
+        }
+        INTENT_LOG_SYNC_TOTAL.with_label_values(&["ok"]).inc();
         Ok(())
     }
 
@@ -231,6 +300,12 @@ impl IntentLog {
         // Reopen so BufWriter's seek matches the new EOF.
         let file = OpenOptions::new().read(true).append(true).open(&self.path)?;
         self.writer = BufWriter::new(file);
+        INTENT_LOG_TRUNCATE_CORRUPT_TAIL_TOTAL.inc();
+        INTENT_LOG_DURABLE_END_OFFSET_BYTES.set(target as i64);
+        tracing::info!(
+            target_offset = target,
+            "intent log truncated corrupt tail",
+        );
         Ok(target)
     }
 }

@@ -30,6 +30,8 @@
 
 use std::error::Error;
 
+use crate::metrics::{PROJECTION_APPLY_DURATION, PROJECTION_APPLY_TOTAL, Timer};
+
 use super::payload::{self, IntentPayload, PayloadError};
 use super::{IntentLog, IntentLogError, Lsn};
 
@@ -136,20 +138,78 @@ impl JournaledWriter {
     /// case; `IntentLog::open` on the next process will detect it via
     /// CRC mismatch / truncated frame and `truncate_corrupt_tail()`
     /// will clear it.
+    #[tracing::instrument(
+        level = "info",
+        name = "journal.record_and_apply",
+        skip(self, payload),
+        fields(
+            user_id = %payload.user_id(),
+            memory_id = %payload.memory_id(),
+            projection_count = self.projections.len(),
+            lsn = tracing::field::Empty,
+        ),
+    )]
     pub fn record_and_apply(
         &mut self,
         payload: &IntentPayload,
     ) -> Result<WriteOutcome, JournalError> {
-        let lsn = payload::append(&mut self.log, payload)?;
-        self.log.sync()?;
+        let lsn = match payload::append(&mut self.log, payload) {
+            Ok(lsn) => lsn,
+            Err(PayloadError::Log(e)) => {
+                tracing::error!(
+                    error = %e,
+                    "journal record_and_apply failed: intent log error during append",
+                );
+                return Err(JournalError::Log(e));
+            }
+            Err(e @ (PayloadError::Encode(_) | PayloadError::Decode(_))) => {
+                tracing::error!(
+                    error = %e,
+                    "journal record_and_apply failed: payload encode/decode error",
+                );
+                return Err(JournalError::Payload(e));
+            }
+        };
+        tracing::Span::current().record("lsn", lsn.0);
+        if let Err(e) = self.log.sync() {
+            tracing::error!(
+                error = %e,
+                lsn = lsn.0,
+                "journal record_and_apply failed: intent log sync error",
+            );
+            return Err(JournalError::Log(e));
+        }
 
         let mut apply_errors = Vec::new();
         for p in &mut self.projections {
-            if let Err(source) = p.apply(lsn, payload) {
-                apply_errors.push(ApplyError {
-                    projection: p.name().to_string(),
-                    source,
-                });
+            let projection_name = p.name().to_string();
+            let timer = Timer::new(
+                PROJECTION_APPLY_DURATION
+                    .with_label_values(&[projection_name.as_str()]),
+            );
+            let apply_result = p.apply(lsn, payload);
+            drop(timer);
+            match apply_result {
+                Ok(()) => {
+                    PROJECTION_APPLY_TOTAL
+                        .with_label_values(&[projection_name.as_str(), "ok"])
+                        .inc();
+                }
+                Err(source) => {
+                    PROJECTION_APPLY_TOTAL
+                        .with_label_values(&[projection_name.as_str(), "error"])
+                        .inc();
+                    tracing::error!(
+                        projection = %projection_name,
+                        lsn = lsn.0,
+                        error = %source,
+                        "projection apply failed during journaled write",
+                    );
+                    apply_errors.push(ApplyError {
+                        projection: projection_name,
+                        source,
+                    });
+                }
             }
         }
 
