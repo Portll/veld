@@ -55,8 +55,10 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod checkpoint_store;
+pub mod payload;
 pub mod projection;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
+pub use payload::{IntentPayload, PayloadError};
 pub use projection::{replay, Projection, ReplayError};
 
 /// A log sequence number — the position assigned to a record at append time.
