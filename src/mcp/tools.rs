@@ -273,6 +273,41 @@ impl VeldMcpServer {
     }
 
     #[tool(
+        description = "Give explicit feedback on memories that were surfaced by a recent recall. outcome: 'helpful' boosts (memories that helped solve the task), 'misleading' suppresses (memories that wasted time or were wrong), 'neutral' is a mild access bump. Feeds the closed-loop ranker — future recalls re-rank based on accumulated momentum."
+    )]
+    async fn reinforce_memories(
+        &self,
+        Parameters(params): Parameters<ReinforceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<ReinforceResponse> = self
+            .client
+            .post(
+                "/api/reinforce",
+                &ReinforceRequest {
+                    user_id: self.client.user_id.clone(),
+                    ids: params.memory_ids,
+                    outcome: params.outcome,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Reinforced {} memories — {} boosts, {} decays, {} associations strengthened",
+                resp.memories_processed,
+                resp.importance_boosts,
+                resp.importance_decays,
+                resp.associations_strengthened
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
         description = "Move a memory to a specific tier. target_tier accepts: 'working', 'session', 'longterm', 'archive'. Prefer the named helpers (promote_to_hot, demote_to_cold) for the common cases."
     )]
     async fn move_to_tier(

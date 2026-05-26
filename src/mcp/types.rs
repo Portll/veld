@@ -128,6 +128,37 @@ pub(crate) struct TierMoveResponse {
     pub current_tier: String,
 }
 
+// =============================================================================
+// CLOSED-LOOP FEEDBACK MCP TOOL PARAMETERS
+// =============================================================================
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReinforceParams {
+    /// Memory IDs (UUID strings) that were surfaced. Mark them with the
+    /// outcome — the feedback store updates each memory's momentum so future
+    /// rankings prefer helpful memories and suppress misleading ones.
+    pub memory_ids: Vec<String>,
+    /// "helpful" — memories that helped solve the task (boost score)
+    /// "misleading" — memories that misled or wasted time (suppress score)
+    /// "neutral" — neither obviously helped nor hurt (mild access bump)
+    pub outcome: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ReinforceRequest {
+    pub user_id: String,
+    pub ids: Vec<String>,
+    pub outcome: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ReinforceResponse {
+    pub memories_processed: usize,
+    pub associations_strengthened: usize,
+    pub importance_boosts: usize,
+    pub importance_decays: usize,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GapMapperParams {
     #[schemars(description = "Filter function: 'centroid_distance' (default), 'density', 'eccentricity', 'neighbor_distance', or 'embedding_pc1'")]
