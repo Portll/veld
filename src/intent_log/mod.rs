@@ -17,9 +17,21 @@
 //! W4 (Postgres / Supabase) depends on this — Postgres writes are idempotent
 //! when keyed by LSN, so a replay re-applies them safely.
 //!
+//! ## File layout
+//!
+//! Every file starts with a fixed-size [`IntentLogHeader`] (36 bytes)
+//! carrying a magic literal, a `format_version`, a creation timestamp,
+//! a reserved span, and a header CRC. The header lets future versions
+//! detect breaking changes to the frame layout below without having to
+//! guess from the bytes. See [`header`] for the wire shape.
+//!
+//! Legacy logs written before the header existed are auto-detected (no
+//! magic at offset 0) and read in "legacy unversioned" mode. They can
+//! be upgraded in place to v1 via [`IntentLog::upgrade_unversioned_to_v1`].
+//!
 //! ## Frame format
 //!
-//! Each record is stored as a frame:
+//! After the header, each record is stored as a frame:
 //!
 //! ```text
 //!   ┌───────────┬───────────┬─────────────────┬───────────┐
@@ -55,11 +67,17 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod checkpoint_store;
+pub mod header;
 pub mod journal;
+pub mod migrations;
 pub mod payload;
 pub mod projection;
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError};
+pub use header::{
+    HeaderError, IntentLogHeader, CURRENT_FORMAT_VERSION, HEADER_BYTES, MAGIC,
+};
 pub use journal::{ApplyError, JournalError, JournaledWriter, TypedProjection, WriteOutcome};
+pub use migrations::{migrate_payload, MigrationError};
 pub use payload::{IntentPayload, PayloadError};
 pub use projection::{replay, Projection, ReplayError};
 
@@ -98,6 +116,17 @@ pub enum IntentLogError {
         expected: usize,
         actual: usize,
     },
+    /// The file's header could not be validated. Carries the underlying
+    /// [`HeaderError`] so the caller can distinguish "legacy file with
+    /// no header" (which is recoverable via `upgrade_unversioned_to_v1`)
+    /// from "future version we cannot interpret" (which is not).
+    #[error("intent log header error: {0}")]
+    Header(#[from] HeaderError),
+    /// Operation refused because the log is being treated as a legacy
+    /// (header-less) file. The caller must `upgrade_unversioned_to_v1`
+    /// before performing the operation.
+    #[error("operation requires a versioned intent log; this file is in legacy mode")]
+    LegacyModeUnsupported,
 }
 
 /// Hard cap on a single payload's size. 16 MiB is far larger than any
@@ -119,8 +148,44 @@ pub struct IntentLog {
     /// File offset (in bytes from start) of the byte *after* the last
     /// successfully-written frame. Used by `truncate_corrupt_tail` and to
     /// answer "how big is the durable portion of this file" without an
-    /// extra fstat.
+    /// extra fstat. Includes any header bytes — `durable_end_offset` is
+    /// always relative to byte 0 of the file.
     durable_end_offset: u64,
+    /// Versioning mode this log file is in. `Versioned { .. }` means the
+    /// file starts with a valid [`IntentLogHeader`]; `Legacy` means it
+    /// was created before headers existed and frames start at offset 0.
+    mode: LogMode,
+}
+
+/// Versioning mode for an open intent log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    /// File starts with a valid header at offset 0; frames start at
+    /// [`HEADER_BYTES`].
+    Versioned {
+        format_version: u32,
+        created_unix_secs: u64,
+    },
+    /// File has no header (was created before headers existed). Frames
+    /// start at offset 0. Reads still work; writes still work; the only
+    /// difference from `Versioned` is the lack of a forwards-compat
+    /// guard, which `upgrade_unversioned_to_v1` adds in place.
+    Legacy,
+}
+
+impl LogMode {
+    /// Byte offset at which frames start, relative to byte 0 of the file.
+    pub fn frame_region_start(&self) -> u64 {
+        match self {
+            LogMode::Versioned { .. } => HEADER_BYTES as u64,
+            LogMode::Legacy => 0,
+        }
+    }
+
+    /// `true` iff the file currently has a versioned header.
+    pub fn is_versioned(&self) -> bool {
+        matches!(self, LogMode::Versioned { .. })
+    }
 }
 
 impl IntentLog {
@@ -136,22 +201,120 @@ impl IntentLog {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Discover next_lsn + durable_end by scanning whatever is already
-        // there. A reader walks frames until EOF or a corruption signal.
-        let (next_lsn, durable_end) = scan_for_tail(&path)?;
+        // Probe the file shape: new / versioned / legacy. The probe also
+        // tells us the byte offset at which frames begin (after a header,
+        // for versioned files; at 0, for legacy files).
+        let mode = probe_mode(&path)?;
 
-        let file = OpenOptions::new()
+        // Now scan frames from the appropriate offset to discover next
+        // LSN + durable_end. A corrupt or truncated tail is reported via
+        // the returned offset — open() does not truncate.
+        let (next_lsn, durable_end) = scan_for_tail(&path, mode.frame_region_start())?;
+
+        let mut file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&path)?;
+
+        // If the file was *created just now* (zero length, no header yet)
+        // stamp a fresh header on it before any frame can be written. We
+        // detect "new" by combining the probe result with the file's
+        // current length: a brand-new file is in `Versioned` mode (probe
+        // returned that for an empty file) but its on-disk length is 0.
+        let actual_len = file.metadata()?.len();
+        let mode = if mode.is_versioned() && actual_len == 0 {
+            let header = IntentLogHeader::new_current();
+            file.write_all(&header.to_bytes())?;
+            file.sync_data()?;
+            LogMode::Versioned {
+                format_version: header.format_version,
+                created_unix_secs: header.created_unix_secs,
+            }
+        } else {
+            mode
+        };
+
+        // Recompute durable_end if we just stamped a header onto a
+        // newly-created file — the header occupies the first HEADER_BYTES
+        // bytes and no frames exist yet.
+        let durable_end = if mode.is_versioned() && actual_len == 0 {
+            HEADER_BYTES as u64
+        } else {
+            durable_end
+        };
 
         Ok(Self {
             path,
             writer: BufWriter::new(file),
             next_lsn,
             durable_end_offset: durable_end,
+            mode,
         })
+    }
+
+    /// Versioning mode this log was opened in. Callers that need the
+    /// `format_version` integer for diagnostics or compatibility checks
+    /// read it from here.
+    pub fn mode(&self) -> LogMode {
+        self.mode
+    }
+
+    /// Rewrite a legacy (header-less) log so it starts with a v1
+    /// [`IntentLogHeader`]. Atomic via write-temp-then-rename: if the
+    /// process dies mid-upgrade, the original file is untouched. On
+    /// success the log is reopened in versioned mode and `self.mode()`
+    /// reports `Versioned { format_version: 1, .. }`.
+    ///
+    /// Returns `Ok(false)` (no-op) when the log is already versioned.
+    /// Returns an error if the upgrade I/O failed; the on-disk file is
+    /// guaranteed to be either the original legacy bytes (if the rename
+    /// did not happen) or the upgraded bytes (if it did). There is no
+    /// in-between persisted state.
+    pub fn upgrade_unversioned_to_v1(&mut self) -> Result<bool, IntentLogError> {
+        if self.mode.is_versioned() {
+            return Ok(false);
+        }
+
+        // Flush any buffered appends so the bytes on disk reflect every
+        // record the caller has written. Upgrade then reads the file
+        // contents and prepends a header in a side file.
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+
+        let header = IntentLogHeader::new_current();
+        let header_bytes = header.to_bytes();
+        let tmp_path = self.path.with_extension("intentlog.upgrade.tmp");
+
+        // Stream the live file into the tmp with the header prepended.
+        // Doing it as a stream keeps RAM usage flat for huge logs.
+        {
+            let mut tmp = BufWriter::new(File::create(&tmp_path)?);
+            tmp.write_all(&header_bytes)?;
+            let mut src = File::open(&self.path)?;
+            io::copy(&mut src, &mut tmp)?;
+            tmp.flush()?;
+            tmp.get_ref().sync_data()?;
+        }
+
+        // Drop the live append handle before renaming — Windows refuses
+        // to rename over an open file with an exclusive append handle.
+        // We replace `self.writer` with a handle on the tmp file in the
+        // interim, then swing it back after the rename completes.
+        let staged = OpenOptions::new().read(true).append(true).open(&tmp_path)?;
+        self.writer = BufWriter::new(staged);
+        std::fs::rename(&tmp_path, &self.path)?;
+        let live = OpenOptions::new().read(true).append(true).open(&self.path)?;
+        self.writer = BufWriter::new(live);
+
+        // The frame region just shifted by HEADER_BYTES, so durable_end
+        // moves with it.
+        self.durable_end_offset += HEADER_BYTES as u64;
+        self.mode = LogMode::Versioned {
+            format_version: header.format_version,
+            created_unix_secs: header.created_unix_secs,
+        };
+        Ok(true)
     }
 
     /// Append a record. Returns the LSN assigned to it. Writes go through a
@@ -208,12 +371,13 @@ impl IntentLog {
         self.durable_end_offset
     }
 
-    /// Iterate every frame from the start of the file. Stops at the first
-    /// corrupt or truncated frame; returns an `IntentLogError` for that
-    /// frame so the caller can decide whether to truncate. The iterator is
-    /// independent of the writer — it opens its own read handle.
+    /// Iterate every frame from the start of the frame region. Stops at
+    /// the first corrupt or truncated frame; returns an `IntentLogError`
+    /// for that frame so the caller can decide whether to truncate. The
+    /// iterator is independent of the writer — it opens its own read
+    /// handle. The header (if any) is skipped before iteration begins.
     pub fn iter(&self) -> Result<IntentLogIter, IntentLogError> {
-        IntentLogIter::open(&self.path)
+        IntentLogIter::open(&self.path, self.mode.frame_region_start())
     }
 
     /// Truncate the file so its length equals `durable_end_offset`. Used to
@@ -253,12 +417,12 @@ pub struct IntentLogIter {
 }
 
 impl IntentLogIter {
-    fn open(path: &Path) -> Result<Self, IntentLogError> {
+    fn open(path: &Path, start_offset: u64) -> Result<Self, IntentLogError> {
         let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(0))?;
+        file.seek(SeekFrom::Start(start_offset))?;
         Ok(Self {
             file,
-            offset: 0,
+            offset: start_offset,
             finished: false,
         })
     }
@@ -423,16 +587,26 @@ fn read_exact_or_eof(file: &mut File, buf: &mut [u8]) -> Result<bool, ReadOutcom
     }
 }
 
-/// Walk an existing log file (if any) to compute the next LSN and the byte
-/// offset immediately after the last valid frame. A corrupt or truncated
-/// tail is reported via the returned offset — open() does not truncate.
-fn scan_for_tail(path: &Path) -> Result<(Lsn, u64), IntentLogError> {
+/// Walk an existing log file (if any) starting at `frame_region_start`
+/// (immediately past the header, for versioned files; 0 for legacy) to
+/// compute the next LSN and the byte offset immediately after the last
+/// valid frame. A corrupt or truncated tail is reported via the returned
+/// offset — open() does not truncate.
+fn scan_for_tail(path: &Path, frame_region_start: u64) -> Result<(Lsn, u64), IntentLogError> {
     if !path.exists() {
-        return Ok((Lsn::ZERO, 0));
+        // No file yet → frames will start at frame_region_start once a
+        // header is written. Report that as the durable end so the
+        // caller's bookkeeping is consistent.
+        return Ok((Lsn::ZERO, frame_region_start));
     }
-    let mut iter = IntentLogIter::open(path)?;
+    let file_len = std::fs::metadata(path)?.len();
+    if file_len <= frame_region_start {
+        // File exists but has nothing after the header — clean empty log.
+        return Ok((Lsn::ZERO, frame_region_start));
+    }
+    let mut iter = IntentLogIter::open(path, frame_region_start)?;
     let mut last_lsn = None;
-    let mut last_good_offset = 0u64;
+    let mut last_good_offset = frame_region_start;
     loop {
         let off = iter.current_offset();
         match iter.next() {
@@ -457,10 +631,89 @@ fn scan_for_tail(path: &Path) -> Result<(Lsn, u64), IntentLogError> {
     Ok((next_lsn, last_good_offset))
 }
 
+/// Probe a log file's versioning mode.
+///
+/// - File missing or empty → `LogMode::Versioned { format_version: 1, .. }`
+///   so the caller stamps a fresh header on it.
+/// - First 8 bytes match [`MAGIC`] → parse the header and return its
+///   contents.
+/// - First 8 bytes don't match → `LogMode::Legacy` (the caller will read
+///   the file's frames from offset 0 as before).
+/// - Magic matched but the header was malformed (CRC bad, version
+///   unknown) → forwarded as an error; this is a real corruption /
+///   future-version condition that callers must surface, not silently
+///   recover from.
+fn probe_mode(path: &Path) -> Result<LogMode, IntentLogError> {
+    if !path.exists() {
+        // Fresh file — the open() caller will write a header.
+        return Ok(LogMode::Versioned {
+            format_version: CURRENT_FORMAT_VERSION,
+            // Placeholder; the real timestamp is stamped at write time.
+            created_unix_secs: 0,
+        });
+    }
+    let len = std::fs::metadata(path)?.len();
+    if len == 0 {
+        // Touched but never written — treat as fresh.
+        return Ok(LogMode::Versioned {
+            format_version: CURRENT_FORMAT_VERSION,
+            created_unix_secs: 0,
+        });
+    }
+
+    let mut file = File::open(path)?;
+    let mut magic_buf = [0u8; 8];
+    let n = match read_n_or_short(&mut file, &mut magic_buf) {
+        Ok(n) => n,
+        Err(e) => return Err(IntentLogError::Io(e)),
+    };
+
+    // Too short to even hold the magic — treat as legacy (whoever owns
+    // this file can take it from there).
+    if n < 8 {
+        return Ok(LogMode::Legacy);
+    }
+    if &magic_buf != MAGIC {
+        return Ok(LogMode::Legacy);
+    }
+
+    // Magic matches — parse the rest of the header. The file MUST be
+    // long enough to contain the whole header; if it isn't, that is a
+    // torn-write-during-create scenario which we surface as a header
+    // error rather than silently downgrading to legacy mode.
+    if len < HEADER_BYTES as u64 {
+        return Err(IntentLogError::Header(HeaderError::TooShort {
+            have: len,
+            need: HEADER_BYTES as u64,
+        }));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let header = IntentLogHeader::read_from(&mut file)?;
+    Ok(LogMode::Versioned {
+        format_version: header.format_version,
+        created_unix_secs: header.created_unix_secs,
+    })
+}
+
+/// `read` up to `buf.len()` bytes, returning the number actually read.
+/// Used by the probe path which is fine with partial reads (a 3-byte
+/// file is unambiguously not a versioned log).
+fn read_n_or_short(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0;
+    while read < buf.len() {
+        match file.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(read)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn tmp_log_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -478,7 +731,11 @@ mod tests {
         let path = tmp_log_path("empty");
         let log = IntentLog::open(&path).unwrap();
         assert_eq!(log.next_lsn(), Lsn::ZERO);
-        assert_eq!(log.durable_end_offset(), 0);
+        // Brand-new logs are versioned; the file already holds a header
+        // (HEADER_BYTES) before any frame lands, so the durable end is
+        // the post-header offset, not literally zero.
+        assert_eq!(log.durable_end_offset(), HEADER_BYTES as u64);
+        assert!(log.mode().is_versioned());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -578,14 +835,15 @@ mod tests {
         // Flip one byte inside the second payload.
         {
             let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
-            // First frame is 4 + 8 + 9 + 4 = 25 bytes.
-            // Second frame starts at offset 25: len(4) + lsn(8) + payload(15) + crc(4).
-            // Flip the first byte of the second payload, which is at offset 25 + 12 = 37.
-            f.seek(SeekFrom::Start(37)).unwrap();
+            // Layout: [HEADER_BYTES][first frame: 4+8+9+4=25][second frame…].
+            // Second frame starts at HEADER_BYTES + 25; the first byte of
+            // its payload is at HEADER_BYTES + 25 + 12.
+            let target = (HEADER_BYTES + 25 + 12) as u64;
+            f.seek(SeekFrom::Start(target)).unwrap();
             let mut b = [0u8; 1];
             f.read_exact(&mut b).unwrap();
             b[0] ^= 0xff;
-            f.seek(SeekFrom::Start(37)).unwrap();
+            f.seek(SeekFrom::Start(target)).unwrap();
             f.write_all(&b).unwrap();
             f.sync_data().unwrap();
         }
@@ -632,6 +890,194 @@ mod tests {
             .map(|r| r.unwrap().lsn)
             .collect();
         assert_eq!(lsns, vec![Lsn(0), Lsn(1), Lsn(2)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ========================================================================
+    // Versioning tests (W: format_version header + per-record schema_version)
+    // ========================================================================
+
+    /// Hand-roll a legacy (header-less) log by writing raw frames to a fresh
+    /// file. Used to seed the legacy-mode and upgrade tests.
+    fn write_legacy_log(path: &Path, payloads: &[&[u8]]) {
+        let mut f = File::create(path).unwrap();
+        let mut next_lsn = 0u64;
+        for payload in payloads {
+            let len = payload.len() as u32;
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&len.to_le_bytes());
+            hasher.update(&next_lsn.to_le_bytes());
+            hasher.update(payload);
+            let crc = hasher.finalize();
+            f.write_all(&len.to_le_bytes()).unwrap();
+            f.write_all(&next_lsn.to_le_bytes()).unwrap();
+            f.write_all(payload).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+            next_lsn += 1;
+        }
+        f.sync_data().unwrap();
+    }
+
+    #[test]
+    fn new_log_writes_a_v1_header_at_offset_zero() {
+        let path = tmp_log_path("v1_header");
+        {
+            let mut log = IntentLog::open(&path).unwrap();
+            log.append(b"hello").unwrap();
+            log.sync().unwrap();
+            // Mode reports the freshly-stamped header.
+            match log.mode() {
+                LogMode::Versioned { format_version, .. } => {
+                    assert_eq!(format_version, CURRENT_FORMAT_VERSION);
+                }
+                LogMode::Legacy => panic!("expected versioned, got legacy"),
+            }
+        }
+        // The on-disk file starts with the MAGIC and the file's first
+        // HEADER_BYTES round-trip through the header parser.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= HEADER_BYTES);
+        assert_eq!(&bytes[0..8], MAGIC);
+        let parsed = IntentLogHeader::parse(&bytes[..HEADER_BYTES]).unwrap();
+        assert_eq!(parsed.format_version, CURRENT_FORMAT_VERSION);
+
+        // Reopening sees the existing header (not a fresh one) and
+        // iterates only the frame, not the header.
+        let log2 = IntentLog::open(&path).unwrap();
+        let records: Vec<_> = log2.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload, b"hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_unversioned_log_opens_and_iterates() {
+        // A header-less file written before this feature existed should
+        // still be readable end-to-end. open() puts it in Legacy mode and
+        // iter() walks the frames from offset 0.
+        let path = tmp_log_path("legacy_open");
+        write_legacy_log(&path, &[b"alpha", b"beta", b"gamma"]);
+
+        let log = IntentLog::open(&path).unwrap();
+        assert_eq!(log.mode(), LogMode::Legacy);
+        assert_eq!(log.next_lsn(), Lsn(3));
+        let records: Vec<_> = log.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].payload, b"alpha");
+        assert_eq!(records[2].payload, b"gamma");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrade_legacy_to_v1_preserves_all_frames() {
+        let path = tmp_log_path("legacy_upgrade");
+        write_legacy_log(&path, &[b"one", b"two", b"three"]);
+
+        let mut log = IntentLog::open(&path).unwrap();
+        assert_eq!(log.mode(), LogMode::Legacy);
+        let upgraded = log.upgrade_unversioned_to_v1().unwrap();
+        assert!(upgraded);
+        assert!(log.mode().is_versioned());
+
+        // After upgrade, the file's first HEADER_BYTES are a valid header
+        // and the frames live immediately after.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= HEADER_BYTES);
+        let _ = IntentLogHeader::parse(&bytes[..HEADER_BYTES]).unwrap();
+
+        // Reopen via the v1 reader; every original record survives, in
+        // order, with the same LSNs as before.
+        let log2 = IntentLog::open(&path).unwrap();
+        assert!(log2.mode().is_versioned());
+        let records: Vec<_> = log2.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].lsn, Lsn(0));
+        assert_eq!(records[0].payload, b"one");
+        assert_eq!(records[1].payload, b"two");
+        assert_eq!(records[2].payload, b"three");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upgrade_is_idempotent_on_versioned_log() {
+        let path = tmp_log_path("upgrade_idempotent");
+        let mut log = IntentLog::open(&path).unwrap();
+        log.append(b"x").unwrap();
+        log.sync().unwrap();
+        assert!(log.mode().is_versioned());
+        // Calling upgrade on a file that already has a header is a no-op.
+        let upgraded = log.upgrade_unversioned_to_v1().unwrap();
+        assert!(!upgraded, "upgrade on versioned log should report no-op");
+        // Subsequent appends still work and frames are intact.
+        log.append(b"y").unwrap();
+        log.sync().unwrap();
+        let log2 = IntentLog::open(&path).unwrap();
+        let records: Vec<_> = log2.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn future_format_version_is_rejected_with_clear_error() {
+        // Craft a file whose magic and CRC are valid but whose
+        // format_version is 999 — i.e. a log written by some imaginary
+        // future Veld. The current reader must refuse to open it with a
+        // structured error, not panic.
+        let path = tmp_log_path("future_version");
+        {
+            let mut bytes = [0u8; HEADER_BYTES];
+            bytes[0..8].copy_from_slice(MAGIC);
+            bytes[8..12].copy_from_slice(&999u32.to_le_bytes());
+            bytes[12..20].copy_from_slice(&0u64.to_le_bytes());
+            // reserved bytes stay zero
+            let crc = crc32fast::hash(&bytes[..HEADER_BYTES - 4]);
+            bytes[HEADER_BYTES - 4..HEADER_BYTES].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+        }
+
+        // IntentLog does not implement Debug, so `unwrap_err()` is off
+        // the table — pattern-match the Result directly instead.
+        match IntentLog::open(&path) {
+            Err(IntentLogError::Header(HeaderError::UnknownFormatVersion {
+                version,
+                supported,
+            })) => {
+                assert_eq!(version, 999);
+                assert_eq!(supported, CURRENT_FORMAT_VERSION);
+            }
+            Err(other) => panic!("expected UnknownFormatVersion, got {other:?}"),
+            Ok(_) => panic!("expected open() to fail for a future format_version"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn header_crc_mismatch_is_rejected() {
+        let path = tmp_log_path("hdr_crc_bad");
+        // Build a valid header, then flip a byte and leave the CRC alone.
+        let mut bytes = IntentLogHeader::new_current().to_bytes();
+        bytes[8] ^= 0xff; // tamper with format_version
+        std::fs::write(&path, bytes).unwrap();
+        match IntentLog::open(&path) {
+            Err(IntentLogError::Header(HeaderError::CrcMismatch { .. })) => {}
+            Err(other) => panic!("expected CrcMismatch, got {other:?}"),
+            Ok(_) => panic!("expected open() to fail for a header CRC mismatch"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn header_only_too_short_after_magic_is_rejected() {
+        // First eight bytes are the magic, then the file ends. Must
+        // surface as a structured "too short" header error, not silently
+        // get reinterpreted as legacy mode.
+        let path = tmp_log_path("hdr_too_short");
+        std::fs::write(&path, MAGIC).unwrap();
+        match IntentLog::open(&path) {
+            Err(IntentLogError::Header(HeaderError::TooShort { .. })) => {}
+            Err(other) => panic!("expected TooShort, got {other:?}"),
+            Ok(_) => panic!("expected open() to fail when file is shorter than the header"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

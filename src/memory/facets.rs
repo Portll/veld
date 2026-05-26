@@ -26,12 +26,120 @@
 //! separate facets.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::types::MemoryId;
+
+// =============================================================================
+// FACET SCHEMA VERSIONING
+// =============================================================================
+//
+// Every facet struct (WhereFacet, WhoFacet, WhatFacet, WhenFacet, WhyFacet,
+// EngramBinding, AgentSession, etc.) carries a compile-time
+// `FACET_SCHEMA_VERSION` constant exposed via the [`FacetVersioned`] trait.
+//
+// The version is *not* serialised into each instance — that would inflate
+// every record by several bytes for a value that is overwhelmingly going to
+// be the same. Instead, the version is a *typed claim* the code makes about
+// the shape of bytes it produces, used by the migration layer when a
+// breaking change ships. Today every facet is at version 1.
+//
+// `#[serde(default)]` continues to handle additive forward-compat: when an
+// old wire shape decodes with missing fields, defaults fill them in.
+// [`note_facet_silent_upgrade`] emits one warning the first time such an
+// up-conversion happens per process, so operators see drift in the logs
+// without the warning storm a per-record log would produce.
+
+/// Compile-time schema version claim for a facet type.
+///
+/// A facet bumps [`FACET_SCHEMA_VERSION`](FacetVersioned::FACET_SCHEMA_VERSION)
+/// at the same time it ships a breaking wire change — the same discipline
+/// the intent-log `IntentPayload` uses for its per-record `schema_version`.
+/// The trait is intentionally minimal: it exists so the migration registry
+/// and audit tools can iterate "every facet's claimed version" without
+/// stringly-typed lookups.
+pub trait FacetVersioned {
+    /// The schema version this binary's code produces for this facet.
+    /// Bumped only when the wire bytes for the type change in a way that
+    /// older readers cannot handle via `#[serde(default)]` fill-ins.
+    const FACET_SCHEMA_VERSION: u16;
+
+    /// Stable, lowercase identifier for the facet — used in logs and in
+    /// any future migration manifest.
+    const FACET_NAME: &'static str;
+}
+
+/// Set of facet schema versions a reader of this codebase recognises.
+/// Mirrored from `IntentPayload`'s known-versions set; encountering a
+/// value outside this list is an [`FacetVersionError::Unknown`].
+pub const KNOWN_FACET_SCHEMA_VERSIONS: &[u16] = &[0, 1];
+
+/// Errors raised when validating a facet's claimed schema version.
+#[derive(Debug, thiserror::Error)]
+pub enum FacetVersionError {
+    /// The provided version is not in [`KNOWN_FACET_SCHEMA_VERSIONS`].
+    /// The reader must either be upgraded or run a migration before it
+    /// attempts to interpret the bytes.
+    #[error(
+        "unknown facet '{facet}' schema version {found} (this binary knows {known:?})"
+    )]
+    Unknown {
+        facet: &'static str,
+        found: u16,
+        known: &'static [u16],
+    },
+}
+
+/// Validate that `version` is in [`KNOWN_FACET_SCHEMA_VERSIONS`] before
+/// the caller deserialises. Returns [`FacetVersionError::Unknown`] when
+/// it is not, so the caller surfaces a structured error instead of
+/// silently dropping fields the binary doesn't understand.
+///
+/// `None` is treated as the legacy "version 0" shape and always accepted.
+pub fn check_facet_version(
+    facet_name: &'static str,
+    version: Option<u16>,
+) -> Result<(), FacetVersionError> {
+    let v = version.unwrap_or(0);
+    if KNOWN_FACET_SCHEMA_VERSIONS.contains(&v) {
+        Ok(())
+    } else {
+        Err(FacetVersionError::Unknown {
+            facet: facet_name,
+            found: v,
+            known: KNOWN_FACET_SCHEMA_VERSIONS,
+        })
+    }
+}
+
+/// One-shot guard so an operator sees "schema drift detected" warnings
+/// at most once per process. The first silent up-conversion (an older
+/// wire shape decoded with `#[serde(default)]`-filled fields) trips this
+/// flag; subsequent up-conversions only update internal metrics rather
+/// than spamming the log.
+static FACET_SILENT_UPGRADE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Emit a single warning the first time this process notices a facet
+/// wire shape that needed `#[serde(default)]` fill-ins to decode. The
+/// argument is the facet name for diagnostics.
+///
+/// Callers don't need to know *which* fields were missing — that's the
+/// job of a future structured diff tool. The point here is to make the
+/// upgrade visible at all.
+pub fn note_facet_silent_upgrade(facet_name: &'static str) {
+    if !FACET_SILENT_UPGRADE_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            target: "veld::memory::facets",
+            facet = facet_name,
+            "facet wire shape required default fill-ins to decode; \
+             this is the first such event this process. Schema drift?"
+        );
+    }
+}
 
 /// The kind of record a core row carries.
 ///
@@ -627,6 +735,66 @@ pub struct AgentSession {
     pub parent_repo: Option<PathBuf>,
 }
 
+// =============================================================================
+// FacetVersioned impls — one per first-class facet type
+// =============================================================================
+//
+// Every impl here is `FACET_SCHEMA_VERSION: u16 = 1`. The first breaking
+// change to a facet's wire shape bumps that facet's number, alongside a
+// migration arm in `crate::intent_log::migrations`. Adding an impl for a new
+// facet does NOT need a coordinated bump anywhere else — the trait is purely
+// per-type metadata.
+
+impl FacetVersioned for WhereFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "where";
+}
+
+impl FacetVersioned for WhoFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "who";
+}
+
+impl FacetVersioned for WhyFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "why";
+}
+
+impl FacetVersioned for WhatFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "what";
+}
+
+impl FacetVersioned for WhenFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "when";
+}
+
+impl FacetVersioned for EngramBinding {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "engram_binding";
+}
+
+impl FacetVersioned for PlanFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "plan";
+}
+
+impl FacetVersioned for PromptFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "prompt";
+}
+
+impl FacetVersioned for LearningFacet {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "learning";
+}
+
+impl FacetVersioned for AgentSession {
+    const FACET_SCHEMA_VERSION: u16 = 1;
+    const FACET_NAME: &'static str = "agent_session";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,5 +1082,57 @@ mod tests {
         assert!(json.contains("\"vscode_window_id\":\"vscode-1\""));
         let back: AgentSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, session);
+    }
+
+    // ========================================================================
+    // Facet schema versioning
+    // ========================================================================
+
+    #[test]
+    fn every_facet_claims_schema_version_1_today() {
+        // One assertion per facet — pinning the current cohort. The first
+        // breaking change to any one of these bumps that facet's number
+        // in isolation; the test then needs to learn the new number.
+        assert_eq!(WhereFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(WhoFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(WhyFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(WhatFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(WhenFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(EngramBinding::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(PlanFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(PromptFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(LearningFacet::FACET_SCHEMA_VERSION, 1);
+        assert_eq!(AgentSession::FACET_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn facet_name_strings_are_stable_lowercase_identifiers() {
+        // Used in logs / future migration manifests — must not drift.
+        assert_eq!(WhereFacet::FACET_NAME, "where");
+        assert_eq!(WhoFacet::FACET_NAME, "who");
+        assert_eq!(WhyFacet::FACET_NAME, "why");
+        assert_eq!(WhatFacet::FACET_NAME, "what");
+        assert_eq!(WhenFacet::FACET_NAME, "when");
+        assert_eq!(EngramBinding::FACET_NAME, "engram_binding");
+        assert_eq!(AgentSession::FACET_NAME, "agent_session");
+    }
+
+    #[test]
+    fn known_facet_versions_accept_none_and_current() {
+        check_facet_version("where", None).unwrap();
+        check_facet_version("where", Some(0)).unwrap();
+        check_facet_version("where", Some(1)).unwrap();
+    }
+
+    #[test]
+    fn unknown_facet_version_returns_structured_error() {
+        let err = check_facet_version("where", Some(999)).unwrap_err();
+        match err {
+            FacetVersionError::Unknown { facet, found, known } => {
+                assert_eq!(facet, "where");
+                assert_eq!(found, 999);
+                assert_eq!(known, KNOWN_FACET_SCHEMA_VERSIONS);
+            }
+        }
     }
 }

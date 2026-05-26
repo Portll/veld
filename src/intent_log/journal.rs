@@ -232,6 +232,7 @@ mod tests {
         let payload = IntentPayload::Forget {
             user_id: "u".into(),
             memory_id: "m-1".into(),
+            schema_version: None,
         };
         let outcome = writer.record_and_apply(&payload).unwrap();
         assert_eq!(outcome.lsn, Lsn(0));
@@ -262,6 +263,7 @@ mod tests {
                 user_id: "u".into(),
                 memory_id: format!("m-{i}"),
                 importance: 0.5,
+                schema_version: None,
             })
             .collect();
         for p in &payloads {
@@ -291,6 +293,7 @@ mod tests {
             user_id: "u".into(),
             memory_id: "m".into(),
             memory_bincode: vec![1, 2, 3],
+            schema_version: None,
         };
         let outcome = writer.record_and_apply(&payload).unwrap();
         assert_eq!(outcome.lsn, Lsn(0));
@@ -314,6 +317,7 @@ mod tests {
             let payload = IntentPayload::Forget {
                 user_id: "u".into(),
                 memory_id: "m".into(),
+                schema_version: None,
             };
             let outcome = writer.record_and_apply(&payload).unwrap();
             assert_eq!(outcome.apply_errors.len(), 1);
