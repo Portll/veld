@@ -64,6 +64,14 @@ jobs:
         if: runner.os == 'Windows'
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
+      # macOS bindgen (via librocksdb-sys) can't find libclang.dylib unless we
+      # point it at the Command Line Tools install. Matches scripts/setup-libclang-env.sh.
+      - name: Set libclang env (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=/Library/Developer/CommandLineTools/usr/lib" >> $GITHUB_ENV
+
       - name: Install clang (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y clang libclang-dev

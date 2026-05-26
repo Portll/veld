@@ -8,9 +8,62 @@
  * Events: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStop, Stop
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 const VELD_API_URL = process.env.VELD_API_URL || "http://127.0.0.1:3030";
-const VELD_API_KEY = process.env.VELD_API_KEY || "";
+const VELD_API_KEY = resolveApiKey();
 const VELD_USER_ID = process.env.VELD_USER_ID || "claude-code";
+
+/**
+ * Resolve the Veld API key, in order:
+ *   1. VELD_API_KEY env var (if non-empty)
+ *   2. `api_key = "..."` line in the platform's veld config.toml
+ *   3. empty string (server may reject; backendDown will trip)
+ *
+ * Exported for testing.
+ */
+export function resolveApiKey(): string {
+  const envKey = process.env.VELD_API_KEY;
+  if (envKey && envKey.trim()) return envKey.trim();
+
+  const path = veldConfigPath();
+  if (!existsSync(path)) return "";
+
+  try {
+    const text = readFileSync(path, "utf-8");
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const eq = line.indexOf("=");
+      if (eq === -1) continue;
+      if (line.slice(0, eq).trim() !== "api_key") continue;
+      const value = line
+        .slice(eq + 1)
+        .split("#")[0]
+        .trim()
+        .replace(/^["']|["']$/g, "");
+      if (value) return value;
+    }
+  } catch {
+    // unreadable / corrupt config — fall through
+  }
+  return "";
+}
+
+/** Exported for testing. */
+export function veldConfigPath(): string {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg) return join(xdg, "veld", "config.toml");
+  if (process.platform === "win32") {
+    const appdata = process.env.APPDATA;
+    if (appdata) return join(appdata, "veld", "config.toml");
+  } else if (process.platform === "darwin") {
+    return join(homedir(), "Library", "Application Support", "veld", "config.toml");
+  }
+  return join(homedir(), ".config", "veld", "config.toml");
+}
 
 interface HookInput {
   hook_event_name: string;
