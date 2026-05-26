@@ -69,6 +69,9 @@ pub mod external_dimensions;
 // Prompt generation (end-to-end context assembly) and entity resolution
 pub mod prompt_gen;
 
+// User auth (Phase C) — password + TOTP + recovery codes behind a flag
+pub mod user_auth;
+
 // Test utilities (compiled only in test builds)
 #[cfg(test)]
 pub mod test_helpers;

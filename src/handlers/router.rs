@@ -14,7 +14,7 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, external_dimensions,
     facts, files, gap_analysis, graph, health, ingest, integrations, lineage, mif, prompt_gen,
-    recall, remember, search, seed, sessions, todos, users, visualization, webhooks,
+    recall, remember, search, seed, sessions, todos, user_auth, users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -125,7 +125,27 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         r
     };
 
+    // Phase C user-auth surface — session-token auth (separate from the
+    // X-API-Key middleware that wraps the rest of the protected router).
+    // The session middleware is applied here, not at the outer auth layer,
+    // so the api-key check in `auth_middleware` is skipped for
+    // `/api/user_auth/*` paths (see `crate::auth::auth_middleware`).
+    let session_routes = Router::new()
+        .route("/api/user_auth/2fa/enroll", post(user_auth::enroll_2fa))
+        .route("/api/user_auth/2fa/confirm", post(user_auth::confirm_2fa))
+        .route("/api/user_auth/logout", post(user_auth::logout))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            user_auth::require_user_session,
+        ));
+    let user_auth_routes = Router::new()
+        .route("/api/user_auth/register", post(user_auth::register))
+        .route("/api/user_auth/login", post(user_auth::login))
+        .route("/api/user_auth/recover", post(user_auth::recover))
+        .merge(session_routes);
+
     r
+        .merge(user_auth_routes)
         // =================================================================
         // PER-USER HEALTH (auth required — tenant-bound via
         // resolve_request_user_id; replaces the leaked ?user_id= branches

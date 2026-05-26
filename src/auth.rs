@@ -404,6 +404,15 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
 
+    // Skip API key auth for the Phase C user-auth surface — those routes
+    // are session-token authenticated (Authorization: Bearer <session>) and
+    // have their own middleware applied where needed. Mounting them on the
+    // protected router still routes them through the rate-limit governance
+    // layer; the api-key check is the only piece that doesn't apply.
+    if path.starts_with("/api/user_auth/") {
+        return next.run(request).await;
+    }
+
     // Extract API key: try X-API-Key header first, then Authorization: Bearer,
     // then query parameter (for WebSocket connections where headers aren't supported)
     let api_key_value = match request
