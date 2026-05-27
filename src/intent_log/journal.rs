@@ -162,10 +162,23 @@ impl JournaledWriter {
                 );
                 return Err(JournalError::Log(e));
             }
-            Err(e @ (PayloadError::Encode(_) | PayloadError::Decode(_))) => {
+            Err(
+                e @ (PayloadError::Encode(_)
+                | PayloadError::Decode(_)
+                | PayloadError::UnknownSchemaVersion { .. }
+                | PayloadError::Migration(_)),
+            ) => {
+                // Encode-side: a payload variant this binary cannot
+                // serialise (rare — bincode of #[non_exhaustive] enums
+                // does not fail in practice). Decode-side and the two
+                // schema-version variants are not reachable from
+                // `payload::append` today (that function only encodes)
+                // but we cover them so adding a new payload error
+                // variant upstream is a "fix the match" change, not a
+                // compile-error scramble at every call site.
                 tracing::error!(
                     error = %e,
-                    "journal record_and_apply failed: payload encode/decode error",
+                    "journal record_and_apply failed: payload encode error",
                 );
                 return Err(JournalError::Payload(e));
             }

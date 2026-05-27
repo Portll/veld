@@ -237,6 +237,27 @@ pub struct MultiUserMemoryManager {
     /// and ensures the sync TTL actually works across requests.
     pub slow_stores: DashMap<String, std::sync::Arc<crate::memory::slow_store::SlowStore>>,
 
+    /// Per-user [`JournaledWriter`]. Created lazily on first journaled
+    /// CRUD for that user; holds the open intent log, the per-user
+    /// `CheckpointStore`, and the live `SqliteProjection` attached for
+    /// dispatch. Wrapped in `Mutex` because `record_and_apply` mutates
+    /// the underlying log + projections — only one writer at a time per
+    /// tenant.
+    ///
+    /// Wired up here (and not in the per-user Earth) because the
+    /// projection list is a runtime construct that may grow over time
+    /// (Vamana, BM25, Postgres) and we want one place to register them.
+    pub journaled_writers: DashMap<
+        String,
+        std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>,
+    >,
+
+    /// One init-lock per tenant for the lazy `JournaledWriter` creation.
+    /// Without this, two concurrent first-touch requests for the same
+    /// user could both miss the cache, both call `IntentLog::open`, and
+    /// the second open would race with the first writer's append.
+    journaled_writer_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
+
     /// Capabilities for the effective backend in the current runtime.
     storage_capabilities: StorageCapabilities,
 
@@ -544,6 +565,8 @@ impl MultiUserMemoryManager {
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
+            journaled_writers: DashMap::new(),
+            journaled_writer_init_locks: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
         };
@@ -1540,6 +1563,126 @@ impl MultiUserMemoryManager {
         let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open(&db_path)?);
         self.slow_stores.insert(user_id.to_string(), store.clone());
         Ok(store)
+    }
+
+    /// Get or create a [`JournaledWriter`] for `user_id`.
+    ///
+    /// On first call for a tenant, this:
+    ///   1. opens (or creates) the per-user intent log at
+    ///      `{base_path}/{user_id}/intent.log`,
+    ///   2. opens (or creates) the per-user checkpoint store at
+    ///      `{base_path}/{user_id}/projection_checkpoints.bin`,
+    ///   3. instantiates a [`SqliteProjection`] wrapped around the user's
+    ///      `SlowStore`,
+    ///   4. **runs replay** so the SQLite slow store catches up to the
+    ///      head of the log before any live write lands, and
+    ///   5. attaches the projection to the writer so subsequent live
+    ///      `record_and_apply` calls dispatch through it.
+    ///
+    /// On any subsequent call this returns the cached writer.
+    ///
+    /// Replay runs synchronously (inline with the call) because:
+    ///   - the log is small (one frame per CRUD operation, bincoded),
+    ///   - we MUST close the W5 catch-up gap before live writes can race
+    ///     against a half-replayed projection, and
+    ///   - the caller can spawn this on a blocking task pool if it needs
+    ///     a non-blocking startup. Doing the replay inside the lazy-open
+    ///     keeps the "logged ↔ projected" invariant local and provable.
+    pub fn get_user_journaled_writer(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>,
+    > {
+        // Fast path — cached.
+        if let Some(w) = self.journaled_writers.get(user_id) {
+            return Ok(w.clone());
+        }
+
+        // Slow path — single-flight init under a per-user lock.
+        let init_lock = self
+            .journaled_writer_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let _guard = init_lock.lock();
+
+        // Re-check after acquiring the lock — another thread may have
+        // populated the writer while we were waiting.
+        if let Some(w) = self.journaled_writers.get(user_id) {
+            return Ok(w.clone());
+        }
+
+        let user_path = self.base_path.join(user_id);
+        std::fs::create_dir_all(&user_path)?;
+        let log_path = user_path.join("intent.log");
+        let checkpoint_path = user_path.join("projection_checkpoints.bin");
+
+        let log = crate::intent_log::IntentLog::open(&log_path)
+            .with_context(|| format!("open intent log for user {user_id}"))?;
+        let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::intent_log::CheckpointStore::open(&checkpoint_path)
+                .with_context(|| format!("open checkpoint store for user {user_id}"))?,
+        ));
+
+        let slow_store = self.get_user_slow_store(user_id)?;
+        let mut projection = crate::memory::slow_store::SqliteProjection::new(
+            slow_store.clone(),
+            checkpoint_store.clone(),
+        );
+
+        // Catch the SQLite projection up to the head of the log before
+        // it goes live. The `Some(100)` flushes the checkpoint every 100
+        // applied records so a crash during a long replay survives.
+        let applied = crate::intent_log::replay(&log, &mut projection, Some(100))
+            .with_context(|| format!("replay intent log for user {user_id}"))?;
+        if applied > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                applied,
+                "replayed intent log records into SQLite projection on first writer open",
+            );
+        }
+
+        // Hand the log handle into the writer so subsequent appends
+        // continue against the same file. Replay above used a read-only
+        // borrow; the same handle is fine for the writer's appends.
+        let mut writer = crate::intent_log::JournaledWriter::new(log);
+        writer.add_projection(Box::new(projection));
+
+        let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
+        self.journaled_writers
+            .insert(user_id.to_string(), writer.clone());
+        Ok(writer)
+    }
+
+    /// Convenience: journal a typed payload through the user's
+    /// `JournaledWriter`. Calls `record_and_apply` under the writer's
+    /// mutex and returns the assigned LSN. Per-projection apply errors
+    /// are *not* propagated as failures — they are logged at warn level
+    /// (the log frame is durable, replay will retry on restart).
+    pub fn journal_and_apply(
+        &self,
+        user_id: &str,
+        payload: &crate::intent_log::IntentPayload,
+    ) -> Result<crate::intent_log::Lsn> {
+        let writer = self.get_user_journaled_writer(user_id)?;
+        let outcome = {
+            let mut writer = writer.lock();
+            writer
+                .record_and_apply(payload)
+                .map_err(|e| anyhow::anyhow!("journal record_and_apply: {e}"))?
+        };
+        for err in &outcome.apply_errors {
+            tracing::warn!(
+                user_id = %user_id,
+                projection = %err.projection,
+                lsn = outcome.lsn.0,
+                error = %err.source,
+                "projection apply failed during journaled write (log durable; replay will retry)",
+            );
+        }
+        Ok(outcome.lsn)
     }
 
     /// Get graph statistics for a user
