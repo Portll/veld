@@ -36,12 +36,14 @@
 //! ```
 
 pub mod distance_inline;
+pub mod hnsw;
 pub mod pq;
 pub mod spann;
 pub mod vamana;
 pub mod vamana_persist;
 
 // Re-export key types for convenient access
+pub use hnsw::{HnswConfig, HnswIndex};
 pub use pq::{CompressedVectorStore, PQConfig, ProductQuantizer};
 pub use spann::{SpannConfig, SpannIndex};
 pub use vamana::{DistanceMetric, VamanaConfig, VamanaIndex, REBUILD_THRESHOLD};
@@ -70,6 +72,14 @@ pub struct BackendConfig {
     pub vamana_max_degree: usize,
     /// Search list size for Vamana
     pub vamana_search_list_size: usize,
+    /// Max neighbors per node at HNSW layers > 0
+    pub hnsw_m: usize,
+    /// Max neighbors at HNSW layer 0 (densest)
+    pub hnsw_m_max_0: usize,
+    /// HNSW search-list size during construction
+    pub hnsw_ef_construction: usize,
+    /// HNSW search-list size during queries (caller-tunable)
+    pub hnsw_ef_search: usize,
 }
 
 impl Default for BackendConfig {
@@ -82,6 +92,10 @@ impl Default for BackendConfig {
             spann_probes: 20,
             vamana_max_degree: 32,
             vamana_search_list_size: 100,
+            hnsw_m: 16,
+            hnsw_m_max_0: 32,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
         }
     }
 }
@@ -93,12 +107,17 @@ pub enum BackendType {
     Vamana,
     /// Disk-based IVF+PQ - scalable, best for >100k vectors
     Spann,
+    /// Hierarchical Navigable Small World - industry-standard in-RAM ANN
+    /// (default in Qdrant, Weaviate, Milvus, pgvector). Best when broad
+    /// tooling/parameter familiarity matters more than disk-friendliness.
+    Hnsw,
 }
 
-/// Unified vector index backend supporting Vamana and SPANN
+/// Unified vector index backend supporting Vamana, SPANN, and HNSW
 pub enum VectorIndexBackend {
     Vamana(VamanaIndex),
     Spann(SpannIndex),
+    Hnsw(HnswIndex),
 }
 
 impl VectorIndexBackend {
@@ -115,6 +134,7 @@ impl VectorIndexBackend {
         match backend_type {
             BackendType::Vamana => Self::new_vamana(config),
             BackendType::Spann => Self::new_spann(config),
+            BackendType::Hnsw => Self::new_hnsw(config),
         }
     }
 
@@ -142,11 +162,25 @@ impl VectorIndexBackend {
         Ok(Self::Spann(SpannIndex::new(spann_config)))
     }
 
+    /// Create HNSW backend explicitly
+    pub fn new_hnsw(config: BackendConfig) -> Result<Self> {
+        let hnsw_config = HnswConfig {
+            dimension: config.dimension,
+            m: config.hnsw_m,
+            m_max_0: config.hnsw_m_max_0,
+            ef_construction: config.hnsw_ef_construction,
+            ef_search: config.hnsw_ef_search,
+            distance_metric: config.distance_metric,
+        };
+        Ok(Self::Hnsw(HnswIndex::new(hnsw_config)))
+    }
+
     /// Get backend type
     pub fn backend_type(&self) -> BackendType {
         match self {
             Self::Vamana(_) => BackendType::Vamana,
             Self::Spann(_) => BackendType::Spann,
+            Self::Hnsw(_) => BackendType::Hnsw,
         }
     }
 
@@ -159,6 +193,7 @@ impl VectorIndexBackend {
                 idx.insert(id, &vector)?;
                 Ok(id)
             }
+            Self::Hnsw(idx) => idx.add_vector(vector),
         }
     }
 
@@ -167,6 +202,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.search(query, k),
             Self::Spann(idx) => idx.search(query, k),
+            Self::Hnsw(idx) => idx.search(query, k),
         }
     }
 
@@ -175,6 +211,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.len(),
             Self::Spann(idx) => idx.len(),
+            Self::Hnsw(idx) => idx.len(),
         }
     }
 
@@ -188,6 +225,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.save_to_file(path),
             Self::Spann(idx) => idx.save_to_file(path),
+            Self::Hnsw(idx) => idx.save_to_file(path),
         }
     }
 
@@ -196,6 +234,7 @@ impl VectorIndexBackend {
         match backend_type {
             BackendType::Vamana => Ok(Self::Vamana(VamanaIndex::load_from_file(path)?)),
             BackendType::Spann => Ok(Self::Spann(SpannIndex::load_from_file(path)?)),
+            BackendType::Hnsw => Ok(Self::Hnsw(HnswIndex::load_from_file(path)?)),
         }
     }
 
@@ -204,6 +243,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.build(vectors),
             Self::Spann(idx) => idx.build(vectors),
+            Self::Hnsw(idx) => idx.build(vectors),
         }
     }
 
@@ -212,6 +252,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.needs_rebuild(),
             Self::Spann(_) => false, // SPANN doesn't need rebuild
+            Self::Hnsw(_) => false,  // HNSW is incremental
         }
     }
 
@@ -220,6 +261,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.auto_rebuild_if_needed(),
             Self::Spann(_) => Ok(false),
+            Self::Hnsw(_) => Ok(false),
         }
     }
 
@@ -228,6 +270,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.incremental_insert_count(),
             Self::Spann(_) => 0,
+            Self::Hnsw(_) => 0,
         }
     }
 
@@ -236,6 +279,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.deleted_count(),
             Self::Spann(_) => 0,
+            Self::Hnsw(_) => 0,
         }
     }
 
@@ -244,6 +288,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.deletion_ratio(),
             Self::Spann(_) => 0.0,
+            Self::Hnsw(_) => 0.0,
         }
     }
 
@@ -252,6 +297,7 @@ impl VectorIndexBackend {
         match self {
             Self::Vamana(idx) => idx.needs_compaction(),
             Self::Spann(_) => false,
+            Self::Hnsw(_) => false,
         }
     }
 
@@ -260,6 +306,7 @@ impl VectorIndexBackend {
         match backend_type {
             BackendType::Vamana => VamanaIndex::verify_index_file(path),
             BackendType::Spann => SpannIndex::verify_index_file(path),
+            BackendType::Hnsw => Ok(HnswIndex::load_from_file(path).is_ok()),
         }
     }
 }

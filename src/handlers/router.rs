@@ -223,6 +223,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/anchor", post(crud::anchor_memory))
         // =================================================================
+        // AGENT-DIRECTED TIER MOVES
+        // =================================================================
+        .route("/api/memory/tier", post(crud::move_memory_tier))
+        // =================================================================
         // FORGET OPERATIONS
         // =================================================================
         .route("/api/forget", post(crud::forget_by_id))

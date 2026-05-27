@@ -200,6 +200,40 @@ pub struct RecallResponse {
     /// Number of lineage edges found
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage_count: Option<usize>,
+    /// Estimated token cost of the response body (chars / 4 heuristic,
+    /// matches OpenAI's rough English ratio). Published for parity with
+    /// Mem0's token-efficiency benchmarks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_estimated: Option<usize>,
+}
+
+impl RecallResponse {
+    /// Rough token estimate over the entire response body. Sums the chars
+    /// across all returned content fields and divides by 4 (OpenAI's
+    /// approximate English token-to-char ratio).
+    pub fn estimate_tokens(&self) -> usize {
+        let mut chars: usize = 0;
+        for mem in &self.memories {
+            chars += mem.experience.content.len();
+            chars += mem.id.len();
+            for tag in &mem.experience.tags {
+                chars += tag.len() + 1;
+            }
+        }
+        for fact in &self.facts {
+            chars += fact.fact.len();
+        }
+        for todo in &self.todos {
+            chars += todo.content.len();
+        }
+        for reminder in &self.triggered_reminders {
+            chars += reminder.content.len();
+        }
+        for edge in &self.lineage {
+            chars += edge.from.len() + edge.to.len() + edge.relation.len();
+        }
+        chars.div_ceil(4)
+    }
 }
 
 /// Causal lineage edge returned in recall results
@@ -1000,6 +1034,7 @@ mod tests {
             reminder_count: None,
             lineage: vec![],
             lineage_count: None,
+            tokens_estimated: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("memories"));

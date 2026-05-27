@@ -837,7 +837,7 @@ pub async fn recall(
         Some(triggered_reminders.len())
     };
 
-    Ok(Json(RecallResponse {
+    let mut resp = RecallResponse {
         memories: recall_memories,
         count,
         retrieval_stats: None, // Retrieval stats not exposed in new API
@@ -849,7 +849,10 @@ pub async fn recall(
         reminder_count,
         lineage,
         lineage_count,
-    }))
+        tokens_estimated: None,
+    };
+    resp.tokens_estimated = Some(resp.estimate_tokens());
+    Ok(Json(resp))
 }
 
 // =============================================================================

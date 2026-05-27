@@ -604,6 +604,57 @@ impl TemporalFactStore {
 
         Ok(facts)
     }
+
+    /// Return temporal facts that were valid at the given instant `at`
+    /// (point-in-time query). A fact is valid at `at` when its `valid_from`
+    /// (or `conversation_date` if `valid_from` is `None`) is at or before
+    /// `at`, and its `valid_until` is `None` or strictly after `at`.
+    pub fn as_of(
+        &self,
+        user_id: &str,
+        at: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<TemporalFact>> {
+        let prefix = format!("temporal_facts:{}:", user_id);
+        let mut facts = Vec::new();
+
+        let iter = self.db.iterator(IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+
+            if let Ok((fact, _)) = bincode::serde::decode_from_slice::<TemporalFact, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                let from = fact.valid_from.unwrap_or(fact.conversation_date);
+                if from > at {
+                    continue;
+                }
+                let still_valid = match fact.valid_until {
+                    Some(until) => until > at,
+                    None => true,
+                };
+                if !still_valid {
+                    continue;
+                }
+                facts.push(fact);
+                if facts.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(facts)
+    }
 }
 
 // ============================================================================
@@ -1288,5 +1339,74 @@ mod tests {
         let sentence = "We're thinking about going camping next month";
         let event = extract_event_from_sentence(sentence);
         assert!(event.to_lowercase().contains("camping"));
+    }
+
+    /// Point-in-time recall over TemporalFacts: a fact invalidated at T2
+    /// must be visible via `as_of(T_between)` but absent via `as_of(now)`.
+    #[test]
+    fn test_temporal_fact_as_of_returns_historical_state() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let now = Utc::now();
+        let t1 = now - chrono::Duration::days(10);
+        let t2 = now - chrono::Duration::days(5);
+        let t_between = now - chrono::Duration::days(7);
+
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+
+        // Fact A: planned camping next month — valid from t1, invalidated at t2
+        let fact_a = TemporalFact {
+            id: "tf-a".to_string(),
+            entity: "alice".to_string(),
+            event: "camping".to_string(),
+            event_stems: vec!["camp".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("next month".to_string()),
+            resolved_time: ResolvedTime::Year(2025),
+            source_memory_id: memory_id.clone(),
+            conversation_date: t1,
+            confidence: 0.8,
+            source_text: "Alice is planning to go camping next month".to_string(),
+            valid_from: Some(t1),
+            valid_until: Some(t2),
+        };
+        store.store("user-1", &fact_a).unwrap();
+
+        // Fact B: cancellation — valid from t2 onward
+        let fact_b = TemporalFact {
+            id: "tf-b".to_string(),
+            entity: "alice".to_string(),
+            event: "cancelled camping".to_string(),
+            event_stems: vec!["cancel".to_string(), "camp".to_string()],
+            event_type: EventType::Occurred,
+            relative_time: None,
+            resolved_time: ResolvedTime::Year(2025),
+            source_memory_id: memory_id,
+            conversation_date: t2,
+            confidence: 0.85,
+            source_text: "Alice cancelled the camping trip".to_string(),
+            valid_from: Some(t2),
+            valid_until: None,
+        };
+        store.store("user-1", &fact_b).unwrap();
+
+        let at_between = store.as_of("user-1", t_between, 100).unwrap();
+        assert_eq!(at_between.len(), 1, "between t1 and t2: only A");
+        assert_eq!(at_between[0].id, "tf-a");
+
+        let at_now = store.as_of("user-1", now, 100).unwrap();
+        assert_eq!(at_now.len(), 1, "now: only B");
+        assert_eq!(at_now[0].id, "tf-b");
+
+        let before_t1 = store
+            .as_of("user-1", t1 - chrono::Duration::days(1), 100)
+            .unwrap();
+        assert!(before_t1.is_empty(), "before t1: nothing yet");
     }
 }
