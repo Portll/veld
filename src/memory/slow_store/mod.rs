@@ -13,11 +13,13 @@
 //! Architecture: RocksDB (fast store) → periodic sync → SQLite (slow store, gap analysis)
 
 mod embeddings;
+mod projection;
 mod queries;
 mod storage;
 
+pub use projection::SqliteProjection;
 pub use queries::{EntityCluster, RawDiamondGap, RawOpenTriad, RawStarGap};
-pub use storage::{StoredGap, StoredThought};
+pub use storage::{StoredGap, StoredMemoryRow, StoredThought};
 
 use super::gap_topology::GapStore;
 
@@ -43,7 +45,7 @@ pub struct CleanupStats {
     pub thoughts_deleted: usize,
 }
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// SQLite-backed slow store for relational queries on the knowledge graph.
 ///
@@ -171,6 +173,26 @@ impl SlowStore {
                 ON thoughts(dismissed, confidence DESC)
                 WHERE dismissed = 0;
 
+            -- Projection of the intent log: one row per live memory per user.
+            -- (user_id, memory_id) is the natural idempotency key — replay-safe
+            -- because UPSERTs collapse duplicate applies. `lsn` is carried as a
+            -- monotonic stamp so a concurrent replay vs. live write can resolve
+            -- the conflict by keeping the higher LSN (write-skew guard).
+            CREATE TABLE IF NOT EXISTS memories (
+                user_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                lsn INTEGER NOT NULL,
+                memory_bincode BLOB NOT NULL,
+                importance REAL NOT NULL DEFAULT 0.5,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, memory_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_user
+                ON memories(user_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_lsn
+                ON memories(lsn);
+
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL
@@ -206,8 +228,11 @@ impl SlowStore {
                 tracing::info!("SlowStore: initialized schema version {}", CURRENT_SCHEMA_VERSION);
             }
             Some(v) if v < CURRENT_SCHEMA_VERSION => {
-                // Run migrations from v+1 to CURRENT_SCHEMA_VERSION
-                // No migrations yet — framework is in place for future versions
+                // Run forward migrations. `create_schema` is idempotent
+                // (every CREATE uses IF NOT EXISTS), so it has already
+                // materialised any new tables/indexes added in v2+. The
+                // migration here just records the version bump so future
+                // boots stop trying to migrate again.
                 let now = Utc::now().to_rfc3339();
                 conn.execute(
                     "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
