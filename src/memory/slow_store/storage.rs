@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::SlowStore;
@@ -23,6 +23,22 @@ pub struct StoredGap {
     pub impact_score: f32,
     pub detected_at: String,
     pub scope: String,
+}
+
+/// A row from the `memories` projection table.
+///
+/// One row per `(user_id, memory_id)`. `lsn` is the intent-log position of
+/// the write that produced this row — used by the projection layer as a
+/// write-skew tie-breaker when a live UPSERT races against a replay
+/// re-apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMemoryRow {
+    pub user_id: String,
+    pub memory_id: String,
+    pub lsn: u64,
+    pub memory_bincode: Vec<u8>,
+    pub importance: f32,
+    pub updated_at: String,
 }
 
 /// A stored thought record
@@ -221,5 +237,128 @@ impl SlowStore {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(gaps)
+    }
+
+    // ========================================================================
+    // Memory projection table — populated by `SqliteProjection`.
+    //
+    // These methods are the SQL substrate the projection layer calls. They
+    // are intentionally simple (no business logic, no caching) — every
+    // write is keyed by `(user_id, memory_id)` and stamped with the
+    // intent-log LSN so a replay can resolve write-skew with a higher-wins
+    // rule.
+    // ========================================================================
+
+    /// UPSERT a memory row at a specific LSN. The `ON CONFLICT` clause
+    /// keeps the row with the *higher* LSN — so a live write at LSN 7 is
+    /// never overwritten by a stale replay at LSN 3. Equal LSN replays
+    /// (the normal idempotent re-apply) overwrite without semantic change
+    /// because the bytes are identical.
+    pub fn upsert_memory(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        lsn: u64,
+        memory_bincode: &[u8],
+        importance: f32,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories
+                (user_id, memory_id, lsn, memory_bincode, importance, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id, memory_id) DO UPDATE SET
+                lsn = excluded.lsn,
+                memory_bincode = excluded.memory_bincode,
+                importance = excluded.importance,
+                updated_at = excluded.updated_at
+             WHERE excluded.lsn >= memories.lsn",
+            params![user_id, memory_id, lsn as i64, memory_bincode, importance, now],
+        )?;
+        Ok(())
+    }
+
+    /// UPDATE only the `importance` column for `(user_id, memory_id)`,
+    /// stamping the supplied LSN. Equivalent to `upsert_memory` but
+    /// doesn't require a fresh memory bincode — used for `IntentPayload::Anchor`.
+    /// Like `upsert_memory`, the update is gated on `lsn >= current` to
+    /// preserve the higher-wins invariant.
+    ///
+    /// If the row does not exist (anchoring a memory that was never
+    /// recorded in the projection), this is a silent no-op — replay will
+    /// see the preceding `Remember`/`Update` first and then re-apply the
+    /// anchor with the correct LSN ordering.
+    pub fn anchor_memory_importance(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        lsn: u64,
+        importance: f32,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories
+                SET importance = ?3, lsn = ?4, updated_at = ?5
+              WHERE user_id = ?1 AND memory_id = ?2 AND ?4 >= lsn",
+            params![user_id, memory_id, importance, lsn as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// DELETE the row for `(user_id, memory_id)`. Idempotent — a delete
+    /// against a non-existent row returns successfully with zero rows
+    /// affected.
+    pub fn delete_memory(&self, user_id: &str, memory_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM memories WHERE user_id = ?1 AND memory_id = ?2",
+            params![user_id, memory_id],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch the bincoded memory blob for `(user_id, memory_id)`, or
+    /// `None` if the row does not exist. Read-only — used by tests and by
+    /// the future "read-your-writes" check from the SQLite projection.
+    pub fn get_memory_blob(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<StoredMemoryRow>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT user_id, memory_id, lsn, memory_bincode, importance, updated_at
+                 FROM memories
+                 WHERE user_id = ?1 AND memory_id = ?2",
+                params![user_id, memory_id],
+                |row| {
+                    let lsn_i64: i64 = row.get(2)?;
+                    Ok(StoredMemoryRow {
+                        user_id: row.get(0)?,
+                        memory_id: row.get(1)?,
+                        lsn: lsn_i64 as u64,
+                        memory_bincode: row.get(3)?,
+                        importance: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Total number of memory rows for a tenant. Used by tests and the
+    /// admin dashboard to confirm replay caught up.
+    pub fn count_memories(&self, user_id: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
     }
 }

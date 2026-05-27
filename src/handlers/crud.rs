@@ -516,6 +516,24 @@ pub async fn delete_memory(
         .forget(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
 
+    // W5: journal the delete. See `handlers::remember` for the full
+    // rationale — RocksDB already holds the canonical removal; the
+    // journal frame is what lets the SQLite projection (and future
+    // projections) converge via replay.
+    let journal_payload = crate::intent_log::IntentPayload::Forget {
+        user_id: user_id.to_string(),
+        memory_id: resolved_id_str.clone(),
+        schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+    };
+    if let Err(e) = state.journal_and_apply(&user_id, &journal_payload) {
+        tracing::warn!(
+            user_id = %user_id,
+            memory_id = %resolved_id_str,
+            error = %e,
+            "intent-log journal_and_apply (Forget) failed (RocksDB delete already durable)",
+        );
+    }
+
     state.log_event(&user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
     state.emit_event(MemoryEvent {
@@ -566,6 +584,21 @@ pub async fn forget_by_id(
     memory_guard
         .forget(memory::ForgetCriteria::ById(resolved_id))
         .map_err(AppError::Internal)?;
+
+    // W5: journal the delete (see `delete_memory` for rationale).
+    let journal_payload = crate::intent_log::IntentPayload::Forget {
+        user_id: req.user_id.clone(),
+        memory_id: resolved_id_str.clone(),
+        schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+    };
+    if let Err(e) = state.journal_and_apply(&req.user_id, &journal_payload) {
+        tracing::warn!(
+            user_id = %req.user_id,
+            memory_id = %resolved_id_str,
+            error = %e,
+            "intent-log journal_and_apply (Forget) failed (RocksDB delete already durable)",
+        );
+    }
 
     state.log_event(&req.user_id, "DELETE", &resolved_id_str, "Memory deleted");
 
@@ -1203,16 +1236,37 @@ pub async fn anchor_memory(
 
     let anchor_value = req.anchor;
     let mid = memory_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let guard = memory_sys.read();
+    let memory_sys_for_anchor = memory_sys.clone();
+    let final_importance = tokio::task::spawn_blocking(move || {
+        let guard = memory_sys_for_anchor.read();
         let mem = guard.get_memory(&mid)?;
         mem.set_anchored(anchor_value);
         guard.update_memory(&mem)?;
-        Ok::<(), anyhow::Error>(())
+        // Sample the post-anchor importance so the projection can mirror
+        // it without round-tripping the full Memory blob.
+        Ok::<f32, anyhow::Error>(mem.importance())
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
+
+    // W5: journal the anchor as an `Anchor` payload so the SQLite
+    // projection updates its `importance` column without rewriting the
+    // memory blob. See `handlers::remember` for the broader contract.
+    let journal_payload = crate::intent_log::IntentPayload::Anchor {
+        user_id: req.user_id.clone(),
+        memory_id: req.memory_id.clone(),
+        importance: final_importance,
+        schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+    };
+    if let Err(e) = state.journal_and_apply(&req.user_id, &journal_payload) {
+        tracing::warn!(
+            user_id = %req.user_id,
+            memory_id = %req.memory_id,
+            error = %e,
+            "intent-log journal_and_apply (Anchor) failed (RocksDB anchor already durable)",
+        );
+    }
 
     state.emit_event(MemoryEvent {
         event_type: if req.anchor {
