@@ -36,6 +36,7 @@
 //!     refused entirely. There is no scenario where production stores a
 //!     2FA secret in plaintext.
 
+pub mod argon2_pool;
 pub mod password;
 pub mod recovery_codes;
 pub mod runtime;
