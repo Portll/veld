@@ -134,6 +134,27 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/user_auth/2fa/enroll", post(user_auth::enroll_2fa))
         .route("/api/user_auth/2fa/confirm", post(user_auth::confirm_2fa))
         .route("/api/user_auth/logout", post(user_auth::logout))
+        // Admin-only role management — gating on the Admin role itself is
+        // done inside the handler; the session middleware only proves the
+        // caller has *some* valid session.
+        .route(
+            "/api/user_auth/admin/promote",
+            post(user_auth::admin_promote),
+        )
+        .route(
+            "/api/user_auth/admin/demote",
+            post(user_auth::admin_demote),
+        )
+        // Session revocation — admin "kill all sessions for username" and
+        // user "log out every other device".
+        .route(
+            "/api/user_auth/sessions/revoke_all",
+            post(user_auth::revoke_all_sessions),
+        )
+        .route(
+            "/api/user_auth/sessions/revoke_mine",
+            post(user_auth::revoke_my_other_sessions),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             user_auth::require_user_session,
