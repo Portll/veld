@@ -5,12 +5,12 @@
  * Aggressive proactive context surfacing at every opportunity.
  * Memory should be woven into every interaction - the AI thinks with memory.
  *
- * Events: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStop, Stop
+ * Events: SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStop, Stop
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const VELD_API_URL = process.env.VELD_API_URL || "http://127.0.0.1:3030";
 const VELD_API_KEY = resolveApiKey();
@@ -404,7 +404,98 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
   return output;
 }
 
+// =============================================================================
+// AGENT SESSION MARKER FILE
+// =============================================================================
+//
+// On SessionStart we write `.veld-agent-session.<pid>` into the current
+// working directory so external tooling (notably the upcoming agent-session
+// detection helper) can identify which chat brand is driving this process.
+//
+// Format (JSON):
+//   {
+//     "agent_id":   "Claude",          // chat brand — always "Claude" for this hook
+//     "started_at": ISO-8601 UTC,
+//     "pid":        <process pid>,
+//     "binary":     basename of process.argv[0] (best-effort, diagnostics only)
+//   }
+//
+// Written atomically (write to .tmp then rename) and idempotent (overwrites
+// on every SessionStart). Removed on SessionEnd best-effort.
+
+export interface AgentSessionMarker {
+  agent_id: string;
+  started_at: string;
+  pid: number;
+  binary: string;
+}
+
+/** Absolute path to the agent-session marker file for the current process. */
+export function agentSessionMarkerPath(cwd: string = process.cwd(), pid: number = process.pid): string {
+  return join(cwd, `.veld-agent-session.${pid}`);
+}
+
+/**
+ * Best-effort detection of the launcher binary. Returns the basename of
+ * `process.argv[0]` (e.g. "bun.exe", "node", "claude-code"). Falls back to
+ * a marker string if argv[0] is missing or empty. Used by downstream tooling
+ * for diagnostics; not load-bearing.
+ */
+export function detectBinary(): string {
+  if (process.env.CLAUDE_DESKTOP) return "claude-desktop";
+  const argv0 = process.argv[0];
+  if (!argv0) return "unknown";
+  return basename(argv0) || "unknown";
+}
+
+/** Build the marker payload. Pure for testability. */
+export function buildAgentSessionMarker(now: Date = new Date()): AgentSessionMarker {
+  return {
+    agent_id: "Claude",
+    started_at: now.toISOString(),
+    pid: process.pid,
+    binary: detectBinary(),
+  };
+}
+
+/**
+ * Write the marker file atomically. Writes to `<path>.tmp` then renames over
+ * the target so readers never observe a half-written file.
+ * Errors are logged and swallowed — the hook must never crash the host.
+ */
+export function writeAgentSessionMarker(path: string = agentSessionMarkerPath()): AgentSessionMarker | null {
+  const marker = buildAgentSessionMarker();
+  const tmp = `${path}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(marker, null, 2), { encoding: "utf-8" });
+    renameSync(tmp, path);
+    return marker;
+  } catch (e) {
+    console.error(`[veld] agent-session marker write failed at ${path}:`, e);
+    try { unlinkSync(tmp); } catch { /* tmp may not exist */ }
+    return null;
+  }
+}
+
+/**
+ * Delete the marker file. Best-effort — a missing file is not an error.
+ * Logs a debug message on unexpected failure (e.g. permission denied).
+ */
+export function removeAgentSessionMarker(path: string = agentSessionMarkerPath()): void {
+  try {
+    unlinkSync(path);
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return; // already gone — nothing to do
+    console.error(`[veld] agent-session marker delete failed at ${path}:`, e);
+  }
+}
+
 async function handleSessionStart(): Promise<void> {
+  // Drop the agent-session marker file first so downstream chat-brand
+  // detection works even if the memory backend is unreachable below.
+  writeAgentSessionMarker();
+
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const projectName = projectDir.split(/[/\\]/).pop() || "unknown";
 
@@ -936,6 +1027,13 @@ async function handleStop(_input: HookInput): Promise<void> {
   // and gets re-ingested by proactive_context auto-ingest, causing duplicate events.
 }
 
+async function handleSessionEnd(_input: HookInput): Promise<void> {
+  // Remove the agent-session marker file written at SessionStart.
+  // Best-effort — leaks are not critical: the file is gitignored and lives in
+  // the worktree, so the next SessionStart will overwrite it anyway.
+  removeAgentSessionMarker();
+}
+
 async function main(): Promise<void> {
   const inputText = await Bun.stdin.text();
 
@@ -967,6 +1065,9 @@ async function main(): Promise<void> {
       break;
     case "Stop":
       await handleStop(input);
+      break;
+    case "SessionEnd":
+      await handleSessionEnd(input);
       break;
   }
 }
