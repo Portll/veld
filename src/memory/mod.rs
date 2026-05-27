@@ -33,6 +33,7 @@ mod recall;
 pub mod replay;
 pub mod retrieval;
 pub mod segmentation;
+pub mod session_detect;
 pub mod sessions;
 pub mod slow_store;
 pub mod storage;

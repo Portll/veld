@@ -46,7 +46,9 @@ impl ContextBuilder {
                 who: Default::default(),
                 why: Default::default(),
                 binding: Default::default(),
-                session: Default::default(),
+                // Auto-detect WHO ran this — agent / worktree / branch.
+                // Cached per-process; the call is cheap after the first hit.
+                session: crate::memory::session_detect::detect_session(),
                 parent: None,
                 embeddings: None,
                 decay_rate: 0.1, // Default decay
