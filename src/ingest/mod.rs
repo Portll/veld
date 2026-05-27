@@ -8,6 +8,8 @@
 //! No external crates — parsing uses only stdlib + `regex`.
 
 pub mod extractors;
+pub mod gdrive;
+pub mod github;
 
 use anyhow::Result;
 
