@@ -1,0 +1,8 @@
+domain = "programming"
+kind = "filesystem"
+path = "../veld-w3-readers/src"
+extensions = ["rs"]
+license = "BUSL-1.1"
+source = "veld-w3-readers-rust"
+min_chunk = 256
+max_chunk = 2048

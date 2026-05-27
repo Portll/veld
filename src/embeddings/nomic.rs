@@ -985,6 +985,10 @@ impl NomicEmbedder {
 }
 
 impl Embedder for NomicEmbedder {
+    fn model_id(&self) -> &str {
+        "nomic-embed-text-v1.5"
+    }
+
     /// Default encode uses the "search_document: " prefix (content being stored).
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         self.encode_document(text)
