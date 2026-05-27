@@ -141,6 +141,205 @@ impl VeldMcpServer {
     }
 
     // =========================================================================
+    // AGENT SELF-PAGING TOOLS - Tier + Pin Control
+    // =========================================================================
+
+    #[tool(
+        description = "Pin a memory so it resists automatic decay and skips compression. Use for critical facts that must persist in working context (Letta-style core-memory anchor)."
+    )]
+    async fn pin_memory(
+        &self,
+        Parameters(params): Parameters<PinMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<AnchorResponse> = self
+            .client
+            .post(
+                "/api/anchor",
+                &AnchorRequest {
+                    user_id: self.client.user_id.clone(),
+                    memory_id: params.memory_id,
+                    anchor: true,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Pinned memory {} (anchored={})",
+                resp.memory_id, resp.anchored
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Unpin a previously pinned memory, allowing automatic decay and compression to apply again."
+    )]
+    async fn unpin_memory(
+        &self,
+        Parameters(params): Parameters<PinMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<AnchorResponse> = self
+            .client
+            .post(
+                "/api/anchor",
+                &AnchorRequest {
+                    user_id: self.client.user_id.clone(),
+                    memory_id: params.memory_id,
+                    anchor: false,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unpinned memory {} (anchored={})",
+                resp.memory_id, resp.anchored
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Promote a memory back into the hot working tier. Use when an archived memory needs to be brought into immediate focus for the current task."
+    )]
+    async fn promote_to_hot(
+        &self,
+        Parameters(params): Parameters<PinMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<TierMoveResponse> = self
+            .client
+            .post(
+                "/api/memory/tier",
+                &TierMoveRequest {
+                    user_id: self.client.user_id.clone(),
+                    memory_id: params.memory_id,
+                    target_tier: "working".to_string(),
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Promoted memory {} from {} to {}",
+                resp.memory_id, resp.previous_tier, resp.current_tier
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Push a memory down to cold archival storage. Use when a memory is no longer relevant to the current task but should be preserved for possible future recall."
+    )]
+    async fn demote_to_cold(
+        &self,
+        Parameters(params): Parameters<PinMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<TierMoveResponse> = self
+            .client
+            .post(
+                "/api/memory/tier",
+                &TierMoveRequest {
+                    user_id: self.client.user_id.clone(),
+                    memory_id: params.memory_id,
+                    target_tier: "archive".to_string(),
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Demoted memory {} from {} to {}",
+                resp.memory_id, resp.previous_tier, resp.current_tier
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Give explicit feedback on memories that were surfaced by a recent recall. outcome: 'helpful' boosts (memories that helped solve the task), 'misleading' suppresses (memories that wasted time or were wrong), 'neutral' is a mild access bump. Feeds the closed-loop ranker — future recalls re-rank based on accumulated momentum."
+    )]
+    async fn reinforce_memories(
+        &self,
+        Parameters(params): Parameters<ReinforceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<ReinforceResponse> = self
+            .client
+            .post(
+                "/api/reinforce",
+                &ReinforceRequest {
+                    user_id: self.client.user_id.clone(),
+                    ids: params.memory_ids,
+                    outcome: params.outcome,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Reinforced {} memories — {} boosts, {} decays, {} associations strengthened",
+                resp.memories_processed,
+                resp.importance_boosts,
+                resp.importance_decays,
+                resp.associations_strengthened
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Move a memory to a specific tier. target_tier accepts: 'working', 'session', 'longterm', 'archive'. Prefer the named helpers (promote_to_hot, demote_to_cold) for the common cases."
+    )]
+    async fn move_to_tier(
+        &self,
+        Parameters(params): Parameters<MoveTierParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<TierMoveResponse> = self
+            .client
+            .post(
+                "/api/memory/tier",
+                &TierMoveRequest {
+                    user_id: self.client.user_id.clone(),
+                    memory_id: params.memory_id,
+                    target_tier: params.target_tier,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Moved memory {} from {} to {}",
+                resp.memory_id, resp.previous_tier, resp.current_tier
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    // =========================================================================
     // LINEAGE TOOLS - Causal Memory Tracking
     // =========================================================================
 
