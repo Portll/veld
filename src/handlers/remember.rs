@@ -283,7 +283,9 @@ pub fn build_rich_context(
         who: Default::default(),
         why: Default::default(),
         binding: Default::default(),
-        session: Default::default(),
+        // Stamp this engram with the active agent / worktree / branch.
+        // Cached per-process — see `memory::session_detect`.
+        session: crate::memory::session_detect::detect_session(),
         conversation: Default::default(),
         user: Default::default(),
         project: Default::default(),
