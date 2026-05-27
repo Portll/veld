@@ -130,19 +130,37 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
     // The session middleware is applied here, not at the outer auth layer,
     // so the api-key check in `auth_middleware` is skipped for
     // `/api/user_auth/*` paths (see `crate::auth::auth_middleware`).
-    let session_routes = Router::new()
-        .route("/api/user_auth/2fa/enroll", post(user_auth::enroll_2fa))
-        .route("/api/user_auth/2fa/confirm", post(user_auth::confirm_2fa))
-        .route("/api/user_auth/logout", post(user_auth::logout))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            user_auth::require_user_session,
-        ));
-    let user_auth_routes = Router::new()
-        .route("/api/user_auth/register", post(user_auth::register))
-        .route("/api/user_auth/login", post(user_auth::login))
-        .route("/api/user_auth/recover", post(user_auth::recover))
-        .merge(session_routes);
+    //
+    // When `VELD_USER_AUTH_ENABLED=false`, none of the real handlers are
+    // mounted. Instead a single catch-all returns 503 with a documented
+    // JSON body — see `user_auth::disabled_fallback`. The motivation
+    // (B7 hardening): 404 means "no such endpoint", which misleads
+    // operators probing the feature; 503 means "endpoint exists but
+    // disabled" and tells them what to set to enable it.
+    let user_auth_routes = if crate::user_auth::feature_enabled() {
+        let session_routes = Router::new()
+            .route("/api/user_auth/2fa/enroll", post(user_auth::enroll_2fa))
+            .route("/api/user_auth/2fa/confirm", post(user_auth::confirm_2fa))
+            .route("/api/user_auth/logout", post(user_auth::logout))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                user_auth::require_user_session,
+            ));
+        Router::new()
+            .route("/api/user_auth/register", post(user_auth::register))
+            .route("/api/user_auth/login", post(user_auth::login))
+            .route("/api/user_auth/recover", post(user_auth::recover))
+            .merge(session_routes)
+    } else {
+        // Single catch-all under `/api/user_auth/{*path}` returning 503
+        // with the documented `user_auth_disabled` body. Both GET and
+        // POST (and any other verb) hit the same handler — clients can
+        // ping the surface with any method and get a consistent answer.
+        Router::new().route(
+            "/api/user_auth/{*path}",
+            axum::routing::any(user_auth::disabled_fallback),
+        )
+    };
 
     r
         .merge(user_auth_routes)

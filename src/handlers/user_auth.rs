@@ -1,6 +1,15 @@
 //! HTTP handlers for the self-hosted user-auth surface (Phase C).
 //!
-//! Every handler short-circuits with `404` when the feature flag is off.
+//! When `VELD_USER_AUTH_ENABLED=false`, the router (see
+//! `crate::handlers::router::build_protected_routes`) replaces the live
+//! handlers with [`disabled_fallback`], which returns `503 Service
+//! Unavailable` with the documented body
+//! `{"error":"user_auth_disabled","detail":"Set VELD_USER_AUTH_ENABLED=true to enable"}`.
+//! Handlers in this module are therefore only invoked when the feature is
+//! on; the in-handler `AuthError::Disabled` branches remain as a defence
+//! in depth for the case where the router mounted the live routes but the
+//! runtime failed to construct (e.g. the column family is missing).
+//!
 //! Authentication for session-protected handlers is performed by a separate
 //! middleware ([`require_user_session`]) layered on the routes that need it,
 //! distinct from the X-API-Key middleware on the rest of the protected
@@ -183,7 +192,7 @@ async fn register_inner(
         UserRole::User
     };
 
-    let password_hash = password::hash_password(&req.password)?;
+    let password_hash = password::hash_password_async(&req.password).await?;
     let record = UserRecord {
         id: Uuid::new_v4(),
         username: req.username.trim().to_string(),
@@ -244,13 +253,16 @@ async fn login_inner(
         Some(u) => u,
         None => {
             // Verify against a throw-away hash so the wall-time looks the
-            // same as a real verify.
-            let _ = password::verify_password(&req.password, DUMMY_HASH);
+            // same as a real verify. Use the async wrapper so the dummy
+            // verify also passes through the Argon2 semaphore — otherwise
+            // the username-enumeration timing channel widens whenever the
+            // semaphore is saturated.
+            let _ = password::verify_password_async(&req.password, DUMMY_HASH).await;
             return Err(AuthError::InvalidCredentials);
         }
     };
 
-    if !password::verify_password(&req.password, &record.password_hash)? {
+    if !password::verify_password_async(&req.password, &record.password_hash).await? {
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -315,7 +327,7 @@ async fn enroll_2fa_inner(
 
     let secret = totp::generate_secret();
     let provisioning_uri = totp::provisioning_uri(&secret, &user.username)?;
-    let (recovery_plaintext, recovery_hashes) = recovery_codes::generate_batch()?;
+    let (recovery_plaintext, recovery_hashes) = recovery_codes::generate_batch_async().await?;
     let encrypted = encrypt_totp_secret(runtime, &secret)?;
 
     let mut record = user.clone();
@@ -399,14 +411,15 @@ async fn recover_inner(
         .find_user_by_username(&req.username)?
         .ok_or(AuthError::InvalidRecoveryCode)?;
 
-    let outcome = recovery_codes::redeem(&record.recovery_code_hashes, &req.recovery_code)?;
+    let outcome =
+        recovery_codes::redeem_async(&record.recovery_code_hashes, &req.recovery_code).await?;
     let remaining = match outcome {
         recovery_codes::RedeemOutcome::Consumed { remaining } => remaining,
         recovery_codes::RedeemOutcome::NoMatch => return Err(AuthError::InvalidRecoveryCode),
     };
 
     record.recovery_code_hashes = remaining;
-    record.password_hash = password::hash_password(&req.new_password)?;
+    record.password_hash = password::hash_password_async(&req.new_password).await?;
     // Recovery wipes 2FA — user must re-enroll, which also issues a fresh
     // set of recovery codes.
     record.totp_secret_encrypted = None;
@@ -446,6 +459,30 @@ pub async fn logout(
         return e.into_response();
     }
     (StatusCode::OK, Json(json!({"success": true}))).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Disabled-feature fallback (B7)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Catch-all handler mounted under `/api/user_auth/{*path}` when the
+/// feature flag is **off** (`VELD_USER_AUTH_ENABLED=false`).
+///
+/// Returns `503 Service Unavailable` with a fixed JSON body shape so
+/// clients probing the surface can distinguish "endpoint exists but
+/// disabled" from "no such endpoint, are you on the right server?".
+/// The body is deliberately a different shape from the live error
+/// surface — the live surface uses [`crate::errors::ErrorResponse`]
+/// (`code` / `message` / `details`), whereas the disabled surface uses
+/// `{"error": "user_auth_disabled", "detail": "…"}` so an operator
+/// reading logs / clients can pattern-match on the marker without
+/// pulling in the full auth-error vocabulary.
+pub async fn disabled_fallback() -> Response {
+    let body = json!({
+        "error": "user_auth_disabled",
+        "detail": "Set VELD_USER_AUTH_ENABLED=true to enable",
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -662,5 +699,58 @@ mod tests {
         )
         .unwrap()
         .generate(t)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // B7: disabled-feature fallback returns 503 with the documented body
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn disabled_fallback_returns_503_with_documented_body_shape() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Method, Request};
+        use axum::routing::any;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        // Mount only the fallback — same shape the router uses when the
+        // feature flag is OFF.
+        let app: Router =
+            Router::new().route("/api/user_auth/{*path}", any(disabled_fallback));
+
+        // POST /api/user_auth/login is the path called out in the breakers
+        // report; any sub-path under `/api/user_auth/` must yield the
+        // same 503 + body.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/user_auth/login")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "user_auth_disabled");
+        assert_eq!(
+            body["detail"],
+            "Set VELD_USER_AUTH_ENABLED=true to enable"
+        );
+
+        // Any other verb hits the same handler — confirm GET also returns
+        // 503 with the same body. `any` routing means clients probing the
+        // surface get a consistent answer regardless of method.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/user_auth/2fa/enroll")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

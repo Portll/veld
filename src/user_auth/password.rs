@@ -8,7 +8,20 @@
 //! salt, hash), so the cost parameters used at registration travel with the
 //! stored hash. Future cost increases need only swap [`PASSWORD_PARAMS`] —
 //! existing hashes keep verifying with the params encoded in their string.
+//!
+//! ## Concurrency
+//!
+//! [`hash_password`] / [`verify_password`] are synchronous helpers used by
+//! the unit tests and by code paths that do not run on a Tokio executor.
+//! Production async paths must call [`hash_password_async`] /
+//! [`verify_password_async`], which acquire one slot from the process-global
+//! [`crate::user_auth::argon2_pool`] semaphore before running the work on the
+//! blocking-task pool. The semaphore caps in-flight Argon2 jobs at
+//! `available_parallelism()` so a thundering herd of logins cannot saturate
+//! every CPU core simultaneously — queued requests park on the semaphore
+//! instead.
 
+use crate::user_auth::argon2_pool;
 use crate::user_auth::AuthError;
 
 use argon2::password_hash::{
@@ -72,6 +85,26 @@ pub fn verify_password(plaintext: &str, stored_hash: &str) -> Result<bool, AuthE
     }
 }
 
+/// Async wrapper around [`hash_password`] that runs the CPU-bound work on
+/// the blocking-task pool *under* the process-global Argon2 semaphore. Use
+/// from any handler reached through Axum — see the module-level
+/// "Concurrency" note.
+pub async fn hash_password_async(plaintext: &str) -> Result<String, AuthError> {
+    let plain = plaintext.to_owned();
+    argon2_pool::run_blocking(move || hash_password(&plain)).await
+}
+
+/// Async wrapper around [`verify_password`] with the same concurrency
+/// semantics as [`hash_password_async`].
+pub async fn verify_password_async(
+    plaintext: &str,
+    stored_hash: &str,
+) -> Result<bool, AuthError> {
+    let plain = plaintext.to_owned();
+    let stored = stored_hash.to_owned();
+    argon2_pool::run_blocking(move || verify_password(&plain, &stored)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +149,61 @@ mod tests {
         assert!(
             matches!(err, AuthError::WeakPassword(_)),
             "expected WeakPassword, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_hash_and_verify_round_trip_through_the_pool() {
+        // Smoke-test the async path so we know the semaphore wrapper still
+        // produces the same answer the synchronous helpers would.
+        let pw = "async-correct-horse";
+        let hash = hash_password_async(pw).await.expect("hash_async");
+        assert!(hash.starts_with("$argon2id$"));
+        assert!(verify_password_async(pw, &hash).await.expect("verify_async"));
+        assert!(!verify_password_async("nope", &hash).await.expect("mismatch"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_verifies_respect_the_semaphore_cap() {
+        // Spawn 20 verifies concurrently. The Argon2 pool must keep
+        // in-flight work below the permit cap; we sample the cap by reading
+        // the available_permits counter from inside each task and capping
+        // at `permit_count() - available`.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let pw = "rate-limited-password";
+        let hash = hash_password_async(pw).await.expect("hash_async");
+
+        let cap = crate::user_auth::argon2_pool::permit_count();
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let pw = pw.to_owned();
+            let hash = hash.clone();
+            let peak = Arc::clone(&peak);
+            handles.push(tokio::spawn(async move {
+                let ok = verify_password_async(&pw, &hash).await.expect("verify");
+                assert!(ok);
+                // Sample the in-flight count from inside the spawned task.
+                // available_permits is a lower bound (some tasks may have
+                // already finished by the time we read it), so
+                // `cap - available` upper-bounds the in-flight value.
+                let avail = crate::user_auth::argon2_pool::available_permits();
+                let in_flight = cap.saturating_sub(avail);
+                peak.fetch_max(in_flight, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= cap,
+            "peak in-flight {} exceeded the semaphore cap {}",
+            peak.load(Ordering::SeqCst),
+            cap
         );
     }
 }
