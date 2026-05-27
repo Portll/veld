@@ -230,9 +230,18 @@ async fn login_inner(
     req: LoginRequest,
 ) -> Result<LoginResponse, AuthError> {
     let runtime = runtime(state)?;
-    // Per-username throttle before we touch the password hasher (don't
-    // burn Argon2 cycles for a known-throttled username).
+    let now = Utc::now();
+
+    // First line of defence: in-memory governor (cheap, no I/O).
     if runtime.login_limiter.check(&req.username).is_err() {
+        return Err(AuthError::TooManyAttempts);
+    }
+    // Second line: persistent throttle row — survives process restart so an
+    // attacker can't unstick themselves by waiting for a redeploy. Read
+    // BEFORE touching the password hasher (don't burn Argon2 cycles for a
+    // known-locked username).
+    let throttle = runtime.store.get_login_throttle(&req.username)?;
+    if throttle.is_locked(now) {
         return Err(AuthError::TooManyAttempts);
     }
 
@@ -246,16 +255,30 @@ async fn login_inner(
             // Verify against a throw-away hash so the wall-time looks the
             // same as a real verify.
             let _ = password::verify_password(&req.password, DUMMY_HASH);
+            // We deliberately do NOT increment the persistent throttle for
+            // unknown usernames — that would let an attacker grief-lock
+            // legitimate users out by spamming logins with their username
+            // (the in-memory governor + global rate-limit already cap this).
             return Err(AuthError::InvalidCredentials);
         }
     };
 
     if !password::verify_password(&req.password, &record.password_hash)? {
+        // Real user, wrong password — count it.
+        record_failed_login(runtime, &req.username, now)?;
         return Err(AuthError::InvalidCredentials);
     }
 
     if record.has_active_totp() {
-        let candidate = req.totp.ok_or(AuthError::TotpRequired)?;
+        let candidate = match req.totp {
+            Some(c) => c,
+            None => {
+                // TOTP missing — treat as failed credential attempt so
+                // brute-forcing TOTP also walks the throttle.
+                record_failed_login(runtime, &req.username, now)?;
+                return Err(AuthError::TotpRequired);
+            }
+        };
         let secret = decrypt_totp_secret(
             runtime,
             record.totp_secret_encrypted.as_ref().ok_or_else(|| {
@@ -263,16 +286,18 @@ async fn login_inner(
             })?,
         )?;
         if !totp::verify_code(&secret, &candidate, totp::current_unix_time())? {
+            record_failed_login(runtime, &req.username, now)?;
             return Err(AuthError::InvalidCredentials);
         }
     }
 
     // Mint a session and stamp last-login.
-    let now = Utc::now();
     let (token, session_record) = session_mod::issue(record.id, now);
     runtime.store.put_session(&session_record)?;
     record.last_login_at = Some(now);
     runtime.store.put_user(&record)?;
+    // Clear the persistent throttle row — fresh start.
+    runtime.store.clear_login_throttle(&req.username)?;
 
     Ok(LoginResponse {
         success: true,
@@ -280,6 +305,27 @@ async fn login_inner(
         expires_at: session_record.expires_at,
         role: record.role.as_str(),
     })
+}
+
+/// Bump the persistent throttle row for `username`. If the failure pushed
+/// the row over [`crate::user_auth::store::THROTTLE_FAILURE_THRESHOLD`] we
+/// emit an audit-tagged warn so a SIEM can correlate lockouts.
+fn record_failed_login(
+    runtime: &crate::user_auth::runtime::UserAuthRuntime,
+    username: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), AuthError> {
+    let row = runtime.store.record_login_failure(username, now)?;
+    if row.locked_until.map(|t| t > now).unwrap_or(false) {
+        tracing::warn!(
+            audit = "login_lockout",
+            username = %username,
+            failed_attempts = row.failed_attempts,
+            locked_until = ?row.locked_until,
+            "user_auth: persistent login throttle locked username"
+        );
+    }
+    Ok(())
 }
 
 /// A constant Argon2id PHC of an unrelated, single-purpose secret. Used to
@@ -523,6 +569,187 @@ fn require_session_user_from_headers(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Admin-only: promote / demote
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct UsernameRequest {
+    pub username: String,
+}
+
+/// `POST /api/user_auth/admin/promote` — admin-only.
+///
+/// Body: `{username}`. Sets the target user's role to `Admin`. Idempotent —
+/// promoting an already-admin user is a no-op success.
+pub async fn admin_promote(
+    State(state): State<AppState>,
+    Extension(caller): Extension<crate::user_auth::SessionUser>,
+    Json(req): Json<UsernameRequest>,
+) -> Response {
+    let result = runtime(&state)
+        .and_then(|rt| admin_set_role_with_runtime(rt, &caller.0, &req.username, UserRole::Admin));
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/user_auth/admin/demote` — admin-only.
+///
+/// Body: `{username}`. Sets the target user's role to `User`. Refuses with
+/// `409 LAST_ADMIN` if the demotion would leave zero administrators.
+pub async fn admin_demote(
+    State(state): State<AppState>,
+    Extension(caller): Extension<crate::user_auth::SessionUser>,
+    Json(req): Json<UsernameRequest>,
+) -> Response {
+    let result = runtime(&state)
+        .and_then(|rt| admin_set_role_with_runtime(rt, &caller.0, &req.username, UserRole::User));
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({"success": true}))).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Inner role-change logic — broken out from the handlers so unit tests
+/// can drive it with a freestanding [`crate::user_auth::runtime::UserAuthRuntime`]
+/// without instantiating the full [`super::state::MultiUserMemoryManager`].
+fn admin_set_role_with_runtime(
+    runtime: &crate::user_auth::runtime::UserAuthRuntime,
+    caller: &UserRecord,
+    target_username: &str,
+    new_role: UserRole,
+) -> Result<(), AuthError> {
+    if caller.role != UserRole::Admin {
+        return Err(AuthError::Forbidden);
+    }
+
+    let mut target = runtime
+        .store
+        .find_user_by_username(target_username)?
+        .ok_or(AuthError::UserNotFound)?;
+
+    if target.role == new_role {
+        // Idempotent. No write, no audit (nothing changed).
+        return Ok(());
+    }
+
+    // Demote guard: if the target is currently Admin and we're moving them
+    // to User, count remaining admins and refuse to zero out the set.
+    if target.role == UserRole::Admin && new_role == UserRole::User {
+        let admins = runtime.store.count_admins()?;
+        if admins <= 1 {
+            return Err(AuthError::LastAdmin);
+        }
+    }
+
+    target.role = new_role;
+    runtime.store.put_user(&target)?;
+
+    let audit_action = match new_role {
+        UserRole::Admin => "admin_promotion",
+        UserRole::User => "admin_demotion",
+    };
+    tracing::warn!(
+        audit = audit_action,
+        promoter = %caller.id,
+        target = %target.username,
+        target_user_id = %target.id,
+        "user_auth: role change"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Session revocation
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `POST /api/user_auth/sessions/revoke_all` — admin-only.
+///
+/// Body: `{username}`. Deletes every active session for the named user.
+/// Returns `{success: true, removed: <count>}`.
+pub async fn revoke_all_sessions(
+    State(state): State<AppState>,
+    Extension(caller): Extension<crate::user_auth::SessionUser>,
+    Json(req): Json<UsernameRequest>,
+) -> Response {
+    let result =
+        runtime(&state).and_then(|rt| revoke_all_sessions_with_runtime(rt, &caller.0, &req.username));
+    match result {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(json!({"success": true, "removed": removed})),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+fn revoke_all_sessions_with_runtime(
+    runtime: &crate::user_auth::runtime::UserAuthRuntime,
+    caller: &UserRecord,
+    target_username: &str,
+) -> Result<usize, AuthError> {
+    if caller.role != UserRole::Admin {
+        return Err(AuthError::Forbidden);
+    }
+    let target = runtime
+        .store
+        .find_user_by_username(target_username)?
+        .ok_or(AuthError::UserNotFound)?;
+    let removed = runtime.store.delete_all_sessions_for_user(&target.id)?;
+    tracing::warn!(
+        audit = "session_revoke_all",
+        admin = %caller.id,
+        target = %target.username,
+        target_user_id = %target.id,
+        removed = removed,
+        "user_auth: admin revoked all sessions for user"
+    );
+    Ok(removed)
+}
+
+/// `POST /api/user_auth/sessions/revoke_mine` — session-authenticated.
+///
+/// Deletes every session for the caller EXCEPT the one making this request
+/// — i.e. "log out all other devices" from the active session.
+pub async fn revoke_my_other_sessions(
+    State(state): State<AppState>,
+    Extension(caller): Extension<crate::user_auth::SessionUser>,
+    Extension(token): Extension<crate::user_auth::SessionTokenExt>,
+) -> Response {
+    let result = runtime(&state)
+        .and_then(|rt| revoke_my_other_sessions_with_runtime(rt, &caller.0, &token.0));
+    match result {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(json!({"success": true, "removed": removed})),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+fn revoke_my_other_sessions_with_runtime(
+    runtime: &crate::user_auth::runtime::UserAuthRuntime,
+    caller: &UserRecord,
+    caller_token: &str,
+) -> Result<usize, AuthError> {
+    let keep_hash = session_mod::hash_token(caller_token)?;
+    let removed = runtime
+        .store
+        .delete_other_sessions_for_user(&caller.id, &keep_hash)?;
+    tracing::warn!(
+        audit = "session_revoke_mine",
+        user_id = %caller.id,
+        username = %caller.username,
+        removed = removed,
+        "user_auth: user revoked their other sessions"
+    );
+    Ok(removed)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Tests — handler-level end-to-end flow.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -662,5 +889,220 @@ mod tests {
         )
         .unwrap()
         .generate(t)
+    }
+
+    // ── Helpers for admin / revoke / throttle tests ─────────────────────
+
+    fn fixture_user(name: &str, role: UserRole) -> UserRecord {
+        UserRecord {
+            id: Uuid::new_v4(),
+            username: name.to_string(),
+            password_hash: password::hash_password("temp-pass-12345").unwrap(),
+            totp_secret_encrypted: None,
+            totp_enrollment_pending: false,
+            recovery_code_hashes: Vec::new(),
+            role,
+            created_at: Utc::now(),
+            last_login_at: None,
+        }
+    }
+
+    // ── A) Admin promote / demote ───────────────────────────────────────
+
+    #[test]
+    fn admin_can_promote_user_to_admin() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+
+        let admin = fixture_user("root", UserRole::Admin);
+        let bob = fixture_user("bob", UserRole::User);
+        runtime.store.create_user(&admin).unwrap();
+        runtime.store.create_user(&bob).unwrap();
+
+        admin_set_role_with_runtime(&runtime, &admin, "bob", UserRole::Admin).unwrap();
+
+        let bob_after = runtime.store.find_user_by_username("bob").unwrap().unwrap();
+        assert_eq!(bob_after.role, UserRole::Admin);
+    }
+
+    #[test]
+    fn non_admin_promote_attempt_is_forbidden() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+
+        let alice = fixture_user("alice", UserRole::User);
+        let bob = fixture_user("bob", UserRole::User);
+        runtime.store.create_user(&alice).unwrap();
+        runtime.store.create_user(&bob).unwrap();
+
+        let err = admin_set_role_with_runtime(&runtime, &alice, "bob", UserRole::Admin)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Forbidden), "{err:?}");
+        // bob's role unchanged.
+        let bob_after = runtime.store.find_user_by_username("bob").unwrap().unwrap();
+        assert_eq!(bob_after.role, UserRole::User);
+    }
+
+    #[test]
+    fn promote_unknown_username_returns_user_not_found() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+        let admin = fixture_user("root", UserRole::Admin);
+        runtime.store.create_user(&admin).unwrap();
+
+        let err = admin_set_role_with_runtime(&runtime, &admin, "nobody", UserRole::Admin)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::UserNotFound), "{err:?}");
+    }
+
+    #[test]
+    fn demoting_only_admin_returns_last_admin_conflict() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+
+        let admin = fixture_user("root", UserRole::Admin);
+        let bob = fixture_user("bob", UserRole::User);
+        runtime.store.create_user(&admin).unwrap();
+        runtime.store.create_user(&bob).unwrap();
+
+        // An admin self-demoting themselves while they're the only admin
+        // must be refused.
+        let err = admin_set_role_with_runtime(&runtime, &admin, "root", UserRole::User)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::LastAdmin), "{err:?}");
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.code(), "LAST_ADMIN");
+
+        // root still has Admin role.
+        let still = runtime.store.find_user_by_username("root").unwrap().unwrap();
+        assert_eq!(still.role, UserRole::Admin);
+    }
+
+    #[test]
+    fn demote_second_admin_succeeds() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+
+        let admin = fixture_user("root", UserRole::Admin);
+        let admin2 = fixture_user("root2", UserRole::Admin);
+        runtime.store.create_user(&admin).unwrap();
+        runtime.store.create_user(&admin2).unwrap();
+
+        // Two admins — demoting root2 is allowed.
+        admin_set_role_with_runtime(&runtime, &admin, "root2", UserRole::User).unwrap();
+        let after = runtime
+            .store
+            .find_user_by_username("root2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.role, UserRole::User);
+
+        // Now there's exactly one admin again — demoting root must fail.
+        let err = admin_set_role_with_runtime(&runtime, &admin, "root", UserRole::User)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::LastAdmin), "{err:?}");
+    }
+
+    // ── B) Persistent login throttle ────────────────────────────────────
+
+    #[test]
+    fn persistent_throttle_survives_runtime_drop_and_reopen() {
+        // This is the spec acceptance test for deliverable B: 5 failed
+        // logins, drop+reopen the store, the 6th attempt is still locked.
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        {
+            let runtime = open_runtime(dir.path());
+            // Sentinel real user so failures actually walk the throttle row.
+            let bob = UserRecord {
+                id: Uuid::new_v4(),
+                username: "bob".to_string(),
+                password_hash: password::hash_password("the-real-password-321").unwrap(),
+                totp_secret_encrypted: None,
+                totp_enrollment_pending: false,
+                recovery_code_hashes: Vec::new(),
+                role: UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            };
+            runtime.store.create_user(&bob).unwrap();
+
+            for _ in 0..crate::user_auth::store::THROTTLE_FAILURE_THRESHOLD {
+                record_failed_login(&runtime, "bob", now).unwrap();
+            }
+            let row = runtime.store.get_login_throttle("bob").unwrap();
+            assert!(row.is_locked(now), "must lock at threshold");
+        }
+        // Process restart simulation: drop the store, reopen the same dir.
+        let runtime = open_runtime(dir.path());
+        let row = runtime.store.get_login_throttle("bob").unwrap();
+        assert!(
+            row.is_locked(now),
+            "persistent lock must survive store reopen"
+        );
+    }
+
+    // ── C) Session revocation ───────────────────────────────────────────
+
+    #[test]
+    fn admin_revoke_all_wipes_every_session() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+
+        let admin = fixture_user("root", UserRole::Admin);
+        let bob = fixture_user("bob", UserRole::User);
+        runtime.store.create_user(&admin).unwrap();
+        runtime.store.create_user(&bob).unwrap();
+
+        let now = Utc::now();
+        let (token_a, sess_a) = session_mod::issue(bob.id, now);
+        let (token_b, sess_b) = session_mod::issue(bob.id, now);
+        runtime.store.put_session(&sess_a).unwrap();
+        runtime.store.put_session(&sess_b).unwrap();
+
+        // Admin yanks every bob session.
+        let removed = runtime.store.delete_all_sessions_for_user(&bob.id).unwrap();
+        assert_eq!(removed, 2);
+        // Both tokens are now dead.
+        assert!(runtime
+            .store
+            .validate_and_refresh(&token_a, now)
+            .is_err());
+        assert!(runtime
+            .store
+            .validate_and_refresh(&token_b, now)
+            .is_err());
+    }
+
+    #[test]
+    fn revoke_mine_keeps_caller_token_only() {
+        let dir = tempdir().unwrap();
+        let runtime = open_runtime(dir.path());
+
+        let bob = fixture_user("bob", UserRole::User);
+        runtime.store.create_user(&bob).unwrap();
+
+        let now = Utc::now();
+        // token_a is the active call's bearer; token_b is the other device.
+        let (token_a, sess_a) = session_mod::issue(bob.id, now);
+        let (token_b, sess_b) = session_mod::issue(bob.id, now);
+        runtime.store.put_session(&sess_a).unwrap();
+        runtime.store.put_session(&sess_b).unwrap();
+
+        let keep_hash = session_mod::hash_token(&token_a.0).unwrap();
+        let removed = runtime
+            .store
+            .delete_other_sessions_for_user(&bob.id, &keep_hash)
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        // token_a still resolves.
+        let still = runtime.store.validate_and_refresh(&token_a, now).unwrap();
+        assert_eq!(still.id, bob.id);
+        // token_b is gone.
+        assert!(runtime
+            .store
+            .validate_and_refresh(&token_b, now)
+            .is_err());
     }
 }

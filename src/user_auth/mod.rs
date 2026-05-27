@@ -166,6 +166,11 @@ pub enum AuthError {
     WeakPassword(String),
     /// Per-username login throttle tripped.
     TooManyAttempts,
+    /// Admin operation references an unknown username.
+    UserNotFound,
+    /// Demote was asked to remove the last remaining Admin — refused to
+    /// avoid locking the deployment out of every admin-only endpoint.
+    LastAdmin,
     /// Feature flag is off — request hit a user-auth route despite the
     /// router 404-ing the surface; only reachable in tests.
     Disabled,
@@ -195,6 +200,8 @@ impl AuthError {
             Self::UsernameTaken => "USERNAME_TAKEN",
             Self::WeakPassword(_) => "WEAK_PASSWORD",
             Self::TooManyAttempts => "TOO_MANY_ATTEMPTS",
+            Self::UserNotFound => "USER_NOT_FOUND",
+            Self::LastAdmin => "LAST_ADMIN",
             Self::Disabled => "USER_AUTH_DISABLED",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
@@ -213,6 +220,8 @@ impl AuthError {
             Self::UsernameTaken => StatusCode::CONFLICT,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::TooManyAttempts => StatusCode::TOO_MANY_REQUESTS,
+            Self::UserNotFound => StatusCode::NOT_FOUND,
+            Self::LastAdmin => StatusCode::CONFLICT,
             Self::Disabled => StatusCode::NOT_FOUND,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -236,6 +245,10 @@ impl AuthError {
             Self::UsernameTaken => "Username is already registered".to_string(),
             Self::WeakPassword(reason) => format!("Password rejected: {reason}"),
             Self::TooManyAttempts => "Too many login attempts; try again later".to_string(),
+            Self::UserNotFound => "No user matches the supplied username".to_string(),
+            Self::LastAdmin => {
+                "Refusing to demote the last remaining administrator".to_string()
+            }
             Self::Disabled => "User auth is disabled on this server".to_string(),
             Self::Internal(detail) => {
                 tracing::error!(detail = %detail, "user_auth internal error");
