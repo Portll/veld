@@ -114,3 +114,6 @@ veld-market.csv
 benchmarks/locomo_test2.json
 seps/mcp-sep-mif.md
 plans/
+
+# Veld agent-session marker files (written by SessionStart hook, see hooks/README.md)
+.veld-agent-session.*

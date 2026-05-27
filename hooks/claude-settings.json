@@ -232,6 +232,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run $VELD_HOOKS_DIR/memory-hook.ts SessionEnd",
+            "timeout": 5000
+          }
+        ]
+      }
     ]
   }
 }
