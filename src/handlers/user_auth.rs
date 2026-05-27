@@ -487,10 +487,21 @@ pub async fn require_user_session(
         Err(e) => return e.into_response(),
     };
 
+    // SEC: also insert Extension<AuthenticatedUser> so the existing
+    // resolve_request_user_id machinery applies to session-token
+    // requests. Without this a session-token caller that passes
+    // ?user_id=X bypasses tenant isolation entirely — every handler
+    // that checks AuthenticatedUser would see None and fall through
+    // the "no binding" path. The user UUID is the tenant identifier
+    // in this design, mirroring how the API-key path resolves tenants.
+    let authenticated = crate::auth::AuthenticatedUser {
+        user_id: user.id.to_string(),
+    };
     req.extensions_mut()
         .insert(crate::user_auth::SessionUser(user));
     req.extensions_mut()
         .insert(crate::user_auth::SessionTokenExt(token.0));
+    req.extensions_mut().insert(authenticated);
 
     next.run(req).await
 }
