@@ -806,6 +806,10 @@ impl MiniLMEmbedder {
 }
 
 impl Embedder for MiniLMEmbedder {
+    fn model_id(&self) -> &str {
+        "minilm-l6-v2"
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         if text.is_empty() {
             return Ok(vec![0.0; self.dimension]);
