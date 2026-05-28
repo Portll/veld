@@ -169,6 +169,17 @@ impl JournaledWriter {
                 );
                 return Err(JournalError::Payload(e));
             }
+            Err(e @ (PayloadError::UnknownSchemaVersion { .. } | PayloadError::Migration(_))) => {
+                // Decode-side variants — shouldn't fire on the append/encode
+                // path. If they do, it's a programming error (someone wired
+                // a decode through the append surface). Surface loudly.
+                tracing::error!(
+                    error = %e,
+                    "journal record_and_apply failed: decode-side payload error on append path \
+                     (likely a programming error — append shouldn't decode)"
+                );
+                return Err(JournalError::Payload(e));
+            }
         };
         tracing::Span::current().record("lsn", lsn.0);
         if let Err(e) = self.log.sync() {
