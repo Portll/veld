@@ -62,6 +62,11 @@ use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::memory::facets::AgentSession;
+use crate::memory::types::{
+    CodeContext, ContextId, ConversationContext, DocumentContext, EmotionalContext,
+    EnvironmentContext, EpisodeContext, ProjectContext, RichContext, SemanticContext,
+    SourceContext, TemporalContext, UserContext,
+};
 
 /// Whitelist of accepted chat-brand identifiers.
 ///
@@ -331,6 +336,49 @@ fn run_git_with_timeout(args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(result.stdout).ok()
+}
+
+// =============================================================================
+// RichContext factory
+// =============================================================================
+
+/// Build a [`RichContext`] populated with the detected [`AgentSession`] and
+/// neutral defaults everywhere else.
+///
+/// This is the canonical helper for writer construction sites that have no
+/// other contextual signal to carry (a plain `remember` call with no
+/// emotional/source/episode hints, the upsert path, the ingest pipeline, …).
+/// It guarantees every stored memory carries a session facet, which is the
+/// whole point of the writer-side wiring.
+///
+/// Cheap: the heavy work (git probes, sysinfo, env reads) lives behind the
+/// per-process cache in [`detect_session`].
+pub fn rich_context_with_session() -> RichContext {
+    let now = Utc::now();
+    RichContext {
+        id: ContextId(uuid::Uuid::new_v4()),
+        conversation: ConversationContext::default(),
+        user: UserContext::default(),
+        project: ProjectContext::default(),
+        temporal: TemporalContext::default(),
+        semantic: SemanticContext::default(),
+        code: CodeContext::default(),
+        document: DocumentContext::default(),
+        environment: EnvironmentContext::default(),
+        emotional: EmotionalContext::default(),
+        source: SourceContext::default(),
+        episode: EpisodeContext::default(),
+        place: Default::default(),
+        who: Default::default(),
+        why: Default::default(),
+        binding: Default::default(),
+        session: detect_session(),
+        parent: None,
+        embeddings: None,
+        decay_rate: 1.0,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 // =============================================================================
