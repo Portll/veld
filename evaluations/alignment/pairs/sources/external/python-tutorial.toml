@@ -1,0 +1,8 @@
+domain = "programming"
+kind = "filesystem"
+path = "../_external/cpython/Doc"
+extensions = ["rst"]
+license = "PSF-2.0"
+source = "python-cpython-docs"
+min_chunk = 256
+max_chunk = 2048
