@@ -1,0 +1,8 @@
+domain = "project_management"
+kind = "filesystem"
+path = "evaluations/alignment/pairs/_external/rust-rfcs/text"
+extensions = ["md"]
+license = "Apache-2.0 OR MIT"
+source = "rust-lang-rfcs"
+min_chunk = 256
+max_chunk = 2048

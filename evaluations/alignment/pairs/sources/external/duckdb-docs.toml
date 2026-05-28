@@ -1,0 +1,8 @@
+domain = "database"
+kind = "filesystem"
+path = "evaluations/alignment/pairs/_external/duckdb-web/docs"
+extensions = ["md"]
+license = "MIT"
+source = "duckdb-docs"
+min_chunk = 256
+max_chunk = 2048
