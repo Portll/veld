@@ -790,8 +790,16 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Combines BM25 + Vector + RRF + Cross-encoder + Cognitive signals.
 /// Includes adaptive weight learning from retrieval feedback (P2.3).
+///
+/// The BM25 inverted index is held as a shared `Arc<BM25Index>` so the
+/// retrieval-side reader can be wired to the same handle the
+/// [`crate::memory::Bm25Projection`] writes through. In server mode the
+/// `Arc` is injected via [`HybridSearchEngine::with_bm25_index`]; in
+/// standalone / test usage [`HybridSearchEngine::new`] opens the index on
+/// disk and wraps it in `Arc` itself. Either way, every read goes through
+/// the same handle that the journaled writer's projection commits to.
 pub struct HybridSearchEngine {
-    bm25_index: BM25Index,
+    bm25_index: Arc<BM25Index>,
     config: HybridSearchConfig,
     reranker: Option<CrossEncoderReranker>,
     /// Learned weights from retrieval feedback (EMA-adapted)
@@ -801,14 +809,38 @@ pub struct HybridSearchEngine {
 }
 
 impl HybridSearchEngine {
-    /// Create hybrid search engine
+    /// Create hybrid search engine that opens its own BM25 index at
+    /// `bm25_path`.
+    ///
+    /// Used in standalone / test code paths where there is no projection
+    /// driving the index from an intent log. Server code should prefer
+    /// [`HybridSearchEngine::with_bm25_index`] so the engine shares the
+    /// `Arc<BM25Index>` owned by the projection — that's the only way
+    /// reads converge with writes without a reader reload race.
     pub fn new(
         bm25_path: &Path,
         embedder: Arc<dyn Embedder>,
         config: HybridSearchConfig,
     ) -> Result<Self> {
-        let bm25_index = BM25Index::new(bm25_path)?;
+        let bm25_index = Arc::new(BM25Index::new(bm25_path)?);
+        Ok(Self::with_bm25_index(bm25_index, embedder, config))
+    }
 
+    /// Create hybrid search engine around a pre-opened, shared
+    /// `Arc<BM25Index>`.
+    ///
+    /// This is the server-side seam: the `MultiUserMemoryManager` owns
+    /// one `Arc<BM25Index>` per tenant (created lazily and cached). The
+    /// `Bm25Projection` writes through that handle from the intent log,
+    /// committing + reloading on its `COMMIT_EVERY` cadence. Passing the
+    /// same handle here means a search that fires immediately after a
+    /// journaled write sees the committed segments without a separate
+    /// reload step on the read side.
+    pub fn with_bm25_index(
+        bm25_index: Arc<BM25Index>,
+        embedder: Arc<dyn Embedder>,
+        config: HybridSearchConfig,
+    ) -> Self {
         let reranker = if config.use_reranking {
             Some(CrossEncoderReranker::new(embedder))
         } else {
@@ -817,12 +849,23 @@ impl HybridSearchEngine {
 
         let learned_weights = RwLock::new(LearnedWeights::from_defaults(&config));
 
-        Ok(Self {
+        Self {
             bm25_index,
             config,
             reranker,
             learned_weights,
-        })
+        }
+    }
+
+    /// Return the shared `Arc<BM25Index>` handle. Lets the host (e.g. the
+    /// `MultiUserMemoryManager`) keep a second pointer alive for the
+    /// projection without re-opening tantivy. Production wiring injects
+    /// the handle the other way (manager → engine via
+    /// [`HybridSearchEngine::with_bm25_index`]); this accessor exists for
+    /// tests and admin tooling that needs to bridge in the reverse
+    /// direction.
+    pub fn bm25_index_arc(&self) -> Arc<BM25Index> {
+        self.bm25_index.clone()
     }
 
     /// Index a memory for BM25 search
@@ -1246,55 +1289,6 @@ impl HybridSearchEngine {
     /// Get BM25 document count
     pub fn bm25_doc_count(&self) -> usize {
         self.bm25_index.len()
-    }
-
-    /// Check if BM25 index is empty (needs backfill)
-    pub fn needs_backfill(&self) -> bool {
-        self.bm25_index.is_empty()
-    }
-
-    /// Backfill BM25 index from existing memories
-    ///
-    /// Call this on startup if the BM25 index is empty but memories exist.
-    /// This indexes all memories into BM25 for hybrid search.
-    ///
-    /// # Arguments
-    /// * `memories` - Iterator of (memory_id, content, tags, entities)
-    ///
-    /// # Returns
-    /// Number of memories indexed
-    pub fn backfill<I>(&self, memories: I) -> Result<usize>
-    where
-        I: Iterator<Item = (MemoryId, String, Vec<String>, Vec<String>)>,
-    {
-        let mut count = 0;
-        let mut batch_count = 0;
-        const BATCH_SIZE: usize = 100;
-
-        for (memory_id, content, tags, entities) in memories {
-            self.bm25_index
-                .upsert(&memory_id, &content, &tags, &entities)?;
-            count += 1;
-            batch_count += 1;
-
-            // Commit in batches to avoid holding locks too long
-            if batch_count >= BATCH_SIZE {
-                self.bm25_index.commit()?;
-                batch_count = 0;
-                debug!("BM25 backfill: indexed {} memories", count);
-            }
-        }
-
-        // Final commit
-        if batch_count > 0 {
-            self.bm25_index.commit()?;
-        }
-
-        // Reload reader to see new documents
-        self.bm25_index.reload()?;
-
-        info!("BM25 backfill complete: indexed {} memories", count);
-        Ok(count)
     }
 }
 
