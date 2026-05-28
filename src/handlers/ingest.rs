@@ -193,11 +193,16 @@ pub async fn ingest(
     // ── Build and store experience ──────────────────────────────────────
     let experience_type_str = format!("{:?}", experience_type);
 
+    // Stamp the ingest with the active agent / worktree / branch so the
+    // AgentSession facet is recorded for memories stored via this path.
+    let context = Some(crate::memory::session_detect::rich_context_with_session());
+
     let experience = Experience {
         content: processed_content,
         experience_type,
         entities: merged_entities.clone(),
         tags: merged_entities,
+        context,
         ner_entities,
         ..Default::default()
     };
