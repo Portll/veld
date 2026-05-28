@@ -918,7 +918,7 @@ impl MultiUserMemoryManager {
         }
     }
 
-    fn open_user_earth(&self, config: MemoryConfig) -> Result<Earth> {
+    fn open_user_earth(&self, user_id: &str, config: MemoryConfig) -> Result<Earth> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
                 let primary_store = RocksDbPrimaryMemoryStore::open(
@@ -929,7 +929,20 @@ impl MultiUserMemoryManager {
                     format!("Failed to open primary memory store at {:?}", config.storage_path)
                 })?;
 
-                Earth::with_storage(config, Arc::new(primary_store.into_inner()))
+                // Share the tenant's `Arc<BM25Index>` with the
+                // retrieval engine so reads see exactly the same tantivy
+                // segments the `Bm25Projection` commits to from the
+                // intent log. Without this the substrate would open its
+                // own `{storage_path}/bm25_index` directory and diverge
+                // from the projection until the next restart-time
+                // replay reconverged them.
+                let bm25_index = self.get_user_bm25_index(user_id)?;
+
+                Earth::with_storage_and_bm25_index(
+                    config,
+                    Arc::new(primary_store.into_inner()),
+                    bm25_index,
+                )
             }
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for MemorySystem construction yet",
@@ -1002,7 +1015,7 @@ impl MultiUserMemoryManager {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
-                match self.open_user_earth(config.clone()) {
+                match self.open_user_earth(user_id, config.clone()) {
                     Ok(earth) => {
                         if attempt > 0 {
                             info!(
@@ -1575,15 +1588,23 @@ impl MultiUserMemoryManager {
         Ok(store)
     }
 
-    /// Get or create a cached BM25 tantivy index for a user.
+    /// Get or create the per-tenant `Arc<BM25Index>`.
     ///
-    /// The on-disk path mirrors what `MemorySystem` uses for the
-    /// retrieval-side BM25 — `{base_path}/{user_id}/bm25_projection_index`
-    /// — but is held under a *separate* directory so the projection's
-    /// writer cannot race with the retrieval engine's writer (tantivy
-    /// holds an exclusive lock per directory). The two indices converge
-    /// once every projection write is replayed; in steady state they
-    /// hold the same documents.
+    /// One tantivy directory per user at
+    /// `{base_path}/{user_id}/bm25_projection_index`, shared by:
+    ///
+    /// 1. the `Bm25Projection` driven off the user's intent log (writes,
+    ///    via `JournaledWriter::record_and_apply`), and
+    /// 2. the retrieval-side `HybridSearchEngine` living inside the
+    ///    user's `Earth` (reads, via `MemorySystem::with_storage_and_bm25_index`).
+    ///
+    /// Sharing the `Arc` means tantivy's single-writer / multi-reader
+    /// constraint is respected (the projection holds the only
+    /// `IndexWriter`) and reads see fresh segments as soon as the
+    /// projection's `commit()` + `reload()` returns. The legacy
+    /// `{base_path}/{user_id}/bm25_index` directory is no longer
+    /// created by any code path; operators can delete it from old
+    /// tenants at any time.
     pub fn get_user_bm25_index(
         &self,
         user_id: &str,
@@ -1592,7 +1613,7 @@ impl MultiUserMemoryManager {
             return Ok(index.clone());
         }
         let user_path = self.base_path.join(user_id);
-        let bm25_path = user_path.join("bm25_projection_index");
+        let bm25_path = user_path.join(crate::memory::BM25_INDEX_DIR);
         std::fs::create_dir_all(&bm25_path)?;
         let index =
             std::sync::Arc::new(crate::memory::BM25Index::new(&bm25_path).with_context(

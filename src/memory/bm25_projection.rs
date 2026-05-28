@@ -662,4 +662,148 @@ mod tests {
             "expected error message to mention the bad id, got: {msg}",
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Unified-index tests: projection writes ↔ HybridSearchEngine reads
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // These guard the W5 unification invariant: a journaled write that
+    // lands in the `Bm25Projection` MUST become visible to a
+    // `HybridSearchEngine` sharing the same `Arc<BM25Index>` as soon as
+    // the projection's commit boundary returns — no separate reader
+    // reload on the engine side, no parallel on-disk directory.
+    //
+    // We instantiate `HybridSearchEngine` with reranking disabled so we
+    // do not need a real embedder; the BM25 read path is exercised via
+    // `bm25_index().search(...)` which is what `recall::semantic_retrieve`
+    // ultimately calls.
+
+    struct NoopEmbedder;
+
+    impl crate::embeddings::Embedder for NoopEmbedder {
+        fn encode(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            // Reranking is disabled in these tests, so this is never invoked.
+            // Returning a fixed zero vector keeps the implementation total
+            // without pulling in an ONNX model just to satisfy the type.
+            Ok(vec![0.0; 8])
+        }
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    fn open_engine_sharing(
+        index: Arc<crate::memory::hybrid_search::BM25Index>,
+    ) -> crate::memory::hybrid_search::HybridSearchEngine {
+        let config = crate::memory::hybrid_search::HybridSearchConfig {
+            use_reranking: false,
+            ..crate::memory::hybrid_search::HybridSearchConfig::default()
+        };
+        crate::memory::hybrid_search::HybridSearchEngine::with_bm25_index(
+            index,
+            std::sync::Arc::new(NoopEmbedder),
+            config,
+        )
+    }
+
+    /// Round-trip across the unified boundary: journal a `Remember`
+    /// through the projection, then read it back via the
+    /// retrieval-side `HybridSearchEngine` that holds the same
+    /// `Arc<BM25Index>`. Before the unification this would fail because
+    /// the engine opened a parallel index at `bm25_index/` while the
+    /// projection wrote to `bm25_projection_index/`.
+    #[test]
+    fn projection_write_is_immediately_visible_to_hybrid_search_engine() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("unified_round_trip");
+        let (index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
+
+        // Build the retrieval engine around the SAME Arc the projection holds.
+        let engine = open_engine_sharing(index.clone());
+
+        let id = Uuid::new_v4();
+        let memory = mk_memory(
+            id,
+            "SIGHUP is the canonical reload signal on POSIX systems",
+            &["linux", "signals"],
+            &["SIGHUP"],
+        );
+
+        // Write via the journaled-writer projection arm…
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&memory)).unwrap();
+        // …and force the commit + reader reload (what `COMMIT_EVERY`
+        // would have done automatically once we crossed the batch size).
+        Projection::persist_checkpoint(&mut proj).unwrap();
+
+        // The retrieval engine — pointed at the same Arc — sees it.
+        let hits = engine.bm25_index().search("SIGHUP", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "engine sharing the projection's Arc<BM25Index> must see committed writes"
+        );
+        assert_eq!(hits[0].0, MemoryId(id));
+    }
+
+    /// Idempotency at the unified boundary: applying the same
+    /// `Remember` twice (e.g. a replay that re-applies past the last
+    /// checkpoint) still leaves exactly one document, and the engine
+    /// agrees on the count.
+    #[test]
+    fn duplicate_remember_through_projection_yields_single_doc_via_engine() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("unified_idempotent");
+        let (index, _ckpt, mut proj) = open_projection(&bm25_path, &checkpoint_path);
+        let engine = open_engine_sharing(index.clone());
+
+        let id = Uuid::new_v4();
+        let memory = mk_memory(id, "exactly one body via engine", &[], &[]);
+        let payload = remember_payload(&memory);
+
+        TypedProjection::apply(&mut proj, Lsn(5), &payload).unwrap();
+        Projection::persist_checkpoint(&mut proj).unwrap();
+        TypedProjection::apply(&mut proj, Lsn(5), &payload).unwrap();
+        Projection::persist_checkpoint(&mut proj).unwrap();
+
+        assert_eq!(engine.bm25_doc_count(), 1);
+        let hits = engine
+            .bm25_index()
+            .search("exactly one body via engine", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, MemoryId(id));
+    }
+
+    /// Opening the projection-owned index at a tenant's path must NOT
+    /// create the legacy `bm25_index/` sibling directory. The unified
+    /// design uses a single tantivy directory at `bm25_projection_index/`;
+    /// any artefact at the old path would be evidence of a code path
+    /// that still goes through `HybridSearchEngine::new` with the old
+    /// directory name.
+    #[test]
+    fn legacy_bm25_index_directory_is_not_created_on_fresh_tenant() {
+        let (bm25_path, _, checkpoint_path) = tmp_paths("no_legacy_dir");
+        // `bm25_path` is `{tenant}/bm25_index` in the test helper; for
+        // the unification assertion we need the *tenant* root and to
+        // open the projection at the canonical
+        // `bm25_projection_index` subdirectory.
+        let tenant = bm25_path.parent().unwrap().to_path_buf();
+        let unified_index_dir = tenant.join(crate::memory::BM25_INDEX_DIR);
+        let legacy_index_dir = tenant.join("bm25_index");
+
+        let (_index, _ckpt, mut proj) =
+            open_projection(&unified_index_dir, &checkpoint_path);
+
+        let id = Uuid::new_v4();
+        let memory = mk_memory(id, "tenant body", &[], &[]);
+        TypedProjection::apply(&mut proj, Lsn(0), &remember_payload(&memory)).unwrap();
+        Projection::persist_checkpoint(&mut proj).unwrap();
+
+        assert!(
+            unified_index_dir.exists(),
+            "projection-owned BM25 directory must exist after a write"
+        );
+        assert!(
+            !legacy_index_dir.exists(),
+            "legacy '{}' directory must not be created — it is a sentinel for the pre-unification dual-write bug",
+            legacy_index_dir.display()
+        );
+    }
 }

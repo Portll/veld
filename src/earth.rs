@@ -11,6 +11,7 @@ use anyhow::Result;
 
 pub use crate::config::StorageBackend;
 pub use crate::graph_memory::{EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge};
+pub use crate::memory::hybrid_search::BM25Index;
 pub use crate::memory::storage::MemoryStorage;
 pub use crate::memory::{Experience, Memory, MemoryConfig, MemoryId, MemoryStats};
 pub use crate::storage::{
@@ -44,6 +45,25 @@ impl Earth {
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
         Ok(Self {
             inner: MemorySystem::with_storage(config, storage)?,
+        })
+    }
+
+    /// Create a substrate with an already-opened primary store *and* an
+    /// externally-owned `Arc<BM25Index>`.
+    ///
+    /// Used by the multi-user runtime so the substrate's
+    /// retrieval-side BM25 reader shares the same tantivy handle the
+    /// per-tenant `Bm25Projection` writes through from the intent log.
+    /// Without this seam the read side would open a second on-disk index
+    /// at a parallel path and diverge from the writer until the next
+    /// process restart triggered a replay catch-up.
+    pub fn with_storage_and_bm25_index(
+        config: MemoryConfig,
+        storage: Arc<MemoryStorage>,
+        bm25_index: Arc<BM25Index>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: MemorySystem::with_storage_and_bm25_index(config, storage, bm25_index)?,
         })
     }
 
