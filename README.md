@@ -51,6 +51,20 @@ Veld - Agentic Memory fixes this. It's persistent memory that actually learns �
 
 Veld is strongest when memory has to stay local, adaptive, and operationally simple. Mem0 is better when you want managed cloud memory workflows. Cognee is better when the main job is graph-heavy extraction. Pinecone is better when you need hosted vector infra. Zep is better when you want a hosted conversational memory service. The key distinction is that Veld is a memory runtime, not just storage or orchestration.
 
+## Documentation
+
+The full developer docs site lives at **<https://portll.github.io/veld/>**
+(built from [`docs/`](docs/) on every push to `main`). Highlights:
+
+- [Quickstart](https://portll.github.io/veld/quickstart.html) — install + first memory in 60 seconds
+- [Architecture overview](https://portll.github.io/veld/architecture/overview.html) — retrieval pipeline, storage, consolidation
+- [MCP tools reference](https://portll.github.io/veld/reference/mcp-tools.html) — all 46 tools, auto-generated
+- [HTTP API reference](https://portll.github.io/veld/reference/http-api.html) — every route, auto-generated
+- [Decisions](https://portll.github.io/veld/decisions/index.html) — architectural decision records
+- [FAQ](https://portll.github.io/veld/faq.html)
+
+For project status and roadmap, see [PROGRESS.md](PROGRESS.md).
+
 ## Get Started
 
 These install commands target the last tagged public artifacts. If you are working
@@ -220,9 +234,10 @@ veld tui
 
 <p align="center"><i>GTD task management — projects, todos, comments, and causal lineage</i></p>
 
-## 37 MCP Tools
+## 46 MCP Tools
 
-Full list of tools available to Claude, Cursor, and other MCP clients:
+Full list of tools available to Claude, Cursor, and other MCP clients (also
+documented and auto-generated in the [docs site](https://portll.github.io/veld/reference/mcp-tools.html)):
 
 <details>
 <summary>Memory</summary>
