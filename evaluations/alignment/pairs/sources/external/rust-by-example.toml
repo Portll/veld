@@ -1,6 +1,6 @@
 domain = "programming"
 kind = "filesystem"
-path = "../_external/rust-by-example/src"
+path = "evaluations/alignment/pairs/_external/rust-by-example/src"
 extensions = ["md"]
 license = "MIT-OR-Apache-2.0"
 source = "rust-by-example"

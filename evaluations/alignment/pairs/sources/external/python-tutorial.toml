@@ -1,6 +1,6 @@
 domain = "programming"
 kind = "filesystem"
-path = "../_external/cpython/Doc"
+path = "evaluations/alignment/pairs/_external/cpython/Doc"
 extensions = ["rst"]
 license = "PSF-2.0"
 source = "python-cpython-docs"
