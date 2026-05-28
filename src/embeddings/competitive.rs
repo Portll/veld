@@ -22,11 +22,22 @@
 //!   retrieval layer, not here.
 
 use anyhow::Result;
+use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::alignment::Alignment;
 use super::Embedder;
 
 type DualEmbeddingBatch = (Vec<Vec<f32>>, Option<Vec<Vec<f32>>>);
+
+/// Which face of an asymmetric embedder to invoke for an aligned encode.
+#[derive(Copy, Clone, Debug)]
+pub enum AlignedSide {
+    /// Document side — `encode()`. Used at ingest / when projecting stored content.
+    Doc,
+    /// Query side — `encode_for_query()`. Used at search time.
+    Query,
+}
 
 /// Dual-model competitive embedder.
 ///
@@ -41,6 +52,11 @@ pub struct CompetitiveEmbedder {
     secondary: Option<Arc<dyn Embedder>>,
     /// Cached secondary dimension (avoids repeated vtable calls).
     secondary_dim: Option<usize>,
+    /// Optional learned projection from secondary-space into primary-space.
+    /// Installed via [`install_alignment`] after construction (the embedder is
+    /// typically held as `Arc<CompetitiveEmbedder>` so the slot must be
+    /// interior-mutable).
+    alignment: RwLock<Option<Arc<dyn Alignment>>>,
 }
 
 impl CompetitiveEmbedder {
@@ -54,6 +70,7 @@ impl CompetitiveEmbedder {
             primary,
             secondary,
             secondary_dim,
+            alignment: RwLock::new(None),
         }
     }
 
@@ -63,6 +80,7 @@ impl CompetitiveEmbedder {
             primary,
             secondary: None,
             secondary_dim: None,
+            alignment: RwLock::new(None),
         }
     }
 
@@ -160,6 +178,95 @@ impl CompetitiveEmbedder {
     /// Get a reference to the secondary embedder, if available.
     pub fn secondary_embedder(&self) -> Option<&Arc<dyn Embedder>> {
         self.secondary.as_ref()
+    }
+
+    /// Install a learned alignment. Refuses if dimensions don't match the
+    /// currently-configured secondary, or if no secondary is configured.
+    ///
+    /// Uses `&self` (not `&mut self`) so callers holding an `Arc<CompetitiveEmbedder>`
+    /// can install at startup without unwrapping.
+    pub fn install_alignment(&self, alignment: Arc<dyn Alignment>) -> Result<()> {
+        let sec_dim = self.secondary_dim.ok_or_else(|| {
+            anyhow::anyhow!("cannot install alignment: no secondary embedder configured")
+        })?;
+        if alignment.in_dim() != sec_dim {
+            anyhow::bail!(
+                "alignment in_dim {} != secondary dim {}",
+                alignment.in_dim(),
+                sec_dim
+            );
+        }
+        if alignment.out_dim() != self.primary.dimension() {
+            anyhow::bail!(
+                "alignment out_dim {} != primary dim {}",
+                alignment.out_dim(),
+                self.primary.dimension()
+            );
+        }
+        *self.alignment.write() = Some(alignment);
+        Ok(())
+    }
+
+    /// True if an alignment is installed.
+    pub fn has_alignment(&self) -> bool {
+        self.alignment.read().is_some()
+    }
+
+    /// Snapshot the current alignment (clone of the `Arc`) without holding the lock.
+    pub fn alignment_snapshot(&self) -> Option<Arc<dyn Alignment>> {
+        self.alignment.read().clone()
+    }
+
+    /// Encode with the secondary embedder (selecting query or doc face) and
+    /// project the result into primary space via the installed alignment.
+    ///
+    /// Returns `Ok(None)` if either the secondary embedder or the alignment is
+    /// absent — callers should fall back to the existing max-score union path.
+    pub fn encode_aligned(&self, text: &str, side: AlignedSide) -> Result<Option<Vec<f32>>> {
+        let Some(secondary) = &self.secondary else {
+            return Ok(None);
+        };
+        let alignment = match self.alignment_snapshot() {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        let s = match side {
+            AlignedSide::Doc => secondary.encode(text)?,
+            AlignedSide::Query => secondary.encode_for_query(text)?,
+        };
+        Ok(Some(alignment.project(&s)?))
+    }
+
+    /// Encode `text` with the primary and additionally produce a *fused
+    /// primary-space vector* — the "regular task space" position — as a
+    /// weighted blend of the primary embedding and the projected secondary.
+    ///
+    /// `alpha` is the weight on the projected secondary; primary gets `1 - alpha`.
+    /// Returns `None` for the fused vector when the alignment or secondary is
+    /// absent. The fused result is L2-renormalized.
+    pub fn encode_fused(
+        &self,
+        text: &str,
+        alpha: f32,
+        side: AlignedSide,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+        let primary_emb = self.primary.encode(text)?;
+        let projected = self.encode_aligned(text, side)?;
+        let fused = projected.map(|q| {
+            let mut out: Vec<f32> = primary_emb
+                .iter()
+                .zip(q.iter())
+                .map(|(p, q)| (1.0 - alpha) * p + alpha * q)
+                .collect();
+            let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in &mut out {
+                    *x /= norm;
+                }
+            }
+            out
+        });
+        Ok((primary_emb, fused))
     }
 }
 

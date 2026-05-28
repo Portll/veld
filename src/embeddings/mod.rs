@@ -17,6 +17,8 @@
 //! - `VELD_ONNX_THREADS=N` - Set ONNX intra-op thread count (default: 1 on macOS ARM64, 2 elsewhere)
 
 pub mod alignment;
+pub mod alignment_procrustes;
+pub mod alignment_ridge;
 pub mod chunking;
 pub mod circuit_breaker;
 pub mod competitive;
@@ -57,11 +59,55 @@ pub use circuit_breaker::{
 // Re-export competitive embedder
 pub use competitive::CompetitiveEmbedder;
 
-// Re-export alignment scaffolding (Phase 1)
+// Re-export alignment scaffolding (Phase 1) + Procrustes (Phase 3)
 pub use alignment::{
     read_alignment_file, resolve_alignment_path, save_alignment, unix_ts_now, Alignment,
     AlignmentHeader, AlignmentPairId, IdentityAlignment,
 };
+pub use alignment_procrustes::ProcrustesAlignment;
+pub use alignment_ridge::RidgeAlignment;
+
+/// Load a primary embedder by canonical identifier.
+///
+/// Dispatch rules:
+/// - prefix `nomic` → `NomicEmbedder::new(NomicConfig::from_env())`
+/// - prefix `minilm` → `MiniLMEmbedder::new(EmbeddingConfig::default())`
+/// - `http://` / `https://` URL → `HttpEmbedder::new` with `base_url = id`
+/// - anything else → `bail!`
+pub fn load_primary_embedder(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
+    load_embedder_by_id(id)
+}
+
+/// Load a secondary embedder by canonical identifier. Same dispatch rules as
+/// [`load_primary_embedder`] — the distinction is purely informational at the
+/// caller level (which side of the alignment pair we're constructing).
+pub fn load_secondary_embedder(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
+    load_embedder_by_id(id)
+}
+
+fn load_embedder_by_id(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
+    use std::sync::Arc;
+
+    if id.starts_with("nomic") {
+        let cfg = nomic::NomicConfig::from_env();
+        let e = nomic::NomicEmbedder::new(cfg)?;
+        return Ok(Arc::new(e));
+    }
+    if id.starts_with("minilm") {
+        let cfg = minilm::EmbeddingConfig::default();
+        let e = minilm::MiniLMEmbedder::new(cfg)?;
+        return Ok(Arc::new(e));
+    }
+    if id.starts_with("http://") || id.starts_with("https://") {
+        let mut cfg = http_embedder::HttpEmbedderConfig::from_env();
+        cfg.base_url = id.to_string();
+        let e = http_embedder::HttpEmbedder::new(cfg);
+        return Ok(Arc::new(e));
+    }
+    anyhow::bail!(
+        "unknown embedder id: {id} (supported prefixes: nomic*, minilm*, http://, https://)"
+    );
+}
 
 fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
@@ -112,5 +158,15 @@ pub trait Embedder: Send + Sync {
     /// Batch encode multiple texts (default: sequential)
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|text| self.encode(text)).collect()
+    }
+
+    /// Canonical, version-pinned identifier for this embedder (e.g.
+    /// `"nomic-embed-text-v1.5"`, `"minilm-l6-v2"`). Consulted by the
+    /// alignment subsystem to construct [`AlignmentPairId`] and to refuse
+    /// loading an alignment fitted on a different pair. Default `"unknown"`
+    /// keeps the trait change non-breaking for external implementors; concrete
+    /// embedders should override.
+    fn model_id(&self) -> &str {
+        "unknown"
     }
 }

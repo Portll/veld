@@ -245,6 +245,29 @@ impl RetrievalEngine {
         // ATOMIC STARTUP: Rebuild Vamana from RocksDB (single source of truth)
         engine.rebuild_from_rocksdb()?;
 
+        // Alignment onboarding: load (or autofit, if VELD_ALIGNMENT_AUTOFIT=1)
+        // a learned projection from secondary→primary space. No-op for
+        // primary-only installs. Errors are downgraded to a warning so an
+        // unreadable alignment file doesn't take down the engine.
+        if let (Some(secondary), _) = (
+            engine.embedder.secondary_embedder(),
+            engine.embedder.has_alignment(),
+        ) {
+            let pair_id = crate::embeddings::AlignmentPairId::new(
+                engine.embedder.primary_embedder().model_id(),
+                secondary.model_id(),
+            );
+            match super::alignment_onboarding::resolve_or_fit(&pair_id) {
+                Ok(Some(alignment)) => {
+                    if let Err(e) = engine.embedder.install_alignment(alignment) {
+                        tracing::warn!("could not install alignment {:?}: {}", pair_id, e);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("alignment onboarding failed for {:?}: {}", pair_id, e),
+            }
+        }
+
         Ok(engine)
     }
 
@@ -1470,6 +1493,61 @@ impl RetrievalEngine {
         }
 
         // Tie-break by MemoryId for deterministic rank order across runs (RH-10).
+        let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
+        memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        memory_ids.truncate(limit);
+
+        Ok(memory_ids)
+    }
+
+    /// Search the *primary* Vamana index using a query text encoded with the
+    /// secondary embedder and projected through the installed alignment.
+    ///
+    /// Returns an empty vec if no alignment is installed or no secondary
+    /// embedder is configured — the existing max-score union path is the
+    /// caller's fallback.
+    ///
+    /// Mirrors `search_ids_secondary`: distance is inverted to similarity,
+    /// duplicate `MemoryId`s are kept at max similarity, ties are broken by id
+    /// for deterministic ordering.
+    pub fn search_ids_aligned(
+        &self,
+        query_text: &str,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        use crate::embeddings::competitive::AlignedSide;
+
+        let projected = match self.embedder.encode_aligned(query_text, AlignedSide::Query)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+
+        // LOCK ORDERING: primary vector_index (1) before id_mapping (2)
+        let index = self.vector_index.read();
+        let results = index
+            .search(&projected, limit * VECTOR_SEARCH_CANDIDATE_MULTIPLIER * 2)
+            .context("Aligned vector search failed")?;
+
+        let id_mapping = self.id_mapping.read();
+        let mut best_scores: std::collections::HashMap<MemoryId, f32> =
+            std::collections::HashMap::new();
+
+        for (vector_id, distance) in results {
+            // NormalizedDotProduct: similarity = -distance
+            let similarity = -distance;
+            if let Some(memory_id) = id_mapping.get_memory_id(vector_id) {
+                best_scores
+                    .entry(memory_id.clone())
+                    .and_modify(|score| {
+                        if similarity > *score {
+                            *score = similarity;
+                        }
+                    })
+                    .or_insert(similarity);
+            }
+        }
+
+        // Tie-break by MemoryId for deterministic rank order (RH-10).
         let mut memory_ids: Vec<(MemoryId, f32)> = best_scores.into_iter().collect();
         memory_ids.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         memory_ids.truncate(limit);

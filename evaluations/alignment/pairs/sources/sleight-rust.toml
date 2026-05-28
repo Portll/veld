@@ -1,0 +1,8 @@
+domain = "programming"
+kind = "filesystem"
+path = "../../sleight/sleight/src"
+extensions = ["rs"]
+license = "BUSL-1.1"
+source = "sleight-repo-rust"
+min_chunk = 256
+max_chunk = 2048
