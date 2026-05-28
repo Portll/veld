@@ -20,11 +20,21 @@ if (-not (Test-Path $externalDir)) {
 
 # (folder, repo URL, subtree path to sparse-checkout)
 $sources = @(
-    @{ Folder = "mdn-content";       Repo = "https://github.com/mdn/content.git";                Sub = "files/en-us/web/javascript" },
-    @{ Folder = "cpython";           Repo = "https://github.com/python/cpython.git";             Sub = "Doc" },
-    @{ Folder = "rust-by-example";   Repo = "https://github.com/rust-lang/rust-by-example.git";  Sub = "src" },
-    @{ Folder = "react.dev";         Repo = "https://github.com/reactjs/react.dev.git";          Sub = "src/content" },
-    @{ Folder = "TypeScript-Website"; Repo = "https://github.com/microsoft/TypeScript-Website.git"; Sub = "packages/documentation" }
+    # Original five: programming + web_development + docs
+    @{ Folder = "mdn-content";        Repo = "https://github.com/mdn/content.git";                Sub = "files/en-us/web/javascript" },
+    @{ Folder = "cpython";            Repo = "https://github.com/python/cpython.git";             Sub = "Doc" },
+    @{ Folder = "rust-by-example";    Repo = "https://github.com/rust-lang/rust-by-example.git";  Sub = "src" },
+    @{ Folder = "react.dev";          Repo = "https://github.com/reactjs/react.dev.git";          Sub = "src/content" },
+    @{ Folder = "TypeScript-Website"; Repo = "https://github.com/microsoft/TypeScript-Website.git"; Sub = "packages/documentation" },
+
+    # Seven new: project_management / database / analytics / devops / security / testing / ai_loop
+    @{ Folder = "rust-rfcs";              Repo = "https://github.com/rust-lang/rfcs.git";              Sub = "text" },
+    @{ Folder = "duckdb-web";             Repo = "https://github.com/duckdb/duckdb-web.git";           Sub = "docs" },
+    @{ Folder = "spark";                  Repo = "https://github.com/apache/spark.git";                Sub = "docs" },
+    @{ Folder = "kubernetes-website";     Repo = "https://github.com/kubernetes/website.git";          Sub = "content/en/docs/concepts" },
+    @{ Folder = "OWASP-CheatSheetSeries"; Repo = "https://github.com/OWASP/CheatSheetSeries.git";      Sub = "cheatsheets" },
+    @{ Folder = "pytest";                 Repo = "https://github.com/pytest-dev/pytest.git";           Sub = "doc/en" },
+    @{ Folder = "langchain";              Repo = "https://github.com/langchain-ai/langchain.git";      Sub = "docs/docs" }
 )
 
 foreach ($src in $sources) {

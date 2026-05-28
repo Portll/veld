@@ -1,0 +1,8 @@
+domain = "devops"
+kind = "filesystem"
+path = "evaluations/alignment/pairs/_external/kubernetes-website/content/en/docs/concepts"
+extensions = ["md"]
+license = "CC-BY-4.0"
+source = "kubernetes-docs"
+min_chunk = 256
+max_chunk = 2048
