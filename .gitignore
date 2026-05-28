@@ -121,5 +121,5 @@ plans/
 # Alignment training corpus (data, not source)
 evaluations/alignment/pairs/_external/
 evaluations/alignment/pairs/pairs.jsonl
-evaluations/alignment/pairs/pairs.vec
+evaluations/alignment/pairs/*.vec
 evaluations/alignment/fitted/
