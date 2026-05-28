@@ -1,0 +1,58 @@
+# Docs generator workspace.
+#
+# Standalone workspace (declared with `[workspace]` to break the upward walk
+# into veld's root workspace at `../../Cargo.toml`). Generators read veld's
+# source files and emit markdown into `../src/reference/`.
+#
+# Run:
+#   cd docs/generators && cargo run --bin gen-http-api
+#   cd docs/generators && cargo run --bin gen-mcp-tools
+#   cd docs && bash regenerate.sh        # runs all cheap generators
+#
+# Pre-commit hook (see `../regenerate.sh`) runs the cheap ones; CI runs all.
+
+[workspace]
+
+[package]
+name = "veld-docs-generators"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+syn = { version = "2", features = ["full", "visit"] }
+walkdir = "2"
+
+[[bin]]
+name = "gen-http-api"
+path = "src/bin/gen-http-api.rs"
+
+[[bin]]
+name = "gen-mcp-tools"
+path = "src/bin/gen-mcp-tools.rs"
+
+[[bin]]
+name = "gen-config-ref"
+path = "src/bin/gen-config-ref.rs"
+
+[[bin]]
+name = "gen-errors"
+path = "src/bin/gen-errors.rs"
+
+[[bin]]
+name = "gen-metrics"
+path = "src/bin/gen-metrics.rs"
+
+[[bin]]
+name = "gen-module-index"
+path = "src/bin/gen-module-index.rs"
+
+[[bin]]
+name = "lint-decisions"
+path = "src/bin/lint-decisions.rs"
+
+[[bin]]
+name = "gen-claude-sections"
+path = "src/bin/gen-claude-sections.rs"
