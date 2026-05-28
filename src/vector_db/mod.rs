@@ -41,12 +41,14 @@ pub mod pq;
 pub mod spann;
 pub mod vamana;
 pub mod vamana_persist;
+pub mod vamana_projection;
 
 // Re-export key types for convenient access
 pub use hnsw::{HnswConfig, HnswIndex};
 pub use pq::{CompressedVectorStore, PQConfig, ProductQuantizer};
 pub use spann::{SpannConfig, SpannIndex};
 pub use vamana::{DistanceMetric, VamanaConfig, VamanaIndex, REBUILD_THRESHOLD};
+pub use vamana_projection::{VamanaProjection, VamanaProjectionError};
 
 use anyhow::Result;
 use std::path::Path;

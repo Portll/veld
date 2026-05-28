@@ -1626,7 +1626,7 @@ impl MultiUserMemoryManager {
         ));
 
         let slow_store = self.get_user_slow_store(user_id)?;
-        let mut projection = crate::memory::slow_store::SqliteProjection::new(
+        let mut sqlite_projection = crate::memory::slow_store::SqliteProjection::new(
             slow_store.clone(),
             checkpoint_store.clone(),
         );
@@ -1634,13 +1634,68 @@ impl MultiUserMemoryManager {
         // Catch the SQLite projection up to the head of the log before
         // it goes live. The `Some(100)` flushes the checkpoint every 100
         // applied records so a crash during a long replay survives.
-        let applied = crate::intent_log::replay(&log, &mut projection, Some(100))
-            .with_context(|| format!("replay intent log for user {user_id}"))?;
-        if applied > 0 {
+        let applied_sqlite =
+            crate::intent_log::replay(&log, &mut sqlite_projection, Some(100))
+                .with_context(|| {
+                    format!("replay intent log for user {user_id} (sqlite projection)")
+                })?;
+        if applied_sqlite > 0 {
             tracing::info!(
                 user_id = %user_id,
-                applied,
+                applied = applied_sqlite,
                 "replayed intent log records into SQLite projection on first writer open",
+            );
+        }
+
+        // Second projection: Vamana. Each user gets a dedicated vector
+        // index that is *derived from the log*. The index lives under
+        // `{base}/{user_id}/vamana_projection/` so a wipe-and-replay
+        // operator workflow can blow away the directory without
+        // touching the SQLite slow store or RocksDB.
+        //
+        // We use the *lazy* variant: the index is materialised on the
+        // first embedded `Memory` we see during replay or live writes.
+        // This avoids coupling the projection's open to the embedder
+        // cache (the embedder is constructed lazily per-tenant via
+        // `get_user_earth`, which can be a different lifecycle than
+        // `get_user_journaled_writer`). The first embedded memory tells
+        // us the dim — that's the same dim every subsequent memory in
+        // the log must match (the embedder is stable for a tenant's
+        // corpus), so this is correct by construction.
+        let vamana_index_dir = user_path.join("vamana_projection");
+        std::fs::create_dir_all(&vamana_index_dir).with_context(|| {
+            format!(
+                "create vamana projection dir for user {user_id}: {:?}",
+                vamana_index_dir
+            )
+        })?;
+        let bootstrap = crate::vector_db::vamana_projection::VamanaProjectionBootstrap {
+            storage_path: Some(vamana_index_dir),
+            config_template: crate::vector_db::VamanaConfig {
+                // dimension is rewritten on first embedded apply.
+                dimension: 0,
+                max_degree: 32,
+                search_list_size: 100,
+                alpha: 1.2,
+                use_mmap: true,
+                distance_metric: crate::vector_db::DistanceMetric::default(),
+            },
+        };
+        let mut vamana_projection = crate::vector_db::VamanaProjection::lazy(
+            bootstrap,
+            checkpoint_store.clone(),
+        );
+
+        let applied_vamana =
+            crate::intent_log::replay(&log, &mut vamana_projection, Some(100))
+                .with_context(|| {
+                    format!("replay intent log for user {user_id} (vamana projection)")
+                })?;
+        if applied_vamana > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                applied = applied_vamana,
+                "replayed intent log records into Vamana projection on first writer open",
             );
         }
 
@@ -1648,7 +1703,8 @@ impl MultiUserMemoryManager {
         // continue against the same file. Replay above used a read-only
         // borrow; the same handle is fine for the writer's appends.
         let mut writer = crate::intent_log::JournaledWriter::new(log);
-        writer.add_projection(Box::new(projection));
+        writer.add_projection(Box::new(sqlite_projection));
+        writer.add_projection(Box::new(vamana_projection));
 
         let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
         self.journaled_writers
