@@ -1686,56 +1686,82 @@ impl MultiUserMemoryManager {
             );
         }
 
-        // Second projection: Vamana. Each user gets a dedicated vector
-        // index that is *derived from the log*. The index lives under
-        // `{base}/{user_id}/vamana_projection/` so a wipe-and-replay
-        // operator workflow can blow away the directory without
-        // touching the SQLite slow store or RocksDB.
+        // Second family of projections: Vamana, one per embedding kind.
+        // Each user gets up to five dedicated vector indices that are
+        // *derived from the log*. Each kind lives under
+        // `{base}/{user_id}/vamana_projection/{kind}/` so a
+        // wipe-and-replay operator workflow can blow away one kind's
+        // directory (e.g. re-embed all images) without touching the
+        // others, the SQLite slow store, or RocksDB.
         //
-        // We use the *lazy* variant: the index is materialised on the
-        // first embedded `Memory` we see during replay or live writes.
-        // This avoids coupling the projection's open to the embedder
-        // cache (the embedder is constructed lazily per-tenant via
-        // `get_user_earth`, which can be a different lifecycle than
-        // `get_user_journaled_writer`). The first embedded memory tells
-        // us the dim — that's the same dim every subsequent memory in
-        // the log must match (the embedder is stable for a tenant's
-        // corpus), so this is correct by construction.
-        let vamana_index_dir = user_path.join("vamana_projection");
-        std::fs::create_dir_all(&vamana_index_dir).with_context(|| {
+        // We use the *lazy* variant: each kind's index is materialised
+        // on the first memory whose embedding-for-that-kind is present
+        // (during replay or live writes). This avoids coupling the
+        // projection's open to the embedder cache (the embedder is
+        // constructed lazily per-tenant via `get_user_earth`, which can
+        // be a different lifecycle than `get_user_journaled_writer`).
+        // The first embedded memory tells us the dim — that's the same
+        // dim every subsequent memory of the same kind must match (each
+        // embedder is stable for a tenant's corpus), so this is correct
+        // by construction.
+        //
+        // All five kinds are registered eagerly. The cost of an empty,
+        // un-materialised projection is one in-memory `HashMap` and one
+        // checkpoint-store row — negligible. Kinds that never see a
+        // matching field stay pending and never allocate a Vamana
+        // graph, so there's no I/O penalty for tenants that only ever
+        // store text memories.
+        let vamana_root = user_path.join("vamana_projection");
+        std::fs::create_dir_all(&vamana_root).with_context(|| {
             format!(
-                "create vamana projection dir for user {user_id}: {:?}",
-                vamana_index_dir
+                "create vamana projection root for user {user_id}: {:?}",
+                vamana_root
             )
         })?;
-        let bootstrap = crate::vector_db::vamana_projection::VamanaProjectionBootstrap {
-            storage_path: Some(vamana_index_dir),
-            config_template: crate::vector_db::VamanaConfig {
-                // dimension is rewritten on first embedded apply.
-                dimension: 0,
-                max_degree: 32,
-                search_list_size: 100,
-                alpha: 1.2,
-                use_mmap: true,
-                distance_metric: crate::vector_db::DistanceMetric::default(),
-            },
-        };
-        let mut vamana_projection = crate::vector_db::VamanaProjection::lazy(
-            bootstrap,
-            checkpoint_store.clone(),
-        );
-
-        let applied_vamana =
-            crate::intent_log::replay(&log, &mut vamana_projection, Some(100))
-                .with_context(|| {
-                    format!("replay intent log for user {user_id} (vamana projection)")
-                })?;
-        if applied_vamana > 0 {
-            tracing::info!(
-                user_id = %user_id,
-                applied = applied_vamana,
-                "replayed intent log records into Vamana projection on first writer open",
+        let mut vamana_projections: Vec<crate::vector_db::VamanaProjection> = Vec::new();
+        for &kind in crate::vector_db::VamanaEmbeddingKind::all() {
+            let kind_dir = vamana_root.join(kind.dir_component());
+            std::fs::create_dir_all(&kind_dir).with_context(|| {
+                format!(
+                    "create vamana projection dir for user {user_id} kind {}: {:?}",
+                    kind.projection_name(),
+                    kind_dir
+                )
+            })?;
+            let bootstrap = crate::vector_db::VamanaProjectionBootstrap {
+                storage_path: Some(kind_dir),
+                config_template: crate::vector_db::VamanaConfig {
+                    // dimension is rewritten on first embedded apply
+                    // for this kind.
+                    dimension: 0,
+                    max_degree: 32,
+                    search_list_size: 100,
+                    alpha: 1.2,
+                    use_mmap: true,
+                    distance_metric: crate::vector_db::DistanceMetric::default(),
+                },
+            };
+            let mut proj = crate::vector_db::VamanaProjection::lazy(
+                kind,
+                bootstrap,
+                checkpoint_store.clone(),
             );
+            let applied = crate::intent_log::replay(&log, &mut proj, Some(100))
+                .with_context(|| {
+                    format!(
+                        "replay intent log for user {user_id} ({} projection)",
+                        kind.projection_name()
+                    )
+                })?;
+            if applied > 0 {
+                tracing::info!(
+                    user_id = %user_id,
+                    projection = kind.projection_name(),
+                    applied,
+                    "replayed intent log records into Vamana projection on first writer open",
+                );
+            }
+            vamana_projections.push(proj);
         }
 
         // Third projection: BM25 inverted index. Same independent-checkpoint
@@ -1766,7 +1792,9 @@ impl MultiUserMemoryManager {
         // borrow; the same handle is fine for the writer's appends.
         let mut writer = crate::intent_log::JournaledWriter::new(log);
         writer.add_projection(Box::new(sqlite_projection));
-        writer.add_projection(Box::new(vamana_projection));
+        for vp in vamana_projections {
+            writer.add_projection(Box::new(vp));
+        }
         writer.add_projection(Box::new(bm25_projection));
 
         let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));

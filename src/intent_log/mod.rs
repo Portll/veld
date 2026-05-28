@@ -92,7 +92,13 @@ pub use projection::{replay, Projection, ReplayError};
 /// LSNs are monotonically increasing within one log file. They are *not*
 /// byte offsets; they are abstract counters so that a future segment-rolling
 /// implementation can keep LSNs continuous across files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Serde-derived so projections that snapshot their derived state to the
+/// [`checkpoint_store::CheckpointStore`] side-data slot can include an
+/// `Lsn` field in their snapshot type without a manual impl per call
+/// site. Wire format is the inner `u64` (serde's transparent treatment
+/// of a single-field tuple struct).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
