@@ -1,0 +1,8 @@
+domain = "programming"
+kind = "filesystem"
+path = "../_external/rust-by-example/src"
+extensions = ["md"]
+license = "MIT-OR-Apache-2.0"
+source = "rust-by-example"
+min_chunk = 256
+max_chunk = 2048
