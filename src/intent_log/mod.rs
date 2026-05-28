@@ -512,7 +512,7 @@ impl IntentLog {
         // `set_len` while another read handle is open against the same
         // file, even though POSIX is happy with it.
         let (last_good_offset, _highest_seen) = {
-            let mut iter = IntentLogIter::open(&self.path)?;
+            let mut iter = IntentLogIter::open_for_scan(&self.path)?;
             let mut last_good_offset = 0u64;
             let mut found = false;
             let mut highest_seen: Option<Lsn> = None;
@@ -607,7 +607,7 @@ impl IntentLogIter {
     /// Auto-detects header presence: a versioned log skips past the
     /// 36-byte header; a legacy log starts at offset 0.
     pub fn open_for_scan(path: &Path) -> Result<Self, IntentLogError> {
-        let mode = LogMode::probe(path)?;
+        let mode = probe_mode(path)?;
         Self::open(path, mode.frame_region_start())
     }
 
