@@ -1,0 +1,84 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'src/**'
+      - 'mcp-server/**'
+      - 'CLAUDE.md'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'src/**'
+      - 'mcp-server/**'
+      - 'CLAUDE.md'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # for changelog generation later
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            docs/generators/target
+          key: docs-${{ runner.os }}-${{ hashFiles('docs/generators/Cargo.lock') }}
+
+      - name: Install mdBook and preprocessors
+        run: |
+          cargo install --locked mdbook --version "^0.4"
+          cargo install --locked mdbook-mermaid mdbook-toc mdbook-linkcheck mdbook-admonish
+
+      - name: Run all generators
+        working-directory: docs
+        run: bash regenerate.sh
+
+      - name: Verify no generator drift
+        run: |
+          if ! git diff --exit-code docs/src/; then
+            echo
+            echo "ERROR: Generated docs are out of sync with source."
+            echo "Run 'cd docs && bash regenerate.sh' locally and commit the result."
+            exit 1
+          fi
+
+      - name: Build mdBook
+        working-directory: docs
+        run: mdbook build
+
+      - name: Build rustdoc
+        run: cargo doc --no-deps --workspace
+
+      - name: Stitch rustdoc into the book
+        run: |
+          mkdir -p docs/book/api
+          cp -r target/doc/* docs/book/api/
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: docs/book
+          force_orphan: true
+
+      - name: Upload book artifact (PRs)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-book
+          path: docs/book
+          retention-days: 7
