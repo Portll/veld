@@ -146,6 +146,10 @@ impl HttpEmbedder {
 }
 
 impl Embedder for HttpEmbedder {
+    fn model_id(&self) -> &str {
+        &self.config.model
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         let embedding = self.encode_http(text)?;
         // Cache the dimension on first successful call

@@ -7,6 +7,7 @@
 //! - Multi-modal retrieval (similarity, temporal, causal)
 //! - Automatic memory consolidation
 
+pub mod alignment_onboarding;
 pub mod compression;
 pub mod context;
 pub mod context_blocks;
