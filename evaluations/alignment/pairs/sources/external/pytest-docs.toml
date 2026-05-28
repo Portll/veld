@@ -1,0 +1,8 @@
+domain = "testing"
+kind = "filesystem"
+path = "evaluations/alignment/pairs/_external/pytest/doc/en"
+extensions = ["rst"]
+license = "MIT"
+source = "pytest-docs"
+min_chunk = 256
+max_chunk = 2048

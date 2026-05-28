@@ -17,11 +17,20 @@ mkdir -p "${external_dir}"
 
 # folder | repo url | subtree
 sources=(
+    # Original five: programming + web_development + docs
     "mdn-content|https://github.com/mdn/content.git|files/en-us/web/javascript"
     "cpython|https://github.com/python/cpython.git|Doc"
     "rust-by-example|https://github.com/rust-lang/rust-by-example.git|src"
     "react.dev|https://github.com/reactjs/react.dev.git|src/content"
     "TypeScript-Website|https://github.com/microsoft/TypeScript-Website.git|packages/documentation"
+    # Seven new: project_management / database / analytics / devops / security / testing / ai_loop
+    "rust-rfcs|https://github.com/rust-lang/rfcs.git|text"
+    "duckdb-web|https://github.com/duckdb/duckdb-web.git|docs"
+    "spark|https://github.com/apache/spark.git|docs"
+    "kubernetes-website|https://github.com/kubernetes/website.git|content/en/docs/concepts"
+    "OWASP-CheatSheetSeries|https://github.com/OWASP/CheatSheetSeries.git|cheatsheets"
+    "pytest|https://github.com/pytest-dev/pytest.git|doc/en"
+    "langchain|https://github.com/langchain-ai/langchain.git|docs/docs"
 )
 
 for entry in "${sources[@]}"; do
