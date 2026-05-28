@@ -1,0 +1,23 @@
+[book]
+title = "Veld — Agentic Memory"
+authors = ["Portll"]
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "rust"
+site-url = "/veld/"
+git-repository-url = "https://github.com/Portll/veld"
+edit-url-template = "https://github.com/Portll/veld/edit/main/docs/{path}"
+
+[output.linkcheck]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[preprocessor.toc]
+command = "mdbook-toc"
+
+[preprocessor.admonish]
+command = "mdbook-admonish"
