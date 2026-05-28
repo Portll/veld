@@ -1,0 +1,15 @@
+/* Veld docs — minimal custom theme overrides */
+
+:root {
+    --sidebar-width: 280px;
+}
+
+/* Make generated-file banners visually distinct */
+.generated-notice {
+    font-size: 0.85em;
+    color: var(--fg);
+    opacity: 0.6;
+    border-left: 3px solid var(--sidebar-bg);
+    padding: 0.4em 0.8em;
+    margin-bottom: 1.5em;
+}
