@@ -1,0 +1,8 @@
+domain = "docs"
+kind = "filesystem"
+path = "."
+extensions = ["md"]
+license = "BUSL-1.1"
+source = "veld-repo-docs"
+min_chunk = 256
+max_chunk = 2048
