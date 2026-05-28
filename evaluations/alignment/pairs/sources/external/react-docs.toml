@@ -1,6 +1,6 @@
 domain = "web_development"
 kind = "filesystem"
-path = "../_external/react.dev/src/content"
+path = "evaluations/alignment/pairs/_external/react.dev/src/content"
 extensions = ["md"]
 license = "CC-BY-4.0"
 source = "react-dev-docs"
