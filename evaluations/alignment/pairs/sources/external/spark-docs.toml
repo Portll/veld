@@ -1,0 +1,8 @@
+domain = "analytics"
+kind = "filesystem"
+path = "evaluations/alignment/pairs/_external/spark/docs"
+extensions = ["md"]
+license = "Apache-2.0"
+source = "apache-spark-docs"
+min_chunk = 256
+max_chunk = 2048
