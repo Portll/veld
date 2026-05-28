@@ -102,6 +102,10 @@ path = "src/bin/alignment_fit.rs"
 name = "alignment-eval"
 path = "src/bin/alignment_eval.rs"
 
+[[bin]]
+name = "rlm-eval"
+path = "src/bin/rlm_eval.rs"
+
 [dependencies]
 # MCP Protocol
 rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
