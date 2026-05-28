@@ -25,6 +25,18 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Sentinel returned by [`LlmConsolidator::llm_version`] when the
+/// underlying impl genuinely doesn't know what model handled the call
+/// (e.g. an OpenAI-compatible endpoint that doesn't echo back the model
+/// header). Captured verbatim in provenance trails so audits can tell
+/// "we forgot to record this" apart from "the model itself is named UNKNOWN".
+pub const LLM_VERSION_UNKNOWN: &str = "UNKNOWN";
+
+/// Sentinel returned by [`LlmConsolidator::llm_version`] when no model
+/// identifier was configured at construction time (env var unset,
+/// caller passed empty string).
+pub const LLM_VERSION_NOT_PROVIDED: &str = "NOT PROVIDED";
+
 /// A fact extracted by the LLM from a batch of episodic memories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmExtractedFact {
@@ -34,6 +46,13 @@ pub struct LlmExtractedFact {
     pub entities: Vec<String>,
     /// LLM-stated confidence in [0, 1]
     pub confidence: f32,
+    /// Which LLM produced this fact. Populated by `augment_with_llm` from
+    /// [`LlmConsolidator::llm_version`]. Uses [`LLM_VERSION_UNKNOWN`] or
+    /// [`LLM_VERSION_NOT_PROVIDED`] when the impl can't identify itself
+    /// rather than dropping the field — provenance audits need the
+    /// sentinel to distinguish "didn't capture" from "doesn't exist".
+    #[serde(default)]
+    pub llm_version: String,
 }
 
 /// Anything that can extract semantic facts from a batch of text snippets.
@@ -65,6 +84,15 @@ pub trait LlmConsolidator: Send + Sync {
     /// Cheap descriptor for logging / metrics. Not load-bearing.
     fn name(&self) -> &str {
         "llm"
+    }
+
+    /// Identifier of the underlying model / version, used for provenance
+    /// trails on facts the LLM produces. Default returns
+    /// [`LLM_VERSION_UNKNOWN`]; impls should override when they can.
+    /// Impls that have a configured model name but the value is empty
+    /// should return [`LLM_VERSION_NOT_PROVIDED`] instead.
+    fn llm_version(&self) -> String {
+        LLM_VERSION_UNKNOWN.to_string()
     }
 }
 
@@ -162,6 +190,14 @@ impl LlmConsolidator for HttpLlmConsolidator {
         "http-llm"
     }
 
+    fn llm_version(&self) -> String {
+        if self.model.trim().is_empty() {
+            LLM_VERSION_NOT_PROVIDED.to_string()
+        } else {
+            self.model.clone()
+        }
+    }
+
     fn extract_with_schema(
         &self,
         snippets: &[String],
@@ -216,8 +252,17 @@ impl LlmConsolidator for HttpLlmConsolidator {
 
         let content = self.chat(&prompt)?;
         let trimmed = strip_fences(&content);
-        let facts: Vec<LlmExtractedFact> = serde_json::from_str(trimmed)
+        let mut facts: Vec<LlmExtractedFact> = serde_json::from_str(trimmed)
             .map_err(|e| anyhow!("LLM returned non-JSON facts payload: {e}\nRaw: {content}"))?;
+        // Stamp provenance — the model doesn't echo it back, we have to
+        // inject from the local config. Empty / unknown values get the
+        // sentinel constants so downstream audits can tell them apart.
+        let version = self.llm_version();
+        for f in &mut facts {
+            if f.llm_version.is_empty() {
+                f.llm_version = version.clone();
+            }
+        }
         Ok(facts)
     }
 }
@@ -288,5 +333,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(llm.name(), "http-llm");
+    }
+
+    #[test]
+    fn llm_version_returns_configured_model() {
+        let llm = HttpLlmConsolidator::new(
+            "http://x".to_string(),
+            String::new(),
+            "qwen2.5:14b".to_string(),
+        )
+        .unwrap();
+        assert_eq!(llm.llm_version(), "qwen2.5:14b");
+    }
+
+    #[test]
+    fn llm_version_empty_model_returns_not_provided() {
+        let llm = HttpLlmConsolidator::new(
+            "http://x".to_string(),
+            String::new(),
+            "".to_string(),
+        )
+        .unwrap();
+        assert_eq!(llm.llm_version(), LLM_VERSION_NOT_PROVIDED);
+    }
+
+    #[test]
+    fn llm_version_whitespace_model_returns_not_provided() {
+        let llm = HttpLlmConsolidator::new(
+            "http://x".to_string(),
+            String::new(),
+            "   ".to_string(),
+        )
+        .unwrap();
+        assert_eq!(llm.llm_version(), LLM_VERSION_NOT_PROVIDED);
+    }
+
+    #[test]
+    fn default_trait_llm_version_is_unknown() {
+        struct FakeLlm;
+        impl LlmConsolidator for FakeLlm {
+            fn extract_facts(
+                &self,
+                _: &[String],
+            ) -> Result<Vec<LlmExtractedFact>> {
+                Ok(Vec::new())
+            }
+        }
+        assert_eq!(FakeLlm.llm_version(), LLM_VERSION_UNKNOWN);
     }
 }
