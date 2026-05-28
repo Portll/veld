@@ -49,7 +49,21 @@ Hooks fire for all tool types. Context is surfaced pre-tool and actions are reco
 
 ## MCP / Memory Tools
 
-The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published as `@veld/memory-mcp`) exposes **47 tools** over the HTTP API. The Rust binary `veld serve` ([src/cli.rs](src/cli.rs), using `rmcp` from [src/mcp/mod.rs](src/mcp/mod.rs)) also serves an MCP stdio transport. Representative tools:
+The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published as `@veld/memory-mcp`) exposes **46 tools** over the HTTP API. The Rust binary `veld serve` ([src/cli.rs](src/cli.rs), using `rmcp` from [src/mcp/mod.rs](src/mcp/mod.rs)) also serves an MCP stdio transport.
+
+**CLI subcommands** (from [src/cli.rs](src/cli.rs)):
+
+| Command | Purpose |
+|---|---|
+| `veld server` | Start the HTTP API server (defaults: `127.0.0.1:3030`, `redb` backend) |
+| `veld tui` | Launch the terminal dashboard |
+| `veld serve` | Run as MCP server (stdio transport) — note: *not* the HTTP daemon |
+| `veld init` | First-time setup — config, API key, ONNX runtime |
+| `veld status` | Check server health |
+| `veld doctor` | Diagnose common issues (storage, ONNX, port) |
+| `veld hook session-start \| prompt \| commit` | Output Claude Code hook JSON |
+| `veld claude [args...]` | Launch Claude Code with the Veld proxy wired up |
+| `veld version` | Print version and build info | Representative tools:
 
 | Category | Tools |
 |---|---|
@@ -64,7 +78,7 @@ The TypeScript MCP server ([mcp-server/index.ts](mcp-server/index.ts), published
 | Projects | `add_project`, `list_projects`, `archive_project`, `delete_project` |
 | Seeding | `seed_project` |
 
-The HTTP API beneath the MCP tools is larger (~153 routes registered in [src/handlers/router.rs](src/handlers/router.rs)). Endpoints not exposed via MCP include direct CRUD (`/api/memory/{id}` PUT/DELETE), entity resolution (`/api/entity/*`), prompt generation (`/api/prompt/gen`), context blocks (`/api/context/blocks`), tier moves (`/api/memory/tier`), anchor (`/api/anchor` — decay resistance), sleep-phase consolidation (`/api/consolidation/sleep`), external-dimension push (`/api/sleight/dimensions`), and webhooks (`/webhook/linear`, `/webhook/github`).
+The HTTP API beneath the MCP tools is larger (~202 routes registered in [src/handlers/router.rs](src/handlers/router.rs)). Endpoints not exposed via MCP include direct CRUD (`/api/memory/{id}` PUT/DELETE), entity resolution (`/api/entity/*`), prompt generation (`/api/prompt/gen`), context blocks (`/api/context/blocks`), tier moves (`/api/memory/tier`), anchor (`/api/anchor` — decay resistance), sleep-phase consolidation (`/api/consolidation/sleep`), external-dimension push (`/api/sleight/dimensions`), and webhooks (`/webhook/linear`, `/webhook/github`).
 
 For work that spans sessions, check `list_todos` at session start.
 
@@ -216,7 +230,7 @@ When writing new storage code: target the trait surface (`PrimaryMemoryStore`, `
 Veld hooks are configured for three clients:
 
 ### VS Code Copilot Agent
-- `.vscode/mcp.json` — registers Veld MCP server (47 tools).
+- `.vscode/mcp.json` — registers Veld MCP server (46 tools).
 - `.github/copilot-instructions.md` — workspace instructions with tool/skill switches.
 - User ID: `vscode-copilot`.
 
