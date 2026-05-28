@@ -25,6 +25,18 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Sentinel returned by [`LlmConsolidator::llm_version`] when the
+/// underlying impl genuinely doesn't know what model handled the call
+/// (e.g. an OpenAI-compatible endpoint that doesn't echo back the model
+/// header). Captured verbatim in provenance trails so audits can tell
+/// "we forgot to record this" apart from "the model itself is named UNKNOWN".
+pub const LLM_VERSION_UNKNOWN: &str = "UNKNOWN";
+
+/// Sentinel returned by [`LlmConsolidator::llm_version`] when no model
+/// identifier was configured at construction time (env var unset,
+/// caller passed empty string).
+pub const LLM_VERSION_NOT_PROVIDED: &str = "NOT PROVIDED";
+
 /// A fact extracted by the LLM from a batch of episodic memories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmExtractedFact {
@@ -34,6 +46,13 @@ pub struct LlmExtractedFact {
     pub entities: Vec<String>,
     /// LLM-stated confidence in [0, 1]
     pub confidence: f32,
+    /// Which LLM produced this fact. Populated by `augment_with_llm` from
+    /// [`LlmConsolidator::llm_version`]. Uses [`LLM_VERSION_UNKNOWN`] or
+    /// [`LLM_VERSION_NOT_PROVIDED`] when the impl can't identify itself
+    /// rather than dropping the field — provenance audits need the
+    /// sentinel to distinguish "didn't capture" from "doesn't exist".
+    #[serde(default)]
+    pub llm_version: String,
 }
 
 /// Anything that can extract semantic facts from a batch of text snippets.
@@ -41,9 +60,39 @@ pub trait LlmConsolidator: Send + Sync {
     /// Extract durable facts from a batch of episodic content snippets.
     fn extract_facts(&self, snippets: &[String]) -> Result<Vec<LlmExtractedFact>>;
 
+    /// Schema-constrained extraction (Cognee-style typed output).
+    ///
+    /// `schema_json` is a JSON Schema document the LLM is constrained
+    /// (via prompt instructions) to produce conforming output for. The
+    /// returned values are raw `serde_json::Value`s — callers are expected
+    /// to deserialize into their own caller-defined type via
+    /// `serde_json::from_value`.
+    ///
+    /// The default implementation returns `NotImplemented` so existing
+    /// impls don't have to ship a schema-aware path.
+    fn extract_with_schema(
+        &self,
+        _snippets: &[String],
+        _schema_json: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Err(anyhow!(
+            "{} does not implement schema-constrained extraction",
+            self.name()
+        ))
+    }
+
     /// Cheap descriptor for logging / metrics. Not load-bearing.
     fn name(&self) -> &str {
         "llm"
+    }
+
+    /// Identifier of the underlying model / version, used for provenance
+    /// trails on facts the LLM produces. Default returns
+    /// [`LLM_VERSION_UNKNOWN`]; impls should override when they can.
+    /// Impls that have a configured model name but the value is empty
+    /// should return [`LLM_VERSION_NOT_PROVIDED`] instead.
+    fn llm_version(&self) -> String {
+        LLM_VERSION_UNKNOWN.to_string()
     }
 }
 
@@ -91,9 +140,94 @@ impl HttpLlmConsolidator {
     }
 }
 
+impl HttpLlmConsolidator {
+    /// Shared chat call used by both `extract_facts` and
+    /// `extract_with_schema`. Returns the raw model `content` string.
+    fn chat(&self, prompt: &str) -> Result<String> {
+        let request = ChatRequest {
+            model: &self.model,
+            messages: vec![ChatMessage {
+                role: "user",
+                content: prompt,
+            }],
+            temperature: 0.0,
+        };
+
+        let mut req = self.client.post(&self.endpoint).json(&request);
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req.send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "LLM endpoint {} → {}",
+                self.endpoint,
+                resp.status().as_u16()
+            ));
+        }
+        let body: ChatResponse = resp.json()?;
+        Ok(body
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("LLM response had no choices"))?
+            .message
+            .content)
+    }
+}
+
+/// Strip ```json … ``` fences a model may have wrapped its JSON in.
+fn strip_fences(s: &str) -> &str {
+    s.trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+}
+
 impl LlmConsolidator for HttpLlmConsolidator {
     fn name(&self) -> &str {
         "http-llm"
+    }
+
+    fn llm_version(&self) -> String {
+        if self.model.trim().is_empty() {
+            LLM_VERSION_NOT_PROVIDED.to_string()
+        } else {
+            self.model.clone()
+        }
+    }
+
+    fn extract_with_schema(
+        &self,
+        snippets: &[String],
+        schema_json: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        if snippets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let joined = snippets
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("[{}] {}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            "Extract structured records from the following text. \
+             Return a JSON ARRAY in which every element conforms exactly to \
+             the JSON Schema below. Do NOT include any prose, prefix, or \
+             ```json fences. Only the raw JSON array.\n\n\
+             SCHEMA:\n{schema_json}\n\nTEXT:\n{joined}"
+        );
+
+        let content = self.chat(&prompt)?;
+        let trimmed = strip_fences(&content);
+        let values: Vec<serde_json::Value> = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!(
+                "LLM returned non-JSON-array payload under schema: {e}\nRaw: {content}"
+            ))?;
+        Ok(values)
     }
 
     fn extract_facts(&self, snippets: &[String]) -> Result<Vec<LlmExtractedFact>> {
@@ -116,46 +250,19 @@ impl LlmConsolidator for HttpLlmConsolidator {
              time-bound observations. Output JSON only, no prose.\n\n{joined}"
         );
 
-        let request = ChatRequest {
-            model: &self.model,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: &prompt,
-            }],
-            temperature: 0.0,
-        };
-
-        let mut req = self.client.post(&self.endpoint).json(&request);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-        let resp = req.send()?;
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "LLM endpoint {} → {}",
-                self.endpoint,
-                resp.status().as_u16()
-            ));
-        }
-        let body: ChatResponse = resp.json()?;
-        let content = body
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("LLM response had no choices"))?
-            .message
-            .content;
-
-        // The model may wrap JSON in ```json ... ``` fences — strip them.
-        let trimmed = content
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        let facts: Vec<LlmExtractedFact> = serde_json::from_str(trimmed)
+        let content = self.chat(&prompt)?;
+        let trimmed = strip_fences(&content);
+        let mut facts: Vec<LlmExtractedFact> = serde_json::from_str(trimmed)
             .map_err(|e| anyhow!("LLM returned non-JSON facts payload: {e}\nRaw: {content}"))?;
+        // Stamp provenance — the model doesn't echo it back, we have to
+        // inject from the local config. Empty / unknown values get the
+        // sentinel constants so downstream audits can tell them apart.
+        let version = self.llm_version();
+        for f in &mut facts {
+            if f.llm_version.is_empty() {
+                f.llm_version = version.clone();
+            }
+        }
         Ok(facts)
     }
 }
@@ -226,5 +333,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(llm.name(), "http-llm");
+    }
+
+    #[test]
+    fn llm_version_returns_configured_model() {
+        let llm = HttpLlmConsolidator::new(
+            "http://x".to_string(),
+            String::new(),
+            "qwen2.5:14b".to_string(),
+        )
+        .unwrap();
+        assert_eq!(llm.llm_version(), "qwen2.5:14b");
+    }
+
+    #[test]
+    fn llm_version_empty_model_returns_not_provided() {
+        let llm = HttpLlmConsolidator::new(
+            "http://x".to_string(),
+            String::new(),
+            "".to_string(),
+        )
+        .unwrap();
+        assert_eq!(llm.llm_version(), LLM_VERSION_NOT_PROVIDED);
+    }
+
+    #[test]
+    fn llm_version_whitespace_model_returns_not_provided() {
+        let llm = HttpLlmConsolidator::new(
+            "http://x".to_string(),
+            String::new(),
+            "   ".to_string(),
+        )
+        .unwrap();
+        assert_eq!(llm.llm_version(), LLM_VERSION_NOT_PROVIDED);
+    }
+
+    #[test]
+    fn default_trait_llm_version_is_unknown() {
+        struct FakeLlm;
+        impl LlmConsolidator for FakeLlm {
+            fn extract_facts(
+                &self,
+                _: &[String],
+            ) -> Result<Vec<LlmExtractedFact>> {
+                Ok(Vec::new())
+            }
+        }
+        assert_eq!(FakeLlm.llm_version(), LLM_VERSION_UNKNOWN);
     }
 }
