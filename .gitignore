@@ -117,3 +117,9 @@ plans/
 
 # Veld agent-session marker files (written by SessionStart hook, see hooks/README.md)
 .veld-agent-session.*
+
+# Alignment training corpus (data, not source)
+evaluations/alignment/pairs/_external/
+evaluations/alignment/pairs/pairs.jsonl
+evaluations/alignment/pairs/pairs.vec
+evaluations/alignment/fitted/
