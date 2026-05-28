@@ -31,6 +31,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 
 use super::types::MemoryId;
 use crate::embeddings::Embedder;
+use crate::memory::rlm_refiner::Refiner;
 
 /// Stem text using the English Porter stemmer for BM25 matching.
 /// Enables "choose" to match "chose", "decided" to match "decision", etc.
@@ -48,6 +49,30 @@ fn stem_text(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Final-stage refiner selection for hybrid search.
+///
+/// Controls which post-RRF stage (cross-encoder, LLM refiner, both, or
+/// neither) is applied to the fused candidate set. The `rlm-eval` harness
+/// uses this to compare refiner strategies against an otherwise identical
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RefinerMode {
+    /// Skip both cross-encoder and refiner. Returns raw RRF scores.
+    None,
+    /// Apply only the cross-encoder rerank (current production default).
+    #[default]
+    CrossEncoder,
+    /// Apply only the LLM refiner; skip the cross-encoder.
+    Rlm,
+    /// Cross-encoder first, then LLM refiner over its output.
+    Stacked,
+}
+
+fn default_refiner_mode() -> RefinerMode {
+    RefinerMode::CrossEncoder
 }
 
 /// Configuration for hybrid search
@@ -89,6 +114,14 @@ pub struct HybridSearchConfig {
     /// Minimum graph activation score to consider (SHO-D4)
     #[serde(default = "default_min_graph_score")]
     pub min_graph_score: f32,
+
+    /// Final-stage refiner mode (cross-encoder, LLM refiner, both, or none).
+    ///
+    /// Defaults to `CrossEncoder` for backward compatibility with existing
+    /// callers. The `rlm-eval` harness varies this to compare refiner
+    /// strategies.
+    #[serde(default = "default_refiner_mode")]
+    pub refiner_mode: RefinerMode,
 }
 
 fn default_bm25_weight() -> f32 {
@@ -137,6 +170,7 @@ impl Default for HybridSearchConfig {
             use_reranking: default_use_reranking(),
             min_bm25_score: default_min_bm25_score(),
             min_graph_score: default_min_graph_score(),
+            refiner_mode: default_refiner_mode(),
         }
     }
 }
@@ -794,6 +828,9 @@ pub struct HybridSearchEngine {
     bm25_index: BM25Index,
     config: HybridSearchConfig,
     reranker: Option<CrossEncoderReranker>,
+    /// Optional LLM-driven refiner applied after RRF (and optionally after
+    /// cross-encoder rerank). Gated by `config.refiner_mode`.
+    refiner: Option<Box<dyn Refiner>>,
     /// Learned weights from retrieval feedback (EMA-adapted)
     /// Protected by RwLock for concurrent read access during search
     /// and exclusive write access during feedback updates
@@ -821,8 +858,20 @@ impl HybridSearchEngine {
             bm25_index,
             config,
             reranker,
+            refiner: None,
             learned_weights,
         })
+    }
+
+    /// Attach an LLM-driven refiner to be applied after RRF fusion (and
+    /// optionally after cross-encoder reranking — see [`RefinerMode`]).
+    ///
+    /// Without an attached refiner, `RefinerMode::Rlm` and
+    /// `RefinerMode::Stacked` degrade to their respective baselines:
+    /// `Rlm` becomes RRF-only, `Stacked` becomes cross-encoder-only.
+    pub fn with_refiner(mut self, refiner: Box<dyn Refiner>) -> Self {
+        self.refiner = Some(refiner);
+        self
     }
 
     /// Index a memory for BM25 search
@@ -1131,9 +1180,16 @@ impl HybridSearchEngine {
             .map(|(rank, (id, score))| (id.clone(), (*score, rank)))
             .collect();
 
-        // 3. Optional cross-encoder reranking
+        // 3. Optional cross-encoder reranking + LLM refiner pass
         let effective_rerank_count = rerank_count_override.unwrap_or(self.config.rerank_count);
-        let final_results = if let Some(ref reranker) = self.reranker {
+        let mode = self.config.refiner_mode;
+        let use_cross_encoder =
+            matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked);
+        let use_refiner = matches!(mode, RefinerMode::Rlm | RefinerMode::Stacked);
+
+        let mut final_results: Vec<HybridSearchResult> = if let Some(reranker) =
+            self.reranker.as_ref().filter(|_| use_cross_encoder)
+        {
             // Take top-k for reranking (FIX-11: dynamic per-query override)
             let to_rerank: Vec<_> = fused
                 .iter()
@@ -1239,6 +1295,38 @@ impl HybridSearchEngine {
                 })
                 .collect()
         };
+
+        // 4. Optional LLM refiner pass (applied after cross-encoder when
+        // mode is Stacked; replaces cross-encoder when mode is Rlm).
+        if use_refiner {
+            if let Some(refiner) = self.refiner.as_ref() {
+                let to_refine: Vec<(MemoryId, String, f32)> = final_results
+                    .iter()
+                    .take(effective_rerank_count)
+                    .filter_map(|r| {
+                        get_content(&r.memory_id)
+                            .map(|c| (r.memory_id.clone(), c, r.score))
+                    })
+                    .collect();
+                if !to_refine.is_empty() {
+                    let refined = refiner.refine(query, to_refine)?;
+                    let refined_map: HashMap<MemoryId, f32> =
+                        refined.into_iter().collect();
+
+                    // Blend mirrors the cross-encoder formula: refiner can
+                    // demote weakly relevant candidates but the multiplicative
+                    // structure preserves the RRF rank floor.
+                    const REFINER_BLEND: f32 = 0.4;
+                    for r in &mut final_results {
+                        if let Some(&rs) = refined_map.get(&r.memory_id) {
+                            r.score = (1.0 - REFINER_BLEND) * r.score
+                                + REFINER_BLEND * rs * r.score.max(0.0);
+                        }
+                    }
+                    final_results.sort_by(|a, b| b.score.total_cmp(&a.score));
+                }
+            }
+        }
 
         Ok(final_results)
     }

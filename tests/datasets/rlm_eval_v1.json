@@ -1,0 +1,315 @@
+{
+  "version": "1.0.0",
+  "name": "rlm_eval_v1",
+  "description": "MVP benchmark for RLM-as-refiner evaluation. Single coherent scenario: fictional Loomflux engineering project tracked across 6 sessions over 36 weeks. 24 memories; 16 hand-curated queries across four classes (code_recall, multi_hop, cross_session, decayed_recall).",
+  "created": "2026-05-28",
+  "scenario": "A small engineering team builds an audit-log pipeline. Roles change (Diana departs at week 18), tools evolve (PostgreSQL -> ClickHouse), and code decisions accumulate. Queries test single-fact recall, chained reasoning, state-evolution awareness, and pre-supersession recall.",
+  "memories": [
+    {
+      "id": 1,
+      "content": "Loomflux kickoff at week 0. Anika Rao proposed using PostgreSQL with logical replication as the storage backend for the audit log; the team approved this at the kickoff meeting. The decision was logged in ADR-001.",
+      "tags": ["kickoff", "decision", "database"],
+      "entities": ["Anika Rao", "PostgreSQL", "ADR-001", "audit log"],
+      "class": "foundation",
+      "session": 1
+    },
+    {
+      "id": 2,
+      "content": "At kickoff Diana Park was assigned as data infrastructure lead. She owned the audit log pipeline, including schema design, replication topology, and the ingest workers in src/ingest/pg_writer.rs.",
+      "tags": ["roles", "ownership"],
+      "entities": ["Diana Park", "audit log", "src/ingest/pg_writer.rs"],
+      "class": "foundation",
+      "session": 1
+    },
+    {
+      "id": 3,
+      "content": "Sven Halligan came on as ops lead at kickoff. He set up the initial monitoring stack (Prometheus + Grafana) and wrote the deploy scripts under deploy/k8s/.",
+      "tags": ["roles", "monitoring"],
+      "entities": ["Sven Halligan", "Prometheus", "Grafana", "deploy/k8s"],
+      "class": "foundation",
+      "session": 1
+    },
+    {
+      "id": 4,
+      "content": "At week 4 the team shipped the MVP audit-log pipeline. PostgreSQL ingest rate measured at 8,000 events/second sustained. Latency p95 under 80ms. Diana wrote up the postmortem on the early-week schema corruption incident.",
+      "tags": ["mvp", "metrics", "incident"],
+      "entities": ["PostgreSQL", "Diana Park", "audit log"],
+      "class": "mvp",
+      "session": 2
+    },
+    {
+      "id": 5,
+      "content": "Week 4: the score_pairs function in src/retrieval/scorer.py was originally a naive cosine bi-encoder over MiniLM embeddings. It was correctly returning numeric scores but the ranking quality was middling.",
+      "tags": ["code", "retrieval"],
+      "entities": ["score_pairs", "src/retrieval/scorer.py", "MiniLM"],
+      "class": "code",
+      "session": 2
+    },
+    {
+      "id": 6,
+      "content": "Anika decided at week 4 that the retrieval layer would use bcrypt for any stored credential hashes. She updated src/auth/hasher.rs to use bcrypt with cost factor 12.",
+      "tags": ["security", "code"],
+      "entities": ["Anika Rao", "bcrypt", "src/auth/hasher.rs"],
+      "class": "code",
+      "session": 2
+    },
+    {
+      "id": 7,
+      "content": "Mateo Cruz joined the team at week 10 as the ML/retrieval engineer. His first task was overhauling the retrieval scoring path that Diana had inherited from the kickoff phase.",
+      "tags": ["roles", "onboarding"],
+      "entities": ["Mateo Cruz", "Diana Park", "retrieval"],
+      "class": "growth",
+      "session": 3
+    },
+    {
+      "id": 8,
+      "content": "Week 10: Mateo replaced the naive bi-encoder in score_pairs with the ms-marco-MiniLM-L-6-v2 cross-encoder. Recall@10 on the internal benchmark improved from 0.61 to 0.78. The change shipped in PR #142.",
+      "tags": ["code", "retrieval", "improvement"],
+      "entities": ["Mateo Cruz", "score_pairs", "ms-marco-MiniLM-L-6-v2", "PR #142"],
+      "class": "code",
+      "session": 3
+    },
+    {
+      "id": 9,
+      "content": "At week 10 Anika introduced a feature flag system (src/flags/mod.rs) gated by environment variable LOOMFLUX_FLAGS. The retrieval rewrite shipped behind the rerank_v2 flag, defaulting off in production until the canary completed.",
+      "tags": ["code", "rollout"],
+      "entities": ["Anika Rao", "src/flags/mod.rs", "LOOMFLUX_FLAGS", "rerank_v2"],
+      "class": "code",
+      "session": 3
+    },
+    {
+      "id": 10,
+      "content": "Sven set up a weekly cadence at week 10 for ops review: every Thursday 10am the team reviews paging events and uptime. The first review surfaced that the audit-log replica lag was creeping up under peak load.",
+      "tags": ["ops", "monitoring"],
+      "entities": ["Sven Halligan", "audit log", "replica lag"],
+      "class": "growth",
+      "session": 3
+    },
+    {
+      "id": 11,
+      "content": "Week 18: Diana Park left Loomflux to take a role at a different company. Her ownership of the audit-log pipeline transferred to Mateo Cruz. Mateo inherited the schema, the replication topology, and the ingest workers.",
+      "tags": ["roles", "transition"],
+      "entities": ["Diana Park", "Mateo Cruz", "audit log"],
+      "class": "transition",
+      "session": 4
+    },
+    {
+      "id": 12,
+      "content": "After taking over the audit-log pipeline at week 18, Mateo proposed migrating from PostgreSQL to ClickHouse because the write throughput on PostgreSQL had hit a hard ceiling at 14,000 events/second. The team approved the migration in ADR-012.",
+      "tags": ["decision", "database", "migration"],
+      "entities": ["Mateo Cruz", "PostgreSQL", "ClickHouse", "ADR-012", "audit log"],
+      "class": "transition",
+      "session": 4
+    },
+    {
+      "id": 13,
+      "content": "Week 18: Anika rewrote the auth-hasher module to use Argon2id instead of bcrypt, citing the OWASP 2025 recommendation. The change in src/auth/hasher.rs preserves legacy bcrypt verification during a 6-month migration window.",
+      "tags": ["security", "code", "migration"],
+      "entities": ["Anika Rao", "Argon2id", "bcrypt", "src/auth/hasher.rs"],
+      "class": "code",
+      "session": 4
+    },
+    {
+      "id": 14,
+      "content": "Week 18 retrospective: Sven noted that paging volume had dropped 40% since the rerank_v2 flag was fully enabled at week 14. The retrieval-quality improvement reduced downstream noisy alerts on bad recommendations.",
+      "tags": ["ops", "metrics"],
+      "entities": ["Sven Halligan", "rerank_v2"],
+      "class": "transition",
+      "session": 4
+    },
+    {
+      "id": 15,
+      "content": "Week 25: the ClickHouse migration completed. Audit-log ingest now sustained at 42,000 events/second with latency p95 under 30ms. Mateo wrote up the migration retrospective and archived ADR-001 (the original PostgreSQL decision) as superseded by ADR-012.",
+      "tags": ["migration", "metrics", "decision"],
+      "entities": ["Mateo Cruz", "ClickHouse", "ADR-001", "ADR-012", "audit log"],
+      "class": "hardening",
+      "session": 5
+    },
+    {
+      "id": 16,
+      "content": "At week 25 Anika added structured logging via tracing-subscriber across all services. Log format standardized to JSON. The integration was straightforward except for src/auth/hasher.rs where the spans needed to be careful not to log password material.",
+      "tags": ["code", "logging"],
+      "entities": ["Anika Rao", "tracing-subscriber", "src/auth/hasher.rs"],
+      "class": "hardening",
+      "session": 5
+    },
+    {
+      "id": 17,
+      "content": "Sven proposed at week 25 that the team adopt error budgets formally. SLO set at 99.9% for the audit-log pipeline and 99.5% for the retrieval API. The first month of operation showed both well above target.",
+      "tags": ["ops", "slo"],
+      "entities": ["Sven Halligan", "audit log", "retrieval API"],
+      "class": "hardening",
+      "session": 5
+    },
+    {
+      "id": 18,
+      "content": "Week 25 code change: score_pairs in src/retrieval/scorer.py was extended with a tags_match boost factor (weighted at 0.18) drawn from a tag-weighted Jaccard between query and document tags. Mateo's PR #287.",
+      "tags": ["code", "retrieval"],
+      "entities": ["Mateo Cruz", "score_pairs", "src/retrieval/scorer.py", "PR #287"],
+      "class": "code",
+      "session": 5
+    },
+    {
+      "id": 19,
+      "content": "Week 36 current state: Mateo is the lead engineer for both the audit-log pipeline (ClickHouse) and the retrieval API. The retrieval API serves p95 latency under 45ms and Recall@10 holds at 0.83 on the production-traffic benchmark.",
+      "tags": ["current-state", "metrics"],
+      "entities": ["Mateo Cruz", "ClickHouse", "audit log", "retrieval API"],
+      "class": "current",
+      "session": 6
+    },
+    {
+      "id": 20,
+      "content": "Week 36: Anika is rolling out a new feature flag, retrieval_v3, that introduces a graph-traversal stage before scoring. Early canary numbers show a 6% Recall@10 lift but higher tail latency. Decision on full rollout deferred to week 40.",
+      "tags": ["current-state", "code", "rollout"],
+      "entities": ["Anika Rao", "retrieval_v3", "Recall@10"],
+      "class": "current",
+      "session": 6
+    },
+    {
+      "id": 21,
+      "content": "Week 36 ops: Sven reports that the audit-log pipeline has had zero pages in the last six weeks. The error budget remains untouched. He's redirecting effort to capacity planning for the projected Q4 traffic doubling.",
+      "tags": ["current-state", "ops"],
+      "entities": ["Sven Halligan", "audit log"],
+      "class": "current",
+      "session": 6
+    },
+    {
+      "id": 22,
+      "content": "Week 36 documentation: the public-facing engineering wiki now lists the authoritative database choice for the audit log as ClickHouse, with a footnote crediting Diana for the original PostgreSQL design and Mateo for the migration. The wiki page link is internal: wiki/audit-log/architecture.",
+      "tags": ["current-state", "documentation"],
+      "entities": ["ClickHouse", "Diana Park", "Mateo Cruz", "audit log"],
+      "class": "current",
+      "session": 6
+    },
+    {
+      "id": 23,
+      "content": "Week 36: Mateo merged PR #401 which changed score_pairs to delegate cross-encoder scoring to a separate worker pool via tokio::spawn_blocking, reducing main-thread starvation. Mean retrieval latency dropped 12% in canary.",
+      "tags": ["current-state", "code", "performance"],
+      "entities": ["Mateo Cruz", "score_pairs", "PR #401", "tokio::spawn_blocking"],
+      "class": "code",
+      "session": 6
+    },
+    {
+      "id": 24,
+      "content": "At week 36 Anika finalized the security review for the Argon2id migration. The bcrypt verification path was removed; src/auth/hasher.rs now only accepts Argon2id-hashed credentials. Stragglers on bcrypt were force-rotated.",
+      "tags": ["current-state", "security"],
+      "entities": ["Anika Rao", "Argon2id", "bcrypt", "src/auth/hasher.rs"],
+      "class": "current",
+      "session": 6
+    }
+  ],
+  "queries": [
+    {
+      "id": 1,
+      "query": "Which cross-encoder model replaced the naive bi-encoder in score_pairs?",
+      "class": "code_recall",
+      "expected_memory_ids": [8],
+      "acceptable_memory_ids": [8]
+    },
+    {
+      "id": 2,
+      "query": "What file holds the credential hashing implementation, and what algorithm does it use now?",
+      "class": "code_recall",
+      "expected_memory_ids": [24],
+      "acceptable_memory_ids": [24, 13, 16]
+    },
+    {
+      "id": 3,
+      "query": "Which PR moved cross-encoder scoring to a separate worker pool?",
+      "class": "code_recall",
+      "expected_memory_ids": [23],
+      "acceptable_memory_ids": [23]
+    },
+    {
+      "id": 4,
+      "query": "Where is the feature flag system defined?",
+      "class": "code_recall",
+      "expected_memory_ids": [9],
+      "acceptable_memory_ids": [9]
+    },
+    {
+      "id": 5,
+      "query": "Who took over the audit-log pipeline after Diana left, and what database does it use now?",
+      "class": "multi_hop",
+      "expected_memory_ids": [11, 12],
+      "acceptable_memory_ids": [11, 12, 15, 19, 22]
+    },
+    {
+      "id": 6,
+      "query": "Why did we migrate the audit log to ClickHouse, and what was the throughput before the migration?",
+      "class": "multi_hop",
+      "expected_memory_ids": [12],
+      "acceptable_memory_ids": [12, 4, 15]
+    },
+    {
+      "id": 7,
+      "query": "Who introduced the rerank_v2 flag and which engineer's improvement was shipped behind it?",
+      "class": "multi_hop",
+      "expected_memory_ids": [8, 9],
+      "acceptable_memory_ids": [8, 9, 14]
+    },
+    {
+      "id": 8,
+      "query": "What was the dropped paging volume attributed to, and which engineer was the source of that improvement?",
+      "class": "multi_hop",
+      "expected_memory_ids": [14, 8],
+      "acceptable_memory_ids": [14, 8, 9]
+    },
+    {
+      "id": 9,
+      "query": "What is the current state of our audit-log infrastructure?",
+      "class": "cross_session",
+      "expected_memory_ids": [19, 22],
+      "acceptable_memory_ids": [19, 22, 15, 21]
+    },
+    {
+      "id": 10,
+      "query": "What's the latest with the retrieval API?",
+      "class": "cross_session",
+      "expected_memory_ids": [19, 20, 23],
+      "acceptable_memory_ids": [19, 20, 23]
+    },
+    {
+      "id": 11,
+      "query": "How has Anika's work on credential hashing evolved across the project?",
+      "class": "cross_session",
+      "expected_memory_ids": [6, 13, 24],
+      "acceptable_memory_ids": [6, 13, 24, 16]
+    },
+    {
+      "id": 12,
+      "query": "Summarize the current ownership of major components at Loomflux.",
+      "class": "cross_session",
+      "expected_memory_ids": [19, 20, 21],
+      "acceptable_memory_ids": [19, 20, 21]
+    },
+    {
+      "id": 13,
+      "query": "What database did Loomflux originally pick for the audit log at the week-0 kickoff?",
+      "class": "decayed_recall",
+      "expected_memory_ids": [1],
+      "acceptable_memory_ids": [1, 4]
+    },
+    {
+      "id": 14,
+      "query": "Which hashing algorithm did the auth module use before the Argon2id migration?",
+      "class": "decayed_recall",
+      "expected_memory_ids": [6],
+      "acceptable_memory_ids": [6, 13]
+    },
+    {
+      "id": 15,
+      "query": "What was the implementation of score_pairs before Mateo joined?",
+      "class": "decayed_recall",
+      "expected_memory_ids": [5],
+      "acceptable_memory_ids": [5]
+    },
+    {
+      "id": 16,
+      "query": "Who originally owned the audit-log pipeline before the week-18 transition?",
+      "class": "decayed_recall",
+      "expected_memory_ids": [2],
+      "acceptable_memory_ids": [2, 4]
+    }
+  ]
+}
