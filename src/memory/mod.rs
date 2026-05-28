@@ -145,6 +145,23 @@ pub use crate::memory::temporal_facts::{
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
 
+/// Directory name used for the on-disk BM25 (tantivy) inverted index.
+///
+/// Held under `{storage_path}/bm25_projection_index` so it stays
+/// identical to the path
+/// [`crate::handlers::state::MultiUserMemoryManager::get_user_bm25_index`]
+/// opens for the per-tenant `Bm25Projection`. The retrieval-side
+/// [`hybrid_search::HybridSearchEngine`] and the journaled writer's
+/// projection therefore index *the same tantivy directory*, which
+/// closes the W5 "reads diverge until next backfill" window.
+///
+/// The legacy `{storage_path}/bm25_index` directory is no longer created
+/// by any code path. Pre-existing tenants whose data still lives there
+/// will see a one-time rebuild driven by the projection's replay on
+/// first `JournaledWriter` open — the intent log is the source of
+/// truth, so the old directory can be deleted by operators at any time.
+pub const BM25_INDEX_DIR: &str = "bm25_projection_index";
+
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -483,10 +500,38 @@ impl MemorySystem {
 
     /// Create a memory system around an already-opened primary store.
     ///
-    /// This is the seam used by backend compatibility adapters so higher-level
-    /// orchestration can choose the storage opener before constructing the
-    /// retrieval pipeline.
+    /// Opens (or creates) the BM25 index at
+    /// `{storage_path}/bm25_projection_index` and wraps it in `Arc` for
+    /// sharing with the journaled-writer projection (when one is
+    /// attached). Use [`MemorySystem::with_storage_and_bm25_index`] when
+    /// the caller already holds the projection-owned handle and wants
+    /// the retrieval engine to share it.
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
+        let bm25_path = config.storage_path.join(BM25_INDEX_DIR);
+        let bm25_index = Arc::new(
+            hybrid_search::BM25Index::new(&bm25_path)
+                .context("Failed to open BM25 index for hybrid search")?,
+        );
+        Self::with_storage_and_bm25_index(config, storage, bm25_index)
+    }
+
+    /// Create a memory system around an already-opened primary store *and*
+    /// an externally-owned `Arc<BM25Index>`.
+    ///
+    /// This is the server-side seam: the [`crate::handlers::state::MultiUserMemoryManager`]
+    /// owns one `Arc<BM25Index>` per tenant and feeds it to both the
+    /// retrieval engine (via this constructor) and the live
+    /// [`crate::memory::Bm25Projection`] driven off the intent log.
+    /// Sharing the handle means a journaled write that lands in the
+    /// projection becomes visible to this `MemorySystem`'s
+    /// [`HybridSearchEngine`] as soon as the projection's `commit()` +
+    /// `reload()` returns — no re-open, no second on-disk index, no
+    /// "reads diverge until the next backfill" drift window.
+    pub fn with_storage_and_bm25_index(
+        config: MemoryConfig,
+        storage: Arc<MemoryStorage>,
+        bm25_index: Arc<hybrid_search::BM25Index>,
+    ) -> Result<Self> {
         let storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
@@ -773,7 +818,14 @@ impl MemorySystem {
         let lineage_graph = Arc::new(lineage::LineageGraph::new(storage.db()));
 
         // Initialize hybrid search engine (BM25 + Vector + RRF + Reranking)
-        let bm25_path = storage_path.join("bm25_index");
+        //
+        // The BM25 index is supplied by the caller — either opened by
+        // `MemorySystem::with_storage` from `{storage_path}/bm25_projection_index`
+        // (standalone / test mode) or threaded in from the per-tenant
+        // `Arc<BM25Index>` owned by `MultiUserMemoryManager` (server mode,
+        // shared with the `Bm25Projection` driven off the intent log).
+        // The retrieval engine never opens a second on-disk index — the
+        // projection-owned directory is the single source of truth.
         let hybrid_search_config = hybrid_search::HybridSearchConfig::default();
             #[cfg(feature = "multi-tenant")]
             let default_collective_weights = (
@@ -781,12 +833,11 @@ impl MemorySystem {
                 hybrid_search_config.vector_weight,
                 hybrid_search_config.graph_weight,
             );
-        let hybrid_search_engine = hybrid_search::HybridSearchEngine::new(
-            &bm25_path,
+        let hybrid_search_engine = hybrid_search::HybridSearchEngine::with_bm25_index(
+            bm25_index,
             embedder.clone(),
             hybrid_search_config,
-        )
-        .context("Failed to initialize hybrid search engine")?;
+        );
 
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
@@ -814,36 +865,11 @@ impl MemorySystem {
             }
         }
 
-        // Backfill BM25 index if empty but memories exist
-        if hybrid_search_engine.needs_backfill() {
-            let existing_memories = storage.get_all()?;
-            let memory_count = existing_memories.len();
-
-            if memory_count > 0 {
-                tracing::info!(
-                    "BM25 index empty, backfilling {} existing memories...",
-                    memory_count
-                );
-
-                let memories_iter = existing_memories.into_iter().map(|mem| {
-                    (
-                        mem.id,
-                        mem.experience.content,
-                        mem.experience.tags,
-                        mem.experience.entities,
-                    )
-                });
-
-                match hybrid_search_engine.backfill(memories_iter) {
-                    Ok(indexed) => {
-                        tracing::info!("BM25 backfill complete: {} memories indexed", indexed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("BM25 backfill failed (non-fatal): {}", e);
-                    }
-                }
-            }
-        }
+        // BM25 corpus is rebuilt from the intent log by `Bm25Projection`
+        // on `JournaledWriter` open (server mode) — no in-process
+        // backfill required. Standalone / test code that wants a
+        // pre-populated index must drive `index_memory` directly, just
+        // as it would have via the previous backfill helper.
 
         // Initialize learning history store for persistent significant events
         // Uses the same DB as long-term memory with "learning:" prefix
