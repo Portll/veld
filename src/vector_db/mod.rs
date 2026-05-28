@@ -48,7 +48,9 @@ pub use hnsw::{HnswConfig, HnswIndex};
 pub use pq::{CompressedVectorStore, PQConfig, ProductQuantizer};
 pub use spann::{SpannConfig, SpannIndex};
 pub use vamana::{DistanceMetric, VamanaConfig, VamanaIndex, REBUILD_THRESHOLD};
-pub use vamana_projection::{VamanaProjection, VamanaProjectionError};
+pub use vamana_projection::{
+    VamanaEmbeddingKind, VamanaProjection, VamanaProjectionBootstrap, VamanaProjectionError,
+};
 
 use anyhow::Result;
 use std::path::Path;
