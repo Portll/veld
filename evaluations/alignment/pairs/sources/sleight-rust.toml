@@ -1,6 +1,6 @@
 domain = "programming"
 kind = "filesystem"
-path = "../../sleight/sleight/src"
+path = "../sleight/sleight/src"
 extensions = ["rs"]
 license = "BUSL-1.1"
 source = "sleight-repo-rust"

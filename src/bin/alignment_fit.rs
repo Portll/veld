@@ -13,14 +13,18 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use veld::embeddings::{
     save_alignment, Alignment, AlignmentPairId, Embedder, ProcrustesAlignment, RidgeAlignment,
 };
+
+/// Magic for the encoded-vector cache file (`pairs.<pair>.<side>.vec`).
+const PAIRS_VEC_MAGIC: &[u8; 8] = b"VELDPV1\0";
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Side {
@@ -124,14 +128,47 @@ fn main() -> Result<()> {
         }
     };
 
-    let primary_vecs: Vec<Vec<f32>> = texts
-        .par_iter()
-        .map(|t| encode(&primary, t))
-        .collect::<Result<Vec<_>>>()?;
-    let secondary_vecs: Vec<Vec<f32>> = texts
-        .par_iter()
-        .map(|t| encode(&secondary, t))
-        .collect::<Result<Vec<_>>>()?;
+    // Try the encoded-vector cache first. Cache key is the SHA-256 of
+    // pairs.jsonl bytes + the embedder pair-id + side; the cache invalidates
+    // automatically when any of those change.
+    let pairs_sha = sha256_file(&args.pairs)
+        .with_context(|| format!("hashing {}", args.pairs.display()))?;
+    let cache_path = pairs_vec_path(&args.pairs, &pair_id, side);
+
+    let (primary_vecs, secondary_vecs): (Vec<Vec<f32>>, Vec<Vec<f32>>) =
+        match load_pairs_vec(&cache_path, &pairs_sha, rows.len())? {
+            Some(cached) => {
+                tracing::info!("vector cache hit at {}", cache_path.display());
+                cached
+            }
+            None => {
+                tracing::info!(
+                    "encoding {} rows with primary={} secondary={} side={:?}",
+                    rows.len(),
+                    args.primary_id,
+                    args.secondary_id,
+                    side
+                );
+                let pv: Vec<Vec<f32>> = texts
+                    .par_iter()
+                    .map(|t| encode(&primary, t))
+                    .collect::<Result<Vec<_>>>()?;
+                let sv: Vec<Vec<f32>> = texts
+                    .par_iter()
+                    .map(|t| encode(&secondary, t))
+                    .collect::<Result<Vec<_>>>()?;
+                if let Err(e) = save_pairs_vec(&cache_path, &pairs_sha, &pv, &sv) {
+                    tracing::warn!(
+                        "could not write vector cache at {}: {}",
+                        cache_path.display(),
+                        e
+                    );
+                } else {
+                    tracing::info!("wrote vector cache to {}", cache_path.display());
+                }
+                (pv, sv)
+            }
+        };
 
     let cutoff = (args.holdout * 10.0).round() as usize;
     let mut train_p = Vec::new();
@@ -249,6 +286,133 @@ fn mean_paired_cosine<A: Alignment>(
         sum += dot / (np * pp).max(1e-12);
     }
     Ok(sum / primary.len() as f32)
+}
+
+/// Cache path for the encoded vectors. Lives next to `pairs.jsonl`, keyed
+/// on the embedder pair and the side. Different sides produce different
+/// query/document vectors for asymmetric models and so get separate caches.
+fn pairs_vec_path(pairs: &Path, pid: &AlignmentPairId, side: Side) -> PathBuf {
+    let side_str = match side {
+        Side::Doc => "doc",
+        Side::Query => "query",
+    };
+    let stem = format!(
+        "pairs.{}__{}.{}.vec",
+        pid.primary.replace('/', "_"),
+        pid.secondary.replace('/', "_"),
+        side_str
+    );
+    pairs
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(stem)
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Load the encoded-vector cache if it exists and matches the expected
+/// `pairs.jsonl` SHA + row count. Returns `Ok(None)` for any mismatch or
+/// missing file — the caller then re-encodes.
+fn load_pairs_vec(
+    path: &Path,
+    expected_sha: &[u8; 32],
+    expected_n: usize,
+) -> Result<Option<(Vec<Vec<f32>>, Vec<Vec<f32>>)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut r = BufReader::new(File::open(path)?);
+
+    let mut magic = [0u8; 8];
+    if r.read_exact(&mut magic).is_err() || &magic != PAIRS_VEC_MAGIC {
+        return Ok(None);
+    }
+    let mut sha = [0u8; 32];
+    if r.read_exact(&mut sha).is_err() || sha != *expected_sha {
+        return Ok(None);
+    }
+    let mut n_bytes = [0u8; 8];
+    r.read_exact(&mut n_bytes)?;
+    let n = u64::from_le_bytes(n_bytes) as usize;
+    if n != expected_n {
+        return Ok(None);
+    }
+    let mut dp_bytes = [0u8; 4];
+    r.read_exact(&mut dp_bytes)?;
+    let d_p = u32::from_le_bytes(dp_bytes) as usize;
+    let mut ds_bytes = [0u8; 4];
+    r.read_exact(&mut ds_bytes)?;
+    let d_s = u32::from_le_bytes(ds_bytes) as usize;
+
+    let mut primary = Vec::with_capacity(n);
+    let mut secondary = Vec::with_capacity(n);
+    let mut p_buf = vec![0u8; d_p * 4];
+    let mut s_buf = vec![0u8; d_s * 4];
+    for _ in 0..n {
+        r.read_exact(&mut p_buf)?;
+        primary.push(
+            p_buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>(),
+        );
+        r.read_exact(&mut s_buf)?;
+        secondary.push(
+            s_buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>(),
+        );
+    }
+    Ok(Some((primary, secondary)))
+}
+
+fn save_pairs_vec(
+    path: &Path,
+    sha: &[u8; 32],
+    primary: &[Vec<f32>],
+    secondary: &[Vec<f32>],
+) -> Result<()> {
+    if primary.is_empty() || secondary.is_empty() {
+        bail!("refusing to cache empty vector set");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let tmp = path.with_extension("vec.tmp");
+    {
+        let mut w = BufWriter::new(File::create(&tmp)?);
+        w.write_all(PAIRS_VEC_MAGIC)?;
+        w.write_all(sha)?;
+        w.write_all(&(primary.len() as u64).to_le_bytes())?;
+        let d_p = primary[0].len() as u32;
+        let d_s = secondary[0].len() as u32;
+        w.write_all(&d_p.to_le_bytes())?;
+        w.write_all(&d_s.to_le_bytes())?;
+        for (p, s) in primary.iter().zip(secondary.iter()) {
+            for x in p {
+                w.write_all(&x.to_le_bytes())?;
+            }
+            for x in s {
+                w.write_all(&x.to_le_bytes())?;
+            }
+        }
+        w.flush()?;
+    }
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 /// Render a lambda value for inclusion in a filename — no exponents, no

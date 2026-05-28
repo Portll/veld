@@ -1,6 +1,6 @@
 domain = "web_development"
 kind = "filesystem"
-path = "../_external/TypeScript-Website/packages/documentation/copy/en"
+path = "evaluations/alignment/pairs/_external/TypeScript-Website/packages/documentation/copy/en"
 extensions = ["md"]
 license = "CC-BY-4.0"
 source = "typescript-handbook"

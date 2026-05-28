@@ -1,6 +1,6 @@
 domain = "web_development"
 kind = "filesystem"
-path = "../_external/mdn-content/files/en-us/web/javascript"
+path = "evaluations/alignment/pairs/_external/mdn-content/files/en-us/web/javascript"
 extensions = ["md"]
 license = "CC-BY-SA-2.5"
 source = "mdn-javascript"
