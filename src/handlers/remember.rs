@@ -12,8 +12,8 @@ use crate::earth::SharedEarth;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     types::{
-        ChangeType, ContextId, EmotionalContext, EpisodeContext, NerEntityRecord, RichContext,
-        SourceContext, SourceType,
+        ChangeType, EmotionalContext, EpisodeContext, NerEntityRecord, RichContext, SourceContext,
+        SourceType,
     },
     Experience, ExperienceType, SessionEvent,
 };
@@ -222,7 +222,14 @@ pub fn parse_source_type(s: Option<&String>) -> SourceType {
     .unwrap_or(SourceType::Unknown)
 }
 
-/// Build RichContext from request fields
+/// Build RichContext from request fields.
+///
+/// Always returns `Some(_)` — even when the caller passes no explicit
+/// emotional/source/episode hints, the returned [`RichContext`] carries the
+/// detected [`crate::memory::facets::AgentSession`] (agent / worktree /
+/// branch). The writer-side wiring depends on this: every memory persisted
+/// through `remember` / `batch_remember` / the auto-ingest path must record
+/// the session identity of the process that recorded it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_rich_context(
     emotional_valence: Option<f32>,
@@ -234,7 +241,7 @@ pub fn build_rich_context(
     sequence_number: Option<u32>,
     preceding_memory_id: Option<String>,
 ) -> Option<RichContext> {
-    let has_context = emotional_valence.is_some()
+    let has_explicit_context = emotional_valence.is_some()
         || emotional_arousal.is_some()
         || emotion.is_some()
         || source_type.is_some()
@@ -243,11 +250,15 @@ pub fn build_rich_context(
         || sequence_number.is_some()
         || preceding_memory_id.is_some();
 
-    if !has_context {
-        return None;
+    // Always start from the session-populated baseline so the AgentSession
+    // facet is recorded even when the caller supplied no other signal.
+    let mut ctx = crate::memory::session_detect::rich_context_with_session();
+
+    if !has_explicit_context {
+        return Some(ctx);
     }
 
-    let emotional = EmotionalContext {
+    ctx.emotional = EmotionalContext {
         valence: emotional_valence.unwrap_or(0.0),
         arousal: emotional_arousal.unwrap_or(0.0),
         dominant_emotion: emotion,
@@ -258,14 +269,12 @@ pub fn build_rich_context(
         },
         ..Default::default()
     };
-
-    let source = SourceContext {
+    ctx.source = SourceContext {
         source_type: parse_source_type(source_type.as_ref()),
         credibility: credibility.unwrap_or(0.8),
         ..Default::default()
     };
-
-    let episode = EpisodeContext {
+    ctx.episode = EpisodeContext {
         episode_id,
         sequence_number,
         preceding_memory_id,
@@ -273,33 +282,7 @@ pub fn build_rich_context(
         ..Default::default()
     };
 
-    let now = chrono::Utc::now();
-    Some(RichContext {
-        id: ContextId(uuid::Uuid::new_v4()),
-        emotional,
-        source,
-        episode,
-        place: Default::default(),
-        who: Default::default(),
-        why: Default::default(),
-        binding: Default::default(),
-        // Stamp this engram with the active agent / worktree / branch.
-        // Cached per-process — see `memory::session_detect`.
-        session: crate::memory::session_detect::detect_session(),
-        conversation: Default::default(),
-        user: Default::default(),
-        project: Default::default(),
-        temporal: Default::default(),
-        semantic: Default::default(),
-        code: Default::default(),
-        document: Default::default(),
-        environment: Default::default(),
-        parent: None,
-        embeddings: None,
-        decay_rate: 1.0,
-        created_at: now,
-        updated_at: now,
-    })
+    Some(ctx)
 }
 
 // =============================================================================
@@ -1568,11 +1551,17 @@ pub async fn upsert_memory(
         merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
     }
 
+    // Stamp the upsert with the active agent / worktree / branch — the
+    // upsert path is otherwise a writer that records no context, which would
+    // strand the AgentSession facet at default-empty.
+    let context = Some(crate::memory::session_detect::rich_context_with_session());
+
     let experience = Experience {
         content: req.content.clone(),
         experience_type,
         entities: merged_entities.clone(),
         tags: merged_entities,
+        context,
         ner_entities,
         ..Default::default()
     };
