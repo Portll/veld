@@ -746,6 +746,7 @@ impl SemanticConsolidator {
             .map(|m| m.experience.content.clone())
             .collect();
         let llm_facts = llm.extract_facts(&snippets)?;
+        let llm_version = llm.llm_version();
 
         let existing: std::collections::HashSet<String> = result
             .new_facts
@@ -762,13 +763,27 @@ impl SemanticConsolidator {
                 continue;
             }
             let fact_type = self.classify_fact(&llm_fact.fact);
+            // Provenance tag: persisted in `related_entities` with a
+            // `_llm_provenance:` prefix so it survives the round-trip to
+            // RocksDB without needing a SemanticFact schema bump. Reader
+            // tooling can grep for the prefix to recover provenance.
+            // Prefer the per-fact version when populated (in case the
+            // impl tagged individual facts differently), falling back to
+            // the consolidator-wide version.
+            let version_tag = if llm_fact.llm_version.is_empty() {
+                llm_version.clone()
+            } else {
+                llm_fact.llm_version.clone()
+            };
+            let mut related = llm_fact.entities;
+            related.push(format!("_llm_provenance:{version_tag}"));
             let new_fact = SemanticFact {
                 id: uuid::Uuid::new_v4().to_string(),
                 fact: llm_fact.fact,
                 confidence: llm_fact.confidence.clamp(0.0, 1.0),
                 support_count: 1,
                 source_memories: memories.iter().map(|m| m.id.clone()).collect(),
-                related_entities: llm_fact.entities,
+                related_entities: related,
                 created_at: now,
                 last_reinforced: now,
                 fact_type,
@@ -785,6 +800,7 @@ impl SemanticConsolidator {
 
         tracing::info!(
             llm_name = llm.name(),
+            llm_version = %llm_version,
             llm_facts_added = added,
             "augment_with_llm appended LLM-extracted facts"
         );
