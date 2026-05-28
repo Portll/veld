@@ -1,24 +1,38 @@
 # External knowledge sources
 
-Five permissively-licensed documentation corpora that broaden the alignment
-training set beyond Portll's own code. Each source is fetched into
-`pairs/_external/<repo>/` (gitignored) via `fetch.ps1` (Windows) or
+Twelve permissively-licensed documentation corpora that broaden the
+alignment training set beyond Portll's own code. Each source is fetched
+into `pairs/_external/<repo>/` (gitignored) via `fetch.ps1` (Windows) or
 `fetch.sh` (POSIX), then consumed by `alignment-collect` through the TOML
 specs alongside this README.
 
-The selection targets the languages the system most often answers questions
-about during tool use: JavaScript/TypeScript/React, Python, Rust. PostgreSQL
-is deferred because its docs ship as SGML which would need an extractor.
+The selection covers the ten domains the companion `EMBEDDING_ALIGNMENT.md`
+identifies as task-space targets. PostgreSQL was deferred because its docs
+ship as SGML; DuckDB carries the `database` domain with clean Markdown.
 
 ## Sources
 
-| TOML spec                       | Repo                                     | License       | Subtree fetched                                   | Format    |
-|---------------------------------|------------------------------------------|---------------|---------------------------------------------------|-----------|
-| `mdn-javascript.toml`           | mdn/content                              | CC-BY-SA-2.5  | `files/en-us/web/javascript/`                     | Markdown  |
-| `python-tutorial.toml`          | python/cpython                           | PSF-2.0       | `Doc/tutorial/`, `Doc/library/`                   | reST      |
-| `rust-by-example.toml`          | rust-lang/rust-by-example                | MIT/Apache-2.0| `src/`                                            | Markdown  |
-| `react-docs.toml`               | reactjs/react.dev                        | CC-BY-4.0     | `src/content/learn/`, `src/content/reference/`    | MDX       |
-| `typescript-handbook.toml`      | microsoft/TypeScript-Website             | CC-BY-4.0     | `packages/documentation/copy/en/`                 | Markdown  |
+### Original five (programming + web_development + docs)
+
+| TOML spec                  | Repo                              | License        | Subtree                                | Format   |
+|----------------------------|-----------------------------------|----------------|----------------------------------------|----------|
+| `mdn-javascript.toml`      | mdn/content                       | CC-BY-SA-2.5   | `files/en-us/web/javascript/`          | Markdown |
+| `python-tutorial.toml`     | python/cpython                    | PSF-2.0        | `Doc/`                                 | reST     |
+| `rust-by-example.toml`     | rust-lang/rust-by-example         | MIT/Apache-2.0 | `src/`                                 | Markdown |
+| `react-docs.toml`          | reactjs/react.dev                 | CC-BY-4.0      | `src/content/`                         | MDX      |
+| `typescript-handbook.toml` | microsoft/TypeScript-Website      | CC-BY-4.0      | `packages/documentation/`              | Markdown |
+
+### Seven new (project_management / database / analytics / devops / security / testing / ai_loop)
+
+| TOML spec                  | Repo                              | License             | Subtree                                | Format   |
+|----------------------------|-----------------------------------|---------------------|----------------------------------------|----------|
+| `rust-rfcs.toml`           | rust-lang/rfcs                    | Apache-2.0 OR MIT   | `text/`                                | Markdown |
+| `duckdb-docs.toml`         | duckdb/duckdb-web                 | MIT                 | `docs/`                                | Markdown |
+| `spark-docs.toml`          | apache/spark                      | Apache-2.0          | `docs/`                                | Markdown |
+| `kubernetes-docs.toml`     | kubernetes/website                | CC-BY-4.0           | `content/en/docs/concepts/`            | Markdown |
+| `owasp-cheatsheets.toml`   | OWASP/CheatSheetSeries            | CC-BY-SA-4.0        | `cheatsheets/`                         | Markdown |
+| `pytest-docs.toml`         | pytest-dev/pytest                 | MIT                 | `doc/en/`                              | reST     |
+| `langchain-docs.toml`      | langchain-ai/langchain            | MIT                 | `docs/docs/`                           | Markdown / MDX |
 
 All five formats are text-y enough that the existing paragraph chunker in
 `alignment-collect` handles them without modification. reST / MDX

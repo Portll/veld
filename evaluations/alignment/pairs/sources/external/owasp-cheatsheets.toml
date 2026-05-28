@@ -1,0 +1,8 @@
+domain = "security"
+kind = "filesystem"
+path = "evaluations/alignment/pairs/_external/OWASP-CheatSheetSeries/cheatsheets"
+extensions = ["md"]
+license = "CC-BY-SA-4.0"
+source = "owasp-cheat-sheet-series"
+min_chunk = 256
+max_chunk = 2048
