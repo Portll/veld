@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Veld launchd agent (macOS).
+
+  Installation (per-user):
+    1. Build the release binary:  cargo build --release
+    2. Copy this file and substitute __BINARY_PATH__:
+         sed "s|__BINARY_PATH__|$(pwd)/target/release/veld|" \
+           packaging/macos/net.portll.veld.plist \
+           > ~/Library/LaunchAgents/net.portll.veld.plist
+       (Or use /usr/local/bin/veld if installed via Homebrew.)
+    3. Load and start:
+         launchctl load -w ~/Library/LaunchAgents/net.portll.veld.plist
+    4. Verify:
+         launchctl list | grep portll.veld
+         curl http://127.0.0.1:3030/health
+
+  Uninstall:
+         launchctl unload -w ~/Library/LaunchAgents/net.portll.veld.plist
+         rm ~/Library/LaunchAgents/net.portll.veld.plist
+
+  Logs:  ~/Library/Logs/veld.log (stdout+stderr merged)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.portll.veld</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BINARY_PATH__</string>
+        <string>server</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/veld.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/veld.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
