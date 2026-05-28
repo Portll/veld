@@ -237,6 +237,15 @@ pub struct MultiUserMemoryManager {
     /// and ensures the sync TTL actually works across requests.
     pub slow_stores: DashMap<String, std::sync::Arc<crate::memory::slow_store::SlowStore>>,
 
+    /// Per-user BM25 (tantivy) index cache. Shared between the live
+    /// [`crate::memory::Bm25Projection`] (which writes through it from
+    /// the intent log) and any read-side hybrid-search reader that
+    /// needs to query the same documents. Wrapped in `Arc` because the
+    /// index's interior writer and reader are already lock-protected;
+    /// the outer pointer just amortises the open cost.
+    pub bm25_indices:
+        DashMap<String, std::sync::Arc<crate::memory::BM25Index>>,
+
     /// Per-user [`JournaledWriter`]. Created lazily on first journaled
     /// CRUD for that user; holds the open intent log, the per-user
     /// `CheckpointStore`, and the live `SqliteProjection` attached for
@@ -565,6 +574,7 @@ impl MultiUserMemoryManager {
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
+            bm25_indices: DashMap::new(),
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
             storage_capabilities,
@@ -1565,6 +1575,33 @@ impl MultiUserMemoryManager {
         Ok(store)
     }
 
+    /// Get or create a cached BM25 tantivy index for a user.
+    ///
+    /// The on-disk path mirrors what `MemorySystem` uses for the
+    /// retrieval-side BM25 — `{base_path}/{user_id}/bm25_projection_index`
+    /// — but is held under a *separate* directory so the projection's
+    /// writer cannot race with the retrieval engine's writer (tantivy
+    /// holds an exclusive lock per directory). The two indices converge
+    /// once every projection write is replayed; in steady state they
+    /// hold the same documents.
+    pub fn get_user_bm25_index(
+        &self,
+        user_id: &str,
+    ) -> Result<std::sync::Arc<crate::memory::BM25Index>> {
+        if let Some(index) = self.bm25_indices.get(user_id) {
+            return Ok(index.clone());
+        }
+        let user_path = self.base_path.join(user_id);
+        let bm25_path = user_path.join("bm25_projection_index");
+        std::fs::create_dir_all(&bm25_path)?;
+        let index =
+            std::sync::Arc::new(crate::memory::BM25Index::new(&bm25_path).with_context(
+                || format!("open BM25 projection index for user {user_id}"),
+            )?);
+        self.bm25_indices.insert(user_id.to_string(), index.clone());
+        Ok(index)
+    }
+
     /// Get or create a [`JournaledWriter`] for `user_id`.
     ///
     /// On first call for a tenant, this:
@@ -1573,11 +1610,12 @@ impl MultiUserMemoryManager {
     ///   2. opens (or creates) the per-user checkpoint store at
     ///      `{base_path}/{user_id}/projection_checkpoints.bin`,
     ///   3. instantiates a [`SqliteProjection`] wrapped around the user's
-    ///      `SlowStore`,
-    ///   4. **runs replay** so the SQLite slow store catches up to the
-    ///      head of the log before any live write lands, and
-    ///   5. attaches the projection to the writer so subsequent live
-    ///      `record_and_apply` calls dispatch through it.
+    ///      `SlowStore` and a [`Bm25Projection`] wrapped around the
+    ///      user's BM25 (tantivy) index,
+    ///   4. **runs replay** so both projections catch up to the head of
+    ///      the log before any live write lands, and
+    ///   5. attaches the projections to the writer so subsequent live
+    ///      `record_and_apply` calls dispatch through them in order.
     ///
     /// On any subsequent call this returns the cached writer.
     ///
@@ -1625,6 +1663,7 @@ impl MultiUserMemoryManager {
                 .with_context(|| format!("open checkpoint store for user {user_id}"))?,
         ));
 
+        // SQLite slow store projection — first attached, replays first.
         let slow_store = self.get_user_slow_store(user_id)?;
         let mut sqlite_projection = crate::memory::slow_store::SqliteProjection::new(
             slow_store.clone(),
@@ -1699,12 +1738,36 @@ impl MultiUserMemoryManager {
             );
         }
 
+        // Third projection: BM25 inverted index. Same independent-checkpoint
+        // pattern — a stalled BM25 can't block the others' catch-up.
+        let bm25_index = self.get_user_bm25_index(user_id)?;
+        let mut bm25_projection = crate::memory::Bm25Projection::new(
+            bm25_index.clone(),
+            checkpoint_store.clone(),
+        );
+        let bm25_applied = crate::intent_log::replay(
+            &log,
+            &mut bm25_projection,
+            Some(crate::memory::bm25_projection::COMMIT_EVERY),
+        )
+        .with_context(|| {
+            format!("replay intent log into BM25 projection for user {user_id}")
+        })?;
+        if bm25_applied > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                applied = bm25_applied,
+                "replayed intent log records into BM25 projection on first writer open",
+            );
+        }
+
         // Hand the log handle into the writer so subsequent appends
         // continue against the same file. Replay above used a read-only
         // borrow; the same handle is fine for the writer's appends.
         let mut writer = crate::intent_log::JournaledWriter::new(log);
         writer.add_projection(Box::new(sqlite_projection));
         writer.add_projection(Box::new(vamana_projection));
+        writer.add_projection(Box::new(bm25_projection));
 
         let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
         self.journaled_writers

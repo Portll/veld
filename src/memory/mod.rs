@@ -8,6 +8,7 @@
 //! - Automatic memory consolidation
 
 pub mod alignment_onboarding;
+pub mod bm25_projection;
 pub mod compression;
 pub mod context;
 pub mod context_blocks;
@@ -103,6 +104,7 @@ pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult}
 pub use crate::memory::graph_retrieval::{
     calculate_density_weights, spreading_activation_retrieve, ActivatedMemory,
 };
+pub use crate::memory::bm25_projection::{Bm25Projection, Bm25ProjectionError};
 pub use crate::memory::hybrid_search::{
     BM25Index, CrossEncoderReranker, HybridSearchConfig, HybridSearchEngine, HybridSearchResult,
     LearnedWeights, RRFusion, SignalScores,
