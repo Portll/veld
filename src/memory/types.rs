@@ -51,6 +51,10 @@ pub struct ScoringSignals {
     pub feedback_momentum: f32,
     /// Cross-encoder score: joint query-document attention (0.0-1.0)
     pub cross_encoder: f32,
+    /// RLM refiner score: LLM-driven relevance score (0.0-1.0). Populated
+    /// when the hybrid search engine runs with `RefinerMode::Rlm` or
+    /// `RefinerMode::Stacked`. Defaults to 0.0 (neutral) when no refiner ran.
+    pub rlm_score: f32,
     /// Memory importance: stored importance value (0.0-1.0)
     pub importance: f32,
     /// Entity match score: entity overlap with query (0.0-1.0)
