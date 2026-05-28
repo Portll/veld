@@ -41,6 +41,27 @@ pub trait LlmConsolidator: Send + Sync {
     /// Extract durable facts from a batch of episodic content snippets.
     fn extract_facts(&self, snippets: &[String]) -> Result<Vec<LlmExtractedFact>>;
 
+    /// Schema-constrained extraction (Cognee-style typed output).
+    ///
+    /// `schema_json` is a JSON Schema document the LLM is constrained
+    /// (via prompt instructions) to produce conforming output for. The
+    /// returned values are raw `serde_json::Value`s — callers are expected
+    /// to deserialize into their own caller-defined type via
+    /// `serde_json::from_value`.
+    ///
+    /// The default implementation returns `NotImplemented` so existing
+    /// impls don't have to ship a schema-aware path.
+    fn extract_with_schema(
+        &self,
+        _snippets: &[String],
+        _schema_json: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Err(anyhow!(
+            "{} does not implement schema-constrained extraction",
+            self.name()
+        ))
+    }
+
     /// Cheap descriptor for logging / metrics. Not load-bearing.
     fn name(&self) -> &str {
         "llm"
@@ -91,9 +112,86 @@ impl HttpLlmConsolidator {
     }
 }
 
+impl HttpLlmConsolidator {
+    /// Shared chat call used by both `extract_facts` and
+    /// `extract_with_schema`. Returns the raw model `content` string.
+    fn chat(&self, prompt: &str) -> Result<String> {
+        let request = ChatRequest {
+            model: &self.model,
+            messages: vec![ChatMessage {
+                role: "user",
+                content: prompt,
+            }],
+            temperature: 0.0,
+        };
+
+        let mut req = self.client.post(&self.endpoint).json(&request);
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req.send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "LLM endpoint {} → {}",
+                self.endpoint,
+                resp.status().as_u16()
+            ));
+        }
+        let body: ChatResponse = resp.json()?;
+        Ok(body
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("LLM response had no choices"))?
+            .message
+            .content)
+    }
+}
+
+/// Strip ```json … ``` fences a model may have wrapped its JSON in.
+fn strip_fences(s: &str) -> &str {
+    s.trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+}
+
 impl LlmConsolidator for HttpLlmConsolidator {
     fn name(&self) -> &str {
         "http-llm"
+    }
+
+    fn extract_with_schema(
+        &self,
+        snippets: &[String],
+        schema_json: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        if snippets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let joined = snippets
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("[{}] {}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            "Extract structured records from the following text. \
+             Return a JSON ARRAY in which every element conforms exactly to \
+             the JSON Schema below. Do NOT include any prose, prefix, or \
+             ```json fences. Only the raw JSON array.\n\n\
+             SCHEMA:\n{schema_json}\n\nTEXT:\n{joined}"
+        );
+
+        let content = self.chat(&prompt)?;
+        let trimmed = strip_fences(&content);
+        let values: Vec<serde_json::Value> = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!(
+                "LLM returned non-JSON-array payload under schema: {e}\nRaw: {content}"
+            ))?;
+        Ok(values)
     }
 
     fn extract_facts(&self, snippets: &[String]) -> Result<Vec<LlmExtractedFact>> {
@@ -116,44 +214,8 @@ impl LlmConsolidator for HttpLlmConsolidator {
              time-bound observations. Output JSON only, no prose.\n\n{joined}"
         );
 
-        let request = ChatRequest {
-            model: &self.model,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: &prompt,
-            }],
-            temperature: 0.0,
-        };
-
-        let mut req = self.client.post(&self.endpoint).json(&request);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-        let resp = req.send()?;
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "LLM endpoint {} → {}",
-                self.endpoint,
-                resp.status().as_u16()
-            ));
-        }
-        let body: ChatResponse = resp.json()?;
-        let content = body
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("LLM response had no choices"))?
-            .message
-            .content;
-
-        // The model may wrap JSON in ```json ... ``` fences — strip them.
-        let trimmed = content
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
+        let content = self.chat(&prompt)?;
+        let trimmed = strip_fences(&content);
         let facts: Vec<LlmExtractedFact> = serde_json::from_str(trimmed)
             .map_err(|e| anyhow!("LLM returned non-JSON facts payload: {e}\nRaw: {content}"))?;
         Ok(facts)

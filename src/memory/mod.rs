@@ -4036,6 +4036,62 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Construct a transient handle to the ACL store backed by the same
+    /// RocksDB instance. Cheap — just clones an `Arc<DB>` — and lets
+    /// callers grant / revoke / inspect ACLs without holding a long-lived
+    /// MemoryAclStore.
+    pub fn acl_store(&self) -> acl::MemoryAclStore {
+        acl::MemoryAclStore::new(self.long_term_memory.db())
+    }
+
+    /// Check whether `viewer_user_id` is allowed to read a memory owned by
+    /// `owner_user_id`. The owner always passes; other users pass only if
+    /// the ACL record grants them read or write.
+    pub fn can_read_memory(
+        &self,
+        owner_user_id: &str,
+        viewer_user_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<bool> {
+        if owner_user_id == viewer_user_id {
+            return Ok(true);
+        }
+        self.acl_store().can_read(owner_user_id, memory_id, viewer_user_id)
+    }
+
+    /// Authenticated memory read. Returns `Err` if the viewer lacks ACL
+    /// permission. Use this at API boundaries when a cross-user request is
+    /// possible; the existing `get_memory` stays for owner-internal use
+    /// (consolidation, maintenance, etc.).
+    pub fn get_memory_for_viewer(
+        &self,
+        owner_user_id: &str,
+        viewer_user_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<Memory> {
+        if !self.can_read_memory(owner_user_id, viewer_user_id, memory_id)? {
+            return Err(anyhow::anyhow!(
+                "ACL: viewer '{viewer_user_id}' is not allowed to read \
+                 memory {} owned by '{owner_user_id}'",
+                memory_id.0
+            ));
+        }
+        self.get_memory(memory_id)
+    }
+
+    /// Symmetric write check for cross-user writes.
+    pub fn can_write_memory(
+        &self,
+        owner_user_id: &str,
+        actor_user_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<bool> {
+        if owner_user_id == actor_user_id {
+            return Ok(true);
+        }
+        self.acl_store().can_write(owner_user_id, memory_id, actor_user_id)
+    }
+
     /// Get children of a memory
     pub fn get_memory_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
         self.long_term_memory.get_children(parent_id)
