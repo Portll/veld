@@ -1,0 +1,43 @@
+# Veld systemd user service (Linux).
+#
+# Installation (per-user, no root needed):
+#   1. Build the release binary:  cargo build --release
+#   2. Copy this file and substitute __BINARY_PATH__:
+#        mkdir -p ~/.config/systemd/user
+#        sed "s|__BINARY_PATH__|$(pwd)/target/release/veld|" \
+#          packaging/linux/veld.service \
+#          > ~/.config/systemd/user/veld.service
+#      (Or use /usr/local/bin/veld if installed system-wide.)
+#   3. Enable and start:
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now veld.service
+#   4. Verify:
+#        systemctl --user status veld.service
+#        curl http://127.0.0.1:3030/health
+#
+# Survive logout (linger):
+#   sudo loginctl enable-linger $USER
+#
+# Uninstall:
+#   systemctl --user disable --now veld.service
+#   rm ~/.config/systemd/user/veld.service
+#   systemctl --user daemon-reload
+#
+# Logs:  journalctl --user -u veld.service -f
+
+[Unit]
+Description=Veld - Agentic Memory server
+Documentation=https://github.com/Portll/veld
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__BINARY_PATH__ server
+Restart=on-failure
+RestartSec=10
+# Veld writes to ~/.local/share/veld or %APPDATA% by default; no chdir needed.
+# Cap memory to prevent runaway in case of leak (adjust to your machine):
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target
