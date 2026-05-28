@@ -34,7 +34,7 @@ $sources = @(
     @{ Folder = "kubernetes-website";     Repo = "https://github.com/kubernetes/website.git";          Sub = "content/en/docs/concepts" },
     @{ Folder = "OWASP-CheatSheetSeries"; Repo = "https://github.com/OWASP/CheatSheetSeries.git";      Sub = "cheatsheets" },
     @{ Folder = "pytest";                 Repo = "https://github.com/pytest-dev/pytest.git";           Sub = "doc/en" },
-    @{ Folder = "langchain";              Repo = "https://github.com/langchain-ai/langchain.git";      Sub = "docs/docs" }
+    @{ Folder = "transformers";           Repo = "https://github.com/huggingface/transformers.git";    Sub = "docs/source/en" }
 )
 
 foreach ($src in $sources) {

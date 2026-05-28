@@ -30,7 +30,7 @@ sources=(
     "kubernetes-website|https://github.com/kubernetes/website.git|content/en/docs/concepts"
     "OWASP-CheatSheetSeries|https://github.com/OWASP/CheatSheetSeries.git|cheatsheets"
     "pytest|https://github.com/pytest-dev/pytest.git|doc/en"
-    "langchain|https://github.com/langchain-ai/langchain.git|docs/docs"
+    "transformers|https://github.com/huggingface/transformers.git|docs/source/en"
 )
 
 for entry in "${sources[@]}"; do

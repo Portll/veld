@@ -1,8 +1,8 @@
 domain = "ai_loop"
 kind = "filesystem"
-path = "evaluations/alignment/pairs/_external/langchain/docs/docs"
-extensions = ["md", "mdx"]
-license = "MIT"
-source = "langchain-docs"
+path = "evaluations/alignment/pairs/_external/transformers/docs/source/en"
+extensions = ["md"]
+license = "Apache-2.0"
+source = "huggingface-transformers-docs"
 min_chunk = 256
 max_chunk = 2048

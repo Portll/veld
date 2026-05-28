@@ -32,7 +32,7 @@ ship as SGML; DuckDB carries the `database` domain with clean Markdown.
 | `kubernetes-docs.toml`     | kubernetes/website                | CC-BY-4.0           | `content/en/docs/concepts/`            | Markdown |
 | `owasp-cheatsheets.toml`   | OWASP/CheatSheetSeries            | CC-BY-SA-4.0        | `cheatsheets/`                         | Markdown |
 | `pytest-docs.toml`         | pytest-dev/pytest                 | MIT                 | `doc/en/`                              | reST     |
-| `langchain-docs.toml`      | langchain-ai/langchain            | MIT                 | `docs/docs/`                           | Markdown / MDX |
+| `langchain-docs.toml`      | huggingface/transformers          | Apache-2.0          | `docs/source/en/`                      | Markdown |
 
 All five formats are text-y enough that the existing paragraph chunker in
 `alignment-collect` handles them without modification. reST / MDX
