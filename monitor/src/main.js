@@ -2,6 +2,30 @@
 // Subscribes to "snapshot-updated" events from the Rust side, falls back to
 // polling get_snapshot() if the event channel hasn't delivered for >5s.
 
+function showDebug(msg) {
+  const el = document.getElementById("debug");
+  if (!el) return;
+  el.style.display = "block";
+  el.textContent = msg;
+}
+
+window.addEventListener("error", (e) => {
+  showDebug(`JS error: ${e.message}\n  at ${e.filename}:${e.lineno}:${e.colno}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  showDebug(`Unhandled rejection: ${e.reason}`);
+});
+
+if (!window.__TAURI__) {
+  showDebug(
+    "window.__TAURI__ is undefined — `withGlobalTauri: true` is missing or didn't take effect."
+  );
+  throw new Error("Tauri global not injected");
+}
+showDebug(
+  `__TAURI__ keys: ${Object.keys(window.__TAURI__).join(", ")}`
+);
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
