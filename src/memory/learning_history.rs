@@ -346,6 +346,25 @@ impl LearningHistoryStore {
                 None,
                 None,
             ),
+            // Sleep-time / observational memory events. Bucketed as
+            // MaintenanceCycleCompleted until the sleep-time scaffold lands a
+            // dedicated `LearningEventType::SleepTime*` taxonomy; the resulting
+            // observation memory (when present) is exposed via the memory_a
+            // slot so the index still threads through to the memory_id.
+            ConsolidationEvent::SleepTimeObservationEmitted { memory_id, .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                Some(memory_id.clone()),
+                None,
+                None,
+            ),
+            ConsolidationEvent::SleepTimeBlockRewritten { .. }
+            | ConsolidationEvent::SleepTimeRewriteAborted { .. }
+            | ConsolidationEvent::SleepTimeBudgetExhausted { .. } => (
+                LearningEventType::MaintenanceCycleCompleted,
+                None,
+                None,
+                None,
+            ),
         }
     }
 
