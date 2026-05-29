@@ -92,7 +92,8 @@ pub fn set_shared_zenoh_session(session: zenoh::Session) {
 use crate::embeddings::Embedder;
 use crate::memory::compression::CompressionPipeline;
 pub use crate::memory::compression::{
-    ConsolidationResult, FactType, SemanticConsolidator, SemanticFact,
+    CausalFactLink, ConsolidationResult, FactCluster, FactType, PurgeReason, SemanticConsolidator,
+    SemanticFact,
 };
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
@@ -6069,6 +6070,145 @@ impl MemorySystem {
         &self.fact_store
     }
 
+    /// Administratively purge facts matching `predicate`, marking each with
+    /// `purged_at = now()` and the supplied [`PurgeReason`]. Returns
+    /// `(purged_count, total_scanned)`.
+    ///
+    /// Purge is a soft delete: the record survives on disk with `purged_at`
+    /// set so it is hidden from every active reader path (via
+    /// [`compression::is_active`]) but remains available to forensic
+    /// `*_filtered(include_inactive = true)` queries and the reaper's
+    /// retention window.
+    ///
+    /// Idempotent: a fact already marked purged is skipped (no overwrite of
+    /// the original `purged_at` timestamp / reason).
+    ///
+    /// Concurrency: callers should hold the per-user `FACT_PURGE_LOCKS`
+    /// mutex (in `handlers::facts`) for the duration of this call. The
+    /// store itself is thread-safe via RocksDB, but acquiring the lock
+    /// serialises purge bursts and prevents the contradiction-detector
+    /// (which writes `valid_until`) from racing with us on the same record.
+    pub fn purge_facts<F>(
+        &self,
+        user_id: &str,
+        predicate: F,
+        reason: PurgeReason,
+    ) -> Result<(usize, usize)>
+    where
+        F: Fn(&SemanticFact) -> bool,
+    {
+        const PURGE_CORPUS_CAP: usize = 10_000;
+        let now = chrono::Utc::now();
+        let candidates = self.fact_store.list(user_id, PURGE_CORPUS_CAP)?;
+        let total = candidates.len();
+        let mut purged = 0;
+
+        for mut fact in candidates {
+            if fact.purged_at.is_some() {
+                continue;
+            }
+            if !predicate(&fact) {
+                continue;
+            }
+            fact.purged_at = Some(now);
+            fact.purge_reason = Some(reason.clone());
+            // Update preserves the existing record id + indices; only the
+            // primary record changes shape on disk.
+            self.fact_store.update(user_id, &fact)?;
+            purged += 1;
+        }
+
+        Ok((purged, total))
+    }
+
+    /// Build fact narratives by clustering currently-active facts on shared
+    /// entities.
+    ///
+    /// Algorithm (ported from `shodh-memory`):
+    ///   1. Compute entity document-frequency (DF) over the candidate set.
+    ///   2. Designate entities appearing in ≥ 20% of facts (and at least 5)
+    ///      as *hub* entities. Hubs are skipped for topic selection because
+    ///      they are too generic to form a useful cluster.
+    ///   3. For each fact, pick its *lowest-DF* non-hub entity as the topic;
+    ///      facts with no discriminative entity drop into `__uncategorized__`.
+    ///   4. Group by topic, build clusters with 2+ facts (or single facts
+    ///      with a real topic). Sort by `total_support` DESC, truncate.
+    ///
+    /// `entity_filter` (when supplied) narrows the candidate set to facts
+    /// related to that entity (max 200 facts), otherwise the most-recent
+    /// 500 facts are considered.
+    ///
+    /// All facts surfaced are guaranteed active (`is_active` is enforced by
+    /// `find_by_entity` / `list` reader paths) — purged and bi-temporally
+    /// expired facts never appear in narratives.
+    pub fn build_fact_narratives(
+        &self,
+        user_id: &str,
+        limit: usize,
+        entity_filter: Option<&str>,
+    ) -> Result<Vec<FactCluster>> {
+        let facts = if let Some(entity) = entity_filter {
+            self.fact_store.find_by_entity(user_id, entity, 200)?
+        } else {
+            self.fact_store.list(user_id, 500)?
+        };
+
+        if facts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let n = facts.len();
+        let mut entity_df: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for f in &facts {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for e in &f.related_entities {
+                if seen.insert(e.as_str()) {
+                    *entity_df.entry(e.as_str()).or_default() += 1;
+                }
+            }
+        }
+        let hub_threshold = (n as f32 * 0.20).max(5.0) as usize;
+        let hub_entities: std::collections::HashSet<&str> = entity_df
+            .iter()
+            .filter(|(_, count)| **count >= hub_threshold)
+            .map(|(e, _)| *e)
+            .collect();
+
+        let mut topic_groups: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, f) in facts.iter().enumerate() {
+            let best_entity = f
+                .related_entities
+                .iter()
+                .filter(|e| !hub_entities.contains(e.as_str()))
+                .min_by_key(|e| entity_df.get(e.as_str()).copied().unwrap_or(usize::MAX));
+            let topic = match best_entity {
+                Some(e) => e.clone(),
+                None => "__uncategorized__".to_string(),
+            };
+            topic_groups.entry(topic).or_default().push(i);
+        }
+
+        let mut clusters: Vec<FactCluster> = topic_groups
+            .into_iter()
+            .filter(|(topic, indices)| {
+                indices.len() >= 2 || (indices.len() == 1 && topic != "__uncategorized__")
+            })
+            .map(|(_, indices)| build_single_cluster(&facts, &indices))
+            .collect();
+
+        // Deterministic ordering: total_support DESC, topic ASC as tie-breaker
+        // (per breakers R1.5.03 — fixes backend-dependent iteration order).
+        clusters.sort_by(|a, b| {
+            b.total_support
+                .cmp(&a.total_support)
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
+        clusters.truncate(limit);
+        Ok(clusters)
+    }
+
     // =========================================================================
     // SHO-118: DECISION LINEAGE GRAPH METHODS
     // =========================================================================
@@ -6245,4 +6385,174 @@ impl Drop for MemorySystem {
             tracing::error!("Failed to flush storage on shutdown: {}", e);
         }
     }
+}
+
+// =============================================================================
+// Fact Narrative Helpers (private, used by MemorySystem::build_fact_narratives)
+// =============================================================================
+
+/// Build a single [`FactCluster`] from a set of fact indices.
+fn build_single_cluster(all_facts: &[SemanticFact], indices: &[usize]) -> FactCluster {
+    use std::collections::HashMap;
+
+    let mut entity_counts: HashMap<&str, usize> = HashMap::new();
+    let mut cluster_facts: Vec<SemanticFact> = Vec::with_capacity(indices.len());
+
+    for &i in indices {
+        let f = &all_facts[i];
+        cluster_facts.push(f.clone());
+        for e in &f.related_entities {
+            *entity_counts.entry(e.as_str()).or_default() += 1;
+        }
+    }
+
+    cluster_facts.sort_by_key(|f| f.created_at);
+
+    let topic = entity_counts
+        .iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(n, _)| (*n).to_string())
+        .unwrap_or_else(|| "General".to_string());
+
+    let mut entities: Vec<String> = entity_counts.keys().map(|e| (*e).to_string()).collect();
+    entities.sort();
+
+    let narrative = if cluster_facts.len() == 1 {
+        format!("Regarding {}: {}", topic, cluster_facts[0].fact)
+    } else {
+        let mut lines = vec![format!(
+            "Regarding {} ({} facts):",
+            topic,
+            cluster_facts.len()
+        )];
+        for (i, f) in cluster_facts.iter().enumerate() {
+            let label = if f.confidence >= 0.8 {
+                "established"
+            } else if f.confidence >= 0.5 {
+                "probable"
+            } else {
+                "tentative"
+            };
+            lines.push(format!("  {}. [{}] {}", i + 1, label, f.fact));
+        }
+        lines.join("\n")
+    };
+
+    let causal_chains = detect_causal_chains(&cluster_facts);
+
+    let avg_confidence = if cluster_facts.is_empty() {
+        0.0
+    } else {
+        cluster_facts.iter().map(|f| f.confidence).sum::<f32>() / cluster_facts.len() as f32
+    };
+    let total_support: usize = cluster_facts.iter().map(|f| f.support_count).sum();
+
+    FactCluster {
+        topic,
+        entities,
+        facts: cluster_facts,
+        narrative,
+        avg_confidence,
+        total_support,
+        causal_chains,
+    }
+}
+
+/// Detect causal relationships between temporally ordered facts that share at
+/// least one entity. Heuristic keyword analysis on the *later* fact classifies
+/// the relation as `superseded_by` > `resolved_by` > `informed_by` > `led_to`.
+fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
+    const SUPERSEDED_KEYWORDS: &[&str] = &[
+        "replaced",
+        "instead",
+        "no longer",
+        "removed",
+        "upgraded",
+        "converted",
+        "refactored",
+        "deprecated",
+    ];
+    const RESOLVED_KEYWORDS: &[&str] = &[
+        "fixed",
+        "resolved",
+        "patched",
+        "corrected",
+        "addressed",
+        "eliminated",
+    ];
+    const INFORMED_KEYWORDS: &[&str] = &[
+        "based on",
+        "learned from",
+        "following",
+        "after discovering",
+        "informed by",
+        "derived from",
+    ];
+    const GENERAL_EVOLUTION: &[&str] = &[
+        "migrated",
+        "updated",
+        "changed",
+        "now uses",
+        "switched",
+        "added",
+        "resulted in",
+        "prompted",
+        "triggered",
+        "spawned",
+        "caused",
+        "introduced",
+        "implemented",
+        "enabled",
+    ];
+
+    let mut chains = Vec::new();
+    let lowered: Vec<String> = sorted_facts.iter().map(|f| f.fact.to_lowercase()).collect();
+    let all_keywords: Vec<&str> = SUPERSEDED_KEYWORDS
+        .iter()
+        .chain(RESOLVED_KEYWORDS.iter())
+        .chain(INFORMED_KEYWORDS.iter())
+        .chain(GENERAL_EVOLUTION.iter())
+        .copied()
+        .collect();
+
+    for i in 0..sorted_facts.len() {
+        for j in (i + 1)..sorted_facts.len() {
+            let a = &sorted_facts[i];
+            let b = &sorted_facts[j];
+
+            let shared = a
+                .related_entities
+                .iter()
+                .any(|e| b.related_entities.contains(e));
+            if !shared {
+                continue;
+            }
+
+            let b_lower = &lowered[j];
+            let has_evolution = all_keywords.iter().any(|kw| b_lower.contains(kw));
+            if !has_evolution {
+                continue;
+            }
+
+            let relation = if SUPERSEDED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
+                "superseded_by"
+            } else if RESOLVED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
+                "resolved_by"
+            } else if INFORMED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
+                "informed_by"
+            } else {
+                "led_to"
+            };
+
+            chains.push(CausalFactLink {
+                from_fact_id: a.id.clone(),
+                to_fact_id: b.id.clone(),
+                from_fact: a.fact.clone(),
+                to_fact: b.fact.clone(),
+                relation: relation.to_string(),
+            });
+        }
+    }
+
+    chains
 }

@@ -269,13 +269,13 @@ mod tests {
             self.0
                 .execute(sql, params)
                 .await
-                .map_err(|e| Box::new(e) as BoxError)
+                .map_err(BoxError::new)
         }
         async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
             self.0
                 .query(sql, params)
                 .await
-                .map_err(|e| Box::new(e) as BoxError)
+                .map_err(BoxError::new)
         }
         fn backend(&self) -> RelationalBackend {
             self.0.backend()
