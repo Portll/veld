@@ -1,0 +1,835 @@
+{
+  "benchmark": "LOCOMO_LLM_JUDGE_v2",
+  "version": "0.7.19+89",
+  "build": "afd99b4",
+  "date": "2026-05-29",
+  "judge_model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+  "corpus_size": 20,
+  "query_count": 20,
+  "content_hash": "abaa2872539a2c3",
+  "metrics_version": "intugest-2026-03-30",
+  "overall": {
+    "mrr": 0.9167,
+    "r5": 0.845,
+    "r10": 0.905,
+    "evidence_sufficiency_avg": 2.85,
+    "answer_correctness_avg": 2.8,
+    "generation_gap_count": 0,
+    "avg_misleading_per_query": 2.65,
+    "avg_contradictions_per_query": 0.0,
+    "avg_latency_ms": 44912
+  },
+  "contamination": {
+    "total_misleading_memories": 53,
+    "total_contradictions": 0,
+    "queries_with_misleading": 19,
+    "queries_with_contradictions": 0
+  },
+  "freshness": {
+    "band_distribution": {
+      "A_0_7d": 44,
+      "B_7_30d": 39,
+      "D_90d_plus": 17
+    },
+    "note": "LOCOMO dataset has 28-day window \u2014 all memories fall in Band B. Use LongMemEval for meaningful freshness stratification."
+  },
+  "by_type": [
+    {
+      "type": "single-hop",
+      "n": 5,
+      "mrr": 0.9,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency_avg": 3.0,
+      "answer_correctness_avg": 3.0,
+      "avg_misleading": 2.4,
+      "avg_contradictions": 0.0
+    },
+    {
+      "type": "temporal",
+      "n": 5,
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency_avg": 3.0,
+      "answer_correctness_avg": 3.0,
+      "avg_misleading": 4.0,
+      "avg_contradictions": 0.0
+    },
+    {
+      "type": "multi-hop",
+      "n": 5,
+      "mrr": 1.0,
+      "r5": 0.8667,
+      "r10": 0.8667,
+      "evidence_sufficiency_avg": 3.0,
+      "answer_correctness_avg": 2.8,
+      "avg_misleading": 2.0,
+      "avg_contradictions": 0.0
+    },
+    {
+      "type": "open-domain",
+      "n": 5,
+      "mrr": 0.7667,
+      "r5": 0.5133,
+      "r10": 0.7533,
+      "evidence_sufficiency_avg": 2.4,
+      "answer_correctness_avg": 2.4,
+      "avg_misleading": 2.2,
+      "avg_contradictions": 0.0
+    }
+  ],
+  "per_query": [
+    {
+      "query": "What database did we choose for the analytics pipeline?",
+      "type": "single-hop",
+      "expected": [
+        "M02"
+      ],
+      "returned": [
+        "M02",
+        "M18",
+        "M09",
+        "M20",
+        "M19"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly addresses the question about the chosen database for the analytics pipeline.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1, which mentions PostgreSQL, the reasons for its choice, and the voting outcome.",
+      "misleading_count": 0,
+      "misleading_positions": [],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "A_0_7d",
+        "B_7_30d",
+        "D_90d_plus",
+        "A_0_7d"
+      ],
+      "ms": 53305
+    },
+    {
+      "query": "What was the root cause of the Redis cache invalidation bug?",
+      "type": "single-hop",
+      "expected": [
+        "M05"
+      ],
+      "returned": [
+        "M05",
+        "M01",
+        "M03",
+        "M09",
+        "M11"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence fully supports answering the question about the Redis cache invalidation bug.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be derived from Memory 1 alone, which directly describes the root cause and fix of the bug.",
+      "misleading_count": 1,
+      "misleading_positions": [
+        2
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d"
+      ],
+      "ms": 48016
+    },
+    {
+      "query": "What is my preferred IDE theme and font?",
+      "type": "single-hop",
+      "expected": [
+        "M04"
+      ],
+      "returned": [
+        "M04",
+        "M20",
+        "M16",
+        "M12",
+        "M17"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly states the preferred IDE theme and font, providing full evidence to answer the question.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1 alone, which explicitly mentions the Dracula theme, Catppuccin Mocha terminal theme, Fira Code font, and preference for dark mode.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "D_90d_plus",
+        "A_0_7d",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 49976
+    },
+    {
+      "query": "How many story points did we commit to in Sprint 14?",
+      "type": "single-hop",
+      "expected": [
+        "M01"
+      ],
+      "returned": [
+        "M20",
+        "M01",
+        "M14",
+        "M09",
+        "M13"
+      ],
+      "mrr": 0.5,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence fully supports answering the question about the number of story points committed to in Sprint 14.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be directly derived from Memory 1 and Memory 2, which both mention committing to 34 story points in Sprint 14.",
+      "misleading_count": 3,
+      "misleading_positions": [
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "D_90d_plus",
+        "B_7_30d",
+        "A_0_7d",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 51791
+    },
+    {
+      "query": "What were the security vulnerabilities found in the penetration test?",
+      "type": "single-hop",
+      "expected": [
+        "M14"
+      ],
+      "returned": [
+        "M14",
+        "M20",
+        "M05",
+        "M07",
+        "M19"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly mentions the security vulnerabilities found in the penetration test.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1 alone.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "D_90d_plus",
+        "B_7_30d",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 53288
+    },
+    {
+      "query": "What happened during the production incident that caused downtime?",
+      "type": "temporal",
+      "expected": [
+        "M09"
+      ],
+      "returned": [
+        "M09",
+        "M17",
+        "M16",
+        "M20",
+        "M08"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 provides direct evidence that supports answering the question about the production incident.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer could be fully derived from Memory 1 alone, which contains all the necessary information about the incident.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "A_0_7d",
+        "A_0_7d",
+        "D_90d_plus",
+        "B_7_30d"
+      ],
+      "ms": 44214
+    },
+    {
+      "query": "When is my conference talk and what is it about?",
+      "type": "temporal",
+      "expected": [
+        "M11"
+      ],
+      "returned": [
+        "M11",
+        "M17",
+        "M20",
+        "M01",
+        "M13"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly supports answering the question about the conference talk.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1 alone.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "A_0_7d",
+        "D_90d_plus",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 46721
+    },
+    {
+      "query": "When does Priya start and who is she replacing?",
+      "type": "temporal",
+      "expected": [
+        "M15"
+      ],
+      "returned": [
+        "M15",
+        "M06",
+        "M20",
+        "M10",
+        "M19"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence fully supports answering the question about Priya's start date and who she is replacing.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be derived from Memory 1 alone, which provides all the necessary information.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "B_7_30d",
+        "D_90d_plus",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 51568
+    },
+    {
+      "query": "What are the dates for the company hackathon?",
+      "type": "temporal",
+      "expected": [
+        "M17"
+      ],
+      "returned": [
+        "M17",
+        "M20",
+        "M19",
+        "M18",
+        "M16"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly mentions the company hackathon dates, providing full evidence to answer the question.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1, which explicitly states the hackathon dates and the team's project.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "D_90d_plus",
+        "A_0_7d",
+        "A_0_7d",
+        "A_0_7d"
+      ],
+      "ms": 49139
+    },
+    {
+      "query": "When was the EU checkout latency issue finally resolved?",
+      "type": "temporal",
+      "expected": [
+        "M19"
+      ],
+      "returned": [
+        "M19",
+        "M18",
+        "M20",
+        "M14",
+        "M13"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly addresses the EU checkout latency issue and its resolution.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1 alone.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "A_0_7d",
+        "D_90d_plus",
+        "A_0_7d",
+        "A_0_7d"
+      ],
+      "ms": 49332
+    },
+    {
+      "query": "How did Sarah's Stripe migration fix the EU checkout delay problem?",
+      "type": "multi-hop",
+      "expected": [
+        "M03",
+        "M10",
+        "M19"
+      ],
+      "returned": [
+        "M19",
+        "M01",
+        "M20",
+        "M05",
+        "M14"
+      ],
+      "mrr": 1.0,
+      "r5": 0.3333333333333333,
+      "r10": 0.3333333333333333,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly addresses the EU checkout delay problem and its resolution through Sarah's Stripe v3 EU migration.",
+      "answer_correctness": 2,
+      "answer_reason": "While Memory 1 provides key information about the resolution, it lacks details about the initial US migration and the specific latency improvements mentioned in the gold answer.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "B_7_30d",
+        "D_90d_plus",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 48323
+    },
+    {
+      "query": "What caching problems did we have and how were they resolved?",
+      "type": "multi-hop",
+      "expected": [
+        "M01",
+        "M05"
+      ],
+      "returned": [
+        "M01",
+        "M05",
+        "M11",
+        "M19",
+        "M15"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence from Memories 1 and 2 directly supports answering the question about caching problems and their resolution.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memories 1 and 2, which provide details about the Redis cache invalidation bug and its fix.",
+      "misleading_count": 2,
+      "misleading_positions": [
+        3,
+        4
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d",
+        "A_0_7d",
+        "A_0_7d"
+      ],
+      "ms": 41187
+    },
+    {
+      "query": "Which team member reviewed the onboarding wizard and what did they find?",
+      "type": "multi-hop",
+      "expected": [
+        "M07",
+        "M12"
+      ],
+      "returned": [
+        "M07",
+        "M12",
+        "M01",
+        "M13",
+        "M20"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence fully supports answering the question about the team member who reviewed the onboarding wizard and what they found.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be derived from Memory 2, which mentions Marcus' code review feedback on the onboarding wizard.",
+      "misleading_count": 1,
+      "misleading_positions": [
+        1
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d",
+        "A_0_7d",
+        "D_90d_plus"
+      ],
+      "ms": 41556
+    },
+    {
+      "query": "What is Raj working on now and what happens when he leaves?",
+      "type": "multi-hop",
+      "expected": [
+        "M05",
+        "M15"
+      ],
+      "returned": [
+        "M15",
+        "M01",
+        "M05",
+        "M06",
+        "M07"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence supports answering the question about Raj's current work and what happens when he leaves.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be derived from memories 1 and 3 alone, which provide information about Raj's current work and his transfer.",
+      "misleading_count": 2,
+      "misleading_positions": [
+        2,
+        4
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d",
+        "B_7_30d"
+      ],
+      "ms": 40384
+    },
+    {
+      "query": "How do our analytics benchmark numbers compare to the Q3 OKR targets?",
+      "type": "multi-hop",
+      "expected": [
+        "M13",
+        "M18"
+      ],
+      "returned": [
+        "M18",
+        "M13",
+        "M20",
+        "M02",
+        "M09"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence from Memory 1 directly supports answering the question about analytics benchmark numbers compared to Q3 OKR targets.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer could be derived from Memory 1 alone, which provides the necessary information about the analytics pipeline benchmark and its comparison to the Q3 OKR target.",
+      "misleading_count": 1,
+      "misleading_positions": [
+        2
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "A_0_7d",
+        "D_90d_plus",
+        "B_7_30d",
+        "B_7_30d"
+      ],
+      "ms": 42550
+    },
+    {
+      "query": "What is the team's overall morale and social dynamics like?",
+      "type": "open-domain",
+      "expected": [
+        "M06",
+        "M20"
+      ],
+      "returned": [
+        "M06",
+        "M20",
+        "M13",
+        "M15",
+        "M07"
+      ],
+      "mrr": 1.0,
+      "r5": 1.0,
+      "r10": 1.0,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "The evidence from Memories 1 and 2 directly supports answering the question about the team's overall morale and social dynamics.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memories 1 and 2, which provide information about team morale, social events, and velocity.",
+      "misleading_count": 1,
+      "misleading_positions": [
+        3
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "B_7_30d",
+        "D_90d_plus",
+        "A_0_7d",
+        "A_0_7d",
+        "B_7_30d"
+      ],
+      "ms": 41602
+    },
+    {
+      "query": "What are the most important strategic priorities for the team?",
+      "type": "open-domain",
+      "expected": [
+        "M13",
+        "M16"
+      ],
+      "returned": [
+        "M13",
+        "M20",
+        "M15",
+        "M06",
+        "M17"
+      ],
+      "mrr": 1.0,
+      "r5": 0.5,
+      "r10": 0.5,
+      "evidence_sufficiency": 3,
+      "evidence_reason": "Memory 1 directly mentions the team's key results and VP Elena's emphasis on enterprise onboarding, providing strong evidence to answer the question.",
+      "answer_correctness": 3,
+      "answer_reason": "The gold answer can be fully derived from Memory 1, which explicitly states the team's key results and priorities.",
+      "misleading_count": 4,
+      "misleading_positions": [
+        2,
+        3,
+        4,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "D_90d_plus",
+        "A_0_7d",
+        "B_7_30d",
+        "A_0_7d"
+      ],
+      "ms": 40035
+    },
+    {
+      "query": "What infrastructure and deployment decisions have we made recently?",
+      "type": "open-domain",
+      "expected": [
+        "M02",
+        "M08",
+        "M16"
+      ],
+      "returned": [
+        "M20",
+        "M19",
+        "M16",
+        "M18",
+        "M17"
+      ],
+      "mrr": 0.3333333333333333,
+      "r5": 0.3333333333333333,
+      "r10": 1.0,
+      "evidence_sufficiency": 2,
+      "evidence_reason": "The evidence partially supports answering the question about infrastructure and deployment decisions.",
+      "answer_correctness": 2,
+      "answer_reason": "The gold answer could be partially derived from these memories alone, with mentions of GraphQL and PostgreSQL.",
+      "misleading_count": 3,
+      "misleading_positions": [
+        1,
+        2,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "D_90d_plus",
+        "A_0_7d",
+        "A_0_7d",
+        "A_0_7d",
+        "A_0_7d"
+      ],
+      "ms": 40608
+    },
+    {
+      "query": "What performance improvements have we achieved across the product?",
+      "type": "open-domain",
+      "expected": [
+        "M05",
+        "M07",
+        "M10",
+        "M12",
+        "M18",
+        "M19"
+      ],
+      "returned": [
+        "M18",
+        "M13",
+        "M12",
+        "M20",
+        "M17"
+      ],
+      "mrr": 1.0,
+      "r5": 0.3333333333333333,
+      "r10": 0.6666666666666666,
+      "evidence_sufficiency": 2,
+      "evidence_reason": "The evidence partially supports answering the question about performance improvements, with some memories mentioning specific metrics and optimizations.",
+      "answer_correctness": 2,
+      "answer_reason": "The gold answer could be partially derived from these memories alone, with some mentions of performance improvements and metrics, but not all details are present.",
+      "misleading_count": 2,
+      "misleading_positions": [
+        2,
+        5
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "A_0_7d",
+        "B_7_30d",
+        "D_90d_plus",
+        "A_0_7d"
+      ],
+      "ms": 33628
+    },
+    {
+      "query": "Who are the key people on the team and what are they responsible for?",
+      "type": "open-domain",
+      "expected": [
+        "M01",
+        "M05",
+        "M06",
+        "M10",
+        "M15"
+      ],
+      "returned": [
+        "M13",
+        "M15",
+        "M02",
+        "M20",
+        "M01"
+      ],
+      "mrr": 0.5,
+      "r5": 0.4,
+      "r10": 0.6,
+      "evidence_sufficiency": 2,
+      "evidence_reason": "The evidence partially supports answering the question about key people and their responsibilities.",
+      "answer_correctness": 2,
+      "answer_reason": "The gold answer could be partially derived from these memories alone, with some information about team members and their tasks.",
+      "misleading_count": 1,
+      "misleading_positions": [
+        3
+      ],
+      "contradiction_count": 0,
+      "contradictions": [],
+      "freshness_bands": [
+        "A_0_7d",
+        "A_0_7d",
+        "B_7_30d",
+        "D_90d_plus",
+        "B_7_30d"
+      ],
+      "ms": 31021
+    }
+  ]
+}
