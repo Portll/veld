@@ -678,6 +678,67 @@ pub struct RecurrencePattern {
 // AGENT SESSION — worktree / branch / agent identity at encoding time
 // =============================================================================
 
+/// Closed set of chat-brand identifiers accepted on
+/// [`AgentSession::agent_id`].
+///
+/// Anything outside this whitelist is rejected at write time by
+/// [`validate_agent_id`]. Keeping the brand axis small is deliberate: it
+/// is the source-of-truth for per-agent filtering in the planned worktree
+/// viewer, and an open string field invites brand-spelling drift
+/// (`claude` / `Claude Code` / `claude-cli` …) which would silently
+/// fragment that filter. The fallback `"unknown"` slot exists so a
+/// detection helper that fails to identify the parent process still has a
+/// valid value to record instead of forcing `None` and losing the fact
+/// that the field was probed.
+pub const KNOWN_AGENT_BRANDS: &[&str] =
+    &["Claude", "Copilot", "Cursor", "Aider", "Continue", "unknown"];
+
+/// Validate an agent-brand identifier against [`KNOWN_AGENT_BRANDS`].
+///
+/// Returns the original value when it is a recognised brand, `None` when
+/// the input was already `None`, and `None` (after logging a single
+/// `WARN`) when the input was `Some(_)` but not whitelisted. The intent
+/// is "drop the bad value, don't poison the record with it" — callers
+/// populating [`AgentSession`] programmatically (e.g. the planned
+/// parent-process detection helper) should funnel their input through
+/// this function before assigning the field.
+///
+/// Matching is case-sensitive on purpose: the whitelist values double as
+/// the canonical capitalisation the worktree viewer renders, so a caller
+/// passing `"claude"` instead of `"Claude"` is asserting a brand the
+/// downstream UI does not know how to group with the canonical one and
+/// is therefore rejected.
+pub fn validate_agent_id(opt: Option<String>) -> Option<String> {
+    match opt {
+        None => None,
+        Some(value) => {
+            if KNOWN_AGENT_BRANDS.iter().any(|brand| *brand == value) {
+                Some(value)
+            } else {
+                tracing::warn!(
+                    target: "veld::memory::facets",
+                    invalid_agent_id = %value,
+                    "rejecting non-whitelisted agent brand"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Serde adapter that runs the incoming `agent_id` field through
+/// [`validate_agent_id`] at deserialize time. Any value that survives the
+/// whitelist check lands in the struct; any rejected value (including a
+/// malformed JSON shape that decodes as a non-string variant) is folded
+/// to `None` so a corrupt write upstream cannot poison the field.
+fn deserialize_agent_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(validate_agent_id(raw))
+}
+
 /// Records which agent was operating from which git worktree/branch at the
 /// moment a memory was written.
 ///
@@ -699,6 +760,13 @@ pub struct RecurrencePattern {
 /// (written before this facet existed) deserialize cleanly to an empty
 /// session, and so partial captures (e.g. branch known, worktree path not
 /// yet probed) round-trip without losing the fields that *were* captured.
+///
+/// `agent_id` is additionally constrained: it must be one of
+/// [`KNOWN_AGENT_BRANDS`]. The deserialize path enforces this through
+/// [`validate_agent_id`]; programmatic populators (e.g. the parent-process
+/// detection helper that lives on a parallel branch) must funnel their
+/// input through [`validate_agent_id`] before assignment so the wire
+/// shape and the in-memory shape agree on what a valid brand is.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentSession {
     /// Absolute path of the active worktree this agent was running in.
@@ -716,7 +784,12 @@ pub struct AgentSession {
     /// with a Claude/Copilot extension active, the Claude binaries, `cursor`,
     /// etc.) the brand follows. The binary / launcher slug is the fallback
     /// when detection is ambiguous.
-    #[serde(default)]
+    ///
+    /// Constrained to [`KNOWN_AGENT_BRANDS`] at deserialize time via
+    /// [`validate_agent_id`]; a non-whitelisted value coming off the wire
+    /// is folded to `None` with a single `WARN` log instead of poisoning
+    /// the field with an arbitrary string.
+    #[serde(default, deserialize_with = "deserialize_agent_id")]
     pub agent_id: Option<String>,
     /// VS Code window id when the agent is running inside a VS Code window.
     /// Lets the planned viewer disambiguate concurrent windows on the same
@@ -1134,5 +1207,71 @@ mod tests {
                 assert_eq!(known, KNOWN_FACET_SCHEMA_VERSIONS);
             }
         }
+    }
+
+    // ========================================================================
+    // Agent-brand whitelist — B1
+    // ========================================================================
+
+    #[test]
+    fn validate_agent_id_passes_whitelisted_brands_through() {
+        for brand in KNOWN_AGENT_BRANDS {
+            let kept = validate_agent_id(Some((*brand).to_string()));
+            assert_eq!(
+                kept,
+                Some((*brand).to_string()),
+                "{brand} should round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_agent_id_folds_unknown_brand_to_none() {
+        // Capitalisation must match the canonical entry — `claude` is not
+        // `Claude`, so it's rejected.
+        assert_eq!(validate_agent_id(Some("claude".into())), None);
+        assert_eq!(validate_agent_id(Some("ChatGPT".into())), None);
+        assert_eq!(validate_agent_id(Some("".into())), None);
+        assert_eq!(validate_agent_id(Some("Claude\0".into())), None);
+    }
+
+    #[test]
+    fn validate_agent_id_preserves_none() {
+        assert_eq!(validate_agent_id(None), None);
+    }
+
+    #[test]
+    fn agent_session_deserialize_rejects_non_whitelisted_brand() {
+        // Wire shape includes a `"foo"` brand: deserialize must fold it to
+        // `None` while keeping the rest of the session intact, so a single
+        // bad field doesn't poison the whole record.
+        let json = r#"{
+            "worktree_path": "/repo/wt",
+            "branch": "main",
+            "agent_id": "foo",
+            "vscode_window_id": null,
+            "started_at": null,
+            "parent_repo": null
+        }"#;
+        let session: AgentSession = serde_json::from_str(json).unwrap();
+        assert_eq!(session.agent_id, None);
+        assert_eq!(session.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn agent_session_deserialize_accepts_whitelisted_brand() {
+        let json = r#"{"agent_id": "Claude"}"#;
+        let session: AgentSession = serde_json::from_str(json).unwrap();
+        assert_eq!(session.agent_id.as_deref(), Some("Claude"));
+    }
+
+    #[test]
+    fn agent_session_deserialize_handles_missing_agent_id() {
+        // `#[serde(default)]` still applies — an absent field decodes to
+        // `None` and skips the validator entirely.
+        let json = r#"{"branch": "main"}"#;
+        let session: AgentSession = serde_json::from_str(json).unwrap();
+        assert_eq!(session.agent_id, None);
+        assert_eq!(session.branch.as_deref(), Some("main"));
     }
 }

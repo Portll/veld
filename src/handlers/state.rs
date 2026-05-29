@@ -292,7 +292,7 @@ pub struct MultiUserMemoryManager {
     /// database, since the [`crate::datasets::DatasetStore`] trait does not
     /// expose raw SELECT.
     pub dataset_executor:
-        Option<std::sync::Arc<dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>>>,
+        Option<std::sync::Arc<dyn crate::storage::relational::RelationalStore<Error = crate::storage::relational::BoxError>>>,
 
     /// Sleep-time / observational memory orchestrator (V1). `Some` only
     /// when [`crate::config::SleepTimeConfig::enabled`] is true at startup
@@ -641,7 +641,7 @@ impl MultiUserMemoryManager {
         dataset_store: std::sync::Arc<dyn crate::datasets::DatasetStore>,
         link_store: std::sync::Arc<dyn crate::datasets::LinkStore>,
         dataset_executor: std::sync::Arc<
-            dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>,
+            dyn crate::storage::relational::RelationalStore<Error = crate::storage::relational::BoxError>,
         >,
     ) -> Self {
         self.dataset_store = Some(dataset_store);

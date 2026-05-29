@@ -59,6 +59,41 @@ impl TestHarness {
         }
     }
 
+    /// Build a harness around a pre-built [`MultiUserMemoryManager`].
+    ///
+    /// Used by tests that need to configure manager-level features
+    /// (e.g. attach W7 dataset stores via `with_dataset_stores`) before the
+    /// router observes the state.
+    pub fn with_manager(manager: MultiUserMemoryManager, temp_dir: TempDir) -> Self {
+        static ENV_INIT: Once = Once::new();
+        ENV_INIT.call_once(|| unsafe {
+            std::env::set_var("VELD_API_KEYS", TEST_API_KEY);
+        });
+        Self {
+            manager: Arc::new(manager),
+            _temp_dir: temp_dir,
+        }
+    }
+
+    /// Build a fresh [`MultiUserMemoryManager`] without wrapping it — useful
+    /// when the caller wants to chain builder helpers and then pass the
+    /// result to [`Self::with_manager`].
+    pub fn fresh_manager() -> (MultiUserMemoryManager, TempDir) {
+        static ENV_INIT: Once = Once::new();
+        ENV_INIT.call_once(|| unsafe {
+            std::env::set_var("VELD_API_KEYS", TEST_API_KEY);
+        });
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let config = ServerConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let manager = MultiUserMemoryManager::new(temp_dir.path().to_path_buf(), config)
+            .expect("failed to create test MultiUserMemoryManager");
+        (manager, temp_dir)
+    }
+
     /// Get a clone of the shared state (what handlers receive via `State(..)`).
     pub fn state(&self) -> Arc<MultiUserMemoryManager> {
         self.manager.clone()

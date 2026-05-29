@@ -34,6 +34,7 @@ pub mod relation_extraction;
 mod recall;
 pub mod replay;
 pub mod llm_reranker;
+pub mod rlm_refiner;
 pub mod retrieval;
 pub mod segmentation;
 pub mod session_detect;
