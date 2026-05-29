@@ -63,9 +63,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            // X-button closes the whole app, matching the standard desktop
+            // expectation. The tray menu still has Show / Quit; the tray
+            // icon stays available while the window is hidden via the
+            // menu "Hide" path, but pressing X = exit.
+            if let WindowEvent::CloseRequested { .. } = event {
+                window.app_handle().exit(0);
             }
         })
         .invoke_handler(tauri::generate_handler![

@@ -8,7 +8,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     App, Manager,
 };
 use veld_status_core::{ReachState, StatusSnapshot};
@@ -54,7 +54,16 @@ pub fn build(app: &mut App, snapshot: Arc<RwLock<StatusSnapshot>>) -> tauri::Res
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { .. } = event {
+            // Only LEFT click + button release opens the window. Right click
+            // must fall through to the OS so the context menu can appear; if
+            // we match all clicks here we swallow that event and the menu
+            // (which contains the only Quit option) never shows.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
                 if let Some(window) = tray.app_handle().get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
