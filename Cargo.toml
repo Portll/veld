@@ -115,9 +115,14 @@ mimalloc = "0.1"
 
 # Core
 anyhow = "1.0"
-async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 query planner, W7 DatasetStore)
+async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 query planner, W7 DatasetStore, GDrive OauthProvider)
 thiserror = "2.0"
 dotenvy = "0.15"  # Load .env files
+
+# OAuth2 (GDrive connector, Phase-1 provider). v5 typestate.
+oauth2 = { version = "5", default-features = false, features = ["reqwest-blocking", "rustls-tls"] }
+secrecy = "0.10"  # SecretBox<String> wrapper for in-memory tokens; type-system enforces no log leak
+open = "5"        # Cross-platform browser opener for `veld oauth login`
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
 
 # Async runtime & web server
@@ -272,6 +277,7 @@ zenoh = { version = "1.1", default-features = false, features = ["transport_tcp"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 http-body-util = "0.1"
+httpmock = "0.7"  # In-process HTTP mocks for OAuth token-endpoint tests
 tempfile = "3.24"
 
 [[bench]]
