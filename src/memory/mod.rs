@@ -5037,11 +5037,20 @@ impl MemorySystem {
         } else {
             (0, 0)
         };
-        if facts_decayed > 0 || facts_deleted > 0 {
+        // 3.6. Purge-retention reaper: hard-delete soft-purged facts whose
+        // VELD_PURGE_RETENTION_DAYS window has expired. Runs only on heavy
+        // cycles since it scans the same fact set as decay.
+        let facts_reaped = if is_heavy {
+            self.reap_purged_facts_for_all_users().unwrap_or(0)
+        } else {
+            0
+        };
+        if facts_decayed > 0 || facts_deleted > 0 || facts_reaped > 0 {
             tracing::debug!(
-                "Temporal fact maintenance: {} decayed, {} deleted",
+                "Temporal fact maintenance: {} decayed, {} deleted, {} reaped",
                 facts_decayed,
-                facts_deleted
+                facts_deleted,
+                facts_reaped
             );
         }
 
@@ -5986,6 +5995,54 @@ impl MemorySystem {
         &self.fact_store
     }
 
+    /// Administratively purge facts matching `predicate`. Soft-delete via
+    /// `purged_at` + `purge_reason` (NOT a hard-delete; the reaper task
+    /// removes records after their purge-retention window expires).
+    ///
+    /// Returns `(purged, total_scanned)`. `total_scanned` is bounded by the
+    /// `PURGE_CORPUS_CAP` so callers can detect truncation.
+    ///
+    /// Idempotent: a fact already marked purged is skipped (no overwrite of
+    /// the original `purged_at` timestamp / reason).
+    ///
+    /// Concurrency: callers should hold the per-user `FACT_PURGE_LOCKS`
+    /// mutex (in `handlers::facts`) for the duration of this call. The
+    /// store itself is thread-safe via RocksDB, but acquiring the lock
+    /// serialises purge bursts and prevents the contradiction-detector
+    /// (which writes `valid_until`) from racing with us on the same record.
+    pub fn purge_facts<F>(
+        &self,
+        user_id: &str,
+        predicate: F,
+        reason: PurgeReason,
+    ) -> Result<(usize, usize)>
+    where
+        F: Fn(&SemanticFact) -> bool,
+    {
+        const PURGE_CORPUS_CAP: usize = 10_000;
+        let now = chrono::Utc::now();
+        let candidates = self.fact_store.list(user_id, PURGE_CORPUS_CAP)?;
+        let total = candidates.len();
+        let mut purged = 0;
+
+        for mut fact in candidates {
+            if fact.purged_at.is_some() {
+                continue;
+            }
+            if !predicate(&fact) {
+                continue;
+            }
+            fact.purged_at = Some(now);
+            fact.purge_reason = Some(reason.clone());
+            // Update preserves the existing record id + indices; only the
+            // primary record changes shape on disk.
+            self.fact_store.update(user_id, &fact)?;
+            purged += 1;
+        }
+
+        Ok((purged, total))
+    }
+
     /// Build fact narratives by clustering currently-active facts on shared
     /// entities.
     ///
@@ -6233,6 +6290,54 @@ impl MemorySystem {
         }
 
         Ok((total_decayed, total_deleted))
+    }
+
+    /// Hard-delete facts whose `purged_at` window has expired.
+    ///
+    /// Runs as part of the maintenance loop alongside `decay_facts_for_all_users`.
+    /// Uses a SEPARATE retention window from contradiction-decay so operators can
+    /// tune the audit-trail lifetime independently. Retention defaults are
+    /// `VELD_PURGE_RETENTION_DAYS=30` and `VELD_CONTRADICTION_RETENTION_DAYS=90`
+    /// (per overloop-P2 D-L2). `purged_at` takes precedence: a fact with both
+    /// `purged_at` and `valid_until` set is reaped on the purge window.
+    ///
+    /// Returns the number of facts hard-deleted.
+    fn reap_purged_facts_for_all_users(&self) -> Result<usize> {
+        let retention_days: i64 = std::env::var("VELD_PURGE_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        if retention_days < 0 {
+            // Operator opt-out: negative value disables reaping (keep audit trail forever).
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+        let user_ids = self.fact_store.list_users(100)?;
+        let mut total_reaped = 0;
+
+        for user_id in &user_ids {
+            // include_inactive=true so we can see purged facts.
+            let facts = self.fact_store.list_filtered(user_id, 10_000, true)?;
+            for fact in facts {
+                let Some(purged_at) = fact.purged_at else {
+                    continue;
+                };
+                if purged_at > cutoff {
+                    continue;
+                }
+                self.fact_store.delete(user_id, &fact.id)?;
+                total_reaped += 1;
+            }
+        }
+
+        if total_reaped > 0 {
+            tracing::info!(
+                facts_reaped = total_reaped,
+                retention_days,
+                "Purge-retention reaper complete"
+            );
+        }
+        Ok(total_reaped)
     }
 }
 

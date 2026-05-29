@@ -319,6 +319,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/facts/preview-purge",
             post(facts::facts_preview_purge),
         )
+        .route("/api/facts/purge", post(facts::facts_purge))
         // =================================================================
         // TEMPORAL FACTS
         // =================================================================
