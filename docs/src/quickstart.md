@@ -2,11 +2,11 @@
 
 Get veld running and store your first memory in under 60 seconds.
 
-```admonish tip
-If you only want to use veld with Claude Code and don't care about the
-underlying details, skip to step 5 and use `veld claude` — it handles
-the daemon, MCP wiring, and hooks for you.
-```
+> **💡 Tip**
+>
+> If you only want to use veld with Claude Code and don't care about the
+> underlying details, skip to step 5 and use `veld claude` — it handles
+> the daemon, MCP wiring, and hooks for you.
 
 ## Prerequisites
 

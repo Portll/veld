@@ -40,7 +40,7 @@ jobs:
       - name: Install mdBook and preprocessors
         run: |
           cargo install --locked mdbook --version "^0.4"
-          cargo install --locked mdbook-mermaid mdbook-toc mdbook-linkcheck mdbook-admonish
+          cargo install --locked mdbook-mermaid mdbook-toc
 
       - name: Run all generators
         working-directory: docs

@@ -1,7 +1,8 @@
 <!-- GENERATED FILE — do not edit by hand.
      Source: mcp-server/index.ts
      Generator: docs/generators/src/bin/gen-mcp-tools.rs
-     Regenerate: cd docs/generators && cargo run --bin gen-mcp-tools -->
+     Regenerate: bash docs/regenerate.sh
+     (or, inside docs/generators/, run `cargo run --bin gen-mcp-tools`) -->
 
 # MCP Tools
 

@@ -9,13 +9,13 @@ Consolidation is veld's background maintenance pipeline. It runs as a detached
 
 ```mermaid
 flowchart TB
-    T[Trigger:<br/>POST /api/consolidate<br/>or sleep-phase] --> LK{Acquire<br/>per-user lock}
-    LK -->|busy| SKIP[Skip — already running]
-    LK -->|got it| S1[Stage 1:<br/>Fact extraction]
-    S1 --> S2[Stage 2:<br/>Maintenance<br/>· decay<br/>· tier promotion<br/>· replay<br/>· pattern detection]
-    S2 --> S3[Stage 3:<br/>Graph strengthening<br/>· edge boosts<br/>· promotion propagation]
-    S3 --> REL[Release lock]
-    REL --> RPT[Available via<br/>/api/consolidation/report]
+    T["Trigger:<br/>POST /api/consolidate<br/>or sleep-phase"] --> LK{"Acquire<br/>per-user lock"}
+    LK -->|busy| SKIP["Skip - already running"]
+    LK -->|got it| S1["Stage 1:<br/>Fact extraction"]
+    S1 --> S2["Stage 2: Maintenance<br/>- decay<br/>- tier promotion<br/>- replay<br/>- pattern detection"]
+    S2 --> S3["Stage 3: Graph strengthening<br/>- edge boosts<br/>- promotion propagation"]
+    S3 --> REL["Release lock"]
+    REL --> RPT["Available via<br/>/api/consolidation/report"]
 ```
 
 Implementation: [src/handlers/consolidation.rs](https://github.com/Portll/veld/blob/main/src/handlers/consolidation.rs)
