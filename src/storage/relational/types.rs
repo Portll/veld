@@ -4,6 +4,7 @@
 //! adapters all funnel their native column representations through
 //! [`ColumnValue`] and accept [`Param`] for bound parameters.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// Identifier for the concrete backend behind a `RelationalStore`.
@@ -11,12 +12,15 @@ use std::fmt;
 /// Higher-level code uses this to make capability decisions (e.g. whether to
 /// rely on SQLite-only `INSERT OR REPLACE`, or Postgres-specific `RETURNING`)
 /// without resorting to runtime SQL probing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalBackend {
     Sqlite,
     Postgres,
     Supabase,
     Mssql,
+    /// Any backend not enumerated above. The string is the implementer's
+    /// stable identifier (e.g. "duckdb", "mariadb").
+    Custom(Cow<'static, str>),
 }
 
 impl fmt::Display for RelationalBackend {
@@ -26,6 +30,7 @@ impl fmt::Display for RelationalBackend {
             RelationalBackend::Postgres => "postgres",
             RelationalBackend::Supabase => "supabase",
             RelationalBackend::Mssql => "mssql",
+            RelationalBackend::Custom(name) => name.as_ref(),
         };
         f.write_str(name)
     }
@@ -81,6 +86,37 @@ impl OwnedColumnValue {
             OwnedColumnValue::Text(s) => ColumnValue::Text(s.as_str()),
             OwnedColumnValue::Bytes(b) => ColumnValue::Bytes(b.as_slice()),
             OwnedColumnValue::Json(v) => ColumnValue::Json(v),
+        }
+    }
+}
+
+/// Public, backend-neutral owned column value used by external
+/// [`RelationalStore`] implementations to construct rows.
+///
+/// In-tree adapters use the private [`OwnedColumnValue`] directly; this
+/// type is the stable surface for downstream crates so the internal
+/// representation remains free to evolve.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnedColumn {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Text(String),
+    Bytes(Vec<u8>),
+    Json(serde_json::Value),
+}
+
+impl OwnedColumn {
+    fn into_internal(self) -> OwnedColumnValue {
+        match self {
+            OwnedColumn::Null => OwnedColumnValue::Null,
+            OwnedColumn::Bool(b) => OwnedColumnValue::Bool(b),
+            OwnedColumn::I64(i) => OwnedColumnValue::I64(i),
+            OwnedColumn::F64(f) => OwnedColumnValue::F64(f),
+            OwnedColumn::Text(s) => OwnedColumnValue::Text(s),
+            OwnedColumn::Bytes(b) => OwnedColumnValue::Bytes(b),
+            OwnedColumn::Json(v) => OwnedColumnValue::Json(v),
         }
     }
 }
@@ -155,6 +191,18 @@ impl Row {
     /// neutral [`OwnedColumnValue`] representation.
     pub(crate) fn new(columns: Vec<ColumnMeta>, values: Vec<OwnedColumnValue>) -> Self {
         debug_assert_eq!(columns.len(), values.len(), "row column/value arity mismatch");
+        Self { columns, values }
+    }
+
+    /// Construct a [`Row`] from public, owned column values.
+    ///
+    /// Used by external [`RelationalStore`] backends in downstream crates
+    /// that cannot reach the crate-private [`OwnedColumnValue`] type. The
+    /// public [`OwnedColumn`] enum is converted into the internal
+    /// representation here.
+    pub fn from_owned(columns: Vec<ColumnMeta>, values: Vec<OwnedColumn>) -> Self {
+        debug_assert_eq!(columns.len(), values.len(), "row column/value arity mismatch");
+        let values = values.into_iter().map(OwnedColumn::into_internal).collect();
         Self { columns, values }
     }
 
@@ -308,5 +356,40 @@ impl<T: FromColumn> FromColumn for Option<T> {
             ColumnValue::Null => Ok(None),
             other => T::from_column(other).map(Some),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_from_owned_constructible_from_public_api() {
+        let columns = vec![
+            ColumnMeta { name: "id".into(), sql_type: "INT".into() },
+            ColumnMeta { name: "name".into(), sql_type: "TEXT".into() },
+        ];
+        let values = vec![
+            OwnedColumn::I64(7),
+            OwnedColumn::Text("hello".into()),
+        ];
+        let row = Row::from_owned(columns, values);
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.get::<i64>(0).unwrap(), 7);
+        assert_eq!(row.get_by_name::<String>("name").unwrap(), "hello");
+    }
+
+    #[test]
+    fn relational_backend_custom_displays_string() {
+        let b = RelationalBackend::Custom(std::borrow::Cow::Borrowed("duckdb"));
+        assert_eq!(b.to_string(), "duckdb");
+    }
+
+    #[test]
+    fn relational_backend_known_variants_unchanged() {
+        assert_eq!(RelationalBackend::Sqlite.to_string(), "sqlite");
+        assert_eq!(RelationalBackend::Postgres.to_string(), "postgres");
+        assert_eq!(RelationalBackend::Supabase.to_string(), "supabase");
+        assert_eq!(RelationalBackend::Mssql.to_string(), "mssql");
     }
 }
