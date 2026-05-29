@@ -116,6 +116,7 @@ mimalloc = "0.1"
 # Core
 anyhow = "1.0"
 thiserror = "2.0"
+async-trait = "0.1"  # `dyn` trait support for async methods on `RelationalStore` (W4/W7 shim)
 dotenvy = "0.15"  # Load .env files
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
 
@@ -126,6 +127,14 @@ futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "timeout"] }
+
+# Optional: compile-time docs embedding for self-contained release binaries.
+# Off by default — dev builds stay lean and use the filesystem at docs/book/.
+# Enable with `--features embedded-docs` for release/install artifacts so a
+# fresh `cargo install veld` carries the full sidecar without needing the
+# repo checkout. In debug builds the macro reads from the filesystem at
+# request time anyway, so iteration is unaffected.
+rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 tower_governor = { version = "0.8", features = ["axum"] }
 governor = "0.10"  # Direct GCRA limiter handle (used by ResettableRateLimit for admin-reset support)
 subtle = "2.6"  # Constant-time equality for admin API key compare
@@ -387,6 +396,11 @@ pdf = ["dep:pdf-extract"]
 # Eliminates ALL tracing, replaces error messages with codes,
 # custom panic handler, anti-debug, integrity checks.
 fortress = []
+
+# Embed the mdBook output (`docs/book/`) into the veld binary so the standalone
+# distribution carries the docs without needing the repo on disk. Adds ~3-5 MB
+# to the release binary. Required by CI when producing release artifacts.
+embedded-docs = ["dep:rust-embed"]
 
 # Optional: Distributed tracing for cloud/multi-node deployments (~200 extra packages)
 telemetry = [

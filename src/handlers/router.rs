@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, admin, compression, consolidation, context_blocks, crud, external_dimensions,
+    ab_testing, admin, compression, consolidation, context_blocks, crud, docs, external_dimensions,
     facts, files, gap_analysis, graph, health, ingest, integrations, lineage, mif, prompt_gen,
-    recall, remember, search, seed, sessions, todos, user_auth, users, visualization, webhooks,
+    recall, remember, search, seed, sessions, sleep_time, todos, user_auth, users, visualization,
+    webhooks,
 };
 
 /// Application state type alias
@@ -49,6 +50,7 @@ pub const PUBLIC_PATHS: &[&str] = &[
     "/api/context/status",
     "/api/context_status",
     "/graph/view",
+    "/docs",
     "/api/admin/reset-rate-limit",
 ];
 
@@ -98,6 +100,11 @@ pub fn build_public_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/admin/reset-rate-limit",
             post(admin::reset_rate_limit),
         );
+
+    // STATIC DOCS (mdBook output at docs/book/, or VELD_DOCS_DIR). Carries
+    // no per-tenant data; safe to mount on the public router. Falls back to
+    // a "not built" placeholder when the directory is missing.
+    let r = r.merge(docs::routes());
 
     let r = if metrics_public {
         r.route(METRICS_PATH_IF_PUBLIC, get(health::metrics_endpoint))
@@ -334,6 +341,16 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/context/blocks/{key}",
             delete(context_blocks::delete_context_block),
         )
+        // =================================================================
+        // SLEEP-TIME / OBSERVATIONAL MEMORY (V1)
+        // =================================================================
+        .route("/api/sleep_time/enqueue", post(sleep_time::enqueue))
+        .route("/api/sleep_time/status", get(sleep_time::status))
+        .route(
+            "/api/sleep_time/status/{user_id}",
+            get(sleep_time::user_status),
+        )
+        .route("/api/sleep_time/lock_block", post(sleep_time::lock_block))
         // =================================================================
         // LINEAGE
         // =================================================================
