@@ -29,9 +29,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 custom-protocol = ["tauri/custom-protocol"]
 
 [profile.release]
+# `lto = "thin"` + parallel codegen is the safe middle ground:
+# - opt-level = "z" still optimises for size
+# - thin LTO cuts the Windows linker memory ceiling from ~6 GB (with full LTO)
+#   to ~2 GB, fixing the STATUS_STACK_BUFFER_OVERRUN we hit at link time
+# - codegen-units = 16 lets the linker parallelise instead of feeding it a
+#   single huge module
+# - strip = true keeps the binary small (~12-15 MB vs ~30+ MB unstripped)
 opt-level = "z"
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = true
+panic = "abort"
 
 [workspace]
