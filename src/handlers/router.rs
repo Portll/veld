@@ -14,8 +14,8 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
-    mif, prompt_gen, recall, remember, search, seed, sessions, sleep_time, todos, user_auth, users,
-    visualization, webhooks,
+    mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time, todos, user_auth,
+    users, visualization, webhooks,
 };
 
 /// Application state type alias
@@ -648,6 +648,11 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/datasets/{name}/rows", post(datasets::insert_rows))
         .route("/api/datasets/{name}/query", post(datasets::query_dataset))
         .route("/api/datasets/{name}/link", post(datasets::link_row))
+        // =================================================================
+        // QUERY PLANNER (W6 — explainable multi-source planning)
+        // =================================================================
+        .route("/api/query/plan", post(query::plan_query))
+        .route("/api/query/execute", post(query::execute_query))
         // =================================================================
         // MIF (Memory Interchange Format) v2
         // =================================================================
