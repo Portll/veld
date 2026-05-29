@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the main window — allows core event/window APIs plus the three custom commands.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-close",
+    "core:webview:allow-create-webview-window",
+    {
+      "identifier": "core:default"
+    }
+  ]
+}
