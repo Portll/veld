@@ -3094,3 +3094,53 @@ impl MultiUserMemoryManager {
         Ok(())
     }
 }
+
+/// W6 query-planner integration: surface each tenant's live Vamana
+/// indices to the planner's vector adapter (`RealVectorQuerier`).
+///
+/// The adapter needs two things per `(user_id, kind)`: the shared
+/// `Arc<RwLock<VamanaIndex>>` to search, and the reverse
+/// `(vector_id → memory_id)` map to resolve hits back to memory ids.
+/// Both live on the per-kind [`crate::vector_db::VamanaProjection`],
+/// which the write path *moves* into the tenant's
+/// [`crate::intent_log::JournaledWriter`] and which then stays there for
+/// the tenant's lifetime. Rather than duplicate that state into a
+/// parallel map — which would drift on every write and could never
+/// capture a *lazy* projection's index (it only materialises on the
+/// first embedded memory of that kind) — we reach through the live
+/// writer to the projection that owns it.
+///
+/// `kind` is the projection-name string carried in the `VectorPredicate`
+/// (e.g. `"vamana-text-primary"`), which is exactly what
+/// [`crate::intent_log::TypedProjection::name`] reports, so resolution is
+/// a direct name match. Each call clones the index `Arc` out and releases
+/// the writer mutex immediately; the ANN search runs under the index's
+/// own `RwLock`, never under the writer lock.
+impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
+    fn index(
+        &self,
+        user_id: &str,
+        kind: &str,
+    ) -> Option<std::sync::Arc<parking_lot::RwLock<crate::vector_db::VamanaIndex>>> {
+        let writer = self.get_user_journaled_writer(user_id).ok()?;
+        let guard = writer.lock();
+        let projection = guard.projection_by_name(kind)?;
+        let vamana = projection
+            .as_any()
+            .downcast_ref::<crate::vector_db::VamanaProjection>()?;
+        // `index()` is `None` while the projection is still lazy (no
+        // embedded memory of this kind yet); that resolves to "no
+        // candidates" upstream, which is correct.
+        vamana.index().cloned()
+    }
+
+    fn memory_id_for(&self, user_id: &str, kind: &str, vector_id: u32) -> Option<String> {
+        let writer = self.get_user_journaled_writer(user_id).ok()?;
+        let guard = writer.lock();
+        let projection = guard.projection_by_name(kind)?;
+        let vamana = projection
+            .as_any()
+            .downcast_ref::<crate::vector_db::VamanaProjection>()?;
+        vamana.memory_id_for(vector_id)
+    }
+}

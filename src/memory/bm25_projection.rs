@@ -301,6 +301,10 @@ impl TypedProjection for Bm25Projection {
         }
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Static arm: the replay driver hands us [`IntentRecord`]s straight off
