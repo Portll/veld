@@ -26,11 +26,15 @@
 //! cost-based join ordering, stage budgets, and explainability without
 //! rewriting recall.
 
+pub mod adapters;
 pub mod executor;
 pub mod plan;
 pub mod planner;
 pub mod predicate;
 
+pub use adapters::{
+    RealRelationalQuerier, RealVectorQuerier, StubGraphQuerier, VamanaProvider,
+};
 pub use executor::{
     Executor, GraphQuerier, RelationalQuerier, ScoredMemoryId, VectorQuerier,
 };
