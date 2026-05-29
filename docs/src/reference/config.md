@@ -6,12 +6,13 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **79** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **83** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
 | `VELD_ACTIVATION_DECAY` | — | `src/config.rs` |
 | `VELD_ADMIN_KEY` | — | `src/handlers/users.rs` |
+| `VELD_AGENT_ID` | — | `src/memory/session_detect.rs` |
 | `VELD_ALIGNMENT_AUTOFIT` | — | `src/memory/alignment_onboarding.rs` |
 | `VELD_ALIGNMENT_PAIRS` | — | `src/memory/alignment_onboarding.rs` |
 | `VELD_ALIGNMENT_PATH` | — | `src/embeddings/alignment.rs` |
@@ -31,6 +32,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_CORS_ORIGINS` | — | `src/config.rs` |
 | `VELD_CORS_WARN` | — | `src/config.rs` |
 | `VELD_DEV_API_KEY` | — | `src/auth.rs` |
+| `VELD_DOCS_DIR` | — | `src/handlers/docs.rs` |
 | `VELD_EMBEDDING_API_KEY` | — | `src/embeddings/http_embedder.rs` |
 | `VELD_EMBEDDING_API_MODEL` | — | `src/embeddings/http_embedder.rs` |
 | `VELD_EMBEDDING_API_TIMEOUT_MS` | — | `src/embeddings/http_embedder.rs` |
@@ -61,6 +63,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_NOMIC_DIM` | — | `src/embeddings/nomic.rs` |
 | `VELD_NOMIC_EMBED_TIMEOUT_MS` | — | `src/embeddings/nomic.rs` |
 | `VELD_NOMIC_MODEL_PATH` | — | `src/embeddings/nomic.rs` |
+| `VELD_NOMIC_POOL_SIZE` | — | `src/embeddings/nomic.rs` |
 | `VELD_NOMIC_USE_QUANTIZED` | — | `src/embeddings/nomic.rs` |
 | `VELD_OFFLINE` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_ONNX_THREADS` | — | `src/embeddings/minilm.rs` |
@@ -73,6 +76,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_RLM_API_KEY` | — | `src/memory/llm_reranker.rs` |
 | `VELD_RLM_ENDPOINT` | — | `src/bin/rlm_eval.rs` |
 | `VELD_RLM_MODEL` | — | `src/bin/rlm_eval.rs` |
+| `VELD_SLEEP_TIME_PROFILE` | — | `src/server.rs` |
 | `VELD_STORAGE_BACKEND` | — | `src/config.rs` |
 | `VELD_TLS_ACK` | — | `src/server.rs` |
 | `VELD_USE_QUANTIZED_MODEL` | — | `src/embeddings/minilm.rs` |

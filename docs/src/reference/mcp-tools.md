@@ -6,7 +6,7 @@
 
 # MCP Tools
 
-The TypeScript MCP server (`@veld/memory-mcp`) exposes **46** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
+The TypeScript MCP server (`@veld/memory-mcp`) exposes **48** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
 
 Tools are listed alphabetically. For full parameter schemas, see [mcp-server/index.ts](https://github.com/Portll/veld/blob/main/mcp-server/index.ts).
 
@@ -29,6 +29,8 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `delete_todo` | Delete a todo permanently. |
 | `delete_todo_comment` | Delete a comment from a todo. |
 | `dismiss_reminder` | Dismiss/acknowledge a triggered reminder. Call this after you've handled a reminder. |
+| `fact_narratives` | Get synthesized narratives from accumulated semantic facts, clustered by shared entities with confidence levels and heuristic causal chains. Shows what the system has learned, organized into coherent themes. Read-only; never modifies stored facts. Purged and time-invalidated facts are automatically excluded. |
+| `facts_preview_purge` | Preview the blast radius of a fact-purge pattern WITHOUT deleting anything. Returns a bucketed match count (none / few / some / many) — not an exact count — so the preview cannot become an oracle for fact existence. Use this BEFORE any destructive purge: agents should always preview-check a pattern, surface the bucket to the user, and only escalate to the destructive `/api/facts/purge` route after explicit confirmation. Pattern is substring match (not regex), case-insensitive, minimum 3 characters. |
 | `forget` | Delete a specific memory by ID |
 | `list_memories` | List all stored memories |
 | `list_projects` | List all projects with todo counts and status breakdown. |

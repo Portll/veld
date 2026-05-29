@@ -198,7 +198,7 @@
 <tr><td><code>setup-hooks</code> — print install instructions</td><td>✓ <span class="src">src/cli.rs</span></td><td>— (replaced by <code>.claude/settings.json</code> distribution)</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
 <tr><td><code>claude</code> — launch Claude Code with proxy</td><td>✓</td><td>✓ <span class="src">src/cli.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
 <tr><td><code>version</code></td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
-<tr><td>Separate <code>shodh-memory-server</code> binary</td><td>✓ <span class="src">src/main.rs:66-99</span></td><td>— (unified under <code>veld server</code>)</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td>Separate <code>shodh-memory-server</code> binary</td><td>✓ standalone server binary <span class="src">src/main.rs:66-99</span> — defaults to <code>serve</code>, also has <code>migrate</code> subcommand. Distinct from the <code>shodh</code> CLI binary <span class="src">Cargo.toml:89-95</span>.</td><td>— no <code>src/main.rs</code>; the lone binary is <code>veld</code> at <code>src/cli.rs</code> <span class="src">Cargo.toml:89-91</span>. <em>The <code>veld</code> binary is the descendant of shodh's <code>shodh</code> CLI (same source path), not of <code>shodh-memory-server</code>.</em> Server-start functionality is reached via the <code>veld server</code> subcommand; the <code>migrate</code> functionality was not carried over.</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
 <tr><td>Alignment binaries (<code>alignment-collect</code>, <code>-fit</code>, <code>-eval</code>, <code>rlm-eval</code>)</td><td>—</td><td>✓ <span class="src">src/bin/</span></td><td><span class="pill p-new">NEW</span></td></tr>
 </tbody>
 </table>
@@ -298,7 +298,7 @@
 <tr><td>Cross-encoder reranking</td><td>—</td><td>✓ ~18% blend, top-20 budget <span class="src">src/embeddings/cross_encoder.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
 <tr><td>Dual-embedder competition (MiniLM + Nomic)</td><td>MiniLM only <span class="src">src/embeddings/minilm.rs</span></td><td>MiniLM 384d + Nomic 768d, max-merge <span class="src">src/embeddings/competitive.rs, CLAUDE.md</span></td><td><span class="pill p-new">NEW</span></td></tr>
 <tr><td>RRF fusion</td><td>density-weighted combination (hybrid mode)</td><td>BM25 0.35 + Vector 0.40 + Graph 0.25 with K=45 <span class="src">CLAUDE.md retrieval</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
-<tr><td>LLM refiner / RLM rerank (post-RRF)</td><td>—</td><td>4 modes: None / CrossEncoder / Rlm / Stacked <span class="src">src/memory/rlm_refiner.rs, commit e5730c3</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>LLM refiner / RLM rerank (post-RRF)</td><td>—</td><td>4 modes: None / CrossEncoder / Rlm / Stacked <span class="src">src/memory/llm_reranker.rs, commit e5730c3</span></td><td><span class="pill p-new">NEW</span></td></tr>
 <tr><td>Retrieval modes exposed at MCP/API</td><td>7 distinct modes <span class="src">mcp-server/index.ts:752-756</span></td><td>1 unified semantic surface + signal flags</td><td><span class="pill p-div">DIVERGED</span></td></tr>
 <tr><td>External-dimension modulation (5D from Sleight)</td><td>—</td><td>density / coherence / closure / confidence / isotropy <span class="src">src/memory/types.rs:74-109</span></td><td><span class="pill p-new">NEW</span></td></tr>
 <tr><td>Signal attribution per result</td><td>—</td><td>✓ <code>SignalAttribution</code> struct <span class="src">src/memory/types.rs:122-137</span></td><td><span class="pill p-new">NEW</span></td></tr>
@@ -775,7 +775,7 @@
 <li><span class="src">src\memory\facets.rs</span> — 5-W taxonomy, Place hierarchy (lines 1-200)</li>
 <li><span class="src">src\memory\context_blocks.rs</span> — Letta-style mutable agent state</li>
 <li><span class="src">src\memory\hybrid_search.rs</span> — multi-layer retrieval orchestration</li>
-<li><span class="src">src\memory\rlm_refiner.rs</span> — RLM refiner / 4-mode reranker (commit e5730c3)</li>
+<li><span class="src">src\memory\llm_reranker.rs</span> — LLM refiner / 4-mode reranker (None/CrossEncoder/Rlm/Stacked) (commit e5730c3)</li>
 <li><span class="src">src\memory\sleep_time\*.rs</span> (13 files) + <span class="src">src\handlers\sleep_time.rs</span> — sleep-time V1 scaffold + V2 stage 1 (commits 52e5cda, c09ae4f)</li>
 <li><span class="src">packaging\linux\veld.service, packaging\macos\net.portll.veld.plist, packaging\windows\install-service.ps1</span> — cross-platform service scripts (commit da8c3ee)</li>
 <li><span class="src">src\memory\gap_topology\, wavelet_sessions.rs</span></li>
