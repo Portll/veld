@@ -151,18 +151,6 @@ fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool
     }
 }
 
-/// Returns `true` if the fact has been invalidated (`valid_until` is set and
-/// in the past relative to `now`). Facts with `valid_until: None` are always
-/// currently valid. Note: this checks BI-TEMPORAL invalidation only — for the
-/// universal active-fact check (which also excludes purged), use
-/// [`super::compression::is_active`].
-fn fact_is_expired(fact: &SemanticFact, now: chrono::DateTime<chrono::Utc>) -> bool {
-    match fact.valid_until {
-        Some(until) => until <= now,
-        None => false,
-    }
-}
-
 /// Universal active-fact predicate used by every "currently-true" reader path
 /// in [`SemanticFactStore`]. Excludes BOTH bi-temporally expired AND
 /// administratively purged facts. Centralized so that adding future state
