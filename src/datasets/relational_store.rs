@@ -60,7 +60,7 @@ const CATALOG_DDL: &str = "CREATE TABLE IF NOT EXISTS __veld_dataset_catalog (\n
 /// maps the native error to `anyhow::Error` (see the docstring example on
 /// [`crate::storage::relational`]).
 pub struct RelationalDatasetStore {
-    store: Arc<dyn RelationalStore<Error = anyhow::Error>>,
+    store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
     catalog_table: &'static str,
 }
 
@@ -70,7 +70,7 @@ impl RelationalDatasetStore {
     /// The catalog DDL is `CREATE TABLE IF NOT EXISTS`, so calling this
     /// twice on the same database is a no-op.
     pub async fn new(
-        store: Arc<dyn RelationalStore<Error = anyhow::Error>>,
+        store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
     ) -> Result<Self, DatasetError> {
         store
             .execute(CATALOG_DDL, &[])
@@ -129,7 +129,7 @@ impl RelationalDatasetStore {
     /// Borrow the underlying executor — useful for adjacent stores that need
     /// to issue their own statements against the same database (e.g.
     /// [`crate::datasets::link_store::RelationalLinkStore`]).
-    pub fn store(&self) -> Arc<dyn RelationalStore<Error = anyhow::Error>> {
+    pub fn store(&self) -> Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>> {
         self.store.clone()
     }
 }
@@ -475,38 +475,44 @@ impl DatasetStore for RelationalDatasetStore {
 mod tests {
     use super::*;
     use crate::datasets::schema::{ColumnDef, ColumnType};
-    use crate::storage::relational::SqliteRelationalStore;
-    use anyhow::Error as AnyhowError;
+    use crate::storage::relational::{BoxError, SqliteRelationalStore};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
     // ---------------------------------------------------------------------
     // Test plumbing: wrap the native sqlx error of `SqliteRelationalStore`
-    // into `anyhow::Error` so the store satisfies
-    // `RelationalStore<Error = anyhow::Error>`, the bound that
-    // `RelationalDatasetStore` requires.
+    // into `BoxError` so the store satisfies
+    // `RelationalStore<Error = BoxError>`, the bound that
+    // `RelationalDatasetStore` requires (anyhow::Error can't be used as
+    // the type-erased error because it doesn't implement std::error::Error).
     // ---------------------------------------------------------------------
 
-    struct AnyhowSqlite(SqliteRelationalStore);
+    struct BoxErrorSqlite(SqliteRelationalStore);
 
     #[async_trait]
-    impl RelationalStore for AnyhowSqlite {
-        type Error = AnyhowError;
+    impl RelationalStore for BoxErrorSqlite {
+        type Error = BoxError;
 
         async fn execute(
             &self,
             sql: &str,
             params: &[Param<'_>],
-        ) -> Result<u64, AnyhowError> {
-            self.0.execute(sql, params).await.map_err(AnyhowError::from)
+        ) -> Result<u64, BoxError> {
+            self.0
+                .execute(sql, params)
+                .await
+                .map_err(|e| Box::new(e) as BoxError)
         }
 
         async fn query(
             &self,
             sql: &str,
             params: &[Param<'_>],
-        ) -> Result<Vec<crate::storage::relational::Row>, AnyhowError> {
-            self.0.query(sql, params).await.map_err(AnyhowError::from)
+        ) -> Result<Vec<crate::storage::relational::Row>, BoxError> {
+            self.0
+                .query(sql, params)
+                .await
+                .map_err(|e| Box::new(e) as BoxError)
         }
 
         fn backend(&self) -> RelationalBackend {
@@ -518,8 +524,8 @@ mod tests {
         let sqlite = SqliteRelationalStore::in_memory()
             .await
             .expect("open in-memory sqlite");
-        let store: Arc<dyn RelationalStore<Error = AnyhowError>> =
-            Arc::new(AnyhowSqlite(sqlite));
+        let store: Arc<dyn RelationalStore<Error = BoxError>> =
+            Arc::new(BoxErrorSqlite(sqlite));
         RelationalDatasetStore::new(store)
             .await
             .expect("init relational dataset store")

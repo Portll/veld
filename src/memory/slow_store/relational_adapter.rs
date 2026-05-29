@@ -54,26 +54,26 @@ use super::storage::{StoredGap, StoredThought};
 
 /// W4 trait-backed mirror of the slow-store CRUD surface.
 ///
-/// Only holds an `Arc<dyn RelationalStore<Error = anyhow::Error>>`. No
+/// Only holds an `Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>`. No
 /// connection management, no schema state — both live behind the trait.
 ///
 /// **Not** a drop-in replacement for [`super::SlowStore`]. See the
 /// module-level docs for the deliberate scope of this parallel path.
 pub struct RelationalSlowStoreAdapter {
-    store: Arc<dyn RelationalStore<Error = anyhow::Error>>,
+    store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
 }
 
 impl RelationalSlowStoreAdapter {
     /// Wrap a `RelationalStore` so the slow-store query surface can be
     /// exercised against it.
-    pub fn new(store: Arc<dyn RelationalStore<Error = anyhow::Error>>) -> Self {
+    pub fn new(store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>) -> Self {
         Self { store }
     }
 
     /// Borrow the underlying store. Used by tests and follow-up porting
     /// work that needs to issue ad-hoc statements.
     #[allow(dead_code)]
-    pub fn store(&self) -> &Arc<dyn RelationalStore<Error = anyhow::Error>> {
+    pub fn store(&self) -> &Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>> {
         &self.store
     }
 
@@ -393,32 +393,39 @@ impl RelationalSlowStoreAdapter {
 
 #[cfg(test)]
 mod tests {
-    //! Tests use a small `anyhow`-erased newtype around
+    //! Tests use a small `BoxError`-erased newtype around
     //! [`SqliteRelationalStore`] because the adapter is generic over
-    //! `Error = anyhow::Error` but the in-tree SQLite backend yields
-    //! `sqlx::Error`. The wrapper does the trivial `.map_err(Into::into)`.
+    //! `Error = BoxError` but the in-tree SQLite backend yields
+    //! `sqlx::Error`. The wrapper does the trivial
+    //! `.map_err(|e| Box::new(e) as BoxError)`.
     //!
-    //! When a production `Error = anyhow::Error` backend lands, this shim
+    //! When a production backend lands with `Error = BoxError`, this shim
     //! can be deleted and the tests can wrap that backend directly.
 
     use super::*;
-    use crate::storage::relational::{Row, SqliteRelationalStore};
+    use crate::storage::relational::{BoxError, Row, SqliteRelationalStore};
     use async_trait::async_trait;
     use std::sync::Arc;
 
-    /// Thin newtype that re-erases `sqlx::Error` as `anyhow::Error`.
-    struct AnyhowSqlite(SqliteRelationalStore);
+    /// Thin newtype that re-erases `sqlx::Error` as [`BoxError`].
+    struct BoxErrorSqlite(SqliteRelationalStore);
 
     #[async_trait]
-    impl RelationalStore for AnyhowSqlite {
-        type Error = anyhow::Error;
+    impl RelationalStore for BoxErrorSqlite {
+        type Error = BoxError;
 
-        async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64> {
-            self.0.execute(sql, params).await.map_err(Into::into)
+        async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
+            self.0
+                .execute(sql, params)
+                .await
+                .map_err(|e| Box::new(e) as BoxError)
         }
 
-        async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>> {
-            self.0.query(sql, params).await.map_err(Into::into)
+        async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
+            self.0
+                .query(sql, params)
+                .await
+                .map_err(|e| Box::new(e) as BoxError)
         }
 
         fn backend(&self) -> crate::storage::relational::RelationalBackend {
@@ -430,8 +437,7 @@ mod tests {
         let store = SqliteRelationalStore::in_memory()
             .await
             .expect("open in-memory sqlite");
-        let erased: Arc<dyn RelationalStore<Error = anyhow::Error>> =
-            Arc::new(AnyhowSqlite(store));
+        let erased: Arc<dyn RelationalStore<Error = BoxError>> = Arc::new(BoxErrorSqlite(store));
         RelationalSlowStoreAdapter::new(erased)
     }
 
