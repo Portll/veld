@@ -31,7 +31,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 
 use super::types::MemoryId;
 use crate::embeddings::Embedder;
-use crate::memory::llm_reranker::Refiner;
+use crate::memory::llm_refiner::Refiner;
 
 /// Stem text using the English Porter stemmer for BM25 matching.
 /// Enables "choose" to match "chose", "decided" to match "decision", etc.
@@ -54,7 +54,7 @@ fn stem_text(text: &str) -> String {
 /// Final-stage refiner selection for hybrid search.
 ///
 /// Controls which post-RRF stage (cross-encoder, LLM refiner, both, or
-/// neither) is applied to the fused candidate set. The `rlm-eval` harness
+/// neither) is applied to the fused candidate set. The `llm-eval` harness
 /// uses this to compare refiner strategies against an otherwise identical
 /// pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -66,7 +66,8 @@ pub enum RefinerMode {
     #[default]
     CrossEncoder,
     /// Apply only the LLM refiner; skip the cross-encoder.
-    Rlm,
+    #[serde(alias = "rlm")]
+    Llm,
     /// Cross-encoder first, then LLM refiner over its output.
     Stacked,
 }
@@ -118,7 +119,7 @@ pub struct HybridSearchConfig {
     /// Final-stage refiner mode (cross-encoder, LLM refiner, both, or none).
     ///
     /// Defaults to `CrossEncoder` for backward compatibility with existing
-    /// callers. The `rlm-eval` harness varies this to compare refiner
+    /// callers. The `llm-eval` harness varies this to compare refiner
     /// strategies.
     #[serde(default = "default_refiner_mode")]
     pub refiner_mode: RefinerMode,
@@ -923,9 +924,9 @@ impl HybridSearchEngine {
     /// Attach an LLM-driven refiner to be applied after RRF fusion (and
     /// optionally after cross-encoder reranking — see [`RefinerMode`]).
     ///
-    /// Without an attached refiner, `RefinerMode::Rlm` and
+    /// Without an attached refiner, `RefinerMode::Llm` and
     /// `RefinerMode::Stacked` degrade to their respective baselines:
-    /// `Rlm` becomes RRF-only, `Stacked` becomes cross-encoder-only.
+    /// `Llm` becomes RRF-only, `Stacked` becomes cross-encoder-only.
     pub fn with_refiner(mut self, refiner: Box<dyn Refiner>) -> Self {
         self.refiner = Some(refiner);
         self
@@ -1242,7 +1243,7 @@ impl HybridSearchEngine {
         let mode = self.config.refiner_mode;
         let use_cross_encoder =
             matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked);
-        let use_refiner = matches!(mode, RefinerMode::Rlm | RefinerMode::Stacked);
+        let use_refiner = matches!(mode, RefinerMode::Llm | RefinerMode::Stacked);
 
         let mut final_results: Vec<HybridSearchResult> = if let Some(reranker) =
             self.reranker.as_ref().filter(|_| use_cross_encoder)
@@ -1354,7 +1355,7 @@ impl HybridSearchEngine {
         };
 
         // 4. Optional LLM refiner pass (applied after cross-encoder when
-        // mode is Stacked; replaces cross-encoder when mode is Rlm).
+        // mode is Stacked; replaces cross-encoder when mode is Llm).
         if use_refiner {
             if let Some(refiner) = self.refiner.as_ref() {
                 let to_refine: Vec<(MemoryId, String, f32)> = final_results

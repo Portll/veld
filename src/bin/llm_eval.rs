@@ -1,13 +1,14 @@
-//! rlm-eval — MVP evaluator for RLM-as-refiner vs cross-encoder rerank.
+//! llm-eval — MVP evaluator for the LLM refiner vs cross-encoder rerank.
 //!
 //! Compares three variants over a fixed corpus + query set:
 //!
 //! - `baseline`: hybrid search + cross-encoder rerank (production default).
-//! - `a`:        hybrid search + RLM refiner (cross-encoder bypassed).
-//! - `stacked`:  hybrid search + cross-encoder + RLM refiner.
+//! - `a`:        hybrid search + LLM refiner (cross-encoder bypassed).
+//! - `stacked`:  hybrid search + cross-encoder + LLM refiner.
 //!
-//! The RLM refiner is configured via `VELD_RLM_ENDPOINT`, `VELD_RLM_API_KEY`,
-//! and `VELD_RLM_MODEL`. If the endpoint is unset, `a` degrades to RRF-only
+//! The LLM refiner is configured via `VELD_LLM_REFINER_ENDPOINT`,
+//! `VELD_LLM_REFINER_API_KEY`, and `VELD_LLM_REFINER_MODEL`. If the endpoint
+//! is unset, `a` degrades to RRF-only
 //! and `stacked` degrades to cross-encoder-only — the run still completes
 //! and is labeled as such in the output so degenerate results are obvious.
 //!
@@ -26,7 +27,7 @@ use uuid::Uuid;
 
 use veld::embeddings::{load_primary_embedder, Embedder};
 use veld::memory::hybrid_search::{HybridSearchConfig, HybridSearchEngine, RefinerMode};
-use veld::memory::llm_reranker::LlmReranker;
+use veld::memory::llm_refiner::LlmRefiner;
 use veld::memory::types::MemoryId;
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -48,14 +49,14 @@ impl Variant {
     fn refiner_mode(self) -> RefinerMode {
         match self {
             Variant::Baseline => RefinerMode::CrossEncoder,
-            Variant::A => RefinerMode::Rlm,
+            Variant::A => RefinerMode::Llm,
             Variant::Stacked => RefinerMode::Stacked,
         }
     }
 }
 
 #[derive(Parser)]
-#[command(about = "MVP evaluator for RLM refiner vs cross-encoder rerank")]
+#[command(about = "MVP evaluator for the LLM refiner vs cross-encoder rerank")]
 struct Args {
     /// Path to the eval dataset JSON
     #[arg(long)]
@@ -152,8 +153,8 @@ struct RunReport {
     topk: usize,
     candidate_count: usize,
     queries_total: usize,
-    rlm_model: Option<String>,
-    rlm_endpoint_present: bool,
+    llm_model: Option<String>,
+    llm_endpoint_present: bool,
     variants: Vec<VariantResult>,
 }
 
@@ -219,12 +220,12 @@ fn main() -> Result<()> {
         query_embeddings.push(v);
     }
 
-    let rlm_endpoint_present =
-        std::env::var("VELD_RLM_ENDPOINT").is_ok_and(|v| !v.is_empty());
-    let rlm_model = std::env::var("VELD_RLM_MODEL").ok();
-    if !rlm_endpoint_present {
+    let llm_endpoint_present =
+        std::env::var("VELD_LLM_REFINER_ENDPOINT").is_ok_and(|v| !v.is_empty());
+    let llm_model = std::env::var("VELD_LLM_REFINER_MODEL").ok();
+    if !llm_endpoint_present {
         eprintln!(
-            "WARNING: VELD_RLM_ENDPOINT is not set. Variant 'a' will degrade to RRF-only and 'stacked' to cross-encoder-only. Set VELD_RLM_ENDPOINT (and VELD_RLM_API_KEY, VELD_RLM_MODEL) to exercise the refiner."
+            "WARNING: VELD_LLM_REFINER_ENDPOINT is not set. Variant 'a' will degrade to RRF-only and 'stacked' to cross-encoder-only. Set VELD_LLM_REFINER_ENDPOINT (and VELD_LLM_REFINER_API_KEY, VELD_LLM_REFINER_MODEL) to exercise the refiner."
         );
     }
 
@@ -274,8 +275,8 @@ fn main() -> Result<()> {
         topk: args.topk,
         candidate_count: args.candidate_count,
         queries_total: queries.len(),
-        rlm_model,
-        rlm_endpoint_present,
+        llm_model,
+        llm_endpoint_present,
         variants: variant_results,
     };
 
@@ -311,7 +312,7 @@ fn run_variant(
     topk: usize,
     candidate_count: usize,
 ) -> Result<VariantResult> {
-    let bm25_dir = std::env::temp_dir().join(format!("rlm_eval_bm25_{}", Uuid::new_v4()));
+    let bm25_dir = std::env::temp_dir().join(format!("llm_eval_bm25_{}", Uuid::new_v4()));
     std::fs::create_dir_all(&bm25_dir).context("creating BM25 scratch dir")?;
 
     let config = HybridSearchConfig {
@@ -323,12 +324,12 @@ fn run_variant(
 
     let mut engine = HybridSearchEngine::new(&bm25_dir, embedder.clone(), config)?;
 
-    // Attach the RLM refiner for variants that need it. If the env isn't
+    // Attach the LLM refiner for variants that need it. If the env isn't
     // configured, leave it unattached; the engine then degrades cleanly per
-    // RefinerMode semantics (Rlm -> RRF-only; Stacked -> cross-encoder-only).
+    // RefinerMode semantics (Llm -> RRF-only; Stacked -> cross-encoder-only).
     let mut refiner_attached = false;
-    if matches!(variant.refiner_mode(), RefinerMode::Rlm | RefinerMode::Stacked) {
-        if let Some(refiner) = LlmReranker::from_env()? {
+    if matches!(variant.refiner_mode(), RefinerMode::Llm | RefinerMode::Stacked) {
+        if let Some(refiner) = LlmRefiner::from_env()? {
             engine = engine.with_refiner(Box::new(refiner));
             refiner_attached = true;
         }

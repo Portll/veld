@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "name": "rlm_eval_v1",
-  "description": "MVP benchmark for RLM-as-refiner evaluation. Single coherent scenario: fictional Loomflux engineering project tracked across 6 sessions over 36 weeks. 24 memories; 16 hand-curated queries across four classes (code_recall, multi_hop, cross_session, decayed_recall).",
+  "name": "llm_eval_v1",
+  "description": "MVP benchmark for LLM-refiner evaluation. Single coherent scenario: fictional Loomflux engineering project tracked across 6 sessions over 36 weeks. 24 memories; 16 hand-curated queries across four classes (code_recall, multi_hop, cross_session, decayed_recall).",
   "created": "2026-05-28",
   "scenario": "A small engineering team builds an audit-log pipeline. Roles change (Diana departs at week 18), tools evolve (PostgreSQL -> ClickHouse), and code decisions accumulate. Queries test single-fact recall, chained reasoning, state-evolution awareness, and pre-supersession recall.",
   "memories": [
