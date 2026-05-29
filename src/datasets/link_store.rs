@@ -120,7 +120,7 @@ pub trait LinkStore: Send + Sync {
 /// it can be composed with [`crate::datasets::relational_store::RelationalDatasetStore`]
 /// over the same backing database.
 pub struct RelationalLinkStore {
-    store: Arc<dyn RelationalStore<Error = anyhow::Error>>,
+    store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
     link_table: &'static str,
 }
 
@@ -128,7 +128,7 @@ impl RelationalLinkStore {
     /// Build a link store and ensure the link table exists. Idempotent —
     /// safe to construct repeatedly against the same database.
     pub async fn new(
-        store: Arc<dyn RelationalStore<Error = anyhow::Error>>,
+        store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
     ) -> Result<Self, DatasetError> {
         store
             .execute(LINK_DDL, &[])
@@ -257,24 +257,25 @@ impl LinkStore for RelationalLinkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::relational::{RelationalBackend, Row, SqliteRelationalStore};
-    use anyhow::Error as AnyhowError;
+    use crate::storage::relational::{BoxError, RelationalBackend, Row, SqliteRelationalStore};
     use async_trait::async_trait;
 
-    struct AnyhowSqlite(SqliteRelationalStore);
+    struct BoxErrorSqlite(SqliteRelationalStore);
 
     #[async_trait]
-    impl RelationalStore for AnyhowSqlite {
-        type Error = AnyhowError;
-        async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, AnyhowError> {
-            self.0.execute(sql, params).await.map_err(AnyhowError::from)
+    impl RelationalStore for BoxErrorSqlite {
+        type Error = BoxError;
+        async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
+            self.0
+                .execute(sql, params)
+                .await
+                .map_err(|e| Box::new(e) as BoxError)
         }
-        async fn query(
-            &self,
-            sql: &str,
-            params: &[Param<'_>],
-        ) -> Result<Vec<Row>, AnyhowError> {
-            self.0.query(sql, params).await.map_err(AnyhowError::from)
+        async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
+            self.0
+                .query(sql, params)
+                .await
+                .map_err(|e| Box::new(e) as BoxError)
         }
         fn backend(&self) -> RelationalBackend {
             self.0.backend()
@@ -285,8 +286,8 @@ mod tests {
         let sqlite = SqliteRelationalStore::in_memory()
             .await
             .expect("open sqlite");
-        let store: Arc<dyn RelationalStore<Error = AnyhowError>> =
-            Arc::new(AnyhowSqlite(sqlite));
+        let store: Arc<dyn RelationalStore<Error = BoxError>> =
+            Arc::new(BoxErrorSqlite(sqlite));
         RelationalLinkStore::new(store).await.expect("init link store")
     }
 
