@@ -1205,6 +1205,8 @@ mod tests {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         };
 
         let invalidated = store
@@ -1251,6 +1253,8 @@ mod tests {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         };
 
         // No embedding on either side — must not invalidate.
