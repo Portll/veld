@@ -947,6 +947,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "fact_narratives",
+        description:
+          "Get synthesized narratives from accumulated semantic facts, clustered by shared entities with confidence levels and heuristic causal chains. Shows what the system has learned, organized into coherent themes. Read-only; never modifies stored facts. Purged and time-invalidated facts are automatically excluded.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            limit: {
+              type: "number",
+              description:
+                "Maximum clusters to return. Clamped to [1, 50] server-side. Default: 20.",
+              default: 20,
+            },
+            entity_filter: {
+              type: "string",
+              description:
+                "Optional: narrow the candidate fact set to those related to a specific entity/topic. Substring match (not regex).",
+            },
+          },
+        },
+      },
+      {
         name: "proactive_context",
         description:
           "REQUIRED: Call this tool with EVERY user message to surface relevant memories and build conversation history. Pass the user's message as context. This enables: (1) retrieving memories relevant to what the user is asking, (2) building persistent memory of the conversation for future sessions. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories. Auto-ingest stores the context automatically. USAGE: Always call this FIRST when you receive a user message, passing their message as the context parameter.",
@@ -3066,6 +3087,87 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (eventCount === 0) {
           response += `ℹ️ No consolidation activity in this period.\n`;
           response += `   Store and access memories to trigger learning.`;
+        }
+
+        return {
+          content: [{ type: "text", text: response.trimEnd() }],
+        };
+      }
+
+      case "fact_narratives": {
+        const { limit = 20, entity_filter } = args as {
+          limit?: number;
+          entity_filter?: string;
+        };
+
+        interface FactNarrativeCluster {
+          topic: string;
+          entities: string[];
+          facts: Array<{
+            id: string;
+            fact: string;
+            confidence: number;
+            support_count: number;
+            related_entities: string[];
+            created_at: string;
+          }>;
+          narrative: string;
+          avg_confidence: number;
+          total_support: number;
+          causal_chains: Array<{
+            from_fact_id: string;
+            to_fact_id: string;
+            from_fact: string;
+            to_fact: string;
+            relation: string;
+          }>;
+        }
+
+        interface FactNarrativesResult {
+          success: boolean;
+          clusters: FactNarrativeCluster[];
+          total_facts: number;
+          total_clusters: number;
+        }
+
+        const result = await apiCall<FactNarrativesResult>(
+          "/api/facts/narratives",
+          "POST",
+          {
+            user_id: USER_ID,
+            limit,
+            entity_filter,
+          },
+        );
+
+        if (!result.success || result.total_clusters === 0) {
+          const scope = entity_filter
+            ? ` related to "${entity_filter}"`
+            : "";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `ℹ️ No fact narratives found${scope}. Store more memories to build the fact corpus.`,
+              },
+            ],
+          };
+        }
+
+        let response = `📚 FACT NARRATIVES (${result.total_clusters} clusters from ${result.total_facts} facts)\n\n`;
+        for (const cluster of result.clusters) {
+          response += `── ${cluster.topic} `;
+          response += `(${cluster.facts.length} facts · `;
+          response += `avg confidence ${(cluster.avg_confidence * 100).toFixed(0)}% · `;
+          response += `support ${cluster.total_support}) ──\n`;
+          response += `${cluster.narrative}\n`;
+          if (cluster.causal_chains.length > 0) {
+            response += `\nCausal links:\n`;
+            for (const link of cluster.causal_chains) {
+              response += `  • ${link.from_fact} → [${link.relation}] → ${link.to_fact}\n`;
+            }
+          }
+          response += `\n`;
         }
 
         return {

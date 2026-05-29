@@ -595,6 +595,24 @@ pub struct SemanticFact {
     /// Populated on a *new* fact when it invalidates one or more older facts.
     #[serde(default)]
     pub supersedes: Vec<String>,
+    /// When this fact was administratively purged. `None` = never purged.
+    ///
+    /// ORTHOGONAL to `valid_until` / `superseded_by` which track world-truth
+    /// invalidation. `purged_at` records intentional administrative removal:
+    /// pattern match, confidence floor, user request. A purged fact is hidden
+    /// from all active queries (`SemanticFactStore` reader methods filter via
+    /// [`is_active`]) regardless of whether it was "true" at any time.
+    ///
+    /// Reaper retention uses `purged_at` precedence over `valid_until`: when
+    /// both are set, the purged window governs hard-delete timing.
+    #[serde(default)]
+    pub purged_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why this fact was purged. `None` when `purged_at` is `None`.
+    ///
+    /// Internal metadata — NOT exposed to agent-facing MCP/HTTP responses.
+    /// Operators reach it via audit log + direct store queries.
+    #[serde(default)]
+    pub purge_reason: Option<PurgeReason>,
 }
 
 /// Types of semantic facts
@@ -616,6 +634,79 @@ pub enum FactType {
     Pattern,
 }
 
+/// Reason a fact was administratively purged. Closed enum (no `Other` escape
+/// hatch) to keep `purge_reason` non-leaky: free-form operator notes belong
+/// in the audit log, not on the fact record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PurgeReason {
+    /// Explicit user request to remove specific content.
+    UserRequest,
+    /// Operator-initiated cleanup not tied to a particular pattern.
+    AdminCleanup,
+    /// Matched a substring pattern. Pattern is stored as a SHA-256 hash to
+    /// avoid leaking content into the record; the raw pattern (if forensics
+    /// needs it) lives in the audit log keyed by purge event id.
+    PatternMatch { pattern_hash: String },
+    /// Calibrated confidence fell below the given threshold.
+    ConfidenceFloor { threshold: f32 },
+}
+
+/// Returns `true` if the fact is currently active: NOT bi-temporally expired
+/// AND NOT administratively purged. This is the universal read-path filter —
+/// every `SemanticFactStore` reader method that returns "currently true" facts
+/// must use this helper rather than checking the two fields independently.
+///
+/// Centralized so that adding a future state dimension (e.g. `quarantined_at`)
+/// flows through one call site rather than 9+ enumerated reader methods.
+pub fn is_active(fact: &SemanticFact, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if fact.purged_at.is_some() {
+        return false;
+    }
+    match fact.valid_until {
+        Some(until) => until > now,
+        None => true,
+    }
+}
+
+/// A cluster of related facts grouped by shared entities, with a template-
+/// generated narrative and heuristic causal chain detection. Ported from
+/// `shodh-memory`'s fact narrative subsystem; clustering algorithm is
+/// document-frequency-based topic discovery (lowest-DF non-hub entity = topic).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactCluster {
+    /// Most common entity in the cluster (used as topic heading)
+    pub topic: String,
+    /// All entities appearing in the cluster's facts (sorted, deduped)
+    pub entities: Vec<String>,
+    /// Facts in this cluster, sorted by created_at ascending
+    pub facts: Vec<SemanticFact>,
+    /// Template-generated narrative summary (no LLM required)
+    pub narrative: String,
+    /// Average confidence across facts in the cluster
+    pub avg_confidence: f32,
+    /// Sum of support_count across all facts (drives cluster ranking)
+    pub total_support: usize,
+    /// Detected causal relationships between facts in this cluster
+    pub causal_chains: Vec<CausalFactLink>,
+}
+
+/// A heuristic-detected causal relationship between two facts.
+///
+/// Detected via keyword analysis on temporally ordered facts sharing entities.
+/// Relations: `led_to` (default), `superseded_by` (replaced/deprecated),
+/// `resolved_by` (fixed/resolved), `informed_by` (derived/based-on).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CausalFactLink {
+    pub from_fact_id: String,
+    pub to_fact_id: String,
+    /// The source fact statement (snapshot at detection time)
+    pub from_fact: String,
+    /// The target fact statement (snapshot at detection time)
+    pub to_fact: String,
+    /// Relationship type
+    pub relation: String,
+}
 
 /// Result of consolidation operation
 #[derive(Debug, Clone, Default)]
@@ -780,6 +871,8 @@ impl SemanticConsolidator {
                     valid_until: None,
                     superseded_by: None,
                     supersedes: Vec::new(),
+                    purged_at: None,
+                    purge_reason: None,
                 };
 
                 result.new_fact_ids.push(fact.id.clone());
