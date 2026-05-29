@@ -126,3 +126,14 @@ evaluations/alignment/pairs/_external/
 evaluations/alignment/pairs/pairs.jsonl
 evaluations/alignment/pairs/*.vec
 evaluations/alignment/fitted/
+
+# Benchmark results (data, not source)
+benchmarks/locomo_*.json
+benchmarks/*_results.json
+benchmarks/debug_*.json
+bench_data_locomo/
+evaluations/locomo_*.json
+evaluations/locomo_api_*.json
+evaluations/locomo_judge_*.json
+evaluations/locomo_v*.json
+locomo_results.json
