@@ -146,7 +146,9 @@ Storage abstraction layer: [src/storage/mod.rs](src/storage/mod.rs) defines `Pri
 - **Knowledge graph**: `EntityNode`, `RelationshipEdge`, `EpisodicNode` ([src/graph_memory.rs](src/graph_memory.rs)). Hebbian edge strengthening via `strengthen_memory_edges` during consolidation.
 - **Embeddings cache**: HTTP backend with LRU; optional Zenoh-shared cache when the `zenoh` feature is on.
 - **Compression pipeline** ([src/memory/compression.rs](src/memory/compression.rs)): semantic consolidation into facts; size-based compression.
-- **Streaming** ([src/streaming.rs](src/streaming.rs)): SSE for context status (`/api/context/sse`).
+- **Streaming ingest** ([src/streaming.rs](src/streaming.rs), 1577 lines): WebSocket `/api/stream` for high-throughput memory ingestion. Distinct from the SSE endpoints in `handlers/webhooks.rs` (`/api/context/sse`, `/api/events/sse`).
+- **Metrics** ([src/metrics.rs](src/metrics.rs), 989 lines): Prometheus metric registrations (`veld_*` prefix). `/metrics` route in [src/handlers/router.rs](src/handlers/router.rs); visibility controlled by `VELD_METRICS_PUBLIC`.
+- **Visualization / graph viewer** ([src/handlers/visualization.rs](src/handlers/visualization.rs), 405 lines + [src/handlers/graph_view.html](src/handlers/graph_view.html)): in-browser knowledge-graph viewer. Routes: `GET /graph/view` (public HTML shell), `GET /api/brain/{user_id}`, `/api/visualization/*`.
 - **Auth**: API-key middleware ([src/auth.rs](src/auth.rs)) plus Phase C user-auth (password + TOTP + recovery codes) at `/api/user_auth/*`.
 - **Multi-tenant** ([src/extensions/](src/extensions/), feature `multi-tenant`): hosaka collective-store, PII policy, maintenance.
 - **Fortress** ([src/fortress/](src/fortress/), feature `fortress`): fractal binary obfuscation, anti-debug, integrity checks for distribution builds.
@@ -160,6 +162,8 @@ Cross-embedder alignment: Procrustes + Ridge fitters, fit/eval bins, retrieval i
 ---
 
 ## Codebase Layout
+
+> **Canonical exhaustive module list:** [docs/src/architecture/module-index.md](docs/src/architecture/module-index.md) — auto-generated from `src/lib.rs` by `docs/generators/src/bin/gen-module-index.rs`. The table below is a curated "where to look first" map, **not** a complete inventory. If you're building an inventory or comparing veld to a fork, walk the module index, not this table.
 
 | Path | Purpose |
 |---|---|
