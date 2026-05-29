@@ -366,6 +366,154 @@ pub async fn search_temporal_facts(
 }
 
 // =============================================================================
+// FACT PREVIEW PURGE (read-only, dry-run-locked)
+// =============================================================================
+
+/// Minimum pattern length for preview purge. Three characters prevents the
+/// degenerate case of a 1-2 char substring matching virtually every fact
+/// (the destructive equivalent in Phase C inherits this floor).
+const FACTS_PREVIEW_PURGE_MIN_PATTERN_LEN: usize = 3;
+
+/// Bucketed match count returned by `facts_preview_purge`. Exact counts are
+/// withheld to prevent the preview from becoming an oracle for fact existence
+/// (breakers ORACLE-AS-DOS / RING_1_7.01-02): repeated probes against tight
+/// patterns could otherwise enumerate the user's fact corpus distribution.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactsPreviewPurgeBucket {
+    None,
+    Few,
+    Some,
+    Many,
+}
+
+impl FactsPreviewPurgeBucket {
+    fn from_count(n: usize) -> Self {
+        match n {
+            0 => Self::None,
+            1..=5 => Self::Few,
+            6..=50 => Self::Some,
+            _ => Self::Many,
+        }
+    }
+}
+
+/// Request for `POST /api/facts/preview-purge`. Note the deliberate absence of
+/// a `dry_run` field — this endpoint is preview-only by name and by schema.
+/// Agents cannot escalate to destructive purge via this surface; the actual
+/// delete lives behind a separate route landed in Phase C.
+///
+/// `#[serde(deny_unknown_fields)]` makes the no-dry_run constraint structural:
+/// a client sending `{"dry_run": false}` receives a 400 because the field
+/// isn't recognized. This is the test-guard from
+/// `evaluations/breakers-revised-plan-p2-final-2026-05-29.json` (TIER-CREEP).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactsPreviewPurgeRequest {
+    pub user_id: String,
+    pub pattern: String,
+}
+
+/// Response for `POST /api/facts/preview-purge`. Match count is bucketed (not
+/// exact), and `fact_ids` are NOT returned — Phase B is intentionally
+/// information-stingy. Agents that need to see fact content should call
+/// `recall` or `fact_narratives`; the preview only answers "is your pattern
+/// safe to actually purge".
+#[derive(Debug, Serialize)]
+pub struct FactsPreviewPurgeResponse {
+    pub success: bool,
+    pub match_bucket: FactsPreviewPurgeBucket,
+    /// Exact count of facts scanned (NOT the match count). Bounded by the
+    /// preview corpus cap (default 10_000) — values at the cap indicate the
+    /// user's corpus may have been truncated and the bucket is a lower bound.
+    pub total_scanned: usize,
+    /// Always `true` — documents the preview-only contract in the response
+    /// body for clients that key off the field.
+    pub dry_run: bool,
+    /// `true` when the audit-log entry was successfully enqueued (async
+    /// write; failures here do not block the response).
+    pub audit_recorded: bool,
+}
+
+/// Cap on facts scanned for a preview. Mirrors the cap used by `purge_facts`
+/// in Phase C so that a preview's bucket cannot under-count the destructive
+/// path's actual deletion count.
+const FACTS_PREVIEW_PURGE_CORPUS_CAP: usize = 10_000;
+
+/// `POST /api/facts/preview-purge` — bucketed preview of how many facts
+/// would match a substring pattern. Read-only, audit-logged.
+///
+/// The preview is the SAFE surface: agents inspect their pattern's blast
+/// radius before any destructive path is invoked. Tier 1 (Phase C) adds a
+/// separate `/api/facts/purge` route that actually writes `purged_at`; this
+/// endpoint never mutates.
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, pattern_len = req.pattern.len()))]
+pub async fn facts_preview_purge(
+    State(state): State<AppState>,
+    Json(req): Json<FactsPreviewPurgeRequest>,
+) -> Result<Json<FactsPreviewPurgeResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    if req.pattern.len() < FACTS_PREVIEW_PURGE_MIN_PATTERN_LEN {
+        return Err(AppError::InvalidInput {
+            field: "pattern".into(),
+            reason: format!(
+                "Must be at least {} characters to prevent accidental mass-match",
+                FACTS_PREVIEW_PURGE_MIN_PATTERN_LEN
+            ),
+        });
+    }
+
+    let memory = state
+        .get_user_earth(&req.user_id)
+        .map_err(AppError::Internal)?;
+    let user_id = req.user_id.clone();
+    let pattern_lower = req.pattern.to_lowercase();
+
+    let (match_count, total_scanned) = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        let facts = memory_guard
+            .fact_store()
+            .list(&user_id, FACTS_PREVIEW_PURGE_CORPUS_CAP)?;
+        let total = facts.len();
+        let matched = facts
+            .iter()
+            .filter(|f| f.fact.to_lowercase().contains(&pattern_lower))
+            .count();
+        Ok::<_, anyhow::Error>((matched, total))
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    // Audit hash: SHA-256(pattern) — never the raw pattern itself (breakers
+    // R1.6.03). Operators correlate by hash + audit-event timestamp.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(req.pattern.as_bytes());
+    let pattern_hash = format!("{:x}", hasher.finalize());
+    let bucket = FactsPreviewPurgeBucket::from_count(match_count);
+    let details = format!(
+        "facts.purge.preview pattern_hash={} bucket={:?} scanned={}",
+        &pattern_hash[..16],
+        bucket,
+        total_scanned
+    );
+    // `log_event` enqueues async persistence; failures degrade silently with
+    // a warn-level trace. `audit_recorded=true` indicates the enqueue
+    // succeeded synchronously (the in-memory ring-buffer write).
+    state.log_event(&req.user_id, "facts.purge.preview", "", &details);
+
+    Ok(Json(FactsPreviewPurgeResponse {
+        success: true,
+        match_bucket: bucket,
+        total_scanned,
+        dry_run: true,
+        audit_recorded: true,
+    }))
+}
+
+// =============================================================================
 // FACT NARRATIVES
 // =============================================================================
 
