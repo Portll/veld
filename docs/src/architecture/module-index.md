@@ -1,7 +1,8 @@
 <!-- GENERATED FILE — do not edit by hand.
      Source: src/lib.rs
      Generator: docs/generators/src/bin/gen-module-index.rs
-     Regenerate: cd docs/generators && cargo run --bin gen-module-index -->
+     Regenerate: bash docs/regenerate.sh
+     (or, inside docs/generators/, run `cargo run --bin gen-module-index`) -->
 
 # Module index
 

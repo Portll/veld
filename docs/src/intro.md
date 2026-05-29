@@ -45,12 +45,12 @@ Veld is licensed under the **Business Source License 1.1 (BUSL-1.1)**. The produ
 
 ## Project status
 
-```admonish warning
-The current branch is `v0.7.6-unstable`, being stabilized toward a clean
-`v0.8` release. Treat the branch tip as internal/unstable unless a tagged
-release says otherwise. The next public-release-quality target is `v0.9`
-([decision 0001](decisions/0001-redb-migration.md)).
-```
+> **⚠️ Branch status**
+>
+> The current branch is `v0.7.6-unstable`, being stabilized toward a clean
+> `v0.8` release. Treat the branch tip as internal/unstable unless a tagged
+> release says otherwise. The next public-release-quality target is `v0.9`
+> ([decision 0001](decisions/0001-redb-migration.md)).
 
 ## What this site documents
 

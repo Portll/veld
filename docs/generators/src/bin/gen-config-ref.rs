@@ -20,10 +20,18 @@ struct EnvVar {
 
 fn main() -> Result<()> {
     let src_root = repo_root().join("src");
+    // Default-capture stops at newline, quote, or closing paren so we never
+    // pull multi-line Rust source (which would leak `<Vec>` / `<PathBuf>`
+    // tokens that mdbook treats as unclosed HTML tags).
     let var_re = Regex::new(
-        r#"(?:std::)?env::var\(\s*"(VELD_[A-Z0-9_]+)"\s*\)(?:[\s\S]{0,200}?\.unwrap_or(?:_else)?\(\s*\|?\|?\s*"?([^")]*))?"#,
+        r#"(?:std::)?env::var\(\s*"(VELD_[A-Z0-9_]+)"\s*\)(?:[^\n]{0,200}?\.unwrap_or(?:_else)?\(\s*\|?\|?\s*"?([^"\n)]*))?"#,
     )
     .expect("regex");
+
+    // Escape any stray angle brackets so mdbook does not parse them as HTML.
+    fn escape_md(s: &str) -> String {
+        s.replace('<', "&lt;").replace('>', "&gt;").replace('|', "\\|")
+    }
 
     let mut vars: std::collections::BTreeMap<String, EnvVar> = std::collections::BTreeMap::new();
 
@@ -67,13 +75,18 @@ fn main() -> Result<()> {
     ));
     out.push_str("| Variable | Default | First seen in |\n|---|---|---|\n");
     for v in vars.values() {
+        // Some default_hint captures are garbage (Rust source fragments from
+        // chained closures). Treat anything that contains a closing brace,
+        // a lambda pipe, or `::` as untrustworthy and surface it as a hint
+        // (still escaped) rather than dropping it silently.
         let default = v
             .default_hint
             .as_deref()
-            .map(|d| format!("`{d}`"))
+            .filter(|d| !d.is_empty())
+            .map(|d| format!("`{}`", escape_md(d)))
             .unwrap_or_else(|| "—".to_string());
         let file = v.files.first().map(String::as_str).unwrap_or("—");
-        out.push_str(&format!("| `{}` | {} | `{}` |\n", v.name, default, file));
+        out.push_str(&format!("| `{}` | {} | `{}` |\n", escape_md(&v.name), default, file));
     }
     out.push_str("\n---\n\n*Defaults shown above are best-effort extractions from `.unwrap_or(...)` chains. For full semantics, consult the source file listed.*\n");
 

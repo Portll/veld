@@ -2,9 +2,11 @@
 # Regenerate all auto-generated docs pages. Run before committing changes that
 # touch any of the source files the generators read.
 #
-# This script is invoked by the pre-commit hook and by CI. Manual invocation:
+# This script is invoked by the pre-commit hook and by CI. Manual invocation
+# from the repo root (works in POSIX shells and in PowerShell when Git Bash
+# is on PATH):
 #
-#     cd docs && bash regenerate.sh
+#     bash docs/regenerate.sh
 #
 # Generators are in `docs/generators/`. Each one reads veld source and writes
 # a markdown file under `docs/src/reference/` or `docs/src/architecture/`.

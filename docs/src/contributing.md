@@ -54,8 +54,7 @@ matches what's committed.
 A pre-commit hook is the simplest way to never forget:
 
 ```sh
-ln -s ../../docs/regenerate.sh .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
+bash docs/install-pre-commit.sh
 ```
 
 See [decision 0004](decisions/0004-docs-sidecar-stack.md) for the generator
