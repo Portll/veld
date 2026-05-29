@@ -66,6 +66,9 @@ pub mod context_blocks;
 // Datasets (W7 — relational-backed tabular storage)
 pub mod datasets;
 
+// Query planner HTTP surface (W6 — explainable multi-source planning)
+pub mod query;
+
 // Sleep-time / observational memory orchestrator (V1)
 pub mod sleep_time;
 
