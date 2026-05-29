@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>shodh-memory → veld: Lineage &amp; Feature Comparison</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-alt: #161b22;
+    --bg-table: #0d1117;
+    --row-alt: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --text-bright: #f0f6fc;
+    --accent: #58a6ff;
+    --shodh: #f97583;
+    --veld: #79c0ff;
+    --inherited: #8b949e;
+    --extended: #39d0d8;
+    --diverged: #ffa657;
+    --removed: #f97583;
+    --new: #56d364;
+  }
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", Roboto, "Helvetica Neue", sans-serif;
+    margin: 0;
+    padding: 24px 32px 96px;
+    line-height: 1.5;
+    font-size: 14px;
+  }
+  h1, h2, h3, h4 { color: var(--text-bright); font-weight: 600; letter-spacing: -0.01em; }
+  h1 { font-size: 28px; margin: 0 0 4px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+  h2 { font-size: 22px; margin: 36px 0 8px; padding-top: 8px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 17px; margin: 22px 0 6px; color: var(--accent); }
+  h4 { font-size: 15px; margin: 14px 0 4px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+  p { margin: 6px 0 12px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, kbd, .src { font-family: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; background: #161b22; padding: 1px 5px; border-radius: 3px; border: 1px solid var(--border); color: #d2a8ff; }
+  .src { color: var(--text-dim); font-size: 11.5px; background: transparent; border: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 18px; font-size: 13px; background: var(--bg-table); border: 1px solid var(--border); }
+  thead th { background: #161b22; color: var(--text-bright); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0; font-weight: 600; }
+  td, th { padding: 7px 10px; vertical-align: top; border-bottom: 1px solid #21262d; }
+  tbody tr:nth-child(even) td { background: #10151d; }
+  tbody tr:hover td { background: #1c2128; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; border: 1px solid; line-height: 1.6; }
+  .p-inh { color: var(--inherited); border-color: var(--inherited); background: rgba(139,148,158,0.08); }
+  .p-ext { color: var(--extended); border-color: var(--extended); background: rgba(57,208,216,0.08); }
+  .p-div { color: var(--diverged); border-color: var(--diverged); background: rgba(255,166,87,0.08); }
+  .p-rem { color: var(--removed); border-color: var(--removed); background: rgba(249,117,131,0.08); }
+  .p-new { color: var(--new); border-color: var(--new); background: rgba(86,211,100,0.08); }
+  .p-ren { color: #79c0ff; border-color: #79c0ff; background: rgba(121,192,255,0.08); }
+  .col-shodh { color: var(--shodh); font-weight: 600; }
+  .col-veld { color: var(--veld); font-weight: 600; }
+  .lineage-banner {
+    background: linear-gradient(90deg, rgba(249,117,131,0.12), rgba(121,192,255,0.12));
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 18px;
+    margin: 12px 0 22px;
+    font-size: 13.5px;
+  }
+  .legend {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 12px 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px 16px;
+    font-size: 12.5px;
+  }
+  ul, ol { margin: 4px 0 12px; padding-left: 22px; }
+  li { margin: 2px 0; }
+  .note { color: var(--text-dim); font-size: 12px; font-style: italic; }
+  .verdict { background: var(--bg-alt); border-left: 3px solid var(--accent); padding: 10px 14px; margin: 10px 0; border-radius: 0 4px 4px 0; }
+  .toc { background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; padding: 12px 20px; columns: 2; column-gap: 36px; font-size: 13px; }
+  .toc a { display: block; padding: 2px 0; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+  .small { font-size: 11.5px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<h1>shodh-memory → veld &nbsp;·&nbsp; Lineage &amp; Feature Comparison</h1>
+<p class="small">Generated 2026-05-29 · Comparative inventory aligning the fork ancestor against the downstream evolution. Every assertion in this document is sourced to a file path (and where useful, a line number or quoted excerpt) inside one of the two repositories.</p>
+
+<div class="lineage-banner">
+<strong>Lineage statement (per user):</strong> <span class="col-shodh">shodh-memory</span> is the <em>original base</em>; <span class="col-veld">veld</span> is the downstream fork/rebrand. Both share the same overall architecture (Rust core + TypeScript MCP wrapper + Python bindings + ONNX MiniLM + RocksDB + Vamana + Tantivy + Hebbian graph). The diff is in (a) what shodh shipped and veld kept, (b) what veld extended after the fork, (c) what shodh-side features did not propagate forward, and (d) renames (the most visible: <code>shodh</code> binary → <code>veld</code> binary, <code>@shodh/memory-mcp</code> → <code>@veld/memory-mcp</code>, <code>SHODH_*</code> env → <code>VELD_*</code> env).
+</div>
+
+<div class="verdict" style="border-left-color: var(--diverged);">
+<strong>Erratum (2026-05-29, post-publication).</strong> The first version of this report incorrectly tagged four items as <span class="pill p-rem">SHODH-ONLY</span>: WebSocket streaming ingest, Prometheus <code>/metrics</code>, embedded graph viewer, and the Telegram/Todoist/WhatsApp connector packages. All four are in fact already present in veld and have been re-tagged below:
+<ul style="margin-top:6px">
+<li><code>src/streaming.rs</code> (1577 lines) carries the same <code>WebSocket /api/stream</code> architecture → <span class="pill p-inh">INHERITED</span></li>
+<li><code>src/metrics.rs</code> (690 lines, <code>shodh_*</code> metric prefix renamed to <code>veld_*</code>) + <code>/metrics</code> route in <code>router.rs:122-124</code> with <code>VELD_METRICS_PUBLIC</code> conditional → <span class="pill p-ren">RENAMED</span></li>
+<li><code>src/handlers/visualization.rs</code> + <code>graph_view.html</code> + <code>GET /graph/view</code> route + <code>/api/visualization/*</code> family + <code>/api/brain/{user_id}</code> → <span class="pill p-ext">EXTENDED</span></li>
+<li><code>veld-telegram/</code> (903 LOC, identical file set), <code>veld-todoist/</code> (562 LOC, <code>shodh.ts</code>→<code>veld.ts</code>), <code>veld-whatsapp/</code> (998 LOC, ahead of shodh by ~100 LOC in <code>llm.ts</code> and <code>config.ts</code>) → <span class="pill p-ren">RENAMED</span> (+ veld-whatsapp extended)</li>
+</ul>
+<strong>Root cause:</strong> the veld inventory was built primarily from <code>CLAUDE.md</code>'s enumerated tool/route table, which does not list every Rust module by name (e.g. <code>streaming.rs</code>, <code>metrics.rs</code>, <code>visualization.rs</code> are not enumerated in CLAUDE.md). The independent file-tree pass that would have caught the false negatives wasn't done in the first inventory. Corrections have been applied to §3, §12, §19, §25.
+</div>
+
+<div class="verdict" style="border-left-color: var(--diverged);">
+<strong>Erratum 2 (2026-05-29, second pass).</strong> A full sweep of every remaining <span class="pill p-rem">SHODH-ONLY</span> tag against the veld file tree (the independent pass the first erratum identified as missing) found <strong>10 additional false negatives</strong>. The pattern was the same one the first erratum diagnosed: rows that said "—" for veld because the artifact wasn't listed in <code>CLAUDE.md</code> were assumed absent. They are in fact at the veld repo root. Re-tagged below, with row-level evidence in their sections:
+<ul style="margin-top:6px">
+<li><strong>§1</strong> Citation/DOI → <span class="pill p-inh">INHERITED</span> (same Zenodo DOI <code>10.5281/zenodo.18668709</code>, <code>CITATION.cff:15, :23</code>)</li>
+<li><strong>§8</strong> Robotics fields → <span class="pill p-inh">INHERITED</span> (<code>mission_id</code>, <code>reward</code>, <code>sensor_data</code>, <code>terrain_type</code> first-class on the Rust side, <code>src/memory/types.rs:857, 877, 881, 923</code>; <code>heading</code> on <code>WhereFacet</code>, <code>src/memory/facets.rs:198</code>; geo/terrain projected into <code>Place</code> variants)</li>
+<li><strong>§16</strong> MIF Spec document → <span class="pill p-inh">INHERITED</span> (<code>seps/SEP-002-memory-interchange-format.md</code> + <code>seps/mif-v1.schema.json</code> at repo root)</li>
+<li><strong>§24</strong> CITATION.cff → <span class="pill p-inh">INHERITED</span> (at root, identical DOI)</li>
+<li><strong>§24</strong> STPI pitch deck + bhashini authorization letters → <span class="pill p-inh">INHERITED</span> (<code>STPI_PITCH_DECK.md</code>, <code>bhashini-authorization-letter.html</code>, <code>bhashini_letter.pdf</code> all at repo root)</li>
+<li><strong>§24</strong> IITD research paper → <span class="pill p-ren">RENAMED</span> (<code>veld_IITD.pdf</code> + <code>veld_IITD.odt</code>)</li>
+<li><strong>§24</strong> SEPs (Enhancement Proposals) → <span class="pill p-inh">INHERITED</span> (<code>seps/</code> with SEP-002, conversation-events.md, mif-v1.schema.json, example.mif.json)</li>
+<li><strong>§24</strong> OpenAPI spec → <span class="pill p-inh">INHERITED</span> (<code>openapi.yaml</code> at root + duplicate <code>specs/openapi.yaml</code>)</li>
+<li><strong>§24</strong> Marketing assets → <span class="pill p-div">DIVERGED</span> (<code>marketing/directory-submissions.md</code> present; no <code>demo/</code> or logo PNG)</li>
+<li><strong>§24</strong> Notebooks → <span class="pill p-ren">RENAMED</span> (<code>notebooks/veld_demo.ipynb</code>)</li>
+</ul>
+<strong>Also corrected in §25</strong>: the "Spec/docs" bundle row, "Robotics fields" row, "Retrieval modes" row (modes are in the Rust enum but the HTTP <code>mode=</code> parser doesn't surface <code>spatial</code>/<code>mission</code>/<code>action_outcome</code>), and "Test scripts at root" row (all 7 scripts are at veld's repo root).<br>
+<strong>Lessons:</strong> (a) CLAUDE.md is a curated index, not a tree manifest — never treat its silence as absence. (b) When a row's veld cell is "—", it should cite the file-tree check that confirmed absence, not just the absence of mention in CLAUDE.md. (c) The fork carried over the entire repo, not just the Rust source — citation/research/marketing/spec artifacts came with it.
+</div>
+
+<div class="legend">
+  <div><span class="pill p-inh">INHERITED</span> Same in both, no meaningful divergence</div>
+  <div><span class="pill p-ren">RENAMED</span> Same concept, renamed (shodh→veld brand)</div>
+  <div><span class="pill p-ext">EXTENDED</span> Inherited then expanded in veld</div>
+  <div><span class="pill p-new">NEW</span> Added in veld after fork</div>
+  <div><span class="pill p-rem">SHODH-ONLY</span> Present in shodh, not carried into veld (or removed)</div>
+  <div><span class="pill p-div">DIVERGED</span> Both have it but built differently</div>
+</div>
+
+<h3>Contents</h3>
+<div class="toc">
+<a href="#identity">1. Identity &amp; metadata</a>
+<a href="#cli">2. CLI surface</a>
+<a href="#http">3. HTTP API</a>
+<a href="#mcp">4. MCP tools</a>
+<a href="#retrieval">5. Retrieval pipeline</a>
+<a href="#scoring">6. Scoring signals</a>
+<a href="#storage">7. Storage backends</a>
+<a href="#memory-model">8. Memory model &amp; tiers</a>
+<a href="#facets">9. Facets &amp; experience types</a>
+<a href="#consolidation">10. Consolidation &amp; sleep-time</a>
+<a href="#decay">11. Decay model</a>
+<a href="#ingest">12. Ingest pipeline</a>
+<a href="#embeddings">13. Embeddings</a>
+<a href="#graph">14. Knowledge graph</a>
+<a href="#eventlog">15. Event log / intent log</a>
+<a href="#mif">16. MIF (interchange)</a>
+<a href="#auth">17. Auth</a>
+<a href="#features">18. Feature flags</a>
+<a href="#subsystems">19. Optional subsystems</a>
+<a href="#tui">20. TUI</a>
+<a href="#dist">21. Distribution</a>
+<a href="#clients">22. Client integrations</a>
+<a href="#bench">23. Benchmarks</a>
+<a href="#docs">24. Documentation</a>
+<a href="#divergence">25. Divergence map</a>
+<a href="#sources">26. Sources &amp; verification</a>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="identity">1. Identity &amp; metadata</h2>
+
+<table>
+<thead><tr><th>Field</th><th class="col-shodh">shodh-memory</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Crate name</td><td><code>shodh-memory</code> <span class="src">Cargo.toml:2</span></td><td><code>veld</code> <span class="src">Cargo.toml:2</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Current version</td><td>0.2.0 <span class="src">Cargo.toml:3</span></td><td>0.7.x (v0.7.20 line; v0.7.6-unstable per PROGRESS.md) <span class="src">Cargo.toml:3, PROGRESS.md</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>License</td><td>Apache-2.0 <span class="src">Cargo.toml:7, LICENSE</span></td><td>BUSL-1.1 (non-commercial / non-institutional clause) <span class="src">LICENSE</span></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Author / owner</td><td>Varun Sharma &lt;29.varuns@gmail.com&gt; <span class="src">CITATION.cff:11-14</span></td><td>Portll (john@portll.net) <span class="src">Cargo.toml:5</span></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Repository URL</td><td>github.com/varun29ankuS/shodh-memory <span class="src">Cargo.toml:8</span></td><td>github.com/Portll/veld <span class="src">Cargo.toml:8</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Citation / DOI</td><td>Zenodo 10.5281/zenodo.18668709 <span class="src">CITATION.cff:15</span></td><td>Same Zenodo DOI 10.5281/zenodo.18668709 <span class="src">CITATION.cff:15, :23</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Edition</td><td>Rust 2021</td><td>Rust 2021 <span class="src">Cargo.toml:4</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Product framing</td><td>"Cognitive memory for AI &amp; robots"</td><td>"Veld — Agentic Memory" (product) / "Persistent cognitive memory for AI agents and robots" <span class="src">Cargo.toml:6, CLAUDE.md</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="cli">2. CLI surface</h2>
+
+<p>Both projects ship a unified CLI with the same subcommand grammar. veld dropped <code>setup-hooks</code> as a separate subcommand (the hook config is now in <code>.claude/settings.json</code>).</p>
+
+<table>
+<thead><tr><th>Subcommand</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><code>server</code> — start HTTP API daemon</td><td>✓ <span class="src">src/cli.rs:61-90</span></td><td>✓ <span class="src">src/cli.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>tui</code> — terminal dashboard</td><td>✓ <span class="src">src/cli.rs:92-109</span></td><td>✓ <span class="src">src/cli.rs:408-444</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>serve</code> — MCP stdio server (Rust path)</td><td>✓ <span class="src">src/cli.rs:111-128</span></td><td>✓ <span class="src">src/cli.rs, src/mcp/</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>init</code> — first-time setup</td><td>✓ <span class="src">src/cli.rs:130-131</span></td><td>✓ <span class="src">src/cli.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>status</code> — health check</td><td>✓ <span class="src">src/cli.rs:133-146</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>doctor</code> — environment diagnosis</td><td>✓ <span class="src">src/cli.rs:148-150</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>hook session-start</code></td><td>✓ <span class="src">src/cli.rs</span></td><td>✓ <span class="src">src/cli.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>hook prompt</code></td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>hook commit</code> — git post-commit ingest</td><td>—</td><td>✓ <span class="src">src/cli.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td><code>setup-hooks</code> — print install instructions</td><td>✓ <span class="src">src/cli.rs</span></td><td>— (replaced by <code>.claude/settings.json</code> distribution)</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td><code>claude</code> — launch Claude Code with proxy</td><td>✓</td><td>✓ <span class="src">src/cli.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>version</code></td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Separate <code>shodh-memory-server</code> binary</td><td>✓ <span class="src">src/main.rs:66-99</span></td><td>— (unified under <code>veld server</code>)</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td>Alignment binaries (<code>alignment-collect</code>, <code>-fit</code>, <code>-eval</code>, <code>rlm-eval</code>)</td><td>—</td><td>✓ <span class="src">src/bin/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<h4>Server flags (carried over identically — env-var prefix changed)</h4>
+<table>
+<thead><tr><th>Flag</th><th>shodh env</th><th>veld env</th></tr></thead>
+<tbody>
+<tr><td><code>--storage</code> path</td><td><code>SHODH_MEMORY_PATH</code> <span class="src">src/main.rs:78</span></td><td><code>VELD_STORAGE_PATH</code> (per CLAUDE.md storage section)</td></tr>
+<tr><td><code>--rate-limit</code></td><td><code>SHODH_RATE_LIMIT</code> <span class="src">SECURITY.md:42</span></td><td>same flag, <code>VELD_*</code> env</td></tr>
+<tr><td>API key env</td><td><code>SHODH_API_KEYS</code> (csv)</td><td><code>VELD_API_KEY</code></td></tr>
+<tr><td>Server URL env (clients)</td><td><code>SHODH_API_URL</code></td><td><code>VELD_API_URL</code> / <code>VELD_SERVER_URL</code></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="http">3. HTTP API</h2>
+
+<table>
+<thead><tr><th>Route category</th><th class="col-shodh">shodh-memory</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><strong>Total routes (approx)</strong></td><td>~60-70 (handler modules under <code>src/handlers/</code>) <span class="src">src/handlers/mod.rs:7-52</span></td><td>~202 registered <span class="src">CLAUDE.md, src/handlers/router.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Health probes (<code>/health</code>, <code>/health/extended</code>)</td><td>✓ <span class="src">src/handlers/health.rs</span></td><td>✓ + <code>/health/live</code>, <code>/health/ready</code>, <code>/health/index</code> <span class="src">src/handlers/router.rs:39-157</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Core remember/recall/forget</td><td>✓ <span class="src">src/handlers/remember.rs, recall.rs</span></td><td>✓ <span class="src">src/handlers/router.rs:170-239</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Batch remember</td><td>(single)</td><td><code>/api/remember/batch</code>, <code>/api/batch_remember</code> <span class="src">router.rs:170-180</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Tag &amp; date-range recall</td><td>(filter in body)</td><td><code>/api/recall/tags</code>, <code>/api/recall/by-tags</code>, <code>/api/recall/date</code></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Proactive context</td><td><code>/api/relevant</code> + <code>proactive_context</code> MCP tool</td><td><code>/api/proactive_context</code>, <code>/api/context</code>, <code>/api/context_summary</code></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Compression / decompression</td><td><code>/api/compress</code> <span class="src">src/handlers/consolidation.rs</span></td><td><code>/api/memory/compress</code>, <code>/api/memory/decompress</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Index verify / repair / rebuild</td><td>✓ (<code>verify_index</code>, <code>repair_index</code> via MCP)</td><td><code>/api/index/*</code> including reembed <span class="src">router.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Storage stats / cleanup / migrate</td><td>migrate command on the server binary</td><td><code>/api/storage/*</code> HTTP surface</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Consolidation triggers</td><td><code>POST /api/consolidate</code></td><td><code>/api/consolidate</code> + <code>/api/consolidation/sleep</code> + <code>/api/consolidation/report</code></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Backup / restore (SHA-256)</td><td>✓ <span class="src">src/backup.rs, handlers/backup.rs</span></td><td>✓ <code>/api/backup/*</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Facts (query / purge)</td><td><code>/api/facts/query</code>, <code>/api/facts/purge</code> <span class="src">src/handlers/facts.rs</span></td><td><code>/api/facts/*</code> incl. temporal <span class="src">router.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Context blocks (LETTA-style mutable state)</td><td>—</td><td><code>/api/context/blocks/*</code> <span class="src">src/memory/context_blocks.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Sleep-time / observational memory</td><td>—</td><td><code>POST /api/sleep_time/enqueue</code>, <code>GET /api/sleep_time/status</code>, <code>GET /api/sleep_time/status/:user_id</code>, <code>POST /api/sleep_time/lock_block</code> <span class="src">src/handlers/sleep_time.rs:3-15</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Lineage tracing</td><td><code>/api/lineage</code> via <code>src/memory/lineage.rs</code></td><td><code>/api/lineage/*</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Knowledge graph CRUD &amp; traversal</td><td><code>/api/graph/entities</code>, <code>/relationships</code>, <code>/stats</code></td><td><code>/api/graph/*</code> entity/relationship/episode/traverse</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Graph viewer (embedded HTML)</td><td><code>GET /graph</code> serves <code>src/handlers/graph_view.html</code> (636 lines) + <code>visualization.rs</code> (405 lines)</td><td><code>GET /graph/view</code> serves <code>src/handlers/graph_view.html</code> + <code>visualization.rs</code> + <code>/api/visualization/*</code> route family + <code>/api/brain/{user_id}</code> brain state + universe dump <span class="src">src/handlers/router.rs:93, 402-417</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Gap topology (Voronoi / persistence / mapper)</td><td>—</td><td><code>/api/gap/*</code> <span class="src">src/memory/gap_topology/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Todo / project management</td><td>full CRUD + comments + subtasks <span class="src">src/handlers/todos.rs</span></td><td>same shape, <code>/api/todos</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Sessions API (create/list/get)</td><td>✓ <span class="src">src/handlers/sessions.rs</span></td><td>(merged into context status / lineage)</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Streaming ingest (WebSocket)</td><td><code>GET /api/stream</code> <span class="src">src/streaming.rs (1581 lines)</span></td><td><code>WebSocket /api/stream</code> — same architecture <span class="src">src/streaming.rs (1577 lines)</span> + SSE context-status (<code>/api/context/sse</code>)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>A/B testing</td><td><code>/api/ab/compare</code> <span class="src">src/handlers/ab_testing.rs</span></td><td>✓ <span class="src">src/handlers/ab_testing.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Files / codebase indexing</td><td><code>/api/files/index</code>, <code>/api/files/search</code> <span class="src">src/handlers/files.rs</span></td><td>handled via <code>seed_project</code> path</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>MIF export / import</td><td><code>/api/export/mif</code>, <code>/api/import/mif</code> <span class="src">src/handlers/export.rs</span></td><td>handled inside <code>src/mif/</code> with <code>/api/storage/uncompressed</code></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Prometheus <code>/metrics</code></td><td>✓ (API-key-gated by default) <span class="src">SECURITY.md:42, src/metrics.rs (690 lines)</span></td><td>✓ same surface; metric prefix renamed <code>shodh_*</code> → <code>veld_*</code>; <code>VELD_METRICS_PUBLIC</code> env conditional <span class="src">src/metrics.rs (690 lines), src/handlers/router.rs:36-124</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Webhook ingest (GitHub, Linear)</td><td><code>POST /webhook/github</code>, <code>/webhook/linear</code> (HMAC-verified) <span class="src">src/handlers/webhooks.rs</span></td><td>same routes <span class="src">src/handlers/router.rs:166-167</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>External-dimension push (Sleight)</td><td>—</td><td><code>/api/sleight/dimensions</code> <span class="src">src/memory/types.rs:74-109</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Anchor (pin against decay)</td><td>—</td><td><code>/api/anchor</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Tier moves (agent-directed)</td><td>—</td><td><code>/api/memory/tier</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Prompt generation</td><td>—</td><td><code>/api/prompt/gen</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Entity resolution endpoints</td><td>—</td><td><code>/api/entity/*</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>User-auth (registration / TOTP / recovery)</td><td>API-key only <span class="src">src/auth.rs</span></td><td><code>/api/user_auth/*</code> incl. <code>/2fa/enroll</code>, <code>/2fa/confirm</code> <span class="src">src/user_auth/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="mcp">4. MCP tools (TypeScript server)</h2>
+
+<p>Both ship a TypeScript MCP wrapper around the HTTP API. shodh exposes ~45 tools (<code>mcp-server/index.ts:615-5046</code>); veld exposes 46 + 4 prompts (<code>mcp-server/index.ts</code>, CLAUDE.md says <strong>"46 tools"</strong>). The overlap is the bulk; differences are listed below.</p>
+
+<table>
+<thead><tr><th>MCP tool</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><code>remember</code></td><td>✓ rich context incl. robotics fields <span class="src">mcp-server/index.ts:685-732</span></td><td>✓ facets + importance + tags + feedback</td><td><span class="pill p-div">DIVERGED</span> (schema differs)</td></tr>
+<tr><td><code>recall</code></td><td>✓ <strong>7 modes</strong>: semantic, associative, temporal, hybrid, spatial, mission, action_outcome <span class="src">mcp-server/index.ts:752-756</span></td><td>✓ single semantic + threshold/limit (modes flattened into HTTP query layer)</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td><code>forget</code>, <code>list_memories</code>, <code>read_memory</code></td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>quick_recall</code>, <code>session_summary</code>, <code>what_i_know</code></td><td>✓ as dedicated tools</td><td>✓ as internal prompt shortcuts (<code>index.ts:4282-4302</code>)</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td><code>query</code>, <code>topic</code>, <code>recall_by_tags</code>, <code>recent_memories</code>, <code>count</code></td><td>✓</td><td>✓ (per CLAUDE.md tool table)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>proactive_context</code>, <code>context_summary</code></td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>pending_work</code>, <code>session_digest</code>, <code>session_history</code></td><td>✓</td><td><code>pending_work</code> only (session_digest / session_history not in CLAUDE.md tool table)</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td><code>memory_health</code></td><td>✓ <span class="src">mcp-server/index.ts</span></td><td>✓ (listed in CLAUDE.md core memory tools)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>memory_stats</code>, <code>consolidation_report</code>, <code>verify_index</code>, <code>repair_index</code></td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>token_status</code>, <code>reset_token_session</code> (SHO-115 context-window tracking)</td><td>✓ <span class="src">mcp-server/index.ts</span></td><td>✓ <span class="src">CLAUDE.md token budget</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Backup tools (<code>backup_create</code>, <code>_list</code>, <code>_verify</code>, <code>_restore</code>, <code>_purge</code>)</td><td>5 tools <span class="src">mcp-server/index.ts</span></td><td>same 5 tools</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Reminders (<code>set_reminder</code>, <code>list_reminders</code>, <code>dismiss_reminder</code>)</td><td>✓</td><td>✓ <span class="src">CLAUDE.md reminders</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Todo CRUD (10+ tools incl. comments, subtasks, projects)</td><td>✓ (full 15-tool surface)</td><td>✓ identical shape</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>seed_project</code></td><td>—</td><td>✓ <span class="src">src/handlers/seed.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td><code>purge_facts</code>, <code>fact_narratives</code></td><td>✓ <span class="src">mcp-server/index.ts</span></td><td>not in CLAUDE.md tool table</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td>Prompts (Available Commands / Session Summary / Pending Work / Memory Stats)</td><td>1 (Available Commands)</td><td><strong>4 prompts</strong> <span class="src">mcp-server/index.ts:4018-4303</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="retrieval">5. Retrieval pipeline</h2>
+
+<table>
+<thead><tr><th>Layer / component</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Vector backend: Vamana (graph ANN)</td><td>default for &lt;100k vectors, max_degree 32, search_list 100 <span class="src">src/vector_db/mod.rs:53-68, vamana.rs</span></td><td>HNSW listed as <em>active engine</em>; Vamana retained <span class="src">CLAUDE.md, src/vector_db/</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Vector backend: SPANN (IVF+PQ)</td><td>auto-selects above 100k, PQ 32× compression <span class="src">src/vector_db/mod.rs:53,65</span></td><td>present alongside HNSW / Vamana <span class="src">CLAUDE.md retrieval section</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Vector backend: HNSW</td><td>—</td><td>active retrieval engine <span class="src">CLAUDE.md "HNSW is the active retrieval engine"</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Vector backend: DiskANN</td><td>—</td><td>listed in CLAUDE.md</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Distance metrics</td><td>NormalizedDotProduct (default), Euclidean, Cosine <span class="src">src/vector_db/vamana.rs DistanceMetric</span></td><td>inherited (same vector_db tree)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>BM25 full-text (Tantivy)</td><td>✓ Porter2 stemming <span class="src">Cargo.toml:183, rust-stemmers</span></td><td>✓ <span class="src">CLAUDE.md retrieval</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Graph spreading activation (Hebbian)</td><td>✓ <span class="src">src/memory/graph_retrieval.rs</span></td><td>✓ same module <span class="src">src/memory/graph_retrieval.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Cross-encoder reranking</td><td>—</td><td>✓ ~18% blend, top-20 budget <span class="src">src/embeddings/cross_encoder.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Dual-embedder competition (MiniLM + Nomic)</td><td>MiniLM only <span class="src">src/embeddings/minilm.rs</span></td><td>MiniLM 384d + Nomic 768d, max-merge <span class="src">src/embeddings/competitive.rs, CLAUDE.md</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>RRF fusion</td><td>density-weighted combination (hybrid mode)</td><td>BM25 0.35 + Vector 0.40 + Graph 0.25 with K=45 <span class="src">CLAUDE.md retrieval</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>LLM refiner / RLM rerank (post-RRF)</td><td>—</td><td>4 modes: None / CrossEncoder / Rlm / Stacked <span class="src">src/memory/rlm_refiner.rs, commit e5730c3</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Retrieval modes exposed at MCP/API</td><td>7 distinct modes <span class="src">mcp-server/index.ts:752-756</span></td><td>1 unified semantic surface + signal flags</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>External-dimension modulation (5D from Sleight)</td><td>—</td><td>density / coherence / closure / confidence / isotropy <span class="src">src/memory/types.rs:74-109</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Signal attribution per result</td><td>—</td><td>✓ <code>SignalAttribution</code> struct <span class="src">src/memory/types.rs:122-137</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Embedding cache (LRU)</td><td>dual cache: content + query <span class="src">src/memory/mod.rs:44-47</span></td><td>HTTP backend with LRU + optional Zenoh shared cache <span class="src">CLAUDE.md embeddings cache</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Circuit breaker (embedder API)</td><td>✓ <span class="src">src/embeddings/circuit_breaker.rs</span></td><td>✓ same module <span class="src">src/embeddings/circuit_breaker.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="scoring">6. Scoring signals</h2>
+
+<p>Shodh ranks on ~8 signals; veld's <code>ScoringSignals</code> struct in <code>src/memory/types.rs:29-64</code> declares 20+ fields plus an <code>ExternalDimensionScores</code> companion.</p>
+
+<table>
+<thead><tr><th>Signal</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>base_score (RRF fusion)</td><td>—</td><td>✓ <span class="src">types.rs:29-64</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>recency (exponential decay)</td><td>✓ <span class="src">src/relevance.rs</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>arousal (emotional 0-1)</td><td>field exists on memory (<code>emotional_arousal</code>) <span class="src">mcp-server/index.ts:643-655</span></td><td>✓ as scoring signal</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>credibility (source)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>temporal_match</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>session_boost (2-hr window, +0.03)</td><td>session memories favored implicitly</td><td>✓ explicit <span class="src">types.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>access_count (log-scaled)</td><td>✓ usage tracking</td><td>✓ ~7% blend</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>graph_strength (Hebbian)</td><td>✓ <span class="src">src/graph_memory.rs edge weight</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>calibrated_confidence (Bayesian α/β, gate 0.85-1.0)</td><td>—</td><td>✓ <span class="src">types.rs:46-47,153</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>confidence_observations / feedback_momentum (EMA)</td><td>implicit feedback log <span class="src">src/memory/feedback.rs</span></td><td>✓ explicit signals</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>cross_encoder</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>rlm_score (LLM refiner)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>importance</td><td>type-dependent base + recency boost <span class="src">src/memory/types.rs:200-250, README-rust.md:76-92</span></td><td>✓ stored</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>entity_match / tag_match</td><td>entity fingerprint + tag filter</td><td>✓ as discrete signals</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>episode_coherence (~8%)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>source_type multiplier</td><td>per ExperienceType (table below) <span class="src">src/memory/types.rs:55-113</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>emotional_valence_intensity (~2%)</td><td>field present</td><td>✓ as scoring signal</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>sequence_proximity (~2%)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>entity_density / temporal_fact_density</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>external dimensions (Sleight 5D)</td><td>—</td><td>✓ <code>ExternalDimensionScores</code></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="storage">7. Storage backends</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Default backend (runtime)</td><td>RocksDB (only backend) <span class="src">Cargo.toml:318-323</span></td><td>RocksDB still effective; redb is the <em>requested default</em> and target for v0.9 <span class="src">src/config.rs:57-61, CLAUDE.md</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>redb (Rust embedded relational)</td><td>—</td><td>✓ feature <code>storage-redb</code> (default on) <span class="src">Cargo.toml:366, src/storage/redb.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>RocksDB legacy</td><td>primary <span class="src">src/storage/, Cargo.toml:318-323</span></td><td>kept as <code>legacy-rocksdb</code> feature <span class="src">src/storage/legacy_rocksdb.rs, Cargo.toml:407-413</span></td><td><span class="pill p-ren">RENAMED</span> (becomes legacy)</td></tr>
+<tr><td>Storage trait abstraction</td><td><code>MemoryStorage</code> trait <span class="src">src/memory/storage/</span></td><td><code>PrimaryMemoryStore</code> + <code>GraphStore</code> + <code>KeyValueStore</code> + <code>AuditStore</code> + <code>BackupStore</code> + <code>MigrationStore</code> + <code>StorageFactory</code> <span class="src">src/storage/mod.rs:74-145</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td><code>StorageCapabilities</code> bitset</td><td>—</td><td>embedded, default_target, legacy_compatibility, supports_prefix_scan/transactional_batch/snapshots/migrate_in_place/shared_multi_tenant_store <span class="src">src/storage/mod.rs:26-35</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Serialization: postcard / messagepack / bincode</td><td>Postcard primary + rmp-serde fallback + bincode 1.3 legacy <span class="src">Cargo.toml:129-132, src/serialization.rs</span></td><td>same toolchain</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Default data path</td><td><code>~/.cache/shodh-memory/</code> via <code>dirs</code> crate <span class="src">Cargo.toml:146</span></td><td>per-OS: <code>~/.local/share/veld/</code>, <code>~/Library/Application Support/veld/</code>, <code>%APPDATA%\veld\</code>; fallback <code>./veld_data/</code> <span class="src">CLAUDE.md storage section</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Field-level encryption (AES-256-GCM)</td><td>✓ <span class="src">src/encryption.rs, Cargo.toml:196</span></td><td>✓ in MIF only <span class="src">src/mif/</span></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Backups with SHA-256 checksum</td><td>✓ <span class="src">src/backup.rs</span></td><td>✓ <span class="src">src/handlers/consolidation.rs:297-303</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Per-user write locks</td><td>—</td><td><code>CONSOLIDATION_LOCKS: DashMap&lt;String, Arc&lt;Mutex&gt;&gt;</code> <span class="src">src/handlers/consolidation.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Multi-tenant shared store</td><td>—</td><td>feature-gated <code>multi-tenant</code> + Hosaka extension <span class="src">src/extensions/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="memory-model">8. Memory model &amp; tiers</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Tier names</td><td><code>Working → Session → LongTerm</code> (3) <span class="src">src/memory/types.rs</span></td><td><code>Working → Session → LongTerm → Archive</code> (4) <span class="src">src/memory/types.rs MemoryTier</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Working-memory capacity</td><td>~100 items (Cowan-inspired, <code>DEFAULT_WORKING_MEMORY_SIZE</code>) <span class="src">src/memory/types.rs, src/constants.rs</span></td><td>same convention, configurable <span class="src">src/constants.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Session boundary</td><td>~24h (<code>TIER_PROMOTION_SESSION_AGE_SECS</code>) <span class="src">src/memory/sessions.rs</span></td><td>2-hour rolling window for session boost; longer-running session quota inherited <span class="src">CLAUDE.md, src/memory/types.rs</span></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Anchor (pin against decay)</td><td>—</td><td>✓ <code>/api/anchor</code> + memory flag <span class="src">CLAUDE.md anchor</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Agent-directed tier moves</td><td>—</td><td>✓ <code>/api/memory/tier</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Calibrated confidence (Bayesian α/β)</td><td>—</td><td>✓ retrieval gate 0.85-1.0 <span class="src">src/memory/types.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Context blocks (mutable agent state, Letta-style)</td><td>—</td><td>✓ key/content/max_tokens/version <span class="src">src/memory/context_blocks.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Prospective memory (<code>Intention</code>)</td><td>✓ as ExperienceType <span class="src">src/memory/types.rs:34-53</span></td><td>✓ surfaced via reminder queries / spreading activation <span class="src">CLAUDE.md prospective memory</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Robotics fields (geo, heading, mission_id, sensor_data, reward, terrain)</td><td>✓ as first-class memory fields <span class="src">mcp-server/index.ts:685-732</span></td><td>✓ first-class on the Rust side: <code>mission_id</code>, <code>reward</code>, <code>sensor_data</code>, <code>terrain_type</code> <span class="src">src/memory/types.rs:857, 877, 881, 923</span>; <code>heading</code> on WhereFacet <span class="src">src/memory/facets.rs:198</span>; geo/terrain projected into <code>Place</code> variants <span class="src">src/memory/types.rs:1063-1108</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Hebbian LTP protection (5+ co-activations)</td><td>✓ <code>LTP_PRUNE_FLOOR</code>, <code>HEBBIAN_BOOST_HELPFUL</code> <span class="src">src/constants.rs, src/handlers/consolidation.rs</span></td><td>✓ Hebbian edge strengthening <span class="src">CLAUDE.md "strengthen_memory_edges"</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="facets">9. Facets &amp; experience types</h2>
+
+<p>shodh tracks memory <em>type</em> via the <code>ExperienceType</code> enum (~14 variants with per-type edge/activation multipliers). veld kept the same enum and layered the <strong>5-W facet model</strong> (Who/What/When/Where/Why) on top.</p>
+
+<h4>ExperienceType (shared)</h4>
+<table>
+<thead><tr><th>Variant</th><th>Edge weight</th><th>Activation mult</th><th>In shodh</th><th>In veld</th></tr></thead>
+<tbody>
+<tr><td>Decision</td><td>1.5×</td><td>1.0×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Learning</td><td>1.5×</td><td>1.0×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Error</td><td>1.2×</td><td>1.0×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Discovery</td><td>1.2×</td><td>0.9×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Pattern</td><td>1.0×</td><td>0.9×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Observation</td><td>0.8×</td><td>0.8×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Context</td><td>0.8×</td><td>0.7×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Task</td><td>1.0×</td><td>0.8×</td><td>✓</td><td>✓</td></tr>
+<tr><td>Conversation</td><td>0.6×</td><td>0.6×</td><td>✓</td><td>✓</td></tr>
+<tr><td>CodeEdit / FileAccess / Search / Command (auto-captured)</td><td>0.3×</td><td>0.3×</td><td>✓ <span class="src">src/memory/types.rs:55-113</span></td><td>✓ inherited</td></tr>
+<tr><td>Intention (prospective)</td><td>1.0×</td><td>1.0×</td><td>✓ <span class="src">src/memory/types.rs:195-199</span></td><td>✓</td></tr>
+</tbody>
+</table>
+
+<h4>Facet model</h4>
+<table>
+<thead><tr><th>Facet</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Who / What / When / Where / Why</td><td>partial — Where facet built around geo/local pose for robotics</td><td>full 5-W taxonomy + <code>RecordKind</code>, <code>ContentKind</code>, <code>CausalLink</code>, <code>EngramBinding</code>, <code>Prediction</code>, <code>AgentRef</code>, <code>Place</code> <span class="src">src/memory/facets.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Place hierarchy (Repo→Module→File→Scope, Geo, Host, URL)</td><td>geo-centric (lat/lon/alt + local frame)</td><td>multi-realm Place enum <span class="src">src/memory/facets.rs:1-200</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Page-type taxonomy (wiki-ready)</td><td>—</td><td>RecordKind/ContentKind enums for wiki view <span class="src">CLAUDE.md facets</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="consolidation">10. Consolidation &amp; sleep-time</h2>
+
+<table>
+<thead><tr><th>Stage</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Semantic fact extraction</td><td>✓ <span class="src">src/handlers/consolidation.rs, src/memory/compression.rs</span></td><td>✓ <span class="src">src/handlers/consolidation.rs consolidate_memories</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Temporal fact resolution</td><td>✓ <span class="src">src/memory/temporal_facts.rs</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Knowledge-graph injection (NER + edge formation)</td><td>✓ <span class="src">src/graph_memory.rs</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Hebbian edge strengthening (LTP threshold 5+)</td><td>✓</td><td>✓ same convention</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Decay &amp; pruning</td><td>✓ <span class="src">src/decay.rs</span></td><td>✓ <span class="src">src/decay.rs, src/decay_scales.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Background scheduler</td><td>tokio task on <code>maintenance_interval_secs</code> (default 3600) <span class="src">src/server.rs:139-154</span></td><td>detached tokio task w/ per-user lock <span class="src">src/handlers/consolidation.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Streaming consolidation (WebSocket)</td><td>5s extraction checkpoint, 50-msg buffer <span class="src">src/streaming.rs, mcp-server/index.ts:256-375</span></td><td>✓ same architecture <span class="src">src/streaming.rs (1577 lines)</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><strong>Sleep-time V1+V2-stage-1 module</strong></td><td>—</td><td>✓ <code>src/memory/sleep_time/</code> — 13 files: <code>types.rs</code> (EvidencePack, RewriteProposal, SleepMode, QueueItem), <code>diff.rs</code> (DiffClass: Noop/Minor/Substantive/Massive), <code>policies.rs</code> (BudgetTracker, DebounceTracker), <code>rewriter.rs</code> (Anthropic + Mock variants, R29/R30), <code>queue.rs</code>, <code>observation.rs</code>, <code>observer.rs</code>, <code>orchestrator.rs</code>, <code>worker.rs</code>, <code>edge_proposals.rs</code>, <code>graduation.rs</code>, <code>supersession.rs</code>, <code>mod.rs</code> <span class="src">commits 52e5cda + c09ae4f</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Async LLM-driven context-block rewriter</td><td>—</td><td>✓ Anthropic-backend Rewriter (R29/R30), strict prompt role separation, JSON schema output, response validation <span class="src">src/memory/sleep_time/rewriter.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Sleep-phase endpoint</td><td>—</td><td>✓ <code>POST /api/consolidation/sleep</code> + 4-route <code>/api/sleep_time/*</code> family with per-user budget + lock-block toggle <span class="src">src/handlers/sleep_time.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Gap topology (Voronoi / persistence / mapper)</td><td>—</td><td>✓ <span class="src">src/memory/gap_topology/detectors.rs, scoring</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Wavelet sessions (FFT spectral analysis)</td><td>—</td><td>✓ <span class="src">src/memory/wavelet_sessions.rs (rustfft)</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="decay">11. Decay model</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Hybrid Wixted-style decay</td><td>✓ 3-day exponential consolidation + power-law long-term <span class="src">src/decay.rs:1-82, 74-93</span></td><td>✓ same shape <span class="src">src/decay.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Constants: <code>DECAY_LAMBDA_CONSOLIDATION</code>, <code>POWERLAW_BETA</code>, <code>POWERLAW_BETA_POTENTIATED</code></td><td>✓ <span class="src">src/constants.rs</span></td><td>✓ <span class="src">src/constants.rs (status modified)</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>LTP-protected slower decay</td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Log-periodic correction (discrete scale invariance — Sornette 2003)</td><td>—</td><td>✓ weekly/monthly/yearly resonance <span class="src">CLAUDE.md decay note, src/decay_scales.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>FFT-learned decay scales</td><td>—</td><td>✓ <span class="src">src/memory/wavelet_sessions.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Anchor (immortalize a memory)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="ingest">12. Ingest pipeline</h2>
+
+<table>
+<thead><tr><th>Source / extractor</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Plain text / Markdown / JSON / JSONL / CSV / TSV</td><td>(via embeddings/chunking and file indexer) <span class="src">src/memory/files.rs, src/embeddings/chunking.rs</span></td><td>✓ explicit extractor enum <span class="src">src/ingest/extractors.rs, src/ingest/mod.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Code-aware chunking (20+ languages)</td><td>basic file indexing</td><td>✓ language-aware <span class="src">src/ingest/</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>HTML extraction</td><td>—</td><td>✓ <span class="src">src/ingest/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>PDF (gated by <code>pdf</code> feature, <code>pdf-extract</code>)</td><td>—</td><td>✓ <span class="src">Cargo.toml feature pdf</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Google Drive ingestor</td><td>—</td><td>✓ <span class="src">src/ingest/gdrive.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>GitHub ingestor</td><td>via webhook <span class="src">src/handlers/webhooks.rs</span></td><td>✓ dedicated module <code>src/ingest/github.rs</code> + webhook</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Project seeding (walk local dir)</td><td>file indexer (<code>POST /api/files/index</code>) <span class="src">src/handlers/files.rs</span></td><td>✓ <code>seed_project</code> MCP tool + <code>src/handlers/seed.rs</code></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>WebSocket streaming ingest (continuous)</td><td>✓ <code>GET /api/stream</code></td><td>✓ same <code>WebSocket /api/stream</code> <span class="src">src/streaming.rs (1577 lines)</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Linear webhook</td><td>✓ (HMAC-verified, <code>SHODH_ALLOW_UNSIGNED_WEBHOOKS</code> override) <span class="src">SECURITY.md:40, src/handlers/webhooks.rs</span></td><td>✓ <span class="src">src/handlers/router.rs:166-167</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Telegram / Todoist / WhatsApp connectors</td><td>✓ <code>shodh-telegram/</code> (903 LOC), <code>shodh-todoist/</code> (562 LOC), <code>shodh-whatsapp/</code> (897 LOC)</td><td>✓ <code>veld-telegram/</code> (903 LOC, identical file set), <code>veld-todoist/</code> (562 LOC, <code>shodh.ts</code>→<code>veld.ts</code>), <code>veld-whatsapp/</code> (998 LOC — ahead of shodh in <code>llm.ts</code>+<code>config.ts</code>)</td><td><span class="pill p-ren">RENAMED</span> (+ veld-whatsapp extended)</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="embeddings">13. Embeddings</h2>
+
+<table>
+<thead><tr><th>Component</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>MiniLM-L6-v2 (384d, ONNX via <code>ort</code>)</td><td>✓ ~150-250ms/embed <span class="src">src/embeddings/minilm.rs, BENCHMARKS.md:16</span></td><td>✓ <span class="src">src/embeddings/minilm.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Auto-download on first use</td><td>✓ <span class="src">src/embeddings/, ~/.cache/shodh-memory/models/</span></td><td>✓ <span class="src">src/embeddings/downloader.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Nomic Embed Text v1.5 (768d, HTTP)</td><td>—</td><td>✓ LM Studio / Ollama / vLLM auto-detect <span class="src">src/embeddings/nomic.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Competitive (max-merge) embedder</td><td>—</td><td>✓ <span class="src">src/embeddings/competitive.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Cross-encoder reranker (HTTP)</td><td>—</td><td>✓ <span class="src">src/embeddings/cross_encoder.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>NER (TinyBERT)</td><td>✓ <span class="src">src/embeddings/ner.rs</span></td><td>✓ <span class="src">src/embeddings/ner.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>YAKE keyword extraction</td><td>✓ <span class="src">src/embeddings/keywords.rs, Cargo.toml:149</span></td><td>✓ <span class="src">src/embeddings/keywords.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Query parsing — rule-based</td><td>✓ <span class="src">src/query_parsing/rule_based.rs</span></td><td>✓ inherited (CLAUDE.md doesn't break it out separately)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Query parsing — LLM-based (gated)</td><td>✓ feature <code>llm-parser</code> (reserved) <span class="src">Cargo.toml:299</span></td><td>✓ feature <code>llm-parser</code> (reserved) <span class="src">Cargo.toml features</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Zenoh embedder (robotics shared cache)</td><td>—</td><td>✓ <span class="src">src/embeddings/zenoh_embedder.rs</span> (feature: zenoh)</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Circuit breaker</td><td>✓ <span class="src">src/embeddings/circuit_breaker.rs</span></td><td>✓ <span class="src">src/embeddings/circuit_breaker.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Alignment binaries (Procrustes + Ridge)</td><td>—</td><td>✓ <code>alignment-collect</code>, <code>alignment-fit</code>, <code>alignment-eval</code>, <code>rlm-eval</code> <span class="src">src/bin/, src/embeddings/alignment_*.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="graph">14. Knowledge graph</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>EntityNode (uuid, name, labels, mention_count, summary, attributes, salience, is_proper_noun, PII)</td><td>✓ <span class="src">src/graph_memory.rs:46-91</span></td><td>✓ same struct <span class="src">src/graph_memory.rs</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Entity label ontology</td><td>4 base (PERSON, ORG, LOCATION, MISC) <span class="src">src/embeddings/ner.rs</span></td><td>25+ types (Person, Organization, Technology, Concept, Keyword, Project, Task, Document, Repository, Service, Database, Metric, Configuration, Environment, Pipeline, Team, Role, Module, …) <span class="src">CLAUDE.md retrieval section</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>RelationshipEdge (Hebbian strength + temporal)</td><td>✓</td><td>✓ + Graphiti-style bi-temporal validity</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>EpisodicNode (memory ↔ entities)</td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Column families (entities, relationships, episodes, entity_edges, entity_pair_index, entity_episodes, name_index, lowercase_index, stemmed_index)</td><td>✓ <span class="src">src/graph_memory.rs:22-43</span></td><td>✓ same CF layout</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Spreading activation</td><td>✓ <span class="src">src/memory/graph_retrieval.rs</span></td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>WH-word ontology boost (why→Cause, what→concept hierarchy)</td><td>—</td><td>✓ <span class="src">CLAUDE.md retrieval Layer 3</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Forman-Ricci curvature for entity selectivity</td><td>✓ <span class="src">src/graph_memory.rs (curvature selectivity)</span></td><td>(not enumerated in CLAUDE.md surface; module retained)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Embedded HTML graph viewer</td><td>✓ <span class="src">src/handlers/graph_view.html, src/handlers/visualization.rs</span></td><td>route family <code>/api/visualization/*</code> + universe dump <code>/api/{user_id}/universe</code></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Selective membrane / PII classification (cross-user safety)</td><td>PII redaction <span class="src">src/mif/pii.rs</span></td><td>✓ <code>PersonalIdentity / OrganizationIdentity / Clean</code> on entities (gated by <code>multi-tenant</code>) <span class="src">CLAUDE.md multi-tenant section</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="eventlog">15. Event log / intent log</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Event store per user</td><td>✓ session events + tool calls + memory ops <span class="src">src/memory/learning_history.rs, src/memory/sessions.rs</span></td><td>✓ intent log <span class="src">src/intent_log/</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Lineage tracking (memory ↔ originating event)</td><td>✓ <span class="src">src/memory/lineage.rs, src/handlers/lineage.rs</span></td><td>✓ <code>/api/lineage/*</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Frame-based projection layer</td><td>—</td><td>✓ per-record <code>schema_version</code> + migration registry <span class="src">src/intent_log/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>CRC32 frame integrity (<code>crc32fast</code>)</td><td>—</td><td>✓ <span class="src">src/intent_log/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Bincode-tagged enum payload</td><td>—</td><td>✓ typed <code>IntentPayload</code> (per recent commit <code>3173a16</code>) <span class="src">git log</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Session digest analytics (token use, tool histogram)</td><td>✓ <span class="src">mcp-server/index.ts:3850-3950</span></td><td>(no <code>session_digest</code> MCP tool in CLAUDE.md surface)</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="mif">16. MIF (Memory Interchange Format)</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Spec document</td><td>✓ <code>seps/SEP-002-memory-interchange-format.md</code> (12.9 KB) + <code>seps/mif-v1.schema.json</code> (11.4 KB)</td><td>✓ <code>seps/SEP-002-memory-interchange-format.md</code> + <code>seps/mif-v1.schema.json</code> at repo root</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Adapters</td><td>shodh, mem0, generic, markdown <span class="src">src/mif/adapters/</span></td><td>Mem0, Veld native, markdown, generic <span class="src">CLAUDE.md MIF section, src/mif/</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>PII handling</td><td>✓ <span class="src">src/mif/pii.rs</span></td><td>✓ inherited subsystem</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>HTTP export / import</td><td>✓ <code>/api/export/mif</code>, <code>/api/import/mif</code> <span class="src">src/handlers/export.rs</span></td><td>partial — routes folded into storage handlers</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Optional AES-256-GCM encryption</td><td>(field-level encryption is global, not MIF-scoped)</td><td>✓ MIF-scoped <span class="src">src/mif/</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="auth">17. Auth</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>API-key middleware</td><td>✓ X-API-Key + Bearer, constant-time compare (<code>subtle</code>) <span class="src">src/auth.rs, Cargo.toml:200</span></td><td>✓ same convention + admin key separation <span class="src">src/auth.rs</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Multi-key mode (CSV in env)</td><td>✓ <code>SHODH_API_KEYS</code></td><td>(not explicitly noted; the public-router test enforces no per-user handlers in the public router)</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Auto-generation on localhost</td><td>✓ random 32-byte hex</td><td>via <code>veld init</code></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Rate limiting</td><td>tower_governor; default 4000 req/s, 200 concurrent <span class="src">src/main.rs:66-99</span></td><td>tower_governor (inherited)</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Webhook HMAC verification</td><td>✓ secure-by-default, env override <span class="src">SECURITY.md:40</span></td><td>✓ inherited</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>User registration / login</td><td>—</td><td>✓ <code>POST /api/user_auth/register</code>, <code>/login</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>TOTP 2FA (RFC 6238, <code>totp-rs</code>)</td><td>—</td><td>✓ <code>/2fa/enroll</code>, <code>/2fa/confirm</code> <span class="src">src/user_auth/, Cargo.toml:226-231</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Recovery codes (Argon2id)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Password hashing (Argon2id)</td><td>—</td><td>✓</td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Session middleware (<code>require_user_session</code>)</td><td>session id only</td><td>session-token auth layer <span class="src">src/handlers/user_auth.rs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="features">18. Feature flags</h2>
+
+<table>
+<thead><tr><th>Feature flag</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><code>storage-redb</code></td><td>—</td><td>✓ default on <span class="src">Cargo.toml:366</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td><code>legacy-rocksdb</code></td><td>not a flag — RocksDB is the only path</td><td>✓ optional <span class="src">Cargo.toml:407-413</span></td><td><span class="pill p-ren">RENAMED</span> (default→legacy)</td></tr>
+<tr><td><code>python</code> (PyO3 bindings)</td><td>✓ <span class="src">Cargo.toml:291-310, pyproject.toml:47-51</span></td><td>✓ <span class="src">Cargo.toml features</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>llm-parser</code></td><td>✓ reserved <span class="src">Cargo.toml:299</span></td><td>✓ reserved</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>zenoh</code></td><td>✓ <span class="src">Cargo.toml:295-310</span></td><td>✓ <span class="src">CLAUDE.md zenoh section</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>telemetry</code> (OpenTelemetry)</td><td>✓ <span class="src">Cargo.toml:305-310</span></td><td>✓ <span class="src">CLAUDE.md telemetry</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td><code>multi-tenant</code> (Hosaka collective)</td><td>—</td><td>✓ <span class="src">src/extensions/, CLAUDE.md multi-tenant</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td><code>pdf</code> (pdf-extract)</td><td>—</td><td>✓ <span class="src">Cargo.toml features</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td><code>fortress</code> (binary obfuscation)</td><td>—</td><td>✓ profile + feature <span class="src">Cargo.toml:351-362, src/fortress/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Default feature set</td><td>none (minimal, edge-first) <span class="src">Cargo.toml:293</span></td><td><code>["storage-redb"]</code></td><td><span class="pill p-div">DIVERGED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="subsystems">19. Optional subsystems (gated)</h2>
+
+<table>
+<thead><tr><th>Subsystem</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Zenoh / ROS2 transport (pure-Rust pub/sub)</td><td>✓ <code>SHODH_ZENOH_ENABLED=true</code> <span class="src">src/zenoh_transport/, src/server.rs:168-186</span></td><td>✓ <span class="src">src/zenoh_transport/, CLAUDE.md</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Telemetry (OTLP gRPC, ~200 extra packages)</td><td>✓ <code>SHODH_TELEMETRY=true</code> <span class="src">src/server.rs:157-165</span></td><td>✓ <span class="src">CLAUDE.md</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Python (PyO3, maturin, ABI3 3.8-3.13)</td><td>✓ <span class="src">pyproject.toml, src/python.rs</span></td><td>✓ <span class="src">python/, Cargo.toml feature python</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Multi-tenant Hosaka collective</td><td>—</td><td>✓ feature-gated, selective membrane PII filter <span class="src">src/extensions/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Fortress (fractal binary obfuscation + anti-debug)</td><td>—</td><td>✓ profile <code>fortress</code>: opt-level=3, lto="fat", strip="symbols", panic="abort", overflow-checks=false <span class="src">Cargo.toml:351-362, src/fortress/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Streaming (WebSocket ingest)</td><td>✓ <span class="src">src/streaming.rs (1581 lines)</span></td><td>✓ same module <span class="src">src/streaming.rs (1577 lines)</span> + SSE context-status</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Telegram / Todoist / WhatsApp packages</td><td>✓ <code>shodh-telegram/</code>, <code>shodh-todoist/</code>, <code>shodh-whatsapp/</code></td><td>✓ <code>veld-telegram/</code>, <code>veld-todoist/</code>, <code>veld-whatsapp/</code> at repo root</td><td><span class="pill p-ren">RENAMED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="tui">20. TUI dashboard</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Subcommand entrypoint</td><td><code>shodh tui</code> <span class="src">src/cli.rs:92-109</span></td><td><code>veld tui</code> <span class="src">src/cli.rs:408-444</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Location</td><td><code>tui/</code> in repo (compiled into unified binary) <span class="src">README.md:25</span></td><td><code>tui/</code> dir, excluded from crate publish <span class="src">Cargo.toml:65</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Connection model</td><td>HTTP to running server (<code>--api-url</code>, <code>--api-key</code>)</td><td>HTTP via <code>VELD_SERVER_URL</code> + <code>VELD_API_KEY</code></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Distribution</td><td>bundled in unified binary</td><td>separate binary in GitHub releases</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="dist">21. Distribution channels</h2>
+
+<table>
+<thead><tr><th>Channel</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>crates.io</td><td><code>shodh-memory</code> v0.2.0 <span class="src">README.md:13</span></td><td><code>veld</code> v0.7.x <span class="src">CLAUDE.md distribution table</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>npm (MCP wrapper)</td><td><code>@shodh/memory-mcp</code> v0.2.0 <span class="src">mcp-server/package.json:2-3</span></td><td><code>@veld/memory-mcp</code> v0.7.20 <span class="src">mcp-server/package.json</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>PyPI</td><td><code>shodh-memory</code> v0.2.0 <span class="src">pyproject.toml:6</span></td><td><code>veld</code> <span class="src">pyproject.toml</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Docker Hub</td><td><code>varunshodh/shodh-memory</code> <span class="src">README.md:16</span></td><td><code>varunveld/veld</code> <span class="src">CLAUDE.md distribution table</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Homebrew</td><td><code>brew tap varun29ankuS/shodh-memory</code> <span class="src">README.md:52</span></td><td><code>portll/veld/veld</code> (public-release line only) <span class="src">CLAUDE.md distribution</span></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>MCP Registry</td><td><code>shodh-memory</code> in Smithery <span class="src">README.md:11</span></td><td><code>io.github.Portll/veld</code> at registry.modelcontextprotocol.io</td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Cursor Directory</td><td><code>shodh-memory</code> <span class="src">README.md:12</span></td><td><code>veld-1</code></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>GitHub Releases (pre-built binaries)</td><td>Windows / macOS / Linux, ~8 MB stripped <span class="src">README.md:50</span></td><td>Windows / macOS / Linux, multi-arch <span class="src">CLAUDE.md</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>cargo-binstall pre-built bindings</td><td>—</td><td>✓ platform overrides <span class="src">Cargo.toml:315-330</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>System service templates (Linux / macOS / Windows)</td><td>—</td><td>✓ <code>packaging/linux/veld.service</code> (systemd user unit, MemoryMax=2G, auto-restart), <code>packaging/macos/net.portll.veld.plist</code> (launchd, KeepAlive on crash), <code>packaging/windows/install-service.ps1</code> (nssm/shawl/winsw, -Configure/-Uninstall/-BinaryPath flags, elevated-safe user config resolution) <span class="src">packaging/, commit da8c3ee</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="clients">22. Client integrations</h2>
+
+<table>
+<thead><tr><th>Integration</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Claude Code <code>.claude/settings.json</code> hooks</td><td>via <code>shodh setup-hooks</code> (manual install) <span class="src">src/cli.rs</span></td><td>✓ ships in repo with relative paths <span class="src">.claude/settings.json, hooks/memory-hook.ts</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Memory hook (session-start, prompt, response, tool calls)</td><td>✓ <code>hooks/memory-hook.ts</code> (~60 KB)</td><td>✓ inherited (all 6 lifecycle events, all tool types) <span class="src">hooks/memory-hook.ts, CLAUDE.md</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Claude Desktop / Cursor MCP config</td><td>✓ JSON snippet in README <span class="src">README.md:67-71</span></td><td>✓ <code>claude_desktop_config.json</code> snippet <span class="src">README.md:134-147</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>VS Code MCP</td><td>—</td><td>✓ <code>.vscode/mcp.json</code> + <code>.github/copilot-instructions.md</code> <span class="src">CLAUDE.md client integration</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Standalone hook config (portable, env-driven)</td><td>—</td><td>✓ <code>hooks/claude-settings.json</code> using <code>$VELD_HOOKS_DIR</code> <span class="src">CLAUDE.md standalone hook config</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Git commit hook (auto-sync)</td><td>—</td><td>✓ <code>veld hook commit</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Default user ID for Claude</td><td>uses session id</td><td><code>claude-code</code> (shared between Claude Code and Claude CLI) <span class="src">CLAUDE.md user IDs</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="bench">23. Benchmarks &amp; evaluation</h2>
+
+<table>
+<thead><tr><th>Aspect</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Criterion benchmark suites</td><td>memory_benchmarks, graph_benchmarks, adaptive_memory_benchmarks, cognitive_benchmarks, ner_benchmarks, pipeline_benchmarks, hebbian_benchmarks, … <span class="src">benches/, Cargo.toml:224-273</span></td><td>same names + integration_benchmarks + relevance_benchmarks + softmax_benchmarks + streaming_benchmarks <span class="src">Cargo.toml:262-305</span></td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td><code>benchmark_report.json</code></td><td>4.7 KB summary at repo root</td><td>present at repo root</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>LoCoMo evaluation results</td><td><code>locomo_results.json</code> (52 KB) at repo root</td><td><code>benchmarks/locomo_llm_judge.py</code> (modified)</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>Headline numbers (sourced)</td><td>Entity lookup 763 ns @ 1000 entities; vector search 2-5 ms @ 1000 vecs; embedding 150-250 ms; Hebbian strengthen 7.54 μs @ 100 entities; associative retrieval 107 ms <span class="src">BENCHMARKS.md:15-100</span></td><td>v0.7.2 MRR 0.925 / Temporal 0.900 / Single-hop 1.000 / Multi-hop 0.900 / R@5 0.852 / Composite 78.4% <span class="src">PROGRESS.md:125-130</span></td><td><span class="pill p-div">DIVERGED</span> (different evals)</td></tr>
+<tr><td>Recall harness (test infra)</td><td>✓ <code>src/recall_harness/</code> (runner, fixtures, metrics, report)</td><td>not enumerated as a discrete module</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td>Evaluation artifacts directory</td><td>—</td><td>✓ <code>evaluations/</code>: Bifocal+ (15), Supernova (4), Ring 1 / Ring 2 / Orthogonal V2 / Unseen dimensions <span class="src">PROGRESS.md:132-143</span></td><td><span class="pill p-new">NEW</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="docs">24. Documentation surfaces</h2>
+
+<table>
+<thead><tr><th>Doc surface</th><th class="col-shodh">shodh</th><th class="col-veld">veld</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>README.md (top-level)</td><td>✓ + <code>README-rust.md</code> + <code>README-python.md</code></td><td>✓ + <code>README-rust.md</code> path noted in <code>Cargo.toml:10</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>CLAUDE.md (project instructions for Claude Code)</td><td>✓ ~14-29 lines <span class="src">CLAUDE.md</span></td><td>✓ extensive architecture + MCP tool table + codebase layout</td><td><span class="pill p-ext">EXTENDED</span></td></tr>
+<tr><td>BENCHMARKS.md</td><td>✓ 150-line comprehensive perf doc</td><td>✓ <span class="src">BENCHMARKS.md</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>SECURITY.md</td><td>✓ 2.7 KB threat model + secure defaults <span class="src">SECURITY.md</span></td><td>✓ <span class="src">SECURITY.md</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>CONTRIBUTING.md / CODE_OF_CONDUCT.md</td><td>✓</td><td>✓</td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>CITATION.cff</td><td>✓ Zenodo DOI <span class="src">CITATION.cff</span></td><td>✓ at repo root, same Zenodo DOI 10.5281/zenodo.18668709 <span class="src">CITATION.cff</span></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Pitch deck / authorization letters</td><td>✓ <code>STPI_PITCH_DECK.md</code> (12 KB), <code>bhashini-authorization-letter.html</code>, <code>bhashini_letter.pdf</code></td><td>✓ same three files at repo root: <code>STPI_PITCH_DECK.md</code>, <code>bhashini-authorization-letter.html</code>, <code>bhashini_letter.pdf</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>IITD research paper</td><td>✓ <code>Shodh_memory_IITD.pdf</code> (47 KB) + <code>.odt</code></td><td>✓ at repo root, renamed <code>veld_IITD.pdf</code> + <code>veld_IITD.odt</code></td><td><span class="pill p-ren">RENAMED</span></td></tr>
+<tr><td>Enhancement proposals (SEPs)</td><td>✓ <code>seps/</code> with SEP-002 (MIF v2), conversation-events, JSON schema</td><td>✓ <code>seps/</code> at repo root: <code>SEP-002-memory-interchange-format.md</code>, <code>conversation-events.md</code>, <code>mif-v1.schema.json</code>, <code>example.mif.json</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>mdBook docs site</td><td>—</td><td>✓ <code>docs/</code> tree + <code>docs/book.toml</code> + auto-deploy to <a href="https://portll.github.io/veld/">portll.github.io/veld</a> via <code>.github/workflows/docs.yml</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Generator workspace (8 Rust binaries that build docs)</td><td>—</td><td>✓ <code>docs/generators/</code> with bin <code>gen-config-ref</code> etc. <span class="src">commit 1abc5b2, docs/generators/src/bin/</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>PROGRESS.md (shipped vs in-flight)</td><td>—</td><td>✓ canonical "what is real" doc <span class="src">PROGRESS.md</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>RECTIFICATION.md / REMEDIATION_PLAN.md</td><td>—</td><td>✓ <span class="src">CLAUDE.md "Where to find things"</span></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td>Examples (LangChain / LlamaIndex / Spot robot)</td><td>—</td><td>✓ <code>examples/langchain/</code>, <code>examples/llamaindex/</code>, <code>examples/spot/</code></td><td><span class="pill p-new">NEW</span></td></tr>
+<tr><td><code>drafts/</code> directory</td><td>✓</td><td>—</td><td><span class="pill p-rem">SHODH-ONLY</span></td></tr>
+<tr><td>OpenAPI spec</td><td><code>openapi.yaml</code> at repo root</td><td>✓ <code>openapi.yaml</code> at repo root + duplicate <code>specs/openapi.yaml</code></td><td><span class="pill p-inh">INHERITED</span></td></tr>
+<tr><td>Marketing assets</td><td><code>marketing/</code>, <code>demo/</code>, logo PNG</td><td>partial: <code>marketing/directory-submissions.md</code> present at repo root; no <code>demo/</code> dir or logo PNG in tree</td><td><span class="pill p-div">DIVERGED</span></td></tr>
+<tr><td>Notebooks</td><td><code>notebooks/</code></td><td>✓ <code>notebooks/veld_demo.ipynb</code> at repo root</td><td><span class="pill p-ren">RENAMED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="divergence">25. Divergence map &mdash; who has what</h2>
+
+<h3>Net-new in veld (added after fork)</h3>
+<table>
+<thead><tr><th>Category</th><th>Items</th></tr></thead>
+<tbody>
+<tr><td>Retrieval</td><td>HNSW + DiskANN backends · Cross-encoder reranker · Dual-embedder (MiniLM+Nomic) competitive merge · RLM/LLM refiner (None/CrossEncoder/Rlm/Stacked) · External-dimension modulation (Sleight 5D) · Signal attribution struct · RRF weights w/ K=45 · WH-word ontology boost · 25+ entity-label ontology</td></tr>
+<tr><td>Memory model</td><td>4th tier <code>Archive</code> · Anchor (pin against decay) · Agent-directed tier moves · Calibrated Bayesian confidence (α/β) · Letta-style context blocks · Full 5-W facet model + RecordKind/ContentKind/CausalLink/EngramBinding/Prediction/AgentRef/Place</td></tr>
+<tr><td>Consolidation</td><td>Sleep-time V1+V2-stage-1 (13 files: types/diff/policies/rewriter/queue/observation/observer/orchestrator/worker/edge_proposals/graduation/supersession/mod) · Async LLM context-block rewriter (Anthropic backend, R29/R30) · 4-route sleep_time HTTP handler · Sleep-phase endpoint · Gap topology (Voronoi/persistence/mapper) · Wavelet sessions (FFT) · Log-periodic decay correction</td></tr>
+<tr><td>Storage</td><td><code>storage-redb</code> default (target v0.9) · <code>StorageCapabilities</code> bitset · 7 sub-traits (PrimaryMemoryStore, GraphStore, KeyValueStore, AuditStore, BackupStore, MigrationStore, StorageFactory) · Per-user write locks · Multi-tenant shared store</td></tr>
+<tr><td>Ingest</td><td>Dedicated <code>src/ingest/</code> tree with HTML / PDF (gated) / Google Drive / GitHub modules · Explicit code-aware chunking · <code>seed_project</code> MCP tool</td></tr>
+<tr><td>Embeddings</td><td>Nomic 768d HTTP · Cross-encoder · Competitive max-merge · Zenoh shared cache · Alignment toolchain (Procrustes + Ridge + 4 binaries)</td></tr>
+<tr><td>Auth</td><td>User registration / login · TOTP 2FA (RFC 6238) · Argon2id recovery codes · Argon2id password hashing · Session-token middleware</td></tr>
+<tr><td>Optional subsystems</td><td><code>multi-tenant</code> (Hosaka) · <code>fortress</code> (binary obfuscation profile) · <code>pdf</code></td></tr>
+<tr><td>Event log</td><td>Versioned frame-based intent log · CRC32 frames · Bincode-tagged <code>IntentPayload</code> · Schema migration registry</td></tr>
+<tr><td>Endpoints</td><td><code>/api/anchor</code> · <code>/api/memory/tier</code> · <code>/api/prompt/gen</code> · <code>/api/entity/*</code> · <code>/api/context/blocks/*</code> · <code>/api/sleep_time/*</code> · <code>/api/sleight/dimensions</code> · <code>/api/gap/*</code> · <code>/api/consolidation/sleep</code> · <code>/api/user_auth/*</code></td></tr>
+<tr><td>Distribution / tooling</td><td>mdBook docs auto-deployed to GitHub Pages · <code>docs/generators/</code> Rust workspace (8 binaries: gen-http-api/mcp-tools/config-ref/errors/metrics/module-index/claude-sections/lint-decisions) · <code>examples/</code> (LangChain, LlamaIndex, Spot) · cargo-binstall pre-built bindings · System service templates: <code>packaging/linux/veld.service</code> (systemd), <code>packaging/macos/net.portll.veld.plist</code> (launchd), <code>packaging/windows/install-service.ps1</code> (nssm/shawl/winsw)</td></tr>
+<tr><td>VS Code MCP</td><td><code>.vscode/mcp.json</code> + <code>.github/copilot-instructions.md</code></td></tr>
+<tr><td>Git commit hook</td><td><code>veld hook commit</code></td></tr>
+<tr><td>Evaluation artifacts</td><td>Bifocal+ (15) / Supernova (4) / Ring 1 (5) / Ring 2 (5) / Orthogonal V2 (5) / Unseen dimensions (1)</td></tr>
+</tbody>
+</table>
+
+<h3>Present in shodh, not in veld</h3>
+<table>
+<thead><tr><th>Category</th><th>Items</th></tr></thead>
+<tbody>
+<tr><td>Subcommand</td><td><code>shodh setup-hooks</code> · separate <code>shodh-memory-server</code> binary</td></tr>
+<tr><td>HTTP endpoints</td><td><code>/api/files/index</code>, <code>/api/files/search</code> · <code>/api/sessions</code> CRUD · <code>POST /api/import/mif</code>, <code>POST /api/export/mif</code> as dedicated routes <span class="small">(Note: <code>/api/ab/compare</code>, <code>/metrics</code>, <code>GET /graph/view</code>, <code>GET /api/stream</code> WebSocket — all originally tagged shodh-only here — are in fact carried over to veld; see corrections in §3 and §19.)</span></td></tr>
+<tr><td>MCP tools</td><td><code>session_digest</code> · <code>session_history</code> · <code>purge_facts</code> · <code>fact_narratives</code></td></tr>
+<tr><td>HTTP-API-exposed retrieval modes</td><td>The <code>mode=</code> query parameter accepts <code>spatial</code>, <code>mission</code>, <code>action_outcome</code> as first-class arguments. <span class="small">veld has these as <code>RetrievalMode</code> enum variants <span class="src">src/memory/retrieval.rs:1638-1640</span> but the API parser <span class="src">src/handlers/recall.rs:41-48</span> does not surface them as strings; they fall through to <code>Hybrid</code>. <em>Internally available, externally not.</em></span></td></tr>
+<tr><td>Recall harness</td><td><code>src/recall_harness/</code> (runner, fixtures, metrics, report) as a discrete benchmark infrastructure module</td></tr>
+<tr><td>Marketing/demo dirs (partial)</td><td><code>demo/</code> directory and logo PNG are not in veld; <code>drafts/</code> directory is not in veld. <span class="small">veld <em>does</em> have <code>marketing/directory-submissions.md</code>; see §24.</span></td></tr>
+<tr><td>(was-Connectors)</td><td><span class="small">Originally claimed as shodh-only — corrected. veld has matching <code>veld-telegram/</code> (903 LOC, identical file set), <code>veld-todoist/</code> (562 LOC, <code>shodh.ts</code>→<code>veld.ts</code>), <code>veld-whatsapp/</code> (998 LOC, ahead of shodh). See §12, §19.</span></td></tr>
+<tr><td>(was-WS-streaming)</td><td><span class="small">Originally claimed as shodh-only — corrected. veld has matching <code>src/streaming.rs</code> (1577 lines vs shodh's 1581) with the same <code>WebSocket /api/stream</code> architecture. See §3, §12, §19.</span></td></tr>
+<tr><td>(was-Robotics-fields)</td><td><span class="small">Originally claimed as shodh-only — corrected. veld has <code>mission_id</code>, <code>reward</code>, <code>sensor_data</code>, <code>terrain_type</code> as first-class fields <span class="src">src/memory/types.rs:857, 877, 881, 923</span>; <code>heading</code> on <code>WhereFacet</code> <span class="src">src/memory/facets.rs:198</span>; geo/terrain are also projected into <code>Place</code> variants <span class="src">src/memory/types.rs:1063-1108</span>. See §8.</span></td></tr>
+<tr><td>(was-Spec/docs bundle)</td><td><span class="small">Originally claimed as shodh-only — corrected. veld has the same <code>seps/</code> tree (SEP-002 + mif-v1.schema.json + conversation-events.md + example.mif.json), <code>openapi.yaml</code> at root + duplicate <code>specs/openapi.yaml</code>, <code>STPI_PITCH_DECK.md</code>, <code>bhashini-authorization-letter.html</code> + <code>bhashini_letter.pdf</code>, <code>CITATION.cff</code> (same Zenodo DOI), and renamed IITD paper as <code>veld_IITD.pdf</code> + <code>veld_IITD.odt</code>. See §1, §16, §24.</span></td></tr>
+<tr><td>(was-Notebooks)</td><td><span class="small">Originally claimed as shodh-only — corrected. veld has <code>notebooks/veld_demo.ipynb</code> (renamed). See §24.</span></td></tr>
+<tr><td>(was-Test-scripts)</td><td><span class="small">Originally claimed as shodh-only — corrected. veld has all seven test/install scripts at repo root: <code>apply_layers.py</code>, <code>install_bun.ps1</code>, <code>test_all_apis.py</code>, <code>test_latency.py</code>, <code>test_memory_benchmark.ts</code>, <code>test_models_and_latency.py</code>, <code>test_wheel_comprehensive.py</code>.</span></td></tr>
+</tbody>
+</table>
+
+<h3>Renamed only (same concept, different branding)</h3>
+<table>
+<tbody>
+<tr><td><code>shodh</code> binary</td><td>↔</td><td><code>veld</code> binary</td></tr>
+<tr><td><code>shodh-memory</code> crate</td><td>↔</td><td><code>veld</code> crate</td></tr>
+<tr><td><code>@shodh/memory-mcp</code> npm</td><td>↔</td><td><code>@veld/memory-mcp</code> npm</td></tr>
+<tr><td><code>SHODH_*</code> env vars</td><td>↔</td><td><code>VELD_*</code> env vars</td></tr>
+<tr><td><code>~/.cache/shodh-memory/</code></td><td>↔</td><td><code>~/.local/share/veld/</code> + OS-specific paths</td></tr>
+<tr><td>RocksDB as primary</td><td>↔</td><td>RocksDB as <code>legacy-rocksdb</code> feature</td></tr>
+<tr><td><code>POST /api/files/index</code></td><td>↔</td><td><code>seed_project</code> MCP tool</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="sources">26. Sources &amp; verification</h2>
+
+<div class="verdict">
+<strong>Methodology.</strong> Two read-only Explore subagents ran in parallel — one over each repo — and produced inventories with explicit file:line references. The lineage framing (shodh as ancestor) was supplied by the user; the table assignments below it are derived from comparing the two inventories. Every cell in the tables either cites a file path (and where useful, line numbers or a one-line quoted excerpt) or is annotated as "—" when the feature is absent. Cells citing <code>CLAUDE.md</code> refer to <code>c:\Repositories\Portll\veld\CLAUDE.md</code>, which is the canonical project-instructions doc for veld and was loaded into context for this comparison.
+</div>
+
+<h4>Verified shodh-memory source locations</h4>
+<ul>
+<li><span class="src">c:\Repositories\Portll\shodh-memory\Cargo.toml</span> — name, version, license, dependencies, feature flags, profile config</li>
+<li><span class="src">c:\Repositories\Portll\shodh-memory\src\cli.rs</span> — subcommands (lines 59-151)</li>
+<li><span class="src">src\main.rs</span> — server binary entrypoint (lines 66-99)</li>
+<li><span class="src">src\handlers\mod.rs, router.rs, *.rs</span> — route enumeration</li>
+<li><span class="src">src\memory\types.rs</span> — Memory struct, MemoryTier, ExperienceType (lines 34-250)</li>
+<li><span class="src">src\memory\graph_retrieval.rs</span> — spreading activation</li>
+<li><span class="src">src\graph_memory.rs</span> — EntityNode (lines 46-91), column families (lines 22-43)</li>
+<li><span class="src">src\decay.rs</span> — hybrid decay (lines 1-93)</li>
+<li><span class="src">src\embeddings\*</span> — minilm.rs, ner.rs, keywords.rs, circuit_breaker.rs</li>
+<li><span class="src">src\vector_db\mod.rs, vamana.rs</span> — Vamana + SPANN, DistanceMetric (lines 53-95)</li>
+<li><span class="src">src\mif\, src\mif\adapters\, src\mif\pii.rs</span> — interchange format</li>
+<li><span class="src">src\auth.rs, SECURITY.md</span> — auth + secure defaults</li>
+<li><span class="src">mcp-server\index.ts</span> — 45 MCP tools (lines 615-5046)</li>
+<li><span class="src">mcp-server\package.json</span> — npm publication</li>
+<li><span class="src">pyproject.toml, CITATION.cff, README.md, README-rust.md, BENCHMARKS.md</span></li>
+<li><span class="src">seps\SEP-002-memory-interchange-format.md, seps\mif-v1.schema.json</span></li>
+<li><span class="src">hooks\memory-hook.ts, session-start.sh, user-prompt.sh, stop.sh</span></li>
+</ul>
+
+<h4>Verified veld source locations</h4>
+<ul>
+<li><span class="src">c:\Repositories\Portll\veld\Cargo.toml</span> — package, features, profiles (lines 351-413)</li>
+<li><span class="src">CLAUDE.md</span> — architecture, MCP tool table, codebase layout, storage backend reality</li>
+<li><span class="src">PROGRESS.md</span> — shipped vs in-flight, evaluation artifacts (lines 125-143), retrieval benchmarks</li>
+<li><span class="src">src\cli.rs</span> — subcommands</li>
+<li><span class="src">src\handlers\router.rs</span> — ~202 routes (lines 39-450)</li>
+<li><span class="src">src\handlers\consolidation.rs</span> — consolidate_memories, CONSOLIDATION_LOCKS, backup paths (lines 297-303)</li>
+<li><span class="src">src\handlers\sleep_time.rs, src\memory\sleep_time\*</span> — sleep-time V1 (commit 52e5cda)</li>
+<li><span class="src">src\memory\types.rs</span> — ScoringSignals (lines 29-64), ExternalDimensionScores (74-109), SignalAttribution (122-137), prospective memory (195-199)</li>
+<li><span class="src">src\memory\facets.rs</span> — 5-W taxonomy, Place hierarchy (lines 1-200)</li>
+<li><span class="src">src\memory\context_blocks.rs</span> — Letta-style mutable agent state</li>
+<li><span class="src">src\memory\hybrid_search.rs</span> — multi-layer retrieval orchestration</li>
+<li><span class="src">src\memory\rlm_refiner.rs</span> — RLM refiner / 4-mode reranker (commit e5730c3)</li>
+<li><span class="src">src\memory\sleep_time\*.rs</span> (13 files) + <span class="src">src\handlers\sleep_time.rs</span> — sleep-time V1 scaffold + V2 stage 1 (commits 52e5cda, c09ae4f)</li>
+<li><span class="src">packaging\linux\veld.service, packaging\macos\net.portll.veld.plist, packaging\windows\install-service.ps1</span> — cross-platform service scripts (commit da8c3ee)</li>
+<li><span class="src">src\memory\gap_topology\, wavelet_sessions.rs</span></li>
+<li><span class="src">src\vector_db\</span> — HNSW + Vamana + SPANN + PQ</li>
+<li><span class="src">src\embeddings\nomic.rs, competitive.rs, cross_encoder.rs, alignment_*.rs, zenoh_embedder.rs</span></li>
+<li><span class="src">src\storage\mod.rs (lines 26-145), redb.rs, legacy_rocksdb.rs</span></li>
+<li><span class="src">src\config.rs</span> — backend selection (lines 57-61)</li>
+<li><span class="src">src\intent_log\</span> — frame-based projection</li>
+<li><span class="src">src\user_auth\, src\handlers\user_auth.rs, src\auth.rs</span></li>
+<li><span class="src">src\extensions\, src\fortress\, src\zenoh_transport\</span></li>
+<li><span class="src">src\bin\</span> — alignment-collect, alignment-fit, alignment-eval, rlm-eval</li>
+<li><span class="src">src\ingest\</span> — extractors.rs, gdrive.rs, github.rs</li>
+<li><span class="src">docs\book.toml, docs\generators\, .github\workflows\docs.yml</span> — mdBook pipeline</li>
+<li><span class="src">.claude\settings.json, hooks\memory-hook.ts, hooks\claude-settings.json</span></li>
+<li><span class="src">.vscode\mcp.json, .github\copilot-instructions.md</span></li>
+<li><span class="src">mcp-server\index.ts</span> — 46 tools + 4 prompts (lines 4018-4303)</li>
+</ul>
+
+<h4>Claims this report deliberately did <em>not</em> make</h4>
+<ul>
+<li>No date for the fork itself — the git history of the post-fork ancestry was not traversed; the lineage statement comes from the user.</li>
+<li>No retrieval-quality comparison between shodh and veld — shodh's headline numbers come from microbenchmarks (ns/μs/ms latencies on synthetic data, <code>BENCHMARKS.md</code>) while veld's come from end-to-end LoCoMo / Bifocal+ evaluations (<code>PROGRESS.md:125-143</code>). They are not commensurable and any side-by-side would be misleading.</li>
+<li>No assertion that a "SHODH-ONLY" feature was deliberately removed from veld; some may simply not have been enumerated in <code>CLAUDE.md</code> and could still exist in the tree.</li>
+<li>No claim about which feature flags are <em>actually</em> enabled in published binaries — only what the manifest declares.</li>
+</ul>
+
+<hr>
+<p class="small">End of report. Generated 2026-05-29; updated 2026-05-30 with corrections: RLM refiner source path, sleep-time V1+V2-stage-1 13-file module listing (commits 52e5cda + c09ae4f), 4-route sleep_time HTTP handler, cross-platform service script packaging. Saved to <code>c:\Repositories\Portll\veld\veld-vs-shodh-comparison.html</code>.</p>
+
+</body>
+</html>
