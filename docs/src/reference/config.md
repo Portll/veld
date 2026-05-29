@@ -48,6 +48,9 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_LLM_API_TYPE` | — | `src/query_parsing/llm_parser.rs` |
 | `VELD_LLM_ENDPOINT` | — | `src/memory/llm.rs` |
 | `VELD_LLM_MODEL` | — | `src/memory/llm.rs` |
+| `VELD_LLM_REFINER_API_KEY` | — | `src/memory/llm_refiner.rs` |
+| `VELD_LLM_REFINER_ENDPOINT` | — | `src/bin/llm_eval.rs` |
+| `VELD_LLM_REFINER_MODEL` | — | `src/bin/llm_eval.rs` |
 | `VELD_LLM_URL` | — | `src/query_parsing/llm_parser.rs` |
 | `VELD_LOG_PERIODIC_SCALES` | — | `src/config.rs` |
 | `VELD_MAINTENANCE_INTERVAL` | — | `src/config.rs` |
@@ -73,9 +76,6 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_RATE_BURST` | — | `src/config.rs` |
 | `VELD_RATE_LIMIT` | — | `src/config.rs` |
 | `VELD_REQUEST_TIMEOUT` | — | `src/config.rs` |
-| `VELD_RLM_API_KEY` | — | `src/memory/llm_reranker.rs` |
-| `VELD_RLM_ENDPOINT` | — | `src/bin/rlm_eval.rs` |
-| `VELD_RLM_MODEL` | — | `src/bin/rlm_eval.rs` |
 | `VELD_SLEEP_TIME_PROFILE` | — | `src/server.rs` |
 | `VELD_STORAGE_BACKEND` | — | `src/config.rs` |
 | `VELD_TLS_ACK` | — | `src/server.rs` |

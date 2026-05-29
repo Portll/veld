@@ -103,8 +103,8 @@ name = "alignment-eval"
 path = "src/bin/alignment_eval.rs"
 
 [[bin]]
-name = "rlm-eval"
-path = "src/bin/rlm_eval.rs"
+name = "llm-eval"
+path = "src/bin/llm_eval.rs"
 
 [dependencies]
 # MCP Protocol

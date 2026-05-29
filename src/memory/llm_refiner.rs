@@ -1,4 +1,7 @@
-//! Recursive LLM Refiner — final-stage rerank via LLM relevance scoring.
+//! LLM Refiner — final-stage rerank via LLM relevance scoring.
+//!
+//! Issues a single chat-completions scoring call per query (not recursive,
+//! despite the legacy "RLM" naming this module previously carried).
 //!
 //! # Why this exists
 //!
@@ -15,14 +18,14 @@
 //! # Local-first posture
 //!
 //! Like [`crate::memory::llm::HttpLlmConsolidator`], this module is
-//! **opt-in**. [`LlmReranker`] requires explicit construction with an
+//! **opt-in**. [`LlmRefiner`] requires explicit construction with an
 //! endpoint and API key (or env-var configuration). Without explicit setup,
 //! no remote call ever happens — veld's offline default is preserved.
 //!
 //! # Wiring
 //!
 //! Used by `HybridSearchEngine::search_with_dynamic_weights` when the
-//! engine's [`RefinerMode`](super::hybrid_search::RefinerMode) is `Rlm` or
+//! engine's [`RefinerMode`](super::hybrid_search::RefinerMode) is `Llm` or
 //! `Stacked`. The trait surface mirrors `CrossEncoderReranker::rerank` so
 //! the two are interchangeable at the call site.
 //!
@@ -97,12 +100,12 @@ impl Refiner for NullRefiner {
 /// sends the query and candidate texts; the model returns a JSON array of
 /// `{id, score}` objects which is parsed back into the result vector.
 ///
-/// Configure via constructor or [`LlmReranker::from_env`]. Env vars
+/// Configure via constructor or [`LlmRefiner::from_env`]. Env vars
 /// (read at `from_env` time, not lazily):
-/// - `VELD_RLM_ENDPOINT` — chat-completions URL
-/// - `VELD_RLM_API_KEY`  — bearer token (optional for local hosts)
-/// - `VELD_RLM_MODEL`    — model identifier
-pub struct LlmReranker {
+/// - `VELD_LLM_REFINER_ENDPOINT` — chat-completions URL
+/// - `VELD_LLM_REFINER_API_KEY`  — bearer token (optional for local hosts)
+/// - `VELD_LLM_REFINER_MODEL`    — model identifier
+pub struct LlmRefiner {
     endpoint: String,
     api_key: String,
     model: String,
@@ -113,13 +116,13 @@ pub struct LlmReranker {
     max_response_tokens: u32,
 }
 
-impl LlmReranker {
+impl LlmRefiner {
     pub fn new(endpoint: String, api_key: String, model: String) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
-            .user_agent("veld-rlm-refiner/1.0")
+            .user_agent("veld-llm-refiner/1.0")
             .timeout(Duration::from_secs(60))
             .build()
-            .context("LlmReranker: failed to build HTTP client")?;
+            .context("LlmRefiner: failed to build HTTP client")?;
         Ok(Self {
             endpoint,
             api_key,
@@ -130,17 +133,17 @@ impl LlmReranker {
         })
     }
 
-    /// Construct from `VELD_RLM_*` env vars. Returns `Ok(None)` (not `Err`)
+    /// Construct from `VELD_LLM_REFINER_*` env vars. Returns `Ok(None)` (not `Err`)
     /// when the endpoint isn't configured — callers should treat that as
     /// the offline default and either fall back to the cross-encoder or
     /// skip refinement entirely.
     pub fn from_env() -> Result<Option<Self>> {
-        let endpoint = match std::env::var("VELD_RLM_ENDPOINT") {
+        let endpoint = match std::env::var("VELD_LLM_REFINER_ENDPOINT") {
             Ok(v) if !v.is_empty() => v,
             _ => return Ok(None),
         };
-        let api_key = std::env::var("VELD_RLM_API_KEY").unwrap_or_default();
-        let model = std::env::var("VELD_RLM_MODEL")
+        let api_key = std::env::var("VELD_LLM_REFINER_API_KEY").unwrap_or_default();
+        let model = std::env::var("VELD_LLM_REFINER_MODEL")
             .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
         Self::new(endpoint, api_key, model).map(Some)
     }
@@ -200,7 +203,7 @@ struct ScoredCandidate {
     score: f32,
 }
 
-impl Refiner for LlmReranker {
+impl Refiner for LlmRefiner {
     fn refine(
         &self,
         query: &str,
@@ -231,28 +234,28 @@ impl Refiner for LlmReranker {
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
-        let response = req.send().context("LlmReranker: HTTP request failed")?;
+        let response = req.send().context("LlmRefiner: HTTP request failed")?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
             return Err(anyhow!(
-                "LlmReranker: HTTP {status}: {}",
+                "LlmRefiner: HTTP {status}: {}",
                 body.chars().take(500).collect::<String>()
             ));
         }
         let parsed: ChatResponse = response
             .json()
-            .context("LlmReranker: response body was not valid JSON")?;
+            .context("LlmRefiner: response body was not valid JSON")?;
         let content = parsed
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("LlmReranker: empty choices array in response"))?
+            .ok_or_else(|| anyhow!("LlmRefiner: empty choices array in response"))?
             .message
             .content;
 
         let scored: Vec<ScoredCandidate> = parse_score_array(&content)
-            .with_context(|| format!("LlmReranker: failed to parse model output: {content}"))?;
+            .with_context(|| format!("LlmRefiner: failed to parse model output: {content}"))?;
 
         let mut score_by_idx: HashMap<usize, f32> = HashMap::with_capacity(scored.len());
         for entry in scored {
@@ -276,7 +279,7 @@ impl Refiner for LlmReranker {
     }
 
     fn name(&self) -> &str {
-        "rlm"
+        "llm"
     }
 }
 
@@ -426,12 +429,12 @@ mod tests {
 
     #[test]
     fn from_env_returns_none_when_unset() {
-        let prior = std::env::var("VELD_RLM_ENDPOINT").ok();
-        std::env::remove_var("VELD_RLM_ENDPOINT");
-        let got = LlmReranker::from_env().unwrap();
+        let prior = std::env::var("VELD_LLM_REFINER_ENDPOINT").ok();
+        std::env::remove_var("VELD_LLM_REFINER_ENDPOINT");
+        let got = LlmRefiner::from_env().unwrap();
         assert!(got.is_none());
         if let Some(v) = prior {
-            std::env::set_var("VELD_RLM_ENDPOINT", v);
+            std::env::set_var("VELD_LLM_REFINER_ENDPOINT", v);
         }
     }
 }
