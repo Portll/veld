@@ -305,7 +305,48 @@ export function buildPreToolContext(toolName: string, toolInput: Record<string, 
   return `About to use ${toolName}`;
 }
 
+/** Debounce window (ms) for proactive_context calls — keyed by context prefix.
+ *  Reduces server-side embedding load when parallel agents fan out identical
+ *  tool calls. Tunable via VELD_HOOK_DEBOUNCE_MS. */
+const PROACTIVE_DEBOUNCE_MS = (() => {
+  const raw = process.env.VELD_HOOK_DEBOUNCE_MS;
+  const n = raw ? Number.parseInt(raw, 10) : 500;
+  return Number.isFinite(n) && n >= 0 ? n : 500;
+})();
+
+interface ProactiveCacheEntry {
+  at: number;
+  result: string | null;
+}
+/** Last (timestamp, result) per context-key. Bounded; oldest entries evicted. */
+const proactiveDebounceCache = new Map<string, ProactiveCacheEntry>();
+const PROACTIVE_DEBOUNCE_MAX_KEYS = 64;
+
+function proactiveDebounceKey(context: string, maxResults: number): string {
+  // 80-char prefix lets "Editing file: a.rs" and "Editing file: b.rs" debounce
+  // independently, while two Edits of the same file within the window coalesce.
+  return `${maxResults}|${context.slice(0, 80)}`;
+}
+
 async function surfaceProactiveContext(context: string, maxResults = 3, autoIngest = false): Promise<string | null> {
+  // P2 debounce: parallel agents firing identical proactive_context queries
+  // hammer the Nomic embedder for no extra information. Skip the round-trip
+  // if we answered the same question within VELD_HOOK_DEBOUNCE_MS.
+  //
+  // Two important carve-outs:
+  // - `autoIngest`: UserPromptSubmit relies on this to *record* the prompt;
+  //   debouncing would drop ingestion. Pass through always.
+  // - `backendDown`: when the server is recovering we want every call to try,
+  //   so the offline → online transition is visible quickly.
+  if (PROACTIVE_DEBOUNCE_MS > 0 && !autoIngest && !backendDown) {
+    const key = proactiveDebounceKey(context, maxResults);
+    const cached = proactiveDebounceCache.get(key);
+    const now = Date.now();
+    if (cached && now - cached.at < PROACTIVE_DEBOUNCE_MS) {
+      return cached.result;
+    }
+  }
+
   // Drain pending tool actions for feedback attribution
   const toolActions = pendingToolActions.splice(0, pendingToolActions.length);
 
@@ -400,6 +441,20 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
   // Track surfaced memories for feedback loop on next call
   lastSurfacedMemoryIds = (response.memories || []).map((m) => m.id);
   lastProactiveOutput = output;
+
+  // P2 debounce: record the result so the next identical call within the
+  // window can answer locally. Cache only success paths — backend-down
+  // returns intentionally bypass the cache so recovery is visible quickly.
+  if (PROACTIVE_DEBOUNCE_MS > 0 && !autoIngest) {
+    const key = proactiveDebounceKey(context, maxResults);
+    // LRU-ish eviction: when full, drop the oldest entry. Maps preserve
+    // insertion order, so the first key() is the oldest.
+    if (proactiveDebounceCache.size >= PROACTIVE_DEBOUNCE_MAX_KEYS) {
+      const oldest = proactiveDebounceCache.keys().next().value;
+      if (oldest !== undefined) proactiveDebounceCache.delete(oldest);
+    }
+    proactiveDebounceCache.set(key, { at: Date.now(), result: output });
+  }
 
   return output;
 }
