@@ -138,6 +138,9 @@ rmp-serde = "1.3"  # MessagePack - binary format that supports serde tagged enum
 lz4 = "1.28"
 redb = { version = "2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite slow store for gap topology queries (WAL mode)
+# W4 foundation — backend-agnostic relational executor (SQLite today, Postgres/Supabase next).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+async-trait = "0.1"
 
 # Concurrency
 parking_lot = "0.12"
