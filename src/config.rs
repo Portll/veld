@@ -917,6 +917,152 @@ pub fn print_env_help() {
     println!();
 }
 
+// =============================================================================
+// Sleep-time / observational memory config
+// =============================================================================
+//
+// `SleepTimeConfig` is the full knob surface; `SleepTimeProfile` (E1) is a
+// preset enum that collapses common combinations to a single user choice and
+// expands to a full config via `to_config()`. The orchestrator consumes the
+// expanded `SleepTimeConfig`.
+
+use serde::{Deserialize, Serialize};
+
+use crate::constants::{
+    SLEEP_TIME_CALLS_PER_DAY, SLEEP_TIME_CLAIM_LEASE_SECS, SLEEP_TIME_DEBOUNCE_SECS,
+    SLEEP_TIME_GLOBAL_CALLS_PER_DAY, SLEEP_TIME_GLOBAL_TOKENS_PER_DAY,
+    SLEEP_TIME_IDLE_THRESHOLD_SECS, SLEEP_TIME_QUEUE_COLD_START_TTL_HOURS,
+    SLEEP_TIME_TOKENS_PER_HOUR, SLEEP_TIME_WORKERS,
+};
+
+/// Full sleep-time configuration surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleepTimeConfig {
+    /// Master kill switch. When false the orchestrator is created in a
+    /// shadow state — triggers may be accepted but no LLM call is made.
+    /// V1 ships defaulting to `false` so deployments opt in explicitly.
+    pub enabled: bool,
+
+    /// LLM model id, e.g. `"claude-sonnet-4-6"`. Stamped into the
+    /// `SleepTimeBlockRewritten` event for audit. Must match an Anthropic
+    /// Messages-API model when `enabled = true`.
+    pub model: String,
+
+    /// Environment-variable name holding the Anthropic API key. The
+    /// orchestrator looks it up via `std::env::var` at startup; the key
+    /// itself is never persisted in config files or logged.
+    pub anthropic_api_key_env: String,
+
+    /// Worker pool size (R3). 0 means single-worker mode (no concurrency).
+    pub num_workers: usize,
+
+    /// Seconds of foreground inactivity before idle triggers fire (R13).
+    pub idle_threshold_secs: i64,
+
+    /// Repeated `(user, mode, trigger)` enqueues within this window
+    /// collapse to a single queue item.
+    pub debounce_secs: i64,
+
+    /// Per-user hourly token cap (R12). Conservative default in
+    /// `SLEEP_TIME_TOKENS_PER_HOUR`.
+    pub tokens_per_hour: u32,
+
+    /// Per-user daily LLM-call cap (R12).
+    pub calls_per_day: u32,
+
+    /// Global (cross-user) daily token cap (R33).
+    pub global_tokens_per_day: u64,
+
+    /// Global (cross-user) daily call cap (R33).
+    pub global_calls_per_day: u64,
+
+    /// Cold-start queue TTL in hours (R31).
+    pub queue_cold_start_ttl_hours: i64,
+
+    /// Worker claim lease in seconds (R3 — claims expire so a dead worker
+    /// doesn't lock items forever).
+    pub claim_lease_secs: i64,
+}
+
+impl Default for SleepTimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "claude-sonnet-4-6".into(),
+            anthropic_api_key_env: "ANTHROPIC_API_KEY".into(),
+            num_workers: SLEEP_TIME_WORKERS,
+            idle_threshold_secs: SLEEP_TIME_IDLE_THRESHOLD_SECS,
+            debounce_secs: SLEEP_TIME_DEBOUNCE_SECS,
+            tokens_per_hour: SLEEP_TIME_TOKENS_PER_HOUR,
+            calls_per_day: SLEEP_TIME_CALLS_PER_DAY,
+            global_tokens_per_day: SLEEP_TIME_GLOBAL_TOKENS_PER_DAY,
+            global_calls_per_day: SLEEP_TIME_GLOBAL_CALLS_PER_DAY,
+            queue_cold_start_ttl_hours: SLEEP_TIME_QUEUE_COLD_START_TTL_HOURS,
+            claim_lease_secs: SLEEP_TIME_CLAIM_LEASE_SECS,
+        }
+    }
+}
+
+/// Preset that materialises into a full [`SleepTimeConfig`] (E1).
+///
+/// Collapses the ~12-knob surface into one user-facing decision. Custom
+/// users still have full access via [`SleepTimeProfile::Custom`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SleepTimeProfile {
+    /// Off. `enabled=false`, conservative caps preserved.
+    Disabled,
+    /// Conservative: enabled but with very tight budgets and only one worker;
+    /// suitable for first-week opt-in to observe behaviour at low cost.
+    Conservative,
+    /// Balanced (recommended): defaults.
+    Balanced,
+    /// Aggressive: higher budgets, more workers, looser debounce; for
+    /// power users with established usage patterns.
+    Aggressive,
+    /// Operator-supplied custom config.
+    Custom(Box<SleepTimeConfig>),
+}
+
+impl SleepTimeProfile {
+    /// Expand the preset into a concrete config.
+    pub fn to_config(&self) -> SleepTimeConfig {
+        match self {
+            Self::Disabled => SleepTimeConfig {
+                enabled: false,
+                ..SleepTimeConfig::default()
+            },
+            Self::Conservative => SleepTimeConfig {
+                enabled: true,
+                num_workers: 1,
+                tokens_per_hour: SLEEP_TIME_TOKENS_PER_HOUR / 4, // 2500 tok/hr
+                calls_per_day: SLEEP_TIME_CALLS_PER_DAY / 5,     // 10 calls/day
+                debounce_secs: SLEEP_TIME_DEBOUNCE_SECS * 2,     // 10 min
+                ..SleepTimeConfig::default()
+            },
+            Self::Balanced => SleepTimeConfig {
+                enabled: true,
+                ..SleepTimeConfig::default()
+            },
+            Self::Aggressive => SleepTimeConfig {
+                enabled: true,
+                num_workers: SLEEP_TIME_WORKERS * 2,
+                tokens_per_hour: SLEEP_TIME_TOKENS_PER_HOUR * 3, // 30k tok/hr
+                calls_per_day: SLEEP_TIME_CALLS_PER_DAY * 4,     // 200 calls/day
+                debounce_secs: SLEEP_TIME_DEBOUNCE_SECS / 3,     // 100s
+                ..SleepTimeConfig::default()
+            },
+            Self::Custom(cfg) => (**cfg).clone(),
+        }
+    }
+}
+
+impl Default for SleepTimeProfile {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

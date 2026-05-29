@@ -63,6 +63,9 @@ pub mod admin;
 // Context blocks (Letta-style mutable agent state)
 pub mod context_blocks;
 
+// Datasets (W7 — relational-backed tabular storage)
+pub mod datasets;
+
 // Sleep-time / observational memory orchestrator (V1)
 pub mod sleep_time;
 

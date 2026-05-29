@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, admin, compression, consolidation, context_blocks, crud, docs, external_dimensions,
-    facts, files, gap_analysis, graph, health, ingest, integrations, lineage, mif, prompt_gen,
-    recall, remember, search, seed, sessions, sleep_time, todos, user_auth, users, visualization,
-    webhooks,
+    ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, docs,
+    external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
+    mif, prompt_gen, recall, remember, search, seed, sessions, sleep_time, todos, user_auth, users,
+    visualization, webhooks,
 };
 
 /// Application state type alias
@@ -137,19 +137,54 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
     // The session middleware is applied here, not at the outer auth layer,
     // so the api-key check in `auth_middleware` is skipped for
     // `/api/user_auth/*` paths (see `crate::auth::auth_middleware`).
-    let session_routes = Router::new()
-        .route("/api/user_auth/2fa/enroll", post(user_auth::enroll_2fa))
-        .route("/api/user_auth/2fa/confirm", post(user_auth::confirm_2fa))
-        .route("/api/user_auth/logout", post(user_auth::logout))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            user_auth::require_user_session,
-        ));
-    let user_auth_routes = Router::new()
-        .route("/api/user_auth/register", post(user_auth::register))
-        .route("/api/user_auth/login", post(user_auth::login))
-        .route("/api/user_auth/recover", post(user_auth::recover))
-        .merge(session_routes);
+    //
+    // When `VELD_USER_AUTH_ENABLED=false`, none of the real handlers are
+    // mounted. Instead a single catch-all returns 503 with a documented
+    // JSON body — see `user_auth::disabled_fallback`. The motivation
+    // (B7 hardening): 404 means "no such endpoint", which misleads
+    // operators probing the feature; 503 means "endpoint exists but
+    // disabled" and tells them what to set to enable it.
+    let user_auth_routes = if crate::user_auth::feature_enabled() {
+        let session_routes = Router::new()
+            .route("/api/user_auth/2fa/enroll", post(user_auth::enroll_2fa))
+            .route("/api/user_auth/2fa/confirm", post(user_auth::confirm_2fa))
+            .route("/api/user_auth/logout", post(user_auth::logout))
+            // Admin-only role management — gating on the Admin role itself
+            // is done inside the handler; the session middleware only
+            // proves the caller has *some* valid session.
+            .route(
+                "/api/user_auth/admin/promote",
+                post(user_auth::admin_promote),
+            )
+            .route(
+                "/api/user_auth/admin/demote",
+                post(user_auth::admin_demote),
+            )
+            // Session revocation — admin "kill all sessions for username"
+            // and user "log out every other device".
+            .route(
+                "/api/user_auth/sessions/revoke_all",
+                post(user_auth::revoke_all_sessions),
+            )
+            .route(
+                "/api/user_auth/sessions/revoke_mine",
+                post(user_auth::revoke_my_other_sessions),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                user_auth::require_user_session,
+            ));
+        Router::new()
+            .route("/api/user_auth/register", post(user_auth::register))
+            .route("/api/user_auth/login", post(user_auth::login))
+            .route("/api/user_auth/recover", post(user_auth::recover))
+            .merge(session_routes)
+    } else {
+        Router::new().route(
+            "/api/user_auth/{*path}",
+            axum::routing::any(user_auth::disabled_fallback),
+        )
+    };
 
     r
         .merge(user_auth_routes)
@@ -314,12 +349,6 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/facts/search", post(facts::search_facts))
         .route("/api/facts/by-entity", post(facts::facts_by_entity))
         .route("/api/facts/stats", post(facts::get_facts_stats))
-        .route("/api/facts/narratives", post(facts::fact_narratives))
-        .route(
-            "/api/facts/preview-purge",
-            post(facts::facts_preview_purge),
-        )
-        .route("/api/facts/purge", post(facts::facts_purge))
         // =================================================================
         // TEMPORAL FACTS
         // =================================================================
@@ -609,6 +638,16 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/search/multimodal", post(search::multimodal_search))
         .route("/api/search/robotics", post(search::robotics_search))
+        // =================================================================
+        // DATASETS (W7 — relational-backed tabular storage)
+        // =================================================================
+        .route("/api/datasets", post(datasets::create_dataset))
+        .route("/api/datasets", get(datasets::list_datasets))
+        .route("/api/datasets/{name}", get(datasets::get_dataset_metadata))
+        .route("/api/datasets/{name}", delete(datasets::drop_dataset))
+        .route("/api/datasets/{name}/rows", post(datasets::insert_rows))
+        .route("/api/datasets/{name}/query", post(datasets::query_dataset))
+        .route("/api/datasets/{name}/link", post(datasets::link_row))
         // =================================================================
         // MIF (Memory Interchange Format) v2
         // =================================================================
