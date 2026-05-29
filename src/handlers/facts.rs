@@ -623,7 +623,7 @@ pub enum FactsPreviewPurgeBucket {
 }
 
 impl FactsPreviewPurgeBucket {
-    pub(crate) fn from_count(n: usize) -> Self {
+    pub fn from_count(n: usize) -> Self {
         match n {
             0 => Self::None,
             1..=5 => Self::Few,
