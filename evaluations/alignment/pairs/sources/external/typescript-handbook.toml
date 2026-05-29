@@ -1,8 +1,0 @@
-domain = "web_development"
-kind = "filesystem"
-path = "evaluations/alignment/pairs/_external/TypeScript-Website/packages/documentation/copy/en"
-extensions = ["md"]
-license = "CC-BY-4.0"
-source = "typescript-handbook"
-min_chunk = 256
-max_chunk = 2048
