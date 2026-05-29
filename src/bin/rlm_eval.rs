@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use veld::embeddings::{load_primary_embedder, Embedder};
 use veld::memory::hybrid_search::{HybridSearchConfig, HybridSearchEngine, RefinerMode};
-use veld::memory::rlm_refiner::RlmRefiner;
+use veld::memory::llm_reranker::LlmReranker;
 use veld::memory::types::MemoryId;
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -328,7 +328,7 @@ fn run_variant(
     // RefinerMode semantics (Rlm -> RRF-only; Stacked -> cross-encoder-only).
     let mut refiner_attached = false;
     if matches!(variant.refiner_mode(), RefinerMode::Rlm | RefinerMode::Stacked) {
-        if let Some(refiner) = RlmRefiner::from_env()? {
+        if let Some(refiner) = LlmReranker::from_env()? {
             engine = engine.with_refiner(Box::new(refiner));
             refiner_attached = true;
         }

@@ -6,7 +6,7 @@
 
 # HTTP API
 
-Veld exposes **202** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
+Veld exposes **218** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
 
 > Warning: 1 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
 
@@ -111,6 +111,18 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | Method | Path | Handler |
 |---|---|---|
 | `POST` | `/api/context_summary` | `recall::context_summary` |
+
+## /datasets
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/datasets` | `datasets::list_datasets` |
+| `POST` | `/api/datasets` | `datasets::create_dataset` |
+| `DELETE` | `/api/datasets/{name}` | `datasets::drop_dataset` |
+| `GET` | `/api/datasets/{name}` | `datasets::get_dataset_metadata` |
+| `POST` | `/api/datasets/{name}/link` | `datasets::link_row` |
+| `POST` | `/api/datasets/{name}/query` | `datasets::query_dataset` |
+| `POST` | `/api/datasets/{name}/rows` | `datasets::insert_rows` |
 
 ## /entity
 
@@ -381,6 +393,15 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `GET` | `/api/sessions/stats` | `sessions::get_session_stats` |
 | `GET` | `/api/sessions/{session_id}` | `sessions::get_session` |
 
+## /sleep_time
+
+| Method | Path | Handler |
+|---|---|---|
+| `POST` | `/api/sleep_time/enqueue` | `sleep_time::enqueue` |
+| `POST` | `/api/sleep_time/lock_block` | `sleep_time::lock_block` |
+| `GET` | `/api/sleep_time/status` | `sleep_time::status` |
+| `GET` | `/api/sleep_time/status/{user_id}` | `sleep_time::user_status` |
+
 ## /sleight
 
 | Method | Path | Handler |
@@ -455,10 +476,15 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/api/user_auth/2fa/confirm` | `user_auth::confirm_2fa` |
 | `POST` | `/api/user_auth/2fa/enroll` | `user_auth::enroll_2fa` |
+| `POST` | `/api/user_auth/admin/demote` | `user_auth::admin_demote` |
+| `POST` | `/api/user_auth/admin/promote` | `user_auth::admin_promote` |
 | `POST` | `/api/user_auth/login` | `user_auth::login` |
 | `POST` | `/api/user_auth/logout` | `user_auth::logout` |
 | `POST` | `/api/user_auth/recover` | `user_auth::recover` |
 | `POST` | `/api/user_auth/register` | `user_auth::register` |
+| `POST` | `/api/user_auth/sessions/revoke_all` | `user_auth::revoke_all_sessions` |
+| `POST` | `/api/user_auth/sessions/revoke_mine` | `user_auth::revoke_my_other_sessions` |
+| `ANY` | `/api/user_auth/{*path}` | `user_auth::disabled_fallback` |
 
 ## /users
 

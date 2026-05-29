@@ -19,11 +19,14 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
 
-/// HuggingFace model URLs (pinned to specific commit for reproducibility)
+/// HuggingFace model URLs — tracking `main`. The previous pin to commit
+/// `5b0d1d1b7c8a21c04e5e0168e09ef62faebdcca0` started returning "Entry not
+/// found" after an upstream restructure, silently breaking download +
+/// rerank. `main` always resolves to the current head of the repo.
 const CROSS_ENCODER_MODEL_URL: &str =
-    "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/5b0d1d1b7c8a21c04e5e0168e09ef62faebdcca0/onnx/model.onnx";
+    "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx";
 const CROSS_ENCODER_TOKENIZER_URL: &str =
-    "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/5b0d1d1b7c8a21c04e5e0168e09ef62faebdcca0/tokenizer.json";
+    "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json";
 
 /// Maximum input sequence length (query + document tokens)
 const MAX_PAIR_LENGTH: usize = 512;
