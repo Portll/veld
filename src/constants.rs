@@ -2567,4 +2567,58 @@ pub const RECONSOLIDATION_WORKING_MEMORY_THRESHOLD: u32 = 5;
 // | QUERY_DECOMPOSITION_SUB_WEIGHT         | memory/mod.rs           | semantic_retrieve() decomposed RRF      |
 // | QUERY_DECOMPOSITION_MAX_SUBQUERIES     | memory/query_parser.rs  | decompose_query() cap                   |
 //
+
+// =============================================================================
+// SLEEP-TIME / OBSERVATIONAL MEMORY CONSTANTS
+// =============================================================================
+// Async LLM-driven background worker that re-authors ContextBlocks between
+// sessions and emits observation memories. Augments — does not replace — the
+// synchronous maintenance loop. See `src/memory/sleep_time/` and rationale
+// in `plans/sleep-time-rationale.md`.
+
+/// Default per-user hourly token budget (R12 / R20).
+///
+/// Conservative V1 default that bounds cost while allowing a typical
+/// "Balanced" profile: ~2k tokens × 4 calls/hour = 8k, leaving headroom for
+/// REM-mode runs that include more long-term context.
+pub const SLEEP_TIME_TOKENS_PER_HOUR: u32 = 10_000;
+
+/// Default per-user daily LLM-call cap (R12).
+///
+/// At 50 calls/day a user gets roughly two NREM + REM passes per session
+/// across ~10 sessions before hitting the cap. Operators tune via
+/// `SleepTimeConfig::calls_per_day`.
+pub const SLEEP_TIME_CALLS_PER_DAY: u32 = 50;
+
+/// Default cross-user global token cap per day (R33).
+///
+/// Defence against B11 (DOS pattern) and B7 (one tenant burning the shared
+/// API key). At ~50k tokens/user/day × 100 users = 5M global ceiling.
+pub const SLEEP_TIME_GLOBAL_TOKENS_PER_DAY: u64 = 5_000_000;
+
+/// Default cross-user global call cap per day (R33).
+pub const SLEEP_TIME_GLOBAL_CALLS_PER_DAY: u64 = 10_000;
+
+/// Idle threshold in seconds — minimum gap of foreground inactivity before
+/// idle triggers fire (R13 + L9 fix).
+pub const SLEEP_TIME_IDLE_THRESHOLD_SECS: i64 = 90;
+
+/// Debounce window in seconds — repeated identical triggers (same user +
+/// mode + trigger) collapse within this window.
+pub const SLEEP_TIME_DEBOUNCE_SECS: i64 = 300;
+
+/// Default worker pool size (R3). 2 is enough for V1 single-tenant; scaled
+/// up by operators via `SleepTimeConfig::num_workers`.
+pub const SLEEP_TIME_WORKERS: usize = 2;
+
+/// Cold-start queue TTL — drop queue items older than this on process
+/// restart (R31 + R67). Two hours is a safe default: anything older is
+/// almost certainly stale.
+pub const SLEEP_TIME_QUEUE_COLD_START_TTL_HOURS: i64 = 2;
+
+/// Default claim lease for worker-claimed queue items in seconds (R3).
+/// If a worker dies mid-process the claim expires and the item is
+/// re-claimable. Matches `queue::DEFAULT_CLAIM_LEASE_SECS`.
+pub const SLEEP_TIME_CLAIM_LEASE_SECS: i64 = 600;
+
 // =============================================================================

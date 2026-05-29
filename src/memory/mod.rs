@@ -8,6 +8,7 @@
 //! - Automatic memory consolidation
 
 pub mod alignment_onboarding;
+pub mod bm25_projection;
 pub mod compression;
 pub mod context;
 pub mod context_blocks;
@@ -22,7 +23,6 @@ pub mod injection;
 pub mod introspection;
 pub mod learning_history;
 pub mod lineage;
-pub mod llm_reranker;
 pub mod mapper;
 pub mod pattern_detection;
 pub mod persistence;
@@ -33,9 +33,10 @@ pub mod query_parser;
 pub mod relation_extraction;
 mod recall;
 pub mod replay;
-pub mod rlm_refiner;
+pub mod llm_reranker;
 pub mod retrieval;
 pub mod segmentation;
+pub mod session_detect;
 pub mod sessions;
 pub mod sleep_time;
 pub mod slow_store;
@@ -91,8 +92,7 @@ pub fn set_shared_zenoh_session(session: zenoh::Session) {
 use crate::embeddings::Embedder;
 use crate::memory::compression::CompressionPipeline;
 pub use crate::memory::compression::{
-    CausalFactLink, ConsolidationResult, FactCluster, FactType, PurgeReason,
-    SemanticConsolidator, SemanticFact,
+    ConsolidationResult, FactType, SemanticConsolidator, SemanticFact,
 };
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
@@ -106,6 +106,7 @@ pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult}
 pub use crate::memory::graph_retrieval::{
     calculate_density_weights, spreading_activation_retrieve, ActivatedMemory,
 };
+pub use crate::memory::bm25_projection::{Bm25Projection, Bm25ProjectionError};
 pub use crate::memory::hybrid_search::{
     BM25Index, CrossEncoderReranker, HybridSearchConfig, HybridSearchEngine, HybridSearchResult,
     LearnedWeights, RRFusion, SignalScores,
@@ -145,6 +146,23 @@ pub use crate::memory::temporal_facts::{
 };
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
 pub use crate::memory::visualization::{GraphStats, MemoryLogger};
+
+/// Directory name used for the on-disk BM25 (tantivy) inverted index.
+///
+/// Held under `{storage_path}/bm25_projection_index` so it stays
+/// identical to the path
+/// [`crate::handlers::state::MultiUserMemoryManager::get_user_bm25_index`]
+/// opens for the per-tenant `Bm25Projection`. The retrieval-side
+/// [`hybrid_search::HybridSearchEngine`] and the journaled writer's
+/// projection therefore index *the same tantivy directory*, which
+/// closes the W5 "reads diverge until next backfill" window.
+///
+/// The legacy `{storage_path}/bm25_index` directory is no longer created
+/// by any code path. Pre-existing tenants whose data still lives there
+/// will see a one-time rebuild driven by the projection's replay on
+/// first `JournaledWriter` open — the intent log is the source of
+/// truth, so the old directory can be deleted by operators at any time.
+pub const BM25_INDEX_DIR: &str = "bm25_projection_index";
 
 /// Configuration for the memory system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,10 +502,38 @@ impl MemorySystem {
 
     /// Create a memory system around an already-opened primary store.
     ///
-    /// This is the seam used by backend compatibility adapters so higher-level
-    /// orchestration can choose the storage opener before constructing the
-    /// retrieval pipeline.
+    /// Opens (or creates) the BM25 index at
+    /// `{storage_path}/bm25_projection_index` and wraps it in `Arc` for
+    /// sharing with the journaled-writer projection (when one is
+    /// attached). Use [`MemorySystem::with_storage_and_bm25_index`] when
+    /// the caller already holds the projection-owned handle and wants
+    /// the retrieval engine to share it.
     pub fn with_storage(config: MemoryConfig, storage: Arc<MemoryStorage>) -> Result<Self> {
+        let bm25_path = config.storage_path.join(BM25_INDEX_DIR);
+        let bm25_index = Arc::new(
+            hybrid_search::BM25Index::new(&bm25_path)
+                .context("Failed to open BM25 index for hybrid search")?,
+        );
+        Self::with_storage_and_bm25_index(config, storage, bm25_index)
+    }
+
+    /// Create a memory system around an already-opened primary store *and*
+    /// an externally-owned `Arc<BM25Index>`.
+    ///
+    /// This is the server-side seam: the [`crate::handlers::state::MultiUserMemoryManager`]
+    /// owns one `Arc<BM25Index>` per tenant and feeds it to both the
+    /// retrieval engine (via this constructor) and the live
+    /// [`crate::memory::Bm25Projection`] driven off the intent log.
+    /// Sharing the handle means a journaled write that lands in the
+    /// projection becomes visible to this `MemorySystem`'s
+    /// [`HybridSearchEngine`] as soon as the projection's `commit()` +
+    /// `reload()` returns — no re-open, no second on-disk index, no
+    /// "reads diverge until the next backfill" drift window.
+    pub fn with_storage_and_bm25_index(
+        config: MemoryConfig,
+        storage: Arc<MemoryStorage>,
+        bm25_index: Arc<hybrid_search::BM25Index>,
+    ) -> Result<Self> {
         let storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
@@ -774,7 +820,14 @@ impl MemorySystem {
         let lineage_graph = Arc::new(lineage::LineageGraph::new(storage.db()));
 
         // Initialize hybrid search engine (BM25 + Vector + RRF + Reranking)
-        let bm25_path = storage_path.join("bm25_index");
+        //
+        // The BM25 index is supplied by the caller — either opened by
+        // `MemorySystem::with_storage` from `{storage_path}/bm25_projection_index`
+        // (standalone / test mode) or threaded in from the per-tenant
+        // `Arc<BM25Index>` owned by `MultiUserMemoryManager` (server mode,
+        // shared with the `Bm25Projection` driven off the intent log).
+        // The retrieval engine never opens a second on-disk index — the
+        // projection-owned directory is the single source of truth.
         let hybrid_search_config = hybrid_search::HybridSearchConfig::default();
             #[cfg(feature = "multi-tenant")]
             let default_collective_weights = (
@@ -782,12 +835,11 @@ impl MemorySystem {
                 hybrid_search_config.vector_weight,
                 hybrid_search_config.graph_weight,
             );
-        let hybrid_search_engine = hybrid_search::HybridSearchEngine::new(
-            &bm25_path,
+        let hybrid_search_engine = hybrid_search::HybridSearchEngine::with_bm25_index(
+            bm25_index,
             embedder.clone(),
             hybrid_search_config,
-        )
-        .context("Failed to initialize hybrid search engine")?;
+        );
 
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
@@ -815,36 +867,11 @@ impl MemorySystem {
             }
         }
 
-        // Backfill BM25 index if empty but memories exist
-        if hybrid_search_engine.needs_backfill() {
-            let existing_memories = storage.get_all()?;
-            let memory_count = existing_memories.len();
-
-            if memory_count > 0 {
-                tracing::info!(
-                    "BM25 index empty, backfilling {} existing memories...",
-                    memory_count
-                );
-
-                let memories_iter = existing_memories.into_iter().map(|mem| {
-                    (
-                        mem.id,
-                        mem.experience.content,
-                        mem.experience.tags,
-                        mem.experience.entities,
-                    )
-                });
-
-                match hybrid_search_engine.backfill(memories_iter) {
-                    Ok(indexed) => {
-                        tracing::info!("BM25 backfill complete: {} memories indexed", indexed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("BM25 backfill failed (non-fatal): {}", e);
-                    }
-                }
-            }
-        }
+        // BM25 corpus is rebuilt from the intent log by `Bm25Projection`
+        // on `JournaledWriter` open (server mode) — no in-process
+        // backfill required. Standalone / test code that wants a
+        // pre-populated index must drive `index_memory` directly, just
+        // as it would have via the previous backfill helper.
 
         // Initialize learning history store for persistent significant events
         // Uses the same DB as long-term memory with "learning:" prefix
@@ -4040,6 +4067,62 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// Construct a transient handle to the ACL store backed by the same
+    /// RocksDB instance. Cheap — just clones an `Arc<DB>` — and lets
+    /// callers grant / revoke / inspect ACLs without holding a long-lived
+    /// MemoryAclStore.
+    pub fn acl_store(&self) -> acl::MemoryAclStore {
+        acl::MemoryAclStore::new(self.long_term_memory.db())
+    }
+
+    /// Check whether `viewer_user_id` is allowed to read a memory owned by
+    /// `owner_user_id`. The owner always passes; other users pass only if
+    /// the ACL record grants them read or write.
+    pub fn can_read_memory(
+        &self,
+        owner_user_id: &str,
+        viewer_user_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<bool> {
+        if owner_user_id == viewer_user_id {
+            return Ok(true);
+        }
+        self.acl_store().can_read(owner_user_id, memory_id, viewer_user_id)
+    }
+
+    /// Authenticated memory read. Returns `Err` if the viewer lacks ACL
+    /// permission. Use this at API boundaries when a cross-user request is
+    /// possible; the existing `get_memory` stays for owner-internal use
+    /// (consolidation, maintenance, etc.).
+    pub fn get_memory_for_viewer(
+        &self,
+        owner_user_id: &str,
+        viewer_user_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<Memory> {
+        if !self.can_read_memory(owner_user_id, viewer_user_id, memory_id)? {
+            return Err(anyhow::anyhow!(
+                "ACL: viewer '{viewer_user_id}' is not allowed to read \
+                 memory {} owned by '{owner_user_id}'",
+                memory_id.0
+            ));
+        }
+        self.get_memory(memory_id)
+    }
+
+    /// Symmetric write check for cross-user writes.
+    pub fn can_write_memory(
+        &self,
+        owner_user_id: &str,
+        actor_user_id: &str,
+        memory_id: &MemoryId,
+    ) -> Result<bool> {
+        if owner_user_id == actor_user_id {
+            return Ok(true);
+        }
+        self.acl_store().can_write(owner_user_id, memory_id, actor_user_id)
+    }
+
     /// Get children of a memory
     pub fn get_memory_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
         self.long_term_memory.get_children(parent_id)
@@ -5037,20 +5120,11 @@ impl MemorySystem {
         } else {
             (0, 0)
         };
-        // 3.6. Purge-retention reaper: hard-delete soft-purged facts whose
-        // VELD_PURGE_RETENTION_DAYS window has expired. Runs only on heavy
-        // cycles since it scans the same fact set as decay.
-        let facts_reaped = if is_heavy {
-            self.reap_purged_facts_for_all_users().unwrap_or(0)
-        } else {
-            0
-        };
-        if facts_decayed > 0 || facts_deleted > 0 || facts_reaped > 0 {
+        if facts_decayed > 0 || facts_deleted > 0 {
             tracing::debug!(
-                "Temporal fact maintenance: {} decayed, {} deleted, {} reaped",
+                "Temporal fact maintenance: {} decayed, {} deleted",
                 facts_decayed,
-                facts_deleted,
-                facts_reaped
+                facts_deleted
             );
         }
 
@@ -5995,142 +6069,6 @@ impl MemorySystem {
         &self.fact_store
     }
 
-    /// Administratively purge facts matching `predicate`. Soft-delete via
-    /// `purged_at` + `purge_reason` (NOT a hard-delete; the reaper task
-    /// removes records after their purge-retention window expires).
-    ///
-    /// Returns `(purged, total_scanned)`. `total_scanned` is bounded by the
-    /// `PURGE_CORPUS_CAP` so callers can detect truncation.
-    ///
-    /// Idempotent: a fact already marked purged is skipped (no overwrite of
-    /// the original `purged_at` timestamp / reason).
-    ///
-    /// Concurrency: callers should hold the per-user `FACT_PURGE_LOCKS`
-    /// mutex (in `handlers::facts`) for the duration of this call. The
-    /// store itself is thread-safe via RocksDB, but acquiring the lock
-    /// serialises purge bursts and prevents the contradiction-detector
-    /// (which writes `valid_until`) from racing with us on the same record.
-    pub fn purge_facts<F>(
-        &self,
-        user_id: &str,
-        predicate: F,
-        reason: PurgeReason,
-    ) -> Result<(usize, usize)>
-    where
-        F: Fn(&SemanticFact) -> bool,
-    {
-        const PURGE_CORPUS_CAP: usize = 10_000;
-        let now = chrono::Utc::now();
-        let candidates = self.fact_store.list(user_id, PURGE_CORPUS_CAP)?;
-        let total = candidates.len();
-        let mut purged = 0;
-
-        for mut fact in candidates {
-            if fact.purged_at.is_some() {
-                continue;
-            }
-            if !predicate(&fact) {
-                continue;
-            }
-            fact.purged_at = Some(now);
-            fact.purge_reason = Some(reason.clone());
-            // Update preserves the existing record id + indices; only the
-            // primary record changes shape on disk.
-            self.fact_store.update(user_id, &fact)?;
-            purged += 1;
-        }
-
-        Ok((purged, total))
-    }
-
-    /// Build fact narratives by clustering currently-active facts on shared
-    /// entities.
-    ///
-    /// Algorithm (ported from `shodh-memory`):
-    ///   1. Compute entity document-frequency (DF) over the candidate set.
-    ///   2. Designate entities appearing in ≥ 20% of facts (and at least 5)
-    ///      as *hub* entities. Hubs are skipped for topic selection because
-    ///      they are too generic to form a useful cluster.
-    ///   3. For each fact, pick its *lowest-DF* non-hub entity as the topic;
-    ///      facts with no discriminative entity drop into `__uncategorized__`.
-    ///   4. Group by topic, build clusters with 2+ facts (or single facts
-    ///      with a real topic). Sort by `total_support` DESC, truncate.
-    ///
-    /// `entity_filter` (when supplied) narrows the candidate set to facts
-    /// related to that entity (max 200 facts), otherwise the most-recent
-    /// 500 facts are considered.
-    ///
-    /// All facts surfaced are guaranteed active (`is_active` is enforced by
-    /// `find_by_entity` / `list` reader paths) — purged and bi-temporally
-    /// expired facts never appear in narratives.
-    pub fn build_fact_narratives(
-        &self,
-        user_id: &str,
-        limit: usize,
-        entity_filter: Option<&str>,
-    ) -> Result<Vec<FactCluster>> {
-        let facts = if let Some(entity) = entity_filter {
-            self.fact_store.find_by_entity(user_id, entity, 200)?
-        } else {
-            self.fact_store.list(user_id, 500)?
-        };
-
-        if facts.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let n = facts.len();
-        let mut entity_df: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for f in &facts {
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for e in &f.related_entities {
-                if seen.insert(e.as_str()) {
-                    *entity_df.entry(e.as_str()).or_default() += 1;
-                }
-            }
-        }
-        let hub_threshold = (n as f32 * 0.20).max(5.0) as usize;
-        let hub_entities: std::collections::HashSet<&str> = entity_df
-            .iter()
-            .filter(|(_, count)| **count >= hub_threshold)
-            .map(|(e, _)| *e)
-            .collect();
-
-        let mut topic_groups: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, f) in facts.iter().enumerate() {
-            let best_entity = f
-                .related_entities
-                .iter()
-                .filter(|e| !hub_entities.contains(e.as_str()))
-                .min_by_key(|e| entity_df.get(e.as_str()).copied().unwrap_or(usize::MAX));
-            let topic = match best_entity {
-                Some(e) => e.clone(),
-                None => "__uncategorized__".to_string(),
-            };
-            topic_groups.entry(topic).or_default().push(i);
-        }
-
-        let mut clusters: Vec<FactCluster> = topic_groups
-            .into_iter()
-            .filter(|(topic, indices)| {
-                indices.len() >= 2 || (indices.len() == 1 && topic != "__uncategorized__")
-            })
-            .map(|(_, indices)| build_single_cluster(&facts, &indices))
-            .collect();
-
-        // Deterministic ordering: total_support DESC, topic ASC as tie-breaker
-        // (per breakers R1.5.03 — fixes backend-dependent iteration order).
-        clusters.sort_by(|a, b| {
-            b.total_support
-                .cmp(&a.total_support)
-                .then_with(|| a.topic.cmp(&b.topic))
-        });
-        clusters.truncate(limit);
-        Ok(clusters)
-    }
-
     // =========================================================================
     // SHO-118: DECISION LINEAGE GRAPH METHODS
     // =========================================================================
@@ -6291,54 +6229,6 @@ impl MemorySystem {
 
         Ok((total_decayed, total_deleted))
     }
-
-    /// Hard-delete facts whose `purged_at` window has expired.
-    ///
-    /// Runs as part of the maintenance loop alongside `decay_facts_for_all_users`.
-    /// Uses a SEPARATE retention window from contradiction-decay so operators can
-    /// tune the audit-trail lifetime independently. Retention defaults are
-    /// `VELD_PURGE_RETENTION_DAYS=30` and `VELD_CONTRADICTION_RETENTION_DAYS=90`
-    /// (per overloop-P2 D-L2). `purged_at` takes precedence: a fact with both
-    /// `purged_at` and `valid_until` set is reaped on the purge window.
-    ///
-    /// Returns the number of facts hard-deleted.
-    fn reap_purged_facts_for_all_users(&self) -> Result<usize> {
-        let retention_days: i64 = std::env::var("VELD_PURGE_RETENTION_DAYS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
-        if retention_days < 0 {
-            // Operator opt-out: negative value disables reaping (keep audit trail forever).
-            return Ok(0);
-        }
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
-        let user_ids = self.fact_store.list_users(100)?;
-        let mut total_reaped = 0;
-
-        for user_id in &user_ids {
-            // include_inactive=true so we can see purged facts.
-            let facts = self.fact_store.list_filtered(user_id, 10_000, true)?;
-            for fact in facts {
-                let Some(purged_at) = fact.purged_at else {
-                    continue;
-                };
-                if purged_at > cutoff {
-                    continue;
-                }
-                self.fact_store.delete(user_id, &fact.id)?;
-                total_reaped += 1;
-            }
-        }
-
-        if total_reaped > 0 {
-            tracing::info!(
-                facts_reaped = total_reaped,
-                retention_days,
-                "Purge-retention reaper complete"
-            );
-        }
-        Ok(total_reaped)
-    }
 }
 
 /// Automatic persistence on drop - ensures vector index and ID mappings survive restarts
@@ -6355,174 +6245,4 @@ impl Drop for MemorySystem {
             tracing::error!("Failed to flush storage on shutdown: {}", e);
         }
     }
-}
-
-// =============================================================================
-// Fact Narrative Helpers (private, used by MemorySystem::build_fact_narratives)
-// =============================================================================
-
-/// Build a single [`FactCluster`] from a set of fact indices.
-fn build_single_cluster(all_facts: &[SemanticFact], indices: &[usize]) -> FactCluster {
-    use std::collections::HashMap;
-
-    let mut entity_counts: HashMap<&str, usize> = HashMap::new();
-    let mut cluster_facts: Vec<SemanticFact> = Vec::with_capacity(indices.len());
-
-    for &i in indices {
-        let f = &all_facts[i];
-        cluster_facts.push(f.clone());
-        for e in &f.related_entities {
-            *entity_counts.entry(e.as_str()).or_default() += 1;
-        }
-    }
-
-    cluster_facts.sort_by_key(|f| f.created_at);
-
-    let topic = entity_counts
-        .iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(n, _)| (*n).to_string())
-        .unwrap_or_else(|| "General".to_string());
-
-    let mut entities: Vec<String> = entity_counts.keys().map(|e| (*e).to_string()).collect();
-    entities.sort();
-
-    let narrative = if cluster_facts.len() == 1 {
-        format!("Regarding {}: {}", topic, cluster_facts[0].fact)
-    } else {
-        let mut lines = vec![format!(
-            "Regarding {} ({} facts):",
-            topic,
-            cluster_facts.len()
-        )];
-        for (i, f) in cluster_facts.iter().enumerate() {
-            let label = if f.confidence >= 0.8 {
-                "established"
-            } else if f.confidence >= 0.5 {
-                "probable"
-            } else {
-                "tentative"
-            };
-            lines.push(format!("  {}. [{}] {}", i + 1, label, f.fact));
-        }
-        lines.join("\n")
-    };
-
-    let causal_chains = detect_causal_chains(&cluster_facts);
-
-    let avg_confidence = if cluster_facts.is_empty() {
-        0.0
-    } else {
-        cluster_facts.iter().map(|f| f.confidence).sum::<f32>() / cluster_facts.len() as f32
-    };
-    let total_support: usize = cluster_facts.iter().map(|f| f.support_count).sum();
-
-    FactCluster {
-        topic,
-        entities,
-        facts: cluster_facts,
-        narrative,
-        avg_confidence,
-        total_support,
-        causal_chains,
-    }
-}
-
-/// Detect causal relationships between temporally ordered facts that share at
-/// least one entity. Heuristic keyword analysis on the *later* fact classifies
-/// the relation as `superseded_by` > `resolved_by` > `informed_by` > `led_to`.
-fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
-    const SUPERSEDED_KEYWORDS: &[&str] = &[
-        "replaced",
-        "instead",
-        "no longer",
-        "removed",
-        "upgraded",
-        "converted",
-        "refactored",
-        "deprecated",
-    ];
-    const RESOLVED_KEYWORDS: &[&str] = &[
-        "fixed",
-        "resolved",
-        "patched",
-        "corrected",
-        "addressed",
-        "eliminated",
-    ];
-    const INFORMED_KEYWORDS: &[&str] = &[
-        "based on",
-        "learned from",
-        "following",
-        "after discovering",
-        "informed by",
-        "derived from",
-    ];
-    const GENERAL_EVOLUTION: &[&str] = &[
-        "migrated",
-        "updated",
-        "changed",
-        "now uses",
-        "switched",
-        "added",
-        "resulted in",
-        "prompted",
-        "triggered",
-        "spawned",
-        "caused",
-        "introduced",
-        "implemented",
-        "enabled",
-    ];
-
-    let mut chains = Vec::new();
-    let lowered: Vec<String> = sorted_facts.iter().map(|f| f.fact.to_lowercase()).collect();
-    let all_keywords: Vec<&str> = SUPERSEDED_KEYWORDS
-        .iter()
-        .chain(RESOLVED_KEYWORDS.iter())
-        .chain(INFORMED_KEYWORDS.iter())
-        .chain(GENERAL_EVOLUTION.iter())
-        .copied()
-        .collect();
-
-    for i in 0..sorted_facts.len() {
-        for j in (i + 1)..sorted_facts.len() {
-            let a = &sorted_facts[i];
-            let b = &sorted_facts[j];
-
-            let shared = a
-                .related_entities
-                .iter()
-                .any(|e| b.related_entities.contains(e));
-            if !shared {
-                continue;
-            }
-
-            let b_lower = &lowered[j];
-            let has_evolution = all_keywords.iter().any(|kw| b_lower.contains(kw));
-            if !has_evolution {
-                continue;
-            }
-
-            let relation = if SUPERSEDED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
-                "superseded_by"
-            } else if RESOLVED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
-                "resolved_by"
-            } else if INFORMED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
-                "informed_by"
-            } else {
-                "led_to"
-            };
-
-            chains.push(CausalFactLink {
-                from_fact_id: a.id.clone(),
-                to_fact_id: b.id.clone(),
-                from_fact: a.fact.clone(),
-                to_fact: b.fact.clone(),
-                relation: relation.to_string(),
-            });
-        }
-    }
-
-    chains
 }

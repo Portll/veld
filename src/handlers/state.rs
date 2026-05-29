@@ -237,6 +237,36 @@ pub struct MultiUserMemoryManager {
     /// and ensures the sync TTL actually works across requests.
     pub slow_stores: DashMap<String, std::sync::Arc<crate::memory::slow_store::SlowStore>>,
 
+    /// Per-user BM25 (tantivy) index cache. Shared between the live
+    /// [`crate::memory::Bm25Projection`] (which writes through it from
+    /// the intent log) and any read-side hybrid-search reader that
+    /// needs to query the same documents. Wrapped in `Arc` because the
+    /// index's interior writer and reader are already lock-protected;
+    /// the outer pointer just amortises the open cost.
+    pub bm25_indices:
+        DashMap<String, std::sync::Arc<crate::memory::BM25Index>>,
+
+    /// Per-user [`JournaledWriter`]. Created lazily on first journaled
+    /// CRUD for that user; holds the open intent log, the per-user
+    /// `CheckpointStore`, and the live `SqliteProjection` attached for
+    /// dispatch. Wrapped in `Mutex` because `record_and_apply` mutates
+    /// the underlying log + projections — only one writer at a time per
+    /// tenant.
+    ///
+    /// Wired up here (and not in the per-user Earth) because the
+    /// projection list is a runtime construct that may grow over time
+    /// (Vamana, BM25, Postgres) and we want one place to register them.
+    pub journaled_writers: DashMap<
+        String,
+        std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>,
+    >,
+
+    /// One init-lock per tenant for the lazy `JournaledWriter` creation.
+    /// Without this, two concurrent first-touch requests for the same
+    /// user could both miss the cache, both call `IntentLog::open`, and
+    /// the second open would race with the first writer's append.
+    journaled_writer_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
+
     /// Capabilities for the effective backend in the current runtime.
     storage_capabilities: StorageCapabilities,
 
@@ -244,6 +274,33 @@ pub struct MultiUserMemoryManager {
     /// truthy at server startup. Handlers gate on this — when `None`, the
     /// /api/user_auth/* surface returns 404.
     pub user_auth_runtime: Option<crate::user_auth::runtime::UserAuthRuntime>,
+
+    /// Optional relational-backed dataset store (W7). `None` when no
+    /// relational backend has been wired (the v0.9 redb-cutover work will
+    /// flip this to mandatory). Handlers behind `/api/datasets/*` return
+    /// `503 Service Unavailable` when this is `None`.
+    pub dataset_store: Option<std::sync::Arc<dyn crate::datasets::DatasetStore>>,
+
+    /// Optional row-link store backed by the same relational engine as
+    /// [`Self::dataset_store`]. Independently optional: present only when
+    /// the relational store is wired and link persistence is enabled.
+    pub link_store: Option<std::sync::Arc<dyn crate::datasets::LinkStore>>,
+
+    /// Optional raw relational executor shared with [`Self::dataset_store`]
+    /// and [`Self::link_store`]. The `/api/datasets/{name}/query` endpoint
+    /// uses this to run parametrised SELECTs directly against the same
+    /// database, since the [`crate::datasets::DatasetStore`] trait does not
+    /// expose raw SELECT.
+    pub dataset_executor:
+        Option<std::sync::Arc<dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>>>,
+
+    /// Sleep-time / observational memory orchestrator (V1). `Some` only
+    /// when [`crate::config::SleepTimeConfig::enabled`] is true at startup
+    /// AND the API key environment variable resolves. Handlers gate on
+    /// this — when `None`, the /api/sleep_time/* surface returns 503
+    /// Service Unavailable with a clear reason.
+    pub sleep_time_orchestrator:
+        parking_lot::RwLock<Option<Arc<crate::memory::sleep_time::SleepTimeOrchestrator>>>,
 }
 
 impl MultiUserMemoryManager {
@@ -544,8 +601,22 @@ impl MultiUserMemoryManager {
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
+            bm25_indices: DashMap::new(),
+            journaled_writers: DashMap::new(),
+            journaled_writer_init_locks: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
+            // W7: dataset / link stores are opt-in until the relational
+            // backend is wired into server bootstrap. Tests construct
+            // these in-place via `with_dataset_stores`.
+            dataset_store: None,
+            link_store: None,
+            dataset_executor: None,
+            // Sleep-time orchestrator is wired post-construction so its
+            // startup (cold-start purge + spawn workers) can run after the
+            // rest of state is settled and a tokio runtime is available.
+            // See `set_sleep_time_orchestrator()`.
+            sleep_time_orchestrator: parking_lot::RwLock::new(None),
         };
 
         info!("Running initial audit log rotation...");
@@ -554,6 +625,29 @@ impl MultiUserMemoryManager {
         }
 
         Ok(manager)
+    }
+
+    /// Builder-style helper for tests and bootstrap code that has already
+    /// constructed the relational [`crate::datasets::DatasetStore`] and
+    /// [`crate::datasets::LinkStore`] and wants to attach them to the
+    /// running manager.
+    ///
+    /// Production bootstrap will set both at construction time once the
+    /// relational engine is wired in (W4 → W7 follow-up); until then the
+    /// fields default to `None` and the dataset HTTP surface returns
+    /// `503 Service Unavailable`.
+    pub fn with_dataset_stores(
+        mut self,
+        dataset_store: std::sync::Arc<dyn crate::datasets::DatasetStore>,
+        link_store: std::sync::Arc<dyn crate::datasets::LinkStore>,
+        dataset_executor: std::sync::Arc<
+            dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>,
+        >,
+    ) -> Self {
+        self.dataset_store = Some(dataset_store);
+        self.link_store = Some(link_store);
+        self.dataset_executor = Some(dataset_executor);
+        self
     }
 
     fn bootstrap_shared_stores(
@@ -647,6 +741,12 @@ impl MultiUserMemoryManager {
         cfs.extend(ProspectiveStore::column_family_descriptors());
         cfs.extend(FileMemoryStore::cf_descriptors());
         cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
+        // Sleep-time / observational memory CFs (V1 + V2). Always created
+        // so the orchestrator can be enabled later without an offline migration.
+        cfs.extend(crate::memory::sleep_time::policies::BudgetTracker::cf_descriptors());
+        cfs.extend(crate::memory::sleep_time::queue::Queue::cf_descriptors());
+        cfs.extend(crate::memory::sleep_time::graduation::GraduationStore::cf_descriptors());
+        cfs.extend(crate::memory::sleep_time::supersession::SupersessionStore::cf_descriptors());
         cfs.push(ColumnFamilyDescriptor::new(
             crate::memory::feedback::CF_FEEDBACK,
             Self::shared_store_cf_options(),
@@ -885,7 +985,7 @@ impl MultiUserMemoryManager {
         }
     }
 
-    fn open_user_earth(&self, config: MemoryConfig) -> Result<Earth> {
+    fn open_user_earth(&self, user_id: &str, config: MemoryConfig) -> Result<Earth> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
                 let primary_store = RocksDbPrimaryMemoryStore::open(
@@ -896,7 +996,20 @@ impl MultiUserMemoryManager {
                     format!("Failed to open primary memory store at {:?}", config.storage_path)
                 })?;
 
-                Earth::with_storage(config, Arc::new(primary_store.into_inner()))
+                // Share the tenant's `Arc<BM25Index>` with the
+                // retrieval engine so reads see exactly the same tantivy
+                // segments the `Bm25Projection` commits to from the
+                // intent log. Without this the substrate would open its
+                // own `{storage_path}/bm25_index` directory and diverge
+                // from the projection until the next restart-time
+                // replay reconverged them.
+                let bm25_index = self.get_user_bm25_index(user_id)?;
+
+                Earth::with_storage_and_bm25_index(
+                    config,
+                    Arc::new(primary_store.into_inner()),
+                    bm25_index,
+                )
             }
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for MemorySystem construction yet",
@@ -969,7 +1082,7 @@ impl MultiUserMemoryManager {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
-                match self.open_user_earth(config.clone()) {
+                match self.open_user_earth(user_id, config.clone()) {
                     Ok(earth) => {
                         if attempt > 0 {
                             info!(
@@ -1542,6 +1655,271 @@ impl MultiUserMemoryManager {
         Ok(store)
     }
 
+    /// Get or create the per-tenant `Arc<BM25Index>`.
+    ///
+    /// One tantivy directory per user at
+    /// `{base_path}/{user_id}/bm25_projection_index`, shared by:
+    ///
+    /// 1. the `Bm25Projection` driven off the user's intent log (writes,
+    ///    via `JournaledWriter::record_and_apply`), and
+    /// 2. the retrieval-side `HybridSearchEngine` living inside the
+    ///    user's `Earth` (reads, via `MemorySystem::with_storage_and_bm25_index`).
+    ///
+    /// Sharing the `Arc` means tantivy's single-writer / multi-reader
+    /// constraint is respected (the projection holds the only
+    /// `IndexWriter`) and reads see fresh segments as soon as the
+    /// projection's `commit()` + `reload()` returns. The legacy
+    /// `{base_path}/{user_id}/bm25_index` directory is no longer
+    /// created by any code path; operators can delete it from old
+    /// tenants at any time.
+    pub fn get_user_bm25_index(
+        &self,
+        user_id: &str,
+    ) -> Result<std::sync::Arc<crate::memory::BM25Index>> {
+        if let Some(index) = self.bm25_indices.get(user_id) {
+            return Ok(index.clone());
+        }
+        let user_path = self.base_path.join(user_id);
+        let bm25_path = user_path.join(crate::memory::BM25_INDEX_DIR);
+        std::fs::create_dir_all(&bm25_path)?;
+        let index =
+            std::sync::Arc::new(crate::memory::BM25Index::new(&bm25_path).with_context(
+                || format!("open BM25 projection index for user {user_id}"),
+            )?);
+        self.bm25_indices.insert(user_id.to_string(), index.clone());
+        Ok(index)
+    }
+
+    /// Get or create a [`JournaledWriter`] for `user_id`.
+    ///
+    /// On first call for a tenant, this:
+    ///   1. opens (or creates) the per-user intent log at
+    ///      `{base_path}/{user_id}/intent.log`,
+    ///   2. opens (or creates) the per-user checkpoint store at
+    ///      `{base_path}/{user_id}/projection_checkpoints.bin`,
+    ///   3. instantiates a [`SqliteProjection`] wrapped around the user's
+    ///      `SlowStore` and a [`Bm25Projection`] wrapped around the
+    ///      user's BM25 (tantivy) index,
+    ///   4. **runs replay** so both projections catch up to the head of
+    ///      the log before any live write lands, and
+    ///   5. attaches the projections to the writer so subsequent live
+    ///      `record_and_apply` calls dispatch through them in order.
+    ///
+    /// On any subsequent call this returns the cached writer.
+    ///
+    /// Replay runs synchronously (inline with the call) because:
+    ///   - the log is small (one frame per CRUD operation, bincoded),
+    ///   - we MUST close the W5 catch-up gap before live writes can race
+    ///     against a half-replayed projection, and
+    ///   - the caller can spawn this on a blocking task pool if it needs
+    ///     a non-blocking startup. Doing the replay inside the lazy-open
+    ///     keeps the "logged ↔ projected" invariant local and provable.
+    pub fn get_user_journaled_writer(
+        &self,
+        user_id: &str,
+    ) -> Result<
+        std::sync::Arc<parking_lot::Mutex<crate::intent_log::JournaledWriter>>,
+    > {
+        // Fast path — cached.
+        if let Some(w) = self.journaled_writers.get(user_id) {
+            return Ok(w.clone());
+        }
+
+        // Slow path — single-flight init under a per-user lock.
+        let init_lock = self
+            .journaled_writer_init_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let _guard = init_lock.lock();
+
+        // Re-check after acquiring the lock — another thread may have
+        // populated the writer while we were waiting.
+        if let Some(w) = self.journaled_writers.get(user_id) {
+            return Ok(w.clone());
+        }
+
+        let user_path = self.base_path.join(user_id);
+        std::fs::create_dir_all(&user_path)?;
+        let log_path = user_path.join("intent.log");
+        let checkpoint_path = user_path.join("projection_checkpoints.bin");
+
+        let log = crate::intent_log::IntentLog::open(&log_path)
+            .with_context(|| format!("open intent log for user {user_id}"))?;
+        let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::intent_log::CheckpointStore::open(&checkpoint_path)
+                .with_context(|| format!("open checkpoint store for user {user_id}"))?,
+        ));
+
+        // SQLite slow store projection — first attached, replays first.
+        let slow_store = self.get_user_slow_store(user_id)?;
+        let mut sqlite_projection = crate::memory::slow_store::SqliteProjection::new(
+            slow_store.clone(),
+            checkpoint_store.clone(),
+        );
+
+        // Catch the SQLite projection up to the head of the log before
+        // it goes live. The `Some(100)` flushes the checkpoint every 100
+        // applied records so a crash during a long replay survives.
+        let applied_sqlite =
+            crate::intent_log::replay(&log, &mut sqlite_projection, Some(100))
+                .with_context(|| {
+                    format!("replay intent log for user {user_id} (sqlite projection)")
+                })?;
+        if applied_sqlite > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                applied = applied_sqlite,
+                "replayed intent log records into SQLite projection on first writer open",
+            );
+        }
+
+        // Second family of projections: Vamana, one per embedding kind.
+        // Each user gets up to five dedicated vector indices that are
+        // *derived from the log*. Each kind lives under
+        // `{base}/{user_id}/vamana_projection/{kind}/` so a
+        // wipe-and-replay operator workflow can blow away one kind's
+        // directory (e.g. re-embed all images) without touching the
+        // others, the SQLite slow store, or RocksDB.
+        //
+        // We use the *lazy* variant: each kind's index is materialised
+        // on the first memory whose embedding-for-that-kind is present
+        // (during replay or live writes). This avoids coupling the
+        // projection's open to the embedder cache (the embedder is
+        // constructed lazily per-tenant via `get_user_earth`, which can
+        // be a different lifecycle than `get_user_journaled_writer`).
+        // The first embedded memory tells us the dim — that's the same
+        // dim every subsequent memory of the same kind must match (each
+        // embedder is stable for a tenant's corpus), so this is correct
+        // by construction.
+        //
+        // All five kinds are registered eagerly. The cost of an empty,
+        // un-materialised projection is one in-memory `HashMap` and one
+        // checkpoint-store row — negligible. Kinds that never see a
+        // matching field stay pending and never allocate a Vamana
+        // graph, so there's no I/O penalty for tenants that only ever
+        // store text memories.
+        let vamana_root = user_path.join("vamana_projection");
+        std::fs::create_dir_all(&vamana_root).with_context(|| {
+            format!(
+                "create vamana projection root for user {user_id}: {:?}",
+                vamana_root
+            )
+        })?;
+        let mut vamana_projections: Vec<crate::vector_db::VamanaProjection> = Vec::new();
+        for &kind in crate::vector_db::VamanaEmbeddingKind::all() {
+            let kind_dir = vamana_root.join(kind.dir_component());
+            std::fs::create_dir_all(&kind_dir).with_context(|| {
+                format!(
+                    "create vamana projection dir for user {user_id} kind {}: {:?}",
+                    kind.projection_name(),
+                    kind_dir
+                )
+            })?;
+            let bootstrap = crate::vector_db::VamanaProjectionBootstrap {
+                storage_path: Some(kind_dir),
+                config_template: crate::vector_db::VamanaConfig {
+                    // dimension is rewritten on first embedded apply
+                    // for this kind.
+                    dimension: 0,
+                    max_degree: 32,
+                    search_list_size: 100,
+                    alpha: 1.2,
+                    use_mmap: true,
+                    distance_metric: crate::vector_db::DistanceMetric::default(),
+                },
+            };
+            let mut proj = crate::vector_db::VamanaProjection::lazy(
+                kind,
+                bootstrap,
+                checkpoint_store.clone(),
+            );
+            let applied = crate::intent_log::replay(&log, &mut proj, Some(100))
+                .with_context(|| {
+                    format!(
+                        "replay intent log for user {user_id} ({} projection)",
+                        kind.projection_name()
+                    )
+                })?;
+            if applied > 0 {
+                tracing::info!(
+                    user_id = %user_id,
+                    projection = kind.projection_name(),
+                    applied,
+                    "replayed intent log records into Vamana projection on first writer open",
+                );
+            }
+            vamana_projections.push(proj);
+        }
+
+        // Third projection: BM25 inverted index. Same independent-checkpoint
+        // pattern — a stalled BM25 can't block the others' catch-up.
+        let bm25_index = self.get_user_bm25_index(user_id)?;
+        let mut bm25_projection = crate::memory::Bm25Projection::new(
+            bm25_index.clone(),
+            checkpoint_store.clone(),
+        );
+        let bm25_applied = crate::intent_log::replay(
+            &log,
+            &mut bm25_projection,
+            Some(crate::memory::bm25_projection::COMMIT_EVERY),
+        )
+        .with_context(|| {
+            format!("replay intent log into BM25 projection for user {user_id}")
+        })?;
+        if bm25_applied > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                applied = bm25_applied,
+                "replayed intent log records into BM25 projection on first writer open",
+            );
+        }
+
+        // Hand the log handle into the writer so subsequent appends
+        // continue against the same file. Replay above used a read-only
+        // borrow; the same handle is fine for the writer's appends.
+        let mut writer = crate::intent_log::JournaledWriter::new(log);
+        writer.add_projection(Box::new(sqlite_projection));
+        for vp in vamana_projections {
+            writer.add_projection(Box::new(vp));
+        }
+        writer.add_projection(Box::new(bm25_projection));
+
+        let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
+        self.journaled_writers
+            .insert(user_id.to_string(), writer.clone());
+        Ok(writer)
+    }
+
+    /// Convenience: journal a typed payload through the user's
+    /// `JournaledWriter`. Calls `record_and_apply` under the writer's
+    /// mutex and returns the assigned LSN. Per-projection apply errors
+    /// are *not* propagated as failures — they are logged at warn level
+    /// (the log frame is durable, replay will retry on restart).
+    pub fn journal_and_apply(
+        &self,
+        user_id: &str,
+        payload: &crate::intent_log::IntentPayload,
+    ) -> Result<crate::intent_log::Lsn> {
+        let writer = self.get_user_journaled_writer(user_id)?;
+        let outcome = {
+            let mut writer = writer.lock();
+            writer
+                .record_and_apply(payload)
+                .map_err(|e| anyhow::anyhow!("journal record_and_apply: {e}"))?
+        };
+        for err in &outcome.apply_errors {
+            tracing::warn!(
+                user_id = %user_id,
+                projection = %err.projection,
+                lsn = outcome.lsn.0,
+                error = %err.source,
+                "projection apply failed during journaled write (log durable; replay will retry)",
+            );
+        }
+        Ok(outcome.lsn)
+    }
+
     /// Get graph statistics for a user
     pub fn get_user_graph_stats(&self, user_id: &str) -> Result<GraphStats> {
         let graph = self.get_user_graph(user_id)?;
@@ -1773,6 +2151,71 @@ impl MultiUserMemoryManager {
                 total_feedback_events,
             ) {
                 tracing::warn!(error = %error, "Collective maintenance aggregation failed");
+            }
+        }
+
+        // Heavy cycle: sleep-time graduation pass (R27) + supersession decay
+        // (R48). Both run only when the orchestrator is installed; both are
+        // best-effort — a failure here does not abort the rest of the
+        // maintenance cycle.
+        if is_heavy {
+            let orch_opt = self.sleep_time_orchestrator.read().clone();
+            if let Some(orch) = orch_opt {
+                // R48: supersession-confidence decay across every user's
+                // edges (the store is global). Single pass, returns
+                // (decayed, removed) counts.
+                match orch.supersession_store().decay_all(
+                    crate::memory::sleep_time::DEFAULT_SUPERSESSION_DECAY,
+                ) {
+                    Ok((decayed, removed)) => {
+                        if decayed > 0 || removed > 0 {
+                            tracing::info!(
+                                decayed,
+                                removed,
+                                "sleep-time supersession decay applied (R48)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sleep-time supersession decay failed");
+                    }
+                }
+
+                // R27: graduation pass per user. Scans each user's memories,
+                // promotes observation memories whose access_count meets the
+                // configured threshold.
+                let threshold =
+                    crate::memory::sleep_time::DEFAULT_GRADUATION_ACCESS_THRESHOLD;
+                for (user_id_arc, _) in self.user_earths.iter() {
+                    let user_id = user_id_arc.as_ref();
+                    if let Ok(earth) = self.get_user_earth(user_id) {
+                        let earth_guard = earth.read();
+                        match crate::memory::sleep_time::graduate_eligible_observations(
+                            earth_guard.as_memory_system(),
+                            orch.graduation_store(),
+                            threshold,
+                        ) {
+                            Ok(result) => {
+                                if result.graduated > 0 {
+                                    tracing::info!(
+                                        user_id = %user_id,
+                                        graduated = result.graduated,
+                                        scanned = result.observations_scanned,
+                                        threshold,
+                                        "sleep-time graduation pass (R27)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    error = %e,
+                                    "sleep-time graduation pass failed"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
