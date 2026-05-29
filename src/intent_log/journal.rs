@@ -55,6 +55,12 @@ pub trait TypedProjection: Send {
         lsn: Lsn,
         payload: &IntentPayload,
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
+
+    /// Downcast hook. Lets a holder of `&dyn TypedProjection` recover the
+    /// concrete projection type — e.g. the W6 query planner reaching a
+    /// live `VamanaProjection`'s ANN index through the writer that owns
+    /// it. Every impl is the one-liner `{ self }`.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Errors raised by [`JournaledWriter::record_and_apply`].
@@ -111,6 +117,19 @@ impl JournaledWriter {
     /// Number of projections currently attached.
     pub fn projection_count(&self) -> usize {
         self.projections.len()
+    }
+
+    /// Borrow an attached projection by its [`TypedProjection::name`].
+    /// Returns the first match, or `None` if no attached projection
+    /// reports that name. Used by read-side consumers (e.g. the query
+    /// planner's vector adapter) to reach a live projection's state
+    /// without owning it — the projections live here, behind the
+    /// writer's mutex, for the lifetime of the tenant.
+    pub fn projection_by_name(&self, name: &str) -> Option<&dyn TypedProjection> {
+        self.projections
+            .iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.as_ref())
     }
 
     /// Borrow the underlying log read-only. Useful for diagnostics —
@@ -265,6 +284,9 @@ mod tests {
             self.applied.lock().unwrap().push((lsn, payload.clone()));
             Ok(())
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     /// Projection that always fails on apply, so we can verify the
@@ -282,6 +304,9 @@ mod tests {
             _payload: &IntentPayload,
         ) -> Result<(), Box<dyn Error + Send + Sync>> {
             Err("synthetic failure".into())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

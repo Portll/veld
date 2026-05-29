@@ -204,6 +204,10 @@ impl TypedProjection for SqliteProjection {
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Static arm: the replay driver hands us [`IntentRecord`]s straight off
