@@ -403,12 +403,52 @@ pub struct DiffSummary {
 pub struct RewriterOutput {
     pub proposals: Vec<RewriteProposal>,
     pub observations: Vec<ObservationDraft>,
+    /// V2 R43 — REM-mode-only graph edge proposals derived from
+    /// cross-session entity co-occurrence in the evidence pack. Empty in
+    /// NREM mode. Validated by R54 (entity ID presence) and R51 (NER
+    /// confidence) before application to graph_memory.
+    pub edge_proposals: Vec<EdgeProposalDraft>,
     /// Total tokens billed by the LLM provider for this call.
     pub total_tokens: u32,
     /// Model id used for the call.
     pub model: String,
     /// Wall-clock duration of the LLM call.
     pub elapsed_ms: u64,
+}
+
+/// REM-mode graph edge proposal (R43).
+///
+/// The rewriter emits these alongside observations when cross-session
+/// entity co-occurrence in the evidence pack suggests an unrecorded
+/// relationship. They are NOT applied directly — the worker validates
+/// each:
+///
+///   1. Both entity names must resolve to existing `EntityNode`s in the
+///      user's graph (R54). Names are matched via the graph's
+///      `find_entity_by_name` (case-insensitive exact, then fuzzy).
+///   2. `confidence >= R51 threshold` (default 0.6).
+///   3. Both entity refs must appear in at least one evidence memory
+///      (defence against LLM-fabricated entities).
+///
+/// Validated proposals are applied to `graph_memory` at
+/// `EdgeTier::L1Working` so they participate in normal
+/// strengthening/decay rather than appearing as already-trusted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeProposalDraft {
+    /// Source entity name (resolved to `EntityNode.uuid` at apply time).
+    pub from_entity: String,
+    /// Target entity name.
+    pub to_entity: String,
+    /// String form of `graph_memory::RelationType`; unknown values map to
+    /// `RelationType::CoOccurs` (the conservative default for REM-derived
+    /// co-occurrence claims).
+    pub relation: String,
+    /// LLM-asserted confidence in `[0, 1]`. Gated by R51 threshold.
+    pub confidence: f32,
+    /// Short rationale citing the source memory IDs that motivated the
+    /// proposal — recorded for audit but not used at apply time.
+    #[serde(default)]
+    pub rationale: String,
 }
 
 // =============================================================================

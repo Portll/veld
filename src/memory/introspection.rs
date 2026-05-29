@@ -288,6 +288,58 @@ pub enum ConsolidationEvent {
         orphaned_entities: usize,
         timestamp: DateTime<Utc>,
     },
+
+    // =========================================================================
+    // Sleep-time / Observational Memory events (R1 / R6 / R12 / R14 / R40)
+    // =========================================================================
+    /// A sleep-time pass produced a successful `ContextBlock` rewrite. Carries
+    /// the block key, old/new version numbers, mode, trigger, and token
+    /// spend. Significant — persisted via `record_consolidation_event_for_user`.
+    SleepTimeBlockRewritten {
+        user_id: String,
+        block_key: String,
+        old_version: u32,
+        new_version: u32,
+        mode: String,
+        trigger: String,
+        token_spend: u32,
+        model: String,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// A sleep-time pass emitted (and persisted) an observation memory.
+    /// `memory_id` is the resulting memory; `mode` is the producing sleep
+    /// mode. Significant.
+    SleepTimeObservationEmitted {
+        user_id: String,
+        memory_id: String,
+        mode: String,
+        trigger: String,
+        token_spend: u32,
+        confidence: f32,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// A sleep-time pass was blocked by budget / lock / concurrency, or its
+    /// rewriter response failed validation. `reason` carries a short
+    /// diagnostic. Not significant — routine for ops, not audit.
+    SleepTimeRewriteAborted {
+        user_id: String,
+        block_key: Option<String>,
+        mode: String,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// A per-user or global budget cap was hit. `what` carries the
+    /// specific cap name (e.g. "tokens_per_hour", "calls_per_day",
+    /// "global_tokens_per_day"). Not significant individually — operators
+    /// monitor aggregate frequency via metrics.
+    SleepTimeBudgetExhausted {
+        user_id: String,
+        what: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Types of memory interference (SHO-106)
@@ -898,6 +950,14 @@ impl ConsolidationEventBuffer {
                 ConsolidationEvent::GraphOrphanDetected { .. } => {}
                 ConsolidationEvent::GraphAdjustedPromotion { .. } => {}
                 ConsolidationEvent::GraphDecayConsolidated { .. } => {}
+
+                // Sleep-time events — logged for introspection; aggregate
+                // counters live on dedicated sleep-time metrics, not the
+                // consolidation report.
+                ConsolidationEvent::SleepTimeBlockRewritten { .. } => {}
+                ConsolidationEvent::SleepTimeObservationEmitted { .. } => {}
+                ConsolidationEvent::SleepTimeRewriteAborted { .. } => {}
+                ConsolidationEvent::SleepTimeBudgetExhausted { .. } => {}
             }
         }
 
@@ -1232,6 +1292,14 @@ impl ConsolidationEventBuffer {
                 ConsolidationEvent::GraphOrphanDetected { .. } => {}
                 ConsolidationEvent::GraphAdjustedPromotion { .. } => {}
                 ConsolidationEvent::GraphDecayConsolidated { .. } => {}
+
+                // Sleep-time events — logged for introspection; aggregate
+                // counters live on dedicated sleep-time metrics, not the
+                // consolidation report.
+                ConsolidationEvent::SleepTimeBlockRewritten { .. } => {}
+                ConsolidationEvent::SleepTimeObservationEmitted { .. } => {}
+                ConsolidationEvent::SleepTimeRewriteAborted { .. } => {}
+                ConsolidationEvent::SleepTimeBudgetExhausted { .. } => {}
             }
         }
 
@@ -1275,6 +1343,11 @@ impl ConsolidationEvent {
             ConsolidationEvent::GraphOrphanDetected { timestamp, .. } => *timestamp,
             ConsolidationEvent::GraphAdjustedPromotion { timestamp, .. } => *timestamp,
             ConsolidationEvent::GraphDecayConsolidated { timestamp, .. } => *timestamp,
+            // Sleep-time / Observational Memory events
+            ConsolidationEvent::SleepTimeBlockRewritten { timestamp, .. } => *timestamp,
+            ConsolidationEvent::SleepTimeObservationEmitted { timestamp, .. } => *timestamp,
+            ConsolidationEvent::SleepTimeRewriteAborted { timestamp, .. } => *timestamp,
+            ConsolidationEvent::SleepTimeBudgetExhausted { timestamp, .. } => *timestamp,
         }
     }
 
@@ -1323,6 +1396,13 @@ impl ConsolidationEvent {
                 | ConsolidationEvent::GraphOrphanDetected { .. }
                 | ConsolidationEvent::GraphAdjustedPromotion { .. }
                 | ConsolidationEvent::GraphDecayConsolidated { .. }
+                // Sleep-time block rewrites + emitted observations represent
+                // actual durable state changes — persisted.
+                // Aborts + budget-exhausted are routine ops noise and are
+                // intentionally NOT significant (operators monitor in
+                // aggregate via metrics, not per-event audit).
+                | ConsolidationEvent::SleepTimeBlockRewritten { .. }
+                | ConsolidationEvent::SleepTimeObservationEmitted { .. }
         )
     }
 }

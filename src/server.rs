@@ -178,6 +178,12 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    // Start sleep-time / observational memory orchestrator (V1).
+    // No-op when `SleepTimeConfig::enabled = false` (the default). On enable,
+    // resolves the Anthropic API key from the configured env var, runs the
+    // cold-start queue purge, and spawns the worker pool.
+    start_sleep_time_orchestrator(Arc::clone(&manager));
+
     // Start Zenoh transport if feature-enabled and configured
     #[cfg(feature = "zenoh")]
     let zenoh_handle = {
@@ -520,6 +526,103 @@ fn start_reminder_scheduler(manager: AppState) {
     });
 
     info!("Active reminder scheduler started (interval: 60s)");
+}
+
+/// Start the sleep-time / observational memory orchestrator (V1).
+///
+/// Reads [`SleepTimeConfig`] from env. When `enabled=false` (default) this
+/// is a no-op. When enabled:
+///   1. Resolves the Anthropic API key from the configured env var. Bails
+///      with a warn-level log if missing — server continues without
+///      sleep-time, the `/api/sleep_time/*` surface returns 503.
+///   2. Constructs the [`AnthropicRewriter`] + [`SleepTimeOrchestrator`].
+///   3. Runs the cold-start queue purge (drops items older than the
+///      configured TTL — R31 + R67).
+///   4. Spawns the worker pool.
+///   5. Installs the orchestrator onto the shared `MultiUserMemoryManager`
+///      so handlers can find it.
+fn start_sleep_time_orchestrator(manager: AppState) {
+    use crate::config::SleepTimeProfile;
+    use crate::memory::sleep_time::rewriter::{AnthropicRewriter, Rewriter};
+    use crate::memory::sleep_time::SleepTimeOrchestrator;
+
+    // Env-driven preset selection (V1 minimum surface). Future: deserialize
+    // the full SleepTimeConfig from a config file.
+    let profile = match std::env::var("VELD_SLEEP_TIME_PROFILE")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "disabled" | "off" | "false" => SleepTimeProfile::Disabled,
+        "conservative" => SleepTimeProfile::Conservative,
+        "balanced" => SleepTimeProfile::Balanced,
+        "aggressive" => SleepTimeProfile::Aggressive,
+        other => {
+            warn!(
+                profile = %other,
+                "Unknown VELD_SLEEP_TIME_PROFILE; defaulting to disabled"
+            );
+            SleepTimeProfile::Disabled
+        }
+    };
+
+    let cfg = profile.to_config();
+    if !cfg.enabled {
+        info!("Sleep-time orchestrator: disabled (set VELD_SLEEP_TIME_PROFILE=conservative|balanced|aggressive to enable)");
+        return;
+    }
+
+    let Ok(api_key) = std::env::var(&cfg.anthropic_api_key_env) else {
+        warn!(
+            env_var = %cfg.anthropic_api_key_env,
+            "Sleep-time enabled but {} is not set; orchestrator NOT started", cfg.anthropic_api_key_env,
+        );
+        return;
+    };
+
+    let rewriter = match AnthropicRewriter::new(api_key, cfg.model.clone()) {
+        Ok(r) => Rewriter::Anthropic(r),
+        Err(e) => {
+            error!(error = %e, "Failed to build AnthropicRewriter; sleep-time NOT started");
+            return;
+        }
+    };
+
+    let orch = match SleepTimeOrchestrator::new(
+        cfg,
+        Arc::clone(&manager.shared_db),
+        Arc::downgrade(&manager),
+        Arc::clone(&manager.context_block_store),
+        rewriter,
+    ) {
+        Ok(o) => Arc::new(o),
+        Err(e) => {
+            error!(error = %e, "Failed to construct SleepTimeOrchestrator; sleep-time NOT started");
+            return;
+        }
+    };
+
+    match orch.cold_start_purge() {
+        Ok(purged) if purged > 0 => {
+            info!(purged, "Sleep-time queue cold-start purge complete");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "Sleep-time cold-start purge failed (continuing)");
+        }
+    }
+
+    if let Err(e) = orch.start_workers() {
+        error!(error = %e, "Failed to spawn sleep-time workers; sleep-time NOT started");
+        return;
+    }
+
+    *manager.sleep_time_orchestrator.write() = Some(Arc::clone(&orch));
+    info!(
+        workers = orch.config().num_workers,
+        model = %orch.config().model,
+        "Sleep-time orchestrator started"
+    );
 }
 
 // =============================================================================

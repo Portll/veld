@@ -27,7 +27,15 @@ use super::types::{Param, RelationalBackend, Row};
 #[async_trait]
 pub trait RelationalStore: Send + Sync {
     /// Backend-native error type.
-    type Error: std::error::Error + Send + Sync + 'static;
+    ///
+    /// Bound is intentionally weak: `anyhow::Error` is the documented type
+    /// for the application-facing `Arc<dyn RelationalStore<Error =
+    /// anyhow::Error>>` form, and `anyhow::Error` does not implement
+    /// `std::error::Error` (to keep `?` propagation unambiguous in
+    /// application code that already uses `anyhow::Result`). Concrete
+    /// backends can still use their native error type; consumers that
+    /// need `std::error::Error` should construct their own newtype.
+    type Error: Send + Sync + 'static;
 
     /// Execute a non-result-returning statement. Returns the number of rows
     /// affected (where the backend reports it).

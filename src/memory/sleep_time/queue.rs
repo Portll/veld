@@ -18,10 +18,9 @@
 //! `claim_next_for_user` a cheap prefix scan that returns the oldest first.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, DB};
 use std::sync::Arc;
-use uuid::Uuid;
 
 use super::types::{QueueItem, SleepMode, SleepTimeTrigger, QUEUE_ITEM_SCHEMA_VERSION};
 
@@ -329,6 +328,7 @@ fn decode_item(bytes: &[u8]) -> Result<Option<QueueItem>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn open_test_db() -> (Arc<DB>, TempDir) {
         let tmp = TempDir::new().unwrap();

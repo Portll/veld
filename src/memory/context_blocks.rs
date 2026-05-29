@@ -36,6 +36,35 @@ pub struct ContextBlock {
     pub updated_at: DateTime<Utc>,
     /// Monotonically increasing version, incremented on each write
     pub version: u32,
+    /// User-pinned: when true, sleep-time will refuse to rewrite this block.
+    /// Locks are explicit-only and never auto-expire (R14 + R22). The lock
+    /// state itself is duplicated in the per-user budget ledger so
+    /// sleep-time can check without loading every block; this field is the
+    /// authoritative copy.
+    #[serde(default)]
+    pub locked: bool,
+}
+
+/// Outcome of an optimistic-concurrency write
+/// ([`ContextBlockStore::set_with_version_check`]).
+///
+/// Used by the sleep-time worker to distinguish a successful OCC write from
+/// a stale-version abort. The current live block is returned in the
+/// conflict / locked cases so the caller can emit a
+/// `SleepTimeRewriteAborted` event with rich diagnostics.
+#[derive(Debug)]
+pub enum OccOutcome {
+    /// Write succeeded; the new block (with bumped version) is returned.
+    Applied(ContextBlock),
+    /// Live block version did not match `expected_version`. The current
+    /// live block is returned (its `version` field is the live one).
+    VersionConflict { current: ContextBlock },
+    /// Live block has `locked = true`. The current live block is returned.
+    Locked { current: ContextBlock },
+    /// No such block exists at apply-time. Should not normally occur — the
+    /// evidence pack will only carry blocks that existed at assembly time.
+    /// Returned for completeness so callers can handle deletion races.
+    Missing,
 }
 
 /// Storage for agent context blocks, backed by a shared RocksDB instance.
@@ -86,9 +115,11 @@ impl ContextBlockStore {
     /// Create or update a context block. Returns the resulting block.
     ///
     /// If the block already exists, its content is replaced, version is
-    /// incremented, and `updated_at` is set to now. If `max_tokens` is
-    /// `None` on a new block, the default (2000) is used; on an existing
-    /// block, the previous value is preserved.
+    /// incremented, and `updated_at` is set to now. The `locked` flag is
+    /// preserved across writes (sleep-time guards against this separately;
+    /// foreground agent edits never auto-unlock). If `max_tokens` is `None`
+    /// on a new block, the default (2000) is used; on an existing block, the
+    /// previous value is preserved.
     pub fn set(
         &self,
         user_id: &str,
@@ -99,7 +130,6 @@ impl ContextBlockStore {
         let key = Self::db_key(user_id, block_key);
         let now = Utc::now();
 
-        // Load existing block to preserve version and max_tokens if not specified
         let existing = self.get(user_id, block_key)?;
 
         let block = match existing {
@@ -109,6 +139,7 @@ impl ContextBlockStore {
                 max_tokens: max_tokens.unwrap_or(prev.max_tokens),
                 updated_at: now,
                 version: prev.version.saturating_add(1),
+                locked: prev.locked,
             },
             None => ContextBlock {
                 key: block_key.to_string(),
@@ -116,6 +147,7 @@ impl ContextBlockStore {
                 max_tokens: max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 updated_at: now,
                 version: 1,
+                locked: false,
             },
         };
 
@@ -134,6 +166,95 @@ impl ContextBlockStore {
         );
 
         Ok(block)
+    }
+
+    /// Set with optimistic concurrency control (R1).
+    ///
+    /// Writes only if the live block's `version` equals `expected_version`.
+    /// If the live version has advanced (foreground agent rewrote it since
+    /// the evidence pack was assembled), returns
+    /// [`OccOutcome::VersionConflict`] WITHOUT writing — the caller MUST
+    /// abort and emit a `SleepTimeRewriteAborted` event.
+    ///
+    /// The `locked` flag is honoured: a locked block returns
+    /// [`OccOutcome::Locked`] regardless of version match. This is a
+    /// double-check on top of the orchestrator's pre-flight lock filter; if
+    /// a user locks a block between evidence-assembly and apply-time, the
+    /// rewrite still aborts cleanly.
+    ///
+    /// Successful applies preserve the existing `max_tokens` (sleep-time
+    /// never resizes blocks — sizing is a foreground concern) and the
+    /// existing `locked` flag.
+    pub fn set_with_version_check(
+        &self,
+        user_id: &str,
+        block_key: &str,
+        new_content: &str,
+        expected_version: u32,
+    ) -> Result<OccOutcome> {
+        let key = Self::db_key(user_id, block_key);
+        let now = Utc::now();
+
+        let Some(prev) = self.get(user_id, block_key)? else {
+            return Ok(OccOutcome::Missing);
+        };
+        if prev.locked {
+            return Ok(OccOutcome::Locked { current: prev });
+        }
+        if prev.version != expected_version {
+            return Ok(OccOutcome::VersionConflict { current: prev });
+        }
+
+        let block = ContextBlock {
+            key: block_key.to_string(),
+            content: new_content.to_string(),
+            max_tokens: prev.max_tokens,
+            updated_at: now,
+            version: prev.version.saturating_add(1),
+            locked: prev.locked,
+        };
+
+        let value = bincode::serde::encode_to_vec(&block, bincode::config::standard())
+            .context("Failed to serialize context block (OCC)")?;
+        self.db
+            .put_cf(self.cf(), key.as_bytes(), &value)
+            .context("Failed to write context block to RocksDB (OCC)")?;
+
+        tracing::debug!(
+            user_id = user_id,
+            block_key = block_key,
+            old_version = expected_version,
+            new_version = block.version,
+            content_len = block.content.len(),
+            "Context block updated via OCC"
+        );
+
+        Ok(OccOutcome::Applied(block))
+    }
+
+    /// Toggle the `locked` flag without touching content or version. Locks
+    /// are explicit-only (R14 + R22): nothing else flips this.
+    pub fn set_locked(&self, user_id: &str, block_key: &str, locked: bool) -> Result<()> {
+        let Some(mut prev) = self.get(user_id, block_key)? else {
+            anyhow::bail!("context block {block_key} for user {user_id} does not exist");
+        };
+        if prev.locked == locked {
+            return Ok(());
+        }
+        prev.locked = locked;
+        let key = Self::db_key(user_id, block_key);
+        let value = bincode::serde::encode_to_vec(&prev, bincode::config::standard())
+            .context("Failed to serialize context block lock toggle")?;
+        self.db
+            .put_cf(self.cf(), key.as_bytes(), &value)
+            .context("Failed to write context block lock toggle")?;
+        tracing::info!(
+            user_id = user_id,
+            block_key = block_key,
+            locked,
+            "Context block lock toggled"
+        );
+        Ok(())
     }
 
     /// List all context blocks for a user.
@@ -281,5 +402,131 @@ mod tests {
         let store = ContextBlockStore::new(db);
 
         assert!(store.get("user1", "missing").unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // R14 + R22: lock state
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn new_block_starts_unlocked() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        let block = store.set("u", "persona", "x", None).unwrap();
+        assert!(!block.locked);
+    }
+
+    #[test]
+    fn set_locked_persists_across_get() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        store.set("u", "persona", "x", None).unwrap();
+        store.set_locked("u", "persona", true).unwrap();
+        let got = store.get("u", "persona").unwrap().unwrap();
+        assert!(got.locked);
+    }
+
+    #[test]
+    fn set_preserves_lock_across_content_update() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        store.set("u", "persona", "v1", None).unwrap();
+        store.set_locked("u", "persona", true).unwrap();
+        let updated = store.set("u", "persona", "v2", None).unwrap();
+        assert!(
+            updated.locked,
+            "regular set() must not auto-unlock — only explicit set_locked(false) does (R22)"
+        );
+    }
+
+    #[test]
+    fn set_locked_idempotent() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        store.set("u", "persona", "x", None).unwrap();
+        store.set_locked("u", "persona", true).unwrap();
+        store.set_locked("u", "persona", true).unwrap();
+        // No panic, no version churn (set_locked does not bump version).
+        let got = store.get("u", "persona").unwrap().unwrap();
+        assert_eq!(got.version, 1);
+        assert!(got.locked);
+    }
+
+    #[test]
+    fn set_locked_on_missing_block_errors() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        assert!(store.set_locked("u", "ghost", true).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // R1: optimistic concurrency control
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn occ_applied_on_matching_version() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        let v1 = store.set("u", "persona", "v1", None).unwrap();
+        let out = store
+            .set_with_version_check("u", "persona", "v2", v1.version)
+            .unwrap();
+        match out {
+            OccOutcome::Applied(b) => {
+                assert_eq!(b.version, v1.version + 1);
+                assert_eq!(b.content, "v2");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn occ_version_conflict_does_not_write() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        let v1 = store.set("u", "persona", "v1", None).unwrap();
+        // Foreground writer bumps version to 2.
+        store.set("u", "persona", "v1.5", None).unwrap();
+        // Sleep-time tries to apply with stale expected_version = 1.
+        let out = store
+            .set_with_version_check("u", "persona", "v2", v1.version)
+            .unwrap();
+        match out {
+            OccOutcome::VersionConflict { current } => assert_eq!(current.version, 2),
+            other => panic!("expected VersionConflict, got {other:?}"),
+        }
+        let live = store.get("u", "persona").unwrap().unwrap();
+        assert_eq!(
+            live.content, "v1.5",
+            "OCC abort must not have overwritten the foreground edit"
+        );
+    }
+
+    #[test]
+    fn occ_locked_block_aborts() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        let v1 = store.set("u", "persona", "v1", None).unwrap();
+        store.set_locked("u", "persona", true).unwrap();
+        let out = store
+            .set_with_version_check("u", "persona", "v2", v1.version)
+            .unwrap();
+        match out {
+            OccOutcome::Locked { current } => {
+                assert!(current.locked);
+                assert_eq!(current.content, "v1");
+            }
+            other => panic!("expected Locked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn occ_missing_block_returns_missing() {
+        let (db, _tmp) = open_test_db();
+        let store = ContextBlockStore::new(db);
+        let out = store
+            .set_with_version_check("u", "ghost", "anything", 1)
+            .unwrap();
+        assert!(matches!(out, OccOutcome::Missing));
     }
 }
