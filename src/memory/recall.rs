@@ -2737,7 +2737,12 @@ impl super::MemorySystem {
                 // broader candidate pool from multi-query vector search.
                 let ce_cap = if decomposed { 30 } else { 20 };
                 let rerank_budget = memories.len().min(query.max_results * 2).min(ce_cap);
-                let candidates: Vec<(MemoryId, String, f32)> = memories
+                // Pass each candidate's stored embedding so the reranker's
+                // bi-encoder pass can reuse it instead of re-embedding via the
+                // HTTP embedder (5–6s/call for CPU Nomic). The reranker
+                // dim-checks against the query embedding and falls back to
+                // `embedder.encode(content)` on mismatch.
+                let candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)> = memories
                     .iter()
                     .take(rerank_budget)
                     .map(|m| {
@@ -2745,6 +2750,7 @@ impl super::MemorySystem {
                             m.id.clone(),
                             m.experience.content.clone(),
                             m.score.unwrap_or(0.0),
+                            m.experience.embeddings.clone(),
                         )
                     })
                     .collect();
