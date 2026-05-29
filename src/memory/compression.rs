@@ -1592,6 +1592,8 @@ mod tests {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         };
         let memory = create_test_memory("reinforcing memory", 0.7);
 
@@ -1621,6 +1623,8 @@ mod tests {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         };
         assert!(!consolidator.should_decay_fact(&recent_fact));
 
@@ -1638,6 +1642,8 @@ mod tests {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         };
         assert!(consolidator.should_decay_fact(&old_fact));
     }
