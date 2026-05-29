@@ -115,6 +115,7 @@ mimalloc = "0.1"
 
 # Core
 anyhow = "1.0"
+async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 query planner, W7 DatasetStore)
 thiserror = "2.0"
 async-trait = "0.1"  # `dyn` trait support for async methods on `RelationalStore` (W4/W7 shim)
 dotenvy = "0.15"  # Load .env files
@@ -151,11 +152,18 @@ rmp-serde = "1.3"  # MessagePack - binary format that supports serde tagged enum
 lz4 = "1.28"
 redb = { version = "2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite slow store for gap topology queries (WAL mode)
+# W4 foundation — backend-agnostic relational executor (SQLite today, Postgres/Supabase next).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 
 # Concurrency
 parking_lot = "0.12"
 dashmap = "6.1"
 moka = { version = "0.12", features = ["sync"] }  # Lock-free concurrent cache with LRU eviction
+once_cell = "1.20"  # Per-process caches (e.g. AgentSession detection)
+
+# Process / system introspection — minimal feature set (no networking / disks / components).
+# Used by memory::session_detect to map the parent process to a chat-brand id.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # Utilities
 uuid = { version = "1.19", features = ["v4", "serde"] }

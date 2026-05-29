@@ -736,6 +736,12 @@ pub struct SemanticConsolidator {
     /// Minimum age in days before consolidation
     min_age_days: i64,
     stemmer: Stemmer,
+    /// Optional LLM hook for augmenting pattern-based facts with
+    /// LLM-extracted ones. When `None`, consolidation stays fully offline
+    /// (Veld's default). When set via [`SemanticConsolidator::with_llm`],
+    /// callers can opt into [`SemanticConsolidator::augment_with_llm`] for
+    /// the long-tail patterns the regex catalog misses.
+    llm: Option<std::sync::Arc<dyn crate::memory::llm::LlmConsolidator>>,
 }
 
 /// A cluster of semantically similar pattern candidates
@@ -773,6 +779,7 @@ impl SemanticConsolidator {
             min_support: CONSOLIDATION_MIN_SUPPORT,
             min_age_days: CONSOLIDATION_MIN_AGE_DAYS,
             stemmer: Stemmer::create(Algorithm::English),
+            llm: None,
         }
     }
 
@@ -783,7 +790,112 @@ impl SemanticConsolidator {
             min_support,
             min_age_days,
             stemmer: Stemmer::create(Algorithm::English),
+            llm: None,
         }
+    }
+
+    /// Attach an LLM hook. Caller must explicitly invoke
+    /// [`SemanticConsolidator::augment_with_llm`] after [`consolidate`]
+    /// to opt into LLM augmentation — `consolidate` itself stays offline.
+    #[must_use]
+    pub fn with_llm(
+        mut self,
+        llm: std::sync::Arc<dyn crate::memory::llm::LlmConsolidator>,
+    ) -> Self {
+        self.llm = Some(llm);
+        self
+    }
+
+    /// True when an LLM hook is attached.
+    pub fn has_llm(&self) -> bool {
+        self.llm.is_some()
+    }
+
+    /// Augment a pattern-based consolidation result with facts extracted by
+    /// the attached LLM hook. No-op when no LLM is attached or when the
+    /// memory list is empty.
+    ///
+    /// Strategy: send the raw content of the last N memories to the LLM
+    /// and append every distinct claim it returns as a new `SemanticFact`.
+    /// Distinctness is checked by case-insensitive fact-text equality
+    /// against the already-extracted patterns — caller-side dedup via
+    /// `SemanticFactStore::find_similar` is still recommended on store.
+    pub fn augment_with_llm(
+        &self,
+        memories: &[Memory],
+        result: &mut ConsolidationResult,
+    ) -> anyhow::Result<usize> {
+        let Some(llm) = self.llm.as_ref() else {
+            return Ok(0);
+        };
+        if memories.is_empty() {
+            return Ok(0);
+        }
+
+        let snippets: Vec<String> = memories
+            .iter()
+            .map(|m| m.experience.content.clone())
+            .collect();
+        let llm_facts = llm.extract_facts(&snippets)?;
+        let llm_version = llm.llm_version();
+
+        let existing: std::collections::HashSet<String> = result
+            .new_facts
+            .iter()
+            .map(|f| f.fact.to_lowercase())
+            .collect();
+
+        let now = chrono::Utc::now();
+        let mut added = 0usize;
+        for llm_fact in llm_facts {
+            if llm_fact.fact.trim().is_empty()
+                || existing.contains(&llm_fact.fact.to_lowercase())
+            {
+                continue;
+            }
+            let fact_type = self.classify_fact(&llm_fact.fact);
+            // Provenance tag: persisted in `related_entities` with a
+            // `_llm_provenance:` prefix so it survives the round-trip to
+            // RocksDB without needing a SemanticFact schema bump. Reader
+            // tooling can grep for the prefix to recover provenance.
+            // Prefer the per-fact version when populated (in case the
+            // impl tagged individual facts differently), falling back to
+            // the consolidator-wide version.
+            let version_tag = if llm_fact.llm_version.is_empty() {
+                llm_version.clone()
+            } else {
+                llm_fact.llm_version.clone()
+            };
+            let mut related = llm_fact.entities;
+            related.push(format!("_llm_provenance:{version_tag}"));
+            let new_fact = SemanticFact {
+                id: uuid::Uuid::new_v4().to_string(),
+                fact: llm_fact.fact,
+                confidence: llm_fact.confidence.clamp(0.0, 1.0),
+                support_count: 1,
+                source_memories: memories.iter().map(|m| m.id.clone()).collect(),
+                related_entities: related,
+                created_at: now,
+                last_reinforced: now,
+                fact_type,
+                valid_from: Some(now),
+                valid_until: None,
+                superseded_by: None,
+                supersedes: Vec::new(),
+            };
+            result.new_fact_ids.push(new_fact.id.clone());
+            result.new_facts.push(new_fact);
+            result.facts_extracted += 1;
+            added += 1;
+        }
+
+        tracing::info!(
+            llm_name = llm.name(),
+            llm_version = %llm_version,
+            llm_facts_added = added,
+            "augment_with_llm appended LLM-extracted facts"
+        );
+        Ok(added)
     }
 
     /// Extract semantic facts from a set of memories

@@ -5,6 +5,9 @@
 //! - `user:<uuid>`              → bincode-encoded [`UserRecord`]
 //! - `username:<lowercase>`     → uuid bytes (16) — case-insensitive lookup
 //! - `session:<token-hash-hex>` → bincode-encoded [`SessionRecord`]
+//! - `throttle:<lowercase>`     → bincode-encoded [`LoginThrottleRecord`] —
+//!   persistent per-username failed-login state. See the throttle section
+//!   below for the schema and the lockout policy.
 //!
 //! The username index is kept in lock-step with the user record by writing
 //! both keys in a single `WriteBatch`. Sessions are stored under the
@@ -13,13 +16,23 @@
 //!
 //! All bincode encoding uses `bincode::serde` with `bincode::config::standard()`
 //! to match the rest of the codebase.
+//!
+//! ## Why one CF instead of `cf_login_throttle`
+//!
+//! The throttle data is tiny (one row per active attacker), shares lifecycle
+//! and backup semantics with the user records it gates, and never needs a
+//! distinct compression/tuning profile. Putting it under a `throttle:` key
+//! prefix in the existing CF keeps the CF count flat, makes restore atomic
+//! across both halves of the auth state, and avoids touching the shared-DB
+//! bootstrap path in `MultiUserMemoryManager`.
 
 use crate::user_auth::session::{SessionRecord, SessionToken};
-use crate::user_auth::{session, AuthError, UserRecord};
+use crate::user_auth::{session, AuthError, UserRecord, UserRole};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -38,6 +51,40 @@ pub fn cf_descriptor() -> ColumnFamilyDescriptor {
 const USER_PREFIX: &[u8] = b"user:";
 const USERNAME_PREFIX: &[u8] = b"username:";
 const SESSION_PREFIX: &[u8] = b"session:";
+const THROTTLE_PREFIX: &[u8] = b"throttle:";
+
+/// Window over which failed login attempts accumulate before a lockout.
+pub const THROTTLE_WINDOW_MINUTES: i64 = 15;
+/// Number of failed attempts within [`THROTTLE_WINDOW_MINUTES`] that triggers
+/// a lockout.
+pub const THROTTLE_FAILURE_THRESHOLD: u32 = 5;
+/// Duration of a triggered lockout.
+pub const THROTTLE_LOCKOUT_MINUTES: i64 = 15;
+
+/// Per-username failed-login state, persisted under `throttle:<lowercase>` so
+/// a process restart cannot reset an active lockout.
+///
+/// This is the *persistent* throttle layer; the in-memory
+/// [`crate::user_auth::runtime::LoginLimiter`] sits in front of it as a
+/// cheap rate-limit check that never reaches RocksDB.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginThrottleRecord {
+    /// Count of consecutive failed login attempts since the last success or
+    /// since the failure window rolled over.
+    pub failed_attempts: u32,
+    /// If set and in the future, login is rejected as `TooManyAttempts`.
+    pub locked_until: Option<DateTime<Utc>>,
+    /// Wall-clock time of the most recent attempt counted into
+    /// `failed_attempts`. Used to drop the counter when the window expires.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+}
+
+impl LoginThrottleRecord {
+    /// True iff a current lockout is in effect at `now`.
+    pub fn is_locked(&self, now: DateTime<Utc>) -> bool {
+        matches!(self.locked_until, Some(t) if t > now)
+    }
+}
 
 fn user_key(id: &Uuid) -> Vec<u8> {
     let mut k = Vec::with_capacity(USER_PREFIX.len() + 36);
@@ -58,6 +105,14 @@ fn session_key(token_hash: &[u8; 32]) -> Vec<u8> {
     let mut k = Vec::with_capacity(SESSION_PREFIX.len() + 64);
     k.extend_from_slice(SESSION_PREFIX);
     k.extend_from_slice(hex::encode(token_hash).as_bytes());
+    k
+}
+
+fn throttle_key(username: &str) -> Vec<u8> {
+    let lowered = username.to_lowercase();
+    let mut k = Vec::with_capacity(THROTTLE_PREFIX.len() + lowered.len());
+    k.extend_from_slice(THROTTLE_PREFIX);
+    k.extend_from_slice(lowered.as_bytes());
     k
 }
 
@@ -179,6 +234,113 @@ impl UserAuthStore {
         Ok(false)
     }
 
+    /// Count users whose role is `Admin`. Used by `demote` to prevent the
+    /// last remaining administrator from being downgraded out of existence.
+    pub fn count_admins(&self) -> Result<usize, AuthError> {
+        let cf = self.cf()?;
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(USER_PREFIX, rocksdb::Direction::Forward),
+        );
+        let mut admins = 0usize;
+        for item in iter {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(USER_PREFIX) {
+                break;
+            }
+            let (record, _): (UserRecord, _) =
+                bincode::serde::decode_from_slice(&v, bincode::config::standard())
+                    .map_err(|e| AuthError::internal(format!("decode UserRecord in admin sweep: {e}")))?;
+            if record.role == UserRole::Admin {
+                admins += 1;
+            }
+        }
+        Ok(admins)
+    }
+
+    // ── Login throttle ──────────────────────────────────────────────────
+
+    /// Read the persistent login throttle row for `username`. Returns the
+    /// default (all-zero, never-locked) record when no row exists yet.
+    pub fn get_login_throttle(
+        &self,
+        username: &str,
+    ) -> Result<LoginThrottleRecord, AuthError> {
+        let cf = self.cf()?;
+        let raw = match self
+            .db
+            .get_cf(cf, throttle_key(username))
+            .map_err(rocks_err)?
+        {
+            Some(b) => b,
+            None => return Ok(LoginThrottleRecord::default()),
+        };
+        let (record, _): (LoginThrottleRecord, _) =
+            bincode::serde::decode_from_slice(&raw, bincode::config::standard())
+                .map_err(|e| AuthError::internal(format!("decode LoginThrottleRecord: {e}")))?;
+        Ok(record)
+    }
+
+    /// Persist the throttle row for `username`. The row is keyed by the
+    /// lowercased username so it stays in lock-step with the username index.
+    pub fn put_login_throttle(
+        &self,
+        username: &str,
+        record: &LoginThrottleRecord,
+    ) -> Result<(), AuthError> {
+        let cf = self.cf()?;
+        let encoded = bincode::serde::encode_to_vec(record, bincode::config::standard())
+            .map_err(|e| AuthError::internal(format!("encode LoginThrottleRecord: {e}")))?;
+        self.db
+            .put_cf(cf, throttle_key(username), &encoded)
+            .map_err(rocks_err)?;
+        Ok(())
+    }
+
+    /// Delete the throttle row for `username` — called on successful login
+    /// so the user starts fresh next time.
+    pub fn clear_login_throttle(&self, username: &str) -> Result<(), AuthError> {
+        let cf = self.cf()?;
+        self.db
+            .delete_cf(cf, throttle_key(username))
+            .map_err(rocks_err)?;
+        Ok(())
+    }
+
+    /// Register one failed login attempt for `username` at `now`, applying
+    /// the lockout policy in [`LoginThrottleRecord`].
+    ///
+    /// Counter behaviour:
+    ///   - If the last attempt is older than [`THROTTLE_WINDOW_MINUTES`],
+    ///     the counter resets to 1 (we're past the window).
+    ///   - Otherwise it increments by 1.
+    ///   - When it reaches [`THROTTLE_FAILURE_THRESHOLD`], `locked_until`
+    ///     becomes `now + THROTTLE_LOCKOUT_MINUTES`.
+    ///
+    /// Returns the updated record so callers can decide what to surface.
+    pub fn record_login_failure(
+        &self,
+        username: &str,
+        now: DateTime<Utc>,
+    ) -> Result<LoginThrottleRecord, AuthError> {
+        let mut row = self.get_login_throttle(username)?;
+        let window = chrono::Duration::minutes(THROTTLE_WINDOW_MINUTES);
+        let within_window = row
+            .last_attempt_at
+            .map(|t| now.signed_duration_since(t) < window)
+            .unwrap_or(false);
+        if !within_window {
+            row.failed_attempts = 0;
+        }
+        row.failed_attempts = row.failed_attempts.saturating_add(1);
+        row.last_attempt_at = Some(now);
+        if row.failed_attempts >= THROTTLE_FAILURE_THRESHOLD {
+            row.locked_until = Some(now + chrono::Duration::minutes(THROTTLE_LOCKOUT_MINUTES));
+        }
+        self.put_login_throttle(username, &row)?;
+        Ok(row)
+    }
+
     // ── Sessions ────────────────────────────────────────────────────────
 
     pub fn put_session(&self, record: &SessionRecord) -> Result<(), AuthError> {
@@ -216,6 +378,40 @@ impl UserAuthStore {
             .delete_cf(cf, session_key(token_hash))
             .map_err(rocks_err)?;
         Ok(())
+    }
+
+    /// Drop every session belonging to `user_id` EXCEPT the one whose hash
+    /// equals `keep`. Used by the "log out all other devices" flow so the
+    /// caller's own bearer token survives. Returns the count removed.
+    pub fn delete_other_sessions_for_user(
+        &self,
+        user_id: &Uuid,
+        keep: &[u8; 32],
+    ) -> Result<usize, AuthError> {
+        let cf = self.cf()?;
+        let mut removed = 0usize;
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(SESSION_PREFIX, rocksdb::Direction::Forward),
+        );
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (k, v) = item.map_err(rocks_err)?;
+            if !k.starts_with(SESSION_PREFIX) {
+                break;
+            }
+            let (record, _): (SessionRecord, _) =
+                bincode::serde::decode_from_slice(&v, bincode::config::standard())
+                    .map_err(|e| AuthError::internal(format!("decode session in sweep: {e}")))?;
+            if record.user_id == *user_id && record.token_hash != *keep {
+                batch.delete_cf(cf, &k);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.db.write(batch).map_err(rocks_err)?;
+        }
+        Ok(removed)
     }
 
     /// Drop every session belonging to `user_id`. Returns the count removed.
@@ -380,5 +576,135 @@ mod tests {
             .get_session_by_hash(&a2.token_hash)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn delete_other_sessions_keeps_caller_token() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+
+        let alice = fixture_user("alice", UserRole::User);
+        let bob = fixture_user("bob", UserRole::User);
+        store.create_user(&alice).unwrap();
+        store.create_user(&bob).unwrap();
+
+        let now = Utc::now();
+        let (_, a_keep) = session::issue(alice.id, now);
+        let (_, a_drop) = session::issue(alice.id, now);
+        let (_, b_keep) = session::issue(bob.id, now);
+        store.put_session(&a_keep).unwrap();
+        store.put_session(&a_drop).unwrap();
+        store.put_session(&b_keep).unwrap();
+
+        let n = store
+            .delete_other_sessions_for_user(&alice.id, &a_keep.token_hash)
+            .unwrap();
+        assert_eq!(n, 1, "only the second alice session should be deleted");
+        assert!(store
+            .get_session_by_hash(&a_keep.token_hash)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_session_by_hash(&a_drop.token_hash)
+            .unwrap()
+            .is_none());
+        // Bob is untouched.
+        assert!(store
+            .get_session_by_hash(&b_keep.token_hash)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn count_admins_walks_user_records() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        assert_eq!(store.count_admins().unwrap(), 0);
+
+        store
+            .create_user(&fixture_user("root", UserRole::Admin))
+            .unwrap();
+        store
+            .create_user(&fixture_user("rooty", UserRole::Admin))
+            .unwrap();
+        store
+            .create_user(&fixture_user("peon", UserRole::User))
+            .unwrap();
+
+        assert_eq!(store.count_admins().unwrap(), 2);
+    }
+
+    #[test]
+    fn login_throttle_default_is_unlocked() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let row = store.get_login_throttle("ghost").unwrap();
+        assert_eq!(row.failed_attempts, 0);
+        assert!(row.locked_until.is_none());
+        assert!(row.last_attempt_at.is_none());
+        assert!(!row.is_locked(Utc::now()));
+    }
+
+    #[test]
+    fn record_login_failure_locks_after_threshold() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let now = Utc::now();
+        for _ in 0..(THROTTLE_FAILURE_THRESHOLD - 1) {
+            let row = store.record_login_failure("alice", now).unwrap();
+            assert!(row.locked_until.is_none(), "locked too early");
+        }
+        let final_row = store.record_login_failure("alice", now).unwrap();
+        assert_eq!(final_row.failed_attempts, THROTTLE_FAILURE_THRESHOLD);
+        let lock_until = final_row.locked_until.expect("must be locked");
+        assert!(lock_until > now);
+        assert!(final_row.is_locked(now));
+    }
+
+    #[test]
+    fn record_login_failure_resets_after_window() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let t0 = Utc::now();
+        store.record_login_failure("alice", t0).unwrap();
+        store.record_login_failure("alice", t0).unwrap();
+        let row = store.get_login_throttle("alice").unwrap();
+        assert_eq!(row.failed_attempts, 2);
+
+        // Past the window — counter starts fresh.
+        let t1 = t0 + chrono::Duration::minutes(THROTTLE_WINDOW_MINUTES + 1);
+        let after = store.record_login_failure("alice", t1).unwrap();
+        assert_eq!(after.failed_attempts, 1);
+        assert!(after.locked_until.is_none());
+    }
+
+    #[test]
+    fn clear_login_throttle_drops_row() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path());
+        let now = Utc::now();
+        store.record_login_failure("alice", now).unwrap();
+        assert_eq!(store.get_login_throttle("alice").unwrap().failed_attempts, 1);
+        store.clear_login_throttle("alice").unwrap();
+        let row = store.get_login_throttle("alice").unwrap();
+        assert_eq!(row, LoginThrottleRecord::default());
+    }
+
+    #[test]
+    fn login_throttle_persists_across_reopen() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        {
+            let store = open_store(dir.path());
+            for _ in 0..THROTTLE_FAILURE_THRESHOLD {
+                store.record_login_failure("alice", now).unwrap();
+            }
+            let row = store.get_login_throttle("alice").unwrap();
+            assert!(row.is_locked(now));
+        }
+        // Drop + reopen — simulates a process restart. Lock survives.
+        let store = open_store(dir.path());
+        let row = store.get_login_throttle("alice").unwrap();
+        assert!(row.is_locked(now), "lockout must survive restart");
     }
 }
