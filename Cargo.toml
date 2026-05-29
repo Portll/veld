@@ -113,6 +113,7 @@ mimalloc = "0.1"
 anyhow = "1.0"
 async-trait = "0.1"  # Object-safe async trait sugar (W7 DatasetStore)
 thiserror = "2.0"
+async-trait = "0.1"  # Async-fn-in-trait sugar (dyn-compatible) — W6 query planner trait surfaces
 dotenvy = "0.15"  # Load .env files
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
 
