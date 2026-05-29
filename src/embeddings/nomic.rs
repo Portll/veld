@@ -27,17 +27,105 @@
 //! - VELD_NOMIC_EMBED_TIMEOUT_MS: Embedding timeout in ms (default: 5000)
 //! - VELD_NOMIC_DIM: Matryoshka output dimension — 64|128|256|512|768 (default: 768)
 //! - VELD_LAZY_LOAD: Set to "false" to load model at startup (default: true)
-//! - VELD_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, 2 elsewhere)
+//! - VELD_ONNX_THREADS: Number of ONNX threads (default: 1 on macOS ARM64, min(cores,8) elsewhere)
+//! - VELD_NOMIC_POOL_SIZE: Number of ONNX sessions in the pool, each independently
+//!   lockable. Trades memory (~150-200 MB per session) for concurrent throughput.
+//!   Default: 2 on macOS ARM64, min(cores/2, 4) elsewhere. Set to 1 for low-memory
+//!   deployments.
 
 use anyhow::{Context, Result};
 use ort::session::Session;
 use ort::value::Value;
 use parking_lot::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 
 use super::Embedder;
+
+/// Thread-pool / spinning knobs handed to the ORT session builder.
+#[derive(Clone, Copy)]
+struct ThreadsConfig {
+    intra: usize,
+    inter: usize,
+    intra_spin: bool,
+    inter_spin: bool,
+}
+
+/// Per-platform safe defaults for ORT threading.
+///
+/// macOS aarch64 (M-series) hits an Eigen spin-to-block deadlock on heterogeneous
+/// P/E cores (microsoft/onnxruntime#10270), so we keep a single non-spinning
+/// thread there. Every other platform gets a wide thread pool and enables
+/// spinning — leaving these off costs 3-5x on x86 CPUs that are not vulnerable
+/// to the macOS bug.
+fn default_threads_config() -> ThreadsConfig {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        ThreadsConfig {
+            intra: 1,
+            inter: 1,
+            intra_spin: false,
+            inter_spin: false,
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8);
+        ThreadsConfig {
+            intra: cores,
+            inter: 1,
+            intra_spin: true,
+            inter_spin: true,
+        }
+    }
+}
+
+/// Default number of independently-lockable sessions in the pool.
+///
+/// Each session is ~150-200 MB resident; the pool multiplies throughput by N
+/// at the cost of N× model memory. A modest pool (~cores/2 capped at 4) gives
+/// good concurrency without ballooning RSS.
+fn default_pool_size() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        2
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(2))
+            .unwrap_or(2)
+            .min(4)
+    }
+}
+
+/// Round a sequence length up to the next multiple of 32, capped at `max_length`.
+/// Better SIMD/matmul tile alignment than feeding raw token counts to the model.
+fn align_seq_len(n: usize, max_length: usize) -> usize {
+    let aligned = (n + 31) & !31;
+    aligned.clamp(32, max_length)
+}
+
+/// Build a single ORT session with the supplied threading config.
+fn build_session(model_path: &Path, threads: ThreadsConfig) -> Result<Session> {
+    Session::builder()
+        .context("Failed to create session builder")?
+        .with_intra_threads(threads.intra)
+        .context("Failed to set intra thread count")?
+        .with_inter_threads(threads.inter)
+        .context("Failed to set inter thread count")?
+        .with_intra_op_spinning(threads.intra_spin)
+        .context("Failed to set intra-op spinning")?
+        .with_inter_op_spinning(threads.inter_spin)
+        .context("Failed to set inter-op spinning")?
+        .commit_from_file(model_path)
+        .context("Failed to load Nomic ONNX model")
+}
 
 /// Nomic task prefixes for asymmetric embedding
 const SEARCH_DOCUMENT_PREFIX: &str = "search_document: ";
@@ -85,61 +173,74 @@ fn resolve_output_dim() -> usize {
     }
 }
 
-/// Lazily initialized ONNX session and tokenizer for Nomic
+/// Pool of independently-lockable ONNX sessions sharing one tokenizer.
+///
+/// The `ort` v2 API requires `&mut Session` for `Session::run`, so concurrent
+/// inference on one session is impossible. The pool sidesteps that by holding
+/// N sessions, each guarded by its own mutex, and round-robins requests across
+/// them. Real-world throughput scales close to linearly with pool size until
+/// CPU saturates.
 struct LazyNomicModel {
-    session: Mutex<Session>,
+    /// One `Mutex<Session>` per pool slot. Pool size is fixed at construction.
+    sessions: Vec<Mutex<Session>>,
+    /// Wrapping counter used to pick the next pool slot for a request.
+    next: AtomicUsize,
     tokenizer: Tokenizer,
 }
 
 impl LazyNomicModel {
     fn new(config: &NomicConfig) -> Result<Self> {
-        // macOS ARM64 (M1/M2/M3): default to 1 thread to avoid Eigen thread pool
-        // spin-to-block deadlock on heterogeneous P/E cores.
-        // See: https://github.com/microsoft/onnxruntime/issues/10270
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let default_threads = 1;
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let default_threads = 2;
+        let threads_env = std::env::var("VELD_ONNX_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let mut threads = default_threads_config();
+        if let Some(n) = threads_env {
+            threads.intra = n;
+        }
 
-        let num_threads = std::env::var("VELD_ONNX_THREADS")
+        let pool_size = std::env::var("VELD_NOMIC_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default_threads);
+            .filter(|n: &usize| *n >= 1)
+            .unwrap_or_else(default_pool_size);
 
         tracing::info!(
-            "Loading Nomic-embed-text-v1.5 model from {:?} with {} threads",
+            "Loading Nomic-embed-text-v1.5 from {:?} (pool={}, intra={}, inter={}, spin_intra={}, spin_inter={})",
             config.model_path,
-            num_threads
+            pool_size,
+            threads.intra,
+            threads.inter,
+            threads.intra_spin,
+            threads.inter_spin
         );
-
-        let builder = Session::builder()
-            .context("Failed to create session builder")?
-            .with_intra_threads(num_threads)
-            .context("Failed to set intra thread count")?
-            .with_inter_threads(1)
-            .context("Failed to set inter thread count")?;
-
-        // Disable thread pool spinning to prevent Eigen spin-to-block deadlock
-        // on macOS ARM64 heterogeneous cores (P-core/E-core architecture).
-        let builder = builder
-            .with_intra_op_spinning(false)
-            .context("Failed to disable intra-op spinning")?
-            .with_inter_op_spinning(false)
-            .context("Failed to disable inter-op spinning")?;
-
-        let session = builder
-            .commit_from_file(&config.model_path)
-            .context("Failed to load Nomic ONNX model")?;
 
         let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load Nomic tokenizer: {e}"))?;
 
-        tracing::info!("Nomic-embed-text-v1.5 model loaded successfully");
+        let mut sessions = Vec::with_capacity(pool_size);
+        for slot in 0..pool_size {
+            let session = build_session(&config.model_path, threads)
+                .with_context(|| format!("Failed to build Nomic session #{slot}"))?;
+            sessions.push(Mutex::new(session));
+        }
+
+        tracing::info!(
+            "Nomic-embed-text-v1.5 model loaded successfully ({} sessions)",
+            pool_size
+        );
 
         Ok(Self {
-            session: Mutex::new(session),
+            sessions,
+            next: AtomicUsize::new(0),
             tokenizer,
         })
+    }
+
+    /// Pick the next pool slot. Round-robin via a wrapping counter — cheaper than
+    /// scanning for the least-contended slot and good enough for uniform loads.
+    fn acquire(&self) -> &Mutex<Session> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
+        &self.sessions[i]
     }
 }
 
@@ -552,23 +653,43 @@ impl NomicEmbedder {
             return result;
         }
 
-        let start = std::time::Instant::now();
+        let total_start = std::time::Instant::now();
 
         match self.generate_embedding_onnx(text) {
-            Ok(embedding) => {
-                let duration = start.elapsed().as_secs_f64();
+            Ok((embedding, queue_ms, run_ms)) => {
+                let total_duration = total_start.elapsed().as_secs_f64();
+                // Total stays for back-compat dashboards; the new labels expose the
+                // split that actually matters: are we waiting in line or doing work?
                 crate::metrics::EMBEDDING_GENERATE_DURATION
                     .with_label_values(&["nomic_onnx"])
-                    .observe(duration);
+                    .observe(total_duration);
+                crate::metrics::EMBEDDING_GENERATE_DURATION
+                    .with_label_values(&["nomic_onnx_queue"])
+                    .observe(queue_ms / 1000.0);
+                crate::metrics::EMBEDDING_GENERATE_DURATION
+                    .with_label_values(&["nomic_onnx_run"])
+                    .observe(run_ms / 1000.0);
                 crate::metrics::EMBEDDING_GENERATE_TOTAL
                     .with_label_values(&["nomic_onnx", "success"])
                     .inc();
 
-                if duration * 1000.0 > self.config.embed_timeout_ms as f64 {
+                // Two separate warning paths so the operator can tell whether
+                // throughput is bound by queue depth (add pool slots) or by
+                // per-call cost (model size, sequence length, threading).
+                let threshold = self.config.embed_timeout_ms as f64;
+                if run_ms > threshold {
                     tracing::warn!(
-                        "Nomic ONNX inference took {:.0}ms (threshold: {}ms)",
-                        duration * 1000.0,
-                        self.config.embed_timeout_ms
+                        "Nomic ONNX inference run took {:.0}ms (threshold: {:.0}ms)",
+                        run_ms,
+                        threshold
+                    );
+                }
+                if queue_ms > threshold {
+                    tracing::warn!(
+                        "Nomic ONNX inference queued for {:.0}ms before running \
+                         (threshold: {:.0}ms) — consider raising VELD_NOMIC_POOL_SIZE",
+                        queue_ms,
+                        threshold
                     );
                 }
 
@@ -765,13 +886,49 @@ impl NomicEmbedder {
     /// Generate embedding using ONNX Runtime
     ///
     /// Lazily loads the model on first call if not already loaded.
-    fn generate_embedding_onnx(&self, text: &str) -> Result<Vec<f32>> {
+    fn generate_embedding_onnx(&self, text: &str) -> Result<(Vec<f32>, f64, f64)> {
         tracing::debug!("Nomic ONNX: ensuring model loaded...");
         let model = self.ensure_model_loaded()?;
         tracing::debug!("Nomic ONNX: model ready, acquiring session lock...");
 
+        // Tokenize before grabbing the lock — there's no need to hold a session
+        // mutex while we're just running the tokenizer.
+        let encoding = model
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("Nomic tokenization failed: {e}"))?;
+
+        let tokens = encoding.get_ids();
+        let attention_mask = encoding.get_attention_mask();
+        let max_length = self.config.max_length;
+        // Pad only as far as the actual input requires (rounded up for SIMD
+        // alignment). A 10-token query no longer pays 512-token cost.
+        let seq_len = align_seq_len(tokens.len().min(max_length), max_length);
+        tracing::debug!(
+            "Nomic ONNX: tokenized {} tokens, seq_len={} (max={})",
+            tokens.len(),
+            seq_len,
+            max_length
+        );
+
+        // Truncate or pad to seq_len
+        let mut input_ids = vec![0i64; seq_len];
+        let mut attention = vec![0i64; seq_len];
+        let token_type_ids = vec![0i64; seq_len];
+
+        for (i, &token) in tokens.iter().take(seq_len).enumerate() {
+            input_ids[i] = token as i64;
+        }
+        for (i, &mask) in attention_mask.iter().take(seq_len).enumerate() {
+            attention[i] = mask as i64;
+        }
+
+        // Acquire a pool slot. The queue wait is measured separately from the
+        // run so the operator can tell which one is hot.
         let lock_timeout = std::time::Duration::from_secs(30);
-        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
+        let queue_start = std::time::Instant::now();
+        let session_mutex = model.acquire();
+        let mut session = session_mutex.try_lock_for(lock_timeout).ok_or_else(|| {
             tracing::error!(
                 "Nomic ONNX session lock acquisition timed out after {}s",
                 lock_timeout.as_secs()
@@ -781,43 +938,30 @@ impl NomicEmbedder {
                 lock_timeout.as_secs()
             )
         })?;
-        tracing::debug!("Nomic ONNX: session lock acquired, tokenizing...");
-
-        let encoding = model
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| anyhow::anyhow!("Nomic tokenization failed: {e}"))?;
-
-        let tokens = encoding.get_ids();
-        let attention_mask = encoding.get_attention_mask();
-        let max_length = self.config.max_length;
-        tracing::debug!("Nomic ONNX: tokenized {} tokens", tokens.len());
-
-        // Truncate or pad to max_length
-        let mut input_ids = vec![0i64; max_length];
-        let mut attention = vec![0i64; max_length];
-        let token_type_ids = vec![0i64; max_length];
-
-        for (i, &token) in tokens.iter().take(max_length).enumerate() {
-            input_ids[i] = token as i64;
-        }
-        for (i, &mask) in attention_mask.iter().take(max_length).enumerate() {
-            attention[i] = mask as i64;
-        }
+        let queue_ms = queue_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            "Nomic ONNX: session lock acquired after {:.1}ms",
+            queue_ms
+        );
 
         // Create input tensors
-        let input_ids_value = Value::from_array((vec![1, max_length], input_ids))?;
-        let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))?;
-        let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))?;
+        let input_ids_value = Value::from_array((vec![1, seq_len], input_ids))?;
+        let attention_mask_value = Value::from_array((vec![1, seq_len], attention.clone()))?;
+        let token_type_ids_value = Value::from_array((vec![1, seq_len], token_type_ids))?;
 
-        // Run inference
+        // Run inference — this is the only span that holds the session lock.
         tracing::debug!("Nomic ONNX: running inference...");
+        let run_start = std::time::Instant::now();
         let outputs = session.run(ort::inputs![
             "input_ids" => &input_ids_value,
             "attention_mask" => &attention_mask_value,
             "token_type_ids" => &token_type_ids_value,
         ])?;
-        tracing::debug!("Nomic ONNX: inference complete");
+        let run_ms = run_start.elapsed().as_secs_f64() * 1000.0;
+        // Can't drop `session` here — `outputs` borrows from it. The lock
+        // releases at function end. Pool size (VELD_NOMIC_POOL_SIZE) is what
+        // gives concurrent throughput, not per-call drop timing.
+        tracing::debug!("Nomic ONNX: inference complete in {:.1}ms", run_ms);
 
         // Extract embeddings
         let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
@@ -861,7 +1005,7 @@ impl NomicEmbedder {
         }
 
         // Matryoshka: truncate to the configured dimension and re-normalize.
-        Ok(self.apply_matryoshka(pooled))
+        Ok((self.apply_matryoshka(pooled), queue_ms, run_ms))
     }
 
     /// Generate embeddings for multiple texts in a single ONNX batch
@@ -871,22 +1015,11 @@ impl NomicEmbedder {
         }
 
         let model = self.ensure_model_loaded()?;
-        let lock_timeout = std::time::Duration::from_secs(30);
-        let mut session = model.session.try_lock_for(lock_timeout).ok_or_else(|| {
-            tracing::error!(
-                "Nomic ONNX session lock timed out after {}s in batch embed",
-                lock_timeout.as_secs()
-            );
-            anyhow::anyhow!(
-                "Nomic ONNX session lock timeout ({}s) in batch embed",
-                lock_timeout.as_secs()
-            )
-        })?;
-
         let batch_size = texts.len();
         let max_length = self.config.max_length;
 
-        // Tokenize all texts
+        // Tokenize all texts before grabbing a session — purely CPU work, no
+        // reason to serialize it behind the model lock.
         let encodings: Vec<_> = texts
             .iter()
             .map(|text| {
@@ -897,8 +1030,18 @@ impl NomicEmbedder {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // The batched seq_len is the longest tokenization in the batch, aligned
+        // to the next multiple of 32, capped at max_length. Empty batches and
+        // short queries no longer pay full 512-token cost.
+        let longest = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
+        let seq_len = align_seq_len(longest.min(max_length), max_length);
+
         // Prepare batched tensors
-        let total_elements = batch_size * max_length;
+        let total_elements = batch_size * seq_len;
         let mut input_ids = vec![0i64; total_elements];
         let mut attention_masks = vec![0i64; total_elements];
         let token_type_ids = vec![0i64; total_elements];
@@ -906,24 +1049,40 @@ impl NomicEmbedder {
         for (batch_idx, encoding) in encodings.iter().enumerate() {
             let tokens = encoding.get_ids();
             let attention_mask = encoding.get_attention_mask();
-            let offset = batch_idx * max_length;
+            let offset = batch_idx * seq_len;
 
-            for (i, &token) in tokens.iter().take(max_length).enumerate() {
+            for (i, &token) in tokens.iter().take(seq_len).enumerate() {
                 input_ids[offset + i] = token as i64;
             }
-            for (i, &mask) in attention_mask.iter().take(max_length).enumerate() {
+            for (i, &mask) in attention_mask.iter().take(seq_len).enumerate() {
                 attention_masks[offset + i] = mask as i64;
             }
         }
 
-        // Create batched input tensors
-        let input_ids_value = Value::from_array((vec![batch_size, max_length], input_ids))?;
-        let attention_mask_value =
-            Value::from_array((vec![batch_size, max_length], attention_masks.clone()))?;
-        let token_type_ids_value =
-            Value::from_array((vec![batch_size, max_length], token_type_ids))?;
+        // Acquire a pool slot for the run only.
+        let lock_timeout = std::time::Duration::from_secs(30);
+        let session_mutex = model.acquire();
+        let mut session = session_mutex.try_lock_for(lock_timeout).ok_or_else(|| {
+            tracing::error!(
+                "Nomic ONNX session lock timed out after {}s in batch embed",
+                lock_timeout.as_secs()
+            );
+            anyhow::anyhow!(
+                "Nomic ONNX session lock timeout ({}s) in batch embed",
+                lock_timeout.as_secs()
+            )
+        })?;
 
-        // Run batch inference
+        // Create batched input tensors
+        let input_ids_value = Value::from_array((vec![batch_size, seq_len], input_ids))?;
+        let attention_mask_value =
+            Value::from_array((vec![batch_size, seq_len], attention_masks.clone()))?;
+        let token_type_ids_value =
+            Value::from_array((vec![batch_size, seq_len], token_type_ids))?;
+
+        // Run batch inference. `outputs` borrows from `session`, so the lock
+        // stays held through pooling below; pool size (VELD_NOMIC_POOL_SIZE)
+        // is what enables concurrent batches across slots.
         let outputs = session.run(ort::inputs![
             "input_ids" => &input_ids_value,
             "attention_mask" => &attention_mask_value,
@@ -942,10 +1101,10 @@ impl NomicEmbedder {
             let mut pooled = vec![0.0; NOMIC_NATIVE_DIM];
             let mut mask_sum = 0.0;
 
-            let batch_offset = batch_idx * max_length * NOMIC_NATIVE_DIM;
-            let attention_offset = batch_idx * max_length;
+            let batch_offset = batch_idx * seq_len * NOMIC_NATIVE_DIM;
+            let attention_offset = batch_idx * seq_len;
 
-            for seq_idx in 0..max_length {
+            for seq_idx in 0..seq_len {
                 if attention_masks[attention_offset + seq_idx] == 1 {
                     for (dim_idx, pooled_val) in
                         pooled.iter_mut().enumerate().take(NOMIC_NATIVE_DIM)
