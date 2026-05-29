@@ -123,9 +123,24 @@ if ($Configure) {
             exit 1
         }
         Write-Host "  using nssm: $nssm"
-        & $nssm stop $ServiceName 2>&1 | Out-Null
+        # Stop and WAIT for SCM to reach Stopped before reconfiguring. If we set
+        # AppEnvironmentExtra while the wrapper is still in StopPending, the
+        # wrapper can get stuck (SCM marks it NOT_STOPPABLE) and the only
+        # recovery is taskkill on the wrapper PID. PS cmdlets block on SCM
+        # transitions by default; raw `nssm stop` does not.
+        try {
+            Stop-Service -Name $ServiceName -ErrorAction Stop
+        } catch {
+            Write-Warning "Stop-Service failed: $($_.Exception.Message). Retrying via nssm..."
+            & $nssm stop $ServiceName 2>&1 | Out-Null
+        }
+        # Defensive: if SCM still reports a transitional state, poll briefly.
+        for ($i = 0; $i -lt 20; $i++) {
+            if ((Get-Service $ServiceName).Status -eq 'Stopped') { break }
+            Start-Sleep -Milliseconds 500
+        }
         & $nssm set $ServiceName AppEnvironmentExtra ":VELD_API_KEYS=$ApiKey" ":VELD_MEMORY_PATH=$StoragePath"
-        & $nssm start $ServiceName
+        Start-Service -Name $ServiceName
     } elseif ($Supervisor -eq "shawl") {
         # shawl stores env on the sc.exe binPath. Easiest: rewrite via shawl add --replace.
         Write-Warning "shawl reconfigure: stop service, re-run 'shawl add --replace' with --env flags, restart."
