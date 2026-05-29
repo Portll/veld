@@ -387,6 +387,26 @@ impl VamanaProjection {
         self.memories.get(memory_id).map(|e| e.vector_id)
     }
 
+    /// Inverse of [`Self::vector_id_for`]. Returns the `memory_id` that
+    /// maps to `vector_id`, or `None` if no such mapping exists.
+    ///
+    /// The forward map (`memory_id → vector_id`) is populated by
+    /// `apply()` / `replay()` and persisted via the `CheckpointStore`
+    /// side data; the inverse is materialised on demand by walking the
+    /// forward map. The walk is O(n) in the number of live (non-
+    /// forgotten) memory-id mappings the projection currently tracks —
+    /// search-result resolution is already top-k bounded, so the
+    /// per-call cost stays in proportion to the result set, not the
+    /// corpus. Soft-deleted entries are dropped from the forward map at
+    /// `Forget` time, so this accessor will never return a `memory_id`
+    /// for a vector that has been logically deleted.
+    pub fn memory_id_for(&self, vector_id: u32) -> Option<String> {
+        self.memories
+            .iter()
+            .find(|(_, entry)| entry.vector_id == vector_id)
+            .map(|(memory_id, _)| memory_id.clone())
+    }
+
     /// Number of live (non-forgotten) memory-id mappings the projection
     /// is currently tracking. Soft-deleted vectors stay in the Vamana
     /// graph until the next rebuild but are not counted here.
@@ -1638,5 +1658,129 @@ mod tests {
             0,
             "stale side data must be discarded — defence in depth"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Reverse-lookup accessor (memory_id_for) tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn memory_id_for_returns_known_id() {
+        let (_index, _ckpt, mut proj, _log, _ckptp) = open_projection();
+
+        let (mid, bytes) = mk_memory_with_embedding(axis_vec(0));
+        let mid_str = mid.0.to_string();
+        TypedProjection::apply(&mut proj, Lsn(0), &mk_remember(&mid_str, bytes)).unwrap();
+
+        let vid = proj
+            .vector_id_for(&mid_str)
+            .expect("forward map must hold the freshly applied memory");
+        assert_eq!(
+            proj.memory_id_for(vid),
+            Some(mid_str),
+            "reverse lookup must round-trip through the live forward map",
+        );
+    }
+
+    #[test]
+    fn memory_id_for_unknown_returns_none() {
+        let (_index, _ckpt, mut proj, _log, _ckptp) = open_projection();
+
+        // Empty projection → reverse lookup is None.
+        assert!(proj.memory_id_for(999_999).is_none());
+
+        // Even after applying one memory, an unrelated vector_id stays
+        // unmapped (the assigned id is a small u32; 999_999 will not
+        // collide with the Vamana allocator's choice for the first
+        // insert).
+        let (mid, bytes) = mk_memory_with_embedding(axis_vec(1));
+        TypedProjection::apply(
+            &mut proj,
+            Lsn(0),
+            &mk_remember(&mid.0.to_string(), bytes),
+        )
+        .unwrap();
+        let assigned = proj.vector_id_for(&mid.0.to_string()).unwrap();
+        let bogus = assigned.wrapping_add(1).max(999_999);
+        assert!(
+            proj.memory_id_for(bogus).is_none(),
+            "vector_id outside the forward map must resolve to None",
+        );
+    }
+
+    #[test]
+    fn memory_id_for_round_trips_through_persist() {
+        // Live-write three memories and capture their vector ids. Then
+        // drop the projection, re-open against the same checkpoint
+        // store (which restores the forward map from side data) and
+        // assert that the reverse accessor still resolves each
+        // vector_id back to the same memory_id.
+        let (_log_path, ckpt_path) = tmp_paths("memory_id_for_persist");
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+
+        let (id_a, b_a) = mk_memory_with_embedding(axis_vec(0));
+        let (id_b, b_b) = mk_memory_with_embedding(axis_vec(2));
+        let (id_c, b_c) = mk_memory_with_embedding(axis_vec(5));
+
+        let saved = {
+            let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+            let mut proj = VamanaProjection::new(
+                VamanaEmbeddingKind::TextPrimary,
+                index,
+                ckpt.clone(),
+            );
+            TypedProjection::apply(
+                &mut proj,
+                Lsn(0),
+                &mk_remember(&id_a.0.to_string(), b_a),
+            )
+            .unwrap();
+            TypedProjection::apply(
+                &mut proj,
+                Lsn(1),
+                &mk_remember(&id_b.0.to_string(), b_b),
+            )
+            .unwrap();
+            TypedProjection::apply(
+                &mut proj,
+                Lsn(2),
+                &mk_remember(&id_c.0.to_string(), b_c),
+            )
+            .unwrap();
+            vec![
+                (
+                    id_a.0.to_string(),
+                    proj.vector_id_for(&id_a.0.to_string()).unwrap(),
+                ),
+                (
+                    id_b.0.to_string(),
+                    proj.vector_id_for(&id_b.0.to_string()).unwrap(),
+                ),
+                (
+                    id_c.0.to_string(),
+                    proj.vector_id_for(&id_c.0.to_string()).unwrap(),
+                ),
+            ]
+        };
+
+        // Re-open: brand-new index + projection, same checkpoint store.
+        // The forward map is restored from side data (covered by
+        // `id_map_survives_reopen_via_side_data`). The reverse
+        // accessor must work over that restored map.
+        let index2 = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        let ckpt2 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let proj2 = VamanaProjection::new(
+            VamanaEmbeddingKind::TextPrimary,
+            index2,
+            ckpt2,
+        );
+        assert_eq!(proj2.tracked_memory_count(), 3);
+        for (expected_mid, vid) in saved {
+            assert_eq!(
+                proj2.memory_id_for(vid),
+                Some(expected_mid),
+                "reverse lookup must survive a persist + reopen via side data",
+            );
+        }
     }
 }
