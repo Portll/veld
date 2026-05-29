@@ -28,6 +28,9 @@ pub mod gap_analysis;
 pub mod graph;
 pub mod visualization;
 
+// Static docs hosting (mdBook output)
+pub mod docs;
+
 // Task management
 pub mod todos;
 
@@ -62,6 +65,9 @@ pub mod context_blocks;
 
 // Datasets (W7 — relational-backed tabular storage)
 pub mod datasets;
+
+// Sleep-time / observational memory orchestrator (V1)
+pub mod sleep_time;
 
 // A/B testing
 pub mod ab_testing;
