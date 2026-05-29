@@ -1,7 +1,8 @@
 <!-- GENERATED FILE — do not edit by hand.
      Source: src/handlers/router.rs
      Generator: docs/generators/src/bin/gen-http-api.rs
-     Regenerate: cd docs/generators && cargo run --bin gen-http-api -->
+     Regenerate: bash docs/regenerate.sh
+     (or, inside docs/generators/, run `cargo run --bin gen-http-api`) -->
 
 # HTTP API
 
