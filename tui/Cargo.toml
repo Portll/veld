@@ -39,6 +39,11 @@ dirs = "6.0"
 # without requiring a system libgit2 install.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
+# Cross-platform browser launcher — used by the `?` / F1 keybinding to open
+# the embedded docs site (served by `veld server` at `/docs/`) in the user's
+# default browser.
+webbrowser = "1"
+
 [profile.release]
 opt-level = "z"
 lto = true
