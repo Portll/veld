@@ -23,12 +23,17 @@ pub fn docs_src_root() -> PathBuf {
 }
 
 /// Standard "GENERATED" header. Stamped at the top of every generated file.
+///
+/// The regenerate instruction uses `bash docs/regenerate.sh` because it
+/// works in POSIX shells and in PowerShell (when Git Bash is on PATH),
+/// avoiding the `&&` operator that Windows PowerShell <7 does not support.
 pub fn generated_header(source_file: &str, generator_name: &str) -> String {
     format!(
         "<!-- GENERATED FILE — do not edit by hand.\n     \
          Source: {source_file}\n     \
          Generator: docs/generators/src/bin/{generator_name}.rs\n     \
-         Regenerate: cd docs/generators && cargo run --bin {generator_name} -->\n\n"
+         Regenerate: bash docs/regenerate.sh\n     \
+         (or, inside docs/generators/, run `cargo run --bin {generator_name}`) -->\n\n"
     )
 }
 

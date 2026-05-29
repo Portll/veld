@@ -79,7 +79,7 @@ Future generators on the roadmap (not implemented yet):
 
 ## Deployment
 
-- **Build:** `cd docs && mdbook build` produces `docs/book/` as static HTML.
+- **Build:** `bash docs/regenerate.sh` runs the generators, then `mdbook build docs` produces `docs/book/` as static HTML. (PowerShell <7 users: `cd docs ; mdbook build` works as a `&&`-free equivalent.)
 - **Deploy:** GitHub Actions builds on push to `main` and deploys to
   `gh-pages` branch. Site lives at `portll.github.io/veld/` initially.
 - **Versioning:** mdBook has no native versioning. CI on tag push copies the

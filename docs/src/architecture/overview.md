@@ -4,18 +4,20 @@ Veld is a single-binary edge-native memory system. This page describes the major
 
 ```mermaid
 graph TB
-    A["Agent (Claude Code / Copilot / HTTP)"] -->|remember / recall / MCP| B[HTTP API\n:3030]
+    A["Agent (Claude Code / Copilot / HTTP)"] -->|remember / recall / MCP| B["HTTP API<br/>:3030"]
     B --> C[MultiUserMemoryManager]
     C --> D[Retrieval engine]
     C --> E[Storage layer]
-    C --> K[Consolidation\nbackground task]
+    C --> K["Consolidation<br/>background task"]
     D --> D1[HNSW vector search]
     D --> D2[BM25 full-text]
     D --> D3[Graph spreading activation]
     D --> D4[Cross-encoder reranker]
-    D1 & D2 & D3 --> D4
-    E --> E1[(RocksDB — current)]
-    E --> E2[(Redb — v0.9 target)]
+    D1 --> D4
+    D2 --> D4
+    D3 --> D4
+    E --> E1[("RocksDB — current")]
+    E --> E2[("Redb — v0.9 target")]
     K --> K1[Fact extraction]
     K --> K2[Decay]
     K --> K3[Graph strengthening]
@@ -39,30 +41,24 @@ Retrieval is the hot path. The pipeline is multi-layer hybrid search — no sing
 | 5.3 | Cross-encoder reranker | 18% blend, top-20 budget |
 | 5.9 | Focal-entity recency scan | Fallback for entity queries |
 
-### 20 scoring signals
+### 20 scoring signals (overview)
 
-The composite score is built from 20 signals per memory:
+The composite score is built from 20 signals per memory. Categories:
 
-1. Base vector similarity
-2. Recency (exponential decay)
-3. Arousal / emotional intensity
-4. Source credibility
-5. Temporal match (query time vs. memory timestamp)
-6. Session boost (same-session memories rank higher)
-7. Access count (log-scaled, 7%)
-8. Graph edge strength (Hebbian, 8%)
-9. Calibrated confidence (Bayesian α/β gate at 0.85–1.0)
-10. Confidence observations
-11. Feedback momentum (EMA from user reinforcement)
-12. Cross-encoder score (18% blend)
-13. Importance (agent-set or inferred)
-14. Entity match
-15. Tag match
-16. Episode coherence (8%)
-17. Source-type multiplier
-18. Emotional valence intensity (2%)
-19. Sequence proximity (2%)
-20. External Sleight dimension aggregate (density, coherence, closure, confidence, isotropy)
+| Category | Signals |
+|---|---|
+| **Similarity** | Base vector similarity (1), entity match (14), tag match (15) |
+| **Time** | Recency (2), temporal match (5), session boost (6), sequence proximity (19) |
+| **Affect** | Arousal (3), emotional valence intensity (18) |
+| **Source** | Source credibility (4), source-type multiplier (17) |
+| **Usage** | Access count (7), feedback momentum (11), importance (13) |
+| **Graph** | Graph edge strength / Hebbian (8), episode coherence (16) |
+| **Confidence** | Calibrated confidence (9), confidence observations (10) |
+| **Rerank** | Cross-encoder (12) |
+| **External** | Sleight dimension aggregate (20) |
+
+For per-signal definitions, computation, and blend weights, see
+[Retrieval pipeline → The 20 scoring signals](retrieval.md#the-20-scoring-signals).
 
 Signal attribution is tracked per memory so adaptive weight learning can reinforce which signals predicted relevance for a given query type.
 

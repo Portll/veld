@@ -50,17 +50,28 @@ docs/
 ### Build + preview
 
 ```sh
-# Install mdBook and preprocessors (once per machine)
-cargo install --locked mdbook mdbook-mermaid mdbook-toc mdbook-linkcheck mdbook-admonish
+# Install mdBook and preprocessors (once per machine).
+# mdbook-admonish is intentionally omitted — the docs use native blockquotes
+# so the site builds cleanly on any platform without that plugin.
+cargo install --locked mdbook mdbook-mermaid mdbook-toc
+```
 
-# Preview locally
-cd docs && mdbook serve --open
+```sh
+# Preview locally (POSIX shells)
+cd docs
+mdbook serve --open
+```
+
+```powershell
+# Preview locally (PowerShell <7 — semicolon, not &&)
+cd docs ; mdbook serve --open
 ```
 
 ### Regenerate auto-generated pages
 
 ```sh
-cd docs && bash regenerate.sh
+# Works in POSIX shells and PowerShell (when Git Bash is on PATH)
+bash docs/regenerate.sh
 ```
 
 You don't need to do this manually if you've installed the pre-commit hook
@@ -145,12 +156,15 @@ cross-link from related pages, regenerate-and-rebuild.
 
 ## Common gotchas
 
-- **mdbook-linkcheck** fails CI on broken internal links. Use relative paths
-  (`../decisions/0001-redb-migration.md`) not absolute (`/decisions/...`).
+- **Internal links** — use relative paths (`../decisions/0001-redb-migration.md`)
+  not absolute (`/decisions/...`). mdbook-linkcheck would catch broken links
+  but is currently incompatible with the latest mdBook RenderContext schema;
+  see `book.toml` for the disable note.
 - **Mermaid diagrams** must be inside ` ```mermaid ` code blocks. The
   `mdbook-mermaid` preprocessor handles them.
-- **Admonitions** use `mdbook-admonish` syntax: ` ```admonish warning `,
-  ` ```admonish tip `, ` ```admonish note `.
+- **Admonitions** use native markdown blockquotes with a leading emoji-and-bold
+  header line: `> **⚠️ Warning**` or `> **💡 Tip**`. We deliberately avoid
+  `mdbook-admonish` because it fails to compile on some Windows toolchains.
 - **Generated headers** must stay at the top of generated files. Don't
   hand-edit generated files — your changes will be lost on the next
   regenerate. Edit the source instead.
