@@ -117,7 +117,6 @@ mimalloc = "0.1"
 anyhow = "1.0"
 async-trait = "0.1"  # Object-safe async trait sugar (W4 RelationalStore, W6 query planner, W7 DatasetStore)
 thiserror = "2.0"
-async-trait = "0.1"  # `dyn` trait support for async methods on `RelationalStore` (W4/W7 shim)
 dotenvy = "0.15"  # Load .env files
 toml = { version = "0.8", default-features = false, features = ["parse"] }  # Parse veld init's config.toml
 

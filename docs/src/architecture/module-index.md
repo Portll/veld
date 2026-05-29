@@ -6,7 +6,7 @@
 
 # Module index
 
-Top-level Rust modules in veld. **33** modules (plus **4** feature-gated).
+Top-level Rust modules in veld. **35** modules (plus **4** feature-gated).
 
 Each entry's summary is the first paragraph of that module's `//!` doc comment. Click into the crate docs (built by `cargo doc`) for full API.
 
@@ -19,6 +19,7 @@ Each entry's summary is the first paragraph of that module's `//!` doc comment. 
 | `backup` | P2: Backup & Restore System |
 | `config` | Configuration management for Veld |
 | `constants` | Documented constants for the memory system |
+| `datasets` | Datasets — structured tabular storage with row-level graph links. |
 | `decay` | Hybrid Decay Model (SHO-103) |
 | `decay_scales` | Fourier-Learned Decay Scales (SHO-FFT) |
 | `earth` | Transitional Earth substrate API. |
@@ -36,6 +37,7 @@ Each entry's summary is the first paragraph of that module's `//!` doc comment. 
 | `middleware` | P1.3: HTTP request tracking middleware for observability |
 | `mif` | Memory Interchange Format (MIF) v2 |
 | `query_parsing` | Modular Query Parsing System |
+| `query_planner` | W6 query planner — foundation tier. |
 | `rate_limit_governance` | Resettable rate limiting governance — a thin wrapper around `governor::RateLimiter` that: |
 | `relevance` | Proactive Memory Surfacing (SHO-29) |
 | `roots` | Transitional Roots orchestration API. |

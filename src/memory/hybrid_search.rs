@@ -931,17 +931,6 @@ impl HybridSearchEngine {
         self
     }
 
-    /// Attach an LLM-driven refiner to be applied after RRF fusion (and
-    /// optionally after cross-encoder reranking — see [`RefinerMode`]).
-    ///
-    /// Without an attached refiner, `RefinerMode::Rlm` and
-    /// `RefinerMode::Stacked` degrade to their respective baselines:
-    /// `Rlm` becomes RRF-only, `Stacked` becomes cross-encoder-only.
-    pub fn with_refiner(mut self, refiner: Box<dyn Refiner>) -> Self {
-        self.refiner = Some(refiner);
-        self
-    }
-
     /// Index a memory for BM25 search
     pub fn index_memory(
         &self,
