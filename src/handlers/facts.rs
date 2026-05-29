@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{self, SemanticFact, TemporalFact};
+use crate::memory::{self, FactCluster, SemanticFact, TemporalFact};
 use crate::validation;
 use std::sync::Arc;
 
@@ -362,5 +362,82 @@ pub async fn search_temporal_facts(
     Ok(Json(TemporalFactsResponse {
         facts: entries,
         total,
+    }))
+}
+
+// =============================================================================
+// FACT NARRATIVES
+// =============================================================================
+
+fn narratives_default_limit() -> usize {
+    20
+}
+
+/// Request for fact narratives. Limit is clamped to 50 server-side; values
+/// outside `[1, 50]` are coerced into range (no 400 on overshoot — agents that
+/// ask for "all" via a large limit get the cap automatically).
+#[derive(Debug, Deserialize)]
+pub struct FactNarrativesRequest {
+    pub user_id: String,
+    #[serde(default = "narratives_default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub entity_filter: Option<String>,
+}
+
+/// Response carrying clustered fact narratives. `total_clusters` is the count
+/// returned; `total_facts` is the sum of `facts.len()` across all clusters
+/// (a hint at the candidate-set size, not the user's full fact corpus).
+#[derive(Debug, Serialize)]
+pub struct FactNarrativesResponse {
+    pub success: bool,
+    pub clusters: Vec<FactCluster>,
+    pub total_facts: usize,
+    pub total_clusters: usize,
+}
+
+/// `POST /api/facts/narratives` — cluster currently-active facts on shared
+/// entities, generate template narratives, detect causal chains.
+///
+/// Read-only: never writes to the fact store. Purged and bi-temporally
+/// expired facts never appear (filter is enforced inside
+/// `SemanticFactStore::list` / `find_by_entity` via the `is_active`
+/// predicate).
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
+pub async fn fact_narratives(
+    State(state): State<AppState>,
+    Json(req): Json<FactNarrativesRequest>,
+) -> Result<Json<FactNarrativesResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_earth(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    // Clamp to [1, 50]: zero is treated as 1; values above 50 cap at 50.
+    let limit = req.limit.max(1).min(50);
+    let entity_filter = req
+        .entity_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let clusters = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        memory_guard.build_fact_narratives(&user_id, limit, entity_filter.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let total_facts: usize = clusters.iter().map(|c| c.facts.len()).sum();
+    let total_clusters = clusters.len();
+    Ok(Json(FactNarrativesResponse {
+        success: true,
+        clusters,
+        total_facts,
+        total_clusters,
     }))
 }

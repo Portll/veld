@@ -314,6 +314,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/facts/search", post(facts::search_facts))
         .route("/api/facts/by-entity", post(facts::facts_by_entity))
         .route("/api/facts/stats", post(facts::get_facts_stats))
+        .route("/api/facts/narratives", post(facts::fact_narratives))
         // =================================================================
         // TEMPORAL FACTS
         // =================================================================

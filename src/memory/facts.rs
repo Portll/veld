@@ -33,10 +33,12 @@ pub struct FactStats {
     pub avg_support: f32,
 }
 
-/// Pre-bi-temporal `SemanticFact` shape. Used as a fallback when decoding
-/// records written before `valid_from` / `valid_until` / `superseded_by` /
-/// `supersedes` were appended to the struct. See [crate::memory::storage]
-/// for the equivalent pattern on `Memory`.
+/// Pre-bi-temporal `SemanticFact` shape (the OLDEST on-disk format). Used as
+/// a fallback when decoding records written before `valid_from` / `valid_until`
+/// / `superseded_by` / `supersedes` were appended to the struct.
+///
+/// Decoder chain on read: current shape → [`LegacySemanticFactV2`] (bi-temporal
+/// but pre-purge) → `LegacySemanticFactV1` (pre-bi-temporal).
 ///
 /// bincode 2 with `config::standard()` is positional — `#[serde(default)]`
 /// does NOT cover trailing fields. We must explicitly decode against the
@@ -70,14 +72,62 @@ impl LegacySemanticFactV1 {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         }
     }
 }
 
-/// Decode a `SemanticFact` from RocksDB bytes, falling back to the v1 shape
-/// (pre-bi-temporal) on `UnexpectedEnd`. Returns `(fact, is_legacy)` — when
-/// `is_legacy` is true, callers may opt to re-write the record in the current
-/// shape to amortize future reads. Matches the
+/// Bi-temporal-but-pre-purge `SemanticFact` shape. Used as a fallback for
+/// records written between the bi-temporal landing and the
+/// `purged_at` / `purge_reason` schema bump.
+#[derive(Deserialize)]
+struct LegacySemanticFactV2 {
+    id: String,
+    fact: String,
+    confidence: f32,
+    support_count: usize,
+    source_memories: Vec<MemoryId>,
+    related_entities: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_reinforced: chrono::DateTime<chrono::Utc>,
+    fact_type: FactType,
+    #[serde(default)]
+    valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    superseded_by: Option<String>,
+    #[serde(default)]
+    supersedes: Vec<String>,
+}
+
+impl LegacySemanticFactV2 {
+    fn upgrade(self) -> SemanticFact {
+        SemanticFact {
+            id: self.id,
+            fact: self.fact,
+            confidence: self.confidence,
+            support_count: self.support_count,
+            source_memories: self.source_memories,
+            related_entities: self.related_entities,
+            created_at: self.created_at,
+            last_reinforced: self.last_reinforced,
+            fact_type: self.fact_type,
+            valid_from: self.valid_from,
+            valid_until: self.valid_until,
+            superseded_by: self.superseded_by,
+            supersedes: self.supersedes,
+            purged_at: None,
+            purge_reason: None,
+        }
+    }
+}
+
+/// Decode a `SemanticFact` from RocksDB bytes with a two-step fallback chain:
+/// current shape → V2 (bi-temporal, no purge) → V1 (pre-bi-temporal). Returns
+/// `(fact, is_legacy)` — when `is_legacy` is true, callers may opt to re-write
+/// the record in the current shape to amortize future reads. Matches the
 /// [crate::memory::storage::deserialize_with_fallback] pattern on `Memory`.
 fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool)> {
     match bincode::serde::decode_from_slice::<SemanticFact, _>(
@@ -86,6 +136,13 @@ fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool
     ) {
         Ok((fact, _)) => Ok((fact, false)),
         Err(_) => {
+            if let Ok((v2, _)) = bincode::serde::decode_from_slice::<LegacySemanticFactV2, _>(
+                data,
+                bincode::config::standard(),
+            ) {
+                tracing::debug!("Migrated SemanticFact from pre-purge v2 shape");
+                return Ok((v2.upgrade(), true));
+            }
             let (legacy, _): (LegacySemanticFactV1, _) =
                 bincode::serde::decode_from_slice(data, bincode::config::standard())?;
             tracing::debug!("Migrated SemanticFact from pre-bi-temporal v1 shape");
@@ -96,12 +153,25 @@ fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool
 
 /// Returns `true` if the fact has been invalidated (`valid_until` is set and
 /// in the past relative to `now`). Facts with `valid_until: None` are always
-/// currently valid.
+/// currently valid. Note: this checks BI-TEMPORAL invalidation only — for the
+/// universal active-fact check (which also excludes purged), use
+/// [`super::compression::is_active`].
 fn fact_is_expired(fact: &SemanticFact, now: chrono::DateTime<chrono::Utc>) -> bool {
     match fact.valid_until {
         Some(until) => until <= now,
         None => false,
     }
+}
+
+/// Universal active-fact predicate used by every "currently-true" reader path
+/// in [`SemanticFactStore`]. Excludes BOTH bi-temporally expired AND
+/// administratively purged facts. Centralized so that adding future state
+/// dimensions flows through one call site.
+///
+/// Direct delegate to [`super::compression::is_active`] kept here for ergonomic
+/// access from this module without an additional import at every call site.
+fn fact_is_active(fact: &SemanticFact, now: chrono::DateTime<chrono::Utc>) -> bool {
+    super::compression::is_active(fact, now)
 }
 
 /// Returns `true` if the fact was valid at the given instant `at`:
@@ -225,17 +295,20 @@ impl SemanticFactStore {
         }
     }
 
-    /// List all currently-valid facts for a user (filters out expired).
+    /// List all currently-active facts for a user (excludes expired AND purged).
     pub fn list(&self, user_id: &str, limit: usize) -> Result<Vec<SemanticFact>> {
         self.list_filtered(user_id, limit, false)
     }
 
-    /// List facts for a user, optionally including invalidated (expired) facts.
+    /// List facts for a user. When `include_inactive` is true the result also
+    /// contains bi-temporally expired AND administratively purged facts —
+    /// reserved for forensic / MIF-export / restore-replay paths. Active
+    /// reader paths should call [`Self::list`].
     pub fn list_filtered(
         &self,
         user_id: &str,
         limit: usize,
-        include_expired: bool,
+        include_inactive: bool,
     ) -> Result<Vec<SemanticFact>> {
         let prefix = format!("facts:{}:", user_id);
         let mut facts = Vec::new();
@@ -260,7 +333,7 @@ impl SemanticFactStore {
             }
 
             if let Ok((fact, _is_legacy)) = decode_semantic_fact_with_fallback(&value) {
-                if !include_expired && fact_is_expired(&fact, now) {
+                if !include_inactive && !fact_is_active(&fact, now) {
                     continue;
                 }
                 facts.push(fact);
@@ -276,7 +349,7 @@ impl SemanticFactStore {
         Ok(facts)
     }
 
-    /// Find currently-valid facts by related entity.
+    /// Find currently-active facts by related entity (excludes expired AND purged).
     pub fn find_by_entity(
         &self,
         user_id: &str,
@@ -286,13 +359,14 @@ impl SemanticFactStore {
         self.find_by_entity_filtered(user_id, entity, limit, false)
     }
 
-    /// Find facts by related entity, optionally including expired facts.
+    /// Find facts by related entity. When `include_inactive` is true the
+    /// result also contains expired AND purged facts (forensic / MIF paths).
     pub fn find_by_entity_filtered(
         &self,
         user_id: &str,
         entity: &str,
         limit: usize,
-        include_expired: bool,
+        include_inactive: bool,
     ) -> Result<Vec<SemanticFact>> {
         let prefix = format!("facts_by_entity:{}:{}:", user_id, entity.to_lowercase());
         let mut facts = Vec::new();
@@ -315,7 +389,7 @@ impl SemanticFactStore {
             let fact_id = String::from_utf8_lossy(&value);
             if seen_ids.insert(fact_id.to_string()) {
                 if let Some(fact) = self.get(user_id, &fact_id)? {
-                    if !include_expired && fact_is_expired(&fact, now) {
+                    if !include_inactive && !fact_is_active(&fact, now) {
                         continue;
                     }
                     facts.push(fact);
@@ -329,7 +403,7 @@ impl SemanticFactStore {
         Ok(facts)
     }
 
-    /// Find currently-valid facts by type.
+    /// Find currently-active facts by type (excludes expired AND purged).
     pub fn find_by_type(
         &self,
         user_id: &str,
@@ -339,13 +413,14 @@ impl SemanticFactStore {
         self.find_by_type_filtered(user_id, fact_type, limit, false)
     }
 
-    /// Find facts by type, optionally including expired facts.
+    /// Find facts by type. When `include_inactive` is true the result also
+    /// contains expired AND purged facts (forensic / MIF paths).
     pub fn find_by_type_filtered(
         &self,
         user_id: &str,
         fact_type: FactType,
         limit: usize,
-        include_expired: bool,
+        include_inactive: bool,
     ) -> Result<Vec<SemanticFact>> {
         let type_name = format!("{:?}", fact_type);
         let prefix = format!("facts_by_type:{}:{}:", user_id, type_name);
@@ -367,7 +442,7 @@ impl SemanticFactStore {
 
             let fact_id = String::from_utf8_lossy(&value);
             if let Some(fact) = self.get(user_id, &fact_id)? {
-                if !include_expired && fact_is_expired(&fact, now) {
+                if !include_inactive && !fact_is_active(&fact, now) {
                     continue;
                 }
                 facts.push(fact);
@@ -380,21 +455,22 @@ impl SemanticFactStore {
         Ok(facts)
     }
 
-    /// Search currently-valid facts by keyword.
+    /// Search currently-active facts by keyword (excludes expired AND purged).
     pub fn search(&self, user_id: &str, query: &str, limit: usize) -> Result<Vec<SemanticFact>> {
         self.search_filtered(user_id, query, limit, false)
     }
 
-    /// Search facts by keyword, optionally including expired facts.
+    /// Search facts by keyword. When `include_inactive` is true the result
+    /// also contains expired AND purged facts (forensic / MIF paths).
     pub fn search_filtered(
         &self,
         user_id: &str,
         query: &str,
         limit: usize,
-        include_expired: bool,
+        include_inactive: bool,
     ) -> Result<Vec<SemanticFact>> {
         let query_lower = query.to_lowercase();
-        let all_facts = self.list_filtered(user_id, 1000, include_expired)?;
+        let all_facts = self.list_filtered(user_id, 1000, include_inactive)?;
 
         let mut matching: Vec<SemanticFact> = all_facts
             .into_iter()
@@ -409,6 +485,12 @@ impl SemanticFactStore {
     /// query). A fact is valid at `at` when `valid_from <= at` and
     /// `valid_until` is `None` or strictly after `at`. Facts without an
     /// explicit `valid_from` use `created_at` as the start of their window.
+    ///
+    /// **Administrative-purge override** (security): facts with `purged_at`
+    /// set are ALWAYS excluded, regardless of whether `at` predates the
+    /// purge timestamp. Time-travel queries must not become an oracle for
+    /// purged content (see `evaluations/breakers-revised-plan-p1-...json`
+    /// TIME-TRAVEL-LEAK).
     pub fn as_of(
         &self,
         user_id: &str,
@@ -435,6 +517,9 @@ impl SemanticFactStore {
             }
 
             if let Ok((fact, _is_legacy)) = decode_semantic_fact_with_fallback(&value) {
+                if fact.purged_at.is_some() {
+                    continue;
+                }
                 if fact_is_valid_at(&fact, at) {
                     facts.push(fact);
                     if facts.len() >= limit {
