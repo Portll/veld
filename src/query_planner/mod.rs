@@ -33,7 +33,8 @@ pub mod planner;
 pub mod predicate;
 
 pub use adapters::{
-    RealRelationalQuerier, RealVectorQuerier, StubGraphQuerier, VamanaProvider,
+    GraphProvider, RealGraphQuerier, RealRelationalQuerier, RealVectorQuerier,
+    StubGraphQuerier, VamanaProvider,
 };
 pub use executor::{
     Executor, GraphQuerier, RelationalQuerier, ScoredMemoryId, VectorQuerier,
