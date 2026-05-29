@@ -274,6 +274,25 @@ pub struct MultiUserMemoryManager {
     /// truthy at server startup. Handlers gate on this — when `None`, the
     /// /api/user_auth/* surface returns 404.
     pub user_auth_runtime: Option<crate::user_auth::runtime::UserAuthRuntime>,
+
+    /// Optional relational-backed dataset store (W7). `None` when no
+    /// relational backend has been wired (the v0.9 redb-cutover work will
+    /// flip this to mandatory). Handlers behind `/api/datasets/*` return
+    /// `503 Service Unavailable` when this is `None`.
+    pub dataset_store: Option<std::sync::Arc<dyn crate::datasets::DatasetStore>>,
+
+    /// Optional row-link store backed by the same relational engine as
+    /// [`Self::dataset_store`]. Independently optional: present only when
+    /// the relational store is wired and link persistence is enabled.
+    pub link_store: Option<std::sync::Arc<dyn crate::datasets::LinkStore>>,
+
+    /// Optional raw relational executor shared with [`Self::dataset_store`]
+    /// and [`Self::link_store`]. The `/api/datasets/{name}/query` endpoint
+    /// uses this to run parametrised SELECTs directly against the same
+    /// database, since the [`crate::datasets::DatasetStore`] trait does not
+    /// expose raw SELECT.
+    pub dataset_executor:
+        Option<std::sync::Arc<dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>>>,
 }
 
 impl MultiUserMemoryManager {
@@ -579,6 +598,12 @@ impl MultiUserMemoryManager {
             journaled_writer_init_locks: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
+            // W7: dataset / link stores are opt-in until the relational
+            // backend is wired into server bootstrap. Tests construct
+            // these in-place via `with_dataset_stores`.
+            dataset_store: None,
+            link_store: None,
+            dataset_executor: None,
         };
 
         info!("Running initial audit log rotation...");
@@ -587,6 +612,29 @@ impl MultiUserMemoryManager {
         }
 
         Ok(manager)
+    }
+
+    /// Builder-style helper for tests and bootstrap code that has already
+    /// constructed the relational [`crate::datasets::DatasetStore`] and
+    /// [`crate::datasets::LinkStore`] and wants to attach them to the
+    /// running manager.
+    ///
+    /// Production bootstrap will set both at construction time once the
+    /// relational engine is wired in (W4 → W7 follow-up); until then the
+    /// fields default to `None` and the dataset HTTP surface returns
+    /// `503 Service Unavailable`.
+    pub fn with_dataset_stores(
+        mut self,
+        dataset_store: std::sync::Arc<dyn crate::datasets::DatasetStore>,
+        link_store: std::sync::Arc<dyn crate::datasets::LinkStore>,
+        dataset_executor: std::sync::Arc<
+            dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>,
+        >,
+    ) -> Self {
+        self.dataset_store = Some(dataset_store);
+        self.link_store = Some(link_store);
+        self.dataset_executor = Some(dataset_executor);
+        self
     }
 
     fn bootstrap_shared_stores(

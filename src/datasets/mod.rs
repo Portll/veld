@@ -18,10 +18,14 @@
 //!   values) to either a knowledge-graph entity or a memory record.
 
 pub mod link;
+pub mod link_store;
+pub mod relational_store;
 pub mod schema;
 pub mod store;
 
 pub use link::{LinkKind, RowLink, RowPk};
+pub use link_store::{LinkStore, RelationalLinkStore, LINK_TABLE};
+pub use relational_store::{RelationalDatasetStore, CATALOG_TABLE};
 pub use schema::{ColumnDef, ColumnType, DatasetSchema};
 pub use store::{
     DatasetError, DatasetMeta, DatasetRef, DatasetRow, DatasetStore, InMemoryDatasetStore,
