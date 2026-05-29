@@ -31,7 +31,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 
 use super::types::MemoryId;
 use crate::embeddings::Embedder;
-use crate::memory::rlm_refiner::Refiner;
+use crate::memory::llm_reranker::Refiner;
 
 /// Stem text using the English Porter stemmer for BM25 matching.
 /// Enables "choose" to match "chose", "decided" to match "decision", etc.
@@ -736,13 +736,18 @@ impl CrossEncoderReranker {
 
     /// Rerank candidates using true cross-encoder with bi-encoder fallback
     ///
-    /// Takes (memory_id, content, current_score) and returns reranked scores.
+    /// Takes (memory_id, content, current_score, stored_embedding) and returns
+    /// reranked scores. When `stored_embedding` is `Some` and its dimensionality
+    /// matches the query embedding, it is reused — avoiding a redundant embedder
+    /// call (Nomic via HTTP can be 5–6s per inference on CPU). On mismatch or
+    /// `None`, the document content is embedded on the fly.
+    ///
     /// Uses 70/30 cross-encoder/bi-encoder blend when cross-encoder is available,
     /// falls back to pure bi-encoder cosine similarity otherwise.
     pub fn rerank(
         &self,
         query: &str,
-        candidates: Vec<(MemoryId, String, f32)>,
+        candidates: Vec<(MemoryId, String, f32, Option<Vec<f32>>)>,
     ) -> Result<Vec<(MemoryId, f32)>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -751,16 +756,25 @@ impl CrossEncoderReranker {
         // Always compute bi-encoder scores (fast, used for blending or fallback).
         // Query side uses encode_for_query so asymmetric models apply the query prefix.
         let query_embedding = self.embedder.encode_for_query(query)?;
+        let query_dim = query_embedding.len();
         let mut bi_scores: Vec<f32> = Vec::with_capacity(candidates.len());
-        for (_, content, _) in &candidates {
-            let doc_embedding = self.embedder.encode(content)?;
-            bi_scores.push(cosine_similarity(&query_embedding, &doc_embedding));
+        for (_, content, _, stored) in &candidates {
+            let bi = match stored {
+                Some(emb) if emb.len() == query_dim => {
+                    cosine_similarity(&query_embedding, emb)
+                }
+                _ => {
+                    let doc_embedding = self.embedder.encode(content)?;
+                    cosine_similarity(&query_embedding, &doc_embedding)
+                }
+            };
+            bi_scores.push(bi);
         }
 
         // Try cross-encoder for blended scoring
         let use_cross_encoder = self.cross_encoder.is_available();
         let blended_scores = if use_cross_encoder {
-            let doc_texts: Vec<&str> = candidates.iter().map(|(_, c, _)| c.as_str()).collect();
+            let doc_texts: Vec<&str> = candidates.iter().map(|(_, c, _, _)| c.as_str()).collect();
             match self.cross_encoder.score_pairs(query, &doc_texts) {
                 Ok(ce_scores) => {
                     // Normalize cross-encoder logits to [0,1] via sigmoid
@@ -790,7 +804,7 @@ impl CrossEncoderReranker {
         let mut results: Vec<(MemoryId, f32)> = candidates
             .into_iter()
             .zip(blended_scores)
-            .map(|((id, _, _), score)| (id, score))
+            .map(|((id, _, _, _), score)| (id, score))
             .collect();
 
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -1195,7 +1209,7 @@ impl HybridSearchEngine {
                 .iter()
                 .take(effective_rerank_count)
                 .filter_map(|(id, _score)| {
-                    get_content(id).map(|content| (id.clone(), content, *_score))
+                    get_content(id).map(|content| (id.clone(), content, *_score, None))
                 })
                 .collect();
 
