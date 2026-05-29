@@ -15,6 +15,7 @@
 mod embeddings;
 mod projection;
 mod queries;
+mod relational_adapter;
 mod storage;
 
 pub use projection::SqliteProjection;
