@@ -3144,3 +3144,76 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
         vamana.memory_id_for(vector_id)
     }
 }
+
+/// W6 query-planner integration: surface each tenant's entity/episode
+/// topology to the planner's graph adapter (`RealGraphQuerier`).
+///
+/// The memory↔entity link lives on the `Memory` itself (its `entity_refs`
+/// set), not in `GraphMemory`, so these primitives read the tenant's
+/// `Earth`. Each returns owned ids and releases the `Earth` read lock
+/// before returning — the querier never holds it across an `await`.
+///
+/// `memory_ids_with_entity` / `memory_ids_in_episode` scan the tenant's
+/// live memory set (`get_all_memories`); that is `O(n)` in the corpus.
+/// This is the query-planner surface, not the hot recall path, so the
+/// linear scan is acceptable for v1 — a reverse `entity → memory_ids`
+/// index is a future optimisation if the graph stage becomes a leading
+/// scan on large corpora.
+impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
+    fn entity_ids_of_memory(&self, user_id: &str, memory_id: &str) -> Vec<uuid::Uuid> {
+        let earth = match self.get_user_earth(user_id) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let parsed = match uuid::Uuid::parse_str(memory_id) {
+            Ok(u) => crate::memory::MemoryId(u),
+            Err(_) => return Vec::new(),
+        };
+        let guard = earth.read();
+        match guard.get_memory(&parsed) {
+            Ok(memory) => memory.entity_ids(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn memory_ids_with_entity(&self, user_id: &str, entity_id: &uuid::Uuid) -> Vec<String> {
+        let earth = match self.get_user_earth(user_id) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let guard = earth.read();
+        let memories = match guard.get_all_memories() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        memories
+            .iter()
+            .filter(|m| m.entity_ids().contains(entity_id))
+            .map(|m| m.id.0.to_string())
+            .collect()
+    }
+
+    fn memory_ids_in_episode(&self, user_id: &str, episode_id: &uuid::Uuid) -> Vec<String> {
+        let earth = match self.get_user_earth(user_id) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let guard = earth.read();
+        let memories = match guard.get_all_memories() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        let target = episode_id.to_string();
+        memories
+            .iter()
+            .filter(|m| {
+                m.experience
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.episode.episode_id.as_deref())
+                    == Some(target.as_str())
+            })
+            .map(|m| m.id.0.to_string())
+            .collect()
+    }
+}
