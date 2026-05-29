@@ -190,3 +190,72 @@ fn purged_fields_default_when_decoding_older_record() {
     assert!(got.purged_at.is_none());
     assert!(got.purge_reason.is_none());
 }
+
+// -----------------------------------------------------------------------------
+// Phase B — facts_preview_purge schema guards
+// -----------------------------------------------------------------------------
+//
+// The preview handler refuses unknown fields via `#[serde(deny_unknown_fields)]`.
+// A client sending `{"dry_run": false}` (trying to escalate to destructive
+// purge through the preview surface) is rejected by serde itself. This is
+// the structural TIER-CREEP guard from breakers — the constraint lives in
+// the type, not in a runtime branch.
+
+#[test]
+fn preview_purge_request_rejects_dry_run_field() {
+    use veld::handlers::facts::FactsPreviewPurgeRequest;
+
+    // Legitimate payload deserializes fine.
+    let ok = serde_json::json!({"user_id": "u1", "pattern": "abc"});
+    let parsed: Result<FactsPreviewPurgeRequest, _> = serde_json::from_value(ok);
+    assert!(parsed.is_ok(), "valid payload must parse");
+
+    // Adding dry_run=false must be REJECTED by serde — the field doesn't
+    // exist on the request struct, and deny_unknown_fields makes the
+    // omission load-bearing.
+    let escalation = serde_json::json!({
+        "user_id": "u1",
+        "pattern": "abc",
+        "dry_run": false,
+    });
+    let parsed: Result<FactsPreviewPurgeRequest, _> = serde_json::from_value(escalation);
+    assert!(
+        parsed.is_err(),
+        "preview-purge must reject dry_run field (TIER-CREEP guard)"
+    );
+}
+
+#[test]
+fn preview_purge_bucket_boundaries() {
+    use veld::handlers::facts::FactsPreviewPurgeBucket;
+
+    // Bucket transitions are at: 0|1, 5|6, 50|51.
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(0),
+        FactsPreviewPurgeBucket::None
+    ));
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(1),
+        FactsPreviewPurgeBucket::Few
+    ));
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(5),
+        FactsPreviewPurgeBucket::Few
+    ));
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(6),
+        FactsPreviewPurgeBucket::Some
+    ));
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(50),
+        FactsPreviewPurgeBucket::Some
+    ));
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(51),
+        FactsPreviewPurgeBucket::Many
+    ));
+    assert!(matches!(
+        FactsPreviewPurgeBucket::from_count(10_000),
+        FactsPreviewPurgeBucket::Many
+    ));
+}

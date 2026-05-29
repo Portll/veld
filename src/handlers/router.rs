@@ -315,6 +315,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/facts/by-entity", post(facts::facts_by_entity))
         .route("/api/facts/stats", post(facts::get_facts_stats))
         .route("/api/facts/narratives", post(facts::fact_narratives))
+        .route(
+            "/api/facts/preview-purge",
+            post(facts::facts_preview_purge),
+        )
         // =================================================================
         // TEMPORAL FACTS
         // =================================================================

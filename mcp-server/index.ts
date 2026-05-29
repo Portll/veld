@@ -968,6 +968,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "facts_preview_purge",
+        description:
+          "Preview the blast radius of a fact-purge pattern WITHOUT deleting anything. Returns a bucketed match count (none / few / some / many) — not an exact count — so the preview cannot become an oracle for fact existence. Use this BEFORE any destructive purge: agents should always preview-check a pattern, surface the bucket to the user, and only escalate to the destructive `/api/facts/purge` route after explicit confirmation. Pattern is substring match (not regex), case-insensitive, minimum 3 characters.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pattern: {
+              type: "string",
+              description:
+                "Substring to match in fact content (case-insensitive, minimum 3 characters).",
+              minLength: 3,
+            },
+          },
+          required: ["pattern"],
+        },
+      },
+      {
         name: "proactive_context",
         description:
           "REQUIRED: Call this tool with EVERY user message to surface relevant memories and build conversation history. Pass the user's message as context. This enables: (1) retrieving memories relevant to what the user is asking, (2) building persistent memory of the conversation for future sessions. The system analyzes entities, semantic similarity, and recency to find contextually appropriate memories. Auto-ingest stores the context automatically. USAGE: Always call this FIRST when you receive a user message, passing their message as the context parameter.",
@@ -3091,6 +3108,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         return {
           content: [{ type: "text", text: response.trimEnd() }],
+        };
+      }
+
+      case "facts_preview_purge": {
+        const { pattern } = args as { pattern: string };
+
+        interface PreviewPurgeResult {
+          success: boolean;
+          match_bucket: "none" | "few" | "some" | "many";
+          total_scanned: number;
+          dry_run: boolean;
+          audit_recorded: boolean;
+        }
+
+        const result = await apiCall<PreviewPurgeResult>(
+          "/api/facts/preview-purge",
+          "POST",
+          { user_id: USER_ID, pattern },
+        );
+
+        const bucketDescription: Record<string, string> = {
+          none: "ZERO facts match — pattern is safe to purge (nothing would be removed).",
+          few: "1-5 facts match — small, targeted purge.",
+          some: "6-50 facts match — moderate purge; review pattern before escalating.",
+          many: "51+ facts match — LARGE purge; refine the pattern before invoking the destructive endpoint.",
+        };
+
+        const text =
+          `🔍 PURGE PREVIEW (dry-run only — nothing deleted)\n\n` +
+          `Match bucket: ${result.match_bucket.toUpperCase()}\n` +
+          `${bucketDescription[result.match_bucket] ?? ""}\n\n` +
+          `Scanned ${result.total_scanned} active facts.\n` +
+          (result.audit_recorded ? "" : "⚠️ Audit entry did NOT persist — check server logs.\n");
+
+        return {
+          content: [{ type: "text", text }],
         };
       }
 
