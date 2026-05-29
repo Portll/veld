@@ -20,6 +20,7 @@ pub mod auth;
 pub mod backup;
 pub mod config;
 pub mod constants;
+pub mod datasets;
 pub mod decay;
 pub mod decay_scales;
 pub mod earth;
