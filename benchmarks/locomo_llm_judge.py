@@ -35,12 +35,22 @@ from eval_metrics import (
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-VELD_URL = "http://127.0.0.1:3030"
-VELD_API_KEY = "dev-key-local"
-LM_STUDIO_URL = "http://localhost:1234/v1"
-JUDGE_MODEL = "qwen/qwq-32b"
+import os
+
+VELD_URL = os.environ.get("VELD_URL", "http://127.0.0.1:3030")
+VELD_API_KEY = os.environ.get("VELD_API_KEY", "dev-key-local")
+# Judge LLM — defaults to local LM Studio (qwen/qwq-32b); env vars switch to
+# a hosted OpenAI-compatible endpoint such as Together AI.
+JUDGE_URL = os.environ.get("VELD_JUDGE_URL", "http://localhost:1234/v1")
+JUDGE_MODEL = os.environ.get("VELD_JUDGE_MODEL", "qwen/qwq-32b")
+JUDGE_API_KEY = os.environ.get("VELD_JUDGE_API_KEY")  # None for LM Studio
+# Keep the old name for any downstream references that still read it.
+LM_STUDIO_URL = JUDGE_URL
 USER_ID = f"locomo_judge_{int(time.time())}"
 HEADERS = {"Content-Type": "application/json", "X-API-Key": VELD_API_KEY}
+JUDGE_HEADERS = {"Content-Type": "application/json"}
+if JUDGE_API_KEY:
+    JUDGE_HEADERS["Authorization"] = f"Bearer {JUDGE_API_KEY}"
 
 # ---------------------------------------------------------------------------
 # Memories — 20 entries across 4 weeks
@@ -346,7 +356,7 @@ def store_memory(mem: dict) -> str | None:
 
 
 def recall_memories(query: str, limit: int = 10) -> list[dict]:
-    payload = {"user_id": USER_ID, "query": query, "limit": limit, "mode": "hybrid"}
+    payload = {"user_id": USER_ID, "query": query, "limit": limit, "mode": "semantic"}
     resp = requests.post(f"{VELD_URL}/api/recall", headers=HEADERS, json=payload)
     if resp.status_code != 200:
         print(f"  ERROR recalling: {resp.status_code} {resp.text}")
@@ -359,7 +369,8 @@ def _call_judge(prompt: str) -> dict:
     """Send a prompt to the judge LLM and parse SCORE:/REASON: response."""
     try:
         resp = requests.post(
-            f"{LM_STUDIO_URL}/chat/completions",
+            f"{JUDGE_URL}/chat/completions",
+            headers=JUDGE_HEADERS,
             json={
                 "model": JUDGE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
@@ -581,19 +592,125 @@ def judge_with_llm(query: str, gold_answer: str, retrieved_memories: list[dict])
 
 
 # ---------------------------------------------------------------------------
+# Single-call combined judge — folds E5 evidence + E5 correctness + E1
+# contradictions + E6 misleading into one LLM round-trip per query. Drops
+# total judge calls from 4N to N (80→20 for the standard 20-query suite).
+# ---------------------------------------------------------------------------
+
+def judge_query_all_in_one(query: str, gold_answer: str, retrieved_memories: list[dict]) -> dict:
+    """One LLM call that scores all four judge axes for a single query."""
+    context_block = _build_context_block(retrieved_memories)
+
+    prompt = f"""You are evaluating retrieved memories against a question. Score FOUR dimensions in a single response. Be precise and concise.
+
+QUESTION: {query}
+GOLD ANSWER: {gold_answer}
+
+RETRIEVED MEMORIES:
+{context_block}
+
+Dimensions:
+1. EVIDENCE — does the evidence support answering at all? (0=none, 1=tangential, 2=partial, 3=full)
+2. CORRECTNESS — could the gold answer be derived from these memories alone? (0=miss, 1=tangential, 2=partial, 3=full)
+3. CONTRADICTIONS — number of memory PAIRS that state conflicting facts about the same entity, event, or topic
+4. MISLEADING — number of memories that could mislead from the correct answer (outdated, contradictory, plausible-but-wrong)
+
+Reply EXACTLY this format, one field per line, nothing else:
+
+EVIDENCE_SCORE: <0-3>
+EVIDENCE_REASON: <one sentence>
+CORRECTNESS_SCORE: <0-3>
+CORRECTNESS_REASON: <one sentence>
+CONTRADICTION_COUNT: <integer>
+CONTRADICTION_REASON: <one sentence or "none">
+MISLEADING_COUNT: <integer 0-5>
+MISLEADING_POSITIONS: <comma-separated memory indices 1-5, or "none">
+MISLEADING_REASON: <one sentence>"""
+
+    try:
+        resp = requests.post(
+            f"{JUDGE_URL}/chat/completions",
+            headers=JUDGE_HEADERS,
+            json={
+                "model": JUDGE_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 1024,
+            },
+            timeout=240,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        clean = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip() or text
+    except Exception as e:
+        return _empty_combined(f"LLM error: {e}")
+
+    def field(name, default=""):
+        m = re.search(rf'^[*\s]*{name}\s*:\s*(.+)$', clean, re.MULTILINE | re.IGNORECASE)
+        return m.group(1).strip() if m else default
+
+    def int_field(name, lo=0, hi=99):
+        v = field(name, "")
+        m = re.search(r'-?\d+', v)
+        if not m:
+            return -1
+        try:
+            return max(lo, min(hi, int(m.group(0))))
+        except ValueError:
+            return -1
+
+    misleading_positions_text = field("MISLEADING_POSITIONS", "")
+    if "none" in misleading_positions_text.lower():
+        misleading_positions = []
+    else:
+        misleading_positions = [
+            int(m.group(0)) for m in re.finditer(r'\d+', misleading_positions_text)
+            if 1 <= int(m.group(0)) <= 5
+        ]
+
+    return {
+        "evidence_sufficiency": int_field("EVIDENCE_SCORE", 0, 3),
+        "evidence_reason": field("EVIDENCE_REASON"),
+        "judge_score": int_field("CORRECTNESS_SCORE", 0, 3),
+        "judge_reason": field("CORRECTNESS_REASON"),
+        "contradiction_count": max(int_field("CONTRADICTION_COUNT", 0, 25), 0),
+        "contradiction_reason": field("CONTRADICTION_REASON"),
+        "misleading_count": max(int_field("MISLEADING_COUNT", 0, 5), 0),
+        "misleading_positions": misleading_positions,
+        "misleading_reason": field("MISLEADING_REASON"),
+        "raw": text,
+    }
+
+
+def _empty_combined(reason: str) -> dict:
+    return {
+        "evidence_sufficiency": -1,
+        "evidence_reason": reason,
+        "judge_score": -1,
+        "judge_reason": reason,
+        "contradiction_count": 0,
+        "contradiction_reason": reason,
+        "misleading_count": 0,
+        "misleading_positions": [],
+        "misleading_reason": reason,
+        "raw": "",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 72)
     print("LOCOMO LLM-JUDGED EVALUATION — veld")
     print(f"Server:  {VELD_URL}")
-    print(f"Judge:   {JUDGE_MODEL} @ LM Studio")
+    print(f"Judge:   {JUDGE_MODEL} @ {JUDGE_URL}")
     print(f"User:    {USER_ID}")
     print(f"Time:    {datetime.now(timezone.utc).isoformat()}")
     print("=" * 72)
 
     # Health check
-    print("\n[1/5] Health checks...")
+    print("\n[1/3] Health checks...")
     try:
         h = requests.get(f"{VELD_URL}/health", timeout=5).json()
         print(f"  veld: {h.get('status')} v{h.get('version')}")
@@ -601,14 +718,16 @@ def main():
         print(f"  FATAL: veld unreachable: {e}")
         sys.exit(1)
     try:
-        m = requests.get(f"{LM_STUDIO_URL}/models", timeout=5).json()
-        model_ids = [x["id"] for x in m.get("data", [])]
-        if JUDGE_MODEL not in model_ids:
-            print(f"  WARNING: {JUDGE_MODEL} not in LM Studio models: {model_ids}")
+        m = requests.get(f"{JUDGE_URL}/models", headers=JUDGE_HEADERS, timeout=15).json()
+        # Tolerate Together's larger model list — only warn if model is missing.
+        data_field = m.get("data", m) if isinstance(m, dict) else m
+        model_ids = [x.get("id", "") for x in data_field] if isinstance(data_field, list) else []
+        if model_ids and JUDGE_MODEL not in model_ids:
+            print(f"  WARNING: {JUDGE_MODEL} not in models listing ({len(model_ids)} models seen)")
         else:
-            print(f"  LM Studio: {JUDGE_MODEL} ready")
+            print(f"  judge: {JUDGE_MODEL} ready")
     except Exception as e:
-        print(f"  FATAL: LM Studio unreachable: {e}")
+        print(f"  FATAL: judge endpoint unreachable at {JUDGE_URL}: {e}")
         sys.exit(1)
 
     # Get git commit
@@ -622,7 +741,7 @@ def main():
         build = "unknown"
 
     # Store memories
-    print(f"\n[2/5] Storing {len(MEMORIES)} memories...")
+    print(f"\n[2/3] Storing {len(MEMORIES)} memories...")
     id_map = {}
     for mem in MEMORIES:
         uuid = store_memory(mem)
@@ -635,15 +754,19 @@ def main():
     print(f"  Stored: {len(id_map)}/{len(MEMORIES)}")
     time.sleep(1.5)  # indexing
 
-    # Run queries + retrieval metrics
-    print(f"\n[3/7] Running {len(QUERIES)} retrieval queries...")
+    # [3/3] Interleaved retrieve + judge.
+    # Recall and judge each query back-to-back so Together's dedicated endpoint
+    # stays warm (its inactive_timeout kicks in if too much time passes without
+    # a call).
+    print(f"\n[3/3] Interleaved recall + combined judge ({len(QUERIES)} queries) with {JUDGE_MODEL}...")
     uuid_to_tag = {v: k for k, v in id_map.items()}
     results = []
 
     for i, q in enumerate(QUERIES):
+        # ---- recall ----
         t0 = time.time()
         memories = recall_memories(q["query"], limit=10)
-        ms = (time.time() - t0) * 1000
+        recall_ms = (time.time() - t0) * 1000
 
         ranked_uuids = [m["id"] for m in memories]
         ranked_tags = [uuid_to_tag.get(uid, "?") for uid in ranked_uuids]
@@ -669,68 +792,48 @@ def main():
             "mrr": mrr,
             "recall_at_5": r5,
             "recall_at_10": r10,
-            "latency_ms": round(ms),
+            "latency_ms": round(recall_ms),
             "memories_for_judge": memories[:5],
             "gold_answer": q["gold_answer"],
             "freshness_bands": freshness_bands,
         }
+
+        status = "HIT " if mrr > 0 else "MISS"
+        found = [t for t in ranked_tags[:5] if t in q["expected"]]
+
+        # ---- judge ----
+        t1 = time.time()
+        j = judge_query_all_in_one(q["query"], q["gold_answer"], memories[:5])
+        judge_ms = (time.time() - t1) * 1000
+
+        result["evidence_sufficiency"] = j["evidence_sufficiency"]
+        result["evidence_reason"] = j["evidence_reason"]
+        result["judge_score"] = j["judge_score"]
+        result["judge_reason"] = j["judge_reason"]
+        result["contradiction_count"] = j["contradiction_count"]
+        result["contradictions"] = []
+        result["misleading_count"] = j["misleading_count"]
+        result["misleading_positions"] = j["misleading_positions"]
+        result["misleading_rate"] = j["misleading_count"] / max(len(memories[:5]), 1)
+
+        ev_tag = {3: "FULL", 2: "PART", 1: "TANG", 0: "NONE", -1: "ERR "}.get(j["evidence_sufficiency"], "????")
+        co_tag = {3: "FULL", 2: "PART", 1: "TANG", 0: "MISS", -1: "ERR "}.get(j["judge_score"], "????")
+        print(
+            f"  Q{i+1:02d} [{q['category']:11s}] {status} MRR={mrr:.3f} R@5={r5:.2f} top3={ranked_tags[:3]}"
+        )
+        print(
+            f"      ev={j['evidence_sufficiency']}/3 {ev_tag} cor={j['judge_score']}/3 {co_tag} "
+            f"contra={j['contradiction_count']} mis={j['misleading_count']} "
+            f"(recall {recall_ms:.0f}ms + judge {judge_ms:.0f}ms)"
+        )
+        gap = result["evidence_sufficiency"] - result["judge_score"]
+        if gap > 0 and result["evidence_sufficiency"] >= 0 and result["judge_score"] >= 0:
+            print(f"      ^ GENERATION GAP: evidence={result['evidence_sufficiency']} but correct={result['judge_score']}")
+
         results.append(result)
 
-        status = "HIT" if mrr > 0 else "MISS"
-        found = [t for t in ranked_tags[:5] if t in q["expected"]]
-        print(
-            f"  Q{i+1:02d} [{q['category']:11s}] MRR={mrr:.3f} R@5={r5:.2f} "
-            f"{status:4s} top3={ranked_tags[:3]} found={found} ({ms:.0f}ms)"
-        )
-
-    # E5: 2-pass LLM judging (evidence sufficiency + answer correctness)
-    print(f"\n[4/7] Pass 1: Evidence sufficiency with {JUDGE_MODEL}...")
-    for i, r in enumerate(results):
-        suf = judge_evidence_sufficiency(r["query"], r["memories_for_judge"])
-        r["evidence_sufficiency"] = suf["score"]
-        r["evidence_reason"] = suf["reason"]
-        tag = {3: "FULL", 2: "PART", 1: "TANG", 0: "NONE", -1: "ERR "}.get(suf["score"], "????")
-        print(f"  Q{i+1:02d} [{r['category']:11s}] evidence={suf['score']}/3 {tag}")
-
-    print(f"\n[5/7] Pass 2: Answer correctness with {JUDGE_MODEL}...")
-    for i, r in enumerate(results):
-        cor = judge_answer_correctness(r["query"], r["gold_answer"], r["memories_for_judge"])
-        r["judge_score"] = cor["score"]
-        r["judge_reason"] = cor["reason"]
-        status = {3: "FULL", 2: "PART", 1: "TANG", 0: "MISS", -1: "ERR "}.get(cor["score"], "????")
-        print(
-            f"  Q{i+1:02d} [{r['category']:11s}] correct={cor['score']}/3 "
-            f"{status} | {cor['reason'][:70]}"
-        )
-        # E5 diagnostic: gap between evidence and correctness
-        gap = r["evidence_sufficiency"] - r["judge_score"]
-        if gap > 0 and r["evidence_sufficiency"] >= 0 and r["judge_score"] >= 0:
-            print(f"         ^ GENERATION GAP: evidence={r['evidence_sufficiency']} but correct={r['judge_score']}")
-
-    # E1 + E6: Contamination detection
-    print(f"\n[6/7] Contamination analysis (E1 contradiction + E6 misleading)...")
-    for i, r in enumerate(results):
-        # E1: Contradiction@K
-        contra = detect_contradictions_in_topk(r["query"], r["memories_for_judge"])
-        r["contradiction_count"] = contra["contradiction_count"]
-        r["contradictions"] = contra.get("contradictions", [])
-
-        # E6: Misleading-context rate
-        mislead = judge_misleading_context(r["query"], r["gold_answer"], r["memories_for_judge"])
-        r["misleading_count"] = mislead["misleading_count"]
-        r["misleading_positions"] = mislead.get("misleading_positions", [])
-        r["misleading_rate"] = mislead["misleading_count"] / max(len(r["memories_for_judge"]), 1)
-
-        flags = []
-        if r["contradiction_count"] > 0:
-            flags.append(f"CONTRA={r['contradiction_count']}")
-        if r["misleading_count"] > 0:
-            flags.append(f"MISLEAD={r['misleading_count']} @pos{r['misleading_positions']}")
-        flag_str = " ".join(flags) if flags else "clean"
-        print(f"  Q{i+1:02d} [{r['category']:11s}] {flag_str}")
-
     # Report
-    print(f"\n[7/7] Results")
+    print(f"\nResults")
     print("=" * 72)
 
     categories = ["single-hop", "temporal", "multi-hop", "open-domain"]
