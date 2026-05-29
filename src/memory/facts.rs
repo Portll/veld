@@ -978,6 +978,8 @@ mod tests {
             valid_until: None,
             superseded_by: None,
             supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
         }
     }
 
