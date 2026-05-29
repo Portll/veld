@@ -882,6 +882,8 @@ impl SemanticConsolidator {
                 valid_until: None,
                 superseded_by: None,
                 supersedes: Vec::new(),
+                purged_at: None,
+                purge_reason: None,
             };
             result.new_fact_ids.push(new_fact.id.clone());
             result.new_facts.push(new_fact);

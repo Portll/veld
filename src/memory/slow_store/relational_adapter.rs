@@ -397,7 +397,7 @@ mod tests {
     //! [`SqliteRelationalStore`] because the adapter is generic over
     //! `Error = BoxError` but the in-tree SQLite backend yields
     //! `sqlx::Error`. The wrapper does the trivial
-    //! `.map_err(|e| Box::new(e) as BoxError)`.
+    //! `.map_err(BoxError::new)`.
     //!
     //! When a production backend lands with `Error = BoxError`, this shim
     //! can be deleted and the tests can wrap that backend directly.
@@ -418,14 +418,14 @@ mod tests {
             self.0
                 .execute(sql, params)
                 .await
-                .map_err(|e| Box::new(e) as BoxError)
+                .map_err(BoxError::new)
         }
 
         async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
             self.0
                 .query(sql, params)
                 .await
-                .map_err(|e| Box::new(e) as BoxError)
+                .map_err(BoxError::new)
         }
 
         fn backend(&self) -> crate::storage::relational::RelationalBackend {
