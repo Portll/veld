@@ -2,29 +2,88 @@
 // Subscribes to "snapshot-updated" events from the Rust side, falls back to
 // polling get_snapshot() if the event channel hasn't delivered for >5s.
 
-function showDebug(msg) {
-  const el = document.getElementById("debug");
-  if (!el) return;
-  el.style.display = "block";
-  el.textContent = msg;
+// ─── Diagnostics ────────────────────────────────────────────────────────────
+// Accumulated log of script-level events. Hidden by default; toggle with
+// Ctrl+D (or Cmd+D on macOS) to pop it out as an overlay. Errors auto-pop.
+
+const diagLog = [];
+let diagAutoShow = false;
+
+function diagPush(level, msg) {
+  diagLog.push(`[${new Date().toLocaleTimeString()}] ${level} ${msg}`);
+  if (diagLog.length > 200) diagLog.shift();
+  if (level === "ERROR") {
+    diagAutoShow = true;
+    renderDiag();
+  } else if (isDiagVisible()) {
+    renderDiag();
+  }
 }
 
+function isDiagVisible() {
+  const el = document.getElementById("__diag");
+  return !!el && el.style.display !== "none";
+}
+
+function renderDiag() {
+  let el = document.getElementById("__diag");
+  if (!el) {
+    el = document.createElement("pre");
+    el.id = "__diag";
+    el.style.cssText =
+      "color:#fff;background:#7a1f1f;font:11px/1.4 monospace;padding:8px;margin:0;" +
+      "white-space:pre-wrap;position:fixed;top:0;left:0;right:0;z-index:99999;" +
+      "border-bottom:1px solid #000;max-height:40vh;overflow:auto;cursor:pointer;";
+    el.title = "Click or press Ctrl+D to dismiss";
+    el.addEventListener("click", () => {
+      diagAutoShow = false;
+      el.style.display = "none";
+    });
+    (document.body || document.documentElement).prepend(el);
+  }
+  el.textContent = diagLog.join("\n");
+  el.style.display = "block";
+}
+
+function toggleDiag() {
+  const el = document.getElementById("__diag");
+  if (!el || el.style.display === "none") {
+    renderDiag();
+  } else {
+    el.style.display = "none";
+    diagAutoShow = false;
+  }
+}
+
+window.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+    e.preventDefault();
+    toggleDiag();
+  }
+});
+
+// Back-compat shim — older call sites still write to showDebug.
+function showDebug(msg) {
+  diagPush("ERROR", msg);
+}
+
+diagPush("info", "main.js loaded — userAgent: " + navigator.userAgent);
+
 window.addEventListener("error", (e) => {
-  showDebug(`JS error: ${e.message}\n  at ${e.filename}:${e.lineno}:${e.colno}`);
+  diagPush("ERROR", `${e.message}\n  at ${e.filename}:${e.lineno}:${e.colno}`);
 });
 window.addEventListener("unhandledrejection", (e) => {
-  showDebug(`Unhandled rejection: ${e.reason}`);
+  diagPush("ERROR", `Unhandled rejection: ${e.reason}`);
 });
 
 if (!window.__TAURI__) {
-  showDebug(
+  diagPush(
+    "ERROR",
     "window.__TAURI__ is undefined — `withGlobalTauri: true` is missing or didn't take effect."
   );
   throw new Error("Tauri global not injected");
 }
-showDebug(
-  `__TAURI__ keys: ${Object.keys(window.__TAURI__).join(", ")}`
-);
+diagPush("info", "__TAURI__ keys: " + Object.keys(window.__TAURI__).join(", "));
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -198,16 +257,30 @@ function relTime(iso) {
 async function pull() {
   try {
     const snap = await invoke("get_snapshot");
+    diagPush(
+      "info",
+      `pull ok — state=${JSON.stringify(snap.server?.state)} ` +
+        `total=${snap.memory?.total} user=${snap.user_id}`
+    );
     render(snap);
   } catch (err) {
+    diagPush("ERROR", "invoke(get_snapshot) failed: " + (err?.message || err));
     console.error("get_snapshot failed", err);
   }
 }
 
 async function init() {
-  await listen("snapshot-updated", (event) => render(event.payload));
+  try {
+    await listen("snapshot-updated", (event) => render(event.payload));
+    diagPush("info", "listen('snapshot-updated') subscribed");
+  } catch (err) {
+    diagPush(
+      "ERROR",
+      "listen('snapshot-updated') failed: " + (err?.message || err)
+    );
+    return;
+  }
   await pull();
-  // Safety-net polling: if the event channel goes >5s without delivery, pull.
   setInterval(() => {
     if (Date.now() - lastUpdateAt > 5000) pull();
   }, 2000);
