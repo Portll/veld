@@ -293,6 +293,14 @@ pub struct MultiUserMemoryManager {
     /// expose raw SELECT.
     pub dataset_executor:
         Option<std::sync::Arc<dyn crate::storage::relational::RelationalStore<Error = anyhow::Error>>>,
+
+    /// Sleep-time / observational memory orchestrator (V1). `Some` only
+    /// when [`crate::config::SleepTimeConfig::enabled`] is true at startup
+    /// AND the API key environment variable resolves. Handlers gate on
+    /// this — when `None`, the /api/sleep_time/* surface returns 503
+    /// Service Unavailable with a clear reason.
+    pub sleep_time_orchestrator:
+        parking_lot::RwLock<Option<Arc<crate::memory::sleep_time::SleepTimeOrchestrator>>>,
 }
 
 impl MultiUserMemoryManager {
@@ -604,6 +612,11 @@ impl MultiUserMemoryManager {
             dataset_store: None,
             link_store: None,
             dataset_executor: None,
+            // Sleep-time orchestrator is wired post-construction so its
+            // startup (cold-start purge + spawn workers) can run after the
+            // rest of state is settled and a tokio runtime is available.
+            // See `set_sleep_time_orchestrator()`.
+            sleep_time_orchestrator: parking_lot::RwLock::new(None),
         };
 
         info!("Running initial audit log rotation...");
@@ -728,6 +741,12 @@ impl MultiUserMemoryManager {
         cfs.extend(ProspectiveStore::column_family_descriptors());
         cfs.extend(FileMemoryStore::cf_descriptors());
         cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
+        // Sleep-time / observational memory CFs (V1 + V2). Always created
+        // so the orchestrator can be enabled later without an offline migration.
+        cfs.extend(crate::memory::sleep_time::policies::BudgetTracker::cf_descriptors());
+        cfs.extend(crate::memory::sleep_time::queue::Queue::cf_descriptors());
+        cfs.extend(crate::memory::sleep_time::graduation::GraduationStore::cf_descriptors());
+        cfs.extend(crate::memory::sleep_time::supersession::SupersessionStore::cf_descriptors());
         cfs.push(ColumnFamilyDescriptor::new(
             crate::memory::feedback::CF_FEEDBACK,
             Self::shared_store_cf_options(),
@@ -2132,6 +2151,71 @@ impl MultiUserMemoryManager {
                 total_feedback_events,
             ) {
                 tracing::warn!(error = %error, "Collective maintenance aggregation failed");
+            }
+        }
+
+        // Heavy cycle: sleep-time graduation pass (R27) + supersession decay
+        // (R48). Both run only when the orchestrator is installed; both are
+        // best-effort — a failure here does not abort the rest of the
+        // maintenance cycle.
+        if is_heavy {
+            let orch_opt = self.sleep_time_orchestrator.read().clone();
+            if let Some(orch) = orch_opt {
+                // R48: supersession-confidence decay across every user's
+                // edges (the store is global). Single pass, returns
+                // (decayed, removed) counts.
+                match orch.supersession_store().decay_all(
+                    crate::memory::sleep_time::DEFAULT_SUPERSESSION_DECAY,
+                ) {
+                    Ok((decayed, removed)) => {
+                        if decayed > 0 || removed > 0 {
+                            tracing::info!(
+                                decayed,
+                                removed,
+                                "sleep-time supersession decay applied (R48)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sleep-time supersession decay failed");
+                    }
+                }
+
+                // R27: graduation pass per user. Scans each user's memories,
+                // promotes observation memories whose access_count meets the
+                // configured threshold.
+                let threshold =
+                    crate::memory::sleep_time::DEFAULT_GRADUATION_ACCESS_THRESHOLD;
+                for (user_id_arc, _) in self.user_earths.iter() {
+                    let user_id = user_id_arc.as_ref();
+                    if let Ok(earth) = self.get_user_earth(user_id) {
+                        let earth_guard = earth.read();
+                        match crate::memory::sleep_time::graduate_eligible_observations(
+                            earth_guard.as_memory_system(),
+                            orch.graduation_store(),
+                            threshold,
+                        ) {
+                            Ok(result) => {
+                                if result.graduated > 0 {
+                                    tracing::info!(
+                                        user_id = %user_id,
+                                        graduated = result.graduated,
+                                        scanned = result.observations_scanned,
+                                        threshold,
+                                        "sleep-time graduation pass (R27)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    error = %e,
+                                    "sleep-time graduation pass failed"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 

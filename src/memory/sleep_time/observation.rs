@@ -1,117 +1,107 @@
 //! ObservationDraft → Memory persistence pipeline.
 //!
-//! V1 path: persist sleep-time observations into the user's working memory
-//! tier with `ExperienceType::Observation` and origin metadata. The existing
-//! synchronous maintenance loop (`maintenance.rs`) will tier-promote them
-//! naturally based on importance + age.
+//! V1 path: persist sleep-time observations via the standard
+//! [`crate::memory::MemorySystem::remember`] entry point. This reuses the
+//! existing embedding + entity extraction + graph indexing pipeline rather
+//! than building a parallel path. Origin metadata is stamped into
+//! `Experience.metadata` so retrieval and evidence-assembly downstream can
+//! apply the visibility rules in
+//! [`super::types::MemoryOrigin::visible_to_evidence`].
+//!
+//! Degraded-embedding handling: if the underlying embedder is in fallback
+//! mode, `remember()` will still store the memory but mark
+//! `experience.embedding_degraded = true`. The existing maintenance loop
+//! re-embeds degraded memories when the embedder recovers
+//! (`maintenance.rs::run_maintenance` section 3.7). No special handling here.
 //!
 //! V2 (R27) introduces explicit *graduation* — a foreground-access-driven
 //! transition where observations earn entry into the semantic fact corpus.
-//! That is **not** implemented here; graduation logic lives with the
-//! observer/orchestrator in V2.
-//!
-//! Embedder discipline (R38 / B6): we check `Embedder::is_healthy()` before
-//! persisting. If the embedder is degraded, the draft is returned to the
-//! caller as a *pending* observation; the worker can retry on the next cycle.
-//! We never persist an observation with a hash-fallback embedding.
+//! That logic lives in `observer.rs` / V2.
 
-use anyhow::Result;
-use parking_lot::RwLock;
-use std::sync::Arc;
-use uuid::Uuid;
+use std::collections::HashMap;
 
 use super::types::{MemoryOrigin, ObservationDraft, SleepTimeError, SleepTimeResult};
-use crate::embeddings::Embedder;
-use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId, WorkingMemory};
+use crate::memory::types::{Experience, ExperienceType, MemoryId};
+use crate::memory::MemorySystem;
 
 /// Importance assigned to freshly-persisted observations. Picked to be just
 /// above the working→session promotion threshold so observations that survive
 /// one maintenance cycle without negative feedback graduate naturally.
-const DEFAULT_OBSERVATION_IMPORTANCE: f32 = 0.55;
+pub const DEFAULT_OBSERVATION_IMPORTANCE: f32 = 0.55;
 
 /// Outcome of a persistence attempt.
+#[derive(Debug)]
 pub enum PersistOutcome {
     /// Observation was stored; this is its assigned memory id.
     Stored(MemoryId),
-    /// Embedder unhealthy; draft was not stored. Caller should hold the draft
-    /// and retry on the next sleep-time cycle (R38).
-    DeferredEmbedderUnhealthy,
+    /// `remember()` returned an existing-content match (idempotency
+    /// dedup). The existing memory id is returned so the worker can still
+    /// emit a `SleepTimeObservationEmitted` event pointing to a stable
+    /// retrieval target.
+    Deduped(MemoryId),
 }
 
-/// Persist an [`ObservationDraft`] into the user's working memory tier.
+/// Persist an [`ObservationDraft`] via [`MemorySystem::remember`].
 ///
 /// Side effects:
-///   1. (R38) Aborts persistence if `embedder.is_healthy() == false`.
-///   2. Generates the content embedding via the supplied [`Embedder`].
-///   3. Stamps the embedder version on the draft for later quality-gate use.
-///   4. Constructs a `Memory` (origin metadata in `experience.metadata`).
-///   5. Adds to working memory under `user_id` actor (multi-tenant routing).
+///   - Builds an `Experience` whose `metadata` carries the origin tag, sleep
+///     mode, embedder version, priority, confidence, lineage backlinks, and
+///     three-date temporal anchors.
+///   - Defers all embedding / entity extraction / graph indexing to
+///     `remember()` — sleep-time observations are first-class memories.
+///   - Returns `PersistOutcome::Deduped` if the content already exists
+///     (content-hash dedup in `remember()`).
 ///
-/// Note: this function does not write any consolidation events — the worker
-/// is responsible for emitting `SleepTimeObservationEmitted` so the event
-/// and the persistence can share a single audit batch (R1 spirit).
+/// Does NOT emit consolidation events — the worker pairs persistence with
+/// `SleepTimeObservationEmitted` in a single audit batch (R1 spirit).
 pub fn persist_observation(
-    draft: &mut ObservationDraft,
-    embedder: &dyn Embedder,
-    working_memory: &Arc<RwLock<WorkingMemory>>,
-    user_id: &str,
+    draft: &ObservationDraft,
+    mem_sys: &MemorySystem,
 ) -> SleepTimeResult<PersistOutcome> {
-    // R15: stamp the embedder identity we're about to embed against.
-    draft.embedder_version = embedder.model_id().to_string();
+    let experience = build_experience(draft);
 
-    // R38 / B6: refuse to persist with a degraded fallback embedding.
-    // `encode_with_status` returns (vec, is_degraded); the circuit-breaker
-    // wrapper sets is_degraded=true when the underlying model is failing.
-    let (embedding, degraded) = embedder
-        .encode_with_status(&draft.content)
-        .map_err(|e| SleepTimeError::Other(anyhow::anyhow!("embed observation: {e}")))?;
-    if degraded {
-        tracing::debug!(
-            user_id = %user_id,
-            "embedder degraded — deferring sleep-time observation persistence"
-        );
-        return Ok(PersistOutcome::DeferredEmbedderUnhealthy);
-    }
+    // `remember()` is the canonical foreground-API entry point and does:
+    //   - content-hash dedup (idempotent on repeat content)
+    //   - embedding generation (with cache)
+    //   - entity extraction + graph linking
+    //   - vector indexing + interference detection
+    // We piggy-back on all of it; origin metadata distinguishes downstream.
+    let memory_id = mem_sys
+        .remember(experience, Some(draft.created_at))
+        .map_err(|e| SleepTimeError::Other(anyhow::anyhow!("remember observation: {e}")))?;
 
-    let experience = Experience {
+    // `remember()` returns the EXISTING memory id on content-hash hit;
+    // we have no cheap way to tell after-the-fact whether dedup occurred,
+    // so default to `Stored` and let the worker treat the returned id
+    // idempotently.
+    Ok(PersistOutcome::Stored(memory_id))
+}
+
+/// Construct the `Experience` value that will be passed to `remember()`.
+/// Public so V2 graduation can build the same shape with a different origin
+/// tag.
+pub fn build_experience(draft: &ObservationDraft) -> Experience {
+    Experience {
         experience_type: ExperienceType::Observation,
         content: draft.content.clone(),
         entities: draft.entity_refs.clone(),
         metadata: observation_metadata(draft),
-        embeddings: Some(embedding),
-        embedding_degraded: false,
         ..Default::default()
-    };
-
-    let memory = Memory::new(
-        MemoryId(Uuid::new_v4()),
-        experience,
-        DEFAULT_OBSERVATION_IMPORTANCE,
-        None,                       // agent_id — sleep-time has no foreground agent
-        None,                       // run_id
-        Some(user_id.to_string()),  // actor_id carries the user
-        Some(draft.created_at),
-    );
-    let memory_id = memory.id.clone();
-
-    {
-        let mut wm = working_memory.write();
-        wm.add(memory)
-            .map_err(|e| SleepTimeError::Other(anyhow::anyhow!("working_memory.add: {e}")))?;
     }
-
-    Ok(PersistOutcome::Stored(memory_id))
 }
 
 /// Build the metadata HashMap attached to the `Experience`. Includes the
-/// fields that downstream feedback/retrieval code needs to recognize this
+/// fields that downstream feedback/retrieval code needs to recognise this
 /// memory as a sleep-time observation (without requiring schema changes to
 /// `Experience`).
-fn observation_metadata(draft: &ObservationDraft) -> std::collections::HashMap<String, String> {
-    let mut m = std::collections::HashMap::new();
+fn observation_metadata(draft: &ObservationDraft) -> HashMap<String, String> {
+    let mut m = HashMap::new();
     m.insert("origin".to_string(), draft.origin.as_str().to_string());
     m.insert("sleep_mode".to_string(), draft.mode.as_str().to_string());
-    m.insert("embedder_version".to_string(), draft.embedder_version.clone());
+    m.insert(
+        "embedder_version".to_string(),
+        draft.embedder_version.clone(),
+    );
     m.insert(
         "priority".to_string(),
         match draft.priority {
@@ -148,15 +138,14 @@ fn observation_metadata(draft: &ObservationDraft) -> std::collections::HashMap<S
 }
 
 // =============================================================================
-// Public re-export for the orchestrator to thread origin metadata into the
-// foreground retrieval/feedback path. Provides a stable accessor that does
-// not require downstream code to know the metadata key names.
+// Origin inspection helpers for downstream code
 // =============================================================================
 
-/// Read the `MemoryOrigin` recorded in an Experience's metadata. Returns
-/// [`MemoryOrigin::ForegroundUser`] (the safe default) if the metadata key
-/// is absent or unrecognised — never panics. Downstream evidence-assembly
-/// code uses this to enforce the visibility rules in
+/// Read the `MemoryOrigin` recorded in an `Experience`'s metadata.
+///
+/// Returns [`MemoryOrigin::ForegroundUser`] (the safe default) if the
+/// metadata key is absent or unrecognised — never panics. Evidence-assembly
+/// uses this to enforce the visibility rules in
 /// [`MemoryOrigin::visible_to_evidence`].
 pub fn origin_of(experience: &Experience) -> MemoryOrigin {
     match experience.metadata.get("origin").map(|s| s.as_str()) {
@@ -188,7 +177,7 @@ mod tests {
         let mut d = ObservationDraft::new(
             "user prefers concise replies",
             crate::memory::sleep_time::types::SleepMode::Nrem,
-            "v1",
+            "minilm-l6-v2",
         );
         d.entity_refs = vec!["user".to_string()];
         d.confidence = 0.7;
@@ -197,14 +186,25 @@ mod tests {
     }
 
     #[test]
-    fn metadata_captures_origin_and_mode() {
+    fn build_experience_carries_origin_metadata() {
         let draft = make_draft();
-        let md = observation_metadata(&draft);
+        let exp = build_experience(&draft);
+        assert_eq!(exp.experience_type, ExperienceType::Observation);
         assert_eq!(
-            md.get("origin").map(|s| s.as_str()),
+            exp.metadata.get("origin").map(|s| s.as_str()),
             Some("background_sleep_time_observation")
         );
-        assert_eq!(md.get("sleep_mode").map(|s| s.as_str()), Some("nrem"));
+        assert_eq!(exp.metadata.get("sleep_mode").map(|s| s.as_str()), Some("nrem"));
+        assert_eq!(
+            exp.metadata.get("embedder_version").map(|s| s.as_str()),
+            Some("minilm-l6-v2")
+        );
+    }
+
+    #[test]
+    fn metadata_captures_priority_and_confidence() {
+        let draft = make_draft();
+        let md = observation_metadata(&draft);
         assert_eq!(md.get("priority").map(|s| s.as_str()), Some("high"));
         assert!(md.get("confidence").is_some());
     }

@@ -17,8 +17,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::types::{
-    EvidencePack, MemoryOrigin, ObservationDraft, ObservationPriority, RewriteProposal,
-    RewriterOutput, SleepMode, SleepTimeError, SleepTimeResult, SleepTimeTrigger,
+    EdgeProposalDraft, EvidencePack, MemoryOrigin, ObservationDraft, ObservationPriority,
+    RewriteProposal, RewriterOutput, SleepMode, SleepTimeError, SleepTimeResult, SleepTimeTrigger,
 };
 use crate::memory::types::MemoryId;
 
@@ -68,6 +68,27 @@ struct RewriterResponseJson {
     block_proposals: Vec<BlockProposalJson>,
     #[serde(default)]
     observations: Vec<ObservationJson>,
+    /// V2 R43 — only populated by REM-mode prompts. The JSON field name
+    /// `entity_edge_proposals` is verbose deliberately so the LLM does not
+    /// confuse it with `block_proposals`.
+    #[serde(default)]
+    entity_edge_proposals: Vec<EdgeProposalJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EdgeProposalJson {
+    from_entity: String,
+    to_entity: String,
+    #[serde(default = "default_relation")]
+    relation: String,
+    #[serde(default = "default_confidence_json")]
+    confidence: f32,
+    #[serde(default)]
+    rationale: String,
+}
+
+fn default_relation() -> String {
+    "co_occurs".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,12 +235,19 @@ impl AnthropicRewriter {
             SleepMode::Nrem => {
                 "You are operating in NREM mode: integrate recent episodic experience. \
 Stay close to the source. Favour episodic fidelity over abstraction. \
-Do not propose semantic generalisations that go beyond what is explicit in the evidence."
+Do not propose semantic generalisations that go beyond what is explicit in the evidence. \
+You MAY emit `entity_edge_proposals` for entity pairs that co-occur explicitly within a \
+SINGLE memory in the recent evidence (i.e. directly observed co-presence, not cross-session \
+inference). Confidence MUST be at least 0.75 for any NREM edge proposal; lower-confidence \
+co-occurrences belong to REM mode."
             }
             SleepMode::Rem => {
                 "You are operating in REM mode: revisit long-term semantic material. \
 Bounded abstraction is permitted. Look for cross-session patterns supported by entity \
-co-occurrence across the evidence, but do not invent relationships that no evidence supports."
+co-occurrence across the evidence, but do not invent relationships that no evidence supports. \
+You MAY emit `entity_edge_proposals` for entity pairs that co-occur in two or more memories \
+from distinct sessions. Both entity names MUST appear in at least one MEMORY block in the \
+evidence; never invent entity names. Conservative default for `relation` is `co_occurs`."
             }
         };
 
@@ -253,6 +281,15 @@ You MUST respond with a single JSON object of this exact shape:
       "confidence": 0.7,
       "priority": "high" | "medium" | "low"
     }}
+  ],
+  "entity_edge_proposals": [
+    {{
+      "from_entity": "<entity name from evidence>",
+      "to_entity": "<entity name from evidence>",
+      "relation": "co_occurs",
+      "confidence": 0.7,
+      "rationale": "<short citation of source memory IDs>"
+    }}
   ]
 }}
 
@@ -266,7 +303,7 @@ Rules:
 - Do not include any prose outside the JSON object.
 
 If the evidence is insufficient, emit:
-{{"block_proposals": [], "observations": []}}"#
+{{"block_proposals": [], "observations": [], "entity_edge_proposals": []}}"#
         )
     }
 
@@ -494,11 +531,62 @@ If the evidence is insufficient, emit:
             observations.push(draft);
         }
 
+        // V2 R43 + R66 — edge proposals. Both modes may emit them; NREM
+        // is the lower-confidence path (recent-experience co-occurrence)
+        // so it gets a stricter threshold to avoid graph noise. REM is
+        // the canonical path for cross-session pattern-based proposals.
+        let mut edge_proposals = Vec::new();
+        let conf_threshold = match pack.mode {
+            SleepMode::Nrem => 0.75, // strict — NREM proposes only what's clearly co-present
+            SleepMode::Rem => 0.6,
+        };
+        for ep in parsed_json.entity_edge_proposals {
+            // R51-lite (V2 stage 1): LLM-asserted confidence threshold.
+            // Full NER-confidence integration lands in a follow-up that
+            // pipes through `neural_ner` scores per entity.
+            let conf = ep.confidence.clamp(0.0, 1.0);
+            if conf < conf_threshold {
+                continue;
+            }
+            if ep.from_entity.trim().is_empty() || ep.to_entity.trim().is_empty() {
+                continue;
+            }
+            if ep.from_entity.eq_ignore_ascii_case(&ep.to_entity) {
+                // Don't propose self-loops — they convey no new edge information.
+                continue;
+            }
+            // R54-lite (V2 stage 1): both entities must appear in some
+            // evidence memory's `entity_refs`. Graph-id resolution is
+            // re-checked at apply time in the worker (where the
+            // user's `GraphMemory` is in scope).
+            let from_present = pack.memories.iter().any(|m| {
+                m.entity_refs
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(&ep.from_entity))
+            });
+            let to_present = pack.memories.iter().any(|m| {
+                m.entity_refs
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(&ep.to_entity))
+            });
+            if !from_present || !to_present {
+                continue;
+            }
+            edge_proposals.push(EdgeProposalDraft {
+                from_entity: ep.from_entity,
+                to_entity: ep.to_entity,
+                relation: ep.relation,
+                confidence: conf,
+                rationale: ep.rationale,
+            });
+        }
+
         let total_tokens = parsed.usage.input_tokens + parsed.usage.output_tokens;
 
         Ok(RewriterOutput {
             proposals,
             observations,
+            edge_proposals,
             total_tokens,
             model: self.model.clone(),
             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -571,6 +659,7 @@ impl MockRewriter {
             Ok(RewriterOutput {
                 proposals: Vec::new(),
                 observations: Vec::new(),
+                edge_proposals: Vec::new(),
                 total_tokens: 0,
                 model: self.model.clone(),
                 elapsed_ms: 0,
@@ -617,6 +706,7 @@ mod tests {
         m.push(RewriterOutput {
             proposals: vec![],
             observations: vec![],
+            edge_proposals: vec![],
             total_tokens: 42,
             model: "test-model".into(),
             elapsed_ms: 1,
