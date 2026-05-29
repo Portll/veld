@@ -3,12 +3,12 @@
 Veld is a single binary. Deployment is "put the binary somewhere and run it
 as a service."
 
-```admonish warning
-`v0.7.6-unstable` is not yet production-hardened. For desktop/developer use
-the current branch works well; for production multi-tenant deployment, wait
-for the v0.9 release. See [PROGRESS.md](https://github.com/Portll/veld/blob/main/PROGRESS.md)
-for status.
-```
+> **⚠️ Production readiness**
+>
+> `v0.7.6-unstable` is not yet production-hardened. For desktop/developer use
+> the current branch works well; for production multi-tenant deployment, wait
+> for the v0.9 release. See [PROGRESS.md](https://github.com/Portll/veld/blob/main/PROGRESS.md)
+> for status.
 
 ## Local desktop
 

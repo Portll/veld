@@ -1,7 +1,8 @@
 <!-- GENERATED FILE — do not edit by hand.
      Source: src/errors.rs
      Generator: docs/generators/src/bin/gen-errors.rs
-     Regenerate: cd docs/generators && cargo run --bin gen-errors -->
+     Regenerate: bash docs/regenerate.sh
+     (or, inside docs/generators/, run `cargo run --bin gen-errors`) -->
 
 # Error Reference
 

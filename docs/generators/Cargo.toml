@@ -4,10 +4,11 @@
 # into veld's root workspace at `../../Cargo.toml`). Generators read veld's
 # source files and emit markdown into `../src/reference/`.
 #
-# Run:
-#   cd docs/generators && cargo run --bin gen-http-api
-#   cd docs/generators && cargo run --bin gen-mcp-tools
-#   cd docs && bash regenerate.sh        # runs all cheap generators
+# Run (works in POSIX shells and PowerShell when Git Bash is on PATH):
+#   bash docs/regenerate.sh                              # runs all generators
+# Or, individually (also POSIX/PowerShell-portable — no &&):
+#   cargo run --bin gen-http-api --manifest-path docs/generators/Cargo.toml
+#   cargo run --bin gen-mcp-tools --manifest-path docs/generators/Cargo.toml
 #
 # Pre-commit hook (see `../regenerate.sh`) runs the cheap ones; CI runs all.
 

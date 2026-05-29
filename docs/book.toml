@@ -2,7 +2,6 @@
 title = "Veld — Agentic Memory"
 authors = ["Portll"]
 language = "en"
-multilingual = false
 src = "src"
 
 [output.html]
@@ -11,13 +10,13 @@ site-url = "/veld/"
 git-repository-url = "https://github.com/Portll/veld"
 edit-url-template = "https://github.com/Portll/veld/edit/main/docs/{path}"
 
-[output.linkcheck]
+# Note: [output.linkcheck] is intentionally omitted. mdbook-linkcheck 0.7.x
+# is incompatible with current mdBook (RenderContext schema drift). If/when a
+# compatible version ships, re-enable here. Until then, broken-link checks
+# happen in CI via a separate tool (lychee or equivalent).
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
 
 [preprocessor.toc]
 command = "mdbook-toc"
-
-[preprocessor.admonish]
-command = "mdbook-admonish"
