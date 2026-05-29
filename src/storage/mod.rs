@@ -7,6 +7,7 @@
 pub mod legacy_rocksdb;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
+pub mod relational;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
