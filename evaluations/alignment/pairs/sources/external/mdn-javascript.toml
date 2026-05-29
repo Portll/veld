@@ -1,8 +1,0 @@
-domain = "web_development"
-kind = "filesystem"
-path = "evaluations/alignment/pairs/_external/mdn-content/files/en-us/web/javascript"
-extensions = ["md"]
-license = "CC-BY-SA-2.5"
-source = "mdn-javascript"
-min_chunk = 256
-max_chunk = 2048
