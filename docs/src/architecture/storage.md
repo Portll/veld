@@ -5,12 +5,12 @@ Veld's storage is behind a trait abstraction in
 `PrimaryMemoryStore`, `GraphStore`, `KeyValueStore`. Two backends implement
 these traits.
 
-```admonish warning
-The default-*requested* backend is Redb, but the *effective* runtime engine
-is still RocksDB until v0.9 — see [decision 0001](../decisions/0001-redb-migration.md).
-Code that targets the trait surface lands ready for the eventual cutover;
-code that uses RocksDB concrete types directly will need to be reworked.
-```
+> **⚠️ Storage backend reality**
+>
+> The default-*requested* backend is Redb, but the *effective* runtime engine
+> is still RocksDB until v0.9 — see [decision 0001](../decisions/0001-redb-migration.md).
+> Code that targets the trait surface lands ready for the eventual cutover;
+> code that uses RocksDB concrete types directly will need to be reworked.
 
 | Backend | Crate | Status |
 |---|---|---|

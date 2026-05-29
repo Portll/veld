@@ -1,7 +1,8 @@
 <!-- GENERATED FILE — do not edit by hand.
      Source: src/**/*.rs (register_* macro calls)
      Generator: docs/generators/src/bin/gen-metrics.rs
-     Regenerate: cd docs/generators && cargo run --bin gen-metrics -->
+     Regenerate: bash docs/regenerate.sh
+     (or, inside docs/generators/, run `cargo run --bin gen-metrics`) -->
 
 # Metrics Reference
 
