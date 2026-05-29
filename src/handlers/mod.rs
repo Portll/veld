@@ -60,6 +60,9 @@ pub mod admin;
 // Context blocks (Letta-style mutable agent state)
 pub mod context_blocks;
 
+// Datasets (W7 — relational-backed tabular storage)
+pub mod datasets;
+
 // A/B testing
 pub mod ab_testing;
 

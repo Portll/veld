@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, admin, compression, consolidation, context_blocks, crud, external_dimensions,
-    facts, files, gap_analysis, graph, health, ingest, integrations, lineage, mif, prompt_gen,
-    recall, remember, search, seed, sessions, todos, user_auth, users, visualization, webhooks,
+    ab_testing, admin, compression, consolidation, context_blocks, crud, datasets,
+    external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
+    mif, prompt_gen, recall, remember, search, seed, sessions, todos, user_auth, users,
+    visualization, webhooks,
 };
 
 /// Application state type alias
@@ -621,6 +622,16 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/search/multimodal", post(search::multimodal_search))
         .route("/api/search/robotics", post(search::robotics_search))
+        // =================================================================
+        // DATASETS (W7 — relational-backed tabular storage)
+        // =================================================================
+        .route("/api/datasets", post(datasets::create_dataset))
+        .route("/api/datasets", get(datasets::list_datasets))
+        .route("/api/datasets/{name}", get(datasets::get_dataset_metadata))
+        .route("/api/datasets/{name}", delete(datasets::drop_dataset))
+        .route("/api/datasets/{name}/rows", post(datasets::insert_rows))
+        .route("/api/datasets/{name}/query", post(datasets::query_dataset))
+        .route("/api/datasets/{name}/link", post(datasets::link_row))
         // =================================================================
         // MIF (Memory Interchange Format) v2
         // =================================================================
