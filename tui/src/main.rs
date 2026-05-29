@@ -1763,6 +1763,16 @@ async fn run_tui(
                     // Normal mode keybindings
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('?') | KeyCode::F(1) => {
+                            // Open the embedded docs (served by `veld server`
+                            // at /docs/) in the user's default browser.
+                            // base_url is the active veld HTTP root, so the
+                            // docs URL is just base_url + "/docs/".
+                            let docs_url = format!("{}/docs/", base_url.trim_end_matches('/'));
+                            if let Err(e) = webbrowser::open(&docs_url) {
+                                g.set_error(format!("Could not open browser: {e}"));
+                            }
+                        }
                         KeyCode::Esc => {
                             // Exit detail panel focus first, then clear event selection, then quit
                             if g.focus_panel == FocusPanel::Detail {
