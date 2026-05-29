@@ -709,11 +709,18 @@ impl super::MemorySystem {
         } else {
             (0, 0)
         };
-        if facts_decayed > 0 || facts_deleted > 0 {
+        // 3.6. Purge-retention reaper.
+        let facts_reaped = if is_heavy {
+            self.reap_purged_facts_for_all_users().unwrap_or(0)
+        } else {
+            0
+        };
+        if facts_decayed > 0 || facts_deleted > 0 || facts_reaped > 0 {
             tracing::debug!(
-                "Temporal fact maintenance: {} decayed, {} deleted",
+                "Temporal fact maintenance: {} decayed, {} deleted, {} reaped",
                 facts_decayed,
-                facts_deleted
+                facts_deleted,
+                facts_reaped
             );
         }
 

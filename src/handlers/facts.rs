@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::memory::{self, FactCluster, SemanticFact, TemporalFact};
+use crate::memory::{self, FactCluster, PurgeReason, SemanticFact, TemporalFact};
 use crate::validation;
 use std::sync::Arc;
 
@@ -366,6 +366,241 @@ pub async fn search_temporal_facts(
 }
 
 // =============================================================================
+// FACT PURGE (destructive — Phase C)
+// =============================================================================
+//
+// Per-user write barrier for destructive purge operations. Mirrors the
+// CONSOLIDATION_LOCKS pattern in `consolidation.rs` (CLAUDE.md). Purge bursts
+// against the same user are serialised; concurrent purges across users
+// proceed in parallel.
+//
+// Acquired by `facts_purge` for the entire destructive call (predicate
+// evaluation + `purged_at` writes + context-block DIRTY-flag scan). The
+// contradiction-detector reads facts with `find_by_entity_filtered(.., false)`
+// which excludes purged records via `is_active`, so contradiction never
+// overwrites `valid_until` on a fact we just purged.
+static FACT_PURGE_LOCKS: std::sync::LazyLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// UUID v4 regex (8-4-4-4-12 hex). Compiled once. Used by the context-block
+/// DIRTY scan: any UUID-shape substring found inside a context block's
+/// content is a *candidate* fact reference; false positives are tolerated
+/// because the DIRTY entries are advisory (sleep-time V2 reconciles).
+static UUID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+    )
+    .expect("UUID regex must compile at startup")
+});
+
+fn default_dry_run() -> bool {
+    true
+}
+
+/// Request for `POST /api/facts/purge`. The destructive route — distinct from
+/// `/api/facts/preview-purge` so that a misconfigured client cannot escalate
+/// to deletion via field-flipping on a single endpoint.
+///
+/// `dry_run` defaults to `true` (safe-by-default). Setting `false` performs
+/// the soft-delete: matching facts get `purged_at = now()`, `purge_reason =
+/// PatternMatch { pattern_hash }`. They become invisible to all
+/// `SemanticFactStore` reader paths via the `is_active` filter, and the reaper
+/// hard-deletes them after `VELD_PURGE_RETENTION_DAYS` (default 30).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactsPurgeRequest {
+    pub user_id: String,
+    pub pattern: String,
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FactsPurgeResponse {
+    pub success: bool,
+    pub dry_run: bool,
+    /// Exact count of matching facts (when dry_run) or the count of facts
+    /// actually soft-purged (when !dry_run). Exposes precise numbers here
+    /// because the route requires the same auth as `preview-purge` and is
+    /// already implicitly destructive — the oracle concern (bucketed counts
+    /// on the preview surface) does not apply to the explicit operator path.
+    pub purged: usize,
+    pub total_scanned: usize,
+    /// Number of context blocks flagged DIRTY because their content contained
+    /// a UUID-shape substring matching a purged fact id. Advisory only —
+    /// sleep-time V2 reconciles. Always `0` for dry runs.
+    pub context_blocks_flagged: usize,
+    pub audit_recorded: bool,
+}
+
+/// `POST /api/facts/purge` — soft-delete facts matching a substring pattern.
+///
+/// Acquires the per-user `FACT_PURGE_LOCKS` mutex; serialises against
+/// concurrent purges for the same user. The contradiction-detector reads
+/// purged facts as inactive (Phase A `is_active` integration), so it cannot
+/// race-write `valid_until` on a record we're purging.
+///
+/// Hosaka collective: **no replication-aware purge needed**. The
+/// `collective_store` extension aggregates population-level retrieval weights
+/// from feedback events, not individual facts. Purging a fact does NOT remove
+/// historical feedback that was already aggregated into weights — this is
+/// documented in `SECURITY.md` as expected behavior, not a leak.
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, dry_run = req.dry_run))]
+pub async fn facts_purge(
+    State(state): State<AppState>,
+    Json(req): Json<FactsPurgeRequest>,
+) -> Result<Json<FactsPurgeResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    if req.pattern.len() < FACTS_PREVIEW_PURGE_MIN_PATTERN_LEN {
+        return Err(AppError::InvalidInput {
+            field: "pattern".into(),
+            reason: format!(
+                "Must be at least {} characters to prevent accidental mass deletion",
+                FACTS_PREVIEW_PURGE_MIN_PATTERN_LEN
+            ),
+        });
+    }
+
+    let lock = FACT_PURGE_LOCKS
+        .entry(req.user_id.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
+    let memory = state
+        .get_user_earth(&req.user_id)
+        .map_err(AppError::Internal)?;
+    let user_id = req.user_id.clone();
+    let pattern_lower = req.pattern.to_lowercase();
+    let dry_run = req.dry_run;
+
+    // SHA-256 hash of the pattern for both PurgeReason::PatternMatch and audit
+    // log. Raw pattern never persists anywhere on the fact record.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(req.pattern.as_bytes());
+    let pattern_hash = format!("{:x}", hasher.finalize());
+
+    let reason_for_method = PurgeReason::PatternMatch {
+        pattern_hash: pattern_hash.clone(),
+    };
+
+    let memory_clone = memory.clone();
+    let user_id_for_blocking = user_id.clone();
+    let pattern_lower_clone = pattern_lower.clone();
+
+    let (purged_count, total_scanned, purged_ids) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize, Vec<String>)> {
+            let memory_guard = memory_clone.read();
+            if dry_run {
+                let facts = memory_guard
+                    .fact_store()
+                    .list(&user_id_for_blocking, 10_000)?;
+                let total = facts.len();
+                let matched: Vec<String> = facts
+                    .iter()
+                    .filter(|f| f.fact.to_lowercase().contains(&pattern_lower_clone))
+                    .map(|f| f.id.clone())
+                    .collect();
+                Ok((matched.len(), total, Vec::new()))
+            } else {
+                // Re-list to capture ids of facts we're about to purge, then
+                // delegate to MemorySystem::purge_facts which writes purged_at
+                // + purge_reason. The two-pass approach keeps the predicate
+                // closure simple and the id capture explicit.
+                let facts = memory_guard
+                    .fact_store()
+                    .list(&user_id_for_blocking, 10_000)?;
+                let pattern_for_predicate = pattern_lower_clone.clone();
+                let target_ids: Vec<String> = facts
+                    .iter()
+                    .filter(|f| f.fact.to_lowercase().contains(&pattern_for_predicate))
+                    .map(|f| f.id.clone())
+                    .collect();
+                let target_id_set: std::collections::HashSet<String> =
+                    target_ids.iter().cloned().collect();
+                let (purged, total) = memory_guard.purge_facts(
+                    &user_id_for_blocking,
+                    |f| target_id_set.contains(&f.id),
+                    reason_for_method,
+                )?;
+                Ok((purged, total, target_ids))
+            }
+        })
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?;
+
+    let context_blocks_flagged = if !dry_run && !purged_ids.is_empty() {
+        scan_context_blocks_for_dead_refs(&state, &user_id, &purged_ids)
+    } else {
+        0
+    };
+
+    let details = format!(
+        "facts.purge pattern_hash={} dry_run={} purged={} scanned={} blocks_flagged={}",
+        &pattern_hash[..16],
+        dry_run,
+        purged_count,
+        total_scanned,
+        context_blocks_flagged
+    );
+    let event_type = if dry_run {
+        "facts.purge.dryrun"
+    } else {
+        "facts.purge"
+    };
+    state.log_event(&req.user_id, event_type, "", &details);
+
+    Ok(Json(FactsPurgeResponse {
+        success: true,
+        dry_run,
+        purged: purged_count,
+        total_scanned,
+        context_blocks_flagged,
+        audit_recorded: true,
+    }))
+}
+
+/// Scan every context block for the user for UUID-shape substrings; if any
+/// match a purged fact id, emit an audit `context_block.dirty` event with
+/// the candidate ids in the details payload. Sleep-time V2 (deferred) will
+/// consume these events to rewrite affected blocks.
+///
+/// Returns the number of context blocks flagged.
+fn scan_context_blocks_for_dead_refs(
+    state: &AppState,
+    user_id: &str,
+    purged_ids: &[String],
+) -> usize {
+    let purged_set: std::collections::HashSet<&str> =
+        purged_ids.iter().map(String::as_str).collect();
+    let blocks = match state.context_block_store.list(user_id) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    let mut flagged = 0;
+    for block in blocks {
+        let candidate_ids: Vec<&str> = UUID_RE
+            .find_iter(&block.content)
+            .map(|m| m.as_str())
+            .filter(|s| purged_set.contains(*s))
+            .collect();
+        if !candidate_ids.is_empty() {
+            let details = format!(
+                "context_block={} candidates={}",
+                block.key,
+                candidate_ids.join(",")
+            );
+            state.log_event(user_id, "context_block.dirty", &block.key, &details);
+            flagged += 1;
+        }
+    }
+    flagged
+}
+
+// =============================================================================
 // FACT PREVIEW PURGE (read-only, dry-run-locked)
 // =============================================================================
 
@@ -388,7 +623,7 @@ pub enum FactsPreviewPurgeBucket {
 }
 
 impl FactsPreviewPurgeBucket {
-    fn from_count(n: usize) -> Self {
+    pub(crate) fn from_count(n: usize) -> Self {
         match n {
             0 => Self::None,
             1..=5 => Self::Few,
@@ -588,4 +823,67 @@ pub async fn fact_narratives(
         total_facts,
         total_clusters,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FactsPreviewPurgeBucket, FactsPreviewPurgeRequest};
+
+    #[test]
+    fn preview_purge_bucket_boundaries() {
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(0),
+            FactsPreviewPurgeBucket::None
+        ));
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(1),
+            FactsPreviewPurgeBucket::Few
+        ));
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(5),
+            FactsPreviewPurgeBucket::Few
+        ));
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(6),
+            FactsPreviewPurgeBucket::Some
+        ));
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(50),
+            FactsPreviewPurgeBucket::Some
+        ));
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(51),
+            FactsPreviewPurgeBucket::Many
+        ));
+        assert!(matches!(
+            FactsPreviewPurgeBucket::from_count(10_000),
+            FactsPreviewPurgeBucket::Many
+        ));
+    }
+
+    /// `deny_unknown_fields` rejects requests carrying a `dry_run` field — the
+    /// structural test-guard for TIER-CREEP-SILENT-DESTRUCTION from
+    /// `evaluations/breakers-revised-plan-p2-final-2026-05-29.json`. A future
+    /// developer who tries to "unlock" destructive purge by setting
+    /// `dry_run: false` on this endpoint hits a 400 instead of a destructive
+    /// path. The actual delete lives on a separate route (Phase C).
+    #[test]
+    fn dry_run_field_in_request_body_is_rejected() {
+        let body = r#"{"user_id":"u1","pattern":"abc","dry_run":false}"#;
+        let err = serde_json::from_str::<FactsPreviewPurgeRequest>(body)
+            .expect_err("dry_run field must be rejected by deny_unknown_fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dry_run") || msg.contains("unknown field"),
+            "expected deny_unknown_fields error mentioning dry_run, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn preview_purge_valid_body_deserializes() {
+        let body = r#"{"user_id":"u1","pattern":"abc"}"#;
+        let req: FactsPreviewPurgeRequest = serde_json::from_str(body).expect("valid body");
+        assert_eq!(req.user_id, "u1");
+        assert_eq!(req.pattern, "abc");
+    }
 }
