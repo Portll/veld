@@ -205,6 +205,10 @@ pub struct RecallResponse {
     /// Mem0's token-efficiency benchmarks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_estimated: Option<usize>,
+    /// Query-level metacognition (M3): a returned feeling-of-knowing scalar +
+    /// label. Advisory; a terminal readout never fed into learning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metacognition: Option<crate::memory::types::QueryMetacognition>,
 }
 
 impl RecallResponse {
@@ -1035,6 +1039,7 @@ mod tests {
             lineage: vec![],
             lineage_count: None,
             tokens_estimated: None,
+            metacognition: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("memories"));

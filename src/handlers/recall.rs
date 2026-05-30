@@ -837,6 +837,46 @@ pub async fn recall(
         Some(triggered_reminders.len())
     };
 
+    // M3: assemble the query-level feeling-of-knowing readout. Advisory and
+    // terminal — it never feeds back into scoring or adaptive weight learning.
+    let meta_opt = memory.read().last_query_metacognition();
+    let metacognition = meta_opt.map(|mut meta| {
+        let top = recall_memories.first().map(|m| m.score).unwrap_or(0.0).max(0.0);
+        let second = recall_memories.get(1).map(|m| m.score).unwrap_or(0.0).max(0.0);
+        meta.peak_confidence = if top + second > 0.0 { top / (top + second) } else { 0.0 };
+        meta.answerability = if top > 0.0 { top / (top + 1.0) } else { 0.0 };
+        // M5 link: does the query sit in a known unresolved knowledge gap?
+        if !meta.focal_entities.is_empty() {
+            if let Ok(store) = state.get_user_slow_store(&req.user_id) {
+                if let Ok(hits) =
+                    store.gaps_touching_entities(&req.user_id, &meta.focal_entities, 1)
+                {
+                    meta.in_known_gap = !hits.is_empty();
+                }
+            }
+            meta.signal_strength = "score+gap".to_string();
+        }
+        let mut fok = if let Some(agr) = meta.cross_embedder_agreement {
+            0.4 * meta.peak_confidence + 0.35 * meta.answerability + 0.25 * agr
+        } else {
+            0.5 * meta.peak_confidence + 0.5 * meta.answerability
+        };
+        if meta.in_known_gap {
+            // We know this region of the graph is under-connected — damp confidence.
+            fok *= 0.8;
+        }
+        meta.fok = fok.clamp(0.0, 1.0);
+        meta.label = if meta.fok >= 0.66 {
+            "high"
+        } else if meta.fok >= 0.4 {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_string();
+        meta
+    });
+
     let mut resp = RecallResponse {
         memories: recall_memories,
         count,
@@ -850,6 +890,7 @@ pub async fn recall(
         lineage,
         lineage_count,
         tokens_estimated: None,
+        metacognition,
     };
     resp.tokens_estimated = Some(resp.estimate_tokens());
     Ok(Json(resp))
