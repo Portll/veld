@@ -37,6 +37,16 @@ pub struct IngestRequest {
     pub importance: Option<f32>,
     #[serde(default, alias = "experience_type")]
     pub memory_type: Option<String>,
+    /// W7 tabular mode: when `true` and the content is CSV or JSON, store
+    /// the input as a relational dataset (one row per record) instead of a
+    /// single free-text memory. Requires a configured relational backend.
+    /// Default `false` preserves the memory-storing behaviour.
+    #[serde(default)]
+    pub tabular: bool,
+    /// Optional dataset name for tabular mode. Defaults to the filename
+    /// stem, or `ingest_dataset` when no filename is given.
+    #[serde(default)]
+    pub dataset_name: Option<String>,
 }
 
 /// Ingest response - remember response plus extraction metadata
@@ -46,6 +56,12 @@ pub struct IngestResponse {
     pub success: bool,
     pub format_detected: String,
     pub metadata: IngestMetadata,
+    /// Tabular mode only: the dataset that was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    /// Tabular mode only: how many rows were inserted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_inserted: Option<u64>,
 }
 
 /// Extraction metadata returned alongside the stored memory
@@ -84,6 +100,11 @@ pub async fn ingest(
     // ── Format detection and extraction ─────────────────────────────────
     let format = ingest::detect_format(req.filename.as_deref(), &req.content);
     let format_label = format.as_str().to_string();
+
+    // ── Tabular mode: structured input → a relational dataset, not memory ─
+    if req.tabular {
+        return ingest_tabular(&state, &req, format, format_label).await;
+    }
 
     let (processed_content, extraction_metadata) = if format != ingest::InputFormat::PlainText {
         match ingest::extract_text(&req.content, format) {
@@ -278,5 +299,87 @@ pub async fn ingest(
         success: true,
         format_detected: format_label,
         metadata: extraction_metadata,
+        dataset: None,
+        rows_inserted: None,
+    }))
+}
+
+/// Derive a dataset name from a filename: the stem (text before the first
+/// `.`) of the final path component. Empty / dotfile inputs fall back to the
+/// caller's default.
+fn dataset_name_from_filename(filename: &str) -> Option<String> {
+    let base = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename);
+    let stem = base.split('.').next().unwrap_or(base);
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+/// Tabular ingest path: parse CSV/JSON into a dataset schema + rows and
+/// persist them through the configured relational [`crate::datasets::DatasetStore`].
+/// Returns `503` when no relational backend is configured.
+async fn ingest_tabular(
+    state: &AppState,
+    req: &IngestRequest,
+    format: ingest::InputFormat,
+    format_label: String,
+) -> Result<Json<IngestResponse>, AppError> {
+    let store = state.dataset_store.clone().ok_or_else(|| {
+        AppError::ServiceUnavailable(
+            "tabular ingest requires a configured relational backend (set VELD_RELATIONAL_BACKEND)"
+                .to_string(),
+        )
+    })?;
+
+    let dataset_name = req
+        .dataset_name
+        .clone()
+        .or_else(|| req.filename.as_deref().and_then(dataset_name_from_filename))
+        .unwrap_or_else(|| "ingest_dataset".to_string());
+
+    let (schema, rows) = ingest::tabular::to_dataset(format, &req.content, &dataset_name)
+        .map_err(|e| AppError::InvalidInput {
+            field: "content".to_string(),
+            reason: e.to_string(),
+        })?;
+
+    let dref = store
+        .create_dataset(&req.user_id, &schema)
+        .await
+        .map_err(|e| match e {
+            crate::datasets::DatasetError::AlreadyExists(name) => AppError::InvalidInput {
+                field: "dataset_name".to_string(),
+                reason: format!("dataset '{name}' already exists — choose a different dataset_name"),
+            },
+            other => AppError::Internal(anyhow::anyhow!("create dataset: {other}")),
+        })?;
+
+    let inserted = store
+        .insert_rows(&dref, &rows)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("insert rows: {e}")))?;
+
+    metrics::MEMORY_STORE_TOTAL
+        .with_label_values(&["success"])
+        .inc();
+
+    Ok(Json(IngestResponse {
+        id: dref.name.clone(),
+        success: true,
+        format_detected: format_label,
+        metadata: IngestMetadata {
+            title: None,
+            headings: vec![],
+            entities_hint: vec![],
+            line_count: 0,
+            word_count: 0,
+        },
+        dataset: Some(dref.name),
+        rows_inserted: Some(inserted),
     }))
 }
