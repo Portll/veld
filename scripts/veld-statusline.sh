@@ -7,6 +7,23 @@
 # Configuration
 VELD_API="${VELD_API_URL:-http://127.0.0.1:3030}"
 
+# Resolve API key: the context-status POST route is authenticated (only the GET
+# is public), so without a key the server returns 401 and the session never
+# registers. VELD_API_KEY env wins; otherwise read `api_key` from config.toml.
+# (The cross-platform path is hooks/statusline.ts; this script is Unix-only.)
+API_KEY="${VELD_API_KEY:-}"
+if [ -z "$API_KEY" ]; then
+    if [ "$(uname)" = "Darwin" ]; then
+        CONFIG="$HOME/Library/Application Support/veld/config.toml"
+    else
+        CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/veld/config.toml"
+    fi
+    if [ -f "$CONFIG" ]; then
+        API_KEY=$(grep -E '^[[:space:]]*api_key[[:space:]]*=' "$CONFIG" | head -1 \
+            | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^["'"'"']//; s/["'"'"']$//')
+    fi
+fi
+
 # Read JSON from stdin
 input=$(cat)
 
@@ -32,6 +49,7 @@ fi
 # POST to veld backend (fire and forget, don't block status line)
 curl -s -X POST "${VELD_API}/api/context_status" \
     -H "Content-Type: application/json" \
+    ${API_KEY:+-H "X-API-Key: $API_KEY"} \
     -d "{\"session_id\": \"$SESSION_ID\", \"tokens_used\": $CURRENT_TOKENS, \"tokens_budget\": $CONTEXT_SIZE, \"current_dir\": \"$CWD\", \"model\": \"$MODEL\"}" \
     >/dev/null 2>&1 &
 
