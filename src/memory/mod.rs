@@ -6738,3 +6738,94 @@ fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
 
     chains
 }
+
+#[cfg(test)]
+mod reconsolidation_expiry_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn shadow_for(
+        id: &MemoryId,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        count: u32,
+    ) -> types::ReconsolidationShadow {
+        types::ReconsolidationShadow {
+            memory_id: id.clone(),
+            opened_at: expires_at - chrono::Duration::seconds(300),
+            expires_at,
+            retrieval_context: "test query".to_string(),
+            consecutive_retrieval_count: count,
+            last_retrieval_at: expires_at,
+        }
+    }
+
+    #[test]
+    fn disabled_dials_is_a_noop_and_retains_shadows() {
+        let (sys, _tmp) = fresh_system();
+        let now = chrono::Utc::now();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            id.clone(),
+            shadow_for(&id, now - chrono::Duration::seconds(10), 1),
+        );
+
+        // Default dials: reconsolidation disabled -> no-op, shadow retained (parity).
+        let stats = sys.run_reconsolidation_expiry(now);
+        assert_eq!(stats, ReconsolidationStats::default());
+        assert!(sys.has_active_shadow(&id), "shadow must survive when disabled");
+    }
+
+    #[test]
+    fn enabled_drains_only_expired_non_working_shadows() {
+        let (sys, _tmp) = fresh_system();
+        sys.set_cognitive_dials(CognitiveDials {
+            reconsolidation_enabled: true,
+            ..Default::default()
+        });
+        let now = chrono::Utc::now();
+
+        // Expired, not working-memory-class -> drained.
+        let expired_id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            expired_id.clone(),
+            shadow_for(&expired_id, now - chrono::Duration::seconds(10), 1),
+        );
+        // Not yet expired -> retained.
+        let fresh_id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            fresh_id.clone(),
+            shadow_for(&fresh_id, now + chrono::Duration::seconds(300), 1),
+        );
+        // Expired but working-memory-class (count >= threshold) -> retained.
+        let working_id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            working_id.clone(),
+            shadow_for(
+                &working_id,
+                now - chrono::Duration::seconds(10),
+                crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD,
+            ),
+        );
+
+        let stats = sys.run_reconsolidation_expiry(now);
+        // Only the expired non-working shadow drains; applied=0 (no tiered memory).
+        assert_eq!(stats.expired, 1, "exactly one shadow expired");
+        assert_eq!(stats.applied, 0, "no tiered memory to apply to");
+        assert!(!sys.has_active_shadow(&expired_id), "expired shadow drained");
+        assert!(sys.has_active_shadow(&fresh_id), "unexpired shadow retained");
+        assert!(
+            sys.has_active_shadow(&working_id),
+            "working-memory-class shadow retained"
+        );
+    }
+}
