@@ -150,6 +150,57 @@ impl CognitiveDials {
             || self.re_encode_entity_enrich
             || self.re_encode_embedding_nudge
     }
+
+    /// Seed dials from process environment (`VELD_*`), overlaying [`Default`]. Used at
+    /// `MemorySystem` construction. Unset vars keep the (inert) default. Result is
+    /// [`sanitized`](Self::sanitized). Recognized vars:
+    /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
+    /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND}`,
+    /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT}`.
+    pub fn from_env() -> Self {
+        fn env_bool(key: &str) -> Option<bool> {
+            std::env::var(key).ok().map(|v| {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("true") || v == "1"
+            })
+        }
+        fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+            std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
+        }
+
+        let mut d = Self::default();
+        if let Some(v) = env_bool("VELD_RECONSOLIDATION_ENABLED") {
+            d.reconsolidation_enabled = v;
+        }
+        if let Some(v) = env_parse::<i64>("VELD_RECONSOLIDATION_WINDOW_SECS") {
+            d.reconsolidation_window_secs = v;
+        }
+        if let Some(v) = env_bool("VELD_RECONSOLIDATION_GRAPH_STRENGTHEN") {
+            d.re_encode_graph_strengthen = v;
+        }
+        if let Some(v) = env_parse::<f32>("VELD_RECONSOLIDATION_GRAPH_BOOST_SCALE") {
+            d.graph_boost_scale = v;
+        }
+        if let Some(v) = env_bool("VELD_RECONSOLIDATION_ENTITY_ENRICH") {
+            d.re_encode_entity_enrich = v;
+        }
+        if let Some(v) = env_bool("VELD_RECONSOLIDATION_EMBEDDING_NUDGE") {
+            d.re_encode_embedding_nudge = v;
+        }
+        if let Some(v) = env_parse::<f32>("VELD_RECONSOLIDATION_EMBEDDING_BLEND") {
+            d.embedding_blend = v;
+        }
+        if let Some(v) = env_bool("VELD_DIALS_USE_RERANKING") {
+            d.use_reranking = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_CANDIDATE_COUNT") {
+            d.candidate_count = Some(v);
+        }
+        if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
+            d.rerank_count = Some(v);
+        }
+        d.sanitized()
+    }
 }
 
 #[cfg(test)]
