@@ -55,6 +55,24 @@ impl AsyncApiClient {
 
         Ok(resp.json().await?)
     }
+
+    pub(crate) async fn get<R: for<'de> Deserialize<'de>>(&self, endpoint: &str) -> Result<R> {
+        let url = format!("{}{endpoint}", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("API error {status}: {text}");
+        }
+
+        Ok(resp.json().await?)
+    }
 }
 
 /// HTTP client for the veld API (blocking version for hooks)
