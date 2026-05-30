@@ -743,6 +743,7 @@ impl LegacyMemoryFlatV2 {
 /// `LegacyMemoryFlatV2` so data that was written with `parent_id` / `valid_until`
 /// / metadata calibration still preserves them (V2 would silently drop them).
 #[derive(Deserialize)]
+#[allow(dead_code)] // legacy deserialize struct: fields kept for round-trip, not all read
 struct LegacyMemoryFlatV3 {
     id: MemoryId,
     experience: Experience,

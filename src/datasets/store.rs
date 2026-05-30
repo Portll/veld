@@ -122,9 +122,8 @@ pub fn sanitise_sql_identifier(input: &str) -> String {
     for ch in input.chars() {
         if ch.is_ascii_alphanumeric() {
             out.extend(ch.to_lowercase());
-        } else if ch == '_' {
-            out.push('_');
         } else {
+            // Underscore stays; every other non-alphanumeric collapses to one.
             out.push('_');
         }
     }
@@ -186,6 +185,7 @@ fn validate_row(schema: &DatasetSchema, row: &DatasetRow) -> Result<(), DatasetE
     Ok(())
 }
 
+#[allow(dead_code)] // W7 datasets: in-memory row buffer; not all fields wired yet
 struct InMemoryState {
     schema: DatasetSchema,
     table: String,

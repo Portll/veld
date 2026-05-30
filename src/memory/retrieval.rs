@@ -955,7 +955,7 @@ impl RetrievalEngine {
             let sec_vamana_path = sec_path.join(SECONDARY_VAMANA_INDEX_FILE);
 
             let sec_idx = sec_index.read();
-            if sec_idx.len() > 0 {
+            if !sec_idx.is_empty() {
                 let tmp_path = sec_vamana_path.with_extension("vamana.tmp");
                 match sec_idx.save_to_file(&tmp_path) {
                     Ok(()) => {

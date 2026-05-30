@@ -799,7 +799,7 @@ pub async fn fact_narratives(
 
     let user_id = req.user_id.clone();
     // Clamp to [1, 50]: zero is treated as 1; values above 50 cap at 50.
-    let limit = req.limit.max(1).min(50);
+    let limit = req.limit.clamp(1, 50);
     let entity_filter = req
         .entity_filter
         .as_deref()
