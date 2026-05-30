@@ -2472,18 +2472,32 @@ impl super::MemorySystem {
                     .clamp(0.0, 1.0)
                     * 0.08;
 
-                // Signal 9: Episode ID coherence — same-episode memories get boost
-                let episode_boost = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .and_then(|c| c.episode.episode_id.as_ref())
-                    .and_then(|mem_ep| {
-                        query.episode_id.as_ref().and_then(|q_ep| {
-                            if mem_ep == q_ep { Some(0.08_f32) } else { None }
-                        })
-                    })
-                    .unwrap_or(0.0);
+                // Signal 9: graded temporal-context contiguity (E6 TCM). When the
+                // memory carries a context_drift snapshot and a live drift state
+                // exists, boost by cosine proximity between the current subjective
+                // context and the memory's encoding context — graded contiguity
+                // replacing brittle episode_id equality. Falls back to binary
+                // episode_id coherence for memories without a snapshot (pre-E6 or
+                // sync-path) or before any encode has seeded the drift state.
+                let episode_boost = {
+                    let cur = self.tcm_context.read();
+                    let md = &mem.when.context_drift;
+                    if !cur.is_empty() && md.len() == cur.len() {
+                        let dot: f32 = cur.iter().zip(md.iter()).map(|(a, b)| a * b).sum();
+                        dot.max(0.0) * 0.08
+                    } else {
+                        mem.experience
+                            .context
+                            .as_ref()
+                            .and_then(|c| c.episode.episode_id.as_ref())
+                            .and_then(|mem_ep| {
+                                query.episode_id.as_ref().and_then(|q_ep| {
+                                    if mem_ep == q_ep { Some(0.08_f32) } else { None }
+                                })
+                            })
+                            .unwrap_or(0.0)
+                    }
+                };
 
                 // Signal 10: Source type multiplier on credibility
                 let source_type_mult = mem

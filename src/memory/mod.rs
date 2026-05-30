@@ -335,6 +335,14 @@ pub struct MemorySystem {
     /// adaptive weight learning. The handler assembles the final score from this.
     last_query_metacognition: Arc<parking_lot::RwLock<Option<types::QueryMetacognition>>>,
 
+    /// TCM (Temporal Context Model) per-user drift state (E6). A low-dim,
+    /// slowly-drifting subjective-context vector, updated ENCODE-side only
+    /// (never at retrieval, so it cannot self-confirm toward what gets
+    /// retrieved). Snapshotted onto each memory's `WhenFacet.context_drift` at
+    /// encode; retrieval scores graded contiguity = cosine(current drift,
+    /// snapshot), replacing brittle `episode_id` equality.
+    tcm_context: Arc<parking_lot::RwLock<Vec<f32>>>,
+
     /// Drift-adaptive abstention threshold (APP-5).
     /// Calibrated during maintenance by sampling memory importance×confidence scores.
     /// Stored as f32 bits in AtomicU32 for lock-free reads during retrieval.
@@ -961,6 +969,8 @@ impl MemorySystem {
             )),
             // M3: query-level metacognition readout (terminal; not fed to learner)
             last_query_metacognition: Arc::new(parking_lot::RwLock::new(None)),
+            // E6: TCM drift state (encode-driven; empty until the first embed)
+            tcm_context: Arc::new(parking_lot::RwLock::new(Vec::new())),
             // Drift-adaptive abstention: 0 = use static constant
             calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
         })
@@ -1514,6 +1524,43 @@ impl MemorySystem {
         Ok(memory_id)
     }
 
+    /// Update the per-user TCM drift state (E6) from a memory's embedding and
+    /// return the current snapshot. ENCODE-DRIVEN ONLY — never called from the
+    /// retrieval path, so the drifting context cannot self-confirm toward what
+    /// gets retrieved. A deterministic bucket-projection reduces the embedding to
+    /// `D` dims; the state is an exponential drift (`RHO`) of those projections,
+    /// L2-normalized so retrieval can read graded contiguity as a cosine.
+    fn update_tcm_context(&self, emb: &[f32]) -> Vec<f32> {
+        const D: usize = 16;
+        const RHO: f32 = 0.9;
+        let mut proj = vec![0.0f32; D];
+        for (i, &v) in emb.iter().enumerate() {
+            proj[i % D] += v;
+        }
+        let pn = proj.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if pn > 1e-6 {
+            for x in proj.iter_mut() {
+                *x /= pn;
+            }
+        }
+        let mut c = self.tcm_context.write();
+        if c.len() != D {
+            // First encode (or a dimension change): seed the drift state.
+            *c = proj;
+        } else {
+            for k in 0..D {
+                c[k] = RHO * c[k] + (1.0 - RHO) * proj[k];
+            }
+            let cn = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if cn > 1e-6 {
+                for x in c.iter_mut() {
+                    *x /= cn;
+                }
+            }
+        }
+        c.clone()
+    }
+
     /// Complete the deferred embedding + vector indexing for a previously stored memory.
     ///
     /// Call this after `remember_deferred()` to generate the ONNX embedding, persist it,
@@ -1561,6 +1608,13 @@ impl MemorySystem {
                         return Ok(());
                     }
                 }
+            }
+
+            // E6: update the TCM drift state from this memory's embedding and
+            // snapshot it onto the WhenFacet (encode-driven; persisted just below).
+            if let Some(emb) = memory.experience.embeddings.clone() {
+                let snapshot = self.update_tcm_context(&emb);
+                memory.when.context_drift = snapshot;
             }
 
             // Persist embedding to storage so restarts don't re-embed
