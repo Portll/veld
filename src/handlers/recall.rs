@@ -856,11 +856,20 @@ pub async fn recall(
             }
             meta.signal_strength = format!("{}+gap", meta.signal_strength);
         }
-        let mut fok = if let Some(agr) = meta.cross_embedder_agreement {
-            0.4 * meta.peak_confidence + 0.35 * meta.answerability + 0.25 * agr
-        } else {
-            0.5 * meta.peak_confidence + 0.5 * meta.answerability
-        };
+        // Weighted blend over the available cold-robust components (peak +
+        // answerability always present; agreement and coverage folded in when
+        // resolved — den grows so absent components don't deflate the score).
+        let mut num = 0.45 * meta.peak_confidence + 0.25 * meta.answerability;
+        let mut den = 0.70_f32;
+        if let Some(agr) = meta.cross_embedder_agreement {
+            num += 0.20 * agr;
+            den += 0.20;
+        }
+        if let Some(cov) = meta.coverage {
+            num += 0.20 * cov;
+            den += 0.20;
+        }
+        let mut fok = num / den;
         if meta.in_known_gap {
             // We know this region of the graph is under-connected — damp confidence.
             fok *= 0.8;
