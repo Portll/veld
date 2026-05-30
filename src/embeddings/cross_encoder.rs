@@ -38,14 +38,21 @@
 use anyhow::{Context, Result};
 use ort::session::Session;
 use ort::value::Value;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tokenizers::Tokenizer;
 
 /// Maximum input sequence length (query + document tokens combined).
 const MAX_PAIR_LENGTH: usize = 512;
+
+/// Default cross-encoder id used when no env var is set. BGE-reranker-v2-m3
+/// outperformed ms-marco-MiniLM-L-6-v2 on every LoCoMo category in our
+/// internal bench because it was trained on diverse multi-task data
+/// (QA + retrieval + conversational) instead of MS MARCO web-search.
+const DEFAULT_CROSS_ENCODER_ID: &str = "bge-reranker-v2-m3";
 
 // -----------------------------------------------------------------------------
 // Trait
@@ -70,24 +77,47 @@ pub trait CrossEncoderModel: Send + Sync {
 // Config
 // -----------------------------------------------------------------------------
 
-/// Configuration for an ONNX-backed cross-encoder.
+/// Configuration for an ONNX-backed cross-encoder. Owned (`String` URLs) so
+/// custom entries can be added at runtime via [`register`].
 #[derive(Debug, Clone)]
 pub struct CrossEncoderConfig {
     /// Short identifier used in logs, cache paths, and env vars.
     pub id: String,
-    /// HuggingFace URL for the ONNX model.
+    /// HuggingFace URL (or any HTTPS URL) for the ONNX model file.
     pub model_url: String,
-    /// HuggingFace URL for the tokenizer.
+    /// URL for the tokenizer JSON.
     pub tokenizer_url: String,
-    /// Whether the model's ONNX graph accepts `token_type_ids`. BERT-style
-    /// models do; XLM-RoBERTa-style models (BGE, Jina) do not.
+    /// Whether the model's ONNX graph accepts `token_type_ids`. BERT-family
+    /// models do; XLM-RoBERTa-family models (BGE, Jina) do not.
     pub has_token_type_ids: bool,
+    /// Parameter count in millions (for the picker UI and registry table).
+    pub params_millions: u32,
+    /// Approximate download size in MB.
+    pub download_mb: u32,
+    /// Year released — gives a rough freshness signal.
+    pub year: u16,
+    /// One-line summary of training data / domain.
+    pub notes: &'static str,
 }
 
 impl CrossEncoderConfig {
-    /// MS MARCO MiniLM-L-6-v2 (legacy default, 22M params, BERT-style).
-    pub fn ms_marco_minilm_l6_v2() -> Self {
-        Self {
+    /// Sanitise the id for filesystem use (so e.g. `BAAI/bge-…` doesn't
+    /// embed a directory separator in the cache path).
+    fn cache_key(&self) -> String {
+        self.id.replace(['/', '\\'], "_")
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Registry — built-in catalogue + runtime registration
+// -----------------------------------------------------------------------------
+
+/// Built-in cross-encoder catalogue. Edit the table inside `built_ins()` to
+/// add a new known model; consumers using a private model at runtime should
+/// call [`register`] instead.
+fn built_ins() -> Vec<CrossEncoderConfig> {
+    vec![
+        CrossEncoderConfig {
             id: "ms-marco-MiniLM-L-6-v2".into(),
             model_url:
                 "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx"
@@ -96,24 +126,25 @@ impl CrossEncoderConfig {
                 "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/tokenizer.json"
                     .into(),
             has_token_type_ids: true,
-        }
-    }
-
-    /// BGE reranker v2 m3 (568M params, multilingual, XLM-RoBERTa-style).
-    pub fn bge_reranker_v2_m3() -> Self {
-        Self {
+            params_millions: 22,
+            download_mb: 80,
+            year: 2021,
+            notes: "BERT-style; trained on MS MARCO web-search passages. Fast, narrow domain.",
+        },
+        CrossEncoderConfig {
             id: "bge-reranker-v2-m3".into(),
             model_url:
                 "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/main/onnx/model.onnx".into(),
             tokenizer_url:
                 "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/main/tokenizer.json".into(),
             has_token_type_ids: false,
-        }
-    }
-
-    /// Mixedbread mxbai-rerank-large v1 (435M params, QA + retrieval, BERT-style).
-    pub fn mxbai_rerank_large_v1() -> Self {
-        Self {
+            params_millions: 568,
+            download_mb: 2270,
+            year: 2024,
+            notes:
+                "XLM-RoBERTa-style; multilingual + multi-task (QA, retrieval, conversational). Default.",
+        },
+        CrossEncoderConfig {
             id: "mxbai-rerank-large-v1".into(),
             model_url:
                 "https://huggingface.co/mixedbread-ai/mxbai-rerank-large-v1/resolve/main/onnx/model.onnx"
@@ -122,12 +153,12 @@ impl CrossEncoderConfig {
                 "https://huggingface.co/mixedbread-ai/mxbai-rerank-large-v1/resolve/main/tokenizer.json"
                     .into(),
             has_token_type_ids: true,
-        }
-    }
-
-    /// Jina Reranker v2 base multilingual (278M, XLM-RoBERTa-style).
-    pub fn jina_reranker_v2_base() -> Self {
-        Self {
+            params_millions: 435,
+            download_mb: 1740,
+            year: 2024,
+            notes: "BERT-style; trained on QA + retrieval pairs. Strong on factoid queries.",
+        },
+        CrossEncoderConfig {
             id: "jina-reranker-v2-base-multilingual".into(),
             model_url:
                 "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual/resolve/main/onnx/model.onnx"
@@ -136,28 +167,56 @@ impl CrossEncoderConfig {
                 "https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual/resolve/main/tokenizer.json"
                     .into(),
             has_token_type_ids: false,
-        }
-    }
+            params_millions: 278,
+            download_mb: 1110,
+            year: 2024,
+            notes:
+                "XLM-RoBERTa-style; multilingual; late-interaction-influenced training. Mid-size sweet spot.",
+        },
+    ]
+}
 
-    /// Resolve a built-in config by id. Used by env-var parsing.
-    pub fn from_id(id: &str) -> Result<Self> {
-        match id {
-            "ms-marco-MiniLM-L-6-v2" => Ok(Self::ms_marco_minilm_l6_v2()),
-            "bge-reranker-v2-m3" => Ok(Self::bge_reranker_v2_m3()),
-            "mxbai-rerank-large-v1" => Ok(Self::mxbai_rerank_large_v1()),
-            "jina-reranker-v2-base-multilingual" => Ok(Self::jina_reranker_v2_base()),
-            other => anyhow::bail!(
-                "unknown cross-encoder id: {other} (built-ins: ms-marco-MiniLM-L-6-v2, \
-                 bge-reranker-v2-m3, mxbai-rerank-large-v1, jina-reranker-v2-base-multilingual)"
-            ),
-        }
+/// Editable registry. Keyed by id; populated from `built_ins()` on first
+/// access. Callers can [`register`] custom entries at runtime (e.g. a
+/// private fine-tune hosted on a corporate model server).
+static REGISTRY: LazyLock<RwLock<HashMap<String, CrossEncoderConfig>>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for cfg in built_ins() {
+        map.insert(cfg.id.clone(), cfg);
     }
+    RwLock::new(map)
+});
 
-    /// Sanitise the id for filesystem use (so e.g. `BAAI/bge-…` doesn't
-    /// embed a directory separator in the cache path).
-    fn cache_key(&self) -> String {
-        self.id.replace(['/', '\\'], "_")
-    }
+/// Look up a cross-encoder config by id. Built-ins are seeded from
+/// [`built_ins`]; additional entries can be added with [`register`].
+pub fn lookup(id: &str) -> Result<CrossEncoderConfig> {
+    REGISTRY
+        .read()
+        .get(id)
+        .cloned()
+        .with_context(|| {
+            let mut ids: Vec<String> = REGISTRY.read().keys().cloned().collect();
+            ids.sort();
+            format!("unknown cross-encoder id `{id}` (known: {})", ids.join(", "))
+        })
+}
+
+/// Register (or override) a custom cross-encoder config. Useful for
+/// privately-hosted models or fine-tunes that shouldn't be hard-coded.
+pub fn register(config: CrossEncoderConfig) {
+    REGISTRY.write().insert(config.id.clone(), config);
+}
+
+/// Snapshot of registered models — `(id, params_M, download_MB, year, notes)`.
+/// For UI / docs / `--list-rerankers` style introspection.
+pub fn list_registered() -> Vec<(String, u32, u32, u16, &'static str)> {
+    let r = REGISTRY.read();
+    let mut entries: Vec<_> = r
+        .values()
+        .map(|c| (c.id.clone(), c.params_millions, c.download_mb, c.year, c.notes))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
 }
 
 // -----------------------------------------------------------------------------
@@ -475,7 +534,7 @@ pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
     }
 
     if let Ok(id) = std::env::var("VELD_CROSS_ENCODER") {
-        match CrossEncoderConfig::from_id(id.trim()) {
+        match lookup(id.trim()) {
             Ok(cfg) => return Arc::new(OnnxCrossEncoder::new(cfg)),
             Err(e) => {
                 tracing::warn!(
@@ -485,9 +544,10 @@ pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
         }
     }
 
-    Arc::new(OnnxCrossEncoder::new(
-        CrossEncoderConfig::ms_marco_minilm_l6_v2(),
-    ))
+    // Default is BGE-reranker-v2-m3 (set above as DEFAULT_CROSS_ENCODER_ID).
+    let cfg = lookup(DEFAULT_CROSS_ENCODER_ID)
+        .expect("default cross-encoder id must be registered as a built-in");
+    Arc::new(OnnxCrossEncoder::new(cfg))
 }
 
 fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
@@ -503,7 +563,7 @@ fn parse_ensemble_spec(spec: &str) -> Result<Arc<dyn CrossEncoderModel>> {
             })?),
             None => (raw, 1.0),
         };
-        let cfg = CrossEncoderConfig::from_id(id)?;
+        let cfg = lookup(id)?;
         members.push((Arc::new(OnnxCrossEncoder::new(cfg)), weight));
     }
     if members.is_empty() {
@@ -573,17 +633,46 @@ mod tests {
 
     #[test]
     fn cache_keys_are_filesystem_safe() {
-        let cfg = CrossEncoderConfig::bge_reranker_v2_m3();
+        let cfg = lookup("bge-reranker-v2-m3").unwrap();
         let key = cfg.cache_key();
         assert!(!key.contains('/'));
         assert!(!key.contains('\\'));
     }
 
     #[test]
-    fn from_id_resolves_built_ins() {
-        assert!(CrossEncoderConfig::from_id("ms-marco-MiniLM-L-6-v2").is_ok());
-        assert!(CrossEncoderConfig::from_id("bge-reranker-v2-m3").is_ok());
-        assert!(CrossEncoderConfig::from_id("does-not-exist").is_err());
+    fn lookup_resolves_built_ins() {
+        assert!(lookup("ms-marco-MiniLM-L-6-v2").is_ok());
+        assert!(lookup("bge-reranker-v2-m3").is_ok());
+        assert!(lookup("does-not-exist").is_err());
+    }
+
+    #[test]
+    fn registry_default_is_bge() {
+        assert_eq!(DEFAULT_CROSS_ENCODER_ID, "bge-reranker-v2-m3");
+        assert!(lookup(DEFAULT_CROSS_ENCODER_ID).is_ok());
+    }
+
+    #[test]
+    fn list_registered_returns_all_built_ins() {
+        let entries = list_registered();
+        assert!(entries.len() >= 4);
+        assert!(entries.iter().any(|(id, ..)| id == "bge-reranker-v2-m3"));
+    }
+
+    #[test]
+    fn register_overrides_existing() {
+        register(CrossEncoderConfig {
+            id: "test-custom-model".into(),
+            model_url: "https://example.com/m.onnx".into(),
+            tokenizer_url: "https://example.com/t.json".into(),
+            has_token_type_ids: false,
+            params_millions: 100,
+            download_mb: 400,
+            year: 2026,
+            notes: "test fixture",
+        });
+        let cfg = lookup("test-custom-model").unwrap();
+        assert_eq!(cfg.params_millions, 100);
     }
 
     #[test]
