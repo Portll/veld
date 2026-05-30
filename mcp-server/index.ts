@@ -1050,6 +1050,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "get_dials",
+        description:
+          "Read the current cognitive dials for this user: reconsolidation plasticity (labile-window close + graph/entity/embedding re-encode) and retrieval fast/accurate overrides.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "set_dials",
+        description:
+          "Tune the cognitive dials for this user. Only the fields you set change; unset fields keep their current value. Reconsolidation re-encode runs in background maintenance (off the recall hot path); retrieval overrides apply per query. All reconsolidation toggles default OFF.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            reconsolidation_enabled: { type: "boolean" },
+            reconsolidation_window_secs: { type: "number" },
+            re_encode_graph_strengthen: { type: "boolean" },
+            graph_boost_scale: { type: "number" },
+            re_encode_entity_enrich: { type: "boolean" },
+            re_encode_embedding_nudge: { type: "boolean" },
+            embedding_blend: { type: "number" },
+            candidate_count: { type: "number" },
+            rerank_count: { type: "number" },
+            use_reranking: { type: "boolean" },
+          },
+        },
+      },
+      {
         name: "reset_token_session",
         description:
           "Reset the token counter for a new session. Call this when starting a new conversation or after context has been compressed/summarized.",
@@ -3095,6 +3124,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         return {
           content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "get_dials": {
+        const dials = await apiCall<Record<string, unknown>>(
+          `/api/dials?user_id=${encodeURIComponent(USER_ID)}`,
+          "GET",
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🎛️ Cognitive Dials\n${JSON.stringify(dials, null, 2)}`,
+            },
+          ],
+        };
+      }
+
+      case "set_dials": {
+        // Partial update: GET current dials, merge provided fields, PUT the result.
+        const current = await apiCall<Record<string, unknown>>(
+          `/api/dials?user_id=${encodeURIComponent(USER_ID)}`,
+          "GET",
+        );
+        const a = (args ?? {}) as Record<string, unknown>;
+        const fields = [
+          "reconsolidation_enabled",
+          "reconsolidation_window_secs",
+          "re_encode_graph_strengthen",
+          "graph_boost_scale",
+          "re_encode_entity_enrich",
+          "re_encode_embedding_nudge",
+          "embedding_blend",
+          "candidate_count",
+          "rerank_count",
+          "use_reranking",
+        ];
+        for (const f of fields) {
+          if (a[f] !== undefined) current[f] = a[f];
+        }
+        const updated = await apiCall<Record<string, unknown>>(
+          "/api/dials",
+          "PUT",
+          { user_id: USER_ID, dials: current },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `🎛️ Dials updated\n${JSON.stringify(updated, null, 2)}`,
+            },
+          ],
         };
       }
 
