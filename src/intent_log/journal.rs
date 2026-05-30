@@ -201,6 +201,7 @@ impl JournaledWriter {
                 );
                 return Err(JournalError::Payload(e));
             }
+            #[allow(unreachable_patterns)] // defensive: documents decode-side variants on the append path
             Err(e @ (PayloadError::UnknownSchemaVersion { .. } | PayloadError::Migration(_))) => {
                 // Decode-side variants — shouldn't fire on the append/encode
                 // path. If they do, it's a programming error (someone wired

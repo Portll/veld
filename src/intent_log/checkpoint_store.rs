@@ -553,6 +553,7 @@ fn scan(path: &Path) -> Result<(HashMap<String, Lsn>, u64), CheckpointStoreError
 /// Scan the side-data file front-to-back. Latest record per
 /// `(projection, key)` wins. A torn or CRC-bad tail terminates the scan
 /// at the start of the bad record — earlier good records survive.
+#[allow(clippy::type_complexity)] // local scan accumulator: (projection,key) -> entry
 fn scan_side_data(
     path: &Path,
 ) -> Result<(HashMap<(String, String), SideDataEntry>, u64), CheckpointStoreError> {

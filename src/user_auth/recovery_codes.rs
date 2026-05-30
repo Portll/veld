@@ -59,6 +59,7 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Used in tests to guarantee no generated code contains them; the
 /// alphabet definition itself is the source-of-truth, this constant just
 /// makes the audit easier to read.
+#[allow(dead_code)] // referenced from tests; kept as a readable source-of-truth audit list
 const AMBIGUOUS_CHARS: &[char] = &['I', 'L', 'O', 'U'];
 
 /// Argon2id parameters used for hashing recovery codes.

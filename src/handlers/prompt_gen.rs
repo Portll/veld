@@ -617,7 +617,7 @@ pub async fn set_entity_attribute(
         // Find entity by name (handles exact, case-insensitive, stemmed, substring)
         let node = graph_guard
             .find_entity_by_name(&entity_name)
-            .map_err(|e| AppError::Internal(e))?
+            .map_err(AppError::Internal)?
             .ok_or_else(|| {
                 AppError::InvalidInput {
                     field: "entity_name".to_string(),
@@ -631,7 +631,7 @@ pub async fn set_entity_attribute(
         let mut updated = node.clone();
         updated.attributes.insert(key.clone(), value.clone());
         graph_guard.add_entity(updated)
-            .map_err(|e| AppError::Internal(e))?;
+            .map_err(AppError::Internal)?;
 
         Ok::<_, AppError>(serde_json::json!({
             "entity": node.name,
@@ -675,7 +675,7 @@ pub async fn merge_entities(
 
         let source = graph_guard
             .find_entity_by_name(&source_name)
-            .map_err(|e| AppError::Internal(e))?
+            .map_err(AppError::Internal)?
             .ok_or_else(|| {
                 AppError::InvalidInput {
                     field: "source_name".to_string(),
@@ -685,7 +685,7 @@ pub async fn merge_entities(
 
         let target = graph_guard
             .find_entity_by_name(&target_name)
-            .map_err(|e| AppError::Internal(e))?
+            .map_err(AppError::Internal)?
             .ok_or_else(|| {
                 AppError::InvalidInput {
                     field: "target_name".to_string(),
@@ -705,7 +705,7 @@ pub async fn merge_entities(
         // edges pointing to/from the target instead.
         let source_edges = graph_guard
             .get_entity_relationships(&source.uuid)
-            .map_err(|e| AppError::Internal(e))?;
+            .map_err(AppError::Internal)?;
 
         let mut edges_moved: usize = 0;
         for edge in &source_edges {
@@ -719,7 +719,7 @@ pub async fn merge_entities(
             // Check if an equivalent relationship already exists between these entities
             if graph_guard
                 .find_relationship_between(&new_from, &new_to)
-                .map_err(|e| AppError::Internal(e))?
+                .map_err(AppError::Internal)?
                 .is_some()
             {
                 // Relationship already exists, skip to avoid duplicates
@@ -732,7 +732,7 @@ pub async fn merge_entities(
             redirected.to_entity = new_to;
             graph_guard
                 .add_relationship(redirected)
-                .map_err(|e| AppError::Internal(e))?;
+                .map_err(AppError::Internal)?;
             edges_moved += 1;
         }
 
@@ -757,12 +757,12 @@ pub async fn merge_entities(
         }
         graph_guard
             .add_entity(target_updated)
-            .map_err(|e| AppError::Internal(e))?;
+            .map_err(AppError::Internal)?;
 
         // Delete the source entity now that all edges have been redirected to target.
         graph_guard
             .delete_entity(&source.uuid)
-            .map_err(|e| AppError::Internal(e))?;
+            .map_err(AppError::Internal)?;
 
         Ok::<_, AppError>(serde_json::json!({
             "source": source_name,
@@ -809,7 +809,7 @@ pub async fn add_entity_alias(
 
         let node = graph_guard
             .find_entity_by_name(&entity_name)
-            .map_err(|e| AppError::Internal(e))?
+            .map_err(AppError::Internal)?
             .ok_or_else(|| {
                 AppError::InvalidInput {
                     field: "entity_name".to_string(),
@@ -831,7 +831,7 @@ pub async fn add_entity_alias(
 
         graph_guard
             .add_entity(updated)
-            .map_err(|e| AppError::Internal(e))?;
+            .map_err(AppError::Internal)?;
 
         Ok::<_, AppError>(serde_json::json!({
             "entity": entity_name,
