@@ -863,6 +863,12 @@ impl MemorySystem {
             hybrid_search_config,
         );
 
+        // Shared runtime dials: seed from env once, attach to the search engine so its
+        // retrieval overrides take effect, and store the same handle on MemorySystem.
+        let cognitive_dials_arc =
+            Arc::new(parking_lot::RwLock::new(dials::CognitiveDials::from_env()));
+        hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
+
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
             if let Some((bm25, vector, graph, update_count)) =
@@ -971,11 +977,10 @@ impl MemorySystem {
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            // CognitiveDials: runtime tuning surface — seeded from VELD_* env (inert
-            // defaults when unset). KV-persisted per-user override is wired separately.
-            cognitive_dials: Arc::new(parking_lot::RwLock::new(
-                dials::CognitiveDials::from_env(),
-            )),
+            // CognitiveDials: runtime tuning surface (seeded from env above; the same
+            // handle is attached to the hybrid-search engine so retrieval overrides
+            // take effect). KV-persisted per-user override is wired separately.
+            cognitive_dials: cognitive_dials_arc,
             // Signal attribution from most recent semantic retrieval
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
