@@ -160,6 +160,33 @@ fn recv_bridge<T>(rx: std::sync::mpsc::Receiver<Result<T, BoxError>>) -> Result<
     }
 }
 
+/// Drive an arbitrary future to completion on the dedicated bridge runtime
+/// and block the calling thread until it finishes.
+///
+/// This is the generic form of [`BlockingRelationalStore::execute_blocking`]:
+/// use it to bridge async helpers that wrap the trait (e.g. the slow-store
+/// `RelationalSlowStoreAdapter`'s typed `*_memory` methods) from a
+/// synchronous caller. Safe from inside the main runtime — the future runs
+/// on a *separate* runtime and the caller only blocks on a channel — and
+/// from a plain thread with no ambient runtime.
+///
+/// `fut` is moved onto the bridge runtime, so it must be `Send + 'static`;
+/// callers pass owned data into an `async move` block. The output `T` is
+/// usually itself a `Result`. Panics only if the spawned task panics before
+/// producing a value (a genuine bug), surfaced as a dropped channel.
+pub fn bridge_block_on<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    BRIDGE_RUNTIME.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv()
+        .expect("relational bridge runtime dropped before completing a bridged future")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
