@@ -78,6 +78,9 @@ pub mod ab_testing;
 // External dimension push (graph topological health — Sleight integration)
 pub mod external_dimensions;
 
+// Cognitive dials — runtime tuning surface (reconsolidation + retrieval knobs)
+pub mod dials;
+
 // Prompt generation (end-to-end context assembly) and entity resolution
 pub mod prompt_gen;
 
