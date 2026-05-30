@@ -714,13 +714,18 @@ const CROSS_ENCODER_BLEND_WEIGHT: f32 = 0.70;
 const BI_ENCODER_BLEND_WEIGHT: f32 = 0.30;
 
 impl CrossEncoderReranker {
-    /// Create reranker with shared embedder and cross-encoder model
+    /// Create reranker with shared embedder and cross-encoder model.
+    ///
+    /// The cross-encoder is pre-warmed on a background thread by default —
+    /// the ~80 MB ONNX download + load happens during server startup, not
+    /// on the first /api/recall. Set `VELD_LAZY_CROSS_ENCODER=1` to opt
+    /// back into lazy-on-first-use behaviour.
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
+        let cross_encoder = Arc::new(crate::embeddings::cross_encoder::CrossEncoder::new());
+        crate::embeddings::cross_encoder::CrossEncoder::prewarm(Arc::clone(&cross_encoder));
         Self {
             embedder,
-            cross_encoder: Arc::new(
-                crate::embeddings::cross_encoder::CrossEncoder::new(),
-            ),
+            cross_encoder,
         }
     }
 

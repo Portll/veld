@@ -16,7 +16,7 @@ use ort::session::Session;
 use ort::value::Value;
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tokenizers::Tokenizer;
 
 /// HuggingFace model URLs — tracking `main`. The previous pin to commit
@@ -59,6 +59,34 @@ impl CrossEncoder {
     /// Check if the cross-encoder model is available (downloaded and loadable)
     pub fn is_available(&self) -> bool {
         self.available.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Eagerly download + load the model on a background thread. Default
+    /// behaviour at startup so the first /api/recall doesn't pay the
+    /// ~80 MB download + ONNX load cost on the request path. Set
+    /// `VELD_LAZY_CROSS_ENCODER=1` (or `true`) to skip the pre-warm and
+    /// fall back to lazy load on first use.
+    ///
+    /// Safe to call multiple times — the underlying `OnceLock` only ever
+    /// initialises once.
+    pub fn prewarm(self_arc: Arc<Self>) {
+        let lazy = std::env::var("VELD_LAZY_CROSS_ENCODER")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if lazy {
+            tracing::debug!(
+                "cross-encoder pre-warm skipped (VELD_LAZY_CROSS_ENCODER set); loading lazily on first use"
+            );
+            return;
+        }
+        std::thread::Builder::new()
+            .name("cross-encoder-prewarm".into())
+            .spawn(move || match self_arc.ensure_loaded() {
+                Ok(_) => tracing::info!("Cross-encoder pre-warmed"),
+                Err(e) => tracing::warn!("Cross-encoder pre-warm failed (lazy fallback engaged): {e}"),
+            })
+            .ok();
     }
 
     /// Get the model directory
