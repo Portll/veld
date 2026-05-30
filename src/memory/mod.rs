@@ -31,6 +31,7 @@ pub mod acl;
 pub mod llm;
 pub mod query_parser;
 pub mod relation_extraction;
+pub mod dials;
 mod recall;
 pub mod replay;
 pub mod llm_refiner;
@@ -95,6 +96,7 @@ pub use crate::memory::compression::{
     CausalFactLink, ConsolidationResult, FactCluster, FactType, PurgeReason, SemanticConsolidator,
     SemanticFact,
 };
+pub use crate::memory::dials::CognitiveDials;
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
     apply_context_pattern_signals, calculate_entity_flow, calculate_entity_overlap,
