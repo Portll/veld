@@ -15,7 +15,6 @@
 //! invariant.
 
 use axum::{
-    extract::Path as AxumPath,
     http::{header, StatusCode},
     response::{Html, IntoResponse},
     routing::get,
