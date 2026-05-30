@@ -67,6 +67,10 @@ use super::storage::{StoredGap, StoredMemoryRow, StoredThought};
 ///
 /// **Not** a drop-in replacement for [`super::SlowStore`]. See the
 /// module-level docs for the deliberate scope of this parallel path.
+///
+/// `Clone` is a cheap `Arc` bump — the `*_blocking` wrappers clone the
+/// adapter into the `'static` future they hand to the bridge runtime.
+#[derive(Clone)]
 pub struct RelationalSlowStoreAdapter {
     store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
 }
@@ -554,6 +558,63 @@ impl RelationalSlowStoreAdapter {
             .context("decode count")?
             .unwrap_or(0);
         Ok(count as u64)
+    }
+
+    // ─── Synchronous (bridged) wrappers ──────────────────────────────────
+    //
+    // The intent-log `SqliteProjection::apply` path is synchronous and runs
+    // on a tokio worker thread, so it cannot `.await`. These wrappers run
+    // the async write on the shared relational bridge runtime and block the
+    // caller for the result — see [`crate::storage::relational::blocking`].
+    // Each clones the adapter (cheap `Arc` bump) and owns its arguments so
+    // the future handed to the bridge is `Send + 'static`.
+
+    /// Synchronous, bridge-driven [`Self::upsert_memory`].
+    pub fn upsert_memory_blocking(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        lsn: u64,
+        memory_bincode: &[u8],
+        importance: f32,
+    ) -> Result<()> {
+        let adapter = self.clone();
+        let user_id = user_id.to_string();
+        let memory_id = memory_id.to_string();
+        let blob = memory_bincode.to_vec();
+        crate::storage::relational::blocking::bridge_block_on(async move {
+            adapter
+                .upsert_memory(&user_id, &memory_id, lsn, &blob, importance)
+                .await
+        })
+    }
+
+    /// Synchronous, bridge-driven [`Self::anchor_memory_importance`].
+    pub fn anchor_memory_importance_blocking(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        lsn: u64,
+        importance: f32,
+    ) -> Result<()> {
+        let adapter = self.clone();
+        let user_id = user_id.to_string();
+        let memory_id = memory_id.to_string();
+        crate::storage::relational::blocking::bridge_block_on(async move {
+            adapter
+                .anchor_memory_importance(&user_id, &memory_id, lsn, importance)
+                .await
+        })
+    }
+
+    /// Synchronous, bridge-driven [`Self::delete_memory`].
+    pub fn delete_memory_blocking(&self, user_id: &str, memory_id: &str) -> Result<()> {
+        let adapter = self.clone();
+        let user_id = user_id.to_string();
+        let memory_id = memory_id.to_string();
+        crate::storage::relational::blocking::bridge_block_on(async move {
+            adapter.delete_memory(&user_id, &memory_id).await
+        })
     }
 }
 
