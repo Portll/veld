@@ -1209,6 +1209,10 @@ pub enum RelationalBackendChoice {
         project_ref: String,
         db_password: String,
     },
+    /// A Microsoft SQL Server. `VELD_MSSQL_ADO_STRING` is the ADO-style
+    /// connection string. Requires building with `--features mssql`.
+    #[cfg(feature = "mssql")]
+    Mssql { ado_string: String },
 }
 
 impl RelationalBackendChoice {
@@ -1251,12 +1255,24 @@ impl RelationalBackendChoice {
                     db_password,
                 }))
             }
+            #[cfg(feature = "mssql")]
+            "mssql" => {
+                let ado_string = std::env::var("VELD_MSSQL_ADO_STRING").map_err(|_| {
+                    "VELD_RELATIONAL_BACKEND=mssql requires VELD_MSSQL_ADO_STRING".to_string()
+                })?;
+                Ok(Some(Self::Mssql { ado_string }))
+            }
             #[cfg(not(feature = "postgres"))]
             "postgres" | "supabase" => Err(format!(
                 "VELD_RELATIONAL_BACKEND={backend} requires building veld with --features postgres"
             )),
+            #[cfg(not(feature = "mssql"))]
+            "mssql" => Err(
+                "VELD_RELATIONAL_BACKEND=mssql requires building veld with --features mssql"
+                    .to_string(),
+            ),
             other => Err(format!(
-                "unknown VELD_RELATIONAL_BACKEND {other:?} (expected: sqlite, postgres, supabase)"
+                "unknown VELD_RELATIONAL_BACKEND {other:?} (expected: sqlite, postgres, supabase, mssql)"
             )),
         }
     }

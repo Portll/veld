@@ -170,6 +170,15 @@ async fn build_relational_backend() -> Result<
             info!(backend = "supabase", project_ref = %project_ref, "relational backend connected");
             Some(Arc::new(ErasedRelationalStore::new(s)))
         }
+        #[cfg(feature = "mssql")]
+        Some(RelationalBackendChoice::Mssql { ado_string }) => {
+            let s = crate::storage::relational::MssqlRelationalStore::connect(&ado_string)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect relational mssql: {e}"))?;
+            info!(backend = "mssql", "relational backend connected");
+            // MssqlRelationalStore already presents `Error = BoxError`.
+            Some(Arc::new(s))
+        }
     };
     Ok(store)
 }
