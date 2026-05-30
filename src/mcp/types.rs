@@ -107,6 +107,7 @@ pub(crate) struct AnchorRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // response fields deserialized for completeness; not all are read
 pub(crate) struct AnchorResponse {
     pub success: bool,
     pub memory_id: String,
@@ -121,6 +122,7 @@ pub(crate) struct TierMoveRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // response fields deserialized for completeness; not all are read
 pub(crate) struct TierMoveResponse {
     pub success: bool,
     pub memory_id: String,

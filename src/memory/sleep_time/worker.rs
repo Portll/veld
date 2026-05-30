@@ -394,9 +394,9 @@ async fn process_item(
         }
     }
 
-    for mut draft in rewriter_output.observations {
+    for draft in rewriter_output.observations {
         let supersedes = draft.supersedes.clone();
-        match persist_observation(&mut draft, mem_sys) {
+        match persist_observation(&draft, mem_sys) {
             Ok(super::observation::PersistOutcome::Stored(memory_id))
             | Ok(super::observation::PersistOutcome::Deduped(memory_id)) => {
                 emit_observation_emitted(

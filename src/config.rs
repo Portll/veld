@@ -1009,8 +1009,10 @@ impl Default for SleepTimeConfig {
 /// users still have full access via [`SleepTimeProfile::Custom`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[derive(Default)]
 pub enum SleepTimeProfile {
     /// Off. `enabled=false`, conservative caps preserved.
+    #[default]
     Disabled,
     /// Conservative: enabled but with very tight budgets and only one worker;
     /// suitable for first-week opt-in to observe behaviour at low cost.
@@ -1057,11 +1059,6 @@ impl SleepTimeProfile {
     }
 }
 
-impl Default for SleepTimeProfile {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 #[cfg(test)]
 mod tests {

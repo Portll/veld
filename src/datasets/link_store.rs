@@ -46,6 +46,7 @@ fn kind_to_str(kind: LinkKind) -> &'static str {
     }
 }
 
+#[allow(dead_code)] // W7 datasets: link-kind parser, wired as link ingestion lands
 fn kind_from_str(s: &str) -> Result<LinkKind, DatasetError> {
     match s {
         "entity" => Ok(LinkKind::Entity),

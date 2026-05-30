@@ -162,9 +162,9 @@ fn build_where<'a>(user_id: &'a str, p: &'a RelationalPredicate) -> Option<(Stri
                 return None;
             }
             if values.is_empty() {
-                return Some((format!("user_id = ? AND 1 = 0"), params));
+                return Some(("user_id = ? AND 1 = 0".to_string(), params));
             }
-            let placeholders: Vec<&str> = std::iter::repeat("?").take(values.len()).collect();
+            let placeholders: Vec<&str> = std::iter::repeat_n("?", values.len()).collect();
             for v in values {
                 push_json_param(&mut params, v);
             }

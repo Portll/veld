@@ -109,7 +109,7 @@ fn build_patterns() -> Vec<Pattern> {
 /// Split text into sentences using simple terminator boundaries. Strips
 /// surrounding whitespace and discards empty fragments.
 fn split_sentences(text: &str) -> Vec<&str> {
-    text.split(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+    text.split(['.', '!', '?', '\n'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty() && s.len() > 4)
         .collect()
