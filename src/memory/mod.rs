@@ -535,7 +535,7 @@ impl MemorySystem {
         storage: Arc<MemoryStorage>,
         bm25_index: Arc<hybrid_search::BM25Index>,
     ) -> Result<Self> {
-        let storage_path = config.storage_path.clone();
+        let _storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
         //
