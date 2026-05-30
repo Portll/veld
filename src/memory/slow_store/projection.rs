@@ -48,6 +48,7 @@ use crate::intent_log::{
     Projection, TypedProjection,
 };
 
+use super::relational_adapter::RelationalSlowStoreAdapter;
 use super::SlowStore;
 
 /// Errors raised by [`SqliteProjection`]. Distinct from `anyhow::Error`
@@ -93,6 +94,14 @@ pub struct SqliteProjection {
     /// LSN of the last record this projection successfully applied. Lives
     /// in memory; `persist_checkpoint` synchronises it to disk.
     checkpoint: Option<Lsn>,
+    /// Optional relational sink for the `memories` projection. When `Some`,
+    /// memory-row writes (`Remember`/`Update`/`Forget`/`Anchor`) go through
+    /// the W4 `RelationalStore` trait — bridged sync→async via
+    /// [`crate::storage::relational::blocking`] — instead of the rusqlite
+    /// [`SlowStore`], so the projection can target Postgres / Supabase.
+    /// `None` (the default, via [`Self::new`]) preserves the original
+    /// rusqlite path byte-for-byte.
+    relational: Option<RelationalSlowStoreAdapter>,
 }
 
 impl SqliteProjection {
@@ -108,6 +117,30 @@ impl SqliteProjection {
             store,
             checkpoint_store,
             checkpoint,
+            relational: None,
+        }
+    }
+
+    /// Construct a projection whose `memories` writes are routed through a
+    /// [`RelationalSlowStoreAdapter`] (the W4 trait surface) instead of the
+    /// rusqlite [`SlowStore`]. The `store` is still required — it backs the
+    /// checkpoint bookkeeping and keeps the type identical to [`Self::new`]
+    /// — but memory-row writes bypass it entirely while `relational` is set.
+    ///
+    /// This is the slow-store cutover seam: production wiring selects this
+    /// constructor when a relational backend is configured; everything else
+    /// continues to call [`Self::new`].
+    pub fn with_relational(
+        store: Arc<SlowStore>,
+        checkpoint_store: Arc<Mutex<CheckpointStore>>,
+        relational: RelationalSlowStoreAdapter,
+    ) -> Self {
+        let checkpoint = checkpoint_store.lock().get(PROJECTION_NAME);
+        Self {
+            store,
+            checkpoint_store,
+            checkpoint,
+            relational: Some(relational),
         }
     }
 
@@ -143,18 +176,28 @@ impl SqliteProjection {
                 // (the bincoded Memory holds it). We persist a neutral
                 // 0.5 so the importance column has a defined value;
                 // callers that need the precise number decode the blob.
-                self.store
-                    .upsert_memory(user_id, memory_id, lsn.0, memory_bincode, 0.5)
-                    .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                if let Some(rel) = &self.relational {
+                    rel.upsert_memory_blocking(user_id, memory_id, lsn.0, memory_bincode, 0.5)
+                        .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                } else {
+                    self.store
+                        .upsert_memory(user_id, memory_id, lsn.0, memory_bincode, 0.5)
+                        .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                }
             }
             IntentPayload::Forget {
                 user_id,
                 memory_id,
                 ..
             } => {
-                self.store
-                    .delete_memory(user_id, memory_id)
-                    .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                if let Some(rel) = &self.relational {
+                    rel.delete_memory_blocking(user_id, memory_id)
+                        .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                } else {
+                    self.store
+                        .delete_memory(user_id, memory_id)
+                        .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                }
             }
             IntentPayload::Anchor {
                 user_id,
@@ -162,9 +205,14 @@ impl SqliteProjection {
                 importance,
                 ..
             } => {
-                self.store
-                    .anchor_memory_importance(user_id, memory_id, lsn.0, *importance)
-                    .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                if let Some(rel) = &self.relational {
+                    rel.anchor_memory_importance_blocking(user_id, memory_id, lsn.0, *importance)
+                        .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                } else {
+                    self.store
+                        .anchor_memory_importance(user_id, memory_id, lsn.0, *importance)
+                        .map_err(|e| SqliteProjectionError::Storage(e.to_string()))?;
+                }
             }
         }
         self.checkpoint = Some(lsn);
@@ -474,5 +522,90 @@ mod tests {
         assert!((r.importance - 0.93).abs() < 1e-6);
         assert_eq!(r.memory_bincode, b"body-bytes");
         assert_eq!(r.lsn, 1);
+    }
+
+    /// End-to-end cutover proof: a projection constructed with a relational
+    /// sink routes its synchronous `apply` writes through the async
+    /// `RelationalStore` trait (bridged), landing rows in the relational
+    /// backend and bypassing the rusqlite `SlowStore` entirely.
+    #[tokio::test]
+    async fn relational_sink_routes_memory_writes_through_the_trait() {
+        use crate::storage::relational::{
+            BoxError, Param, RelationalStore, Row, SqliteRelationalStore,
+        };
+        use async_trait::async_trait;
+
+        // BoxError-erased in-memory relational backend + adapter w/ schema.
+        struct BoxErrorSqlite(SqliteRelationalStore);
+        #[async_trait]
+        impl RelationalStore for BoxErrorSqlite {
+            type Error = BoxError;
+            async fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<u64, BoxError> {
+                self.0.execute(sql, params).await.map_err(BoxError::new)
+            }
+            async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, BoxError> {
+                self.0.query(sql, params).await.map_err(BoxError::new)
+            }
+            fn backend(&self) -> crate::storage::relational::RelationalBackend {
+                self.0.backend()
+            }
+        }
+
+        let sqlite = SqliteRelationalStore::in_memory()
+            .await
+            .expect("in-memory sqlite");
+        let erased: Arc<dyn RelationalStore<Error = BoxError>> = Arc::new(BoxErrorSqlite(sqlite));
+        let adapter = RelationalSlowStoreAdapter::new(erased);
+        adapter.init_schema().await.expect("init schema");
+
+        // The projection still holds a rusqlite SlowStore (for the type and
+        // checkpoint bookkeeping), but memory writes must bypass it while
+        // the relational sink is set.
+        let (sqlite_path, _, checkpoint_path) = tmp_paths("relational_sink");
+        let store = Arc::new(SlowStore::open(&sqlite_path).unwrap());
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&checkpoint_path).unwrap()));
+        let mut proj = SqliteProjection::with_relational(store.clone(), ckpt, adapter.clone());
+
+        // Synchronous applies on a runtime worker — the real apply shape —
+        // bridged through to the async trait.
+        TypedProjection::apply(&mut proj, Lsn(1), &mk_remember("alice", "m-1", b"hello")).unwrap();
+        TypedProjection::apply(
+            &mut proj,
+            Lsn(2),
+            &IntentPayload::Anchor {
+                user_id: "alice".into(),
+                memory_id: "m-1".into(),
+                importance: 0.9,
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+
+        // Rows landed in the RELATIONAL store…
+        let row = adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.memory_bincode, b"hello");
+        assert_eq!(row.lsn, 2, "anchor stamped the newer lsn");
+        assert!((row.importance - 0.9).abs() < 1e-5);
+        assert_eq!(adapter.count_memories("alice").await.unwrap(), 1);
+        // …and the rusqlite SlowStore was bypassed entirely.
+        assert_eq!(store.count_memories("alice").unwrap(), 0);
+
+        // Forget routes through the trait too.
+        TypedProjection::apply(
+            &mut proj,
+            Lsn(3),
+            &IntentPayload::Forget {
+                user_id: "alice".into(),
+                memory_id: "m-1".into(),
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+        assert_eq!(adapter.count_memories("alice").await.unwrap(), 0);
+        assert_eq!(store.count_memories("alice").unwrap(), 0);
     }
 }
