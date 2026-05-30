@@ -17,6 +17,12 @@ const DEFAULT_USER_ID: &str = "claude-code";
 /// Anchors the background poller so it lives as long as the app does.
 pub struct MonitorState {
     pub snapshot: Arc<RwLock<StatusSnapshot>>,
+    /// Connection params retained so on-demand commands (e.g. dials) can reach the
+    /// veld server without re-deriving them.
+    base_url: String,
+    api_key: String,
+    user_id: String,
+    request_timeout: Duration,
     _client: StatusClient,
 }
 
@@ -40,9 +46,10 @@ pub fn run() {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_USER_ID.to_string());
 
-            let config = StatusClientConfig::new(base_url, api_key, user_id)
-                .with_refresh_interval(Duration::from_secs(2))
-                .with_request_timeout(Duration::from_secs(5));
+            let config =
+                StatusClientConfig::new(base_url.clone(), api_key.clone(), user_id.clone())
+                    .with_refresh_interval(Duration::from_secs(2))
+                    .with_request_timeout(Duration::from_secs(5));
 
             let client = tauri::async_runtime::block_on(async move {
                 StatusClient::spawn(config)
@@ -52,6 +59,10 @@ pub fn run() {
             let snapshot = client.snapshot();
             app.manage(MonitorState {
                 snapshot: Arc::clone(&snapshot),
+                base_url,
+                api_key,
+                user_id,
+                request_timeout: Duration::from_secs(5),
                 _client: client,
             });
 
@@ -74,7 +85,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             show_dashboard,
-            quit_app
+            quit_app,
+            get_dials,
+            set_dials
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -97,6 +110,38 @@ fn show_dashboard(app: AppHandle) {
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
+}
+
+/// Read the current cognitive dials from the veld server (`GET /api/dials`).
+#[tauri::command]
+async fn get_dials(state: State<'_, MonitorState>) -> Result<serde_json::Value, String> {
+    let (base, key, user, timeout) = (
+        state.base_url.clone(),
+        state.api_key.clone(),
+        state.user_id.clone(),
+        state.request_timeout,
+    );
+    StatusClient::get_dials(&base, &key, &user, timeout)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Replace the cognitive dials (`PUT /api/dials`). `dials` is the full dials object
+/// (as returned by `get_dials`); returns the server-sanitized result.
+#[tauri::command]
+async fn set_dials(
+    state: State<'_, MonitorState>,
+    dials: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (base, key, user, timeout) = (
+        state.base_url.clone(),
+        state.api_key.clone(),
+        state.user_id.clone(),
+        state.request_timeout,
+    );
+    StatusClient::set_dials(&base, &key, &user, dials, timeout)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn emit_snapshots(handle: AppHandle, snapshot: Arc<RwLock<StatusSnapshot>>) {

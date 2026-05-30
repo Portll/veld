@@ -252,3 +252,28 @@ main {
 .ev-context_update {
   color: var(--blue);
 }
+
+/* Cognitive Dials */
+.dials { display: flex; flex-direction: column; gap: 6px; }
+.dial-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.dial-row span { flex: 1; }
+.dial-row input[type="number"] {
+  width: 90px;
+  background: #1b1d2a;
+  color: #e6e6ef;
+  border: 1px solid #2b2d3c;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.dial-ro { margin-top: 6px; font-size: 11px; }
+.dials-btn {
+  font-size: 11px;
+  margin-left: 8px;
+  background: #2b2d3c;
+  color: #c8c8d4;
+  border: 1px solid #3a3d4f;
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.dials-btn:hover { background: #353849; }
