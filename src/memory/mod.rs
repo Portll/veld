@@ -971,10 +971,10 @@ impl MemorySystem {
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
-            // CognitiveDials: runtime tuning surface — defaults inert (all OFF / None).
-            // Config/env seeding + KV-persisted per-user override are wired separately.
+            // CognitiveDials: runtime tuning surface — seeded from VELD_* env (inert
+            // defaults when unset). KV-persisted per-user override is wired separately.
             cognitive_dials: Arc::new(parking_lot::RwLock::new(
-                dials::CognitiveDials::default(),
+                dials::CognitiveDials::from_env(),
             )),
             // Signal attribution from most recent semantic retrieval
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
