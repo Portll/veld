@@ -172,9 +172,15 @@ fn recv_bridge<T>(rx: std::sync::mpsc::Receiver<Result<T, BoxError>>) -> Result<
 ///
 /// `fut` is moved onto the bridge runtime, so it must be `Send + 'static`;
 /// callers pass owned data into an `async move` block. The output `T` is
-/// usually itself a `Result`. Panics only if the spawned task panics before
-/// producing a value (a genuine bug), surfaced as a dropped channel.
-pub fn bridge_block_on<F, T>(fut: F) -> T
+/// usually itself a `Result`.
+///
+/// The returned `Result` reports the *bridge's* health, not the future's: it
+/// is `Err` only if the spawned task was dropped before producing a value —
+/// reachable if the bridge runtime is torn down mid-call or the future
+/// panics. That surfaces as a recoverable [`BoxError`] rather than crashing
+/// the calling thread, matching [`recv_bridge`]'s contract. Callers flatten
+/// the two layers (`bridge_block_on(...)?` then handle the inner `T`).
+pub fn bridge_block_on<F, T>(fut: F) -> Result<T, BoxError>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -183,8 +189,7 @@ where
     BRIDGE_RUNTIME.spawn(async move {
         let _ = tx.send(fut.await);
     });
-    rx.recv()
-        .expect("relational bridge runtime dropped before completing a bridged future")
+    rx.recv().map_err(BoxError::new)
 }
 
 #[cfg(test)]
