@@ -864,6 +864,11 @@ pub struct HybridSearchEngine {
     /// Protected by RwLock for concurrent read access during search
     /// and exclusive write access during feedback updates
     learned_weights: RwLock<LearnedWeights>,
+    /// Optional shared runtime tuning dials (the same `Arc` the owning
+    /// `MemorySystem` holds). When attached, `Some` retrieval overrides take
+    /// precedence per query; `None` (default) preserves exact engine/learned
+    /// behavior. See [`crate::memory::dials::CognitiveDials`].
+    dials: RwLock<Option<Arc<RwLock<crate::memory::dials::CognitiveDials>>>>,
 }
 
 impl HybridSearchEngine {
@@ -913,6 +918,7 @@ impl HybridSearchEngine {
             reranker,
             refiner: None,
             learned_weights,
+            dials: RwLock::new(None),
         }
     }
 
@@ -936,6 +942,15 @@ impl HybridSearchEngine {
     pub fn with_refiner(mut self, refiner: Box<dyn Refiner>) -> Self {
         self.refiner = Some(refiner);
         self
+    }
+
+    /// Attach the shared runtime [`crate::memory::dials::CognitiveDials`] so per-query
+    /// retrieval overrides (refiner mode, rerank/candidate counts, RRF weights) take
+    /// effect. Pass the same `Arc` the owning `MemorySystem` holds. `&self` (mirrors
+    /// `set_learned_weight_state`) so it can be called on the engine before it is
+    /// wrapped in an `Arc`.
+    pub fn attach_dials(&self, dials: Arc<RwLock<crate::memory::dials::CognitiveDials>>) {
+        *self.dials.write() = Some(dials);
     }
 
     /// Index a memory for BM25 search
@@ -1170,10 +1185,18 @@ impl HybridSearchEngine {
     where
         F: Fn(&MemoryId) -> Option<String>,
     {
+        // Runtime dial overrides snapshotted once. `None` (no dials attached, or a
+        // given override unset) => exact engine/learned-weight behavior (parity).
+        let dial = self.dials.read().as_ref().map(|h| h.read().clone());
+        let candidate_count = dial
+            .as_ref()
+            .and_then(|d| d.candidate_count)
+            .unwrap_or(self.config.candidate_count);
+
         // 1. BM25 search with IC-weighted term boosting AND phrase matching
         let bm25_results = self.bm25_index.search_with_term_and_phrase_weights(
             query,
-            self.config.candidate_count,
+            candidate_count,
             term_weights,
             phrase_boosts,
         )?;
@@ -1190,7 +1213,10 @@ impl HybridSearchEngine {
         //
         // Base weights come from effective_weights() which blends static defaults
         // with learned weights from retrieval feedback (P2.3 adaptive learning)
-        let (eff_bm25, eff_vector, _eff_graph) = self.effective_weights();
+        let (eff_bm25, eff_vector, _eff_graph) = match dial.as_ref().and_then(|d| d.rrf_weights) {
+            Some((b, v, g)) => (b, v, g),
+            None => self.effective_weights(),
+        };
         let (bm25_weight, vector_weight) = if let Some(disc) = keyword_discriminativeness {
             if disc >= 0.8 {
                 // Highly discriminative keywords - strong BM25 preference
@@ -1245,10 +1271,17 @@ impl HybridSearchEngine {
             .collect();
 
         // 3. Optional cross-encoder reranking + LLM refiner pass
-        let effective_rerank_count = rerank_count_override.unwrap_or(self.config.rerank_count);
-        let mode = self.config.refiner_mode;
-        let use_cross_encoder =
-            matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked);
+        let effective_rerank_count = rerank_count_override
+            .or_else(|| dial.as_ref().and_then(|d| d.rerank_count))
+            .unwrap_or(self.config.rerank_count);
+        let mode = dial
+            .as_ref()
+            .and_then(|d| d.refiner_mode)
+            .unwrap_or(self.config.refiner_mode);
+        let use_cross_encoder = dial
+            .as_ref()
+            .and_then(|d| d.use_reranking)
+            .unwrap_or_else(|| matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked));
         let use_refiner = matches!(mode, RefinerMode::Llm | RefinerMode::Stacked);
 
         let mut final_results: Vec<HybridSearchResult> = if let Some(reranker) =
