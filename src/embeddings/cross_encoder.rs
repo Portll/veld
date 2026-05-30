@@ -48,11 +48,14 @@ use tokenizers::Tokenizer;
 /// Maximum input sequence length (query + document tokens combined).
 const MAX_PAIR_LENGTH: usize = 512;
 
-/// Default cross-encoder id used when no env var is set. BGE-reranker-v2-m3
-/// outperformed ms-marco-MiniLM-L-6-v2 on every LoCoMo category in our
-/// internal bench because it was trained on diverse multi-task data
-/// (QA + retrieval + conversational) instead of MS MARCO web-search.
-const DEFAULT_CROSS_ENCODER_ID: &str = "bge-reranker-v2-m3";
+/// Default cross-encoder id when no env var is set. mxbai-rerank-xsmall-v1
+/// is the smallest 2024-vintage reranker that meaningfully beats the
+/// legacy ms-marco-MiniLM — ~280 MB download, 70 M params, modern QA +
+/// retrieval training. Picks the size/quality sweet spot for the typical
+/// veld install: fast to download, fast at query time, well above the
+/// ms-marco floor. Swap up to `bge-reranker-v2-m3` (568 M) for the best
+/// quality, or stack via `VELD_CROSS_ENCODERS=…`.
+const DEFAULT_CROSS_ENCODER_ID: &str = "mxbai-rerank-xsmall-v1";
 
 // -----------------------------------------------------------------------------
 // Trait
@@ -147,6 +150,38 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             year: 2024,
             notes:
                 "BERT; mid-size mxbai variant. Quality close to bge-reranker-v2-m3 at a third the cost.",
+        },
+        CrossEncoderConfig {
+            id: "jina-reranker-v1-tiny-en".into(),
+            model_url:
+                "https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/resolve/main/onnx/model.onnx"
+                    .into(),
+            tokenizer_url:
+                "https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/resolve/main/tokenizer.json"
+                    .into(),
+            has_token_type_ids: false,
+            params_millions: 33,
+            download_mb: 130,
+            year: 2024,
+            notes:
+                "JinaBERT (English only); modern drop-in replacement for ms-marco-MiniLM-L-6-v2 \
+                 in the same size class. ~50% larger than MiniLM, 3 years newer, broader training mix.",
+        },
+        CrossEncoderConfig {
+            id: "jina-reranker-v1-turbo-en".into(),
+            model_url:
+                "https://huggingface.co/jinaai/jina-reranker-v1-turbo-en/resolve/main/onnx/model.onnx"
+                    .into(),
+            tokenizer_url:
+                "https://huggingface.co/jinaai/jina-reranker-v1-turbo-en/resolve/main/tokenizer.json"
+                    .into(),
+            has_token_type_ids: false,
+            params_millions: 37,
+            download_mb: 150,
+            year: 2024,
+            notes:
+                "JinaBERT (English only); slightly larger sibling of jina-reranker-v1-tiny-en. \
+                 The mini-class option for English-only deployments wanting a small accuracy bump.",
         },
         CrossEncoderConfig {
             id: "ms-marco-MiniLM-L-6-v2".into(),
@@ -575,7 +610,9 @@ pub fn load_cross_encoder_from_env() -> Arc<dyn CrossEncoderModel> {
         }
     }
 
-    // Default is BGE-reranker-v2-m3 (set above as DEFAULT_CROSS_ENCODER_ID).
+    // Default is whatever DEFAULT_CROSS_ENCODER_ID points at (currently
+    // mxbai-rerank-xsmall-v1). Override via VELD_CROSS_ENCODER=<id> or
+    // VELD_CROSS_ENCODERS=<id>:<w>,…
     let cfg = lookup(DEFAULT_CROSS_ENCODER_ID)
         .expect("default cross-encoder id must be registered as a built-in");
     Arc::new(OnnxCrossEncoder::new(cfg))
@@ -678,8 +715,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_default_is_bge() {
-        assert_eq!(DEFAULT_CROSS_ENCODER_ID, "bge-reranker-v2-m3");
+    fn registry_default_is_resolvable() {
+        // Default id is registered as a built-in. The specific id is whatever
+        // the project currently picks as the sweet spot — verify it resolves.
         assert!(lookup(DEFAULT_CROSS_ENCODER_ID).is_ok());
     }
 
