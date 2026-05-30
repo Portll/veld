@@ -153,6 +153,12 @@ redb = { version = "2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite slow store for gap topology queries (WAL mode)
 # W4 foundation — backend-agnostic relational executor (SQLite today, Postgres/Supabase next).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
+# W4 MSSQL backend (optional, heavy — gated behind the `mssql` feature).
+# tiberius is the de-facto MSSQL Rust client (sqlx has no maintained MSSQL
+# driver); it ships its own TDS protocol stack. tokio-util/compat adapts a
+# tokio TcpStream into the futures AsyncRead/Write tiberius expects.
+tiberius = { version = "0.12", optional = true }
+tokio-util = { version = "0.7", optional = true, features = ["compat"] }
 
 # Concurrency
 parking_lot = "0.12"
@@ -405,6 +411,11 @@ stress = []
 # SCRAM-auth + config helpers; no C/native deps). Off by default so the
 # standard build stays SQLite-only and byte-for-byte unchanged.
 postgres = ["sqlx/postgres"]
+
+# Microsoft SQL Server backend (W4-D). Opt-in: tiberius pulls a heavy TDS
+# protocol stack (its own wire codec, TLS, auth). Off by default so the
+# standard build stays SQLite-only.
+mssql = ["dep:tiberius", "dep:tokio-util"]
 
 # Python bindings for PyO3
 python = ["pyo3", "numpy"]
