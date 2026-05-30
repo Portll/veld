@@ -104,6 +104,21 @@ pub struct CognitiveDials {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// Outcome of one reconsolidation-expiry pass (a single `run_maintenance` cycle).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconsolidationStats {
+    /// Shadows whose labile window expired and were drained this pass.
+    pub expired: usize,
+    /// Memories whose window was closed (activation decayed to resting) — Layer 0.
+    pub applied: usize,
+    /// Graph edges strengthened by Layer 1 (`re_encode_graph_strengthen`).
+    pub graph_edges_strengthened: usize,
+    /// Memories whose `entity_refs` were enriched by Layer 2 (`re_encode_entity_enrich`).
+    pub entities_enriched: usize,
+    /// Memories whose embedding was nudged by Layer 3 (`re_encode_embedding_nudge`).
+    pub embeddings_nudged: usize,
+}
+
 impl Default for CognitiveDials {
     fn default() -> Self {
         Self {
