@@ -3609,8 +3609,10 @@ impl super::MemorySystem {
         // Reference: Nader et al. (2000) — reconsolidation theory.
         {
             let now = chrono::Utc::now();
-            let window =
-                chrono::Duration::seconds(crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS);
+            // Labile-window length is a runtime dial (defaults to the constant value).
+            let window = chrono::Duration::seconds(
+                self.cognitive_dials.read().reconsolidation_window_secs,
+            );
             let mut shadows = self.reconsolidation_shadows.write();
 
             for memory in &memories {
@@ -3623,6 +3625,20 @@ impl super::MemorySystem {
                     existing.last_retrieval_at = now;
                     // Last-writer-wins: reset expiry
                     existing.expires_at = now + window;
+                    // Accumulate retrieval context across the labile window for the
+                    // re-encode at window close (capped at 2KB, deduped per segment).
+                    let q = query_text.trim();
+                    if !q.is_empty()
+                        && existing.retrieval_context.len() + q.len() + 3 <= 2048
+                        && !existing.retrieval_context.split(" | ").any(|s| s == q)
+                    {
+                        if existing.retrieval_context.is_empty() {
+                            existing.retrieval_context.push_str(q);
+                        } else {
+                            existing.retrieval_context.push_str(" | ");
+                            existing.retrieval_context.push_str(q);
+                        }
+                    }
                 } else {
                     // New labile window
                     shadows.insert(
