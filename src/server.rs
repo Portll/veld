@@ -232,12 +232,14 @@ async fn async_main() -> Result<()> {
         server_config.clone(),
     )?;
     if let Some(store) = relational {
-        // Ensure the slow-store `memories` schema exists in the backend so
-        // the projection's first write doesn't hit a missing table.
+        // Ensure the `memories` projection table exists in the backend (with
+        // dialect-correct DDL) so the projection's first write doesn't hit a
+        // missing table. Only the memories table is created here — the
+        // gap-analysis tables stay in the rusqlite slow store.
         crate::memory::slow_store::RelationalSlowStoreAdapter::new(store.clone())
-            .init_schema()
+            .init_memories_schema()
             .await
-            .context("initialise relational slow-store schema")?;
+            .context("initialise relational memories schema")?;
         let dataset_store = Arc::new(
             crate::datasets::RelationalDatasetStore::new(store.clone())
                 .await

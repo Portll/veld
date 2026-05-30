@@ -56,9 +56,111 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::storage::relational::{Param, RelationalStore};
+use crate::storage::relational::{Param, RelationalBackend, RelationalStore};
 
 use super::storage::{StoredGap, StoredMemoryRow, StoredThought};
+
+// ─── Dialect-aware `memories` projection SQL ─────────────────────────────
+//
+// The slow-store schema was authored for SQLite, but the W4 cutover runs
+// the `memories` table against Postgres/Supabase/MSSQL too. Each backend
+// translates `?` placeholders, but the *dialect* differs in three ways the
+// memories path hits: column types (Postgres is strictly typed — `lsn` is
+// bound i64→BIGINT, `importance` f64→DOUBLE PRECISION, blob→BYTEA; SQLite's
+// INTEGER/REAL/BLOB would reject those binds), the upsert syntax (MSSQL has
+// no `ON CONFLICT` — it needs `MERGE`), and `CREATE TABLE IF NOT EXISTS`
+// (not valid T-SQL). These are selected per [`RelationalBackend`] below.
+
+const MEMORIES_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS memories (
+    user_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    lsn INTEGER NOT NULL,
+    memory_bincode BLOB NOT NULL,
+    importance REAL NOT NULL DEFAULT 0.5,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, memory_id)
+)";
+
+const MEMORIES_DDL_POSTGRES: &str = "CREATE TABLE IF NOT EXISTS memories (
+    user_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    lsn BIGINT NOT NULL,
+    memory_bincode BYTEA NOT NULL,
+    importance DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, memory_id)
+)";
+
+// No `CREATE TABLE IF NOT EXISTS` in T-SQL (guard with OBJECT_ID); no BLOB
+// (VARBINARY(MAX)); the composite text PK must be bounded + NONCLUSTERED to
+// fit the index key-size limit (user_id/memory_id are short ids / UUIDs).
+const MEMORIES_DDL_MSSQL: &str = "IF OBJECT_ID(N'memories', N'U') IS NULL
+CREATE TABLE memories (
+    user_id NVARCHAR(255) NOT NULL,
+    memory_id NVARCHAR(255) NOT NULL,
+    lsn BIGINT NOT NULL,
+    memory_bincode VARBINARY(MAX) NOT NULL,
+    importance FLOAT NOT NULL DEFAULT 0.5,
+    updated_at NVARCHAR(MAX) NOT NULL,
+    CONSTRAINT pk_memories PRIMARY KEY NONCLUSTERED (user_id, memory_id)
+)";
+
+const MEMORIES_INDEXES_SQLITE_PG: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_lsn ON memories(lsn)",
+];
+
+const MEMORIES_INDEXES_MSSQL: &[&str] = &[
+    "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_memories_user' AND object_id = OBJECT_ID(N'memories')) CREATE INDEX idx_memories_user ON memories(user_id)",
+    "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_memories_lsn' AND object_id = OBJECT_ID(N'memories')) CREATE INDEX idx_memories_lsn ON memories(lsn)",
+];
+
+const UPSERT_MEMORY_ON_CONFLICT: &str = "INSERT INTO memories
+    (user_id, memory_id, lsn, memory_bincode, importance, updated_at)
+ VALUES (?, ?, ?, ?, ?, ?)
+ ON CONFLICT(user_id, memory_id) DO UPDATE SET
+    lsn = excluded.lsn,
+    memory_bincode = excluded.memory_bincode,
+    importance = excluded.importance,
+    updated_at = excluded.updated_at
+ WHERE excluded.lsn >= memories.lsn";
+
+// MSSQL has no ON CONFLICT; the LSN-gated upsert becomes a MERGE. Same six
+// bound params in the same order, so the call site is unchanged.
+const UPSERT_MEMORY_MERGE: &str = "MERGE memories AS t
+USING (SELECT ? AS user_id, ? AS memory_id, ? AS lsn, ? AS memory_bincode, ? AS importance, ? AS updated_at) AS s
+ON t.user_id = s.user_id AND t.memory_id = s.memory_id
+WHEN MATCHED AND s.lsn >= t.lsn THEN
+    UPDATE SET lsn = s.lsn, memory_bincode = s.memory_bincode, importance = s.importance, updated_at = s.updated_at
+WHEN NOT MATCHED THEN
+    INSERT (user_id, memory_id, lsn, memory_bincode, importance, updated_at)
+    VALUES (s.user_id, s.memory_id, s.lsn, s.memory_bincode, s.importance, s.updated_at);";
+
+/// Dialect-correct `CREATE TABLE` for the `memories` projection.
+fn memories_table_ddl(backend: &RelationalBackend) -> &'static str {
+    match backend {
+        RelationalBackend::Postgres | RelationalBackend::Supabase => MEMORIES_DDL_POSTGRES,
+        RelationalBackend::Mssql => MEMORIES_DDL_MSSQL,
+        _ => MEMORIES_DDL_SQLITE,
+    }
+}
+
+/// Dialect-correct index DDL for the `memories` projection.
+fn memories_index_ddls(backend: &RelationalBackend) -> &'static [&'static str] {
+    match backend {
+        RelationalBackend::Mssql => MEMORIES_INDEXES_MSSQL,
+        // SQLite and Postgres/Supabase both accept `CREATE INDEX IF NOT EXISTS`.
+        _ => MEMORIES_INDEXES_SQLITE_PG,
+    }
+}
+
+/// Dialect-correct LSN-gated upsert for the `memories` projection.
+fn upsert_memory_sql(backend: &RelationalBackend) -> &'static str {
+    match backend {
+        RelationalBackend::Mssql => UPSERT_MEMORY_MERGE,
+        _ => UPSERT_MEMORY_ON_CONFLICT,
+    }
+}
 
 /// W4 trait-backed mirror of the slow-store CRUD surface.
 ///
@@ -439,15 +541,7 @@ impl RelationalSlowStoreAdapter {
         let now = Utc::now().to_rfc3339();
         self.store
             .execute(
-                "INSERT INTO memories
-                    (user_id, memory_id, lsn, memory_bincode, importance, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(user_id, memory_id) DO UPDATE SET
-                    lsn = excluded.lsn,
-                    memory_bincode = excluded.memory_bincode,
-                    importance = excluded.importance,
-                    updated_at = excluded.updated_at
-                 WHERE excluded.lsn >= memories.lsn",
+                upsert_memory_sql(&self.store.backend()),
                 &[
                     Param::Text(user_id),
                     Param::Text(memory_id),
@@ -459,6 +553,28 @@ impl RelationalSlowStoreAdapter {
             )
             .await
             .context("relational adapter: upsert_memory")?;
+        Ok(())
+    }
+
+    /// Create just the `memories` projection table (+ its indexes) in the
+    /// backend, with dialect-correct DDL for SQLite / Postgres / MSSQL.
+    ///
+    /// This is the only schema the W4 cutover needs: the gap-analysis tables
+    /// (entities/edges/gaps/thoughts) stay in the rusqlite slow store, so —
+    /// unlike [`Self::init_schema`], which mirrors the full SQLite schema for
+    /// parity tests — they are intentionally NOT created here. Idempotent.
+    pub async fn init_memories_schema(&self) -> Result<()> {
+        let backend = self.store.backend();
+        self.store
+            .execute(memories_table_ddl(&backend), &[])
+            .await
+            .context("create memories table")?;
+        for ddl in memories_index_ddls(&backend) {
+            self.store
+                .execute(ddl, &[])
+                .await
+                .with_context(|| format!("create memories index: {ddl}"))?;
+        }
         Ok(())
     }
 
@@ -587,6 +703,7 @@ impl RelationalSlowStoreAdapter {
                 .upsert_memory(&user_id, &memory_id, lsn, &blob, importance)
                 .await
         })
+        .map_err(|e| anyhow::anyhow!("relational bridge dropped before completing: {e}"))?
     }
 
     /// Synchronous, bridge-driven [`Self::anchor_memory_importance`].
@@ -605,6 +722,7 @@ impl RelationalSlowStoreAdapter {
                 .anchor_memory_importance(&user_id, &memory_id, lsn, importance)
                 .await
         })
+        .map_err(|e| anyhow::anyhow!("relational bridge dropped before completing: {e}"))?
     }
 
     /// Synchronous, bridge-driven [`Self::delete_memory`].
@@ -615,6 +733,7 @@ impl RelationalSlowStoreAdapter {
         crate::storage::relational::blocking::bridge_block_on(async move {
             adapter.delete_memory(&user_id, &memory_id).await
         })
+        .map_err(|e| anyhow::anyhow!("relational bridge dropped before completing: {e}"))?
     }
 }
 
@@ -633,6 +752,32 @@ mod tests {
     use crate::storage::relational::{BoxError, Row, SqliteRelationalStore};
     use async_trait::async_trait;
     use std::sync::Arc;
+
+    #[test]
+    fn memories_ddl_is_dialect_correct() {
+        // SQLite: BLOB + INTEGER + REAL.
+        let lite = memories_table_ddl(&RelationalBackend::Sqlite);
+        assert!(lite.contains("BLOB") && lite.contains("CREATE TABLE IF NOT EXISTS"));
+        // Postgres: strict types — BYTEA / BIGINT / DOUBLE PRECISION.
+        let pg = memories_table_ddl(&RelationalBackend::Postgres);
+        assert!(pg.contains("BYTEA") && pg.contains("BIGINT") && pg.contains("DOUBLE PRECISION"));
+        assert!(!pg.contains("BLOB"), "postgres DDL must not use BLOB");
+        // Supabase shares the Postgres dialect.
+        assert_eq!(memories_table_ddl(&RelationalBackend::Supabase), pg);
+        // MSSQL: OBJECT_ID guard, VARBINARY(MAX), NONCLUSTERED PK.
+        let ms = memories_table_ddl(&RelationalBackend::Mssql);
+        assert!(ms.contains("VARBINARY(MAX)") && ms.contains("OBJECT_ID") && ms.contains("NONCLUSTERED"));
+        assert!(!ms.contains("IF NOT EXISTS"), "T-SQL has no CREATE TABLE IF NOT EXISTS");
+    }
+
+    #[test]
+    fn upsert_sql_is_dialect_correct() {
+        assert!(upsert_memory_sql(&RelationalBackend::Sqlite).contains("ON CONFLICT"));
+        assert!(upsert_memory_sql(&RelationalBackend::Postgres).contains("ON CONFLICT"));
+        let ms = upsert_memory_sql(&RelationalBackend::Mssql);
+        assert!(ms.contains("MERGE memories") && ms.contains("WHEN MATCHED AND s.lsn >= t.lsn"));
+        assert!(!ms.contains("ON CONFLICT"), "T-SQL has no ON CONFLICT");
+    }
 
     /// Thin newtype that re-erases `sqlx::Error` as [`BoxError`].
     struct BoxErrorSqlite(SqliteRelationalStore);
