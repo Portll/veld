@@ -5128,16 +5128,89 @@ impl MemorySystem {
                 reason: StrengtheningReason::Recalled,
                 timestamp: now,
             });
+
+            // Layer 1: strengthen graph edges between this memory's entities and the
+            // entities resolved from its accumulated retrieval context (if dialed on).
+            if d.re_encode_graph_strengthen {
+                stats.graph_edges_strengthened += self.reconsolidate_graph(&mem, shadow, &d);
+            }
         }
 
         if stats.applied > 0 {
             tracing::debug!(
                 expired = stats.expired,
                 applied = stats.applied,
+                edges = stats.graph_edges_strengthened,
                 "FIX-R1: closed expired reconsolidation windows"
             );
         }
         stats
+    }
+
+    /// Layer 1 re-encode: strengthen Hebbian graph edges between `mem`'s entities and
+    /// the entities resolved (by name) from the shadow's accumulated retrieval context.
+    /// Returns the number of edges strengthened. No-op when there is no graph, the
+    /// memory has no entity refs, or no context keyword resolves to a known entity.
+    /// Boost scales with how often the memory was retrieved in-context this window.
+    fn reconsolidate_graph(
+        &self,
+        mem: &SharedMemory,
+        shadow: &types::ReconsolidationShadow,
+        dials: &dials::CognitiveDials,
+    ) -> usize {
+        let Some(graph) = &self.graph_memory else {
+            return 0;
+        };
+        if mem.entity_refs.is_empty() {
+            return 0;
+        }
+        let mem_entity_ids: Vec<String> = mem
+            .entity_refs
+            .iter()
+            .map(|r| r.entity_id.to_string())
+            .collect();
+
+        let threshold = crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD.max(1) as f32;
+        let intensity = (shadow.consecutive_retrieval_count as f32).min(threshold) / threshold;
+        let boost = dials.graph_boost_scale * intensity;
+        if boost <= 0.0 {
+            return 0;
+        }
+
+        // Hold one graph read guard for resolution + strengthening (strengthen takes
+        // `&self`, using its own internal synapse lock).
+        let g = graph.read();
+        let mut ctx_entity_ids: Vec<String> = Vec::new();
+        for kw in extract_entities_simple(&shadow.retrieval_context) {
+            if let Ok(Some(node)) = g.find_entity_by_name(&kw) {
+                let id = node.uuid.to_string();
+                if !ctx_entity_ids.contains(&id) {
+                    ctx_entity_ids.push(id);
+                }
+            }
+        }
+        if ctx_entity_ids.is_empty() {
+            return 0;
+        }
+
+        let mut boosts: Vec<(String, String, f32)> = Vec::new();
+        for from in &mem_entity_ids {
+            for to in &ctx_entity_ids {
+                if from != to {
+                    boosts.push((from.clone(), to.clone(), boost));
+                }
+            }
+        }
+        if boosts.is_empty() {
+            return 0;
+        }
+        match g.strengthen_memory_edges(&boosts) {
+            Ok((n, _promotions)) => n,
+            Err(e) => {
+                tracing::debug!("reconsolidation graph strengthen failed: {e}");
+                0
+            }
+        }
     }
 
     /// Run periodic maintenance (consolidation, activation decay, graph maintenance)
