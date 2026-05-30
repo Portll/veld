@@ -20,6 +20,7 @@ mod storage;
 
 pub use projection::SqliteProjection;
 pub use queries::{EntityCluster, RawDiamondGap, RawOpenTriad, RawStarGap};
+pub use relational_adapter::RelationalSlowStoreAdapter;
 pub use storage::{StoredGap, StoredMemoryRow, StoredThought};
 
 use super::gap_topology::GapStore;
