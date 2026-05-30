@@ -854,7 +854,7 @@ pub async fn recall(
                     meta.in_known_gap = !hits.is_empty();
                 }
             }
-            meta.signal_strength = "score+gap".to_string();
+            meta.signal_strength = format!("{}+gap", meta.signal_strength);
         }
         let mut fok = if let Some(agr) = meta.cross_embedder_agreement {
             0.4 * meta.peak_confidence + 0.35 * meta.answerability + 0.25 * agr
