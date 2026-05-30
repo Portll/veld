@@ -29,8 +29,11 @@
 //!
 //! ## Methods mirrored
 //!
-//! The adapter intentionally targets the four most-called CRUD primitives
-//! on the existing slow store:
+//! The adapter mirrors the gap-analysis CRUD primitives plus the
+//! intent-log `memories` projection table — the latter is what the W6
+//! query planner's [`crate::query_planner::adapters::RealRelationalQuerier`]
+//! already *reads* through this same trait, so covering its writes here
+//! proves the full round-trip ahead of the production cutover:
 //!
 //! | This adapter                          | Slow-store original                   |
 //! |---------------------------------------|---------------------------------------|
@@ -38,6 +41,11 @@
 //! | [`get_active_thoughts`](Self::get_active_thoughts)           | [`super::SlowStore::get_active_thoughts`]    |
 //! | [`store_gap`](Self::store_gap)                               | [`super::SlowStore::store_gap`]              |
 //! | [`get_unresolved_gaps`](Self::get_unresolved_gaps)           | [`super::SlowStore::get_unresolved_gaps`]    |
+//! | [`upsert_memory`](Self::upsert_memory)                       | [`super::SlowStore::upsert_memory`]          |
+//! | [`anchor_memory_importance`](Self::anchor_memory_importance) | [`super::SlowStore::anchor_memory_importance`] |
+//! | [`delete_memory`](Self::delete_memory)                       | [`super::SlowStore::delete_memory`]          |
+//! | [`get_memory_blob`](Self::get_memory_blob)                   | [`super::SlowStore::get_memory_blob`]        |
+//! | [`count_memories`](Self::count_memories)                     | [`super::SlowStore::count_memories`]         |
 //!
 //! Plus [`init_schema`](Self::init_schema), which runs the same DDL the
 //! existing rusqlite path executes inside `SlowStore::create_schema` and
@@ -50,7 +58,7 @@ use chrono::Utc;
 
 use crate::storage::relational::{Param, RelationalStore};
 
-use super::storage::{StoredGap, StoredThought};
+use super::storage::{StoredGap, StoredMemoryRow, StoredThought};
 
 /// W4 trait-backed mirror of the slow-store CRUD surface.
 ///
@@ -63,6 +71,13 @@ pub struct RelationalSlowStoreAdapter {
     store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
 }
 
+// The whole adapter is a deliberately-unwired parallel path (see the
+// module docs): it proves the `RelationalStore` surface against the
+// slow-store SQL ahead of the production cutover and is exercised only by
+// its own tests. Until a call-site adopts it, every method reads as
+// "unused" in a non-test build, so the allow lives at the impl level
+// rather than being sprinkled per method.
+#[allow(dead_code)]
 impl RelationalSlowStoreAdapter {
     /// Wrap a `RelationalStore` so the slow-store query surface can be
     /// exercised against it.
@@ -72,7 +87,6 @@ impl RelationalSlowStoreAdapter {
 
     /// Borrow the underlying store. Used by tests and follow-up porting
     /// work that needs to issue ad-hoc statements.
-    #[allow(dead_code)]
     pub fn store(&self) -> &Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>> {
         &self.store
     }
@@ -159,6 +173,20 @@ impl RelationalSlowStoreAdapter {
             "CREATE INDEX IF NOT EXISTS idx_thoughts_active
                 ON thoughts(dismissed, confidence DESC)
                 WHERE dismissed = 0",
+            // Intent-log projection: one row per live memory per user. The
+            // (user_id, memory_id) PK is the idempotency key; `lsn` is the
+            // monotonic write-skew tie-breaker.
+            "CREATE TABLE IF NOT EXISTS memories (
+                user_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                lsn INTEGER NOT NULL,
+                memory_bincode BLOB NOT NULL,
+                importance REAL NOT NULL DEFAULT 0.5,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, memory_id)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_lsn ON memories(lsn)",
             "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL
@@ -389,6 +417,144 @@ impl RelationalSlowStoreAdapter {
         }
         Ok(out)
     }
+
+    /// Mirror of [`super::SlowStore::upsert_memory`].
+    ///
+    /// Same `(user_id, memory_id)` UPSERT gated on `excluded.lsn >=
+    /// memories.lsn`, so a late replay can never overwrite a newer live
+    /// write. `lsn` funnels through `Param::I64` (the column is `INTEGER`)
+    /// and the bincode payload through `Param::Bytes`.
+    pub async fn upsert_memory(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        lsn: u64,
+        memory_bincode: &[u8],
+        importance: f32,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.store
+            .execute(
+                "INSERT INTO memories
+                    (user_id, memory_id, lsn, memory_bincode, importance, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(user_id, memory_id) DO UPDATE SET
+                    lsn = excluded.lsn,
+                    memory_bincode = excluded.memory_bincode,
+                    importance = excluded.importance,
+                    updated_at = excluded.updated_at
+                 WHERE excluded.lsn >= memories.lsn",
+                &[
+                    Param::Text(user_id),
+                    Param::Text(memory_id),
+                    Param::I64(lsn as i64),
+                    Param::Bytes(memory_bincode),
+                    Param::F64(importance as f64),
+                    Param::Text(&now),
+                ],
+            )
+            .await
+            .context("relational adapter: upsert_memory")?;
+        Ok(())
+    }
+
+    /// Mirror of [`super::SlowStore::anchor_memory_importance`].
+    ///
+    /// Updates only `importance` (plus `lsn`/`updated_at`), gated on
+    /// `lsn >= current`. The original rusqlite SQL reused the `?4` (lsn)
+    /// placeholder in both the SET and the WHERE; the trait surface uses
+    /// non-reusable positional `?`, so `lsn` is bound twice.
+    pub async fn anchor_memory_importance(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        lsn: u64,
+        importance: f32,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.store
+            .execute(
+                "UPDATE memories
+                    SET importance = ?, lsn = ?, updated_at = ?
+                  WHERE user_id = ? AND memory_id = ? AND ? >= lsn",
+                &[
+                    Param::F64(importance as f64),
+                    Param::I64(lsn as i64),
+                    Param::Text(&now),
+                    Param::Text(user_id),
+                    Param::Text(memory_id),
+                    Param::I64(lsn as i64),
+                ],
+            )
+            .await
+            .context("relational adapter: anchor_memory_importance")?;
+        Ok(())
+    }
+
+    /// Mirror of [`super::SlowStore::delete_memory`]. Idempotent — deleting
+    /// a non-existent row succeeds with zero rows affected.
+    pub async fn delete_memory(&self, user_id: &str, memory_id: &str) -> Result<()> {
+        self.store
+            .execute(
+                "DELETE FROM memories WHERE user_id = ? AND memory_id = ?",
+                &[Param::Text(user_id), Param::Text(memory_id)],
+            )
+            .await
+            .context("relational adapter: delete_memory")?;
+        Ok(())
+    }
+
+    /// Mirror of [`super::SlowStore::get_memory_blob`]. Returns `None` when
+    /// the `(user_id, memory_id)` row is absent.
+    pub async fn get_memory_blob(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<StoredMemoryRow>> {
+        let rows = self
+            .store
+            .query(
+                "SELECT user_id, memory_id, lsn, memory_bincode, importance, updated_at
+                 FROM memories
+                 WHERE user_id = ? AND memory_id = ?",
+                &[Param::Text(user_id), Param::Text(memory_id)],
+            )
+            .await
+            .context("relational adapter: get_memory_blob")?;
+        let row = match rows.into_iter().next() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let lsn: i64 = row.get(2).context("decode lsn")?;
+        let importance: f64 = row.get(4).context("decode importance")?;
+        Ok(Some(StoredMemoryRow {
+            user_id: row.get(0).context("decode user_id")?,
+            memory_id: row.get(1).context("decode memory_id")?,
+            lsn: lsn as u64,
+            memory_bincode: row.get(3).context("decode memory_bincode")?,
+            importance: importance as f32,
+            updated_at: row.get(5).context("decode updated_at")?,
+        }))
+    }
+
+    /// Mirror of [`super::SlowStore::count_memories`].
+    pub async fn count_memories(&self, user_id: &str) -> Result<u64> {
+        let rows = self
+            .store
+            .query(
+                "SELECT COUNT(*) FROM memories WHERE user_id = ?",
+                &[Param::Text(user_id)],
+            )
+            .await
+            .context("relational adapter: count_memories")?;
+        let count: i64 = rows
+            .first()
+            .map(|r| r.get::<i64>(0))
+            .transpose()
+            .context("decode count")?
+            .unwrap_or(0);
+        Ok(count as u64)
+    }
 }
 
 #[cfg(test)]
@@ -558,5 +724,80 @@ mod tests {
             .await
             .expect("get_unresolved_gaps on empty table");
         assert!(gaps.is_empty(), "expected no gaps on a fresh table");
+    }
+
+    #[tokio::test]
+    async fn adapter_memories_round_trip_lsn_gate_and_isolation() {
+        let adapter = fresh_adapter().await;
+        adapter.init_schema().await.expect("schema");
+
+        // Fresh tenant — empty.
+        assert_eq!(adapter.count_memories("alice").await.expect("count"), 0);
+        assert!(adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .expect("get")
+            .is_none());
+
+        // Insert and read back the full row, including the BLOB payload.
+        adapter
+            .upsert_memory("alice", "m-1", 5, &[1u8, 2, 3], 0.4)
+            .await
+            .expect("upsert");
+        let row = adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .expect("get")
+            .expect("row present");
+        assert_eq!(row.user_id, "alice");
+        assert_eq!(row.memory_id, "m-1");
+        assert_eq!(row.lsn, 5);
+        assert_eq!(row.memory_bincode, vec![1u8, 2, 3]);
+        assert!((row.importance - 0.4).abs() < 1e-5);
+        assert_eq!(adapter.count_memories("alice").await.expect("count"), 1);
+
+        // Higher LSN wins.
+        adapter
+            .upsert_memory("alice", "m-1", 9, &[9u8, 9], 0.8)
+            .await
+            .expect("upsert higher lsn");
+        let row = adapter.get_memory_blob("alice", "m-1").await.unwrap().unwrap();
+        assert_eq!(row.lsn, 9);
+        assert_eq!(row.memory_bincode, vec![9u8, 9]);
+
+        // Stale (lower) LSN must be a no-op, not an error or an overwrite.
+        adapter
+            .upsert_memory("alice", "m-1", 2, &[0u8], 0.1)
+            .await
+            .expect("stale upsert is a no-op");
+        let row = adapter.get_memory_blob("alice", "m-1").await.unwrap().unwrap();
+        assert_eq!(row.lsn, 9, "stale lsn must not overwrite the newer row");
+        assert_eq!(row.memory_bincode, vec![9u8, 9]);
+
+        // Anchor updates importance + lsn only (gated on lsn >= current).
+        adapter
+            .anchor_memory_importance("alice", "m-1", 12, 0.95)
+            .await
+            .expect("anchor");
+        let row = adapter.get_memory_blob("alice", "m-1").await.unwrap().unwrap();
+        assert!((row.importance - 0.95).abs() < 1e-5);
+        assert_eq!(row.lsn, 12);
+        assert_eq!(row.memory_bincode, vec![9u8, 9], "anchor leaves the blob untouched");
+
+        // Tenant isolation — bob shares the table but sees none of alice's rows.
+        assert_eq!(adapter.count_memories("bob").await.expect("count"), 0);
+
+        // Delete is idempotent.
+        adapter.delete_memory("alice", "m-1").await.expect("delete");
+        assert!(adapter
+            .get_memory_blob("alice", "m-1")
+            .await
+            .unwrap()
+            .is_none());
+        adapter
+            .delete_memory("alice", "m-1")
+            .await
+            .expect("delete again is a no-op");
+        assert_eq!(adapter.count_memories("alice").await.expect("count"), 0);
     }
 }
