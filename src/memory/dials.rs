@@ -36,6 +36,10 @@ fn default_embedding_blend() -> f32 {
     0.1
 }
 
+/// KV key under which a user's `CognitiveDials` are persisted. The store is per-user
+/// (each `MemorySystem` opens that user's own database), so a bare key is sufficient.
+pub const COGNITIVE_DIALS_KEY: &[u8] = b"cognitive_dials";
+
 /// Runtime-tunable cognitive parameters for a single user's [`crate::memory::MemorySystem`].
 ///
 /// See the module docs. All reconsolidation toggles default OFF; all retrieval overrides
