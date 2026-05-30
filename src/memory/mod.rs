@@ -96,7 +96,7 @@ pub use crate::memory::compression::{
     CausalFactLink, ConsolidationResult, FactCluster, FactType, PurgeReason, SemanticConsolidator,
     SemanticFact,
 };
-pub use crate::memory::dials::CognitiveDials;
+pub use crate::memory::dials::{CognitiveDials, ReconsolidationStats};
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
     apply_context_pattern_signals, calculate_entity_flow, calculate_entity_overlap,
@@ -5058,6 +5058,88 @@ impl MemorySystem {
         self.long_term_memory.find_by_external_id(external_id)
     }
 
+    /// Close expired reconsolidation labile windows (FIX-R1) and apply the enabled
+    /// re-encode layers. Runs inside `run_maintenance` (off the recall hot path). `now`
+    /// is injected so the expiry pass is unit-testable without a clock abstraction.
+    ///
+    /// Layer 0 (always, when `reconsolidation_enabled`): drain shadows whose window has
+    /// expired and that are not working-memory-class
+    /// (`consecutive_retrieval_count < RECONSOLIDATION_WORKING_MEMORY_THRESHOLD`), decay
+    /// the memory's activation from labile (1.0) back to a resting value (0.6 bursty /
+    /// 0.3 steady), and record a `MemoryStrengthened` event. No-op (default stats) when
+    /// `reconsolidation_enabled` is false — preserving pre-feature behavior.
+    ///
+    /// Concurrency: the shadow write-guard is released before the per-memory apply loop,
+    /// so no tier lock is held across application (matches the shadow-creation path in
+    /// `recall`, which also takes `reconsolidation_shadows.write()`).
+    pub(crate) fn run_reconsolidation_expiry(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> dials::ReconsolidationStats {
+        let mut stats = dials::ReconsolidationStats::default();
+        let d = self.cognitive_dials.read().clone();
+        if !d.reconsolidation_enabled {
+            return stats;
+        }
+
+        // Drain expired, non-working-memory shadows. Hold the write guard only for the
+        // filter+remove; release it before the apply loop.
+        let expired: Vec<types::ReconsolidationShadow> = {
+            let mut shadows = self.reconsolidation_shadows.write();
+            let expired_keys: Vec<MemoryId> = shadows
+                .iter()
+                .filter(|(_, s)| {
+                    s.expires_at <= now
+                        && s.consecutive_retrieval_count
+                            < crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            expired_keys
+                .iter()
+                .filter_map(|k| shadows.remove(k))
+                .collect()
+        };
+        stats.expired = expired.len();
+
+        for shadow in &expired {
+            // Locate the memory in the in-memory tiers (read guards drop at the `;`).
+            let found: Option<SharedMemory> = self
+                .working_memory
+                .read()
+                .get(&shadow.memory_id)
+                .or_else(|| self.session_memory.read().get(&shadow.memory_id));
+            let Some(mem) = found else { continue };
+
+            // Layer 0: close the labile window — decay activation back to resting.
+            let burstiness = mem.access_burstiness();
+            let resting_activation = if burstiness > 1.5 { 0.6 } else { 0.3 };
+            mem.set_activation(resting_activation);
+            stats.applied += 1;
+
+            self.record_consolidation_event(ConsolidationEvent::MemoryStrengthened {
+                memory_id: shadow.memory_id.0.to_string(),
+                content_preview: format!(
+                    "reconsolidated ({}x retrievals, burstiness={:.1})",
+                    shadow.consecutive_retrieval_count, burstiness
+                ),
+                activation_before: 1.0,
+                activation_after: resting_activation,
+                reason: StrengtheningReason::Recalled,
+                timestamp: now,
+            });
+        }
+
+        if stats.applied > 0 {
+            tracing::debug!(
+                expired = stats.expired,
+                applied = stats.applied,
+                "FIX-R1: closed expired reconsolidation windows"
+            );
+        }
+        stats
+    }
+
     /// Run periodic maintenance (consolidation, activation decay, graph maintenance)
     ///
     /// Call this periodically (e.g., every 5 minutes) to:
@@ -5144,6 +5226,11 @@ impl MemorySystem {
                 }
             }
         }
+
+        // 2.45 FIX-R1: close expired reconsolidation labile windows + re-encode.
+        // Runs after decay (so the resting activation it sets is final) and before
+        // potentiation. No-op unless `reconsolidation_enabled` is dialed on.
+        let _recon_stats = self.run_reconsolidation_expiry(now);
 
         // 2.5 Potentiation: boost ALL memories based on access count (Hebbian LTP)
         // This implements "neurons that fire together wire together" - memories
