@@ -3722,15 +3722,58 @@ impl super::MemorySystem {
                 .iter()
                 .map(|e| e.text.clone())
                 .collect();
+            // M3.1: cross-embedder (S3) agreement over the top results — a
+            // cold-robust confidence signal needing no feedback history. The two
+            // independent embedders agreeing on the ranking => trustworthy;
+            // diverging => uncertain. Skipped when there is no secondary embedder
+            // or too few results carry secondary embeddings.
+            let cross_embedder_agreement = query_embedding_secondary.as_ref().and_then(|qsec| {
+                let mut pairs: Vec<(f32, f32)> = Vec::new();
+                for m in memories.iter().take(10) {
+                    if let (Some(emb), Some(sec)) = (
+                        m.experience.embeddings.as_ref(),
+                        m.experience.embeddings_secondary.as_ref(),
+                    ) {
+                        let p = crate::memory::hybrid_search::cosine_similarity_pub(
+                            &query_embedding,
+                            emb,
+                        );
+                        let s = crate::memory::hybrid_search::cosine_similarity_pub(qsec, sec);
+                        pairs.push((p, s));
+                    }
+                }
+                if pairs.len() < 3 {
+                    return None;
+                }
+                // Min-max normalize each embedder's similarity profile, then
+                // agreement = 1 - mean absolute difference between the profiles.
+                let p_min = pairs.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
+                let p_max = pairs.iter().map(|x| x.0).fold(f32::NEG_INFINITY, f32::max);
+                let s_min = pairs.iter().map(|x| x.1).fold(f32::INFINITY, f32::min);
+                let s_max = pairs.iter().map(|x| x.1).fold(f32::NEG_INFINITY, f32::max);
+                let p_rng = (p_max - p_min).max(1e-6);
+                let s_rng = (s_max - s_min).max(1e-6);
+                let mad: f32 = pairs
+                    .iter()
+                    .map(|&(p, s)| (((p - p_min) / p_rng) - ((s - s_min) / s_rng)).abs())
+                    .sum::<f32>()
+                    / pairs.len() as f32;
+                Some((1.0 - mad).clamp(0.0, 1.0))
+            });
             *self.last_query_metacognition.write() =
                 Some(crate::memory::types::QueryMetacognition {
                     fok: 0.0,
                     label: String::new(),
                     peak_confidence: 0.0,
                     answerability: 0.0,
-                    cross_embedder_agreement: None,
+                    cross_embedder_agreement,
                     in_known_gap: false,
-                    signal_strength: "score_only".to_string(),
+                    signal_strength: if cross_embedder_agreement.is_some() {
+                        "score+agreement"
+                    } else {
+                        "score"
+                    }
+                    .to_string(),
                     focal_entities,
                 });
         }
