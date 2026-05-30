@@ -74,6 +74,46 @@ impl ColumnType {
             ColumnType::Json => "JSONB",
         }
     }
+
+    /// SQL identifier rendering for SQL Server (T-SQL via tiberius).
+    ///
+    /// SQL Server has no `BLOB` / native JSON type (pre-2025), and the
+    /// max-length variable types (`NVARCHAR(MAX)` / `VARBINARY(MAX)`) cannot
+    /// participate in a primary key or index. `in_pk` is therefore set for
+    /// any column that appears in the schema's primary key, so the renderer
+    /// can emit a *bounded* type the key constraint will accept. The bounds
+    /// (`NVARCHAR(450)` / `VARBINARY(900)`) are the largest single-column
+    /// sizes that stay within the 900-byte index-key limit; realistic
+    /// dataset keys (integer / short text) sit well under that.
+    fn mssql_type(self, in_pk: bool) -> &'static str {
+        match self {
+            ColumnType::Bool => "BIT",
+            ColumnType::I64 => "BIGINT",
+            ColumnType::F64 => "FLOAT(53)",
+            ColumnType::Text => {
+                if in_pk {
+                    "NVARCHAR(450)"
+                } else {
+                    "NVARCHAR(MAX)"
+                }
+            }
+            ColumnType::Bytes => {
+                if in_pk {
+                    "VARBINARY(900)"
+                } else {
+                    "VARBINARY(MAX)"
+                }
+            }
+            ColumnType::Timestamp => "DATETIMEOFFSET",
+            ColumnType::Json => {
+                if in_pk {
+                    "NVARCHAR(450)"
+                } else {
+                    "NVARCHAR(MAX)"
+                }
+            }
+        }
+    }
 }
 
 impl DatasetSchema {
@@ -90,53 +130,75 @@ impl DatasetSchema {
     pub fn to_create_table_sql_postgres(&self, table_name: &str) -> String {
         render_create_table(self, table_name, RenderDialect::Postgres)
     }
+
+    /// Render a guarded `CREATE TABLE` statement targeting SQL Server.
+    ///
+    /// T-SQL has no `CREATE TABLE IF NOT EXISTS`, so the statement is wrapped
+    /// in an `IF OBJECT_ID(...) IS NULL` guard — the same
+    /// create-if-absent semantics the SQLite / Postgres renderers get from
+    /// `IF NOT EXISTS`. Primary-key columns are rendered with bounded types
+    /// (see [`ColumnType::mssql_type`]).
+    pub fn to_create_table_sql_mssql(&self, table_name: &str) -> String {
+        render_create_table(self, table_name, RenderDialect::Mssql)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum RenderDialect {
     Sqlite,
     Postgres,
+    Mssql,
 }
 
 fn render_create_table(schema: &DatasetSchema, table_name: &str, dialect: RenderDialect) -> String {
-    let mut out = String::with_capacity(128);
-    out.push_str("CREATE TABLE IF NOT EXISTS \"");
-    out.push_str(table_name);
-    out.push_str("\" (\n");
-
+    // Build the column + primary-key body once; the SQLite / Postgres /
+    // MSSQL output differs only in the per-column type and the
+    // create-if-absent header (so the SQLite / Postgres bytes are unchanged
+    // from the original single-dialect renderer).
+    let mut body = String::with_capacity(128);
     for (idx, col) in schema.columns.iter().enumerate() {
-        out.push_str("  \"");
-        out.push_str(&col.name);
-        out.push_str("\" ");
+        body.push_str("  \"");
+        body.push_str(&col.name);
+        body.push_str("\" ");
         let ty = match dialect {
             RenderDialect::Sqlite => col.ty.sqlite_type(),
             RenderDialect::Postgres => col.ty.postgres_type(),
+            RenderDialect::Mssql => {
+                let in_pk = schema.primary_key.iter().any(|pk| pk == &col.name);
+                col.ty.mssql_type(in_pk)
+            }
         };
-        out.push_str(ty);
+        body.push_str(ty);
         if !col.nullable {
-            out.push_str(" NOT NULL");
+            body.push_str(" NOT NULL");
         }
         if idx + 1 < schema.columns.len() || !schema.primary_key.is_empty() {
-            out.push(',');
+            body.push(',');
         }
-        out.push('\n');
+        body.push('\n');
     }
 
     if !schema.primary_key.is_empty() {
-        out.push_str("  PRIMARY KEY (");
+        body.push_str("  PRIMARY KEY (");
         for (idx, pk) in schema.primary_key.iter().enumerate() {
             if idx > 0 {
-                out.push_str(", ");
+                body.push_str(", ");
             }
-            out.push('"');
-            out.push_str(pk);
-            out.push('"');
+            body.push('"');
+            body.push_str(pk);
+            body.push('"');
         }
-        out.push_str(")\n");
+        body.push_str(")\n");
     }
 
-    out.push_str(");");
-    out
+    match dialect {
+        RenderDialect::Sqlite | RenderDialect::Postgres => {
+            format!("CREATE TABLE IF NOT EXISTS \"{table_name}\" (\n{body});")
+        }
+        RenderDialect::Mssql => format!(
+            "IF OBJECT_ID(N'{table_name}', N'U') IS NULL\nCREATE TABLE \"{table_name}\" (\n{body});"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +269,49 @@ mod tests {
         let sql = sample_schema().to_create_table_sql_postgres("alice__dataset__events");
         let expected = "CREATE TABLE IF NOT EXISTS \"alice__dataset__events\" (\n  \"id\" BIGINT NOT NULL,\n  \"name\" TEXT NOT NULL,\n  \"score\" DOUBLE PRECISION,\n  \"active\" BOOLEAN NOT NULL,\n  \"payload\" BYTEA,\n  \"at\" TIMESTAMPTZ NOT NULL,\n  \"meta\" JSONB,\n  PRIMARY KEY (\"id\")\n);";
         assert_eq!(sql, expected);
+    }
+
+    #[test]
+    fn create_table_sql_mssql_renders_expected_types() {
+        let sql = sample_schema().to_create_table_sql_mssql("alice__dataset__events");
+        // OBJECT_ID guard replaces IF NOT EXISTS; BIT/FLOAT/NVARCHAR(MAX)/
+        // VARBINARY(MAX)/DATETIMEOFFSET replace the SQLite/pg native types.
+        // The `id` PK is I64 (BIGINT) so it needs no bounding; non-key text
+        // stays NVARCHAR(MAX).
+        let expected = "IF OBJECT_ID(N'alice__dataset__events', N'U') IS NULL\nCREATE TABLE \"alice__dataset__events\" (\n  \"id\" BIGINT NOT NULL,\n  \"name\" NVARCHAR(MAX) NOT NULL,\n  \"score\" FLOAT(53),\n  \"active\" BIT NOT NULL,\n  \"payload\" VARBINARY(MAX),\n  \"at\" DATETIMEOFFSET NOT NULL,\n  \"meta\" NVARCHAR(MAX),\n  PRIMARY KEY (\"id\")\n);";
+        assert_eq!(sql, expected);
+    }
+
+    #[test]
+    fn create_table_sql_mssql_bounds_text_primary_key() {
+        // A text primary key must be rendered as a bounded NVARCHAR — an
+        // NVARCHAR(MAX) column cannot participate in a SQL Server key.
+        let schema = DatasetSchema {
+            name: "by_slug".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "slug".to_string(),
+                    ty: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "body".to_string(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec!["slug".to_string()],
+        };
+        let sql = schema.to_create_table_sql_mssql("alice__dataset__by_slug");
+        // PK column bounded, non-key text stays MAX.
+        assert!(
+            sql.contains("\"slug\" NVARCHAR(450) NOT NULL"),
+            "text PK must be bounded: {sql}"
+        );
+        assert!(
+            sql.contains("\"body\" NVARCHAR(MAX)"),
+            "non-key text stays MAX: {sql}"
+        );
+        assert!(sql.starts_with("IF OBJECT_ID(N'alice__dataset__by_slug', N'U') IS NULL\n"));
     }
 }
