@@ -703,6 +703,7 @@ impl RelationalSlowStoreAdapter {
                 .upsert_memory(&user_id, &memory_id, lsn, &blob, importance)
                 .await
         })
+        .map_err(|e| anyhow::anyhow!("relational bridge dropped before completing: {e}"))?
     }
 
     /// Synchronous, bridge-driven [`Self::anchor_memory_importance`].
@@ -721,6 +722,7 @@ impl RelationalSlowStoreAdapter {
                 .anchor_memory_importance(&user_id, &memory_id, lsn, importance)
                 .await
         })
+        .map_err(|e| anyhow::anyhow!("relational bridge dropped before completing: {e}"))?
     }
 
     /// Synchronous, bridge-driven [`Self::delete_memory`].
@@ -731,6 +733,7 @@ impl RelationalSlowStoreAdapter {
         crate::storage::relational::blocking::bridge_block_on(async move {
             adapter.delete_memory(&user_id, &memory_id).await
         })
+        .map_err(|e| anyhow::anyhow!("relational bridge dropped before completing: {e}"))?
     }
 }
 
