@@ -83,7 +83,8 @@ impl SlowStore {
                 confidence = excluded.confidence,
                 embedding_distance = excluded.embedding_distance,
                 impact_score = excluded.impact_score,
-                last_verified = excluded.last_verified",
+                last_verified = excluded.last_verified,
+                resolved_at = NULL",
             params![
                 id,
                 gap_type,
@@ -237,6 +238,95 @@ impl SlowStore {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(gaps)
+    }
+
+    /// Get all unresolved gaps for a scope (across gap types), most impactful
+    /// first. Scope-filtered to prevent cross-user gap leakage (M5).
+    pub fn get_unresolved_gaps_all(&self, scope: &str, limit: usize) -> Result<Vec<StoredGap>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, gap_type, shape_signature, entities_json, missing_links_json,
+                    confidence, embedding_distance, impact_score, detected_at, scope
+             FROM gap_topologies
+             WHERE resolved_at IS NULL AND scope = ?1
+             ORDER BY impact_score DESC, confidence DESC
+             LIMIT ?2",
+        )?;
+        let gaps = stmt
+            .query_map(params![scope, limit], |row| {
+                Ok(StoredGap {
+                    id: row.get(0)?,
+                    gap_type: row.get(1)?,
+                    shape_signature: row.get(2)?,
+                    entities_json: row.get(3)?,
+                    missing_links_json: row.get(4)?,
+                    confidence: row.get(5)?,
+                    embedding_distance: row.get(6)?,
+                    impact_score: row.get(7)?,
+                    detected_at: row.get(8)?,
+                    scope: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(gaps)
+    }
+
+    /// Unresolved gaps whose entity set intersects `entity_names`
+    /// (case-insensitive), scope-filtered. The query-in-gap primitive: tells
+    /// whether a query sits in/near a known knowledge gap (M5). Surface only —
+    /// never triggers acquisition (avoids a curiosity feedback loop).
+    pub fn gaps_touching_entities(
+        &self,
+        scope: &str,
+        entity_names: &[String],
+        limit: usize,
+    ) -> Result<Vec<StoredGap>> {
+        if entity_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<String> = entity_names.iter().map(|n| n.to_lowercase()).collect();
+        // Scan the scoped, impact-ordered, bounded unresolved set and match in
+        // Rust against the stored entity names.
+        let candidates = self.get_unresolved_gaps_all(scope, 500)?;
+        let mut hits = Vec::new();
+        for gap in candidates {
+            let matched = serde_json::from_str::<serde_json::Value>(&gap.entities_json)
+                .ok()
+                .and_then(|v| {
+                    v.as_array().map(|arr| {
+                        arr.iter().any(|e| {
+                            e.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|n| wanted.iter().any(|w| w == &n.to_lowercase()))
+                                .unwrap_or(false)
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if matched {
+                hits.push(gap);
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Resolve gaps not re-verified since `cutoff_rfc3339` (hysteresis: a gap
+    /// must be absent for the stale window before being marked resolved, so
+    /// transient graph churn does not flap it). Scope-filtered. Returns the
+    /// number resolved. A re-detected gap is re-opened by `store_gap` clearing
+    /// `resolved_at`.
+    pub fn resolve_stale_gaps(&self, scope: &str, cutoff_rfc3339: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        let n = conn.execute(
+            "UPDATE gap_topologies SET resolved_at = ?1
+             WHERE scope = ?2 AND resolved_at IS NULL AND last_verified < ?3",
+            params![now, scope, cutoff_rfc3339],
+        )?;
+        Ok(n)
     }
 
     // ========================================================================
