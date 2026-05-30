@@ -1753,10 +1753,25 @@ impl MultiUserMemoryManager {
 
         // SQLite slow store projection — first attached, replays first.
         let slow_store = self.get_user_slow_store(user_id)?;
-        let mut sqlite_projection = crate::memory::slow_store::SqliteProjection::new(
-            slow_store.clone(),
-            checkpoint_store.clone(),
-        );
+        let mut sqlite_projection = match &self.dataset_executor {
+            // W4 cutover: when a relational backend is configured, the
+            // memories projection writes through that store (bridged
+            // sync→async) — the *same* store the W6 query planner reads and
+            // the W7 dataset surface uses — instead of the local rusqlite
+            // slow store. The slow store is still passed for checkpoint
+            // bookkeeping and the gap-analysis tables it also owns. With no
+            // relational backend configured (the default), this is the
+            // original rusqlite path, byte-for-byte.
+            Some(store) => crate::memory::slow_store::SqliteProjection::with_relational(
+                slow_store.clone(),
+                checkpoint_store.clone(),
+                crate::memory::slow_store::RelationalSlowStoreAdapter::new(store.clone()),
+            ),
+            None => crate::memory::slow_store::SqliteProjection::new(
+                slow_store.clone(),
+                checkpoint_store.clone(),
+            ),
+        };
 
         // Catch the SQLite projection up to the head of the log before
         // it goes live. The `Some(100)` flushes the checkpoint every 100
