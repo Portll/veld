@@ -34,6 +34,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::state::MultiUserMemoryManager;
+use super::types::MemoryEvent;
 use super::utils::resolve_request_user_id;
 use crate::auth::AuthenticatedUser;
 use crate::datasets::link::{LinkKind, RowPk};
@@ -246,6 +247,13 @@ pub async fn create_dataset(
         .create_dataset(&user_id, &req.schema)
         .await
         .map_err(map_dataset_error)?;
+    state.emit_event(dataset_event(
+        "DATASET_CREATED",
+        &user_id,
+        &dref.name,
+        format!("created dataset '{}'", dref.name),
+        None,
+    ));
     Ok(Json(CreateDatasetResponse { dataset: dref }))
 }
 
@@ -321,6 +329,13 @@ pub async fn drop_dataset(
     let store = require_dataset_store(&state)?;
     let dref = locate_dataset(&store, &user_id, &name).await?;
     store.drop_dataset(&dref).await.map_err(map_dataset_error)?;
+    state.emit_event(dataset_event(
+        "DATASET_DROPPED",
+        &user_id,
+        &name,
+        format!("dropped dataset '{name}'"),
+        None,
+    ));
     Ok(Json(DropDatasetResponse { dropped: true }))
 }
 
@@ -344,6 +359,13 @@ pub async fn insert_rows(
         .insert_rows(&dref, &req.rows)
         .await
         .map_err(map_dataset_error)?;
+    state.emit_event(dataset_event(
+        "DATASET_ROWS_INSERTED",
+        &user_id,
+        &name,
+        format!("inserted {inserted} row(s) into '{name}'"),
+        Some(inserted as usize),
+    ));
     Ok(Json(InsertRowsResponse { inserted }))
 }
 
@@ -463,6 +485,13 @@ pub async fn link_row(
             .await
             .map_err(map_dataset_error)?,
     }
+    state.emit_event(dataset_event(
+        "DATASET_ROW_LINKED",
+        &user_id,
+        &name,
+        format!("linked a row in '{name}' to {}", req.target_id),
+        None,
+    ));
     Ok(Json(LinkResponse { linked: true }))
 }
 
@@ -485,6 +514,32 @@ fn json_to_param(value: &serde_json::Value) -> Result<Param<'_>, String> {
         }
         serde_json::Value::String(s) => Ok(Param::Text(s.as_str())),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => Ok(Param::Json(value)),
+    }
+}
+
+/// Build a dataset change-data-capture event. Reuses the existing
+/// [`MemoryEvent`] envelope so dataset mutations flow over the same SSE /
+/// projection event bus as memory writes; downstream consumers switch on
+/// the `DATASET_*` `event_type`. The dataset name is carried in `entities`
+/// as `dataset:<name>` and the human-readable change in `content_preview`.
+fn dataset_event(
+    event_type: &str,
+    user_id: &str,
+    dataset: &str,
+    preview: String,
+    count: Option<usize>,
+) -> MemoryEvent {
+    MemoryEvent {
+        event_type: event_type.to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: user_id.to_string(),
+        memory_id: None,
+        content_preview: Some(preview),
+        memory_type: None,
+        importance: None,
+        count,
+        entities: Some(vec![format!("dataset:{dataset}")]),
+        results: None,
     }
 }
 
