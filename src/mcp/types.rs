@@ -427,3 +427,108 @@ pub(crate) struct HookSpecificOutput {
     #[serde(rename = "additionalContext")]
     pub additional_context: String,
 }
+
+// =============================================================================
+// W7 DATASET TOOLS (relational tabular storage)
+// =============================================================================
+// Complex shapes (DatasetSchema, RowPk) are carried as `serde_json::Value`:
+// they have no schemars::JsonSchema derive, and passing JSON straight
+// through keeps the MCP surface flexible for the model while the HTTP
+// handlers do the strict typed validation.
+
+/// Params for `dataset_create`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DatasetCreateParams {
+    /// Dataset schema: `{ "name": ..., "columns": [{ "name", "ty", "nullable" }], "primary_key": [...] }`.
+    /// `ty` is one of Bool|I64|F64|Text|Bytes|Timestamp|Json.
+    pub schema: serde_json::Value,
+}
+
+/// Params for `dataset_list` — no inputs; lists the caller's datasets.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DatasetListParams {}
+
+/// Params for `dataset_query`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DatasetQueryParams {
+    /// Dataset name to query.
+    pub name: String,
+    /// Optional SQL `WHERE` fragment (without the `WHERE` keyword); use `?`
+    /// placeholders bound by `params`.
+    pub where_clause: Option<String>,
+    /// Bound parameter values for the `?` placeholders, in order.
+    #[serde(default)]
+    pub params: Vec<serde_json::Value>,
+}
+
+/// Params for `dataset_link` — link a dataset row to an entity or memory.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DatasetLinkParams {
+    /// Dataset name.
+    pub name: String,
+    /// Row primary key: `{ "columns": { "<pk_col>": <value>, ... } }`.
+    pub row_pk: serde_json::Value,
+    /// Link kind: `"entity"` or `"memory"`.
+    pub kind: String,
+    /// Target entity id or memory id to link the row to.
+    pub target_id: String,
+}
+
+// ── Request bodies (mirror the /api/datasets HTTP surface) ───────────────
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DatasetCreateRequest {
+    pub user_id: String,
+    pub schema: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DatasetQueryRequest {
+    pub user_id: String,
+    pub where_clause: Option<String>,
+    pub params: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DatasetLinkRequest {
+    pub user_id: String,
+    pub row_pk: serde_json::Value,
+    pub kind: String,
+    pub target_id: String,
+}
+
+// ── Response bodies (only the fields the tools render) ───────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DatasetRefWire {
+    pub name: String,
+    pub table: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DatasetCreateResponse {
+    pub dataset: DatasetRefWire,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DatasetMetaWire {
+    pub name: String,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DatasetListResponse {
+    pub datasets: Vec<DatasetMetaWire>,
+    pub total: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DatasetQueryResponse {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DatasetLinkResponse {
+    pub linked: bool,
+}
