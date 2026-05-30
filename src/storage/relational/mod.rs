@@ -79,6 +79,7 @@
 //! ```
 
 pub mod blocking;
+pub mod erased;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod sqlite;
@@ -88,6 +89,7 @@ pub mod supabase;
 pub mod types;
 
 pub use blocking::BlockingRelationalStore;
+pub use erased::ErasedRelationalStore;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresRelationalStore;
 pub use sqlite::SqliteRelationalStore;
