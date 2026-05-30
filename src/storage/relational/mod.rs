@@ -83,6 +83,8 @@ pub mod blocking;
 pub mod postgres;
 pub mod sqlite;
 pub mod store;
+#[cfg(feature = "postgres")]
+pub mod supabase;
 pub mod types;
 
 pub use blocking::BlockingRelationalStore;
@@ -90,6 +92,8 @@ pub use blocking::BlockingRelationalStore;
 pub use postgres::PostgresRelationalStore;
 pub use sqlite::SqliteRelationalStore;
 pub use store::RelationalStore;
+#[cfg(feature = "postgres")]
+pub use supabase::SupabaseRelationalStore;
 pub use types::{
     ColumnError, ColumnMeta, ColumnValue, FromColumn, OwnedColumn, Param, RelationalBackend, Row,
 };
