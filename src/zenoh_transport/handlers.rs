@@ -874,6 +874,8 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
         reminder_count: None,
         lineage: Vec::new(),
         lineage_count: None,
+        tokens_estimated: None,
+        metacognition: None,
     };
 
     match serde_json::to_vec(&response) {
