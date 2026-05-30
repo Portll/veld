@@ -17,6 +17,61 @@ use super::types::{
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory;
 use crate::memory::gap_topology::{GapDetectionConfig, GapDetector};
+
+/// Hysteresis window (M5): a gap must be absent for this long before it is
+/// marked resolved, so transient graph churn does not flap gaps
+/// resolved/unresolved across consolidation cycles.
+const GAP_STALE_RESOLVE_SECS: i64 = 3 * 3600;
+
+/// Persist detected gaps to the slow store and resolve gaps gone stale (M5).
+///
+/// Closes the historical "computed -> logged -> dropped" leak: gap topology was
+/// recomputed every consolidation and discarded. Each gap is persisted with a
+/// deterministic, per-instance id (`type|shape|sorted-entity-uuids`) so
+/// re-detection is idempotent via `ON CONFLICT` (which re-opens a previously
+/// resolved gap). Gaps not re-verified within the hysteresis window are
+/// resolved. Surface-only: never triggers acquisition (no curiosity feedback
+/// loop); reads of these gaps are scope-filtered to prevent cross-user leakage.
+fn persist_detected_gaps(
+    store: &crate::memory::slow_store::SlowStore,
+    scope: &str,
+    result: &crate::memory::gap_topology::GapDetectionResult,
+) {
+    for gap in &result.gaps {
+        let mut uuids: Vec<&str> = gap.entities.iter().map(|e| e.uuid.as_str()).collect();
+        uuids.sort_unstable();
+        let id = format!(
+            "{}|{}|{}",
+            gap.gap_type.as_str(),
+            gap.shape.canonical,
+            uuids.join(",")
+        );
+        let entities_json =
+            serde_json::to_string(&gap.entities).unwrap_or_else(|_| "[]".to_string());
+        let missing_links_json =
+            serde_json::to_string(&gap.missing_links).unwrap_or_else(|_| "[]".to_string());
+        if let Err(e) = store.store_gap(
+            &id,
+            gap.gap_type.as_str(),
+            &gap.shape.canonical,
+            &entities_json,
+            &missing_links_json,
+            gap.confidence,
+            gap.embedding_similarity,
+            gap.impact_score,
+            scope,
+        ) {
+            tracing::debug!(scope = %scope, "M5: store_gap failed: {e}");
+        }
+    }
+    let cutoff =
+        (chrono::Utc::now() - chrono::Duration::seconds(GAP_STALE_RESOLVE_SECS)).to_rfc3339();
+    if let Ok(n) = store.resolve_stale_gaps(scope, &cutoff) {
+        if n > 0 {
+            tracing::debug!(scope = %scope, resolved = n, "M5: resolved stale gaps");
+        }
+    }
+}
 use crate::metrics;
 use crate::validation;
 
@@ -360,11 +415,12 @@ pub async fn consolidate_memories(
                             let config = GapDetectionConfig::default();
                             match GapDetector::detect(store.as_ref(), &config) {
                                 Ok(result) => {
+                                    persist_detected_gaps(&*store, &user_id, &result);
                                     tracing::info!(
                                         user_id = %user_id,
                                         gaps = result.gaps.len(),
                                         types = ?result.type_counts,
-                                        "Gap detection complete (post-consolidation)"
+                                        "Gap detection complete + persisted (post-consolidation)"
                                     );
                                 }
                                 Err(e) => {
@@ -693,7 +749,8 @@ pub async fn sleep_phase_consolidation(
                     if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
                         let config = GapDetectionConfig::default();
                         if let Ok(result) = GapDetector::detect(store.as_ref(), &config) {
-                            tracing::info!(user_id = %user_id, gaps = result.gaps.len(), "Sleep-phase gap detection complete");
+                            persist_detected_gaps(&*store, &user_id, &result);
+                            tracing::info!(user_id = %user_id, gaps = result.gaps.len(), "Sleep-phase gap detection complete + persisted");
                         }
                     }
                 }
