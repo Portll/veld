@@ -3760,6 +3760,25 @@ impl super::MemorySystem {
                     / pairs.len() as f32;
                 Some((1.0 - mad).clamp(0.0, 1.0))
             });
+            // M4: query-level entity coverage — fraction of the query's focal
+            // entities covered by ANY top result (union, not per-memory). Reuses
+            // the Layer 5.95 lowercased-substring matching; cold-robust.
+            let coverage = if focal_entities.is_empty() {
+                None
+            } else {
+                let wanted: Vec<String> =
+                    focal_entities.iter().map(|e| e.to_lowercase()).collect();
+                let top_lc: Vec<String> = memories
+                    .iter()
+                    .take(10)
+                    .map(|m| m.experience.content.to_lowercase())
+                    .collect();
+                let covered = wanted
+                    .iter()
+                    .filter(|e| top_lc.iter().any(|c| c.contains(e.as_str())))
+                    .count();
+                Some(covered as f32 / wanted.len() as f32)
+            };
             *self.last_query_metacognition.write() =
                 Some(crate::memory::types::QueryMetacognition {
                     fok: 0.0,
@@ -3767,6 +3786,7 @@ impl super::MemorySystem {
                     peak_confidence: 0.0,
                     answerability: 0.0,
                     cross_embedder_agreement,
+                    coverage,
                     in_known_gap: false,
                     signal_strength: if cross_embedder_agreement.is_some() {
                         "score+agreement"
