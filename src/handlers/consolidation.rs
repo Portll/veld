@@ -415,7 +415,7 @@ pub async fn consolidate_memories(
                             let config = GapDetectionConfig::default();
                             match GapDetector::detect(store.as_ref(), &config) {
                                 Ok(result) => {
-                                    persist_detected_gaps(&*store, &user_id, &result);
+                                    persist_detected_gaps(&store, &user_id, &result);
                                     tracing::info!(
                                         user_id = %user_id,
                                         gaps = result.gaps.len(),
@@ -749,7 +749,7 @@ pub async fn sleep_phase_consolidation(
                     if let Ok(_sync) = store.sync_from_graph(&entities, &edges) {
                         let config = GapDetectionConfig::default();
                         if let Ok(result) = GapDetector::detect(store.as_ref(), &config) {
-                            persist_detected_gaps(&*store, &user_id, &result);
+                            persist_detected_gaps(&store, &user_id, &result);
                             tracing::info!(user_id = %user_id, gaps = result.gaps.len(), "Sleep-phase gap detection complete + persisted");
                         }
                     }
