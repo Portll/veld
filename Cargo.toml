@@ -323,6 +323,17 @@ name = "softmax_benchmarks"
 harness = false
 
 # =============================================================================
+# GATED TEST TARGETS
+# =============================================================================
+# Heavy stress suites are excluded from the default `cargo test` build via
+# `required-features`. They are slow and intentionally push the system past
+# its limits, so they only build/run under `cargo test --features stress`.
+[[test]]
+name = "brutal_stress_tests"
+path = "tests/brutal_stress_tests.rs"
+required-features = ["stress"]
+
+# =============================================================================
 # CARGO-BINSTALL — pre-built binary installation
 # =============================================================================
 # Users install with: cargo binstall veld
@@ -383,6 +394,11 @@ default = ["storage-redb"]
 # Backend selection scaffolding for the storage migration.
 storage-redb = ["dep:redb"]
 legacy-rocksdb = []
+
+# Heavy stress / brute-force test suites. Off by default so the standard
+# test build stays fast and does not compile the aggressive suites. Enable
+# with `cargo test --features stress` (gates tests/brutal_stress_tests.rs).
+stress = []
 
 # Python bindings for PyO3
 python = ["pyo3", "numpy"]
