@@ -5134,6 +5134,14 @@ impl MemorySystem {
             if d.re_encode_graph_strengthen {
                 stats.graph_edges_strengthened += self.reconsolidate_graph(&mem, shadow, &d);
             }
+
+            // Layers 2 & 3: enrich entity_refs / nudge embedding from the accumulated
+            // context, then persist (one clone + one re-index for both layers).
+            if d.re_encode_entity_enrich || d.re_encode_embedding_nudge {
+                let (enriched, nudged) = self.reconsolidate_memory(&mem, shadow, &d);
+                stats.entities_enriched += enriched;
+                stats.embeddings_nudged += nudged;
+            }
         }
 
         if stats.applied > 0 {
@@ -5211,6 +5219,79 @@ impl MemorySystem {
                 0
             }
         }
+    }
+
+    /// Layers 2 & 3 re-encode: clone the memory once, optionally (a) merge new
+    /// retrieval-context entities into `entity_refs` and (b) nudge its embedding toward
+    /// the retrieval-context embedding, then persist via `update_memory` (single
+    /// re-index). Returns `(entities_enriched, embeddings_nudged)`. No-op (no clone, no
+    /// persist) when neither layer is dialed on or no mutation actually occurs.
+    fn reconsolidate_memory(
+        &self,
+        mem: &SharedMemory,
+        shadow: &types::ReconsolidationShadow,
+        dials: &dials::CognitiveDials,
+    ) -> (usize, usize) {
+        if !dials.re_encode_entity_enrich && !dials.re_encode_embedding_nudge {
+            return (0, 0);
+        }
+        let mut m = (**mem).clone();
+        let mut entities_enriched = 0usize;
+        let mut embeddings_nudged = 0usize;
+        let mut dirty = false;
+
+        // Layer 2: merge genuinely-new context entities into entity_refs.
+        if dials.re_encode_entity_enrich {
+            if let Some(graph) = &self.graph_memory {
+                let g = graph.read();
+                let before = m.entity_refs.len();
+                for kw in extract_entities_simple(&shadow.retrieval_context) {
+                    if let Ok(Some(node)) = g.find_entity_by_name(&kw) {
+                        m.add_entity_ref(node.uuid, node.name.clone(), "reconsolidated".to_string());
+                    }
+                }
+                let added = m.entity_refs.len() - before;
+                if added > 0 {
+                    entities_enriched = added;
+                    dirty = true;
+                }
+            }
+        }
+
+        // Layer 3: blend the embedding toward the retrieval-context embedding (L2-norm).
+        if dials.re_encode_embedding_nudge {
+            if let Some(mem_emb) = m.experience.embeddings.clone() {
+                if !mem_emb.is_empty() {
+                    if let Ok(ctx_emb) = self.compute_embedding(&shadow.retrieval_context) {
+                        if ctx_emb.len() == mem_emb.len() {
+                            let blend = dials.embedding_blend;
+                            let mut blended: Vec<f32> = mem_emb
+                                .iter()
+                                .zip(ctx_emb.iter())
+                                .map(|(a, b)| (1.0 - blend) * a + blend * b)
+                                .collect();
+                            let norm = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > f32::EPSILON {
+                                for x in blended.iter_mut() {
+                                    *x /= norm;
+                                }
+                                m.experience.embeddings = Some(blended);
+                                embeddings_nudged = 1;
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if dirty {
+            if let Err(e) = self.update_memory(&m) {
+                tracing::debug!("reconsolidation memory update failed: {e}");
+                return (0, 0);
+            }
+        }
+        (entities_enriched, embeddings_nudged)
     }
 
     /// Run periodic maintenance (consolidation, activation decay, graph maintenance)
