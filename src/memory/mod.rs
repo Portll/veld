@@ -324,6 +324,12 @@ pub struct MemorySystem {
     reconsolidation_shadows:
         Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::ReconsolidationShadow>>>,
 
+    /// Per-user runtime-tunable cognitive parameters (the "dials"). Seeded from
+    /// config/env at construction, mutated at runtime via `/api/dials` (and Sleight).
+    /// All reconsolidation toggles default OFF and all retrieval overrides default to
+    /// `None` — inert until explicitly dialed on. See [`dials::CognitiveDials`].
+    cognitive_dials: Arc<parking_lot::RwLock<dials::CognitiveDials>>,
+
     /// Signal attribution from the most recent semantic retrieval.
     /// Records which scoring signals (BM25, vector, graph, cross-encoder, recency,
     /// temporal match, entity overlap) contributed to each memory's ranking.
@@ -965,6 +971,11 @@ impl MemorySystem {
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            // CognitiveDials: runtime tuning surface — defaults inert (all OFF / None).
+            // Config/env seeding + KV-persisted per-user override are wired separately.
+            cognitive_dials: Arc::new(parking_lot::RwLock::new(
+                dials::CognitiveDials::default(),
+            )),
             // Signal attribution from most recent semantic retrieval
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1024,6 +1035,20 @@ impl MemorySystem {
     /// Update External dimension scores (Sleight) (called via API push from Sleight).
     pub fn set_external_scores(&self, scores: types::ExternalDimensionScores) {
         *self.external_scores.write() = Some(scores);
+    }
+
+    /// Snapshot the current cognitive dials (cheap clone under read lock).
+    pub fn cognitive_dials(&self) -> dials::CognitiveDials {
+        self.cognitive_dials.read().clone()
+    }
+
+    /// Replace the cognitive dials at runtime (sanitizes ranges + stamps `updated_at`).
+    /// Called via `/api/dials` PUT and by automated tuners. Persistence of the new
+    /// value is handled by the caller path that owns the KV store.
+    pub fn set_cognitive_dials(&self, new_dials: dials::CognitiveDials) {
+        let mut d = new_dials.sanitized();
+        d.updated_at = Some(chrono::Utc::now());
+        *self.cognitive_dials.write() = d;
     }
 
     /// Get current External dimension scores (Sleight) (read during Layer 5 scoring).
