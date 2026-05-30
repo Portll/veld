@@ -863,10 +863,20 @@ impl MemorySystem {
             hybrid_search_config,
         );
 
-        // Shared runtime dials: seed from env once, attach to the search engine so its
-        // retrieval overrides take effect, and store the same handle on MemorySystem.
+        // Shared runtime dials: seed from env once, overlay any persisted (runtime-set)
+        // value, attach to the search engine so its retrieval overrides take effect, and
+        // store the same handle on MemorySystem.
         let cognitive_dials_arc =
             Arc::new(parking_lot::RwLock::new(dials::CognitiveDials::from_env()));
+        if let Ok(Some(bytes)) = storage
+            .key_value_store()
+            .get_bytes(dials::COGNITIVE_DIALS_KEY)
+        {
+            match serde_json::from_slice::<dials::CognitiveDials>(&bytes) {
+                Ok(persisted) => *cognitive_dials_arc.write() = persisted.sanitized(),
+                Err(e) => tracing::warn!("ignoring corrupt persisted cognitive dials: {e}"),
+            }
+        }
         hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
 
         #[cfg(feature = "multi-tenant")]
@@ -1047,12 +1057,25 @@ impl MemorySystem {
         self.cognitive_dials.read().clone()
     }
 
-    /// Replace the cognitive dials at runtime (sanitizes ranges + stamps `updated_at`).
-    /// Called via `/api/dials` PUT and by automated tuners. Persistence of the new
-    /// value is handled by the caller path that owns the KV store.
+    /// Replace the cognitive dials at runtime (sanitizes ranges + stamps `updated_at`)
+    /// and persist them so the value survives a restart. Called via `/api/dials` PUT and
+    /// by automated tuners. Persistence is best-effort: a KV failure is logged, not
+    /// fatal (the in-memory dials still update).
     pub fn set_cognitive_dials(&self, new_dials: dials::CognitiveDials) {
         let mut d = new_dials.sanitized();
         d.updated_at = Some(chrono::Utc::now());
+        match serde_json::to_vec(&d) {
+            Ok(bytes) => {
+                if let Err(e) = self
+                    .long_term_memory
+                    .key_value_store()
+                    .put_bytes(dials::COGNITIVE_DIALS_KEY, &bytes)
+                {
+                    tracing::warn!("failed to persist cognitive dials: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize cognitive dials: {e}"),
+        }
         *self.cognitive_dials.write() = d;
     }
 
