@@ -1117,6 +1117,11 @@ fn crc32_simple(data: &[u8]) -> u32 {
 
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
 const CF_INDEX: &str = "memory_index";
+/// General-purpose key-value column family for small per-user blobs (e.g. the
+/// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
+/// Created on open via `create_missing_column_families`, so it materializes on
+/// existing databases too.
+const CF_KV: &str = "kv";
 
 /// Storage engine for long-term memory persistence
 ///
@@ -1213,6 +1218,14 @@ impl MemoryStorage {
                     idx_opts.set_max_write_buffer_number(2);
                     idx_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
                     idx_opts
+                }),
+                ColumnFamilyDescriptor::new(CF_KV, {
+                    let mut kv_opts = Options::default();
+                    kv_opts.create_if_missing(true);
+                    kv_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                    kv_opts.set_max_write_buffer_number(2);
+                    kv_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
+                    kv_opts
                 }),
             ]
         })?);
@@ -3004,6 +3017,21 @@ impl MemoryStorage {
     /// Facts use a different key prefix ("facts:") to avoid collisions.
     pub fn db(&self) -> Arc<DB> {
         self.db.clone()
+    }
+
+    /// Backend-agnostic key-value handle over the general-purpose `kv` column family.
+    ///
+    /// For small per-user blobs (e.g. the `CognitiveDials` tuning surface) that don't
+    /// belong in the memory or index schemas. Returns a
+    /// [`crate::storage::KeyValueStore`] so callers stay portable across the redb
+    /// cutover — the concrete rocksdb CF lives behind the trait here, and the redb
+    /// path (`RedbKeyValueStore`) implements the same trait. The store is per-user
+    /// (this `MemoryStorage` opens the user's own database), so callers use bare keys.
+    pub fn key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
+        Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
+            self.db.clone(),
+            CF_KV,
+        ))
     }
 }
 
