@@ -108,6 +108,72 @@ pub fn run(config: ServerRunConfig) -> Result<()> {
         .block_on(async_main())
 }
 
+/// Build the optional relational backend selected by
+/// `VELD_RELATIONAL_BACKEND` (see [`crate::config::RelationalBackendChoice`]).
+///
+/// Returns `Ok(None)` when unset — the default rusqlite-only path. When set,
+/// connects (and, for SQLite, creates) the database and returns it
+/// type-erased behind `Arc<dyn RelationalStore<Error = BoxError>>`; the
+/// caller runs schema setup and wires it onto the manager. A misconfigured
+/// backend (missing env vars, unknown value, Postgres requested without the
+/// `postgres` feature) is a hard startup error rather than a silent fallback.
+async fn build_relational_backend() -> Result<
+    Option<
+        Arc<
+            dyn crate::storage::relational::RelationalStore<
+                Error = crate::storage::relational::BoxError,
+            >,
+        >,
+    >,
+> {
+    use crate::config::RelationalBackendChoice;
+    use crate::storage::relational::{
+        BoxError, ErasedRelationalStore, RelationalStore, SqliteRelationalStore,
+    };
+
+    let choice = match RelationalBackendChoice::from_env() {
+        Ok(c) => c,
+        Err(msg) => {
+            error!("relational backend misconfigured: {msg}");
+            anyhow::bail!("relational backend misconfigured: {msg}");
+        }
+    };
+
+    let store: Option<Arc<dyn RelationalStore<Error = BoxError>>> = match choice {
+        None => None,
+        Some(RelationalBackendChoice::Sqlite { path }) => {
+            let s = SqliteRelationalStore::open(&path)
+                .await
+                .with_context(|| format!("open relational sqlite at {path}"))?;
+            info!(backend = "sqlite", path = %path, "relational backend connected");
+            Some(Arc::new(ErasedRelationalStore::new(s)))
+        }
+        #[cfg(feature = "postgres")]
+        Some(RelationalBackendChoice::Postgres { url }) => {
+            let s = crate::storage::relational::PostgresRelationalStore::connect(&url)
+                .await
+                .context("connect relational postgres")?;
+            info!(backend = "postgres", "relational backend connected");
+            Some(Arc::new(ErasedRelationalStore::new(s)))
+        }
+        #[cfg(feature = "postgres")]
+        Some(RelationalBackendChoice::Supabase {
+            project_ref,
+            db_password,
+        }) => {
+            let s = crate::storage::relational::SupabaseRelationalStore::connect(
+                &project_ref,
+                &db_password,
+            )
+            .await
+            .context("connect relational supabase")?;
+            info!(backend = "supabase", project_ref = %project_ref, "relational backend connected");
+            Some(Arc::new(ErasedRelationalStore::new(s)))
+        }
+    };
+    Ok(store)
+}
+
 // =============================================================================
 // ASYNC MAIN
 // =============================================================================
@@ -147,11 +213,38 @@ async fn async_main() -> Result<()> {
     // Initialize runtime-configurable decay scales from config
     crate::decay::init_runtime_scales(&server_config.log_periodic_scales);
 
-    // Create orchestration runtime
-    let runtime = RootsRuntime::new(
+    // Create orchestration runtime. Optionally wire a relational backend
+    // (W4 cutover + W7 datasets + W6 query planner) when
+    // VELD_RELATIONAL_BACKEND is set; otherwise the manager runs
+    // rusqlite-only, exactly as before.
+    let relational = build_relational_backend().await?;
+    let mut manager_inner = crate::handlers::MultiUserMemoryManager::new(
         server_config.storage_path.clone(),
         server_config.clone(),
     )?;
+    if let Some(store) = relational {
+        // Ensure the slow-store `memories` schema exists in the backend so
+        // the projection's first write doesn't hit a missing table.
+        crate::memory::slow_store::RelationalSlowStoreAdapter::new(store.clone())
+            .init_schema()
+            .await
+            .context("initialise relational slow-store schema")?;
+        let dataset_store = Arc::new(
+            crate::datasets::RelationalDatasetStore::new(store.clone())
+                .await
+                .context("initialise relational dataset catalog")?,
+        );
+        let link_store = Arc::new(
+            crate::datasets::RelationalLinkStore::new(store.clone())
+                .await
+                .context("initialise relational link table")?,
+        );
+        manager_inner = manager_inner.with_dataset_stores(dataset_store, link_store, store);
+        info!(
+            "relational backend wired: memories projection cutover + datasets + query planner active"
+        );
+    }
+    let runtime = RootsRuntime::from_manager(Arc::new(manager_inner));
     let manager: AppState = runtime.state();
 
     // Print storage stats
