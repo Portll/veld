@@ -3711,6 +3711,30 @@ impl super::MemorySystem {
             }
         }
 
+        // M3: stash the query-level metacognition substrate. The full
+        // feeling-of-knowing is assembled by the handler (which has the final
+        // scores and slow-store access for the M5 gap check); here we only carry
+        // the resolved focal entities forward. This is a terminal readout — it is
+        // never fed back into scoring or adaptive weight learning.
+        {
+            let focal_entities: Vec<String> = query_analysis
+                .focal_entities
+                .iter()
+                .map(|e| e.text.clone())
+                .collect();
+            *self.last_query_metacognition.write() =
+                Some(crate::memory::types::QueryMetacognition {
+                    fok: 0.0,
+                    label: String::new(),
+                    peak_confidence: 0.0,
+                    answerability: 0.0,
+                    cross_embedder_agreement: None,
+                    in_known_gap: false,
+                    signal_strength: "score_only".to_string(),
+                    focal_entities,
+                });
+        }
+
         Ok(memories)
     }
 

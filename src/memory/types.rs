@@ -136,6 +136,38 @@ pub struct SignalAttribution {
     pub entity_overlap: bool,
 }
 
+/// Query-level metacognition (M3): a returned feeling-of-knowing readout.
+///
+/// Computed as a TERMINAL readout after retrieval — advisory, and never fed back
+/// into scoring or adaptive weight learning (a metamemory signal that
+/// conditioned the learner would self-confirm). Grounded in cold-robust signals
+/// (the result-set score distribution, cross-embedder agreement, and the M5
+/// in-known-gap flag) rather than the prior-dominated per-item calibrated
+/// confidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryMetacognition {
+    /// Calibrated feeling-of-knowing for the whole query, 0.0–1.0.
+    pub fok: f32,
+    /// Coarse label: "high" | "medium" | "low".
+    pub label: String,
+    /// How sharply the top result dominates: top/(top+second). ~0.5 = ambiguous,
+    /// approaching 1.0 = a lone strong match.
+    pub peak_confidence: f32,
+    /// Squashed top score top/(top+1): a bounded proxy for "is there an answer".
+    pub answerability: f32,
+    /// Cross-embedder (S3) agreement over the top results, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_embedder_agreement: Option<f32>,
+    /// Whether the query sits in/near a known unresolved knowledge gap (M5 link).
+    pub in_known_gap: bool,
+    /// Which signals were available: "score_only" | "score+gap" | …
+    pub signal_strength: String,
+    /// Resolved query entity names — an internal hop from recall to the handler's
+    /// gap check; never serialized.
+    #[serde(skip)]
+    pub focal_entities: Vec<String>,
+}
+
 impl ScoringSignals {
     /// Extract signals from a memory. Requires no external state — all data
     /// comes from the memory itself. External signals (graph_strength,

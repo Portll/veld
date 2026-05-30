@@ -330,6 +330,11 @@ pub struct MemorySystem {
     last_signal_attributions:
         Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::SignalAttribution>>>,
 
+    /// Query-level metacognition (M3) from the most recent semantic retrieval.
+    /// A terminal feeling-of-knowing readout — never fed back into scoring or
+    /// adaptive weight learning. The handler assembles the final score from this.
+    last_query_metacognition: Arc<parking_lot::RwLock<Option<types::QueryMetacognition>>>,
+
     /// Drift-adaptive abstention threshold (APP-5).
     /// Calibrated during maintenance by sampling memory importance×confidence scores.
     /// Stored as f32 bits in AtomicU32 for lock-free reads during retrieval.
@@ -954,6 +959,8 @@ impl MemorySystem {
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            // M3: query-level metacognition readout (terminal; not fed to learner)
+            last_query_metacognition: Arc::new(parking_lot::RwLock::new(None)),
             // Drift-adaptive abstention: 0 = use static constant
             calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
         })
@@ -1034,6 +1041,13 @@ impl MemorySystem {
         &self,
     ) -> std::collections::HashMap<MemoryId, types::SignalAttribution> {
         self.last_signal_attributions.read().clone()
+    }
+
+    /// Get the query-level metacognition (M3) from the most recent semantic
+    /// retrieval. A terminal feeling-of-knowing readout; advisory only, never
+    /// fed back into scoring or weight learning.
+    pub fn last_query_metacognition(&self) -> Option<types::QueryMetacognition> {
+        self.last_query_metacognition.read().clone()
     }
 
     /// Get signal attribution for a specific memory from the most recent retrieval.
