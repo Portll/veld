@@ -1603,6 +1603,75 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["project_path"],
         },
       },
+      {
+        name: "dataset_create",
+        description:
+          "Create a relational dataset (table) for tabular data. Requires a configured relational backend.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            schema: {
+              type: "object",
+              description:
+                "Dataset schema: { name, columns: [{ name, ty, nullable }], primary_key: [..] }. ty is one of Bool|I64|F64|Text|Bytes|Timestamp|Json.",
+            },
+          },
+          required: ["schema"],
+        },
+      },
+      {
+        name: "dataset_list",
+        description: "List the datasets you own, with row counts.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "dataset_query",
+        description:
+          "Run a parametrised SELECT over a dataset. Optional where_clause is a SQL fragment (no WHERE keyword) with ? placeholders bound by params in order.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Dataset name to query." },
+            where_clause: {
+              type: "string",
+              description: "Optional SQL WHERE fragment (no WHERE keyword).",
+            },
+            params: {
+              type: "array",
+              description: "Bound values for the ? placeholders, in order.",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "dataset_link",
+        description:
+          "Link a dataset row to a knowledge-graph entity or a memory.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Dataset name." },
+            row_pk: {
+              type: "object",
+              description: "Row primary key: { columns: { <pk_col>: <value> } }.",
+            },
+            kind: {
+              type: "string",
+              enum: ["entity", "memory"],
+              description: "Link target kind.",
+            },
+            target_id: {
+              type: "string",
+              description: "Entity id or memory id to link the row to.",
+            },
+          },
+          required: ["name", "row_pk", "kind", "target_id"],
+        },
+      },
     ],
   };
 });
@@ -1677,6 +1746,88 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Inner function to execute tool logic - allows us to capture result for auto-ingest
   const executeTool = async (): Promise<ToolResult> => {
     switch (name) {
+      // ── W7 dataset tools (relational tabular storage) ──────────────────
+      case "dataset_create": {
+        const { schema } = args as { schema: object };
+        const result = await apiCall<{ dataset: { name: string; table: string } }>(
+          "/api/datasets",
+          "POST",
+          { user_id: USER_ID, schema },
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Created dataset '${result.dataset.name}' (table ${result.dataset.table})`,
+            },
+          ],
+        };
+      }
+
+      case "dataset_list": {
+        const result = await apiCall<{
+          datasets: { name: string; row_count: number }[];
+          total: number;
+        }>(`/api/datasets?user_id=${encodeURIComponent(USER_ID)}`, "GET");
+        let text = `${result.total} dataset(s):\n`;
+        for (const d of result.datasets) {
+          text += `- ${d.name} (${d.row_count} rows)\n`;
+        }
+        return { content: [{ type: "text", text: text.trimEnd() }] };
+      }
+
+      case "dataset_query": {
+        const {
+          name: dsName,
+          where_clause,
+          params = [],
+        } = args as {
+          name: string;
+          where_clause?: string;
+          params?: unknown[];
+        };
+        const result = await apiCall<{
+          columns: string[];
+          rows: unknown[][];
+        }>(`/api/datasets/${encodeURIComponent(dsName)}/query`, "POST", {
+          user_id: USER_ID,
+          where_clause,
+          params,
+        });
+        let text = `${result.columns.join(", ")} | ${result.rows.length} row(s)\n`;
+        for (const row of result.rows.slice(0, 50)) {
+          text += row
+            .map((c) => (typeof c === "string" ? c : JSON.stringify(c)))
+            .join(", ");
+          text += "\n";
+        }
+        return { content: [{ type: "text", text: text.trimEnd() }] };
+      }
+
+      case "dataset_link": {
+        const {
+          name: dsName,
+          row_pk,
+          kind,
+          target_id,
+        } = args as {
+          name: string;
+          row_pk: object;
+          kind: string;
+          target_id: string;
+        };
+        const result = await apiCall<{ linked: boolean }>(
+          `/api/datasets/${encodeURIComponent(dsName)}/link`,
+          "POST",
+          { user_id: USER_ID, row_pk, kind, target_id },
+        );
+        return {
+          content: [
+            { type: "text", text: result.linked ? "Linked." : "Link not created." },
+          ],
+        };
+      }
+
       case "remember": {
         const {
           content,

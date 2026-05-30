@@ -677,4 +677,163 @@ impl VeldMcpServer {
             }),
         }
     }
+
+    // =========================================================================
+    // W7 DATASET TOOLS - relational tabular storage
+    // =========================================================================
+
+    #[tool(
+        description = "Create a relational dataset (table) for tabular data. `schema` is a JSON object { name, columns: [{ name, ty, nullable }], primary_key: [..] }, where ty is one of Bool|I64|F64|Text|Bytes|Timestamp|Json. Requires a configured relational backend."
+    )]
+    async fn dataset_create(
+        &self,
+        Parameters(params): Parameters<DatasetCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<DatasetCreateResponse> = self
+            .client
+            .post(
+                "/api/datasets",
+                &DatasetCreateRequest {
+                    user_id: self.client.user_id.clone(),
+                    schema: params.schema,
+                },
+            )
+            .await;
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Created dataset '{}' (table {})",
+                resp.dataset.name, resp.dataset.table
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(description = "List the datasets you own, with row counts.")]
+    async fn dataset_list(
+        &self,
+        Parameters(_params): Parameters<DatasetListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!(
+            "/api/datasets?user_id={}",
+            url_encode_component(&self.client.user_id)
+        );
+        let result: Result<DatasetListResponse> = self.client.get(&endpoint).await;
+        match result {
+            Ok(resp) => {
+                let mut output = format!("{} dataset(s):\n", resp.total);
+                for d in resp.datasets {
+                    output.push_str(&format!("- {} ({} rows)\n", d.name, d.row_count));
+                }
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Run a parametrised SELECT over a dataset. Optional `where_clause` is a SQL fragment (no WHERE keyword) with `?` placeholders bound by `params` in order. Returns columns + rows (first 50 shown)."
+    )]
+    async fn dataset_query(
+        &self,
+        Parameters(params): Parameters<DatasetQueryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!("/api/datasets/{}/query", url_encode_component(&params.name));
+        let result: Result<DatasetQueryResponse> = self
+            .client
+            .post(
+                &endpoint,
+                &DatasetQueryRequest {
+                    user_id: self.client.user_id.clone(),
+                    where_clause: params.where_clause,
+                    params: params.params,
+                },
+            )
+            .await;
+        match result {
+            Ok(resp) => {
+                let mut output = format!("{} | {} row(s)\n", resp.columns.join(", "), resp.rows.len());
+                for row in resp.rows.iter().take(50) {
+                    let cells: Vec<String> = row.iter().map(render_query_cell).collect();
+                    output.push_str(&cells.join(", "));
+                    output.push('\n');
+                }
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Link a dataset row to a knowledge-graph entity or a memory. `row_pk` is { columns: { <pk_col>: <value> } }, `kind` is 'entity' or 'memory', `target_id` is the entity/memory id."
+    )]
+    async fn dataset_link(
+        &self,
+        Parameters(params): Parameters<DatasetLinkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!("/api/datasets/{}/link", url_encode_component(&params.name));
+        let result: Result<DatasetLinkResponse> = self
+            .client
+            .post(
+                &endpoint,
+                &DatasetLinkRequest {
+                    user_id: self.client.user_id.clone(),
+                    row_pk: params.row_pk,
+                    kind: params.kind,
+                    target_id: params.target_id,
+                },
+            )
+            .await;
+        match result {
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(
+                if resp.linked {
+                    "Linked.".to_string()
+                } else {
+                    "Link not created.".to_string()
+                },
+            )])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+}
+
+/// Percent-encode a single URL path/query component (RFC 3986 unreserved
+/// set passes through; everything else escapes), so dataset names and user
+/// ids with reserved characters don't corrupt the request URL.
+fn url_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Render a query result cell for the text view: strings unquoted, other
+/// JSON values via their compact form.
+fn render_query_cell(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "NULL".to_string(),
+        other => other.to_string(),
+    }
 }
