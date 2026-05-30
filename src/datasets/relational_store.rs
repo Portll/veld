@@ -42,8 +42,10 @@ use crate::storage::relational::{Param, RelationalBackend, RelationalStore};
 /// Name of the per-database catalog table that records dataset metadata.
 pub const CATALOG_TABLE: &str = "__veld_dataset_catalog";
 
-/// DDL for the catalog table. Applied idempotently on every construction so
-/// a fresh database is always ready for dataset operations.
+/// DDL for the catalog table on SQLite and Postgres. Applied idempotently on
+/// every construction so a fresh database is always ready for dataset
+/// operations. `CREATE TABLE IF NOT EXISTS` and `TEXT` are valid on both
+/// engines, so they share one statement.
 const CATALOG_DDL: &str = "CREATE TABLE IF NOT EXISTS __veld_dataset_catalog (\n    \
      user_id TEXT NOT NULL,\n    \
      name TEXT NOT NULL,\n    \
@@ -52,6 +54,29 @@ const CATALOG_DDL: &str = "CREATE TABLE IF NOT EXISTS __veld_dataset_catalog (\n
      created_at TEXT NOT NULL,\n    \
      PRIMARY KEY (user_id, name)\n\
      );";
+
+/// Catalog DDL for SQL Server. T-SQL has no `CREATE TABLE IF NOT EXISTS`
+/// (guarded by `OBJECT_ID`) and `NVARCHAR(MAX)` cannot sit in a key, so the
+/// `(user_id, name)` primary-key columns are bounded to `NVARCHAR(200)` —
+/// 800 bytes combined, inside the 900-byte index-key limit and ample for
+/// real user / dataset identifiers. `schema_json` (never a key) stays MAX.
+const CATALOG_DDL_MSSQL: &str = "IF OBJECT_ID(N'__veld_dataset_catalog', N'U') IS NULL\n\
+     CREATE TABLE __veld_dataset_catalog (\n    \
+     user_id NVARCHAR(200) NOT NULL,\n    \
+     name NVARCHAR(200) NOT NULL,\n    \
+     table_name NVARCHAR(450) NOT NULL,\n    \
+     schema_json NVARCHAR(MAX) NOT NULL,\n    \
+     created_at NVARCHAR(64) NOT NULL,\n    \
+     PRIMARY KEY (user_id, name)\n\
+     );";
+
+/// Select the catalog DDL for the backend's SQL dialect.
+fn catalog_ddl(backend: RelationalBackend) -> &'static str {
+    match backend {
+        RelationalBackend::Mssql => CATALOG_DDL_MSSQL,
+        _ => CATALOG_DDL,
+    }
+}
 
 /// [`DatasetStore`] backed by any [`RelationalStore`] whose error type is
 /// `anyhow::Error`. Use
@@ -73,7 +98,7 @@ impl RelationalDatasetStore {
         store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
     ) -> Result<Self, DatasetError> {
         store
-            .execute(CATALOG_DDL, &[])
+            .execute(catalog_ddl(store.backend()), &[])
             .await
             .map_err(|e| DatasetError::Internal(format!("catalog DDL failed: {e}")))?;
         Ok(Self {
@@ -224,6 +249,7 @@ impl DatasetStore for RelationalDatasetStore {
             RelationalBackend::Postgres | RelationalBackend::Supabase => {
                 schema.to_create_table_sql_postgres(&table)
             }
+            RelationalBackend::Mssql => schema.to_create_table_sql_mssql(&table),
             _ => schema.to_create_table_sql_sqlite(&table),
         };
         self.store
@@ -345,39 +371,51 @@ impl DatasetStore for RelationalDatasetStore {
             }
         }
 
-        // Build the column list + placeholders once. `?` placeholders are
-        // SQLite-native; sqlx translates them for Postgres into `$N`.
-        let mut col_list = String::new();
-        let mut placeholders = String::new();
-        for (idx, col) in schema.columns.iter().enumerate() {
-            if idx > 0 {
-                col_list.push_str(", ");
-                placeholders.push_str(", ");
-            }
-            col_list.push('"');
-            col_list.push_str(&col.name);
-            col_list.push('"');
-            placeholders.push('?');
-        }
-        let insert_sql = format!(
-            "INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders})"
-        );
-
         // Execute one prepared INSERT per row. A single multi-row INSERT
         // would be more efficient on SQLite, but per-row keeps the bind
         // vector small and lets us surface a row-specific error message if
         // any of them fail. The hot path for ingest is a follow-up; this
         // implementation prioritises clarity and correctness.
+        //
+        // Null / absent cells are *omitted* from the column list rather than
+        // bound as `Param::Null`. A type-erased null binds as a text-typed
+        // NULL on Postgres (and SQL Server), which the driver rejects when
+        // the target column is non-text (e.g. `BIGINT`); an omitted column
+        // simply takes its NULL default — the validation pass above has
+        // already proven every omitted column is nullable. The placeholder
+        // set is therefore per-row, not shared. `?` placeholders are
+        // SQLite-native; each backend translates them (`$N` / `@PN`).
         let mut inserted = 0u64;
         for row in rows {
+            let mut col_list = String::new();
+            let mut placeholders = String::new();
             let mut params: Vec<Param<'_>> = Vec::with_capacity(schema.columns.len());
             for col in &schema.columns {
-                let p = match row.values.get(&col.name) {
-                    Some(v) => json_to_param(v)?,
-                    None => Param::Null,
+                let value = match row.values.get(&col.name) {
+                    Some(v) if !v.is_null() => v,
+                    // Null value or missing column → omit it; the column
+                    // takes its NULL default.
+                    _ => continue,
                 };
-                params.push(p);
+                if !col_list.is_empty() {
+                    col_list.push_str(", ");
+                    placeholders.push_str(", ");
+                }
+                col_list.push('"');
+                col_list.push_str(&col.name);
+                col_list.push('"');
+                placeholders.push('?');
+                params.push(json_to_param(value)?);
             }
+
+            // Every column null/absent (all-nullable schema). `DEFAULT
+            // VALUES` is valid on SQLite, Postgres and SQL Server alike.
+            let insert_sql = if params.is_empty() {
+                format!("INSERT INTO \"{table}\" DEFAULT VALUES")
+            } else {
+                format!("INSERT INTO \"{table}\" ({col_list}) VALUES ({placeholders})")
+            };
+
             let affected = self
                 .store
                 .execute(&insert_sql, &params)
@@ -658,6 +696,63 @@ mod tests {
             DatasetError::AlreadyExists(name) => assert_eq!(name, "dup"),
             other => panic!("expected AlreadyExists, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn insert_persists_null_and_absent_nullable_columns_as_sql_null() {
+        let ds = fresh_store().await;
+        let dref = ds
+            .create_dataset("alice", &sample_schema("events"))
+            .await
+            .expect("create");
+
+        // Row 1: explicit JSON null for the nullable `note`.
+        let mut r1 = HashMap::new();
+        r1.insert("id".to_string(), serde_json::json!(1));
+        r1.insert("label".to_string(), serde_json::json!("a"));
+        r1.insert("note".to_string(), serde_json::Value::Null);
+        // Row 2: `note` present and non-null.
+        let mut r2 = HashMap::new();
+        r2.insert("id".to_string(), serde_json::json!(2));
+        r2.insert("label".to_string(), serde_json::json!("b"));
+        r2.insert("note".to_string(), serde_json::json!("hello"));
+        // Row 3: `note` omitted entirely.
+        let mut r3 = HashMap::new();
+        r3.insert("id".to_string(), serde_json::json!(3));
+        r3.insert("label".to_string(), serde_json::json!("c"));
+
+        let n = ds
+            .insert_rows(
+                &dref,
+                &[
+                    DatasetRow { values: r1 },
+                    DatasetRow { values: r2 },
+                    DatasetRow { values: r3 },
+                ],
+            )
+            .await
+            .expect("insert");
+        assert_eq!(n, 3);
+
+        // Both the explicit-null and the absent row must store a real SQL
+        // NULL (not the text "null") — `WHERE note IS NULL` proves it without
+        // needing a nullable column accessor.
+        let store = ds.store();
+        let null_rows = store
+            .query(
+                &format!("SELECT COUNT(*) FROM \"{}\" WHERE note IS NULL", dref.table),
+                &[],
+            )
+            .await
+            .expect("count null");
+        let null_count: i64 = null_rows
+            .first()
+            .and_then(|r| r.get::<i64>(0).ok())
+            .expect("count value");
+        assert_eq!(
+            null_count, 2,
+            "explicit-null and absent rows both persist as SQL NULL"
+        );
     }
 
     #[tokio::test]

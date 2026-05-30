@@ -402,12 +402,26 @@ pub async fn query_dataset(
     // user-supplied string interpolated into the SQL is the WHERE clause
     // fragment (callers are authenticated and signing their own queries).
     let limit = req.limit.unwrap_or(MAX_QUERY_LIMIT).min(MAX_QUERY_LIMIT);
-    let mut sql = format!("SELECT * FROM \"{}\"", dref.table);
+    // The row-count cap is dialect-specific. SQLite and Postgres take a
+    // trailing `LIMIT n`; SQL Server has no `LIMIT` and instead takes
+    // `TOP (n)` immediately after `SELECT` (and unlike `OFFSET/FETCH` it
+    // needs no `ORDER BY`).
+    let is_mssql = matches!(
+        executor.backend(),
+        crate::storage::relational::RelationalBackend::Mssql
+    );
+    let mut sql = if is_mssql {
+        format!("SELECT TOP ({limit}) * FROM \"{}\"", dref.table)
+    } else {
+        format!("SELECT * FROM \"{}\"", dref.table)
+    };
     if let Some(w) = req.where_clause.as_ref().filter(|s| !s.trim().is_empty()) {
         sql.push_str(" WHERE ");
         sql.push_str(w);
     }
-    sql.push_str(&format!(" LIMIT {limit}"));
+    if !is_mssql {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
 
     // Convert each JSON param to a borrowed `Param`. JSON-array/object
     // params bind as `Param::Json`; everything else maps onto the closest
