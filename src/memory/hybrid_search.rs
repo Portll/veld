@@ -705,7 +705,7 @@ impl RRFusion {
 /// Blending: 70% cross-encoder + 30% bi-encoder (proven ratio from literature).
 pub struct CrossEncoderReranker {
     embedder: Arc<dyn Embedder>,
-    cross_encoder: Arc<crate::embeddings::cross_encoder::CrossEncoder>,
+    cross_encoder: Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
 }
 
 /// Weight for cross-encoder score in the blend (0.7 = 70%)
@@ -714,15 +714,16 @@ const CROSS_ENCODER_BLEND_WEIGHT: f32 = 0.70;
 const BI_ENCODER_BLEND_WEIGHT: f32 = 0.30;
 
 impl CrossEncoderReranker {
-    /// Create reranker with shared embedder and cross-encoder model.
-    ///
-    /// The cross-encoder is pre-warmed on a background thread by default —
-    /// the ~80 MB ONNX download + load happens during server startup, not
-    /// on the first /api/recall. Set `VELD_LAZY_CROSS_ENCODER=1` to opt
-    /// back into lazy-on-first-use behaviour.
+    /// Create reranker with shared embedder and the env-configured cross-encoder
+    /// (single model or weighted ensemble). The cross-encoder is pre-warmed on
+    /// a background thread by default — the ONNX download + load happens
+    /// during server startup, not on the first /api/recall. Set
+    /// `VELD_LAZY_CROSS_ENCODER=1` to opt back into lazy-on-first-use, or
+    /// `VELD_CROSS_ENCODER=<id>` / `VELD_CROSS_ENCODERS=<id>:<w>,…` to swap
+    /// the model.
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
-        let cross_encoder = Arc::new(crate::embeddings::cross_encoder::CrossEncoder::new());
-        crate::embeddings::cross_encoder::CrossEncoder::prewarm(Arc::clone(&cross_encoder));
+        let cross_encoder = crate::embeddings::cross_encoder::load_cross_encoder_from_env();
+        crate::embeddings::cross_encoder::prewarm(Arc::clone(&cross_encoder));
         Self {
             embedder,
             cross_encoder,
@@ -732,7 +733,7 @@ impl CrossEncoderReranker {
     /// Create reranker with an existing cross-encoder instance
     pub fn with_cross_encoder(
         embedder: Arc<dyn Embedder>,
-        cross_encoder: Arc<crate::embeddings::cross_encoder::CrossEncoder>,
+        cross_encoder: Arc<dyn crate::embeddings::cross_encoder::CrossEncoderModel>,
     ) -> Self {
         Self {
             embedder,
