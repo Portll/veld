@@ -25,12 +25,17 @@ use async_trait::async_trait;
 
 use crate::datasets::link::{LinkKind, RowLink, RowPk};
 use crate::datasets::store::{DatasetError, DatasetRef};
-use crate::storage::relational::{Param, RelationalStore};
+use crate::storage::relational::{Param, RelationalBackend, RelationalStore};
 
 /// Table name for the link store.
 pub const LINK_TABLE: &str = "__veld_dataset_row_links";
 
-/// DDL applied idempotently when the store is constructed.
+/// DDL applied idempotently when the store is constructed (SQLite + Postgres).
+///
+/// The composite primary key gives idempotency for free: a re-link of the
+/// same `(table, row, kind, target)` tuple is a no-op insert. `TEXT` columns
+/// carry no length limit on either engine, so `row_pk_json` (an arbitrary
+/// JSON-encoded key tuple) can participate in the key directly.
 const LINK_DDL: &str = "CREATE TABLE IF NOT EXISTS __veld_dataset_row_links (\n    \
      dataset_table TEXT NOT NULL,\n    \
      row_pk_json TEXT NOT NULL,\n    \
@@ -38,6 +43,31 @@ const LINK_DDL: &str = "CREATE TABLE IF NOT EXISTS __veld_dataset_row_links (\n 
      target_id TEXT NOT NULL,\n    \
      PRIMARY KEY (dataset_table, row_pk_json, kind, target_id)\n\
      );";
+
+/// Link DDL for SQL Server.
+///
+/// `row_pk_json` is an *unbounded* JSON-encoded key tuple, so it cannot join
+/// a SQL Server primary key or index (which cap at 900 bytes and forbid
+/// `NVARCHAR(MAX)` key columns). The MSSQL link table is therefore a plain
+/// heap with no key constraint; idempotency is enforced instead by the
+/// `IF NOT EXISTS` guard in [`RelationalLinkStore::insert`]. Link volumes per
+/// dataset are small, so the reverse-lookup `SELECT` scanning the heap is
+/// acceptable — this is the secondary backend, not the hot retrieval path.
+const LINK_DDL_MSSQL: &str = "IF OBJECT_ID(N'__veld_dataset_row_links', N'U') IS NULL\n\
+     CREATE TABLE __veld_dataset_row_links (\n    \
+     dataset_table NVARCHAR(450) NOT NULL,\n    \
+     row_pk_json NVARCHAR(MAX) NOT NULL,\n    \
+     kind NVARCHAR(32) NOT NULL,\n    \
+     target_id NVARCHAR(450) NOT NULL\n\
+     );";
+
+/// Select the link DDL for the backend's SQL dialect.
+fn link_ddl(backend: RelationalBackend) -> &'static str {
+    match backend {
+        RelationalBackend::Mssql => LINK_DDL_MSSQL,
+        _ => LINK_DDL,
+    }
+}
 
 fn kind_to_str(kind: LinkKind) -> &'static str {
     match kind {
@@ -131,7 +161,7 @@ impl RelationalLinkStore {
         store: Arc<dyn RelationalStore<Error = crate::storage::relational::BoxError>>,
     ) -> Result<Self, DatasetError> {
         store
-            .execute(LINK_DDL, &[])
+            .execute(link_ddl(store.backend()), &[])
             .await
             .map_err(|e| DatasetError::Internal(format!("link DDL failed: {e}")))?;
         Ok(Self {
@@ -153,25 +183,76 @@ impl RelationalLinkStore {
         target_id: &str,
     ) -> Result<(), DatasetError> {
         let pk_json = encode_row_pk(row_pk)?;
-        // `INSERT OR IGNORE` so re-linking the same row to the same target
-        // is idempotent — convenient for downstream callers that may retry.
-        let sql = format!(
-            "INSERT OR IGNORE INTO {} (dataset_table, row_pk_json, kind, target_id) \
-             VALUES (?, ?, ?, ?)",
-            self.link_table
-        );
-        self.store
-            .execute(
-                &sql,
-                &[
-                    Param::Text(&dataset.table),
-                    Param::Text(&pk_json),
-                    Param::Text(kind_to_str(kind)),
-                    Param::Text(target_id),
-                ],
-            )
-            .await
-            .map_err(|e| DatasetError::Internal(format!("link insert failed: {e}")))?;
+        let kind_str = kind_to_str(kind);
+        let t = self.link_table;
+        // Idempotent insert — re-linking the same row to the same target is a
+        // no-op — but the "ignore the duplicate" syntax is dialect-specific.
+        // SQLite has `INSERT OR IGNORE`; Postgres uses `ON CONFLICT DO
+        // NOTHING` against the composite primary key; SQL Server has neither,
+        // so it guards the insert with `IF NOT EXISTS` (its link table is a
+        // keyless heap — see [`LINK_DDL_MSSQL`]).
+        let result = match self.store.backend() {
+            RelationalBackend::Postgres | RelationalBackend::Supabase => {
+                let sql = format!(
+                    "INSERT INTO {t} (dataset_table, row_pk_json, kind, target_id) \
+                     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING"
+                );
+                self.store
+                    .execute(
+                        &sql,
+                        &[
+                            Param::Text(&dataset.table),
+                            Param::Text(&pk_json),
+                            Param::Text(kind_str),
+                            Param::Text(target_id),
+                        ],
+                    )
+                    .await
+            }
+            RelationalBackend::Mssql => {
+                let sql = format!(
+                    "IF NOT EXISTS (SELECT 1 FROM {t} \
+                     WHERE dataset_table = ? AND row_pk_json = ? AND kind = ? AND target_id = ?) \
+                     INSERT INTO {t} (dataset_table, row_pk_json, kind, target_id) \
+                     VALUES (?, ?, ?, ?)"
+                );
+                self.store
+                    .execute(
+                        &sql,
+                        &[
+                            // EXISTS probe …
+                            Param::Text(&dataset.table),
+                            Param::Text(&pk_json),
+                            Param::Text(kind_str),
+                            Param::Text(target_id),
+                            // … then the INSERT values (same order).
+                            Param::Text(&dataset.table),
+                            Param::Text(&pk_json),
+                            Param::Text(kind_str),
+                            Param::Text(target_id),
+                        ],
+                    )
+                    .await
+            }
+            _ => {
+                let sql = format!(
+                    "INSERT OR IGNORE INTO {t} (dataset_table, row_pk_json, kind, target_id) \
+                     VALUES (?, ?, ?, ?)"
+                );
+                self.store
+                    .execute(
+                        &sql,
+                        &[
+                            Param::Text(&dataset.table),
+                            Param::Text(&pk_json),
+                            Param::Text(kind_str),
+                            Param::Text(target_id),
+                        ],
+                    )
+                    .await
+            }
+        };
+        result.map_err(|e| DatasetError::Internal(format!("link insert failed: {e}")))?;
         Ok(())
     }
 
