@@ -78,10 +78,12 @@
 //! }
 //! ```
 
+pub mod blocking;
 pub mod sqlite;
 pub mod store;
 pub mod types;
 
+pub use blocking::BlockingRelationalStore;
 pub use sqlite::SqliteRelationalStore;
 pub use store::RelationalStore;
 pub use types::{
