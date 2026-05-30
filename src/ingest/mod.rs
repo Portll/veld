@@ -10,6 +10,7 @@
 pub mod extractors;
 pub mod gdrive;
 pub mod github;
+pub mod tabular;
 
 use anyhow::Result;
 
