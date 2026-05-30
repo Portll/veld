@@ -118,6 +118,37 @@ impl CrossEncoderConfig {
 fn built_ins() -> Vec<CrossEncoderConfig> {
     vec![
         CrossEncoderConfig {
+            id: "mxbai-rerank-xsmall-v1".into(),
+            model_url:
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/main/onnx/model.onnx"
+                    .into(),
+            tokenizer_url:
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-xsmall-v1/resolve/main/tokenizer.json"
+                    .into(),
+            has_token_type_ids: true,
+            params_millions: 70,
+            download_mb: 280,
+            year: 2024,
+            notes:
+                "BERT; smallest current reranker. ~3x MiniLM but trained on modern QA + retrieval; \
+                 the cheap upgrade path off MS-MARCO-MiniLM.",
+        },
+        CrossEncoderConfig {
+            id: "mxbai-rerank-base-v1".into(),
+            model_url:
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-base-v1/resolve/main/onnx/model.onnx"
+                    .into(),
+            tokenizer_url:
+                "https://huggingface.co/mixedbread-ai/mxbai-rerank-base-v1/resolve/main/tokenizer.json"
+                    .into(),
+            has_token_type_ids: true,
+            params_millions: 184,
+            download_mb: 740,
+            year: 2024,
+            notes:
+                "BERT; mid-size mxbai variant. Quality close to bge-reranker-v2-m3 at a third the cost.",
+        },
+        CrossEncoderConfig {
             id: "ms-marco-MiniLM-L-6-v2".into(),
             model_url:
                 "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx"
