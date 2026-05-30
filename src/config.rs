@@ -1184,3 +1184,80 @@ mod tests {
         let _layer = cors.to_layer(); // Should not panic
     }
 }
+
+/// Selected relational backend for the W4 cutover (the `memories`
+/// projection writes through it), the W6 query planner (reads), and the W7
+/// dataset surface — all share one store.
+///
+/// Parsed from `VELD_RELATIONAL_BACKEND`. Unset (the default) keeps the
+/// rusqlite-only behaviour: the projection writes to the local slow store
+/// and the dataset / `/api/query/*` surfaces return 503.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationalBackendChoice {
+    /// A SQLite database file (sqlx-backed, distinct from the rusqlite slow
+    /// store). `VELD_RELATIONAL_SQLITE_PATH` gives the path.
+    Sqlite { path: String },
+    /// A Postgres server. `VELD_POSTGRES_URL` is the connection string.
+    /// Requires building with `--features postgres`.
+    #[cfg(feature = "postgres")]
+    Postgres { url: String },
+    /// A Supabase project. `VELD_SUPABASE_PROJECT_REF` +
+    /// `VELD_SUPABASE_DB_PASSWORD` (the database password — not the API
+    /// JWTs). Requires `--features postgres`.
+    #[cfg(feature = "postgres")]
+    Supabase {
+        project_ref: String,
+        db_password: String,
+    },
+}
+
+impl RelationalBackendChoice {
+    /// Parse the relational backend from the environment.
+    ///
+    /// Returns `Ok(None)` when `VELD_RELATIONAL_BACKEND` is unset/empty.
+    /// Returns `Err` with an actionable message when a backend is named but
+    /// its required env vars are missing, the value is unknown, or a
+    /// Postgres-family backend is requested in a build without the
+    /// `postgres` feature.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let backend = match std::env::var("VELD_RELATIONAL_BACKEND") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_ascii_lowercase(),
+            _ => return Ok(None),
+        };
+        match backend.as_str() {
+            "sqlite" => {
+                let path = std::env::var("VELD_RELATIONAL_SQLITE_PATH").map_err(|_| {
+                    "VELD_RELATIONAL_BACKEND=sqlite requires VELD_RELATIONAL_SQLITE_PATH".to_string()
+                })?;
+                Ok(Some(Self::Sqlite { path }))
+            }
+            #[cfg(feature = "postgres")]
+            "postgres" => {
+                let url = std::env::var("VELD_POSTGRES_URL").map_err(|_| {
+                    "VELD_RELATIONAL_BACKEND=postgres requires VELD_POSTGRES_URL".to_string()
+                })?;
+                Ok(Some(Self::Postgres { url }))
+            }
+            #[cfg(feature = "postgres")]
+            "supabase" => {
+                let project_ref = std::env::var("VELD_SUPABASE_PROJECT_REF").map_err(|_| {
+                    "VELD_RELATIONAL_BACKEND=supabase requires VELD_SUPABASE_PROJECT_REF".to_string()
+                })?;
+                let db_password = std::env::var("VELD_SUPABASE_DB_PASSWORD").map_err(|_| {
+                    "VELD_RELATIONAL_BACKEND=supabase requires VELD_SUPABASE_DB_PASSWORD".to_string()
+                })?;
+                Ok(Some(Self::Supabase {
+                    project_ref,
+                    db_password,
+                }))
+            }
+            #[cfg(not(feature = "postgres"))]
+            "postgres" | "supabase" => Err(format!(
+                "VELD_RELATIONAL_BACKEND={backend} requires building veld with --features postgres"
+            )),
+            other => Err(format!(
+                "unknown VELD_RELATIONAL_BACKEND {other:?} (expected: sqlite, postgres, supabase)"
+            )),
+        }
+    }
+}
