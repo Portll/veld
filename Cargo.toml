@@ -400,6 +400,12 @@ legacy-rocksdb = []
 # with `cargo test --features stress` (gates tests/brutal_stress_tests.rs).
 stress = []
 
+# Postgres / Supabase relational backend (W4). Opt-in: enabling it pulls the
+# `sqlx-postgres` driver tree (~12 small pure-Rust crates — sqlx-postgres +
+# SCRAM-auth + config helpers; no C/native deps). Off by default so the
+# standard build stays SQLite-only and byte-for-byte unchanged.
+postgres = ["sqlx/postgres"]
+
 # Python bindings for PyO3
 python = ["pyo3", "numpy"]
 

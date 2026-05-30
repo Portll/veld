@@ -79,11 +79,15 @@
 //! ```
 
 pub mod blocking;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod sqlite;
 pub mod store;
 pub mod types;
 
 pub use blocking::BlockingRelationalStore;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresRelationalStore;
 pub use sqlite::SqliteRelationalStore;
 pub use store::RelationalStore;
 pub use types::{
