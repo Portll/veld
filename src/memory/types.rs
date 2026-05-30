@@ -158,6 +158,10 @@ pub struct QueryMetacognition {
     /// Cross-embedder (S3) agreement over the top results, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_embedder_agreement: Option<f32>,
+    /// Query-level entity coverage (M4): fraction of the query's focal entities
+    /// covered by any top result. None when the query has no resolved entities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<f32>,
     /// Whether the query sits in/near a known unresolved knowledge gap (M5 link).
     pub in_known_gap: bool,
     /// Which signals were available: "score_only" | "score+gap" | …
