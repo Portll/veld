@@ -254,6 +254,110 @@ function relTime(iso) {
   return Math.floor(diff / 86400) + "d";
 }
 
+// ---- Cognitive Dials ----------------------------------------------------
+let currentDials = null;
+
+const DIAL_TOGGLES = [
+  ["reconsolidation_enabled", "Reconsolidation (master)"],
+  ["re_encode_graph_strengthen", "Re-encode · graph strengthen"],
+  ["re_encode_entity_enrich", "Re-encode · entity enrich"],
+  ["re_encode_embedding_nudge", "Re-encode · embedding nudge"],
+];
+const DIAL_NUMBERS = [
+  ["reconsolidation_window_secs", "Labile window (s)", 30, 3600, 1],
+  ["graph_boost_scale", "Graph boost scale", 0, 1, 0.05],
+  ["embedding_blend", "Embedding blend", 0, 0.5, 0.01],
+];
+
+function fmtOpt(v) {
+  return v === null || v === undefined ? "—" : String(v);
+}
+
+function dialsStatus(msg, isError) {
+  const el = document.getElementById("dials-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.style.color = isError ? "#dc5a5a" : "";
+}
+
+async function saveDials(updated) {
+  dialsStatus("saving…", false);
+  try {
+    currentDials = await invoke("set_dials", { dials: updated });
+    renderDialsBody();
+    dialsStatus("saved", false);
+    setTimeout(() => dialsStatus("", false), 1500);
+  } catch (err) {
+    dialsStatus("save failed: " + (err?.message || err), true);
+  }
+}
+
+function renderDialsBody() {
+  const body = document.getElementById("dials-body");
+  if (!body) return;
+  if (!currentDials) {
+    body.innerHTML = '<p class="muted">no dials</p>';
+    return;
+  }
+  body.innerHTML = "";
+
+  for (const [key, label] of DIAL_TOGGLES) {
+    const row = document.createElement("label");
+    row.className = "dial-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!currentDials[key];
+    cb.addEventListener("change", () =>
+      saveDials({ ...currentDials, [key]: cb.checked })
+    );
+    const span = document.createElement("span");
+    span.textContent = label;
+    row.append(cb, span);
+    body.appendChild(row);
+  }
+
+  for (const [key, label, min, max, step] of DIAL_NUMBERS) {
+    const row = document.createElement("label");
+    row.className = "dial-row";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.min = String(min);
+    inp.max = String(max);
+    inp.step = String(step);
+    inp.value = currentDials[key];
+    inp.addEventListener("change", () => {
+      const v = parseFloat(inp.value);
+      if (Number.isNaN(v)) return;
+      saveDials({ ...currentDials, [key]: v });
+    });
+    row.append(span, inp);
+    body.appendChild(row);
+  }
+
+  const ro = document.createElement("p");
+  ro.className = "muted dial-ro";
+  ro.textContent =
+    "retrieval: candidate_count=" + fmtOpt(currentDials.candidate_count) +
+    " · rerank_count=" + fmtOpt(currentDials.rerank_count) +
+    " · use_reranking=" + fmtOpt(currentDials.use_reranking) +
+    " · refiner_mode=" + fmtOpt(currentDials.refiner_mode);
+  body.appendChild(ro);
+}
+
+async function pullDials() {
+  try {
+    currentDials = await invoke("get_dials");
+    renderDialsBody();
+  } catch (err) {
+    const body = document.getElementById("dials-body");
+    if (body)
+      body.innerHTML =
+        '<p class="muted">dials unavailable: ' + (err?.message || err) + "</p>";
+  }
+}
+
 async function pull() {
   try {
     const snap = await invoke("get_snapshot");
@@ -281,6 +385,11 @@ async function init() {
     return;
   }
   await pull();
+
+  const dialsRefresh = document.getElementById("dials-refresh");
+  if (dialsRefresh) dialsRefresh.addEventListener("click", pullDials);
+  await pullDials();
+
   setInterval(() => {
     if (Date.now() - lastUpdateAt > 5000) pull();
   }, 2000);
