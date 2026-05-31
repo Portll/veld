@@ -1616,6 +1616,53 @@ impl MemorySystem {
         c.clone()
     }
 
+    /// R3: compute the conjunctive binding (EngramBinding) from an engram's
+    /// W-facets — previously dead scaffold (binding_strength 0.0, conjunctive_key
+    /// None, present all-false). `present` mask from facet presence;
+    /// `binding_strength` = (present_count - 1)/4 (gist-only 0.0 .. all-five-W
+    /// bound 1.0); `conjunctive_key` = a stable FNV-1a hash over the present
+    /// W-anchors (for dedup / reconsolidation targeting), only when >=2 W's bind.
+    fn compute_engram_binding(memory: &crate::memory::types::Memory) -> crate::memory::facets::EngramBinding {
+        let ctx = memory.experience.context.as_ref();
+        let what = true; // every engram has content
+        let when = memory.when.event_time.is_some();
+        let (where_, who, why) = match ctx {
+            Some(c) => (
+                !c.place.places.is_empty() || !c.place.conceptual_anchors.is_empty(),
+                !c.who.agents.is_empty(),
+                !c.why.goal_stack.is_empty()
+                    || !c.why.causes.is_empty()
+                    || c.why.event_model.is_some(),
+            ),
+            None => (false, false, false),
+        };
+        let present = crate::memory::facets::WFacetMask { what, where_, when, who, why };
+        let present_count = [what, where_, when, who, why].iter().filter(|b| **b).count();
+        let binding_strength = (present_count as f32 - 1.0).max(0.0) / 4.0;
+        let conjunctive_key = if present_count >= 2 {
+            let when_bucket = memory.created_at.format("%Y-%m-%d").to_string();
+            let where_anchor = ctx
+                .and_then(|c| c.place.conceptual_anchors.first().cloned())
+                .unwrap_or_default();
+            let why_anchor = ctx.and_then(|c| c.why.event_model.clone()).unwrap_or_default();
+            let who_count = ctx.map(|c| c.who.agents.len()).unwrap_or(0);
+            let canonical = format!("{when_bucket}|{where_anchor}|{why_anchor}|who{who_count}");
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in canonical.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            Some(format!("{h:016x}"))
+        } else {
+            None
+        };
+        crate::memory::facets::EngramBinding {
+            conjunctive_key,
+            binding_strength,
+            present,
+        }
+    }
+
     /// Complete the deferred embedding + vector indexing for a previously stored memory.
     ///
     /// Call this after `remember_deferred()` to generate the ONNX embedding, persist it,
@@ -1670,6 +1717,14 @@ impl MemorySystem {
             if let Some(emb) = memory.experience.embeddings.clone() {
                 let snapshot = self.update_tcm_context(&emb);
                 memory.when.context_drift = snapshot;
+            }
+
+            // R3: populate the conjunctive binding from the engram's W-facets
+            // (was dead scaffold). Surfaced at recall so the consumer can tell a
+            // bound episode from loose gist (anti-confabulation default-deny).
+            let binding = Self::compute_engram_binding(&memory);
+            if let Some(ctx) = memory.experience.context.as_mut() {
+                ctx.binding = binding;
             }
 
             // Persist embedding to storage so restarts don't re-embed

@@ -301,6 +301,11 @@ pub struct RecallMemory {
     pub competition_conflict: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub competition_opponent: Option<String>,
+    /// R3 conjunctive-binding reliability, 0.0 (gist only) .. 1.0 (all W's bound).
+    /// None when the engram carries no rich context. Low values mean the
+    /// W-conjunction is weak — treat as gist, not a confident bound episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_strength: Option<f32>,
 }
 
 #[derive(Serialize)]
