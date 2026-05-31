@@ -32,6 +32,7 @@ pub mod extensions;
 pub mod graph_memory;
 pub mod handlers;
 pub mod ingest;
+pub mod instance_registry;
 pub mod intent_log;
 pub mod integrations;
 pub mod memory;
