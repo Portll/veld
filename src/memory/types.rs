@@ -2296,6 +2296,13 @@ impl Memory {
             .is_some_and(|dt| dt <= Utc::now())
     }
 
+    /// R6 bi-temporal "as-of": was this memory valid at instant `dt`?
+    /// True when it had been encoded by then (`created_at <= dt`) and had not
+    /// yet been invalidated (`valid_until` is None or strictly after `dt`).
+    pub fn is_valid_at(&self, dt: DateTime<Utc>) -> bool {
+        self.created_at <= dt && self.valid_until.is_none_or(|v| dt < v)
+    }
+
     /// Mark this memory as expired/superseded at the given timestamp.
     /// Called by conflict detection when a newer memory contradicts this one.
     pub fn set_valid_until(&mut self, dt: DateTime<Utc>) {
@@ -2935,6 +2942,11 @@ pub struct Query {
     // === Temporal Filters ===
     pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 
+    /// As-of point-in-time validity (R6 bi-temporal). When set, retrieval
+    /// returns memories that were valid AS OF this instant (encoded by then and
+    /// not yet invalidated), instead of the default "currently valid" filter.
+    pub as_of: Option<DateTime<Utc>>,
+
     // === Content Filters ===
     pub experience_types: Option<Vec<ExperienceType>>,
     pub importance_threshold: Option<f32>,
@@ -3072,6 +3084,7 @@ impl Default for Query {
             query_text: None,
             query_embedding: None,
             time_range: None,
+            as_of: None,
             experience_types: None,
             importance_threshold: None,
             robot_id: None,

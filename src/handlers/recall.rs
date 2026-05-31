@@ -469,6 +469,7 @@ pub async fn recall(
                 prospective_signals: prospective_signals.clone(),
                 competition_mode: req.competition_mode,
                 rrf_k: rrf_k_for_recall,
+                as_of: req.as_of,
                 ..Default::default()
             };
 

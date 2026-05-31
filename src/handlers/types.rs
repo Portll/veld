@@ -157,6 +157,10 @@ pub struct RecallRequest {
     /// Optional retrieval-time competition policy override.
     #[serde(default)]
     pub competition_mode: Option<crate::memory::CompetitionMode>,
+    /// R6 bi-temporal as-of: return memories valid AS OF this instant
+    /// (point-in-time query) instead of the default "currently valid" filter.
+    #[serde(default)]
+    pub as_of: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub fn default_recall_limit() -> usize {
