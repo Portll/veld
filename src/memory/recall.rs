@@ -1000,6 +1000,7 @@ impl super::MemorySystem {
             query_text: None, // Don't re-generate embedding
             query_embedding: Some(query_embedding.clone()),
             time_range: query.time_range,
+            as_of: query.as_of,
             experience_types: query.experience_types.clone(),
             importance_threshold: query.importance_threshold,
             max_results: query.max_results,
@@ -1095,6 +1096,7 @@ impl super::MemorySystem {
                     query_text: None,
                     query_embedding: Some(sub_embedding),
                     time_range: query.time_range,
+                    as_of: query.as_of,
                     experience_types: query.experience_types.clone(),
                     importance_threshold: query.importance_threshold,
                     max_results: query.max_results,
@@ -2725,7 +2727,12 @@ impl super::MemorySystem {
         // Remove memories whose valid_until timestamp has passed.
         {
             let before = memories.len();
-            memories.retain(|m| !m.is_expired());
+            // R6: honor an as-of point-in-time query (validity at that instant);
+            // otherwise the default "currently valid" invalidation filter.
+            match query.as_of {
+                Some(t) => memories.retain(|m| m.is_valid_at(t)),
+                None => memories.retain(|m| !m.is_expired()),
+            }
             if memories.len() < before {
                 tracing::debug!(
                     "Layer 5.1: Filtered {} temporally invalidated memories",
