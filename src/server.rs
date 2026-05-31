@@ -476,6 +476,13 @@ async fn async_main() -> Result<()> {
 
     print_ready_message(addr);
 
+    // Make this instance discoverable to the Veld Monitor / statusline via the
+    // shared filesystem registry. Best-effort: a failure here never blocks serving.
+    // Registered only after a successful bind, so a port-collision loser never
+    // advertises itself.
+    let registry_guard =
+        crate::instance_registry::register(host, port, &server_config.storage_path);
+
     // Use a notify to signal the server to stop accepting new connections
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let shutdown_listener = shutdown_notify.clone();
@@ -517,6 +524,12 @@ async fn async_main() -> Result<()> {
             );
             server_handle.abort();
         }
+    }
+
+    // Stop heartbeating and remove our registry file so consumers see us go
+    // offline promptly (heartbeat task is stopped before the file is unlinked).
+    if let Some(guard) = registry_guard {
+        guard.deregister().await;
     }
 
     // Shut down Zenoh transport before flushing databases
