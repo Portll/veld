@@ -89,9 +89,10 @@ describe("serializeAndValidateBody", () => {
   it("rejects an oversized payload", () => {
     const result = serializeAndValidateBody({ data: "x".repeat(100) }, 20);
     expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain("exceeds maximum length");
-    }
+    // tsconfig `strict: false` disables negative discriminant narrowing
+    // (`!result.ok`), so assert the failure shape explicitly.
+    const failure = result as { ok: false; error: string };
+    expect(failure.error).toContain("exceeds maximum length");
   });
 
   it("accepts payload at exact boundary", () => {
