@@ -534,3 +534,27 @@ pub(crate) struct DatasetQueryResponse {
 pub(crate) struct DatasetLinkResponse {
     pub linked: bool,
 }
+
+/// Params for the `set_dials` MCP tool. Partial update — only the fields you set
+/// change; unset fields keep their current server-side value (the tool GETs current,
+/// merges, then PUTs). (`refiner_mode`/`rrf_weights` are set via the HTTP API.)
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetDialsParams {
+    pub reconsolidation_enabled: Option<bool>,
+    pub reconsolidation_window_secs: Option<i64>,
+    pub re_encode_graph_strengthen: Option<bool>,
+    pub graph_boost_scale: Option<f32>,
+    pub re_encode_entity_enrich: Option<bool>,
+    pub re_encode_embedding_nudge: Option<bool>,
+    pub embedding_blend: Option<f32>,
+    pub candidate_count: Option<usize>,
+    pub rerank_count: Option<usize>,
+    pub use_reranking: Option<bool>,
+}
+
+/// Body for `PUT /api/dials` (full replace).
+#[derive(Debug, Serialize)]
+pub struct SetDialsBody {
+    pub user_id: String,
+    pub dials: crate::memory::CognitiveDials,
+}

@@ -58,6 +58,90 @@ impl VeldMcpServer {
     }
 
     #[tool(
+        description = "Read the current cognitive dials for this user: reconsolidation plasticity toggles (window close + graph/entity/embedding re-encode) and retrieval fast/accurate overrides."
+    )]
+    async fn get_dials(&self) -> Result<CallToolResult, McpError> {
+        let path = format!("/api/dials?user_id={}", self.client.user_id);
+        let result: Result<crate::memory::CognitiveDials> = self.client.get(&path).await;
+        match result {
+            Ok(d) => Ok(CallToolResult::success(vec![Content::text(format_dials(&d))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Tune the cognitive dials for this user. Only the fields you set change; unset fields keep their current value. Reconsolidation re-encode runs in background maintenance (off the recall hot path); retrieval overrides take effect per query."
+    )]
+    async fn set_dials(
+        &self,
+        Parameters(params): Parameters<SetDialsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("/api/dials?user_id={}", self.client.user_id);
+        let mut d: crate::memory::CognitiveDials = match self.client.get(&path).await {
+            Ok(d) => d,
+            Err(e) => {
+                return Err(McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(e.to_string()),
+                    data: None,
+                })
+            }
+        };
+        if let Some(v) = params.reconsolidation_enabled {
+            d.reconsolidation_enabled = v;
+        }
+        if let Some(v) = params.reconsolidation_window_secs {
+            d.reconsolidation_window_secs = v;
+        }
+        if let Some(v) = params.re_encode_graph_strengthen {
+            d.re_encode_graph_strengthen = v;
+        }
+        if let Some(v) = params.graph_boost_scale {
+            d.graph_boost_scale = v;
+        }
+        if let Some(v) = params.re_encode_entity_enrich {
+            d.re_encode_entity_enrich = v;
+        }
+        if let Some(v) = params.re_encode_embedding_nudge {
+            d.re_encode_embedding_nudge = v;
+        }
+        if let Some(v) = params.embedding_blend {
+            d.embedding_blend = v;
+        }
+        if let Some(v) = params.candidate_count {
+            d.candidate_count = Some(v);
+        }
+        if let Some(v) = params.rerank_count {
+            d.rerank_count = Some(v);
+        }
+        if let Some(v) = params.use_reranking {
+            d.use_reranking = Some(v);
+        }
+
+        let body = SetDialsBody {
+            user_id: self.client.user_id.clone(),
+            dials: d,
+        };
+        let result: Result<crate::memory::CognitiveDials> =
+            self.client.put("/api/dials", &body).await;
+        match result {
+            Ok(d) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Dials updated.\n{}",
+                format_dials(&d)
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
         description = "Search memories using semantic, associative, or hybrid retrieval. Modes: 'semantic' (vector similarity), 'associative' (graph traversal), 'hybrid' (combines both)."
     )]
     async fn recall(
@@ -836,4 +920,23 @@ fn render_query_cell(v: &serde_json::Value) -> String {
         serde_json::Value::Null => "NULL".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Render `CognitiveDials` as a short human-readable summary for MCP tool output.
+fn format_dials(d: &crate::memory::CognitiveDials) -> String {
+    format!(
+        "Cognitive dials:\n  reconsolidation_enabled: {}\n  window_secs: {}\n  graph_strengthen: {} (scale {:.2})\n  entity_enrich: {}\n  embedding_nudge: {} (blend {:.2})\n  retrieval: candidate_count={:?} rerank_count={:?} use_reranking={:?} refiner_mode={:?} rrf_weights={:?}",
+        d.reconsolidation_enabled,
+        d.reconsolidation_window_secs,
+        d.re_encode_graph_strengthen,
+        d.graph_boost_scale,
+        d.re_encode_entity_enrich,
+        d.re_encode_embedding_nudge,
+        d.embedding_blend,
+        d.candidate_count,
+        d.rerank_count,
+        d.use_reranking,
+        d.refiner_mode,
+        d.rrf_weights,
+    )
 }

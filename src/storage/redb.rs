@@ -150,17 +150,35 @@ impl GraphStore for RedbGraphStore {
     }
 }
 
+/// Single table backing each namespace's key-value `.redb` file. Keys and values
+/// are opaque byte strings (the trait's contract); callers serialize above this.
+const KV_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> =
+    redb::TableDefinition::new("kv");
+
+/// redb-backed [`KeyValueStore`]. Each namespace is its own `<namespace>.redb` file
+/// holding a single `kv` table. Operations are one transaction each (redb commits are
+/// durable, so [`flush`](KeyValueStore::flush) is a no-op). Prefix scans use redb's
+/// ordered byte-key range and stop at the first key that leaves the prefix.
 pub struct RedbKeyValueStore {
-    _database: Arc<redb::Database>,
+    database: Arc<redb::Database>,
+    #[allow(dead_code)]
     path: PathBuf,
+    #[allow(dead_code)]
     namespace: String,
 }
 
 impl RedbKeyValueStore {
     pub fn open(path: &Path, namespace: &str) -> Result<Self> {
         let database_path = path.join(format!("{}.redb", namespace));
+        let database = create_redb_database(&database_path)?;
+        // Materialize the table up front so reads never hit `TableDoesNotExist`.
+        {
+            let txn = database.begin_write()?;
+            txn.open_table(KV_TABLE)?;
+            txn.commit()?;
+        }
         Ok(Self {
-            _database: create_redb_database(&database_path)?,
+            database,
             path: database_path,
             namespace: namespace.to_string(),
         })
@@ -172,39 +190,96 @@ impl KeyValueStore for RedbKeyValueStore {
         StorageBackend::Redb
     }
 
-    fn get_bytes(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Err(not_implemented(
-            &format!("key-value read in namespace '{}'", self.namespace),
-            &self.path,
-        ))
+    fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(KV_TABLE)?;
+        Ok(table.get(key)?.map(|v| v.value().to_vec()))
     }
 
-    fn put_bytes(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        Err(not_implemented(
-            &format!("key-value write in namespace '{}'", self.namespace),
-            &self.path,
-        ))
+    fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(KV_TABLE)?;
+            table.insert(key, value)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
-    fn delete_bytes(&self, _key: &[u8]) -> Result<()> {
-        Err(not_implemented(
-            &format!("key-value delete in namespace '{}'", self.namespace),
-            &self.path,
-        ))
+    fn delete_bytes(&self, key: &[u8]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(KV_TABLE)?;
+            table.remove(key)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
-    fn scan_prefix(&self, _prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        Err(not_implemented(
-            &format!("key-value prefix scan in namespace '{}'", self.namespace),
-            &self.path,
-        ))
+    fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(KV_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.range(prefix..)? {
+            let (k, v) = entry?;
+            let key_bytes = k.value();
+            if !key_bytes.starts_with(prefix) {
+                break;
+            }
+            out.push((key_bytes.to_vec(), v.value().to_vec()));
+            if limit.is_some_and(|max| out.len() >= max) {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     fn flush(&self) -> Result<()> {
-        Err(not_implemented(
-            &format!("key-value flush in namespace '{}'", self.namespace),
-            &self.path,
-        ))
+        // Each write is committed durably in its own transaction — nothing to flush.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod redb_kv_tests {
+    use super::*;
+    use crate::storage::KeyValueStore;
+
+    #[test]
+    fn round_trip_overwrite_scan_delete_and_persist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kv = RedbKeyValueStore::open(tmp.path(), "test_ns").expect("open");
+
+        // Missing key reads as None (table exists, key absent).
+        assert_eq!(kv.get_bytes(b"missing").unwrap(), None);
+
+        // Put / get.
+        kv.put_bytes(b"dials:a", b"one").unwrap();
+        kv.put_bytes(b"dials:b", b"two").unwrap();
+        kv.put_bytes(b"other:c", b"three").unwrap();
+        assert_eq!(kv.get_bytes(b"dials:a").unwrap().as_deref(), Some(&b"one"[..]));
+
+        // Overwrite.
+        kv.put_bytes(b"dials:a", b"ONE").unwrap();
+        assert_eq!(kv.get_bytes(b"dials:a").unwrap().as_deref(), Some(&b"ONE"[..]));
+
+        // Prefix scan (ordered, prefix-bounded) + limit.
+        let scan = kv.scan_prefix(b"dials:", None).unwrap();
+        assert_eq!(
+            scan.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            vec![b"dials:a".to_vec(), b"dials:b".to_vec()]
+        );
+        assert_eq!(kv.scan_prefix(b"dials:", Some(1)).unwrap().len(), 1);
+
+        // Delete.
+        kv.delete_bytes(b"dials:a").unwrap();
+        assert_eq!(kv.get_bytes(b"dials:a").unwrap(), None);
+
+        // Durability across reopen.
+        drop(kv);
+        let kv2 = RedbKeyValueStore::open(tmp.path(), "test_ns").expect("reopen");
+        assert_eq!(kv2.get_bytes(b"dials:b").unwrap().as_deref(), Some(&b"two"[..]));
+        assert_eq!(kv2.get_bytes(b"dials:a").unwrap(), None);
     }
 }
 
