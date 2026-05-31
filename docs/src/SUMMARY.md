@@ -40,6 +40,7 @@
 - [VS Code Copilot](guides/vscode-copilot.md)
 - [Cursor integration](guides/cursor-integration.md)
 - [Deploying](guides/deploying.md)
+- [Relational backends](guides/relational-backends.md)
 - [Tuning retrieval](guides/tuning-retrieval.md)
 - [Multi-tenant](guides/multi-tenant.md)
 - [Zenoh / robotics](guides/zenoh-robotics.md)
