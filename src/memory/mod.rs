@@ -351,6 +351,14 @@ pub struct MemorySystem {
     /// snapshot), replacing brittle `episode_id` equality.
     tcm_context: Arc<parking_lot::RwLock<Vec<f32>>>,
 
+    /// C1: per-user write-path serialization. Acquired in `remember_impl` so
+    /// every writer (HTTP ingest, WebSocket streaming, hooks — all funnel
+    /// through it) is serialized through the shared create path, instead of the
+    /// plan's HTTP-only INGEST_LOCKS that streaming/hooks bypassed. Per-user by
+    /// construction (MemorySystem is per-user). See the CONSOLIDATION_LOCKS
+    /// per-user-lock discipline (CLAUDE.md).
+    write_lock: parking_lot::Mutex<()>,
+
     /// Drift-adaptive abstention threshold (APP-5).
     /// Calibrated during maintenance by sampling memory importance×confidence scores.
     /// Stored as f32 bits in AtomicU32 for lock-free reads during retrieval.
@@ -999,6 +1007,8 @@ impl MemorySystem {
             last_query_metacognition: Arc::new(parking_lot::RwLock::new(None)),
             // E6: TCM drift state (encode-driven; empty until the first embed)
             tcm_context: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            // C1: per-user write-path serialization lock
+            write_lock: parking_lot::Mutex::new(()),
             // Drift-adaptive abstention: 0 = use static constant
             calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
         })
@@ -1214,6 +1224,13 @@ impl MemorySystem {
         external_id: Option<String>,
         defer_embedding: bool,
     ) -> Result<MemoryId> {
+        // C1: serialize the per-user write path. Every writer (HTTP ingest,
+        // WebSocket streaming, hooks) funnels through remember_impl, so holding
+        // this lock for the create critical section (store + working_memory +
+        // index + BM25) prevents interleaved partial writes / concurrent loss.
+        // Released before the deferred embed_and_index background task runs.
+        let _write_guard = self.write_lock.lock();
+
         // W3.2d: migrate any flat robotics/decision fields into the W3 facets
         // so new memories carry both representations through the transition.
         // No-op when no flat fields are populated.
