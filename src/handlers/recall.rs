@@ -516,6 +516,11 @@ pub async fn recall(
                     .get("competition_conflict")
                     .map(|value| value == "true"),
                 competition_opponent: m.experience.metadata.get("competition_opponent").cloned(),
+                binding_strength: m
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| c.binding.binding_strength),
             }
         })
         .collect();
@@ -2453,6 +2458,11 @@ pub async fn recall_tracked(
                     .get("competition_conflict")
                     .map(|value| value == "true"),
                 competition_opponent: m.experience.metadata.get("competition_opponent").cloned(),
+                binding_strength: m
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| c.binding.binding_strength),
             }
         })
         .collect();
