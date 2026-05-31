@@ -6,7 +6,7 @@
 
 # Configuration Reference
 
-Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **83** distinct `VELD_*` variables.
+Veld is configured via environment variables. The generator scanned `src/**/*.rs` and found **92** distinct `VELD_*` variables.
 
 | Variable | Default | First seen in |
 |---|---|---|
@@ -31,6 +31,8 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_CORS_METHODS` | — | `src/config.rs` |
 | `VELD_CORS_ORIGINS` | — | `src/config.rs` |
 | `VELD_CORS_WARN` | — | `src/config.rs` |
+| `VELD_CROSS_ENCODER` | — | `src/embeddings/cross_encoder.rs` |
+| `VELD_CROSS_ENCODERS` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_DEV_API_KEY` | — | `src/auth.rs` |
 | `VELD_DOCS_DIR` | — | `src/handlers/docs.rs` |
 | `VELD_EMBEDDING_API_KEY` | — | `src/embeddings/http_embedder.rs` |
@@ -43,6 +45,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_ENV` | — | `src/auth.rs` |
 | `VELD_HIDE_DEV_KEY` | — | `src/auth.rs` |
 | `VELD_HOST` | — | `src/config.rs` |
+| `VELD_LAZY_CROSS_ENCODER` | — | `src/embeddings/cross_encoder.rs` |
 | `VELD_LAZY_LOAD` | — | `src/embeddings/minilm.rs` |
 | `VELD_LLM_API_KEY` | — | `src/memory/llm.rs` |
 | `VELD_LLM_API_TYPE` | — | `src/query_parsing/llm_parser.rs` |
@@ -60,6 +63,7 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_MEMORY_PATH` | — | `src/config.rs` |
 | `VELD_METRICS_PUBLIC` | — | `src/config.rs` |
 | `VELD_MODEL_PATH` | — | `src/embeddings/minilm.rs` |
+| `VELD_MSSQL_ADO_STRING` | — | `src/config.rs` |
 | `VELD_MULTI_TENANT` | — | `src/auth.rs` |
 | `VELD_NER_CONFIDENCE` | — | `src/embeddings/ner.rs` |
 | `VELD_NER_MODEL_PATH` | — | `src/embeddings/ner.rs` |
@@ -72,12 +76,17 @@ Veld is configured via environment variables. The generator scanned `src/**/*.rs
 | `VELD_ONNX_THREADS` | — | `src/embeddings/minilm.rs` |
 | `VELD_PACKAGE_DIR` | — | `src/embeddings/minilm.rs` |
 | `VELD_PORT` | — | `src/cli.rs` |
+| `VELD_POSTGRES_URL` | — | `src/config.rs` |
 | `VELD_PUBLIC_RATE_LIMIT` | — | `src/config.rs` |
 | `VELD_RATE_BURST` | — | `src/config.rs` |
 | `VELD_RATE_LIMIT` | — | `src/config.rs` |
+| `VELD_RELATIONAL_BACKEND` | — | `src/config.rs` |
+| `VELD_RELATIONAL_SQLITE_PATH` | — | `src/config.rs` |
 | `VELD_REQUEST_TIMEOUT` | — | `src/config.rs` |
 | `VELD_SLEEP_TIME_PROFILE` | — | `src/server.rs` |
 | `VELD_STORAGE_BACKEND` | — | `src/config.rs` |
+| `VELD_SUPABASE_DB_PASSWORD` | — | `src/config.rs` |
+| `VELD_SUPABASE_PROJECT_REF` | — | `src/config.rs` |
 | `VELD_TLS_ACK` | — | `src/server.rs` |
 | `VELD_USE_QUANTIZED_MODEL` | — | `src/embeddings/minilm.rs` |
 | `VELD_WRITE_MODE` | — | `src/memory/storage.rs` |
