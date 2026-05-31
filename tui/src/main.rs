@@ -53,6 +53,7 @@ fn generate_title(state: &AppState) -> String {
         ViewMode::ActivityLogs => "Activity",
         ViewMode::GraphMap => "Graph",
         ViewMode::Git => "Git",
+        ViewMode::Dials => "Dials",
     };
 
     format!("🦣 Veld - {}", view_name)

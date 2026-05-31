@@ -5,6 +5,11 @@
       "mcp__veld-memory"
     ]
   },
+  "statusLine": {
+    "type": "command",
+    "command": "bun run hooks/statusline.ts http://127.0.0.1:3030,http://127.0.0.1:3031",
+    "padding": 0
+  },
   "mcpServers": {
     "veld-memory": {
       "command": "bun",

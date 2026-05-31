@@ -252,3 +252,49 @@ main {
 .ev-context_update {
   color: var(--blue);
 }
+
+/* Cognitive Dials */
+.dials { display: flex; flex-direction: column; gap: 10px; }
+.dial { display: flex; flex-direction: column; gap: 2px; }
+.dial-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: default;
+}
+/* label + ⓘ on the left; control (checkbox / number) pushed to the right */
+.dial-label { flex: 1; display: inline-flex; align-items: center; gap: 6px; }
+.dial-name { font-weight: 500; }
+.dial-info {
+  font-size: 12px;
+  color: #6f7290;
+  cursor: help;
+  user-select: none;
+}
+.dial-info:hover, .dial-info:focus { color: #9aa0c4; outline: none; }
+.dial-toggle { cursor: pointer; margin: 0; }
+.dial-control { display: inline-flex; align-items: center; gap: 6px; }
+.dial-range { font-size: 11px; color: #6f7290; font-variant-numeric: tabular-nums; }
+.dial-number {
+  width: 84px;
+  background: #1b1d2a;
+  color: #e6e6ef;
+  border: 1px solid #2b2d3c;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+/* one-sentence "what it does" line under each dial */
+.dial-desc { margin: 0; font-size: 11px; color: #8b8ea6; line-height: 1.35; }
+.dial-ro { margin-top: 8px; font-size: 11px; padding-top: 8px; border-top: 1px solid #2b2d3c; }
+.dials-btn {
+  font-size: 11px;
+  margin-left: 8px;
+  background: #2b2d3c;
+  color: #c8c8d4;
+  border: 1px solid #3a3d4f;
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.dials-btn:hover { background: #353849; }
