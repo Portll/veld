@@ -65,7 +65,10 @@ function resolveApiKey(): string {
 }
 
 function resolveUrls(): string[] {
+  // Precedence: CLI arg (settings.json can pass URLs cross-platform without env
+  // injection) → VELD_STATUSLINE_URLS → VELD_API_URL → default.
   const raw =
+    process.argv[2] ||
     process.env.VELD_STATUSLINE_URLS ||
     process.env.VELD_API_URL ||
     "http://127.0.0.1:3030";
