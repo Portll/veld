@@ -1281,7 +1281,7 @@ impl HybridSearchEngine {
         let use_cross_encoder = dial
             .as_ref()
             .and_then(|d| d.use_reranking)
-            .unwrap_or_else(|| matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked));
+            .unwrap_or(matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked));
         let use_refiner = matches!(mode, RefinerMode::Llm | RefinerMode::Stacked);
 
         let mut final_results: Vec<HybridSearchResult> = if let Some(reranker) =
