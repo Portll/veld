@@ -3727,6 +3727,53 @@ impl super::MemorySystem {
         let mut seen_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
         self.expand_with_hierarchy(&mut memories, &mut seen_ids);
 
+        // P4: iterative re-cueing (pattern completion). When the first pass came
+        // back thin (fewer than requested), use the strongest hit's embedding as
+        // a NEW cue and pull its nearest neighbours the literal query missed —
+        // the recurrent-reinstatement analogue. READ-ONLY: it never mutates the
+        // TCM drift or Hebbian edges, so the re-cue cannot self-confirm toward
+        // what gets retrieved (overloop guardrail). Capped at ONE extra pass;
+        // gated on under-fill so it only augments a thin set, never reorders a
+        // satisfied one. Re-cued neighbours pass the same validity + filter gates.
+        if memories.len() < query.max_results {
+            let top_emb = memories.first().and_then(|m| m.experience.embeddings.clone());
+            let floor = memories
+                .iter()
+                .filter_map(|m| m.score)
+                .fold(f32::INFINITY, f32::min);
+            if let Some(emb) = top_emb {
+                let mut recue = query.clone();
+                recue.query_embedding = Some(emb);
+                recue.query_text = None;
+                if let Ok(ids) = self.retriever.search_ids(&recue, query.max_results * 4) {
+                    let recue_score = if floor.is_finite() { floor * 0.9 } else { 0.0 };
+                    for (id, _sim) in ids {
+                        if memories.len() >= query.max_results {
+                            break;
+                        }
+                        if seen_ids.contains(&id) {
+                            continue;
+                        }
+                        if let Ok(mut m) = self.retriever.get_from_storage(&id) {
+                            let valid = match recue.as_of {
+                                Some(t) => m.is_valid_at(t),
+                                None => !m.is_expired(),
+                            };
+                            if valid && self.retriever.matches_filters(&m, &recue) {
+                                seen_ids.insert(id);
+                                m.set_score(recue_score);
+                                memories.push(Arc::new(m));
+                            }
+                        }
+                    }
+                    // Keep the ranking monotonic after augmentation.
+                    memories.sort_by(|a, b| {
+                        b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
+                    });
+                }
+            }
+        }
+
         let t_total = recall_start.elapsed();
         tracing::info!(
             post_ms = format!("{:.2}", (t_total - t_fetch).as_secs_f64() * 1000.0),
