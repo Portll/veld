@@ -4,4 +4,5 @@
 //! render entry point. The dispatching layer in `widgets.rs::render_main`
 //! routes to the right `render_*` per `ViewMode`.
 
+pub mod dials;
 pub mod git;

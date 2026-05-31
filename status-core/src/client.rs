@@ -132,6 +132,68 @@ impl StatusClient {
         }
         Ok(resp.json::<Vec<String>>().await?)
     }
+
+    /// Fetch a user's cognitive dials (`GET /api/dials`). Returns the raw JSON object
+    /// so callers (the monitor) can render/edit without depending on veld's
+    /// `CognitiveDials` type.
+    pub async fn get_dials(
+        base_url: &str,
+        api_key: &str,
+        user_id: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let base = normalize_base_url(base_url)?;
+        let http = Client::builder().timeout(timeout).build()?;
+        let url = format!("{}/api/dials", base);
+        let resp = http
+            .get(&url)
+            .query(&[("user_id", user_id)])
+            .header("X-API-Key", api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(StatusError::BadStatus {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
+    /// Replace a user's cognitive dials (`PUT /api/dials`). `dials` is the full dials
+    /// object (as returned by [`get_dials`](Self::get_dials)). Returns the resulting,
+    /// server-sanitized dials.
+    pub async fn set_dials(
+        base_url: &str,
+        api_key: &str,
+        user_id: &str,
+        dials: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let base = normalize_base_url(base_url)?;
+        let http = Client::builder().timeout(timeout).build()?;
+        let url = format!("{}/api/dials", base);
+        let payload = serde_json::json!({ "user_id": user_id, "dials": dials });
+        let resp = http
+            .put(&url)
+            .header("X-API-Key", api_key)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(StatusError::BadStatus {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
 }
 
 impl Drop for StatusClient {

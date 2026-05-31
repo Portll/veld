@@ -254,6 +254,210 @@ function relTime(iso) {
   return Math.floor(diff / 86400) + "d";
 }
 
+// ---- Cognitive Dials ----------------------------------------------------
+let currentDials = null;
+
+// Each dial carries display metadata: a one-line `desc` shown under the control,
+// and `info` (suggested values for different uses) surfaced via the ⓘ hover tooltip.
+const DIAL_TOGGLES = [
+  {
+    key: "reconsolidation_enabled",
+    label: "Reconsolidation (master)",
+    desc: "Closes the labile window and re-encodes recalled memories during background maintenance.",
+    info: "On = adaptive consolidation runs in maintenance. Off = fully inert (default). Master gate for the layers below.",
+  },
+  {
+    key: "re_encode_graph_strengthen",
+    label: "Re-encode · graph strengthen",
+    desc: "Strengthens graph edges between a recalled memory and the entities in its retrieval context.",
+    info: "On for richer associative recall over time. Off to keep edges stable / if the graph is noisy.",
+  },
+  {
+    key: "re_encode_entity_enrich",
+    label: "Re-encode · entity enrich",
+    desc: "Adds newly-seen retrieval-context entities to the memory's own entity set.",
+    info: "On to grow associations as a memory is re-used. Off to keep each memory's entities fixed.",
+  },
+  {
+    key: "re_encode_embedding_nudge",
+    label: "Re-encode · embedding nudge",
+    desc: "Nudges a memory's embedding toward how it has actually been retrieved (semantic drift).",
+    info: "On for usage-adaptive recall (heaviest layer). Off to keep embeddings fixed (safest, default).",
+  },
+];
+const DIAL_NUMBERS = [
+  {
+    key: "reconsolidation_window_secs",
+    label: "Labile window",
+    unit: "s",
+    min: 30,
+    max: 3600,
+    step: 1,
+    desc: "How long a recalled memory stays re-encodable before the window closes and re-encode fires.",
+    info: "60 = rapid testing · 300 = interactive chat (default) · 1800 = long research · 3600 = max.",
+  },
+  {
+    key: "graph_boost_scale",
+    label: "Graph boost scale",
+    unit: "",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    desc: "Strength of the graph-edge reinforcement applied when the window closes.",
+    info: "0.2 = gentle · 0.5 = balanced (default) · 1.0 = aggressive edge strengthening.",
+  },
+  {
+    key: "embedding_blend",
+    label: "Embedding blend",
+    unit: "",
+    min: 0,
+    max: 0.5,
+    step: 0.01,
+    desc: "Fraction the embedding moves toward the retrieval context on each nudge.",
+    info: "0.05 = subtle (default) · 0.1 = moderate · 0.3 = strong drift (use with care).",
+  },
+];
+
+function fmtOpt(v) {
+  return v === null || v === undefined ? "—" : String(v);
+}
+
+function dialsStatus(msg, isError) {
+  const el = document.getElementById("dials-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.style.color = isError ? "#dc5a5a" : "";
+}
+
+async function saveDials(updated) {
+  dialsStatus("saving…", false);
+  try {
+    currentDials = await invoke("set_dials", { dials: updated });
+    renderDialsBody();
+    dialsStatus("saved", false);
+    setTimeout(() => dialsStatus("", false), 1500);
+  } catch (err) {
+    dialsStatus("save failed: " + (err?.message || err), true);
+  }
+}
+
+// A small ⓘ glyph whose native tooltip carries the "suggested values" text.
+function makeInfoIcon(text) {
+  const icon = document.createElement("span");
+  icon.className = "dial-info";
+  icon.textContent = "ⓘ";
+  icon.title = text;
+  icon.setAttribute("aria-label", text);
+  icon.tabIndex = 0;
+  return icon;
+}
+
+// "<label> ⓘ" — the info icon sits immediately after every label.
+function makeDialLabel(label, info) {
+  const wrap = document.createElement("span");
+  wrap.className = "dial-label";
+  const name = document.createElement("span");
+  name.className = "dial-name";
+  name.textContent = label;
+  wrap.append(name, makeInfoIcon(info));
+  return wrap;
+}
+
+function renderDialsBody() {
+  const body = document.getElementById("dials-body");
+  if (!body) return;
+  if (!currentDials) {
+    body.innerHTML = '<p class="muted">no dials</p>';
+    return;
+  }
+  body.innerHTML = "";
+
+  for (const d of DIAL_TOGGLES) {
+    const dial = document.createElement("div");
+    dial.className = "dial";
+
+    // Head row: label + ⓘ on the left, checkbox pushed to the right.
+    const head = document.createElement("label");
+    head.className = "dial-head";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "dial-toggle";
+    cb.checked = !!currentDials[d.key];
+    cb.addEventListener("change", () =>
+      saveDials({ ...currentDials, [d.key]: cb.checked })
+    );
+    head.append(makeDialLabel(d.label, d.info), cb);
+
+    const desc = document.createElement("p");
+    desc.className = "dial-desc";
+    desc.textContent = d.desc;
+
+    dial.append(head, desc);
+    body.appendChild(dial);
+  }
+
+  for (const d of DIAL_NUMBERS) {
+    const dial = document.createElement("div");
+    dial.className = "dial";
+
+    const head = document.createElement("div");
+    head.className = "dial-head";
+
+    // Control: range bracket to the LEFT of the input field.
+    const control = document.createElement("div");
+    control.className = "dial-control";
+    const range = document.createElement("span");
+    range.className = "dial-range";
+    range.textContent =
+      "[" + d.min + "–" + d.max + (d.unit ? " " + d.unit : "") + "]";
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.className = "dial-number";
+    inp.min = String(d.min);
+    inp.max = String(d.max);
+    inp.step = String(d.step);
+    inp.value = currentDials[d.key];
+    inp.addEventListener("change", () => {
+      let v = parseFloat(inp.value);
+      if (Number.isNaN(v)) return;
+      v = Math.min(d.max, Math.max(d.min, v));
+      inp.value = String(v);
+      saveDials({ ...currentDials, [d.key]: v });
+    });
+    control.append(range, inp);
+
+    head.append(makeDialLabel(d.label, d.info), control);
+
+    const desc = document.createElement("p");
+    desc.className = "dial-desc";
+    desc.textContent = d.desc;
+
+    dial.append(head, desc);
+    body.appendChild(dial);
+  }
+
+  const ro = document.createElement("p");
+  ro.className = "muted dial-ro";
+  ro.textContent =
+    "retrieval: candidate_count=" + fmtOpt(currentDials.candidate_count) +
+    " · rerank_count=" + fmtOpt(currentDials.rerank_count) +
+    " · use_reranking=" + fmtOpt(currentDials.use_reranking) +
+    " · refiner_mode=" + fmtOpt(currentDials.refiner_mode);
+  body.appendChild(ro);
+}
+
+async function pullDials() {
+  try {
+    currentDials = await invoke("get_dials");
+    renderDialsBody();
+  } catch (err) {
+    const body = document.getElementById("dials-body");
+    if (body)
+      body.innerHTML =
+        '<p class="muted">dials unavailable: ' + (err?.message || err) + "</p>";
+  }
+}
+
 async function pull() {
   try {
     const snap = await invoke("get_snapshot");
@@ -281,6 +485,11 @@ async function init() {
     return;
   }
   await pull();
+
+  const dialsRefresh = document.getElementById("dials-refresh");
+  if (dialsRefresh) dialsRefresh.addEventListener("click", pullDials);
+  await pullDials();
+
   setInterval(() => {
     if (Date.now() - lastUpdateAt > 5000) pull();
   }, 2000);

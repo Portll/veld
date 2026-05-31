@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, docs,
+    ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
     mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time, todos, user_auth,
     users, visualization, webhooks,
@@ -611,6 +611,11 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route(
             "/api/sleight/dimensions",
             post(external_dimensions::push_dimensions),
+        )
+        // Cognitive dials — runtime tuning (reconsolidation layers + retrieval knobs)
+        .route(
+            "/api/dials",
+            get(dials::get_dials).put(dials::set_dials),
         )
         // backward-compat aliases
         .route(

@@ -31,6 +31,7 @@ pub mod acl;
 pub mod llm;
 pub mod query_parser;
 pub mod relation_extraction;
+pub mod dials;
 mod recall;
 pub mod replay;
 pub mod llm_refiner;
@@ -95,6 +96,7 @@ pub use crate::memory::compression::{
     CausalFactLink, ConsolidationResult, FactCluster, FactType, PurgeReason, SemanticConsolidator,
     SemanticFact,
 };
+pub use crate::memory::dials::{CognitiveDials, ReconsolidationStats};
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
     apply_context_pattern_signals, calculate_entity_flow, calculate_entity_overlap,
@@ -321,6 +323,12 @@ pub struct MemorySystem {
     /// Reference: Nader et al. (2000) — reconsolidation theory.
     reconsolidation_shadows:
         Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::ReconsolidationShadow>>>,
+
+    /// Per-user runtime-tunable cognitive parameters (the "dials"). Seeded from
+    /// config/env at construction, mutated at runtime via `/api/dials` (and Sleight).
+    /// All reconsolidation toggles default OFF and all retrieval overrides default to
+    /// `None` — inert until explicitly dialed on. See [`dials::CognitiveDials`].
+    cognitive_dials: Arc<parking_lot::RwLock<dials::CognitiveDials>>,
 
     /// Signal attribution from the most recent semantic retrieval.
     /// Records which scoring signals (BM25, vector, graph, cross-encoder, recency,
@@ -855,6 +863,22 @@ impl MemorySystem {
             hybrid_search_config,
         );
 
+        // Shared runtime dials: seed from env once, overlay any persisted (runtime-set)
+        // value, attach to the search engine so its retrieval overrides take effect, and
+        // store the same handle on MemorySystem.
+        let cognitive_dials_arc =
+            Arc::new(parking_lot::RwLock::new(dials::CognitiveDials::from_env()));
+        if let Ok(Some(bytes)) = storage
+            .key_value_store()
+            .get_bytes(dials::COGNITIVE_DIALS_KEY)
+        {
+            match serde_json::from_slice::<dials::CognitiveDials>(&bytes) {
+                Ok(persisted) => *cognitive_dials_arc.write() = persisted.sanitized(),
+                Err(e) => tracing::warn!("ignoring corrupt persisted cognitive dials: {e}"),
+            }
+        }
+        hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
+
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
             if let Some((bm25, vector, graph, update_count)) =
@@ -963,6 +987,10 @@ impl MemorySystem {
             reconsolidation_shadows: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            // CognitiveDials: runtime tuning surface (seeded from env above; the same
+            // handle is attached to the hybrid-search engine so retrieval overrides
+            // take effect). KV-persisted per-user override is wired separately.
+            cognitive_dials: cognitive_dials_arc,
             // Signal attribution from most recent semantic retrieval
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1022,6 +1050,33 @@ impl MemorySystem {
     /// Update External dimension scores (Sleight) (called via API push from Sleight).
     pub fn set_external_scores(&self, scores: types::ExternalDimensionScores) {
         *self.external_scores.write() = Some(scores);
+    }
+
+    /// Snapshot the current cognitive dials (cheap clone under read lock).
+    pub fn cognitive_dials(&self) -> dials::CognitiveDials {
+        self.cognitive_dials.read().clone()
+    }
+
+    /// Replace the cognitive dials at runtime (sanitizes ranges + stamps `updated_at`)
+    /// and persist them so the value survives a restart. Called via `/api/dials` PUT and
+    /// by automated tuners. Persistence is best-effort: a KV failure is logged, not
+    /// fatal (the in-memory dials still update).
+    pub fn set_cognitive_dials(&self, new_dials: dials::CognitiveDials) {
+        let mut d = new_dials.sanitized();
+        d.updated_at = Some(chrono::Utc::now());
+        match serde_json::to_vec(&d) {
+            Ok(bytes) => {
+                if let Err(e) = self
+                    .long_term_memory
+                    .key_value_store()
+                    .put_bytes(dials::COGNITIVE_DIALS_KEY, &bytes)
+                {
+                    tracing::warn!("failed to persist cognitive dials: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize cognitive dials: {e}"),
+        }
+        *self.cognitive_dials.write() = d;
     }
 
     /// Get current External dimension scores (Sleight) (read during Layer 5 scoring).
@@ -5031,6 +5086,242 @@ impl MemorySystem {
         self.long_term_memory.find_by_external_id(external_id)
     }
 
+    /// Close expired reconsolidation labile windows (FIX-R1) and apply the enabled
+    /// re-encode layers. Runs inside `run_maintenance` (off the recall hot path). `now`
+    /// is injected so the expiry pass is unit-testable without a clock abstraction.
+    ///
+    /// Layer 0 (always, when `reconsolidation_enabled`): drain shadows whose window has
+    /// expired and that are not working-memory-class
+    /// (`consecutive_retrieval_count < RECONSOLIDATION_WORKING_MEMORY_THRESHOLD`), decay
+    /// the memory's activation from labile (1.0) back to a resting value (0.6 bursty /
+    /// 0.3 steady), and record a `MemoryStrengthened` event. No-op (default stats) when
+    /// `reconsolidation_enabled` is false — preserving pre-feature behavior.
+    ///
+    /// Concurrency: the shadow write-guard is released before the per-memory apply loop,
+    /// so no tier lock is held across application (matches the shadow-creation path in
+    /// `recall`, which also takes `reconsolidation_shadows.write()`).
+    pub(crate) fn run_reconsolidation_expiry(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> dials::ReconsolidationStats {
+        let mut stats = dials::ReconsolidationStats::default();
+        let d = self.cognitive_dials.read().clone();
+        if !d.reconsolidation_enabled {
+            return stats;
+        }
+
+        // Drain expired, non-working-memory shadows. Hold the write guard only for the
+        // filter+remove; release it before the apply loop.
+        let expired: Vec<types::ReconsolidationShadow> = {
+            let mut shadows = self.reconsolidation_shadows.write();
+            let expired_keys: Vec<MemoryId> = shadows
+                .iter()
+                .filter(|(_, s)| {
+                    s.expires_at <= now
+                        && s.consecutive_retrieval_count
+                            < crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            expired_keys
+                .iter()
+                .filter_map(|k| shadows.remove(k))
+                .collect()
+        };
+        stats.expired = expired.len();
+
+        for shadow in &expired {
+            // Locate the memory in the in-memory tiers (read guards drop at the `;`).
+            let found: Option<SharedMemory> = self
+                .working_memory
+                .read()
+                .get(&shadow.memory_id)
+                .or_else(|| self.session_memory.read().get(&shadow.memory_id));
+            let Some(mem) = found else { continue };
+
+            // Layer 0: close the labile window — decay activation back to resting.
+            let burstiness = mem.access_burstiness();
+            let resting_activation = if burstiness > 1.5 { 0.6 } else { 0.3 };
+            mem.set_activation(resting_activation);
+            stats.applied += 1;
+
+            self.record_consolidation_event(ConsolidationEvent::MemoryStrengthened {
+                memory_id: shadow.memory_id.0.to_string(),
+                content_preview: format!(
+                    "reconsolidated ({}x retrievals, burstiness={:.1})",
+                    shadow.consecutive_retrieval_count, burstiness
+                ),
+                activation_before: 1.0,
+                activation_after: resting_activation,
+                reason: StrengtheningReason::Recalled,
+                timestamp: now,
+            });
+
+            // Layer 1: strengthen graph edges between this memory's entities and the
+            // entities resolved from its accumulated retrieval context (if dialed on).
+            if d.re_encode_graph_strengthen {
+                stats.graph_edges_strengthened += self.reconsolidate_graph(&mem, shadow, &d);
+            }
+
+            // Layers 2 & 3: enrich entity_refs / nudge embedding from the accumulated
+            // context, then persist (one clone + one re-index for both layers).
+            if d.re_encode_entity_enrich || d.re_encode_embedding_nudge {
+                let (enriched, nudged) = self.reconsolidate_memory(&mem, shadow, &d);
+                stats.entities_enriched += enriched;
+                stats.embeddings_nudged += nudged;
+            }
+        }
+
+        if stats.applied > 0 {
+            tracing::debug!(
+                expired = stats.expired,
+                applied = stats.applied,
+                edges = stats.graph_edges_strengthened,
+                "FIX-R1: closed expired reconsolidation windows"
+            );
+        }
+        stats
+    }
+
+    /// Layer 1 re-encode: strengthen Hebbian graph edges between `mem`'s entities and
+    /// the entities resolved (by name) from the shadow's accumulated retrieval context.
+    /// Returns the number of edges strengthened. No-op when there is no graph, the
+    /// memory has no entity refs, or no context keyword resolves to a known entity.
+    /// Boost scales with how often the memory was retrieved in-context this window.
+    fn reconsolidate_graph(
+        &self,
+        mem: &SharedMemory,
+        shadow: &types::ReconsolidationShadow,
+        dials: &dials::CognitiveDials,
+    ) -> usize {
+        let Some(graph) = &self.graph_memory else {
+            return 0;
+        };
+        if mem.entity_refs.is_empty() {
+            return 0;
+        }
+        let mem_entity_ids: Vec<String> = mem
+            .entity_refs
+            .iter()
+            .map(|r| r.entity_id.to_string())
+            .collect();
+
+        let threshold = crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD.max(1) as f32;
+        let intensity = (shadow.consecutive_retrieval_count as f32).min(threshold) / threshold;
+        let boost = dials.graph_boost_scale * intensity;
+        if boost <= 0.0 {
+            return 0;
+        }
+
+        // Hold one graph read guard for resolution + strengthening (strengthen takes
+        // `&self`, using its own internal synapse lock).
+        let g = graph.read();
+        let mut ctx_entity_ids: Vec<String> = Vec::new();
+        for kw in extract_entities_simple(&shadow.retrieval_context) {
+            if let Ok(Some(node)) = g.find_entity_by_name(&kw) {
+                let id = node.uuid.to_string();
+                if !ctx_entity_ids.contains(&id) {
+                    ctx_entity_ids.push(id);
+                }
+            }
+        }
+        if ctx_entity_ids.is_empty() {
+            return 0;
+        }
+
+        let mut boosts: Vec<(String, String, f32)> = Vec::new();
+        for from in &mem_entity_ids {
+            for to in &ctx_entity_ids {
+                if from != to {
+                    boosts.push((from.clone(), to.clone(), boost));
+                }
+            }
+        }
+        if boosts.is_empty() {
+            return 0;
+        }
+        match g.strengthen_memory_edges(&boosts) {
+            Ok((n, _promotions)) => n,
+            Err(e) => {
+                tracing::debug!("reconsolidation graph strengthen failed: {e}");
+                0
+            }
+        }
+    }
+
+    /// Layers 2 & 3 re-encode: clone the memory once, optionally (a) merge new
+    /// retrieval-context entities into `entity_refs` and (b) nudge its embedding toward
+    /// the retrieval-context embedding, then persist via `update_memory` (single
+    /// re-index). Returns `(entities_enriched, embeddings_nudged)`. No-op (no clone, no
+    /// persist) when neither layer is dialed on or no mutation actually occurs.
+    fn reconsolidate_memory(
+        &self,
+        mem: &SharedMemory,
+        shadow: &types::ReconsolidationShadow,
+        dials: &dials::CognitiveDials,
+    ) -> (usize, usize) {
+        if !dials.re_encode_entity_enrich && !dials.re_encode_embedding_nudge {
+            return (0, 0);
+        }
+        let mut m = (**mem).clone();
+        let mut entities_enriched = 0usize;
+        let mut embeddings_nudged = 0usize;
+        let mut dirty = false;
+
+        // Layer 2: merge genuinely-new context entities into entity_refs.
+        if dials.re_encode_entity_enrich {
+            if let Some(graph) = &self.graph_memory {
+                let g = graph.read();
+                let before = m.entity_refs.len();
+                for kw in extract_entities_simple(&shadow.retrieval_context) {
+                    if let Ok(Some(node)) = g.find_entity_by_name(&kw) {
+                        m.add_entity_ref(node.uuid, node.name.clone(), "reconsolidated".to_string());
+                    }
+                }
+                let added = m.entity_refs.len() - before;
+                if added > 0 {
+                    entities_enriched = added;
+                    dirty = true;
+                }
+            }
+        }
+
+        // Layer 3: blend the embedding toward the retrieval-context embedding (L2-norm).
+        if dials.re_encode_embedding_nudge {
+            if let Some(mem_emb) = m.experience.embeddings.clone() {
+                if !mem_emb.is_empty() {
+                    if let Ok(ctx_emb) = self.compute_embedding(&shadow.retrieval_context) {
+                        if ctx_emb.len() == mem_emb.len() {
+                            let blend = dials.embedding_blend;
+                            let mut blended: Vec<f32> = mem_emb
+                                .iter()
+                                .zip(ctx_emb.iter())
+                                .map(|(a, b)| (1.0 - blend) * a + blend * b)
+                                .collect();
+                            let norm = blended.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > f32::EPSILON {
+                                for x in blended.iter_mut() {
+                                    *x /= norm;
+                                }
+                                m.experience.embeddings = Some(blended);
+                                embeddings_nudged = 1;
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if dirty {
+            if let Err(e) = self.update_memory(&m) {
+                tracing::debug!("reconsolidation memory update failed: {e}");
+                return (0, 0);
+            }
+        }
+        (entities_enriched, embeddings_nudged)
+    }
+
     /// Run periodic maintenance (consolidation, activation decay, graph maintenance)
     ///
     /// Call this periodically (e.g., every 5 minutes) to:
@@ -5117,6 +5408,11 @@ impl MemorySystem {
                 }
             }
         }
+
+        // 2.45 FIX-R1: close expired reconsolidation labile windows + re-encode.
+        // Runs after decay (so the resting activation it sets is final) and before
+        // potentiation. No-op unless `reconsolidation_enabled` is dialed on.
+        let _recon_stats = self.run_reconsolidation_expiry(now);
 
         // 2.5 Potentiation: boost ALL memories based on access count (Hebbian LTP)
         // This implements "neurons that fire together wire together" - memories
@@ -6623,4 +6919,95 @@ fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
     }
 
     chains
+}
+
+#[cfg(test)]
+mod reconsolidation_expiry_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn shadow_for(
+        id: &MemoryId,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        count: u32,
+    ) -> types::ReconsolidationShadow {
+        types::ReconsolidationShadow {
+            memory_id: id.clone(),
+            opened_at: expires_at - chrono::Duration::seconds(300),
+            expires_at,
+            retrieval_context: "test query".to_string(),
+            consecutive_retrieval_count: count,
+            last_retrieval_at: expires_at,
+        }
+    }
+
+    #[test]
+    fn disabled_dials_is_a_noop_and_retains_shadows() {
+        let (sys, _tmp) = fresh_system();
+        let now = chrono::Utc::now();
+        let id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            id.clone(),
+            shadow_for(&id, now - chrono::Duration::seconds(10), 1),
+        );
+
+        // Default dials: reconsolidation disabled -> no-op, shadow retained (parity).
+        let stats = sys.run_reconsolidation_expiry(now);
+        assert_eq!(stats, ReconsolidationStats::default());
+        assert!(sys.has_active_shadow(&id), "shadow must survive when disabled");
+    }
+
+    #[test]
+    fn enabled_drains_only_expired_non_working_shadows() {
+        let (sys, _tmp) = fresh_system();
+        sys.set_cognitive_dials(CognitiveDials {
+            reconsolidation_enabled: true,
+            ..Default::default()
+        });
+        let now = chrono::Utc::now();
+
+        // Expired, not working-memory-class -> drained.
+        let expired_id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            expired_id.clone(),
+            shadow_for(&expired_id, now - chrono::Duration::seconds(10), 1),
+        );
+        // Not yet expired -> retained.
+        let fresh_id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            fresh_id.clone(),
+            shadow_for(&fresh_id, now + chrono::Duration::seconds(300), 1),
+        );
+        // Expired but working-memory-class (count >= threshold) -> retained.
+        let working_id = MemoryId(uuid::Uuid::new_v4());
+        sys.reconsolidation_shadows.write().insert(
+            working_id.clone(),
+            shadow_for(
+                &working_id,
+                now - chrono::Duration::seconds(10),
+                crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD,
+            ),
+        );
+
+        let stats = sys.run_reconsolidation_expiry(now);
+        // Only the expired non-working shadow drains; applied=0 (no tiered memory).
+        assert_eq!(stats.expired, 1, "exactly one shadow expired");
+        assert_eq!(stats.applied, 0, "no tiered memory to apply to");
+        assert!(!sys.has_active_shadow(&expired_id), "expired shadow drained");
+        assert!(sys.has_active_shadow(&fresh_id), "unexpired shadow retained");
+        assert!(
+            sys.has_active_shadow(&working_id),
+            "working-memory-class shadow retained"
+        );
+    }
 }
