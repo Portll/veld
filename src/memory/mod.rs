@@ -2463,6 +2463,37 @@ impl MemorySystem {
         hasher.finalize().into()
     }
 
+    /// C2 (W-001): enumerate the ids of every memory in the canonical
+    /// long-term store. Used by the store↔log reconcile to find store
+    /// records the intent log never recorded.
+    pub fn all_memory_ids(&self) -> Result<Vec<MemoryId>> {
+        self.long_term_memory.get_all_ids()
+    }
+
+    /// Run [`forget`](Self::forget) and report which canonical long-term
+    /// store keys it actually removed. A *hard* delete (e.g.
+    /// [`ForgetCriteria::ById`]) drops the RocksDB key and is reported; a
+    /// *soft* forget that only flags `is_forgotten` keeps the key and is
+    /// therefore not reported (the record still exists and the log's
+    /// `Remember` frame is still accurate). The reported ids are exactly
+    /// the canonical-store removals the intent log must learn about via a
+    /// `Forget` frame — the bulk-forget endpoints journal one per id so
+    /// projections and PITR replay don't resurrect them (C5 / W-017
+    /// bulk-forget variant coverage).
+    pub fn forget_collecting_removed(
+        &self,
+        criteria: ForgetCriteria,
+    ) -> Result<(usize, Vec<MemoryId>)> {
+        use std::collections::HashSet;
+        let before: HashSet<MemoryId> =
+            self.long_term_memory.get_all_ids()?.into_iter().collect();
+        let count = self.forget(criteria)?;
+        let after: HashSet<MemoryId> =
+            self.long_term_memory.get_all_ids()?.into_iter().collect();
+        let removed: Vec<MemoryId> = before.difference(&after).cloned().collect();
+        Ok((count, removed))
+    }
+
     /// Forget memories based on criteria
     /// Thread-safe: uses interior mutability for all internal state
     pub fn forget(&self, criteria: ForgetCriteria) -> Result<usize> {

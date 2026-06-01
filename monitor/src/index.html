@@ -16,6 +16,7 @@
       <span id="rtt" class="muted">— ms</span>
       <span id="uptime" class="muted">—</span>
       <span id="version" class="muted">—</span>
+      <button id="open-graph" class="header-btn" title="Open the knowledge-graph viewer">🧠 Graph</button>
     </header>
     <main>
       <section class="card" id="card-memory">
@@ -50,6 +51,16 @@
         </div>
       </section>
     </main>
+    <div id="graph-overlay" class="hidden">
+      <div id="graph-bar">
+        <span>🧠 Veld Memory Graph</span>
+        <span class="graph-bar-actions">
+          <button id="graph-reload" type="button" title="Reload the graph">↻ Reload</button>
+          <button id="graph-close" type="button" title="Back to monitor">✕ Close</button>
+        </span>
+      </div>
+      <iframe id="graph-frame" title="Veld Memory Graph"></iframe>
+    </div>
     <script type="module" src="main.js"></script>
   </body>
 </html>

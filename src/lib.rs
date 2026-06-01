@@ -51,6 +51,7 @@ pub mod streaming;
 pub mod tracing_setup;
 pub mod user_auth;
 pub mod validation;
+pub mod wiki;
 pub mod vector_db;
 
 pub mod mcp;
