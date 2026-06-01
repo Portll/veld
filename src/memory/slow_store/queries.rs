@@ -322,18 +322,26 @@ impl SlowStore {
         Ok(adj)
     }
 
-    /// Get entity names for a set of UUIDs
+    /// Get entity names for a set of UUIDs.
+    ///
+    /// One `IN (...)` query rather than a point lookup per UUID. Placeholders
+    /// are generated for the bind count; UUIDs are bound, never interpolated.
     pub fn get_entity_names(&self, uuids: &[&str]) -> Result<HashMap<String, String>> {
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let conn = self.conn.lock();
-        let mut result = HashMap::new();
-        let mut stmt = conn.prepare_cached("SELECT uuid, name FROM entities WHERE uuid = ?1")?;
+        let placeholders = vec!["?"; uuids.len()].join(",");
+        let sql = format!("SELECT uuid, name FROM entities WHERE uuid IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
 
-        for uuid in uuids {
-            if let Ok((id, name)) = stmt.query_row(params![uuid], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                result.insert(id, name);
-            }
+        let mut result = HashMap::new();
+        let rows = stmt.query_map(rusqlite::params_from_iter(uuids.iter().copied()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, name) = row?;
+            result.insert(id, name);
         }
 
         Ok(result)
