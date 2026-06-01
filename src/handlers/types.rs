@@ -306,6 +306,14 @@ pub struct RecallMemory {
     /// W-conjunction is weak — treat as gist, not a confident bound episode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_strength: Option<f32>,
+    /// C3 injection trust boundary: the engram's source tier (User/File/System
+    /// = trusted; Web/ExternalApi/AiGenerated/Inferred = untrusted). Surfaced so
+    /// a consumer treats untrusted-source content as data, never as instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    /// C3: whether the source tier is trusted (derived from source_type).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trusted: Option<bool>,
 }
 
 #[derive(Serialize)]
