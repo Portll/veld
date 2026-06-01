@@ -1357,13 +1357,15 @@ pub async fn wiki_render(
         ));
     }
 
-    let (target_dir, pages) = state.render_wiki(&user_id).map_err(AppError::Internal)?;
+    let (target_dir, pages, edits_applied) =
+        state.render_wiki(&user_id).map_err(AppError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "success": true,
         "enabled": true,
         "target_dir": target_dir,
         "pages": pages,
+        "edits_applied": edits_applied,
     })))
 }
 

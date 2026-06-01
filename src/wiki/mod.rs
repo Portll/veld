@@ -45,6 +45,7 @@ use crate::intent_log::{
 };
 use crate::memory::types::{ExperienceType, Memory, MemoryId, SourceType};
 use crate::mif::pii::PiiPatterns;
+use sha2::{Digest, Sha256};
 
 /// Checkpoint-store key + metrics label. Stable across versions — the
 /// checkpoint store is keyed on this string, so renaming it is a manual
@@ -218,8 +219,17 @@ impl WikiProjection {
             ),
             None => ("Unknown".to_string(), false),
         };
-        // W-008: redact PII before anything reaches disk.
-        let (body, _redactions, _found) = self.pii.redact(&memory.experience.content);
+        // W-008: redact PII before any byte reaches disk. `redacted` records
+        // whether redaction actually changed the content — a redacted body
+        // cannot be round-tripped back to the canonical content, so edit-back
+        // skips such pages (see `MultiUserMemoryManager::scan_wiki_edits`).
+        let (body, _redactions, redacted) = self.pii.redact(&memory.experience.content);
+        // The body is the *sole* editable region and is exactly what
+        // `last_rendered_hash` covers (W-003/W-004): entities and every other
+        // metadatum live in the frontmatter, so the rendered body equals the
+        // canonical content (modulo redaction) and an Obsidian edit to it
+        // round-trips cleanly into `experience.content`.
+        let body_hash = body_sha256_hex(&body);
         let raw_slug = sanitize_slug(body.lines().next().unwrap_or("").trim());
         let slug = if raw_slug.is_empty() {
             format!("mem-{}", short_id(memory))
@@ -239,6 +249,8 @@ impl WikiProjection {
         out.push_str(&format!("source_trusted: {source_trusted}\n"));
         out.push_str(&format!("created_at: {}\n", memory.created_at.to_rfc3339()));
         out.push_str(&format!("last_rendered_lsn: {}\n", lsn.0));
+        out.push_str(&format!("last_rendered_hash: {body_hash}\n"));
+        out.push_str(&format!("redacted: {redacted}\n"));
         if !memory.experience.tags.is_empty() {
             let tags = memory
                 .experience
@@ -250,18 +262,19 @@ impl WikiProjection {
                 .join(", ");
             out.push_str(&format!("tags: [{tags}]\n"));
         }
+        if !memory.experience.entities.is_empty() {
+            let entities = memory
+                .experience
+                .entities
+                .iter()
+                .map(|e| sanitize_inline(e))
+                .filter(|e| !e.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("entities: [{entities}]\n"));
+        }
         out.push_str("---\n\n");
         out.push_str(&body);
-        out.push('\n');
-        if !memory.experience.entities.is_empty() {
-            out.push_str("\n## Entities\n\n");
-            for e in &memory.experience.entities {
-                let e = sanitize_inline(e);
-                if !e.is_empty() {
-                    out.push_str(&format!("- [[{e}]]\n"));
-                }
-            }
-        }
         out
     }
 
@@ -365,6 +378,66 @@ fn short_id(memory: &Memory) -> String {
     memory.id.0.to_string().chars().take(8).collect()
 }
 
+/// Hex-encoded SHA-256 of a page body. The body is the editable region of a
+/// rendered page; `last_rendered_hash` in the frontmatter is this value at
+/// render time. Edit-back (W-003/W-004) compares the current body's hash to
+/// the recorded one: equal → the page is still exactly what veld wrote (so a
+/// re-render event is veld's own write — self-write suppression, W-004);
+/// different → the user edited the body and the change flows back.
+pub fn body_sha256_hex(body: &str) -> String {
+    let digest = Sha256::digest(body.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
+}
+
+/// A veld-rendered wiki page parsed back from disk: the canonical `id`, the
+/// `last_rendered_hash` the renderer recorded, whether the body was PII-
+/// redacted (and so can't round-trip), and the body text.
+pub struct ParsedPage {
+    pub id: String,
+    pub last_rendered_hash: String,
+    pub redacted: bool,
+    pub body: String,
+}
+
+/// Parse a veld-rendered page. Returns `None` for any file that is not a
+/// veld page — it must open with our frontmatter and carry both `id` and
+/// `last_rendered_hash`. This is the ingestion-sink guard (W-007): a stray
+/// markdown file dropped into the wiki dir has no valid frontmatter and is
+/// never treated as an editable memory.
+pub fn parse_rendered_page(text: &str) -> Option<ParsedPage> {
+    const CLOSE: &str = "\n---\n";
+    let rest = text.strip_prefix("---\n")?;
+    let close = rest.find(CLOSE)?;
+    let frontmatter = &rest[..close];
+    let after = &rest[close + CLOSE.len()..];
+    // The renderer writes `---\n\n{body}`, so one blank line separates the
+    // frontmatter close from the body.
+    let body = after.strip_prefix('\n').unwrap_or(after).to_string();
+
+    let mut id = None;
+    let mut last_rendered_hash = None;
+    let mut redacted = false;
+    for line in frontmatter.lines() {
+        if let Some(v) = line.strip_prefix("id: ") {
+            id = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("last_rendered_hash: ") {
+            last_rendered_hash = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("redacted: ") {
+            redacted = v.trim() == "true";
+        }
+    }
+    Some(ParsedPage {
+        id: id?,
+        last_rendered_hash: last_rendered_hash?,
+        redacted,
+        body,
+    })
+}
+
 /// Dyn-friendly arm: [`crate::intent_log::JournaledWriter`] hands typed
 /// payloads at live-write time. Pages are written atomically per apply; the
 /// checkpoint is persisted on the [`COMMIT_EVERY`] cadence so a crash only
@@ -450,5 +523,27 @@ mod tests {
         // the parse rejects obvious non-truthy values.
         // (Full env-gated behaviour is covered at the registration site.)
         assert!(!matches!("off", "1" | "true" | "on" | "yes"));
+    }
+
+    #[test]
+    fn parse_rendered_page_roundtrips_body_hash_and_guards_foreign_files() {
+        let body = "Decided to default the cross-encoder to mxbai-xsmall.";
+        let hash = body_sha256_hex(body);
+        let page = format!(
+            "---\nid: 11111111-2222-3333-4444-555555555555\nslug: decided\n\
+             last_rendered_hash: {hash}\nredacted: false\nentities: [mxbai]\n---\n\n{body}"
+        );
+        let parsed = parse_rendered_page(&page).expect("a veld page parses");
+        assert_eq!(parsed.id, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(parsed.last_rendered_hash, hash);
+        assert!(!parsed.redacted);
+        assert_eq!(parsed.body, body);
+        // Self-write suppression (W-004): re-hashing the parsed body matches
+        // the recorded hash, so an unedited page is skipped by the scan.
+        assert_eq!(body_sha256_hex(&parsed.body), parsed.last_rendered_hash);
+        // Ingestion-sink guard (W-007): a foreign markdown file is ignored.
+        assert!(parse_rendered_page("# a stray note\n\nnot a veld page").is_none());
+        // Missing last_rendered_hash → not a usable veld page.
+        assert!(parse_rendered_page("---\nid: x\n---\n\nbody").is_none());
     }
 }
