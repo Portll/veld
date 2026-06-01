@@ -91,6 +91,9 @@ const { listen } = window.__TAURI__.event;
 let lastUpdateAt = 0;
 let currentBaseUrl = "";
 let currentUserId = "";
+// Multi-instance: the fleet of discovered veld instances + which tab is active.
+let instances = [];
+let activeBaseUrl = "";
 
 function fmtCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -336,7 +339,10 @@ function dialsStatus(msg, isError) {
 async function saveDials(updated) {
   dialsStatus("saving…", false);
   try {
-    currentDials = await invoke("set_dials", { dials: updated });
+    currentDials = await invoke("set_dials_for", {
+      baseUrl: activeBaseUrl,
+      dials: updated,
+    });
     renderDialsBody();
     dialsStatus("saved", false);
     setTimeout(() => dialsStatus("", false), 1500);
@@ -452,7 +458,7 @@ function renderDialsBody() {
 
 async function pullDials() {
   try {
-    currentDials = await invoke("get_dials");
+    currentDials = await invoke("get_dials_for", { baseUrl: activeBaseUrl });
     renderDialsBody();
   } catch (err) {
     // Null out so the self-heal loop retries once the server is reachable again.
@@ -468,22 +474,71 @@ async function pullDials() {
 
 async function pull() {
   try {
-    const snap = await invoke("get_snapshot");
-    diagPush(
-      "info",
-      `pull ok — state=${JSON.stringify(snap.server?.state)} ` +
-        `total=${snap.memory?.total} user=${snap.user_id}`
-    );
+    // Snapshot for the active instance/tab (falls back to pinned server-side).
+    const snap = await invoke("get_snapshot_for", { baseUrl: activeBaseUrl });
     render(snap);
   } catch (err) {
-    diagPush("ERROR", "invoke(get_snapshot) failed: " + (err?.message || err));
-    console.error("get_snapshot failed", err);
+    diagPush("ERROR", "get_snapshot_for failed: " + (err?.message || err));
   }
+}
+
+// ---- Multi-instance tabs ------------------------------------------------
+async function pullInstances() {
+  try {
+    instances = await invoke("list_instances");
+  } catch (err) {
+    diagPush("ERROR", "list_instances failed: " + (err?.message || err));
+    return;
+  }
+  // Default to the pinned (first) instance; recover if the active one vanished.
+  if (instances.length && !instances.some((i) => i.base_url === activeBaseUrl)) {
+    activeBaseUrl = instances[0].base_url;
+  }
+  renderTabs();
+}
+
+function renderTabs() {
+  const bar = document.getElementById("tabs");
+  if (!bar) return;
+  // Only show the tab bar once more than one instance is discovered.
+  if (instances.length <= 1) {
+    bar.innerHTML = "";
+    bar.classList.add("hidden");
+    return;
+  }
+  bar.classList.remove("hidden");
+  bar.innerHTML = "";
+  for (const inst of instances) {
+    const tab = document.createElement("button");
+    tab.className = "tab" + (inst.base_url === activeBaseUrl ? " active" : "");
+    tab.title = inst.base_url + (inst.pinned ? " (configured)" : "");
+    const dot = document.createElement("span");
+    dot.className = "tab-dot " + (inst.online ? "on" : "off");
+    const lbl = document.createElement("span");
+    lbl.textContent = (inst.pinned ? "★ " : "") + (inst.label || inst.base_url);
+    tab.append(dot, lbl);
+    tab.addEventListener("click", () => setActiveInstance(inst.base_url));
+    bar.appendChild(tab);
+  }
+}
+
+function setActiveInstance(base) {
+  if (base === activeBaseUrl) return;
+  activeBaseUrl = base;
+  currentDials = null; // force a dials reload for the newly-selected instance
+  renderTabs();
+  pull();
+  pullDials();
 }
 
 async function init() {
   try {
-    await listen("snapshot-updated", (event) => render(event.payload));
+    // The emit stream is the pinned instance; only render it when the pinned tab
+    // is the active one (other tabs are driven by polling get_snapshot_for).
+    await listen("snapshot-updated", (event) => {
+      const snap = event.payload;
+      if (snap && (!activeBaseUrl || snap.base_url === activeBaseUrl)) render(snap);
+    });
     diagPush("info", "listen('snapshot-updated') subscribed");
   } catch (err) {
     diagPush(
@@ -492,6 +547,7 @@ async function init() {
     );
     return;
   }
+  await pullInstances(); // sets activeBaseUrl to the pinned instance
   await pull();
 
   const dialsRefresh = document.getElementById("dials-refresh");
@@ -530,7 +586,11 @@ async function init() {
   }
 
   setInterval(() => {
-    if (Date.now() - lastUpdateAt > 5000) pull();
+    pullInstances(); // refresh the tab list as instances come/go
+    // Poll the active instance. For the pinned tab the emit also refreshes (1s);
+    // for other tabs this is the only driver. Always poll if the emit is stale.
+    const activeIsPinned = instances.find((i) => i.base_url === activeBaseUrl)?.pinned;
+    if (!activeIsPinned || Date.now() - lastUpdateAt > 5000) pull();
     // Self-heal the dials card after a server flap/old-build window. Only retries
     // while unavailable (currentDials === null), so it never clobbers a live edit.
     if (!currentDials) pullDials();
