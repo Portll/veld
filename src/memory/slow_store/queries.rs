@@ -178,11 +178,6 @@ impl SlowStore {
              ORDER BY e.strength DESC",
         )?;
 
-        let mut inter_stmt = conn.prepare_cached(
-            "SELECT COUNT(*) FROM edges
-             WHERE from_entity = ?1 AND to_entity = ?2",
-        )?;
-
         let mut results = Vec::new();
         for (hub_uuid, hub_name, _spoke_count, avg_strength) in &hubs {
             let spokes: Vec<(String, String)> = spoke_stmt
@@ -193,24 +188,34 @@ impl SlowStore {
                 continue;
             }
 
-            // Count existing inter-spoke edges
-            let mut existing_inter = 0usize;
             let possible = spokes.len() * (spokes.len() - 1) / 2;
-            for i in 0..spokes.len() {
-                for j in (i + 1)..spokes.len() {
-                    let count_fwd: usize =
-                        inter_stmt.query_row(params![&spokes[i].0, &spokes[j].0], |row| {
-                            row.get(0)
-                        })?;
-                    let count_rev: usize =
-                        inter_stmt.query_row(params![&spokes[j].0, &spokes[i].0], |row| {
-                            row.get(0)
-                        })?;
-                    if count_fwd > 0 || count_rev > 0 {
-                        existing_inter += 1;
-                    }
-                }
-            }
+
+            // Count distinct connected spoke pairs (edge present in either
+            // direction) in ONE query instead of O(spokes^2) round-trips. The
+            // canonicalized lo/hi pair de-dupes A->B and B->A. Placeholders are
+            // generated for the two IN clauses; the spoke UUIDs are *bound*,
+            // never interpolated, so this stays injection-safe.
+            let existing_inter: usize = if spokes.len() >= 2 {
+                let spoke_ids: Vec<&str> = spokes.iter().map(|(id, _)| id.as_str()).collect();
+                let placeholders = vec!["?"; spoke_ids.len()].join(",");
+                let inter_sql = format!(
+                    "SELECT COUNT(*) FROM (
+                        SELECT DISTINCT
+                            CASE WHEN from_entity < to_entity THEN from_entity ELSE to_entity END AS lo,
+                            CASE WHEN from_entity < to_entity THEN to_entity ELSE from_entity END AS hi
+                        FROM edges
+                        WHERE from_entity IN ({ph}) AND to_entity IN ({ph})
+                          AND from_entity <> to_entity
+                    )",
+                    ph = placeholders
+                );
+                let mut bind: Vec<&str> = Vec::with_capacity(spoke_ids.len() * 2);
+                bind.extend_from_slice(&spoke_ids);
+                bind.extend_from_slice(&spoke_ids);
+                conn.query_row(&inter_sql, rusqlite::params_from_iter(bind), |row| row.get(0))?
+            } else {
+                0
+            };
 
             let connectivity = if possible > 0 {
                 existing_inter as f32 / possible as f32
