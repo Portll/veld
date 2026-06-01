@@ -26,14 +26,28 @@
 //! panic and no deadlock (the bridge runtime always makes progress
 //! independently of the caller's runtime).
 //!
-//! This module is intentionally additive: it is the foundation for the
-//! `memories`-projection cutover, but nothing wires it into the projection
-//! yet — that lands in a follow-up so the bridge can be reviewed and tested
-//! before it touches the safety-critical apply path.
+//! This is the `memories`-projection cutover bridge:
+//! [`crate::memory::slow_store::SqliteProjection::with_relational`] routes
+//! memory-row writes through it when a relational backend is configured (wired
+//! in `MultiUserMemoryManager` bootstrap), and the rusqlite path is used
+//! otherwise. Calls are bounded by [`BRIDGE_RECV_TIMEOUT`] so a stalled backend
+//! degrades to a recoverable per-LSN error instead of wedging the worker.
 
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use crate::storage::relational::{BoxError, Param, RelationalStore, Row};
+
+/// Upper bound a synchronous caller will block waiting for the bridge runtime
+/// to complete one relational round-trip. Without it, a hung backend
+/// (unreachable Postgres, stalled connection) would park the calling tokio
+/// worker forever. On timeout the in-flight task is abandoned (its result is
+/// dropped harmlessly) and the caller gets a recoverable error — the
+/// projection apply fails for that LSN and replay re-applies it idempotently,
+/// rather than deadlocking the worker. Generous enough for a slow single-row
+/// upsert over the network; short enough that a dead backend can't wedge the
+/// runtime.
+const BRIDGE_RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-wide runtime that actually drives the async `RelationalStore`
 /// futures handed to the bridge.
@@ -150,11 +164,13 @@ impl BlockingRelationalStore {
     }
 }
 
-/// Block on the bridge channel. A `RecvError` means the spawned task was
-/// dropped before sending — only reachable if the bridge runtime is torn
-/// down mid-call — which we surface as a [`BoxError`] rather than a panic.
+/// Block on the bridge channel, bounded by [`BRIDGE_RECV_TIMEOUT`]. A
+/// `Disconnected` error means the spawned task was dropped before sending
+/// (only reachable if the bridge runtime is torn down mid-call); a `Timeout`
+/// means the backend did not answer within the bound. Both surface as a
+/// [`BoxError`] rather than a panic or an unbounded hang.
 fn recv_bridge<T>(rx: std::sync::mpsc::Receiver<Result<T, BoxError>>) -> Result<T, BoxError> {
-    match rx.recv() {
+    match rx.recv_timeout(BRIDGE_RECV_TIMEOUT) {
         Ok(result) => result,
         Err(e) => Err(BoxError::new(e)),
     }
@@ -189,7 +205,7 @@ where
     BRIDGE_RUNTIME.spawn(async move {
         let _ = tx.send(fut.await);
     });
-    rx.recv().map_err(BoxError::new)
+    rx.recv_timeout(BRIDGE_RECV_TIMEOUT).map_err(BoxError::new)
 }
 
 #[cfg(test)]
