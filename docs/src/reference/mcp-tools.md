@@ -6,7 +6,7 @@
 
 # MCP Tools
 
-The TypeScript MCP server (`@veld/memory-mcp`) exposes **48** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
+The TypeScript MCP server (`@veld/memory-mcp`) exposes **54** tools over the HTTP API. The Rust binary (`veld serve`) exposes the same tools via stdio MCP using `rmcp`.
 
 Tools are listed alphabetically. For full parameter schemas, see [mcp-server/index.ts](https://github.com/Portll/veld/blob/main/mcp-server/index.ts).
 
@@ -25,6 +25,10 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `consolidation_report` | Get a report of what the memory system has been learning. Shows memory strengthening/decay events, edge formation, fact extraction, and maintenance cycles. Use this to understand how your memories are evolving. |
 | `context_summary` | Get a condensed summary of recent learnings, decisions, and context. Use this at the start of a session to quickly understand what you've learned before. |
 | `count` | Number of memories (default: 10) |
+| `dataset_create` | Create a relational dataset (table) for tabular data. Requires a configured relational backend. |
+| `dataset_link` | Link a dataset row to a knowledge-graph entity or a memory. |
+| `dataset_list` | List the datasets you own, with row counts. |
+| `dataset_query` | Run a parametrised SELECT over a dataset. Optional where_clause is a SQL fragment (no WHERE keyword) with ? placeholders bound by params in order. |
 | `delete_project` | Permanently delete a project. Use delete_todos=true to also delete all todos in the project. |
 | `delete_todo` | Delete a todo permanently. |
 | `delete_todo_comment` | Delete a comment from a todo. |
@@ -32,6 +36,7 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `fact_narratives` | Get synthesized narratives from accumulated semantic facts, clustered by shared entities with confidence levels and heuristic causal chains. Shows what the system has learned, organized into coherent themes. Read-only; never modifies stored facts. Purged and time-invalidated facts are automatically excluded. |
 | `facts_preview_purge` | Preview the blast radius of a fact-purge pattern WITHOUT deleting anything. Returns a bucketed match count (none / few / some / many) — not an exact count — so the preview cannot become an oracle for fact existence. Use this BEFORE any destructive purge: agents should always preview-check a pattern, surface the bucket to the user, and only escalate to the destructive `/api/facts/purge` route after explicit confirmation. Pattern is substring match (not regex), case-insensitive, minimum 3 characters. |
 | `forget` | Delete a specific memory by ID |
+| `get_dials` | Read the current cognitive dials for this user: reconsolidation plasticity (labile-window close + graph/entity/embedding re-encode) and retrieval fast/accurate overrides. |
 | `list_memories` | List all stored memories |
 | `list_projects` | List all projects with todo counts and status breakdown. |
 | `list_reminders` | List all pending reminders. Use to check what reminders are scheduled. |
@@ -52,6 +57,7 @@ Tools are listed alphabetically. For full parameter schemas, see [mcp-server/ind
 | `reset_token_session` | Reset the token counter for a new session. Call this when starting a new conversation or after context has been compressed/summarized. |
 | `seed_project` | Scan a project directory and create foundational memories from config files, README, and source code. Enables rapid bootstrapping of memory for a new project. Idempotent: re-running deletes old seed memories first. |
 | `session_summary` | Get a summary of recent learnings, decisions, and context |
+| `set_dials` | Tune the cognitive dials for this user. Only the fields you set change; unset fields keep their current value. Reconsolidation re-encode runs in background maintenance (off the recall hot path); retrieval overrides apply per query. All reconsolidation toggles default OFF. |
 | `set_reminder` | Set a reminder for the future. Triggers on time (at specific time or after duration) or context match (when keywords appear in conversation). Reminders will surface automatically when conditions are met. |
 | `todo_stats` | Get statistics about your todos - counts by status, overdue items, etc. |
 | `token_status` | Get current token usage status for this session. Returns tokens used, budget remaining, and percentage consumed. Use this to check context window health. |

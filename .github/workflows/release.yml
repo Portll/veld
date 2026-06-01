@@ -86,8 +86,26 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-
 
+      - name: Install mdBook (for embedded-docs feature)
+        run: |
+          cargo install --locked mdbook --version "^0.4"
+          cargo install --locked mdbook-mermaid mdbook-toc
+
+      - name: Build the docs sidecar (input to embedded-docs)
+        # `--features embedded-docs` embeds docs/book/ into the veld binary
+        # via rust-embed, so a `cargo install veld` carries the docs site
+        # without needing the repo checkout. Build it here so the embed
+        # macro finds it at compile time.
+        run: |
+          bash docs/regenerate.sh
+          ( cd docs && mdbook build )
+
       - name: Build Rust binary
-        run: cargo build --release --bin veld --target ${{ matrix.target }}
+        # `--features embedded-docs` adds rust-embed + bakes the mdBook
+        # output (docs/book/) into the binary (~3-5 MB). The /docs route
+        # served by `veld server` then falls through to embedded bytes
+        # when VELD_DOCS_DIR / docs/book/ is not present at runtime.
+        run: cargo build --release --bin veld --features embedded-docs --target ${{ matrix.target }}
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
