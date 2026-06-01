@@ -255,6 +255,79 @@ Veld hooks are configured for three clients:
 
 ---
 
+## Encoding Conventions
+
+How to use the memory tools well — what to `remember`, what to leave to the automatic hook layer, and how to tag.
+
+### When to call `remember` explicitly
+
+The hook layer encodes most context automatically (Edit/Write/Bash/Read tool patterns, prompt submissions, session-start surfaces). Reach for explicit `remember(content, importance)` only when:
+
+- A **decision** was made that future sessions need to honour (e.g., "we chose Redb over RocksDB because …" — see [decision 0001](docs/src/decisions/0001-redb-migration.md)).
+- A **user preference** was stated (e.g., "always run cargo check, never cargo build").
+- A **load-bearing invariant** was discovered (e.g., "the `public_router_has_no_per_user_handlers` test is the security contract").
+- A **non-obvious cause-of-failure** was diagnosed and would otherwise be re-discovered.
+
+Do not `remember` routine tool patterns, file paths, or anything visible from `git log`/`git blame`. The hook layer already covers those.
+
+### Importance band
+
+| Importance | Use for |
+|---|---|
+| `0.9–1.0` | Anchorable invariants (won't decay; consume sparingly — these compete for the top of recall) |
+| `0.7–0.8` | Decisions, user preferences, security contracts |
+| `0.4–0.6` | Diagnostic notes, useful-to-have context |
+| ≤ `0.3` | Don't bother — leave it to the hook layer |
+
+### Tag taxonomy
+
+Tags are the cheap "what kind of thing" signal (scoring signal 15). Keep them short and reusable. Veld doesn't enforce a taxonomy, but converging on a small set makes tag-match scoring effective:
+
+- **Domain**: `auth`, `storage`, `retrieval`, `consolidation`, `ingest`, `docs`, `tui`, `ci`, `release`
+- **Kind**: `decision`, `bug`, `preference`, `invariant`, `gotcha`, `todo`
+- **Status**: `wip`, `blocked`, `done` (mostly for todos)
+
+A memory typically carries one domain + one kind tag (`["storage", "decision"]`); add more only if you'll search by them.
+
+### Citation format
+
+Reference code locations as `[path/to/file.rs:42](src/path/to/file.rs#L42)`. Reference decisions as `[0001-redb-migration.md](docs/src/decisions/0001-redb-migration.md)`. Reference HTTP routes as `` `POST /api/remember` `` (backticks, full path). The wiki-render layer (LLM-Wiki Phase 3) consumes this format directly; sticking to it now means no migration cost later.
+
+---
+
+## Scale & Migration
+
+How veld behaves as data grows, and the migration paths between tiers / backends / schemas.
+
+### Retrieval scale (cheap → expensive)
+
+| Memory count | Default retrieval path |
+|---|---|
+| < 1 000 | Working/Session brute-force cosine (Layer 3.5) covers everything |
+| 1 000 – 50 000 | HNSW + BM25 (Tantivy) hybrid kicks in for the LongTerm tier |
+| 50 000 – 500 000 | Cross-encoder rerank budget (top-20, 18% blend) is the dominant cost; consider tuning [`CognitiveDials`](docs/src/architecture/dials.md) to reduce rerank K |
+| 500 000+ | Vamana / SPANN large-collection indexes available in [src/vector_db/](src/vector_db/); SQLite slow store for gap topology queries |
+
+### Tier promotion (drives what's hot vs cold)
+
+`Working → Session → LongTerm → Archive`. Promotion is `age × importance × access_count` against the `TIER_PROMOTION_*` constants in [src/constants.rs](src/constants.rs). Archive-tier memories stay indexed in HNSW but are excluded from default `/api/recall`; surface them explicitly with `/api/recall?include_archived=true`.
+
+### Storage backend migration (RocksDB → Redb, v0.9 target)
+
+No `veld migrate` subcommand today. The trait abstraction (`PrimaryMemoryStore` / `GraphStore` / `KeyValueStore`) means new write code lands ready for the cutover. The runtime flip happens via `effective_storage_backend_for_current_build` in [src/config.rs](src/config.rs). Once the redb path passes acceptance benchmarks, that function returns `Redb` and the cold-start re-indexing happens on first boot. Backup via `POST /api/backup/create` before the flip; restore via `/api/backup/restore` if you need to roll back to the legacy backend.
+
+See [decision 0001](docs/src/decisions/0001-redb-migration.md) for context.
+
+### Record-schema migration
+
+When you add a field on `Memory`, make it backwards-compatible: `Option<T>` with `#[serde(default)]`. The legacy `bincode1` format support in [Cargo.toml](Cargo.toml) handles pre-2.0 memories. Forward-incompatible changes need an explicit migration in [src/storage/](src/storage/); these are rare and should land paired with a `## Schema Version & CHANGELOG` entry once that section exists (LLM-Wiki Phase 1).
+
+### Distribution-binary scaling
+
+The default release binary is ~30 MB. `--features embedded-docs` adds ~3-5 MB for the mdBook output. `--features fortress` strips tracing and adds obfuscation (smaller binary, harder to debug). `--features telemetry` adds OpenTelemetry exporters (~200 extra crates) — only enable in cloud / multi-node deployments where you want distributed tracing.
+
+---
+
 ## Distribution
 
 | Surface | Identifier |

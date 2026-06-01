@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-BASE="${1:-https://portll.github.io/veld}"
+BASE="${1:-https://portll.github.io/veld/latest}"
 BASE="${BASE%/}" # strip trailing slash
 
 fail=0
