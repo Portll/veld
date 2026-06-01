@@ -59,6 +59,17 @@ jobs:
         working-directory: docs
         run: mdbook build
 
+      - name: Lychee link check (offline)
+        # Replaces mdbook-linkcheck (incompatible with current mdBook
+        # RenderContext). Runs against the *built* HTML so it sees what a
+        # reader sees. --offline skips external HTTPS so CI never fails on
+        # transient network errors; external links are checked weekly in a
+        # separate scheduled workflow.
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --base ./docs/book './docs/book/**/*.html'
+          fail: true
+
       - name: Build rustdoc
         run: cargo doc --no-deps --workspace
 
@@ -82,3 +93,14 @@ jobs:
           name: docs-book
           path: docs/book
           retention-days: 7
+
+      - name: Smoke-test the deployed site
+        # Only runs after a main-branch deploy. Gives GitHub Pages ~60 s to
+        # publish the new build, then hits a handful of canonical URLs to
+        # verify the deploy worked. If any of these fail, the build is
+        # marked failed even though the deploy step itself succeeded —
+        # surfaces "the deploy was published but the site is broken" loudly.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          sleep 60
+          bash docs/smoke-test.sh https://portll.github.io/veld
