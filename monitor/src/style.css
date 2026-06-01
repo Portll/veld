@@ -334,7 +334,8 @@ main {
   font-size: 13px;
   color: #c8c8d4;
 }
-#graph-close {
+.graph-bar-actions { display: inline-flex; gap: 8px; }
+#graph-close, #graph-reload {
   background: #2b2d3c;
   color: #c8c8d4;
   border: 1px solid #3a3d4f;
@@ -343,7 +344,7 @@ main {
   cursor: pointer;
   font-size: 12px;
 }
-#graph-close:hover { background: #353849; }
+#graph-close:hover, #graph-reload:hover { background: #353849; }
 #graph-frame {
   flex: 1;
   width: 100%;
