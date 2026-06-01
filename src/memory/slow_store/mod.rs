@@ -261,17 +261,20 @@ impl SlowStore {
     pub fn cleanup_old_data(&self, max_age_days: u32) -> Result<CleanupStats> {
         let cutoff = Utc::now() - Duration::days(max_age_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
 
-        let gaps_deleted = conn.execute(
+        // Both deletes in one transaction so a crash between them can't leave a
+        // half-completed cleanup; either both retention sweeps land or neither.
+        let tx = conn.transaction()?;
+        let gaps_deleted = tx.execute(
             "DELETE FROM gap_topologies WHERE resolved_at IS NOT NULL AND detected_at < ?1",
             params![cutoff_str],
         )?;
-
-        let thoughts_deleted = conn.execute(
+        let thoughts_deleted = tx.execute(
             "DELETE FROM thoughts WHERE dismissed = 1 AND created_at < ?1",
             params![cutoff_str],
         )?;
+        tx.commit()?;
 
         tracing::info!(
             "SlowStore cleanup: {} resolved gaps and {} dismissed thoughts removed (cutoff: {} days)",
