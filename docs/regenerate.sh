@@ -36,6 +36,9 @@ cargo run --quiet --bin gen-module-index
 echo "==> gen-claude-sections"
 cargo run --quiet --bin gen-claude-sections
 
+echo "==> gen-changelog"
+cargo run --quiet --bin gen-changelog
+
 echo "==> lint-decisions"
 cargo run --quiet --bin lint-decisions
 
