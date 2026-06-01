@@ -4,7 +4,6 @@
 //! Voronoi analysis, and Planet X detection.
 
 use anyhow::Result;
-use rusqlite::params;
 use std::collections::HashMap;
 
 use super::SlowStore;
@@ -15,28 +14,32 @@ impl SlowStore {
     /// Returns a map from UUID string to embedding vector.
     /// Used by gap topology scoring to compute cosine similarity between gap endpoints.
     pub fn load_embeddings(&self, uuids: &[&str]) -> Result<HashMap<String, Vec<f32>>> {
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let conn = self.conn.lock();
+        let placeholders = vec!["?"; uuids.len()].join(",");
+        let sql = format!(
+            "SELECT uuid, embedding FROM entities \
+             WHERE embedding IS NOT NULL AND uuid IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+
         let mut result = HashMap::new();
-
-        let mut stmt = conn.prepare_cached(
-            "SELECT uuid, embedding FROM entities WHERE uuid = ?1 AND embedding IS NOT NULL",
-        )?;
-
-        for uuid in uuids {
-            if let Ok(row) = stmt.query_row(params![uuid], |row| {
-                let uuid_str: String = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                Ok((uuid_str, blob))
-            }) {
-                // Decode f32 embedding from little-endian bytes
-                let floats: Vec<f32> = row
-                    .1
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect();
-                if !floats.is_empty() {
-                    result.insert(row.0, floats);
-                }
+        let rows = stmt.query_map(rusqlite::params_from_iter(uuids.iter().copied()), |row| {
+            let uuid_str: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((uuid_str, blob))
+        })?;
+        for row in rows {
+            let (uuid_str, blob) = row?;
+            // Decode f32 embedding from little-endian bytes
+            let floats: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            if !floats.is_empty() {
+                result.insert(uuid_str, floats);
             }
         }
 

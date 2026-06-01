@@ -709,4 +709,34 @@ mod tests {
         assert_eq!(g.possible_edges, 3); // C(3,2)
         assert_eq!(g.missing_edges, 2); // only the s1-s2 pair is connected
     }
+
+    #[test]
+    fn entity_lookups_batch_and_decode() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        let a = test_entity("Alice");
+        let b = test_entity("Bob");
+        let mut c = test_entity("Carol");
+        c.name_embedding = Some(vec![0.5, -0.25]);
+        let (a_id, b_id, c_id) = (a.uuid.to_string(), b.uuid.to_string(), c.uuid.to_string());
+        store.sync_from_graph(&[a, b, c], &[]).unwrap();
+
+        // One batched IN query; missing UUIDs simply aren't returned.
+        let names = store
+            .get_entity_names(&[a_id.as_str(), b_id.as_str(), "missing"])
+            .unwrap();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names.get(&a_id).map(String::as_str), Some("Alice"));
+        assert!(names.get("missing").is_none());
+
+        // Only Carol carries an embedding; Alice has none, so it's absent.
+        let embs = store.load_embeddings(&[c_id.as_str(), a_id.as_str()]).unwrap();
+        assert_eq!(embs.len(), 1);
+        assert_eq!(embs.get(&c_id).map(Vec::as_slice), Some(&[0.5f32, -0.25][..]));
+
+        // Empty input short-circuits.
+        assert!(store.get_entity_names(&[]).unwrap().is_empty());
+        assert!(store.load_embeddings(&[]).unwrap().is_empty());
+    }
 }
