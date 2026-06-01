@@ -265,6 +265,11 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/anchor", post(crud::anchor_memory))
         // =================================================================
+        // WIKI RENDER (W-018) — protected; resolves the user via the tenant
+        // binding, never a bare ?user_id= on the public router.
+        // =================================================================
+        .route("/api/wiki/render", post(crud::wiki_render))
+        // =================================================================
         // AGENT-DIRECTED TIER MOVES
         // =================================================================
         .route("/api/memory/tier", post(crud::move_memory_tier))
