@@ -323,6 +323,26 @@ const DIAL_NUMBERS = [
     desc: "Fraction the embedding moves toward the retrieval context on each nudge.",
     info: "0.05 = subtle (default) · 0.1 = moderate · 0.3 = strong drift (use with care).",
   },
+  {
+    key: "max_active_shadows",
+    label: "Max active shadows",
+    unit: "",
+    min: 1,
+    max: 500,
+    step: 1,
+    desc: "How many memories can be in the labile (re-encodable) window at once before the oldest are evicted.",
+    info: "20 = default · higher = more parallel reconsolidation (more memory/CPU) · lower = tighter focus.",
+  },
+  {
+    key: "working_memory_threshold",
+    label: "Working-memory threshold",
+    unit: "",
+    min: 1,
+    max: 100,
+    step: 1,
+    desc: "Recall count at/above which a memory is kept labile as 'working memory' instead of closing at the window.",
+    info: "5 = default · lower = close windows sooner · higher = hold frequently-recalled memories labile longer.",
+  },
 ];
 
 function fmtOpt(v) {
