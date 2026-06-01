@@ -1910,6 +1910,50 @@ impl MultiUserMemoryManager {
             );
         }
 
+        // Fourth projection (default-OFF, gated by VELD_WIKI_RENDER): the
+        // wiki render. Constructed + replayed here, while `&log` is still
+        // borrowable (it is moved into the writer just below). Added to the
+        // writer after the move. Init/replay failure is non-fatal — the
+        // other projections and the write path are unaffected; the wiki is
+        // simply not registered for this writer's lifetime.
+        let wiki_projection = if crate::wiki::wiki_render_enabled() {
+            let wiki_dir = crate::wiki::wiki_target_dir(&user_path, user_id);
+            match crate::wiki::WikiProjection::new(wiki_dir, checkpoint_store.clone()) {
+                Ok(mut wp) => {
+                    match crate::intent_log::replay(&log, &mut wp, Some(crate::wiki::COMMIT_EVERY)) {
+                        Ok(applied) => {
+                            if applied > 0 {
+                                tracing::info!(
+                                    user_id = %user_id,
+                                    applied,
+                                    "replayed intent log into wiki projection on first writer open",
+                                );
+                            }
+                            Some(wp)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                user_id = %user_id,
+                                error = %e,
+                                "wiki projection replay failed (non-fatal; wiki render disabled this session)",
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "wiki projection init failed (non-fatal; wiki render disabled this session)",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Hand the log handle into the writer so subsequent appends
         // continue against the same file. Replay above used a read-only
         // borrow; the same handle is fine for the writer's appends.
@@ -1919,6 +1963,11 @@ impl MultiUserMemoryManager {
             writer.add_projection(Box::new(vp));
         }
         writer.add_projection(Box::new(bm25_projection));
+        // Register the wiki render projection (built + replayed above) if it
+        // was enabled and opened cleanly. Live writes now also fan out to it.
+        if let Some(wiki_projection) = wiki_projection {
+            writer.add_projection(Box::new(wiki_projection));
+        }
 
         let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
         self.journaled_writers
