@@ -19,7 +19,10 @@ flowchart TB
 ```
 
 Implementation: [src/handlers/consolidation.rs](https://github.com/Portll/veld/blob/main/src/handlers/consolidation.rs)
-+ [src/memory/maintenance.rs](https://github.com/Portll/veld/blob/main/src/memory/maintenance.rs)
++ `run_maintenance` on `MemorySystem` (in [src/memory/mod.rs](https://github.com/Portll/veld/blob/main/src/memory/mod.rs);
+the standalone `src/memory/maintenance.rs` file was removed when the FIX-R1
+labile-window expiry logic was ported inline into `run_maintenance` — see
+commit `2adb909d`)
 + [src/memory/replay.rs](https://github.com/Portll/veld/blob/main/src/memory/replay.rs).
 
 ## Per-user locking
