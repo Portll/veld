@@ -521,6 +521,19 @@ pub async fn recall(
                     .context
                     .as_ref()
                     .map(|c| c.binding.binding_strength),
+                source_type: m
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| format!("{:?}", c.source.source_type)),
+                source_trusted: m.experience.context.as_ref().map(|c| {
+                    matches!(
+                        c.source.source_type,
+                        crate::memory::types::SourceType::User
+                            | crate::memory::types::SourceType::File
+                            | crate::memory::types::SourceType::System
+                    )
+                }),
             }
         })
         .collect();
@@ -2463,6 +2476,19 @@ pub async fn recall_tracked(
                     .context
                     .as_ref()
                     .map(|c| c.binding.binding_strength),
+                source_type: m
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| format!("{:?}", c.source.source_type)),
+                source_trusted: m.experience.context.as_ref().map(|c| {
+                    matches!(
+                        c.source.source_type,
+                        crate::memory::types::SourceType::User
+                            | crate::memory::types::SourceType::File
+                            | crate::memory::types::SourceType::System
+                    )
+                }),
             }
         })
         .collect();
