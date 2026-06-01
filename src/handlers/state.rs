@@ -2004,6 +2004,27 @@ impl MultiUserMemoryManager {
         Ok(outcome.lsn)
     }
 
+    /// W-018 support: ensure the wiki projection is materialised for
+    /// `user_id` — opening the journaled writer replays the intent log into
+    /// the wiki projection on first open (and is a no-op if already open and
+    /// current) — then report the output directory and on-disk page count.
+    /// Callers gate on [`crate::wiki::wiki_render_enabled`].
+    pub fn render_wiki(&self, user_id: &str) -> Result<(String, usize)> {
+        // Opening the writer triggers the on-open replay/backfill of the
+        // wiki projection (when the feature is enabled).
+        let _ = self.get_user_journaled_writer(user_id)?;
+        let user_path = self.base_path.join(user_id);
+        let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
+        let pages = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok((dir.display().to_string(), pages))
+    }
+
     /// C2 (W-001): reconcile a user's canonical store against the intent
     /// log. A write's log frame is appended *after* the RocksDB commit, in
     /// a detached task (`handlers::remember`), so a crash in that window
