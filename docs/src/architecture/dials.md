@@ -1,0 +1,103 @@
+# Cognitive Dials
+
+`CognitiveDials` is the unified, runtime-tunable surface for veld's cognitive
+system. One place to toggle or tune the parameters a human (via the monitor's
+"Dials" tab) or Sleight (via the automated-tuning path) can drive at runtime —
+rather than a second tuning system beside
+[`FeedbackStore`](../reference/http-api.md)'s learned weights and the
+Sleight-pushed [`ExternalDimensionScores`](knowledge-graph.md#external-dimension-scores).
+
+Source: [src/memory/dials.rs](https://github.com/Portll/veld/blob/main/src/memory/dials.rs).
+
+## Two groups of dials
+
+| Group | Touches | Where it runs |
+|---|---|---|
+| **Reconsolidation (plasticity)** | The FIX-R1 labile-window close and the composable re-encode layers | `run_maintenance` — background, off the synchronous recall hot path |
+| **Retrieval (fast ↔ accurate)** | Optional overrides for the hybrid-search knobs (cross-encoder budget, RRF k, refiner mode, etc.) | The recall hot path itself, when set |
+
+`Default` is everything OFF / `None`. A freshly-seeded `CognitiveDials`
+changes nothing — every retrieval dial is `None` so the engine uses its
+learned-weight default; every plasticity dial is `false`/zero so
+reconsolidation behaves exactly as it did pre-dials.
+
+## Lifecycle
+
+```mermaid
+flowchart LR
+    ENV[VELD_DIALS_*<br/>env vars] -->|from_env| INIT[Seed at startup]
+    KV[(KV store<br/>per-user blob)] -->|deserialize + overlay| INIT
+    INIT --> ARC[Arc&lt;RwLock&lt;CognitiveDials&gt;&gt;]
+    ARC --> HS[hybrid_search_engine.attach_dials]
+    ARC --> MS[MemorySystem]
+    PUT[PUT /api/dials] -->|sanitize + stamp updated_at| ARC
+    ARC -->|serde_json::to_vec| KV
+```
+
+1. **Seed from env** — `CognitiveDials::from_env()` reads `VELD_DIALS_*`
+   variables once at startup.
+2. **Overlay from KV** — if the user has a persisted blob at
+   `COGNITIVE_DIALS_KEY`, deserialize and `sanitized()`-overlay it. A corrupt
+   blob is logged and skipped (not fatal).
+3. **Attach** — the `Arc<RwLock<CognitiveDials>>` is handed to the hybrid
+   search engine and stored on `MemorySystem`. The engine's recall path
+   reads through this handle on every call, so a runtime change takes
+   effect immediately.
+4. **Persist** — `PUT /api/dials` replaces the in-memory state, calls
+   `sanitized()` to clamp values into legal ranges, stamps `updated_at`,
+   and writes the JSON blob back to the KV store.
+
+## REST surface
+
+Two routes on the **protected** router (per-user, X-API-Key required):
+
+```
+GET /api/dials?user_id=…   → CognitiveDials JSON
+PUT /api/dials             → replace with the body's CognitiveDials JSON
+```
+
+Full-replace REST semantics — the client GETs, edits, and PUTs the whole
+struct. There is no PATCH; partial updates would race against
+Sleight-driven updates on the same key.
+
+Source: [src/handlers/dials.rs](https://github.com/Portll/veld/blob/main/src/handlers/dials.rs).
+
+## TUI surface
+
+The Veld Monitor exposes a **"Dials" tab** (see
+[tui/src/tabs/dials.rs](https://github.com/Portll/veld/blob/main/tui/src/tabs/dials.rs))
+that GETs the current dials, renders each value as a tunable widget, and
+PUTs on commit. Real-time visibility on what's currently set + an easy way
+to undo experiments.
+
+## Forward-compatible serialisation
+
+Every field in `CognitiveDials` carries `#[serde(default)]` so older
+persisted blobs decode forward-compatibly when new dials land. The
+sanitisation pass clamps each retrieval dial to its valid range
+(`None` is always valid) before the value reaches the engine — a corrupt
+or out-of-range write cannot destabilise retrieval.
+
+## Why dials, not just config
+
+`ServerConfig` and the `VELD_*` env vars are *startup-time* knobs. Dials are
+the *runtime* surface for things that benefit from being tweaked while the
+server is live:
+
+- Quick A/B sweeps without a restart.
+- Sleight-driven automated tuning that wants to push a new RRF k or
+  cross-encoder budget every few minutes based on quality signals.
+- Per-user overrides — every user's dials are independent.
+
+The boundary is: structural choices (storage backend, embedder URL, bind
+address) stay in config; behavioural-tuning choices (rerank budget, decay
+factor, refiner mode) live in dials.
+
+## See also
+
+- [Retrieval pipeline](retrieval.md) — the 20-signal pipeline whose
+  cross-encoder / RRF / refiner knobs the retrieval dials override.
+- [Consolidation](consolidation.md) — the plasticity dials gate the
+  reconsolidation paths that run inside `run_maintenance`.
+- [Instance registry](instance-registry.md) — sibling subsystem that the
+  monitor's other tabs read from.

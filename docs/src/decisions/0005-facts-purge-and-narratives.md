@@ -1,7 +1,7 @@
 ---
 id: 0005
 title: Facts purge, narratives, and the purged_at field
-status: Accepted
+status: accepted
 date: 2026-05-29
 ---
 

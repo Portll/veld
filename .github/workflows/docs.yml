@@ -3,6 +3,7 @@ name: Docs
 on:
   push:
     branches: [main]
+    tags: ['v*']
     paths:
       - 'docs/**'
       - 'src/**'
@@ -23,41 +24,97 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # for changelog generation later
+          fetch-depth: 0 # for gen-changelog (needs full git history)
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry + generator target
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             docs/generators/target
-          key: docs-${{ runner.os }}-${{ hashFiles('docs/generators/Cargo.lock') }}
+          key: docs-generators-${{ runner.os }}-${{ hashFiles('docs/generators/Cargo.lock') }}
+
+      - name: Cache veld build (for gen-cli-ref)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: veld-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install mdBook and preprocessors
         run: |
           cargo install --locked mdbook --version "^0.4"
           cargo install --locked mdbook-mermaid mdbook-toc
 
+      - name: Build veld (for gen-cli-ref + smoke test)
+        # Builds the main binary so gen-cli-ref can `veld --help` it.
+        # Restricted to `--bin veld` to keep the cargo step cheap and
+        # focused on what the docs need.
+        run: cargo build --release --bin veld
+
+      - name: Compute deploy subdir
+        id: subdir
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=latest" >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run all generators
         working-directory: docs
+        env:
+          # Point gen-cli-ref at the binary we just built; without this it
+          # would no-op and leave the previously committed cli.md in place.
+          VELD_BIN: ${{ github.workspace }}/target/release/veld
         run: bash regenerate.sh
 
       - name: Verify no generator drift
+        # Only enforced on PRs (where contributors are expected to have
+        # run regenerate.sh locally). On main and tags the build is
+        # authoritative — the regenerate step rewrites files so a tag
+        # push wouldn't trip on a stale snapshot.
+        if: github.event_name == 'pull_request'
         run: |
           if ! git diff --exit-code docs/src/; then
             echo
             echo "ERROR: Generated docs are out of sync with source."
-            echo "Run 'cd docs && bash regenerate.sh' locally and commit the result."
+            echo "Run 'bash docs/regenerate.sh' locally and commit the result."
             exit 1
           fi
 
       - name: Build mdBook
         working-directory: docs
         run: mdbook build
+
+      - name: Inject version banner (tagged release only)
+        # Tagged-version pages get a banner at the top of every <body>
+        # pointing readers at /latest/. The `latest` deploy itself never
+        # gets a banner (it IS latest).
+        if: steps.subdir.outputs.is_tag == 'true'
+        env:
+          TAG: ${{ steps.subdir.outputs.name }}
+        run: |
+          BANNER="<div style=\"background:#fff3cd;border-bottom:1px solid #ffc107;padding:8px 16px;font-family:system-ui,sans-serif\">You are viewing docs for <strong>${TAG}</strong>. <a href=\"/veld/latest/\">View latest →</a></div>"
+          # sed -i works on GNU sed (ubuntu-latest).
+          find docs/book -name '*.html' -print0 \
+            | xargs -0 sed -i "s|<body>|<body>${BANNER}|"
+
+      - name: Lychee link check (offline)
+        # Replaces mdbook-linkcheck (incompatible with current mdBook
+        # RenderContext). Runs against the *built* HTML so it sees what a
+        # reader sees. --offline skips external HTTPS so CI never fails on
+        # transient network errors; external links are checked weekly in a
+        # separate scheduled workflow.
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --base ./docs/book './docs/book/**/*.html'
+          fail: true
 
       - name: Build rustdoc
         run: cargo doc --no-deps --workspace
@@ -67,13 +124,16 @@ jobs:
           mkdir -p docs/book/api
           cp -r target/doc/* docs/book/api/
 
-      - name: Deploy to GitHub Pages
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Deploy to GitHub Pages (versioned subdir)
+        # `keep_files: true` preserves the other version subdirs already on
+        # gh-pages. `destination_dir` puts this build under /<latest|vX.Y>/.
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || steps.subdir.outputs.is_tag == 'true'
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: docs/book
-          force_orphan: true
+          destination_dir: ${{ steps.subdir.outputs.name }}
+          keep_files: true
 
       - name: Upload book artifact (PRs)
         if: github.event_name == 'pull_request'
@@ -82,3 +142,39 @@ jobs:
           name: docs-book
           path: docs/book
           retention-days: 7
+
+      - name: Smoke-test the deployed site
+        # Only runs after a main-branch deploy (the `latest` URL). Tagged
+        # deploys live under /vX.Y/ and are smoke-tested by a downstream
+        # `release` workflow once it's wired. Gives GitHub Pages ~60 s to
+        # publish, then hits a handful of canonical URLs.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          sleep 60
+          bash docs/smoke-test.sh https://portll.github.io/veld/latest
+
+  prune-old-versions:
+    # Keeps gh-pages from accumulating every tagged subdir forever. Runs
+    # nightly; deletes vX.Y subdirs older than the most recent 5 minor
+    # versions. `latest` is never pruned.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+      - name: Prune
+        run: |
+          # Find vX.Y* dirs, sort by semver, keep the newest 5.
+          mapfile -t versions < <(ls -d v*/ 2>/dev/null | sort -V | head -n -5 || true)
+          for v in "${versions[@]}"; do
+            echo "Removing $v"
+            rm -rf "$v"
+          done
+          if [ ${#versions[@]} -gt 0 ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -A
+            git commit -m "chore(docs): prune ${#versions[@]} old version subdir(s)" || true
+            git push origin gh-pages
+          fi
