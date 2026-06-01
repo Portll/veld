@@ -89,6 +89,8 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 let lastUpdateAt = 0;
+let currentBaseUrl = "";
+let currentUserId = "";
 
 function fmtCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -114,6 +116,8 @@ function stateKind(state) {
 
 function render(snap) {
   lastUpdateAt = Date.now();
+  if (snap.base_url) currentBaseUrl = snap.base_url;
+  if (snap.user_id) currentUserId = snap.user_id;
   const state = stateKind(snap.server.state);
 
   // Header
@@ -490,15 +494,30 @@ async function init() {
   if (dialsRefresh) dialsRefresh.addEventListener("click", pullDials);
   await pullDials();
 
+  // Graph viewer: load the server's /graph/view in an in-window iframe overlay
+  // (not a separate OS window). URL derived from the live snapshot's base_url.
   const openGraph = document.getElementById("open-graph");
-  if (openGraph)
-    openGraph.addEventListener("click", async () => {
-      try {
-        await invoke("open_graph");
-      } catch (err) {
-        diagPush("ERROR", "open_graph failed: " + (err?.message || err));
+  const graphOverlay = document.getElementById("graph-overlay");
+  const graphFrame = document.getElementById("graph-frame");
+  const graphClose = document.getElementById("graph-close");
+  if (openGraph && graphOverlay && graphFrame) {
+    openGraph.addEventListener("click", () => {
+      const base = (currentBaseUrl || "").replace(/\/+$/, "");
+      if (!base) {
+        diagPush("ERROR", "graph: no base_url known yet — is the server up?");
+        return;
       }
+      const user = encodeURIComponent(currentUserId || "claude-code");
+      graphFrame.src = `${base}/graph/view?user_id=${user}`;
+      graphOverlay.classList.remove("hidden");
     });
+  }
+  if (graphClose && graphOverlay && graphFrame) {
+    graphClose.addEventListener("click", () => {
+      graphOverlay.classList.add("hidden");
+      graphFrame.src = "about:blank"; // stop the 3D render loop + SSE while hidden
+    });
+  }
 
   setInterval(() => {
     if (Date.now() - lastUpdateAt > 5000) pull();

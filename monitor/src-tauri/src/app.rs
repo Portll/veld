@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use veld_status_core::{StatusClient, StatusClientConfig, StatusSnapshot};
 
 use crate::tray;
@@ -87,8 +87,7 @@ pub fn run() {
             show_dashboard,
             quit_app,
             get_dials,
-            set_dials,
-            open_graph
+            set_dials
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -143,32 +142,6 @@ async fn set_dials(
     StatusClient::set_dials(&base, &key, &user, dials, timeout)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// Open the veld server's knowledge-graph viewer (`/graph/view`) in a dedicated
-/// Tauri window. The window only displays the server-rendered page (no Tauri IPC),
-/// so it needs no capability beyond window creation. Re-focuses if already open.
-#[tauri::command]
-fn open_graph(app: AppHandle, state: State<'_, MonitorState>) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window("graph") {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-    let url = format!(
-        "{}/graph/view?user_id={}",
-        state.base_url.trim_end_matches('/'),
-        state.user_id
-    );
-    let parsed = tauri::Url::parse(&url).map_err(|e| format!("invalid graph URL {url}: {e}"))?;
-    WebviewWindowBuilder::new(&app, "graph", WebviewUrl::External(parsed))
-        .title("Veld Memory Graph")
-        .inner_size(1200.0, 800.0)
-        .min_inner_size(640.0, 480.0)
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 async fn emit_snapshots(handle: AppHandle, snapshot: Arc<RwLock<StatusSnapshot>>) {
