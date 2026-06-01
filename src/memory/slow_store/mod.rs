@@ -298,7 +298,12 @@ impl SlowStore {
 
     /// Sync entity and edge data from GraphMemory into SQLite.
     ///
-    /// Uses upsert (INSERT OR REPLACE) for idempotent sync.
+    /// Full-mirror semantics: every caller passes the complete graph
+    /// (`get_all_entities` + `get_all_relationships`), so the mirror tables are
+    /// cleared and rebuilt inside one transaction. Entities/edges removed from
+    /// the live graph (decay, prune, forget) are purged here rather than
+    /// lingering as stale rows — closing both an unbounded-growth leak and a
+    /// stale-PII retention gap. Idempotent and atomic (rolls back on error).
     /// Designed to be called periodically (e.g., after consolidation cycles).
     pub fn sync_from_graph(
         &self,
@@ -316,6 +321,12 @@ impl SlowStore {
         let mut stats = SyncStats::default();
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+
+        // Clear the mirror first so rows for graph-deleted entities/edges don't
+        // survive. Edges before entities to respect the FK; the re-insert below
+        // runs entities before edges, so referential integrity holds throughout.
+        tx.execute("DELETE FROM edges", [])?;
+        tx.execute("DELETE FROM entities", [])?;
 
         Self::sync_entities(&tx, entities, &mut stats)?;
         Self::sync_edges(&tx, edges, &mut stats)?;
@@ -641,5 +652,31 @@ mod tests {
         assert_eq!(stats.edges_upserted, 2);
         // Collapsed to one connectivity entry for the directed pair.
         assert_eq!(store.edge_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn sync_purges_entities_dropped_from_the_graph() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        let a = test_entity("Alice");
+        let b = test_entity("Bob");
+        let c = test_entity("Carol");
+        let carol_uuid = c.uuid.to_string();
+        store
+            .sync_from_graph(&[a.clone(), b.clone(), c], &[])
+            .unwrap();
+        assert_eq!(store.entity_count().unwrap(), 3);
+
+        // Carol decayed out of the live graph; the next full sync omits her.
+        store.sync_from_graph(&[a, b], &[]).unwrap();
+        assert_eq!(store.entity_count().unwrap(), 2);
+        assert!(
+            store
+                .get_entity_names(&[carol_uuid.as_str()])
+                .unwrap()
+                .is_empty(),
+            "stale entity must be purged, not retained"
+        );
     }
 }
