@@ -54,7 +54,10 @@
     <div id="graph-overlay" class="hidden">
       <div id="graph-bar">
         <span>🧠 Veld Memory Graph</span>
-        <button id="graph-close" type="button" title="Back to monitor">✕ Close</button>
+        <span class="graph-bar-actions">
+          <button id="graph-reload" type="button" title="Reload the graph">↻ Reload</button>
+          <button id="graph-close" type="button" title="Back to monitor">✕ Close</button>
+        </span>
       </div>
       <iframe id="graph-frame" title="Veld Memory Graph"></iframe>
     </div>

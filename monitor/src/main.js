@@ -455,10 +455,14 @@ async function pullDials() {
     currentDials = await invoke("get_dials");
     renderDialsBody();
   } catch (err) {
+    // Null out so the self-heal loop retries once the server is reachable again.
+    currentDials = null;
+    const msg = String(err?.message || err || "");
+    const hint = /\b404\b/.test(msg)
+      ? "this server build lacks /api/dials — rebuild the server from this branch"
+      : "server unreachable — retrying…";
     const body = document.getElementById("dials-body");
-    if (body)
-      body.innerHTML =
-        '<p class="muted">dials unavailable: ' + (err?.message || err) + "</p>";
+    if (body) body.innerHTML = '<p class="muted">dials unavailable (' + hint + ")</p>";
   }
 }
 
@@ -500,18 +504,24 @@ async function init() {
   const graphOverlay = document.getElementById("graph-overlay");
   const graphFrame = document.getElementById("graph-frame");
   const graphClose = document.getElementById("graph-close");
+  const graphReload = document.getElementById("graph-reload");
+  function loadGraphFrame() {
+    const base = (currentBaseUrl || "").replace(/\/+$/, "");
+    if (!base) {
+      diagPush("ERROR", "graph: no base_url known yet — is the server up?");
+      return;
+    }
+    const user = encodeURIComponent(currentUserId || "claude-code");
+    // Cache-bust so Reload always re-requests (recovers after the server was down).
+    graphFrame.src = `${base}/graph/view?user_id=${user}&_t=${Date.now()}`;
+  }
   if (openGraph && graphOverlay && graphFrame) {
     openGraph.addEventListener("click", () => {
-      const base = (currentBaseUrl || "").replace(/\/+$/, "");
-      if (!base) {
-        diagPush("ERROR", "graph: no base_url known yet — is the server up?");
-        return;
-      }
-      const user = encodeURIComponent(currentUserId || "claude-code");
-      graphFrame.src = `${base}/graph/view?user_id=${user}`;
+      loadGraphFrame();
       graphOverlay.classList.remove("hidden");
     });
   }
+  if (graphReload && graphFrame) graphReload.addEventListener("click", loadGraphFrame);
   if (graphClose && graphOverlay && graphFrame) {
     graphClose.addEventListener("click", () => {
       graphOverlay.classList.add("hidden");
@@ -521,7 +531,10 @@ async function init() {
 
   setInterval(() => {
     if (Date.now() - lastUpdateAt > 5000) pull();
-  }, 2000);
+    // Self-heal the dials card after a server flap/old-build window. Only retries
+    // while unavailable (currentDials === null), so it never clobbers a live edit.
+    if (!currentDials) pullDials();
+  }, 3000);
 }
 
 init();
