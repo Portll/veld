@@ -314,6 +314,35 @@ main {
 .header-btn:hover { background: #28324f; }
 .header-btn:active { transform: scale(0.97); }
 
+/* Multi-instance tab bar (shown only when >1 veld instance is discovered) */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px 0;
+  background: #14151f;
+  border-bottom: 1px solid #2b2d3c;
+  flex-wrap: wrap;
+}
+.tabs.hidden { display: none; }
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #1b1d2a;
+  color: #9a9db0;
+  border: 1px solid #2b2d3c;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.tab:hover { background: #232636; color: #c8c8d4; }
+.tab.active { background: #0f1117; color: #e6e6ef; border-color: #3a3d4f; }
+.tab-dot { width: 7px; height: 7px; border-radius: 50%; }
+.tab-dot.on { background: #4ec77a; }
+.tab-dot.off { background: #6b6e80; }
+
 /* In-window graph viewer overlay (iframe of the server's /graph/view) */
 #graph-overlay {
   position: fixed;
