@@ -35,6 +35,7 @@ Generated from git history. Sections are conventional-commit prefixes; hashes li
 
 ### docs
 
+- docs(sidecar): gen-changelog + lychee CI + smoke-test + consolidation accuracy (61b0d3aa)
 - docs(refresh): post-dials regeneration + dials + instance-registry pages (25378f65)
 - docs(reference): regenerate config.md (92 env vars) (ed3eaa78)
 - docs(guides): add relational-backends operator guide (22edb1e2)
