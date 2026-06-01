@@ -679,4 +679,34 @@ mod tests {
             "stale entity must be purged, not retained"
         );
     }
+
+    #[test]
+    fn find_star_gaps_counts_inter_spoke_connectivity() {
+        use crate::graph_memory::RelationType;
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        let hub = test_entity("Hub");
+        let s1 = test_entity("S1");
+        let s2 = test_entity("S2");
+        let s3 = test_entity("S3");
+        // Hub connects to all three spokes; only s1<->s2 connect to each other.
+        let edges = vec![
+            test_edge(hub.uuid, s1.uuid, RelationType::WorksWith),
+            test_edge(hub.uuid, s2.uuid, RelationType::WorksWith),
+            test_edge(hub.uuid, s3.uuid, RelationType::WorksWith),
+            test_edge(s1.uuid, s2.uuid, RelationType::WorksWith),
+        ];
+        store
+            .sync_from_graph(&[hub.clone(), s1, s2, s3], &edges)
+            .unwrap();
+
+        let gaps = store.find_star_gaps(3, 0.9, 10).unwrap();
+        assert_eq!(gaps.len(), 1, "the 1/3-connected hub is a star gap");
+        let g = &gaps[0];
+        assert_eq!(g.hub_name, "Hub");
+        assert_eq!(g.spokes.len(), 3);
+        assert_eq!(g.possible_edges, 3); // C(3,2)
+        assert_eq!(g.missing_edges, 2); // only the s1-s2 pair is connected
+    }
 }
