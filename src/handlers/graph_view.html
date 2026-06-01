@@ -55,6 +55,22 @@
             background: linear-gradient(90deg, #00d4ff, #00ff88);
             color: #000;
         }
+        .refresh-btn {
+            margin-left: 16px;
+            padding: 6px 14px;
+            border: 1px solid rgba(0, 212, 255, 0.4);
+            background: rgba(0, 0, 0, 0.3);
+            color: #00d4ff;
+            cursor: pointer;
+            border-radius: 16px;
+            font-size: 0.85rem;
+            transition: all 0.3s;
+        }
+        .refresh-btn:hover { background: rgba(0, 212, 255, 0.15); }
+        .refresh-btn:active { transform: scale(0.96); }
+        .refresh-btn.spinning { opacity: 0.55; pointer-events: none; }
+        .refresh-btn.spinning .refresh-icon { display: inline-block; animation: spin 0.8s linear infinite; }
+        .refresh-icon { display: inline-block; }
         #stats {
             margin-left: auto;
             display: flex;
@@ -219,6 +235,7 @@
             <button class="mode-btn" id="btn-2d">2D</button>
             <button class="mode-btn active" id="btn-3d">3D</button>
         </div>
+        <button class="refresh-btn" id="btn-refresh" title="Reload the graph from the server"><span class="refresh-icon">↻</span> Refresh</button>
         <div id="stats">
             <div class="stat">
                 <span class="stat-value" id="node-count">0</span>
@@ -561,6 +578,10 @@
                 .catch(err => {
                     console.error('Failed to load graph:', err);
                     document.getElementById('loading').innerHTML = 'Failed to load graph';
+                })
+                .finally(() => {
+                    const btn = document.getElementById('btn-refresh');
+                    if (btn) btn.classList.remove('spinning');
                 });
         }
 
@@ -598,6 +619,16 @@
         document.addEventListener('mousemove', onMouseMove3D);
         document.getElementById('btn-2d').addEventListener('click', () => switchMode('2d'));
         document.getElementById('btn-3d').addEventListener('click', () => switchMode('3d'));
+        document.getElementById('btn-refresh').addEventListener('click', () => {
+            const btn = document.getElementById('btn-refresh');
+            if (btn) btn.classList.add('spinning');
+            const loading = document.getElementById('loading');
+            if (loading) {
+                loading.innerHTML = '<div class="spinner"></div>Refreshing...';
+                loading.style.display = 'block';
+            }
+            loadGraph();
+        });
 
         // Filter controls
         document.getElementById('show-l1').addEventListener('change', (e) => { filters.showL1 = e.target.checked; updateVisibility(); });
