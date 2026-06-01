@@ -5221,8 +5221,7 @@ impl MemorySystem {
                 .iter()
                 .filter(|(_, s)| {
                     s.expires_at <= now
-                        && s.consecutive_retrieval_count
-                            < crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
+                        && s.consecutive_retrieval_count < d.working_memory_threshold
                 })
                 .map(|(k, _)| k.clone())
                 .collect();
@@ -5309,7 +5308,7 @@ impl MemorySystem {
             .map(|r| r.entity_id.to_string())
             .collect();
 
-        let threshold = crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD.max(1) as f32;
+        let threshold = dials.working_memory_threshold.max(1) as f32;
         let intensity = (shadow.consecutive_retrieval_count as f32).min(threshold) / threshold;
         let boost = dials.graph_boost_scale * intensity;
         if boost <= 0.0 {
