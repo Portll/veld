@@ -63,7 +63,13 @@ impl SlowStore {
                 let blob: Vec<u8> = row.get(2)?;
                 Ok((uuid, name, blob))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("slow_store load_all_embeddings: skipping unreadable row: {e}");
+                    None
+                }
+            })
             .filter_map(|(uuid, name, blob)| {
                 let floats: Vec<f32> = blob
                     .chunks_exact(4)
@@ -92,7 +98,13 @@ impl SlowStore {
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("slow_store load_all_edge_pairs: skipping unreadable row: {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok(results)
