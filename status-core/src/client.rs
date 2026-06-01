@@ -196,6 +196,38 @@ impl StatusClient {
         }
         Ok(resp.json::<serde_json::Value>().await?)
     }
+
+    /// Kick off a project seed (`POST /api/seed`). The server scans `project_path`
+    /// (validated server-side to live under the home dir or /tmp) and creates
+    /// foundational memories. Returns the server's JSON response.
+    pub async fn seed_project(
+        base_url: &str,
+        api_key: &str,
+        user_id: &str,
+        project_path: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let base = normalize_base_url(base_url)?;
+        let http = Client::builder().timeout(timeout).build()?;
+        let url = format!("{}/api/seed", base);
+        let payload = serde_json::json!({ "user_id": user_id, "project_path": project_path });
+        let resp = http
+            .post(&url)
+            .header("X-API-Key", api_key)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(StatusError::BadStatus {
+                status: status.as_u16(),
+                url,
+                body,
+            });
+        }
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
 }
 
 impl Drop for StatusClient {
