@@ -314,6 +314,13 @@ pub struct RecallMemory {
     /// C3: whether the source tier is trusted (derived from source_type).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_trusted: Option<bool>,
+    /// C3.1 (W-006): `Some(true)` when this memory came from a non-trusted
+    /// source AND its content matches prompt-injection-style directives.
+    /// Best-effort defense-in-depth — a consumer should fence such content
+    /// as data, never instructions. Absent when there is no suspicion (the
+    /// common case), so it adds nothing to the wire for clean recalls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injection_suspected: Option<bool>,
 }
 
 #[derive(Serialize)]
