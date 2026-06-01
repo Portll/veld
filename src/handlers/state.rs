@@ -2004,6 +2004,134 @@ impl MultiUserMemoryManager {
         Ok(outcome.lsn)
     }
 
+    /// W-018 support: ensure the wiki projection is materialised for
+    /// `user_id` and pull any out-of-band page edits back into the canonical
+    /// store, then report `(target_dir, pages_on_disk, edits_applied)`.
+    /// Opening the journaled writer replays the intent log into the wiki
+    /// projection on first open (full backfill); the edit-back scan folds in
+    /// user edits. Callers gate on [`crate::wiki::wiki_render_enabled`].
+    pub fn render_wiki(&self, user_id: &str) -> Result<(String, usize, usize)> {
+        // Opening the writer triggers the on-open replay/backfill of the
+        // wiki projection (when the feature is enabled).
+        let _ = self.get_user_journaled_writer(user_id)?;
+        // Fold in user edits first — each edit journals an Update that
+        // re-renders its page and syncs the other projections.
+        let edits = self.scan_wiki_edits(user_id)?;
+        let user_path = self.base_path.join(user_id);
+        let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
+        let pages = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                    .count()
+            })
+            .unwrap_or(0);
+        Ok((dir.display().to_string(), pages, edits))
+    }
+
+    /// W-003/W-004: scan a user's wiki directory for body edits and apply
+    /// them back to the canonical store. **Self-write suppression (W-004)**
+    /// is the `last_rendered_hash` match — a page veld just rendered hashes
+    /// equal to its recorded hash and is skipped, so veld never re-ingests
+    /// its own output and the render→edit loop cannot run away. Redacted
+    /// pages are skipped (a redacted body can't be round-tripped). Only files
+    /// carrying valid veld frontmatter are eligible, so a stray markdown file
+    /// dropped into the directory is ignored (ingestion-sink guard, W-007).
+    /// Returns the number of edits applied.
+    ///
+    /// Scan-based rather than a live `notify` watcher by design: the watcher
+    /// was the synthesis's "most fragile contract" (debounce races, a
+    /// long-lived task, a new dependency). A scan triggered on demand (via
+    /// `POST /api/wiki/render`) is the robust equivalent — a live watcher can
+    /// layer on top later without changing this contract.
+    pub fn scan_wiki_edits(&self, user_id: &str) -> Result<usize> {
+        if !crate::wiki::wiki_render_enabled() {
+            return Ok(0);
+        }
+        let user_path = self.base_path.join(user_id);
+        let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => return Ok(0),
+        };
+        let mut applied = 0usize;
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let Some(page) = crate::wiki::parse_rendered_page(&text) else {
+                continue; // not a veld-rendered page (ingestion-sink guard)
+            };
+            if page.redacted {
+                continue; // redacted body can't round-trip; render is one-way
+            }
+            if crate::wiki::body_sha256_hex(&page.body) == page.last_rendered_hash {
+                continue; // unchanged since veld rendered it (self-write)
+            }
+            match self.apply_wiki_edit(user_id, &page.id, &page.body) {
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    user_id = %user_id,
+                    page = ?path,
+                    error = %e,
+                    "wiki edit-back failed for page (non-fatal)",
+                ),
+            }
+        }
+        if applied > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                applied,
+                "applied wiki page edits back to the canonical store",
+            );
+        }
+        Ok(applied)
+    }
+
+    /// Apply one wiki-page body edit back to the canonical memory. Journals
+    /// an `Update` so the page re-renders (fresh `last_rendered_hash` → the
+    /// next scan is a no-op, closing the loop) and the other projections
+    /// sync. Returns `true` iff the content actually changed. Unknown /
+    /// unparsable ids are ignored (ingestion-sink safety).
+    fn apply_wiki_edit(&self, user_id: &str, memory_id: &str, new_body: &str) -> Result<bool> {
+        let uuid = match uuid::Uuid::parse_str(memory_id) {
+            Ok(u) => u,
+            Err(_) => return Ok(false),
+        };
+        let mid = crate::memory::types::MemoryId(uuid);
+        let earth = self.get_user_earth(user_id)?;
+        let new_content = new_body.trim_end().to_string();
+        let updated_bincode = {
+            let guard = earth.read();
+            let mut mem = match guard.get_memory(&mid) {
+                Ok(m) => m,
+                Err(_) => return Ok(false), // unknown memory — ignore
+            };
+            if mem.experience.content == new_content {
+                return Ok(false); // no real change
+            }
+            mem.experience.content = new_content;
+            mem.experience.embeddings = None; // force re-embed / re-index
+            guard.update_memory(&mem)?;
+            bincode::serde::encode_to_vec(&mem, bincode::config::standard())
+                .map_err(|e| anyhow::anyhow!("wiki edit-back bincode: {e}"))?
+        };
+        let payload = crate::intent_log::IntentPayload::Update {
+            user_id: user_id.to_string(),
+            memory_id: memory_id.to_string(),
+            memory_bincode: updated_bincode,
+            schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        self.journal_and_apply(user_id, &payload)?;
+        Ok(true)
+    }
+
     /// C2 (W-001): reconcile a user's canonical store against the intent
     /// log. A write's log frame is appended *after* the RocksDB commit, in
     /// a detached task (`handlers::remember`), so a crash in that window
