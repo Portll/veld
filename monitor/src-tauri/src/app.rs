@@ -1,29 +1,93 @@
-//! Tauri application bootstrap: spawns the status client, registers commands,
-//! manages window visibility, emits live snapshot events.
+//! Tauri application bootstrap: manages a *fleet* of veld status clients (one per
+//! discovered instance), registers commands, manages window visibility, and emits
+//! live snapshot events for the pinned instance.
+//!
+//! Multi-instance: the configured server is the "pinned" instance and is always
+//! present. A background task reconciles the fleet against the filesystem instance
+//! registry (`veld_status_core::discover_instances`) — spawning a poller when a new
+//! instance comes online and dropping it (which aborts its tasks) when it goes away.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
-use veld_status_core::{StatusClient, StatusClientConfig, StatusSnapshot};
+use veld_status_core::{discover_instances, StatusClient, StatusClientConfig, StatusSnapshot};
 
 use crate::tray;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3030";
 const DEFAULT_DEV_API_KEY: &str = "sk-veld-dev-local-testing-key";
 const DEFAULT_USER_ID: &str = "claude-code";
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Anchors the background poller so it lives as long as the app does.
-pub struct MonitorState {
-    pub snapshot: Arc<RwLock<StatusSnapshot>>,
-    /// Connection params retained so on-demand commands (e.g. dials) can reach the
-    /// veld server without re-deriving them.
+/// One member of the fleet: a running status client plus its snapshot handle.
+struct FleetEntry {
+    /// Held so its background tasks live; dropped (→ aborted) on removal.
+    _client: StatusClient,
+    snapshot: Arc<RwLock<StatusSnapshot>>,
+    label: String,
+    pinned: bool,
+}
+
+/// Tab metadata handed to the frontend.
+#[derive(Serialize, Clone)]
+struct InstanceMeta {
     base_url: String,
+    label: String,
+    pinned: bool,
+    online: bool,
+}
+
+/// App-wide state: connection params + the live fleet.
+pub struct MonitorState {
     api_key: String,
     user_id: String,
     request_timeout: Duration,
-    _client: StatusClient,
+    /// Normalized base_url of the configured (always-present) instance.
+    pinned_base_url: String,
+    fleet: Arc<Mutex<HashMap<String, FleetEntry>>>,
+}
+
+/// Strip a trailing slash so registry/discovery/config URLs key consistently.
+fn norm(base: &str) -> String {
+    base.trim_end_matches('/').to_string()
+}
+
+/// Short tab label derived from a base URL: ":3030" from http://127.0.0.1:3030.
+fn url_short(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    match trimmed.rsplit_once(':') {
+        Some((_, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
+            format!(":{port}")
+        }
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Spawn a status client for `base_url`. Returns its snapshot handle alongside.
+/// Must be called within a tokio runtime (StatusClient::spawn spawns tasks).
+fn spawn_client(
+    base_url: &str,
+    api_key: &str,
+    user_id: &str,
+    timeout: Duration,
+) -> Option<(StatusClient, Arc<RwLock<StatusSnapshot>>)> {
+    let cfg = StatusClientConfig::new(base_url.to_string(), api_key.to_string(), user_id.to_string())
+        .with_refresh_interval(Duration::from_secs(2))
+        .with_request_timeout(timeout);
+    match StatusClient::spawn(cfg) {
+        Ok(client) => {
+            let snap = client.snapshot();
+            Some((client, snap))
+        }
+        Err(e) => {
+            tracing::warn!("fleet: failed to spawn client for {base_url}: {e}");
+            None
+        }
+    }
 }
 
 pub fn run() {
@@ -45,57 +109,111 @@ pub fn run() {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_USER_ID.to_string());
+            let timeout = Duration::from_secs(5);
+            let pinned_key = norm(&base_url);
 
-            let config =
-                StatusClientConfig::new(base_url.clone(), api_key.clone(), user_id.clone())
-                    .with_refresh_interval(Duration::from_secs(2))
-                    .with_request_timeout(Duration::from_secs(5));
-
-            let client = tauri::async_runtime::block_on(async move {
-                StatusClient::spawn(config)
+            // Spawn the pinned client (inside a runtime context).
+            let (client, snapshot) = tauri::async_runtime::block_on(async {
+                spawn_client(&base_url, &api_key, &user_id, timeout)
             })
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>)?;
+            .ok_or_else(|| {
+                Box::new(std::io::Error::other("failed to spawn pinned status client"))
+                    as Box<dyn std::error::Error>
+            })?;
 
-            let snapshot = client.snapshot();
+            let mut map: HashMap<String, FleetEntry> = HashMap::new();
+            map.insert(
+                pinned_key.clone(),
+                FleetEntry {
+                    _client: client,
+                    snapshot: Arc::clone(&snapshot),
+                    label: url_short(&base_url),
+                    pinned: true,
+                },
+            );
+            let fleet = Arc::new(Mutex::new(map));
+
             app.manage(MonitorState {
-                snapshot: Arc::clone(&snapshot),
-                base_url,
-                api_key,
-                user_id,
-                request_timeout: Duration::from_secs(5),
-                _client: client,
+                api_key: api_key.clone(),
+                user_id: user_id.clone(),
+                request_timeout: timeout,
+                pinned_base_url: pinned_key.clone(),
+                fleet: Arc::clone(&fleet),
             });
 
+            // Tray + live event stream follow the pinned instance.
             tray::build(app, Arc::clone(&snapshot))?;
-
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(emit_snapshots(handle, snapshot));
+
+            // Reconcile the fleet against the registry in the background.
+            tauri::async_runtime::spawn(reconcile_fleet(
+                fleet, pinned_key, api_key, user_id, timeout,
+            ));
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // X-button closes the whole app, matching the standard desktop
-            // expectation. The tray menu still has Show / Quit; the tray
-            // icon stays available while the window is hidden via the
-            // menu "Hide" path, but pressing X = exit.
+            // X-button closes the whole app (tray menu still has Show / Quit).
             if let WindowEvent::CloseRequested { .. } = event {
                 window.app_handle().exit(0);
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_snapshot_for,
+            list_instances,
             show_dashboard,
             quit_app,
-            get_dials,
-            set_dials
+            get_dials_for,
+            set_dials_for
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
 }
 
+/// Pinned instance's snapshot (back-compat; used by the default tab + fallback).
 #[tauri::command]
 fn get_snapshot(state: State<'_, MonitorState>) -> StatusSnapshot {
-    state.snapshot.read().clone()
+    let fleet = state.fleet.lock();
+    fleet
+        .get(&state.pinned_base_url)
+        .map(|e| e.snapshot.read().clone())
+        .unwrap_or_default()
+}
+
+/// Snapshot for a specific instance (the active tab). Falls back to the pinned
+/// instance, then an empty snapshot, if the base_url isn't in the fleet.
+#[tauri::command]
+fn get_snapshot_for(state: State<'_, MonitorState>, base_url: String) -> StatusSnapshot {
+    let key = norm(&base_url);
+    let fleet = state.fleet.lock();
+    fleet
+        .get(&key)
+        .or_else(|| fleet.get(&state.pinned_base_url))
+        .map(|e| e.snapshot.read().clone())
+        .unwrap_or_default()
+}
+
+/// All instances currently in the fleet (pinned first), with live online status.
+#[tauri::command]
+fn list_instances(state: State<'_, MonitorState>) -> Vec<InstanceMeta> {
+    let fleet = state.fleet.lock();
+    let mut metas: Vec<InstanceMeta> = fleet
+        .values()
+        .map(|e| {
+            let snap = e.snapshot.read();
+            InstanceMeta {
+                base_url: snap.base_url.clone(),
+                label: e.label.clone(),
+                pinned: e.pinned,
+                online: snap.server.state.is_reachable(),
+            }
+        })
+        .collect();
+    // Pinned first, then by base_url for a stable tab order.
+    metas.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| a.base_url.cmp(&b.base_url)));
+    metas
 }
 
 #[tauri::command]
@@ -112,41 +230,124 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-/// Read the current cognitive dials from the veld server (`GET /api/dials`).
+/// Read the cognitive dials from a specific instance (`GET /api/dials`).
 #[tauri::command]
-async fn get_dials(state: State<'_, MonitorState>) -> Result<serde_json::Value, String> {
-    let (base, key, user, timeout) = (
-        state.base_url.clone(),
+async fn get_dials_for(
+    state: State<'_, MonitorState>,
+    base_url: String,
+) -> Result<serde_json::Value, String> {
+    let (key, user, timeout) = (
         state.api_key.clone(),
         state.user_id.clone(),
         state.request_timeout,
     );
-    StatusClient::get_dials(&base, &key, &user, timeout)
+    StatusClient::get_dials(&base_url, &key, &user, timeout)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// Replace the cognitive dials (`PUT /api/dials`). `dials` is the full dials object
-/// (as returned by `get_dials`); returns the server-sanitized result.
+/// Replace the cognitive dials on a specific instance (`PUT /api/dials`).
 #[tauri::command]
-async fn set_dials(
+async fn set_dials_for(
     state: State<'_, MonitorState>,
+    base_url: String,
     dials: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let (base, key, user, timeout) = (
-        state.base_url.clone(),
+    let (key, user, timeout) = (
         state.api_key.clone(),
         state.user_id.clone(),
         state.request_timeout,
     );
-    StatusClient::set_dials(&base, &key, &user, dials, timeout)
+    StatusClient::set_dials(&base_url, &key, &user, dials, timeout)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Keep the fleet in sync with the registry: add pollers for newly-online
+/// instances, drop them when they go stale. The pinned instance is never removed.
+async fn reconcile_fleet(
+    fleet: Arc<Mutex<HashMap<String, FleetEntry>>>,
+    pinned_key: String,
+    api_key: String,
+    user_id: String,
+    timeout: Duration,
+) {
+    loop {
+        // Desired set: the pinned instance plus every freshly-heartbeating one.
+        let mut desired: HashMap<String, String> = HashMap::new();
+        desired.insert(pinned_key.clone(), String::new());
+        for inst in discover_instances() {
+            let key = norm(&inst.base_url);
+            let label = if inst.label.trim().is_empty() {
+                url_short(&inst.base_url)
+            } else {
+                inst.label.clone()
+            };
+            desired.insert(key, label);
+        }
+
+        // Which desired instances are not yet in the fleet?
+        let missing: Vec<(String, String)> = {
+            let f = fleet.lock();
+            desired
+                .iter()
+                .filter(|(k, _)| !f.contains_key(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        for (key, label) in missing {
+            if let Some((client, snap)) = spawn_client(&key, &api_key, &user_id, timeout) {
+                let pinned = key == pinned_key;
+                let lbl = if label.is_empty() { url_short(&key) } else { label };
+                fleet.lock().insert(
+                    key,
+                    FleetEntry {
+                        _client: client,
+                        snapshot: snap,
+                        label: lbl,
+                        pinned,
+                    },
+                );
+            }
+        }
+
+        // Drop non-pinned instances that are no longer discovered (abort on drop).
+        let stale: Vec<String> = {
+            let f = fleet.lock();
+            f.iter()
+                .filter(|(k, e)| !e.pinned && !desired.contains_key(*k))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        if !stale.is_empty() {
+            let mut f = fleet.lock();
+            for key in stale {
+                f.remove(&key);
+            }
+        }
+
+        // Refresh discovered labels on existing non-pinned entries.
+        {
+            let mut f = fleet.lock();
+            for (key, label) in &desired {
+                if label.is_empty() {
+                    continue;
+                }
+                if let Some(e) = f.get_mut(key) {
+                    if !e.pinned {
+                        e.label = label.clone();
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+    }
 }
 
 async fn emit_snapshots(handle: AppHandle, snapshot: Arc<RwLock<StatusSnapshot>>) {
-    // Cadence: 1s while the main window is visible, 5s while hidden. Cheap because
-    // emit is in-process and the consumer is a single webview.
+    // Cadence: 1s while the main window is visible, 5s while hidden. Emits the
+    // pinned instance; non-pinned tabs poll get_snapshot_for on demand.
     let mut last_visible = false;
     loop {
         let visible = handle

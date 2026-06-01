@@ -60,7 +60,9 @@ impl StatusClientConfig {
     }
 }
 
-/// Background poller + SSE subscriber. Drop the handle to stop both tasks.
+/// Background poller + SSE subscriber. Drop the handle to stop both tasks
+/// (see the `Drop` impl below — it aborts both, so dropping a removed fleet
+/// member stops it polling a dead instance).
 pub struct StatusClient {
     snapshot: Arc<RwLock<StatusSnapshot>>,
     poll_task: JoinHandle<()>,
