@@ -3616,10 +3616,16 @@ impl super::MemorySystem {
         // Reference: Nader et al. (2000) — reconsolidation theory.
         {
             let now = chrono::Utc::now();
-            // Labile-window length is a runtime dial (defaults to the constant value).
-            let window = chrono::Duration::seconds(
-                self.cognitive_dials.read().reconsolidation_window_secs,
-            );
+            // Labile-window length + active-shadow cap are runtime dials (default to the
+            // constant values). Read once here so the shadows write lock below never
+            // nests the dials lock.
+            let (window, max_active_shadows) = {
+                let d = self.cognitive_dials.read();
+                (
+                    chrono::Duration::seconds(d.reconsolidation_window_secs),
+                    d.max_active_shadows.max(1),
+                )
+            };
             let mut shadows = self.reconsolidation_shadows.write();
 
             for memory in &memories {
@@ -3662,8 +3668,8 @@ impl super::MemorySystem {
                 }
             }
 
-            // Cap active shadows to prevent accumulation
-            while shadows.len() > crate::constants::RECONSOLIDATION_MAX_ACTIVE_SHADOWS {
+            // Cap active shadows to prevent accumulation (runtime dial).
+            while shadows.len() > max_active_shadows {
                 // Evict the oldest expired first, then oldest opened
                 let evict_key = shadows
                     .iter()
