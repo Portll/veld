@@ -1329,6 +1329,46 @@ pub async fn anchor_memory(
     }))
 }
 
+/// POST /api/wiki/render — materialise / refresh the wiki for a user (W-018).
+///
+/// Authed: the user is resolved against the tenant binding via
+/// `resolve_request_user_id`, so this never trusts a bare `?user_id=` — it
+/// lives on the protected router, satisfying the
+/// `public_router_has_no_per_user_handlers` contract. Returns 503 when wiki
+/// render is disabled (`VELD_WIKI_RENDER` off). When enabled, opening the
+/// journaled writer replays the intent log into the wiki projection on first
+/// open (full backfill); subsequent live writes keep it current. Reports the
+/// output directory and the on-disk page count.
+#[tracing::instrument(skip_all)]
+pub async fn wiki_render(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = resolve_request_user_id(
+        params.get("user_id").map(String::as_str),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+
+    if !crate::wiki::wiki_render_enabled() {
+        return Err(AppError::ServiceUnavailable(
+            "wiki render is disabled (set VELD_WIKI_RENDER=1 to enable)".to_string(),
+        ));
+    }
+
+    let (target_dir, pages, edits_applied) =
+        state.render_wiki(&user_id).map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "enabled": true,
+        "target_dir": target_dir,
+        "pages": pages,
+        "edits_applied": edits_applied,
+    })))
+}
+
 /// Request body for the tier-move endpoint.
 #[derive(Debug, Deserialize)]
 pub struct TierMoveRequest {
