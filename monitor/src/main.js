@@ -490,6 +490,16 @@ async function init() {
   if (dialsRefresh) dialsRefresh.addEventListener("click", pullDials);
   await pullDials();
 
+  const openGraph = document.getElementById("open-graph");
+  if (openGraph)
+    openGraph.addEventListener("click", async () => {
+      try {
+        await invoke("open_graph");
+      } catch (err) {
+        diagPush("ERROR", "open_graph failed: " + (err?.message || err));
+      }
+    });
+
   setInterval(() => {
     if (Date.now() - lastUpdateAt > 5000) pull();
   }, 2000);
