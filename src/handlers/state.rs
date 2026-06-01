@@ -267,6 +267,11 @@ pub struct MultiUserMemoryManager {
     /// the second open would race with the first writer's append.
     journaled_writer_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
 
+    /// C2 (W-001): set of users whose store↔log reconcile has already run
+    /// in this process. The reconcile is a one-time-per-boot scan on first
+    /// access; this guards against re-running it on every cache miss.
+    reconciled_users: DashMap<String, ()>,
+
     /// Capabilities for the effective backend in the current runtime.
     storage_capabilities: StorageCapabilities,
 
@@ -604,6 +609,7 @@ impl MultiUserMemoryManager {
             bm25_indices: DashMap::new(),
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
+            reconciled_users: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
             // W7: dataset / link stores are opt-in until the relational
@@ -1136,6 +1142,20 @@ impl MultiUserMemoryManager {
             .insert(user_id.to_string(), memory_arc.clone());
 
         info!("Created memory system for user: {}", user_id);
+
+        // C2 (W-001): one-time-per-process store↔log reconcile. Runs after
+        // the earth is cached so the writer-open path resolves it via the
+        // fast cache path without re-entering this per-user init lock.
+        // Non-fatal — a reconcile failure must not block earth creation.
+        if self.reconciled_users.insert(user_id.to_string(), ()).is_none() {
+            if let Err(e) = self.reconcile_store_with_intent_log(user_id, &memory_arc) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "C2 store↔log reconcile failed (non-fatal)",
+                );
+            }
+        }
 
         Ok(memory_arc)
     }
@@ -1890,6 +1910,50 @@ impl MultiUserMemoryManager {
             );
         }
 
+        // Fourth projection (default-OFF, gated by VELD_WIKI_RENDER): the
+        // wiki render. Constructed + replayed here, while `&log` is still
+        // borrowable (it is moved into the writer just below). Added to the
+        // writer after the move. Init/replay failure is non-fatal — the
+        // other projections and the write path are unaffected; the wiki is
+        // simply not registered for this writer's lifetime.
+        let wiki_projection = if crate::wiki::wiki_render_enabled() {
+            let wiki_dir = crate::wiki::wiki_target_dir(&user_path, user_id);
+            match crate::wiki::WikiProjection::new(wiki_dir, checkpoint_store.clone()) {
+                Ok(mut wp) => {
+                    match crate::intent_log::replay(&log, &mut wp, Some(crate::wiki::COMMIT_EVERY)) {
+                        Ok(applied) => {
+                            if applied > 0 {
+                                tracing::info!(
+                                    user_id = %user_id,
+                                    applied,
+                                    "replayed intent log into wiki projection on first writer open",
+                                );
+                            }
+                            Some(wp)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                user_id = %user_id,
+                                error = %e,
+                                "wiki projection replay failed (non-fatal; wiki render disabled this session)",
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "wiki projection init failed (non-fatal; wiki render disabled this session)",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Hand the log handle into the writer so subsequent appends
         // continue against the same file. Replay above used a read-only
         // borrow; the same handle is fine for the writer's appends.
@@ -1899,6 +1963,11 @@ impl MultiUserMemoryManager {
             writer.add_projection(Box::new(vp));
         }
         writer.add_projection(Box::new(bm25_projection));
+        // Register the wiki render projection (built + replayed above) if it
+        // was enabled and opened cleanly. Live writes now also fan out to it.
+        if let Some(wiki_projection) = wiki_projection {
+            writer.add_projection(Box::new(wiki_projection));
+        }
 
         let writer = std::sync::Arc::new(parking_lot::Mutex::new(writer));
         self.journaled_writers
@@ -1933,6 +2002,104 @@ impl MultiUserMemoryManager {
             );
         }
         Ok(outcome.lsn)
+    }
+
+    /// C2 (W-001): reconcile a user's canonical store against the intent
+    /// log. A write's log frame is appended *after* the RocksDB commit, in
+    /// a detached task (`handlers::remember`), so a crash in that window
+    /// leaves a memory durable in the store with no corresponding log
+    /// frame. Left alone, every projection / PITR replay rebuilt from the
+    /// log would be missing that memory. On first access per process we
+    /// scan the log, find store records the log never recorded, and
+    /// backfill a `Remember` frame for each.
+    ///
+    /// Direction is store→log only: the canonical RocksDB store is the
+    /// source of truth; this never deletes from the store based on the
+    /// log. Returns the number of frames backfilled. Non-fatal — the
+    /// caller logs and continues on error.
+    fn reconcile_store_with_intent_log(
+        &self,
+        user_id: &str,
+        earth: &SharedEarth,
+    ) -> Result<usize> {
+        // Ids the log already covers (Remember/Update/Anchor present, minus
+        // Forget), via the clock-independent Lsn scan (C4). Writer lock is
+        // released before the backfill loop so journal_and_apply can retake
+        // it per frame.
+        let covered = {
+            let writer = self.get_user_journaled_writer(user_id)?;
+            let guard = writer.lock();
+            crate::intent_log::payload::live_memory_ids(guard.log())
+                .map_err(|e| anyhow::anyhow!("reconcile: scanning intent log: {e}"))?
+        };
+
+        let store_ids = {
+            let guard = earth.read();
+            guard.all_memory_ids()?
+        };
+
+        let mut backfilled = 0usize;
+        for id in store_ids {
+            let id_str = id.0.to_string();
+            if covered.contains(&id_str) {
+                continue;
+            }
+            // store-ahead-of-log: snapshot the memory and backfill a
+            // `Remember` frame so the log is a complete record of the store.
+            let snapshot = {
+                let guard = earth.read();
+                match guard.get_memory(&id) {
+                    Ok(mem) => {
+                        match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
+                            Ok(bytes) => Some(bytes),
+                            Err(e) => {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    memory_id = %id_str,
+                                    error = %e,
+                                    "C2 reconcile: skipping backfill, bincode encode failed",
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            memory_id = %id_str,
+                            error = %e,
+                            "C2 reconcile: skipping backfill, memory not retrievable",
+                        );
+                        None
+                    }
+                }
+            };
+            let Some(bytes) = snapshot else { continue };
+            let payload = crate::intent_log::IntentPayload::Remember {
+                user_id: user_id.to_string(),
+                memory_id: id_str.clone(),
+                memory_bincode: bytes,
+                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+            };
+            if let Err(e) = self.journal_and_apply(user_id, &payload) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    memory_id = %id_str,
+                    error = %e,
+                    "C2 reconcile: backfill journal_and_apply failed",
+                );
+            } else {
+                backfilled += 1;
+            }
+        }
+        if backfilled > 0 {
+            tracing::warn!(
+                user_id = %user_id,
+                backfilled,
+                "C2 store↔log reconcile backfilled store-ahead-of-log memories into the intent log",
+            );
+        }
+        Ok(backfilled)
     }
 
     /// Get graph statistics for a user
