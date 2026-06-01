@@ -19,6 +19,8 @@
 - [Alignment](architecture/alignment.md)
 - [Wiki render](architecture/wiki-render.md)
 - [Epistemic hygiene](architecture/epistemic-hygiene.md)
+- [Cognitive dials](architecture/dials.md)
+- [Instance registry](architecture/instance-registry.md)
 - [Module index](architecture/module-index.md)
 
 ---
