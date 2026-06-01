@@ -551,6 +551,84 @@ function setActiveInstance(base) {
   pullDials();
 }
 
+// ---- First-run setup panel ----------------------------------------------
+async function setupFirstRun() {
+  let firstRun = false;
+  try {
+    firstRun = await invoke("first_run_check");
+  } catch {
+    return;
+  }
+  const panel = document.getElementById("first-run");
+  if (!panel || !firstRun) return;
+  panel.classList.remove("hidden");
+
+  const seedBtn = document.getElementById("fr-seed-btn");
+  const seedPath = document.getElementById("fr-seed-path");
+  const seedStatus = document.getElementById("fr-seed-status");
+  if (seedBtn && seedPath && seedStatus) {
+    seedBtn.addEventListener("click", async () => {
+      const p = seedPath.value.trim();
+      if (!p) {
+        seedStatus.textContent = "enter a project path";
+        seedStatus.className = "fr-status err";
+        return;
+      }
+      seedStatus.textContent = "seeding…";
+      seedStatus.className = "fr-status";
+      try {
+        await invoke("seed_project", { baseUrl: activeBaseUrl, projectPath: p });
+        seedStatus.textContent = "✓ seed started for " + p;
+        seedStatus.className = "fr-status ok";
+      } catch (err) {
+        seedStatus.textContent = "seed failed: " + (err?.message || err);
+        seedStatus.className = "fr-status err";
+      }
+    });
+  }
+
+  const hookBtn = document.getElementById("fr-hook-btn");
+  const hookPath = document.getElementById("fr-hook-path");
+  const hookStatus = document.getElementById("fr-hook-status");
+  if (hookBtn && hookPath && hookStatus) {
+    hookBtn.addEventListener("click", async () => {
+      const p = hookPath.value.trim();
+      if (!p) {
+        hookStatus.textContent = "enter a project directory";
+        hookStatus.className = "fr-status err";
+        return;
+      }
+      try {
+        const res = await invoke("claude_hook_status", { projectDir: p });
+        if (res.configured) {
+          hookStatus.textContent = "✓ veld hooks configured (" + res.path + ")";
+          hookStatus.className = "fr-status ok";
+        } else {
+          hookStatus.textContent =
+            "✗ not configured at " + res.path +
+            " — copy hooks/claude-settings.json there and set VELD_HOOKS_DIR";
+          hookStatus.className = "fr-status err";
+        }
+      } catch (err) {
+        hookStatus.textContent = "check failed: " + (err?.message || err);
+        hookStatus.className = "fr-status err";
+      }
+    });
+  }
+
+  const done = document.getElementById("fr-done");
+  if (done) {
+    done.addEventListener("click", async () => {
+      try {
+        await invoke("mark_initialized");
+      } catch (err) {
+        diagPush("ERROR", "mark_initialized failed: " + (err?.message || err));
+      }
+      panel.classList.add("hidden");
+    });
+  }
+}
+
 async function init() {
   try {
     // The emit stream is the pinned instance; only render it when the pinned tab
@@ -604,6 +682,8 @@ async function init() {
       graphFrame.src = "about:blank"; // stop the 3D render loop + SSE while hidden
     });
   }
+
+  await setupFirstRun();
 
   setInterval(() => {
     pullInstances(); // refresh the tab list as instances come/go

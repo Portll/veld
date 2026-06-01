@@ -166,7 +166,11 @@ pub fn run() {
             show_dashboard,
             quit_app,
             get_dials_for,
-            set_dials_for
+            set_dials_for,
+            first_run_check,
+            mark_initialized,
+            seed_project,
+            claude_hook_status
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -261,6 +265,70 @@ async fn set_dials_for(
     StatusClient::set_dials(&base_url, &key, &user, dials, timeout)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Marker written after first-run setup completes: `<config>/veld/monitor-initialized`.
+fn monitor_marker_path() -> std::path::PathBuf {
+    veld_status_core::default_config_path()
+        .parent()
+        .map(|p| p.join("monitor-initialized"))
+        .unwrap_or_else(|| std::path::PathBuf::from("monitor-initialized"))
+}
+
+/// True on the monitor's first run (the marker file is absent).
+#[tauri::command]
+fn first_run_check() -> bool {
+    !monitor_marker_path().exists()
+}
+
+/// Record that first-run setup is done so the welcome panel doesn't reappear.
+#[tauri::command]
+fn mark_initialized() -> Result<(), String> {
+    let path = monitor_marker_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, b"initialized\n").map_err(|e| e.to_string())
+}
+
+/// Seed a project into a veld instance (`POST /api/seed`). The server validates the
+/// path (must be under the home dir or /tmp) and scans it into foundational memories.
+#[tauri::command]
+async fn seed_project(
+    state: State<'_, MonitorState>,
+    base_url: String,
+    project_path: String,
+) -> Result<serde_json::Value, String> {
+    let (key, user, timeout) = (
+        state.api_key.clone(),
+        state.user_id.clone(),
+        state.request_timeout,
+    );
+    StatusClient::seed_project(&base_url, &key, &user, &project_path, timeout)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a project has the veld Claude Code hooks wired (read-only — never edits
+/// the user's settings). Looks for the memory hook / statusLine in its settings.json.
+#[derive(Serialize)]
+struct HookStatus {
+    configured: bool,
+    path: String,
+}
+
+#[tauri::command]
+fn claude_hook_status(project_dir: String) -> HookStatus {
+    let path = std::path::Path::new(&project_dir)
+        .join(".claude")
+        .join("settings.json");
+    let configured = std::fs::read_to_string(&path)
+        .map(|s| s.contains("memory-hook.ts") || s.contains("statusLine"))
+        .unwrap_or(false);
+    HookStatus {
+        configured,
+        path: path.display().to_string(),
+    }
 }
 
 /// Keep the fleet in sync with the registry: add pollers for newly-online
