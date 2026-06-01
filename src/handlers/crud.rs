@@ -700,6 +700,33 @@ pub async fn patch_memory(
 // FORGET BY AGE HANDLER
 // =============================================================================
 
+/// C5 (W-017): journal a `Forget` frame for every canonical-store key a
+/// bulk forget actually removed. The RocksDB removal is already durable;
+/// these frames keep the intent log — and every projection / PITR replay
+/// built on it — from resurrecting deleted memories. Per-projection apply
+/// errors are swallowed (the frame is durable; replay retries on restart).
+fn journal_bulk_forget(
+    state: &AppState,
+    user_id: &str,
+    removed: impl IntoIterator<Item = memory::MemoryId>,
+) {
+    for id in removed {
+        let payload = crate::intent_log::IntentPayload::Forget {
+            user_id: user_id.to_string(),
+            memory_id: id.0.to_string(),
+            schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+        };
+        if let Err(e) = state.journal_and_apply(user_id, &payload) {
+            tracing::warn!(
+                user_id = %user_id,
+                memory_id = %id.0,
+                error = %e,
+                "intent-log journal_and_apply (bulk Forget) failed (RocksDB delete already durable)",
+            );
+        }
+    }
+}
+
 /// POST /api/forget/age - Forget memories older than N days
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn forget_by_age(
@@ -713,9 +740,11 @@ pub async fn forget_by_age(
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let count = memory_guard
-        .forget(memory::ForgetCriteria::OlderThan(req.days_old))
+    let (count, removed) = memory_guard
+        .forget_collecting_removed(memory::ForgetCriteria::OlderThan(req.days_old))
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
 
     state.log_event(
         &req.user_id,
@@ -755,9 +784,11 @@ pub async fn forget_by_importance(
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let count = memory_guard
-        .forget(memory::ForgetCriteria::LowImportance(req.threshold))
+    let (count, removed) = memory_guard
+        .forget_collecting_removed(memory::ForgetCriteria::LowImportance(req.threshold))
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
 
     state.log_event(
         &req.user_id,
@@ -804,9 +835,11 @@ pub async fn forget_by_pattern(
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
-    let count = memory_guard
-        .forget(memory::ForgetCriteria::Pattern(req.pattern.clone()))
+    let (count, removed) = memory_guard
+        .forget_collecting_removed(memory::ForgetCriteria::Pattern(req.pattern.clone()))
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
 
     state.log_event(
         &req.user_id,
@@ -847,9 +880,11 @@ pub async fn forget_by_tags(
 
     let memory_guard = memory_sys.read();
 
-    let deleted_count = memory_guard
-        .forget(memory::ForgetCriteria::ByTags(req.tags.clone()))
+    let (deleted_count, removed) = memory_guard
+        .forget_collecting_removed(memory::ForgetCriteria::ByTags(req.tags.clone()))
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
 
     info!(
         "🏷️ Forget by tags: user={}, tags={:?}, deleted={}",
@@ -901,12 +936,14 @@ pub async fn forget_by_date(
 
     let memory_guard = memory_sys.read();
 
-    let deleted_count = memory_guard
-        .forget(memory::ForgetCriteria::ByDateRange {
+    let (deleted_count, removed) = memory_guard
+        .forget_collecting_removed(memory::ForgetCriteria::ByDateRange {
             start: req.start,
             end: req.end,
         })
         .map_err(AppError::Internal)?;
+    drop(memory_guard);
+    journal_bulk_forget(&state, &req.user_id, removed);
 
     info!(
         "📅 Forget by date: user={}, start={}, end={}, deleted={}",

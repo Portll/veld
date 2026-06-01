@@ -228,6 +228,55 @@ pub fn decode_record(record: &IntentRecord) -> Result<(Lsn, IntentPayload), Payl
     Ok((record.lsn, payload))
 }
 
+/// C4 (W-020): build the clock-independent ordering of memories from the
+/// log — `memory_id -> highest Lsn seen`. The `Lsn` is the monotonic
+/// per-tenant sequence assigned at append time, so it is the correct
+/// last-write-wins tie-break: wall-clock `created_at` / `updated_at` can
+/// skew across concurrent writers, but Lsn order is the order the journal
+/// actually accepted the writes. `Forget` removes the key — the memory's
+/// most recent intent is deletion, so it is no longer "live".
+///
+/// Propagates the first corrupt/truncated-frame error the iterator
+/// reports; a clean log has none (`IntentLog::open` truncates a partial
+/// tail on startup).
+pub fn latest_lsn_per_memory(
+    log: &IntentLog,
+) -> Result<std::collections::HashMap<String, Lsn>, PayloadError> {
+    let mut latest: std::collections::HashMap<String, Lsn> = std::collections::HashMap::new();
+    for record in log.iter()? {
+        let record = record?;
+        let (lsn, payload) = decode_record(&record)?;
+        match payload {
+            IntentPayload::Forget { memory_id, .. } => {
+                latest.remove(&memory_id);
+            }
+            other => {
+                let id = other.memory_id().to_string();
+                latest
+                    .entry(id)
+                    .and_modify(|cur| {
+                        if lsn > *cur {
+                            *cur = lsn;
+                        }
+                    })
+                    .or_insert(lsn);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+/// The set of memory ids the log currently considers live (created/updated
+/// and not subsequently forgotten). Thin wrapper over
+/// [`latest_lsn_per_memory`] for callers that only need membership — e.g.
+/// the store↔log reconcile (C2 / W-001) deciding which store records the
+/// log has never recorded.
+pub fn live_memory_ids(
+    log: &IntentLog,
+) -> Result<std::collections::HashSet<String>, PayloadError> {
+    Ok(latest_lsn_per_memory(log)?.into_keys().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +291,65 @@ mod tests {
             .as_nanos();
         p.push(format!("veld-intent-payload-{name}-{pid}-{stamp}.log"));
         p
+    }
+
+    #[test]
+    fn latest_lsn_per_memory_tracks_max_and_forget() {
+        // m-0: Remember then Update -> live at the Update's (higher) Lsn.
+        // m-1: Remember then Forget -> not live.
+        let path = tmp_path("latest-lsn");
+        let mut log = IntentLog::open(&path).unwrap();
+        append(
+            &mut log,
+            &IntentPayload::Remember {
+                user_id: "u".into(),
+                memory_id: "m-0".into(),
+                memory_bincode: vec![1],
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+        let m0_update = append(
+            &mut log,
+            &IntentPayload::Update {
+                user_id: "u".into(),
+                memory_id: "m-0".into(),
+                memory_bincode: vec![2],
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+        append(
+            &mut log,
+            &IntentPayload::Remember {
+                user_id: "u".into(),
+                memory_id: "m-1".into(),
+                memory_bincode: vec![3],
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+        append(
+            &mut log,
+            &IntentPayload::Forget {
+                user_id: "u".into(),
+                memory_id: "m-1".into(),
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+        log.sync().unwrap();
+
+        let latest = latest_lsn_per_memory(&log).unwrap();
+        assert_eq!(latest.get("m-0"), Some(&m0_update));
+        assert!(!latest.contains_key("m-1"));
+
+        let live = live_memory_ids(&log).unwrap();
+        assert!(live.contains("m-0"));
+        assert!(!live.contains("m-1"));
+        assert_eq!(live.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
