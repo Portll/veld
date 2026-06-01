@@ -380,3 +380,65 @@ main {
   border: 0;
   background: #000;
 }
+
+/* First-run welcome / setup modal */
+#first-run {
+  position: fixed;
+  inset: 0;
+  z-index: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 9, 15, 0.82);
+  padding: 20px;
+}
+#first-run.hidden { display: none; }
+#first-run-card {
+  background: #14151f;
+  border: 1px solid #2b2d3c;
+  border-radius: 10px;
+  padding: 18px 20px;
+  max-width: 560px;
+  width: 100%;
+  max-height: 90vh;
+  overflow: auto;
+}
+#first-run-card h2 { margin: 0 0 2px; font-size: 16px; }
+.fr-sub { margin: 0 0 14px; font-size: 11px; color: #8b8ea6; }
+.fr-section { margin: 14px 0; padding-top: 12px; border-top: 1px solid #2b2d3c; }
+.fr-section h3 { margin: 0 0 4px; font-size: 13px; color: #c8c8d4; }
+.fr-desc { margin: 0 0 8px; font-size: 11px; color: #8b8ea6; line-height: 1.4; }
+.fr-row { display: flex; gap: 8px; }
+.fr-row input {
+  flex: 1;
+  background: #1b1d2a;
+  color: #e6e6ef;
+  border: 1px solid #2b2d3c;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.fr-row button {
+  background: #1f2740;
+  color: #8fd0ff;
+  border: 1px solid #2f4368;
+  border-radius: 6px;
+  padding: 4px 14px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.fr-row button:hover { background: #28324f; }
+.fr-status { margin: 6px 0 0; font-size: 11px; min-height: 14px; }
+.fr-status.ok { color: #4ec77a; }
+.fr-status.err { color: #dc5a5a; }
+.fr-actions { margin-top: 16px; text-align: right; }
+.fr-actions button {
+  background: #2b2d3c;
+  color: #c8c8d4;
+  border: 1px solid #3a3d4f;
+  border-radius: 6px;
+  padding: 5px 14px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.fr-actions button:hover { background: #353849; }
