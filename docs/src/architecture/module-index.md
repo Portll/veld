@@ -6,7 +6,7 @@
 
 # Module index
 
-Top-level Rust modules in veld. **35** modules (plus **4** feature-gated).
+Top-level Rust modules in veld. **36** modules (plus **4** feature-gated).
 
 Each entry's summary is the first paragraph of that module's `//!` doc comment. Click into the crate docs (built by `cargo doc`) for full API.
 
@@ -29,6 +29,7 @@ Each entry's summary is the first paragraph of that module's `//!` doc comment. 
 | `graph_memory` | Graph Memory System - Inspired by Graphiti |
 | `handlers` | HTTP API Handlers - Modular organization of the REST API |
 | `ingest` | Multi-format text extraction pipeline |
+| `instance_registry` | Instance registry — how a running `veld server` makes itself discoverable. |
 | `integrations` | External integrations for syncing data sources to Veld memory |
 | `intent_log` | Durable, checksummed append-only intent log (W5 scaffold). |
 | `mcp` | Unified veld binary - MCP server + Claude Code hooks |

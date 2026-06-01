@@ -51,6 +51,14 @@ name = "gen-module-index"
 path = "src/bin/gen-module-index.rs"
 
 [[bin]]
+name = "gen-changelog"
+path = "src/bin/gen-changelog.rs"
+
+[[bin]]
+name = "gen-cli-ref"
+path = "src/bin/gen-cli-ref.rs"
+
+[[bin]]
 name = "lint-decisions"
 path = "src/bin/lint-decisions.rs"
 
