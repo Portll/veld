@@ -375,12 +375,19 @@ impl SlowStore {
     }
 
     fn sync_edges(tx: &Transaction, edges: &[RelationshipEdge], stats: &mut SyncStats) -> Result<()> {
+        // Conflict target is the directed pair, not `uuid`. The slow store is a
+        // connectivity graph (one entry per A->B, per `idx_edge_pair`), but
+        // GraphMemory legitimately holds several edges per pair (one per
+        // relation type). Targeting `uuid` made the 2nd such edge violate the
+        // pair-unique index — an unhandled conflict that aborted the whole sync
+        // transaction. Collapsing on the pair keeps the first uuid/relation_type
+        // and refreshes the mutable strength/tier/activation columns.
         let mut stmt = tx.prepare_cached(
             "INSERT INTO edges (uuid, from_entity, to_entity, relation_type, strength,
                                 tier, ltp_status, activation_count, created_at,
                                 last_activated, context)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(uuid) DO UPDATE SET
+             ON CONFLICT(from_entity, to_entity) DO UPDATE SET
                 strength = excluded.strength,
                 tier = excluded.tier,
                 ltp_status = excluded.ltp_status,
@@ -564,5 +571,75 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0);
         }
+    }
+
+    fn test_entity(name: &str) -> EntityNode {
+        let now = Utc::now();
+        EntityNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![crate::graph_memory::EntityLabel::Person],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: true,
+            pii_classification: crate::graph_memory::PiiClassification::Clean,
+        }
+    }
+
+    fn test_edge(
+        from: uuid::Uuid,
+        to: uuid::Uuid,
+        rel: crate::graph_memory::RelationType,
+    ) -> RelationshipEdge {
+        let now = Utc::now();
+        RelationshipEdge {
+            uuid: uuid::Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: rel,
+            strength: 0.7,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: now,
+            activation_count: 0,
+            ltp_status: LtpStatus::None,
+            tier: EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            created_by: crate::graph_memory::EdgeSource::CoOccurrence,
+            forward_strength: 0.0,
+            backward_strength: 0.0,
+        }
+    }
+
+    #[test]
+    fn sync_collapses_multiple_relation_types_per_pair() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open(tmp.path()).unwrap();
+
+        let a = test_entity("Alice");
+        let b = test_entity("Bob");
+        // Two distinct edges between the same directed pair (different relation
+        // types + uuids) — exactly what GraphMemory produces. Before the fix
+        // the second edge violated idx_edge_pair, an unhandled conflict that
+        // aborted the entire sync transaction.
+        let e1 = test_edge(a.uuid, b.uuid, crate::graph_memory::RelationType::WorksWith);
+        let e2 = test_edge(a.uuid, b.uuid, crate::graph_memory::RelationType::PartOf);
+
+        let stats = store
+            .sync_from_graph(&[a, b], &[e1, e2])
+            .expect("sync must not abort on a multi-relation pair");
+        assert_eq!(stats.entities_upserted, 2);
+        assert_eq!(stats.edges_upserted, 2);
+        // Collapsed to one connectivity entry for the directed pair.
+        assert_eq!(store.edge_count().unwrap(), 1);
     }
 }
