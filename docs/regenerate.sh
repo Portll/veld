@@ -39,6 +39,11 @@ cargo run --quiet --bin gen-claude-sections
 echo "==> gen-changelog"
 cargo run --quiet --bin gen-changelog
 
+echo "==> gen-cli-ref"
+# Gracefully no-ops when no veld binary is on PATH / at target/release / in
+# $VELD_BIN. CI sets VELD_BIN after `cargo build --release --bin veld`.
+cargo run --quiet --bin gen-cli-ref
+
 echo "==> lint-decisions"
 cargo run --quiet --bin lint-decisions
 
