@@ -289,6 +289,93 @@ pub fn build_rich_context(
 // HANDLERS
 // =============================================================================
 
+/// Reserved tag marking a memory as a *derived* synthesis (a filed answer),
+/// as opposed to primary observed material. The anti-autophagy rule keys on
+/// this tag (W-022): a derived memory must never be cited as a source.
+pub const DERIVED_TAG: &str = "derived";
+
+/// Request to file a synthesised answer as a derived memory (A5).
+#[derive(Debug, serde::Deserialize)]
+pub struct FileAnswerRequest {
+    pub user_id: String,
+    pub content: String,
+    /// Memory ids that fed the synthesis. Recorded as `src:<id>` tags.
+    #[serde(default)]
+    pub cited_sources: Vec<String>,
+    /// Optional experience type (default `Learning`).
+    #[serde(default)]
+    pub memory_type: Option<String>,
+}
+
+/// POST /api/file_answer — file a synthesised answer as a DERIVED memory (A5).
+///
+/// The answer is tagged [`DERIVED_TAG`] and its provenance recorded as
+/// `src:<id>` tags. **Anti-autophagy (W-022):** a cited source that is itself
+/// a derived memory is rejected — a filed answer must cite primary material,
+/// never another derived answer, so derived content cannot harden into a
+/// cited "fact" through a chain of re-filings. Delegates to the normal
+/// `remember` pipeline, so entity extraction, journaling, and every
+/// projection (including the wiki render) apply unchanged.
+#[tracing::instrument(skip_all)]
+pub async fn file_answer(
+    State(state): State<AppState>,
+    Json(req): Json<FileAnswerRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_content(&req.content, false).map_validation_err("content")?;
+
+    // Anti-autophagy guard (W-022): refuse to cite a derived memory.
+    if !req.cited_sources.is_empty() {
+        let earth = state
+            .get_user_earth(&req.user_id)
+            .map_err(AppError::Internal)?;
+        let guard = earth.read();
+        for src in &req.cited_sources {
+            if let Ok(uuid) = uuid::Uuid::parse_str(src.trim()) {
+                if let Ok(mem) = guard.get_memory(&crate::memory::types::MemoryId(uuid)) {
+                    if mem.experience.tags.iter().any(|t| t == DERIVED_TAG) {
+                        return Err(AppError::InvalidInput {
+                            field: "cited_sources".to_string(),
+                            reason: format!(
+                                "cannot cite derived memory {src} as a source (anti-autophagy): \
+                                 a filed answer must cite primary material, not another derived answer"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut tags = vec![DERIVED_TAG.to_string()];
+    for s in &req.cited_sources {
+        let s = s.trim();
+        if !s.is_empty() {
+            tags.push(format!("src:{s}"));
+        }
+    }
+    let memory_type = req.memory_type.unwrap_or_else(|| "Learning".to_string());
+
+    // Build the standard remember request via serde so new RememberRequest
+    // fields keep their defaults without touching this call site.
+    let remember_req: RememberRequest = serde_json::from_value(serde_json::json!({
+        "user_id": req.user_id,
+        "content": req.content,
+        "tags": tags,
+        "memory_type": memory_type,
+        "source_type": "AiGenerated",
+    }))
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("file_answer: build remember request: {e}")))?;
+
+    let resp = remember(State(state), Json(remember_req)).await?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "id": resp.0.id,
+        "is_derived": true,
+        "cited_sources": req.cited_sources,
+    })))
+}
+
 /// Remember a single memory
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn remember(
