@@ -110,7 +110,14 @@ pub struct AlignmentConfig {
     pub eval_holdout_frac: f32,
     /// Auto-promotion of a newly-fitted method requires a recall win, never cosine alone.
     pub promote_requires_recall: bool,
+
+    /// Stamped on each runtime update by the persistence setter (not user-set).
+    #[serde(default)]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// KV-store key under which a user's runtime `AlignmentConfig` is persisted.
+pub const ALIGNMENT_CONFIG_KEY: &[u8] = b"alignment_config_v2";
 
 impl Default for AlignmentConfig {
     fn default() -> Self {
@@ -136,6 +143,7 @@ impl Default for AlignmentConfig {
             eval_metric: EvalMetric::PairedCosine,
             eval_holdout_frac: 0.1,
             promote_requires_recall: true,
+            updated_at: None,
         }
     }
 }
@@ -192,6 +200,7 @@ impl AlignmentConfig {
             method: d.method,
             objective: d.objective,
             eval_metric: d.eval_metric,
+            updated_at: None,
         };
         c.clamp();
         c

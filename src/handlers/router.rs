@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
+    ab_testing, admin, align, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
     memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
     todos, user_auth,
@@ -634,6 +634,11 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route(
             "/api/dials",
             get(dials::get_dials).put(dials::set_dials),
+        )
+        // Alignment v2 performance flags — runtime tuning (gated behind v2_enabled)
+        .route(
+            "/api/align",
+            get(align::get_align).put(align::set_align),
         )
         // backward-compat aliases
         .route(

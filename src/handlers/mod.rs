@@ -61,6 +61,9 @@ pub mod consolidation;
 // Admin operational endpoints (rate-limit reset, etc.)
 pub mod admin;
 
+// Alignment v2 performance flags (GET/PUT /api/align)
+pub mod align;
+
 // Context blocks (Letta-style mutable agent state)
 pub mod context_blocks;
 
