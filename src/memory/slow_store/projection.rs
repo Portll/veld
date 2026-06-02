@@ -83,6 +83,14 @@ pub enum SqliteProjectionError {
 /// migration.
 pub const PROJECTION_NAME: &str = "slow_store.sqlite";
 
+/// Live applies between forced checkpoint fsyncs on the [`TypedProjection`] arm.
+///
+/// Each apply already commits its data durably (every SQLite upsert is its own
+/// transaction), so the checkpoint is only the *replay cursor*. Amortizing its
+/// fsync over a batch trades at most this many idempotent, LSN-gated re-applies
+/// on restart for far fewer fsyncs on the hot live-write path.
+const LIVE_CHECKPOINT_PERSIST_INTERVAL: usize = 32;
+
 /// Bridge between the intent log and the SQLite slow store.
 ///
 /// One per tenant. Holds an `Arc<SlowStore>` (the SQLite handle), a
@@ -102,6 +110,10 @@ pub struct SqliteProjection {
     /// `None` (the default, via [`Self::new`]) preserves the original
     /// rusqlite path byte-for-byte.
     relational: Option<RelationalSlowStoreAdapter>,
+    /// Live applies since the last durable checkpoint flush. The live arm
+    /// amortizes the checkpoint fsync over [`LIVE_CHECKPOINT_PERSIST_INTERVAL`]
+    /// applies; the replay arm is unaffected (it batches via the driver).
+    applies_since_persist: usize,
 }
 
 impl SqliteProjection {
@@ -118,6 +130,7 @@ impl SqliteProjection {
             checkpoint_store,
             checkpoint,
             relational: None,
+            applies_since_persist: 0,
         }
     }
 
@@ -141,6 +154,7 @@ impl SqliteProjection {
             checkpoint_store,
             checkpoint,
             relational: Some(relational),
+            applies_since_persist: 0,
         }
     }
 
@@ -227,6 +241,17 @@ impl SqliteProjection {
         }
         Ok(())
     }
+
+    /// Force any pending checkpoint to disk and reset the amortization counter.
+    ///
+    /// Call on graceful shutdown so the amortized tail isn't re-applied on the
+    /// next boot. Crash safety does not depend on this — replay recovers the
+    /// tail idempotently either way — it's purely a restart-cost optimization.
+    pub fn flush_checkpoint(&mut self) -> Result<(), SqliteProjectionError> {
+        self.persist()?;
+        self.applies_since_persist = 0;
+        Ok(())
+    }
 }
 
 /// Dyn-friendly arm: the [`JournaledWriter`] hands us typed payloads at
@@ -245,11 +270,17 @@ impl TypedProjection for SqliteProjection {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.apply_typed(lsn, payload)
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-        // Live-write path persists every step. Replay batches use the
-        // static `Projection` arm below which can amortise via
-        // `persist_every`.
-        self.persist()
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        // The apply above already committed the data durably. The checkpoint is
+        // only the replay cursor, so its fsync is amortized over a batch: a
+        // crash before the next flush merely re-applies the un-checkpointed tail
+        // on restart (idempotent, LSN-gated) instead of fsyncing every write.
+        // `flush_checkpoint` forces it out on graceful shutdown.
+        self.applies_since_persist += 1;
+        if self.applies_since_persist >= LIVE_CHECKPOINT_PERSIST_INTERVAL {
+            self.persist()
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            self.applies_since_persist = 0;
+        }
         Ok(())
     }
 
@@ -607,5 +638,39 @@ mod tests {
         .unwrap();
         assert_eq!(adapter.count_memories("alice").await.unwrap(), 0);
         assert_eq!(store.count_memories("alice").unwrap(), 0);
+    }
+
+    #[test]
+    fn live_apply_amortizes_checkpoint_persist() {
+        let (sqlite_path, _, checkpoint_path) = tmp_paths("amortize");
+        let (store, ckpt, mut proj) = open_projection(&sqlite_path, &checkpoint_path);
+
+        // Fewer applies than the interval: data lands durably, but the
+        // checkpoint is not fsync'd yet (amortized).
+        for i in 0..5u64 {
+            TypedProjection::apply(&mut proj, Lsn(i), &mk_remember("u", &format!("m{i}"), b"x"))
+                .unwrap();
+        }
+        assert_eq!(store.count_memories("u").unwrap(), 5);
+        assert!(
+            ckpt.lock().get(PROJECTION_NAME).is_none(),
+            "checkpoint must not be fsync'd before the interval"
+        );
+
+        // Cross the interval: the checkpoint flushes to disk.
+        for i in 5..LIVE_CHECKPOINT_PERSIST_INTERVAL as u64 {
+            TypedProjection::apply(&mut proj, Lsn(i), &mk_remember("u", &format!("m{i}"), b"x"))
+                .unwrap();
+        }
+        assert_eq!(
+            ckpt.lock().get(PROJECTION_NAME),
+            Some(Lsn(LIVE_CHECKPOINT_PERSIST_INTERVAL as u64 - 1)),
+            "checkpoint flushes once the interval is reached"
+        );
+
+        // flush_checkpoint forces the un-checkpointed tail out explicitly.
+        TypedProjection::apply(&mut proj, Lsn(100), &mk_remember("u", "m100", b"x")).unwrap();
+        proj.flush_checkpoint().unwrap();
+        assert_eq!(ckpt.lock().get(PROJECTION_NAME), Some(Lsn(100)));
     }
 }
