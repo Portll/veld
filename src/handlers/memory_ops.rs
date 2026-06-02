@@ -115,7 +115,7 @@ pub async fn merge_memories(
     }))
     .map_err(|e| AppError::Internal(anyhow::anyhow!("merge: build remember request: {e}")))?;
 
-    let resp = remember(State(state.clone()), Json(remember_req)).await?;
+    let resp = remember(State(state.clone()), crate::handlers::lenient_json::LenientJson(remember_req)).await?;
     let merged_id = resp.0.id;
 
     for id in &req.ids {
@@ -203,7 +203,7 @@ pub async fn split_memory(
             "memory_type": memory_type,
         }))
         .map_err(|e| AppError::Internal(anyhow::anyhow!("split: build remember request: {e}")))?;
-        let resp = remember(State(state.clone()), Json(remember_req)).await?;
+        let resp = remember(State(state.clone()), crate::handlers::lenient_json::LenientJson(remember_req)).await?;
         child_ids.push(resp.0.id);
     }
 
