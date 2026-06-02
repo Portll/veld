@@ -142,6 +142,96 @@ impl VeldMcpServer {
     }
 
     #[tool(
+        description = "Read the current alignment performance flags for this user: the v2 master switch, conditioning (whiten / variance target), fitter method + objective, CSLS, capability-gated adapter/vec2vec toggles, and the eval gate."
+    )]
+    async fn get_align(&self) -> Result<CallToolResult, McpError> {
+        let path = format!("/api/align?user_id={}", self.client.user_id);
+        let result: Result<crate::embeddings::AlignmentConfig> = self.client.get(&path).await;
+        match result {
+            Ok(c) => Ok(CallToolResult::success(vec![Content::text(format_align(&c))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
+        description = "Tune the alignment performance flags for this user. Only the fields you set change. Closed-form methods (procrustes, ridge, whitened_procrustes) work today; gradient objectives (cosine/infonce), the adapter, and vec2vec require an ML runtime not yet available and are rejected with a 400. Values are clamped server-side."
+    )]
+    async fn set_align(
+        &self,
+        Parameters(params): Parameters<SetAlignParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("/api/align?user_id={}", self.client.user_id);
+        let mut c: crate::embeddings::AlignmentConfig = match self.client.get(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(e.to_string()),
+                    data: None,
+                })
+            }
+        };
+        if let Some(v) = params.v2_enabled {
+            c.v2_enabled = v;
+        }
+        if let Some(s) = params.method {
+            c.method = parse_align_enum(&s, "method")?;
+        }
+        if let Some(s) = params.objective {
+            c.objective = parse_align_enum(&s, "objective")?;
+        }
+        if let Some(s) = params.whiten {
+            c.whiten = parse_align_enum(&s, "whiten")?;
+        }
+        if let Some(v) = params.whiten_eps {
+            c.whiten_eps = v;
+        }
+        if let Some(v) = params.variance_target {
+            c.variance_target = v;
+        }
+        if let Some(v) = params.ridge_lambda {
+            c.ridge_lambda = v;
+        }
+        if let Some(v) = params.csls_enabled {
+            c.csls_enabled = v;
+        }
+        if let Some(v) = params.csls_neighborhood_k {
+            c.csls_neighborhood_k = v;
+        }
+        if let Some(v) = params.adapter_enabled {
+            c.adapter_enabled = v;
+        }
+        if let Some(v) = params.vec2vec_enabled {
+            c.vec2vec_enabled = v;
+        }
+        if let Some(s) = params.eval_metric {
+            c.eval_metric = parse_align_enum(&s, "eval_metric")?;
+        }
+
+        let body = SetAlignBody {
+            user_id: self.client.user_id.clone(),
+            config: c,
+        };
+        let result: Result<crate::embeddings::AlignmentConfig> =
+            self.client.put("/api/align", &body).await;
+        match result {
+            Ok(c) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Alignment flags updated.\n{}",
+                format_align(&c)
+            ))])),
+            Err(e) => Err(McpError {
+                code: ErrorCode::INTERNAL_ERROR,
+                message: Cow::from(e.to_string()),
+                data: None,
+            }),
+        }
+    }
+
+    #[tool(
         description = "Search memories using semantic, associative, or hybrid retrieval. Modes: 'semantic' (vector similarity), 'associative' (graph traversal), 'hybrid' (combines both)."
     )]
     async fn recall(
@@ -938,5 +1028,33 @@ fn format_dials(d: &crate::memory::CognitiveDials) -> String {
         d.use_reranking,
         d.refiner_mode,
         d.rrf_weights,
+    )
+}
+
+/// Parse an MCP string param into a config enum via serde (honors the snake_case names).
+fn parse_align_enum<T: serde::de::DeserializeOwned>(s: &str, field: &str) -> Result<T, McpError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(|e| McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: Cow::from(format!("invalid {field} '{s}': {e}")),
+        data: None,
+    })
+}
+
+/// Render `AlignmentConfig` as a short human-readable summary for MCP tool output.
+fn format_align(c: &crate::embeddings::AlignmentConfig) -> String {
+    format!(
+        "Alignment flags (v2_enabled={}):\n  method={:?} objective={:?}\n  conditioning: whiten={:?} eps={:.4} variance_target={:.2}\n  csls={} (k={})\n  adapter={} vec2vec={}\n  eval_metric={:?} promote_requires_recall={}",
+        c.v2_enabled,
+        c.method,
+        c.objective,
+        c.whiten,
+        c.whiten_eps,
+        c.variance_target,
+        c.csls_enabled,
+        c.csls_neighborhood_k,
+        c.adapter_enabled,
+        c.vec2vec_enabled,
+        c.eval_metric,
+        c.promote_requires_recall,
     )
 }

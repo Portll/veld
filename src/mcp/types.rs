@@ -558,3 +558,34 @@ pub struct SetDialsBody {
     pub user_id: String,
     pub dials: crate::memory::CognitiveDials,
 }
+
+/// Params for the `set_align` MCP tool. Partial update — only the fields you set change
+/// (the tool GETs current, merges, then PUTs). Finer numeric knobs (residual threshold,
+/// infonce temp, adapter dims/epochs, self-learning iters, eval holdout) are HTTP-only
+/// via `PUT /api/align`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetAlignParams {
+    pub v2_enabled: Option<bool>,
+    /// Fitter: auto | procrustes | ridge | whitened_procrustes | cca
+    pub method: Option<String>,
+    /// Fit objective: frobenius | cosine | info_nce
+    pub objective: Option<String>,
+    /// Conditioning whitening: off | zca | pca
+    pub whiten: Option<String>,
+    pub whiten_eps: Option<f32>,
+    pub variance_target: Option<f32>,
+    pub ridge_lambda: Option<f32>,
+    pub csls_enabled: Option<bool>,
+    pub csls_neighborhood_k: Option<u32>,
+    pub adapter_enabled: Option<bool>,
+    pub vec2vec_enabled: Option<bool>,
+    /// Eval gate metric: paired_cosine | recall_at_k | mrr
+    pub eval_metric: Option<String>,
+}
+
+/// Body for `PUT /api/align` (full replace).
+#[derive(Debug, Serialize)]
+pub struct SetAlignBody {
+    pub user_id: String,
+    pub config: crate::embeddings::AlignmentConfig,
+}
