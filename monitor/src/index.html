@@ -7,6 +7,14 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
+    <div id="titlebar" data-tauri-drag-region>
+      <span class="tb-title" data-tauri-drag-region>Veld Monitor</span>
+      <div class="tb-controls">
+        <button class="tb-btn" id="win-min" type="button" aria-label="Minimize" title="Minimize"><span class="tb-ico tb-min"></span></button>
+        <button class="tb-btn" id="win-max" type="button" aria-label="Maximize" title="Maximize"><span class="tb-ico tb-max"></span></button>
+        <button class="tb-btn tb-close" id="win-close" type="button" aria-label="Close to tray" title="Close to tray"><span class="tb-ico tb-x"></span></button>
+      </div>
+    </div>
     <pre id="debug" style="color:#dc5a5a;font-family:monospace;font-size:11px;padding:8px;margin:0;border-bottom:1px solid #2b2d3c;display:none;white-space:pre-wrap;"></pre>
     <header id="header">
       <span id="dot" class="dot unknown"></span>

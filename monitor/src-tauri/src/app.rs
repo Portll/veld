@@ -174,7 +174,10 @@ pub fn run() {
             mark_initialized,
             seed_project,
             claude_hook_status,
-            pick_directory
+            pick_directory,
+            minimize_window,
+            toggle_maximize,
+            hide_window
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -236,6 +239,27 @@ fn show_dashboard(app: AppHandle) {
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
+}
+
+// ---- Custom title-bar window controls (frameless window) ----------------
+#[tauri::command]
+fn minimize_window(window: tauri::WebviewWindow) {
+    let _ = window.minimize();
+}
+
+#[tauri::command]
+fn toggle_maximize(window: tauri::WebviewWindow) {
+    if window.is_maximized().unwrap_or(false) {
+        let _ = window.unmaximize();
+    } else {
+        let _ = window.maximize();
+    }
+}
+
+/// Close button → hide to tray (matches the CloseRequested handler).
+#[tauri::command]
+fn hide_window(window: tauri::WebviewWindow) {
+    let _ = window.hide();
 }
 
 /// Read the cognitive dials from a specific instance (`GET /api/dials`).

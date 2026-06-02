@@ -35,6 +35,59 @@ body {
   flex-direction: column;
 }
 
+/* Custom (frameless) title bar with baseline-aligned window controls.
+   Icons are CSS-drawn and flex-centered, so there's no font-baseline drift. */
+#titlebar {
+  flex: 0 0 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #14151f;
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.tb-title {
+  flex: 1;
+  padding-left: 12px;
+  font-size: 12px;
+  color: #c8c8d4;
+  line-height: 32px;
+}
+.tb-controls { display: flex; height: 32px; }
+.tb-btn {
+  width: 46px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.tb-btn:hover { background: #232636; }
+.tb-close:hover { background: #c0392b; }
+.tb-min { width: 11px; height: 0; border-top: 1px solid #c8c8d4; }
+.tb-max { width: 10px; height: 10px; border: 1px solid #c8c8d4; }
+.tb-x { position: relative; width: 11px; height: 11px; }
+.tb-x::before,
+.tb-x::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 0;
+  border-top: 1px solid #c8c8d4;
+}
+.tb-x::before { transform: rotate(45deg); }
+.tb-x::after { transform: rotate(-45deg); }
+.tb-close:hover .tb-min,
+.tb-close:hover .tb-max { border-color: #fff; }
+.tb-close:hover .tb-x::before,
+.tb-close:hover .tb-x::after { border-top-color: #fff; }
+
 header {
   display: flex;
   align-items: center;
