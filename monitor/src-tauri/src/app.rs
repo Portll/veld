@@ -154,9 +154,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // X-button closes the whole app (tray menu still has Show / Quit).
-            if let WindowEvent::CloseRequested { .. } = event {
-                window.app_handle().exit(0);
+            // Minimize to tray: the X button HIDES the window (keeping the app +
+            // tray icon alive) instead of quitting. Quit is on the tray menu.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
