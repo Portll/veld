@@ -240,6 +240,9 @@ hex = "0.4"
 # Intent log frame checksums (W5 — log-structured projection layer)
 crc32fast = "1.4"
 
+# Live wiki edit-back watcher (optional layer; default-off via VELD_WIKI_WATCH)
+notify = "6"
+
 # MIF encryption (AES-256-GCM)
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
