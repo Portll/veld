@@ -17,13 +17,13 @@
         "minWidth": 480,
         "minHeight": 360,
         "resizable": true,
-        "visible": false,
+        "visible": true,
         "decorations": true,
         "fullscreen": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; frame-src http://127.0.0.1:* http://localhost:*"
+      "csp": null
     }
   },
   "bundle": {
