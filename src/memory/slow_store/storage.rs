@@ -352,6 +352,9 @@ impl SlowStore {
         memory_bincode: &[u8],
         importance: f32,
     ) -> Result<()> {
+        // Encrypt the payload at rest when a key is configured (parity with the
+        // RocksDB primary store); no-op passthrough otherwise.
+        let stored = self.maybe_encrypt(memory_bincode)?;
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -364,7 +367,7 @@ impl SlowStore {
                 importance = excluded.importance,
                 updated_at = excluded.updated_at
              WHERE excluded.lsn >= memories.lsn",
-            params![user_id, memory_id, lsn as i64, memory_bincode, importance, now],
+            params![user_id, memory_id, lsn as i64, stored, importance, now],
         )?;
         Ok(())
     }
@@ -417,9 +420,9 @@ impl SlowStore {
         user_id: &str,
         memory_id: &str,
     ) -> Result<Option<StoredMemoryRow>> {
-        let conn = self.read()?;
-        let row = conn
-            .query_row(
+        let row = {
+            let conn = self.read()?;
+            conn.query_row(
                 "SELECT user_id, memory_id, lsn, memory_bincode, importance, updated_at
                  FROM memories
                  WHERE user_id = ?1 AND memory_id = ?2",
@@ -436,8 +439,17 @@ impl SlowStore {
                     })
                 },
             )
-            .optional()?;
-        Ok(row)
+            .optional()?
+        };
+        // Decrypt the payload outside the rusqlite closure (which can't surface
+        // anyhow errors). Marked blobs decrypt; plaintext rows pass through.
+        match row {
+            Some(mut r) => {
+                r.memory_bincode = self.maybe_decrypt(r.memory_bincode)?;
+                Ok(Some(r))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Total number of memory rows for a tenant. Used by tests and the

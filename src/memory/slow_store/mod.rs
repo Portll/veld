@@ -31,6 +31,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use crate::encryption::FieldEncryptor;
 use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
 
 /// Statistics from a graph → SQLite sync operation
@@ -62,6 +63,12 @@ pub struct SlowStore {
     /// check a connection out of this pool, so a long gap-analysis query no
     /// longer blocks a live projection write — or another reader.
     read_pool: ReadPool,
+    /// Optional AES-256-GCM encryptor for the `memory_bincode` payload, mirroring
+    /// the RocksDB primary store. Sourced from `VELD_ENCRYPTION_KEY`; `None`
+    /// (unset) stores plaintext (backward compatible). Entity/edge/gap rows match
+    /// the primary store's plaintext graph posture — the sensitive payload is the
+    /// memory blob, which is encrypted at rest here when a key is configured.
+    encryptor: Option<FieldEncryptor>,
     path: PathBuf,
     last_sync: Mutex<Option<std::time::Instant>>,
 }
@@ -154,8 +161,18 @@ impl Drop for PooledConn<'_> {
 }
 
 impl SlowStore {
-    /// Open or create the slow store database
+    /// Open or create the slow store database. Field-level encryption of the
+    /// memory payload is enabled iff `VELD_ENCRYPTION_KEY` is set.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_encryptor(path, FieldEncryptor::from_env()?)
+    }
+
+    /// Open with an explicit encryptor. Production opens via [`open`](Self::open)
+    /// (which reads the key from the environment); tests inject a key directly.
+    pub(crate) fn open_with_encryptor(
+        path: &Path,
+        encryptor: Option<FieldEncryptor>,
+    ) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -178,6 +195,7 @@ impl SlowStore {
         let store = Self {
             conn: Mutex::new(conn),
             read_pool: ReadPool::new(path.to_owned()),
+            encryptor,
             path: path.to_owned(),
             last_sync: Mutex::new(None),
         };
@@ -191,6 +209,29 @@ impl SlowStore {
     /// (and with one another) under WAL rather than serializing on one mutex.
     pub(crate) fn read(&self) -> Result<PooledConn<'_>> {
         self.read_pool.checkout()
+    }
+
+    /// Encrypt a memory payload for at-rest storage when an encryptor is
+    /// configured; otherwise pass the plaintext through unchanged.
+    pub(crate) fn maybe_encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryptor {
+            Some(enc) => enc.encrypt_bytes(plaintext),
+            None => Ok(plaintext.to_vec()),
+        }
+    }
+
+    /// Inverse of [`maybe_encrypt`](Self::maybe_encrypt). Decrypts marked blobs,
+    /// passes plaintext (pre-encryption) rows through, and errors if a blob is
+    /// encrypted but no key is configured (key removed after encrypting).
+    pub(crate) fn maybe_decrypt(&self, stored: Vec<u8>) -> Result<Vec<u8>> {
+        match &self.encryptor {
+            Some(enc) if FieldEncryptor::is_encrypted(&stored) => enc.decrypt_bytes(&stored),
+            Some(_) => Ok(stored),
+            None if FieldEncryptor::is_encrypted(&stored) => Err(anyhow::anyhow!(
+                "slow store memory payload is encrypted but VELD_ENCRYPTION_KEY is not set"
+            )),
+            None => Ok(stored),
+        }
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -874,5 +915,52 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn memory_blob_encrypted_at_rest_when_key_configured() {
+        let tmp = NamedTempFile::new().unwrap();
+        let enc = crate::encryption::FieldEncryptor::new(&[7u8; 32]);
+        let store = SlowStore::open_with_encryptor(tmp.path(), Some(enc)).unwrap();
+
+        let plaintext = b"super secret memory bincode payload".to_vec();
+        store.upsert_memory("u", "m", 1, &plaintext, 0.5).unwrap();
+
+        // On disk the blob is ENC-marked ciphertext, not the plaintext.
+        {
+            let conn = store.conn.lock();
+            let raw: Vec<u8> = conn
+                .query_row(
+                    "SELECT memory_bincode FROM memories WHERE user_id = 'u' AND memory_id = 'm'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_ne!(raw, plaintext, "payload must be encrypted on disk");
+            assert!(crate::encryption::FieldEncryptor::is_encrypted(&raw));
+        }
+
+        // The read path decrypts transparently.
+        let row = store.get_memory_blob("u", "m").unwrap().unwrap();
+        assert_eq!(row.memory_bincode, plaintext);
+    }
+
+    #[test]
+    fn memory_blob_plaintext_without_key() {
+        let tmp = NamedTempFile::new().unwrap();
+        let store = SlowStore::open_with_encryptor(tmp.path(), None).unwrap();
+
+        let plaintext = b"not encrypted".to_vec();
+        store.upsert_memory("u", "m", 1, &plaintext, 0.5).unwrap();
+
+        let conn = store.conn.lock();
+        let raw: Vec<u8> = conn
+            .query_row(
+                "SELECT memory_bincode FROM memories WHERE user_id = 'u' AND memory_id = 'm'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, plaintext, "no key configured -> stored verbatim");
     }
 }
