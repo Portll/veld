@@ -17,7 +17,7 @@ impl SlowStore {
         if uuids.is_empty() {
             return Ok(HashMap::new());
         }
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let placeholders = vec!["?"; uuids.len()].join(",");
         let sql = format!(
             "SELECT uuid, embedding FROM entities \
@@ -51,7 +51,7 @@ impl SlowStore {
     /// Returns (uuid, name, embedding) triples for all entities that have embeddings.
     /// Used by Voronoi analysis to reason about the shape of knowledge space.
     pub fn load_all_embeddings(&self) -> Result<Vec<(String, String, Vec<f32>)>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT uuid, name, embedding FROM entities WHERE embedding IS NOT NULL",
         )?;
@@ -90,7 +90,7 @@ impl SlowStore {
     ///
     /// Used by Planet X detection to find where edges converge.
     pub fn load_all_edge_pairs(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt =
             conn.prepare_cached("SELECT from_entity, to_entity FROM edges")?;
 

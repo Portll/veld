@@ -90,7 +90,7 @@ impl SlowStore {
     ///
     /// Returns raw triads sorted by combined edge strength (strongest gaps first).
     pub fn find_open_triads(&self, min_strength: f32, limit: usize) -> Result<Vec<RawOpenTriad>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT
                 e1.from_entity, ea.name, ea.salience,
@@ -148,7 +148,7 @@ impl SlowStore {
         max_connectivity: f32,
         limit: usize,
     ) -> Result<Vec<RawStarGap>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
 
         // Step 1: Find hub entities with enough connections
         let mut hub_stmt = conn.prepare_cached(
@@ -248,7 +248,7 @@ impl SlowStore {
     /// where the intermediaries aren't connected. This often indicates
     /// two approaches to the same problem that haven't been reconciled.
     pub fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> Result<Vec<RawDiamondGap>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT
                 e1.from_entity, ea.name,   -- A (top)
@@ -301,7 +301,7 @@ impl SlowStore {
 
     /// Get all entity neighbors (both directions) for orbit detection
     pub fn get_adjacency_list(&self, min_strength: f32) -> Result<HashMap<String, Vec<String>>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT from_entity, to_entity FROM edges WHERE strength >= ?1",
         )?;
@@ -330,7 +330,7 @@ impl SlowStore {
         if uuids.is_empty() {
             return Ok(HashMap::new());
         }
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let placeholders = vec!["?"; uuids.len()].join(",");
         let sql = format!("SELECT uuid, name FROM entities WHERE uuid IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
@@ -349,7 +349,7 @@ impl SlowStore {
 
     /// Get entity count in the slow store
     pub fn entity_count(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let count: usize =
             conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
         Ok(count)
@@ -357,7 +357,7 @@ impl SlowStore {
 
     /// Get edge count in the slow store
     pub fn edge_count(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let count: usize = conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))?;
         Ok(count)
     }
