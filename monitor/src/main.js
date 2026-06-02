@@ -664,6 +664,18 @@ async function init() {
   await pullInstances(); // sets activeBaseUrl to the pinned instance
   await pull();
 
+  // Custom title-bar window controls (frameless window).
+  const winCtl = (cmd) => async () => {
+    try {
+      await invoke(cmd);
+    } catch (err) {
+      diagPush("ERROR", cmd + ": " + (err?.message || err));
+    }
+  };
+  document.getElementById("win-min")?.addEventListener("click", winCtl("minimize_window"));
+  document.getElementById("win-max")?.addEventListener("click", winCtl("toggle_maximize"));
+  document.getElementById("win-close")?.addEventListener("click", winCtl("hide_window"));
+
   const dialsRefresh = document.getElementById("dials-refresh");
   if (dialsRefresh) dialsRefresh.addEventListener("click", pullDials);
   await pullDials();
