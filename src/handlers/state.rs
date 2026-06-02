@@ -272,6 +272,13 @@ pub struct MultiUserMemoryManager {
     /// access; this guards against re-running it on every cache miss.
     reconciled_users: DashMap<String, ()>,
 
+    /// (b) Live wiki edit-back watchers, one per user, kept alive here so the
+    /// `notify` watcher keeps running (dropping the handle stops it). The
+    /// `Mutex` only satisfies `Sync` — the value is a keep-alive handle, never
+    /// locked. Populated lazily when both `VELD_WIKI_RENDER` and
+    /// `VELD_WIKI_WATCH` are on.
+    wiki_watchers: DashMap<String, parking_lot::Mutex<notify::RecommendedWatcher>>,
+
     /// Capabilities for the effective backend in the current runtime.
     storage_capabilities: StorageCapabilities,
 
@@ -610,6 +617,7 @@ impl MultiUserMemoryManager {
             journaled_writers: DashMap::new(),
             journaled_writer_init_locks: DashMap::new(),
             reconciled_users: DashMap::new(),
+            wiki_watchers: DashMap::new(),
             storage_capabilities,
             user_auth_runtime,
             // W7: dataset / link stores are opt-in until the relational
@@ -2027,6 +2035,40 @@ impl MultiUserMemoryManager {
             })
             .unwrap_or(0);
         Ok((dir.display().to_string(), pages, edits))
+    }
+
+    /// (b) Ensure a live filesystem watcher is running for `user_id`'s wiki
+    /// dir, so out-of-band edits flow back without an explicit
+    /// `POST /api/wiki/render`. No-op unless both `VELD_WIKI_RENDER` and
+    /// `VELD_WIKI_WATCH` are on, and idempotent (one watcher per user). The
+    /// watcher debounces and calls [`Self::scan_wiki_edits`] — the same
+    /// hash-guarded edit-back path — so it never re-ingests veld's own writes.
+    /// `manager` is the shared `Arc<Self>` the spawned thread calls back into.
+    pub fn ensure_wiki_watcher(&self, manager: std::sync::Arc<Self>, user_id: &str) {
+        if !crate::wiki::wiki_render_enabled() || !crate::wiki::watcher::wiki_watch_enabled() {
+            return;
+        }
+        if self.wiki_watchers.contains_key(user_id) {
+            return;
+        }
+        let user_path = self.base_path.join(user_id);
+        let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(user_id = %user_id, error = %e, "wiki watcher: could not create wiki dir");
+            return;
+        }
+        match crate::wiki::watcher::spawn_wiki_watcher(manager, user_id.to_string(), &dir) {
+            Ok(w) => {
+                self.wiki_watchers
+                    .insert(user_id.to_string(), parking_lot::Mutex::new(w));
+                tracing::info!(user_id = %user_id, dir = ?dir, "started live wiki edit-back watcher");
+            }
+            Err(e) => tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "failed to start live wiki watcher (non-fatal)"
+            ),
+        }
     }
 
     /// W-003/W-004: scan a user's wiki directory for body edits and apply
