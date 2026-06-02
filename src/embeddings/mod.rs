@@ -17,6 +17,10 @@
 //! - `VELD_ONNX_THREADS=N` - Set ONNX intra-op thread count (default: 1 on macOS ARM64, 2 elsewhere)
 
 pub mod alignment;
+pub mod alignment_affine;
+pub mod alignment_conditioning;
+pub mod alignment_config;
+pub mod alignment_csls;
 pub mod alignment_procrustes;
 pub mod alignment_ridge;
 pub mod chunking;
@@ -66,6 +70,15 @@ pub use alignment::{
 };
 pub use alignment_procrustes::ProcrustesAlignment;
 pub use alignment_ridge::RidgeAlignment;
+
+// Alignment v2: conditioning + whitened-Procrustes affine map, CSLS, and the runtime
+// performance-flag config (gated behind AlignmentConfig::v2_enabled).
+pub use alignment_affine::AffineAlignment;
+pub use alignment_conditioning::Conditioning;
+pub use alignment_config::{
+    AlignmentConfig, AlignmentMethod, AlignmentObjective, CapabilityState, EvalMetric, WhitenMode,
+};
+pub use alignment_csls::{csls_adjust, local_means, topk_mean};
 
 /// Load a primary embedder by canonical identifier.
 ///

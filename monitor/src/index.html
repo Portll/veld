@@ -18,6 +18,7 @@
       <span id="version" class="muted">—</span>
       <button id="open-graph" class="header-btn" title="Open the knowledge-graph viewer">🧠 Graph</button>
     </header>
+    <nav id="tabs" class="tabs hidden"></nav>
     <main>
       <section class="card" id="card-memory">
         <h2>Memory</h2>
@@ -60,6 +61,36 @@
         </span>
       </div>
       <iframe id="graph-frame" title="Veld Memory Graph"></iframe>
+    </div>
+    <div id="first-run" class="hidden">
+      <div id="first-run-card">
+        <h2>Welcome to Veld Monitor</h2>
+        <p class="fr-sub">First-run setup — optional. You can do this later from a fresh install marker.</p>
+
+        <section class="fr-section">
+          <h3>Seed a project</h3>
+          <p class="fr-desc">Scan a project directory into the active instance's memory (paths must be under your home dir or /tmp).</p>
+          <div class="fr-row">
+            <input id="fr-seed-path" type="text" placeholder="C:\\path\\to\\project" />
+            <button id="fr-seed-btn" type="button">Seed</button>
+          </div>
+          <p id="fr-seed-status" class="fr-status"></p>
+        </section>
+
+        <section class="fr-section">
+          <h3>Claude Code hooks</h3>
+          <p class="fr-desc">Check whether a project has the veld hooks wired (so Claude sessions feed memory + show in the Sessions card). Read-only — this never edits your settings.</p>
+          <div class="fr-row">
+            <input id="fr-hook-path" type="text" placeholder="C:\\path\\to\\project" />
+            <button id="fr-hook-btn" type="button">Check</button>
+          </div>
+          <p id="fr-hook-status" class="fr-status"></p>
+        </section>
+
+        <div class="fr-actions">
+          <button id="fr-done" type="button">Done — don't show again</button>
+        </div>
+      </div>
     </div>
     <script type="module" src="main.js"></script>
   </body>
