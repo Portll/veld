@@ -367,7 +367,7 @@ pub async fn file_answer(
     }))
     .map_err(|e| AppError::Internal(anyhow::anyhow!("file_answer: build remember request: {e}")))?;
 
-    let resp = remember(State(state), Json(remember_req)).await?;
+    let resp = remember(State(state), crate::handlers::lenient_json::LenientJson(remember_req)).await?;
     Ok(Json(serde_json::json!({
         "success": true,
         "id": resp.0.id,
@@ -380,7 +380,7 @@ pub async fn file_answer(
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn remember(
     State(state): State<AppState>,
-    Json(req): Json<RememberRequest>,
+    crate::handlers::lenient_json::LenientJson(req): crate::handlers::lenient_json::LenientJson<RememberRequest>,
 ) -> Result<Json<RememberResponse>, AppError> {
     let op_start = std::time::Instant::now();
 

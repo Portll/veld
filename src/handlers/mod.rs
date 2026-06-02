@@ -4,6 +4,7 @@
 //! Each submodule handles a specific domain of functionality.
 
 // Core modules
+pub mod lenient_json;
 pub mod router;
 pub mod state;
 pub mod types;
