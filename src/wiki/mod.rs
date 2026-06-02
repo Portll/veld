@@ -548,4 +548,124 @@ mod tests {
         // Missing last_rendered_hash → not a usable veld page.
         assert!(parse_rendered_page("---\nid: x\n---\n\nbody").is_none());
     }
+
+    /// End-to-end demo: drive the wiki projection like the live write path
+    /// does and show the rendered page + edit-back + forget. Run with
+    /// `cargo test --lib wiki::tests::render_demo_end_to_end -- --nocapture`.
+    #[test]
+    fn render_demo_end_to_end() {
+        use crate::intent_log::{
+            payload::CURRENT_PAYLOAD_SCHEMA_VERSION, CheckpointStore, IntentPayload, Lsn,
+            TypedProjection,
+        };
+        use crate::memory::types::{Experience, ExperienceType, Memory, MemoryId};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let pid = std::process::id();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("veld-wiki-demo-{pid}-{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let wiki_dir = base.join("wiki");
+        let cp = Arc::new(Mutex::new(
+            CheckpointStore::open(base.join("cp.bin")).unwrap(),
+        ));
+        let mut wp = WikiProjection::new(wiki_dir.clone(), cp).unwrap();
+
+        let mk = |content: &str, et: ExperienceType, tags: &[&str], entities: &[&str]| -> Memory {
+            let experience = Experience {
+                experience_type: et,
+                content: content.to_string(),
+                tags: tags.iter().map(|s| s.to_string()).collect(),
+                entities: entities.iter().map(|s| s.to_string()).collect(),
+                ..Experience::default()
+            };
+            Memory::new(MemoryId(Uuid::new_v4()), experience, 0.9, None, None, None, None)
+        };
+        let remember = |m: &Memory| -> IntentPayload {
+            IntentPayload::Remember {
+                user_id: "alice".into(),
+                memory_id: m.id.0.to_string(),
+                memory_bincode: bincode::serde::encode_to_vec(m, bincode::config::standard())
+                    .unwrap(),
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            }
+        };
+
+        // 1) A page-worthy decision (no PII) → renders, round-trips for edit-back.
+        let m1 = mk(
+            "We chose redb over RocksDB for the v0.9 cutover because the single-file store simplifies backups.",
+            ExperienceType::Decision,
+            &["storage", "decision"],
+            &["redb", "RocksDB"],
+        );
+        TypedProjection::apply(&mut wp, Lsn(1), &remember(&m1)).unwrap();
+        let p1 = wiki_dir.join(format!("{}.md", m1.id.0));
+        let page = std::fs::read_to_string(&p1).expect("page rendered");
+        println!("\n========== RENDERED WIKI PAGE: {}.md ==========\n{page}\n========================================\n", m1.id.0);
+
+        assert!(page.contains("page_type: Decision"));
+        assert!(page.contains("last_rendered_hash: "));
+        assert!(page.contains("entities: [redb, RocksDB]"));
+
+        // edit-back contract: unedited body matches the recorded hash
+        // (self-write suppression); an edit makes it differ (ingest).
+        let parsed = parse_rendered_page(&page).unwrap();
+        assert_eq!(
+            body_sha256_hex(&parsed.body),
+            parsed.last_rendered_hash,
+            "W-004: an unedited page hashes to its recorded value → skipped"
+        );
+        let edited = page.replace("simplifies backups", "simplifies backups and restores");
+        let parsed_edited = parse_rendered_page(&edited).unwrap();
+        assert_ne!(
+            body_sha256_hex(&parsed_edited.body),
+            parsed_edited.last_rendered_hash,
+            "W-003: an edited body no longer matches → flows back as an update"
+        );
+        println!("edit-back: unedited page → hash match (skip); edited body → mismatch (ingest).");
+
+        // 2) A memory with PII → redacted on disk (W-008).
+        let m2 = mk(
+            "Escalation contact for the storage migration is alice@example.com.",
+            ExperienceType::Context,
+            &["ops"],
+            &[],
+        );
+        TypedProjection::apply(&mut wp, Lsn(3), &remember(&m2)).unwrap();
+        let page2 = std::fs::read_to_string(wiki_dir.join(format!("{}.md", m2.id.0))).unwrap();
+        assert!(page2.contains("[REDACTED:email]"), "W-008: email redacted on disk");
+        assert!(!page2.contains("alice@example.com"));
+        assert!(page2.contains("redacted: true"));
+        println!("PII: email redacted to [REDACTED:email]; frontmatter redacted: true (edit-back skips it).");
+
+        // 3) Tool-noise is not page-worthy (W-016).
+        let noise = mk("ran `ls`", ExperienceType::Command, &[], &[]);
+        TypedProjection::apply(&mut wp, Lsn(4), &remember(&noise)).unwrap();
+        assert!(
+            !wiki_dir.join(format!("{}.md", noise.id.0)).exists(),
+            "W-016: Command (tool-noise) is not rendered"
+        );
+        println!("eligibility: a Command memory produced no page (W-016).");
+
+        // 4) Forget removes the page.
+        TypedProjection::apply(
+            &mut wp,
+            Lsn(5),
+            &IntentPayload::Forget {
+                user_id: "alice".into(),
+                memory_id: m1.id.0.to_string(),
+                schema_version: Some(CURRENT_PAYLOAD_SCHEMA_VERSION),
+            },
+        )
+        .unwrap();
+        assert!(!p1.exists(), "forget removed the page");
+        println!("forget: page {}.md removed.\n", m1.id.0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

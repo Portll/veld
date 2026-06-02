@@ -5,11 +5,13 @@
 //! and clone the fields they need — never hold the lock across an `.await`.
 
 mod client;
+mod discovery;
 mod dto;
 mod snapshot;
 mod sse;
 
 pub use client::{StatusClient, StatusClientConfig};
+pub use discovery::{discover_instances, instances_dir, DiscoveredInstance};
 pub use snapshot::{
     ActivityEntry, ContextSession, GraphStats, ReachState, ServerHealth, StatusSnapshot,
     TierStats, TodoStats,

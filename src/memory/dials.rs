@@ -36,6 +36,18 @@ fn default_embedding_blend() -> f32 {
     0.1
 }
 
+/// Default cap on simultaneous labile shadows — mirrors
+/// [`crate::constants::RECONSOLIDATION_MAX_ACTIVE_SHADOWS`].
+fn default_max_active_shadows() -> usize {
+    crate::constants::RECONSOLIDATION_MAX_ACTIVE_SHADOWS
+}
+
+/// Default working-memory threshold — mirrors
+/// [`crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD`].
+fn default_working_memory_threshold() -> u32 {
+    crate::constants::RECONSOLIDATION_WORKING_MEMORY_THRESHOLD
+}
+
 /// KV key under which a user's `CognitiveDials` are persisted. The store is per-user
 /// (each `MemorySystem` opens that user's own database), so a bare key is sufficient.
 pub const COGNITIVE_DIALS_KEY: &[u8] = b"cognitive_dials";
@@ -80,6 +92,16 @@ pub struct CognitiveDials {
     /// Blend factor for Layer 3 (`new = normalize((1-blend)·mem + blend·ctx)`).
     #[serde(default = "default_embedding_blend")]
     pub embedding_blend: f32,
+
+    /// Max simultaneous labile shadows before the oldest (expired-first) are evicted
+    /// on the recall path. Caps memory + per-cycle re-encode work.
+    #[serde(default = "default_max_active_shadows")]
+    pub max_active_shadows: usize,
+
+    /// Consecutive-retrieval count at/above which a shadow is treated as *working
+    /// memory* and kept labile (NOT drained at window close). Lower ⇒ drains sooner.
+    #[serde(default = "default_working_memory_threshold")]
+    pub working_memory_threshold: u32,
 
     // ---- Retrieval (fast↔accurate) — None = engine/learned default ------------------
     /// Override the post-fusion refiner stage. `None` keeps the engine default.
@@ -133,6 +155,8 @@ impl Default for CognitiveDials {
             re_encode_entity_enrich: false,
             re_encode_embedding_nudge: false,
             embedding_blend: default_embedding_blend(),
+            max_active_shadows: default_max_active_shadows(),
+            working_memory_threshold: default_working_memory_threshold(),
             refiner_mode: None,
             use_reranking: None,
             candidate_count: None,
@@ -150,6 +174,8 @@ impl CognitiveDials {
         self.reconsolidation_window_secs = self.reconsolidation_window_secs.clamp(30, 3600);
         self.graph_boost_scale = self.graph_boost_scale.clamp(0.0, 1.0);
         self.embedding_blend = self.embedding_blend.clamp(0.0, 0.5);
+        self.max_active_shadows = self.max_active_shadows.clamp(1, 500);
+        self.working_memory_threshold = self.working_memory_threshold.clamp(1, 100);
         if let Some(c) = self.candidate_count {
             self.candidate_count = Some(c.clamp(1, 1000));
         }
@@ -174,7 +200,8 @@ impl CognitiveDials {
     /// `MemorySystem` construction. Unset vars keep the (inert) default. Result is
     /// [`sanitized`](Self::sanitized). Recognized vars:
     /// `VELD_RECONSOLIDATION_{ENABLED,WINDOW_SECS,GRAPH_STRENGTHEN,GRAPH_BOOST_SCALE,
-    /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND}`,
+    /// ENTITY_ENRICH,EMBEDDING_NUDGE,EMBEDDING_BLEND,MAX_ACTIVE_SHADOWS,
+    /// WORKING_MEMORY_THRESHOLD}`,
     /// `VELD_DIALS_{USE_RERANKING,CANDIDATE_COUNT,RERANK_COUNT}`.
     pub fn from_env() -> Self {
         fn env_bool(key: &str) -> Option<bool> {
@@ -208,6 +235,12 @@ impl CognitiveDials {
         }
         if let Some(v) = env_parse::<f32>("VELD_RECONSOLIDATION_EMBEDDING_BLEND") {
             d.embedding_blend = v;
+        }
+        if let Some(v) = env_parse::<usize>("VELD_RECONSOLIDATION_MAX_ACTIVE_SHADOWS") {
+            d.max_active_shadows = v;
+        }
+        if let Some(v) = env_parse::<u32>("VELD_RECONSOLIDATION_WORKING_MEMORY_THRESHOLD") {
+            d.working_memory_threshold = v;
         }
         if let Some(v) = env_bool("VELD_DIALS_USE_RERANKING") {
             d.use_reranking = Some(v);
