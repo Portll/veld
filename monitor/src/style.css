@@ -428,6 +428,9 @@ main {
   font-size: 12px;
 }
 .fr-row button:hover { background: #28324f; }
+/* Browse… is secondary (neutral) so the primary Seed/Check action stands out */
+.fr-row button.fr-browse { background: #2b2d3c; color: #c8c8d4; border-color: #3a3d4f; }
+.fr-row button.fr-browse:hover { background: #353849; }
 .fr-status { margin: 6px 0 0; font-size: 11px; min-height: 14px; }
 .fr-status.ok { color: #4ec77a; }
 .fr-status.err { color: #dc5a5a; }
