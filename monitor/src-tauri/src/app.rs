@@ -92,6 +92,7 @@ fn spawn_client(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let base_url = std::env::var("VELD_SERVER_URL")
                 .ok()
@@ -172,7 +173,8 @@ pub fn run() {
             first_run_check,
             mark_initialized,
             seed_project,
-            claude_hook_status
+            claude_hook_status,
+            pick_directory
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri application");
@@ -331,6 +333,22 @@ fn claude_hook_status(project_dir: String) -> HookStatus {
         configured,
         path: path.display().to_string(),
     }
+}
+
+/// Open a native folder picker and return the chosen directory (or None if the
+/// user cancels). Backs the "Browse…" buttons on the first-run panel's path inputs.
+#[tauri::command]
+async fn pick_directory(app: AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
+    rx.await
+        .ok()
+        .flatten()
+        .and_then(|fp| fp.into_path().ok())
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// Keep the fleet in sync with the registry: add pollers for newly-online

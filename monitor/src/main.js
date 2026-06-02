@@ -616,6 +616,22 @@ async function setupFirstRun() {
     });
   }
 
+  // "Browse…" buttons → native folder picker (Tauri dialog) → fill the input.
+  const wireBrowse = (btnId, input) => {
+    const btn = document.getElementById(btnId);
+    if (!btn || !input) return;
+    btn.addEventListener("click", async () => {
+      try {
+        const dir = await invoke("pick_directory");
+        if (dir) input.value = dir;
+      } catch (err) {
+        diagPush("ERROR", "pick_directory failed: " + (err?.message || err));
+      }
+    });
+  };
+  wireBrowse("fr-seed-browse", seedPath);
+  wireBrowse("fr-hook-browse", hookPath);
+
   const done = document.getElementById("fr-done");
   if (done) {
     done.addEventListener("click", async () => {
