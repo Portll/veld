@@ -1,6 +1,9 @@
 # Rust
 /target/
 **/target/
+# Isolated bench build target (CARGO_TARGET_DIR=target-bench) — build output, never source
+/target-bench/
+**/target-bench/
 **/*.rs.bk
 *.pdb
 
@@ -127,6 +130,16 @@ benchmarks/*_results.json
 benchmarks/debug_*.json
 bench_data_locomo/
 locomo_results.json
+
+# Canonical bench/scratch OUTPUT dir — all bench data, stores, and result files
+# are disposable and must land here (or under target/), never in the repo root.
+# Convention: builds → CARGO_TARGET_DIR=target-bench; data/results → bench-output/.
+bench-output/
+**/bench-output/
+# Scratch / demo server stores (e.g. the monitor multi-instance demo)
+**/*-scratch-store/
+**/demo-*-store/
+bench_data_*/
 
 # Evaluations directory — eval result snapshots + corpus data are derived,
 # not source. Includes alignment TOMLs/scripts; re-add with `git add -f` if
