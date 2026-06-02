@@ -145,7 +145,7 @@ impl SlowStore {
 
     /// Get active (non-dismissed) thoughts, ordered by confidence
     pub fn get_active_thoughts(&self, limit: usize) -> Result<Vec<StoredThought>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, scope, confidence, description, hypothesis,
                     evidence_json, impact_score, entities_json, created_at,
@@ -210,7 +210,7 @@ impl SlowStore {
 
     /// Get unresolved gaps by type
     pub fn get_unresolved_gaps(&self, gap_type: &str, limit: usize) -> Result<Vec<StoredGap>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, gap_type, shape_signature, entities_json, missing_links_json,
                     confidence, embedding_distance, impact_score, detected_at, scope
@@ -243,7 +243,7 @@ impl SlowStore {
     /// Get all unresolved gaps for a scope (across gap types), most impactful
     /// first. Scope-filtered to prevent cross-user gap leakage (M5).
     pub fn get_unresolved_gaps_all(&self, scope: &str, limit: usize) -> Result<Vec<StoredGap>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, gap_type, shape_signature, entities_json, missing_links_json,
                     confidence, embedding_distance, impact_score, detected_at, scope
@@ -417,7 +417,7 @@ impl SlowStore {
         user_id: &str,
         memory_id: &str,
     ) -> Result<Option<StoredMemoryRow>> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let row = conn
             .query_row(
                 "SELECT user_id, memory_id, lsn, memory_bincode, importance, updated_at
@@ -443,7 +443,7 @@ impl SlowStore {
     /// Total number of memory rows for a tenant. Used by tests and the
     /// admin dashboard to confirm replay caught up.
     pub fn count_memories(&self, user_id: &str) -> Result<u64> {
-        let conn = self.conn.lock();
+        let conn = self.read()?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE user_id = ?1",
             params![user_id],
