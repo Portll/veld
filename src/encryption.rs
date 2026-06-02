@@ -128,15 +128,17 @@ impl FieldEncryptor {
         ))
     }
 
-    /// Encrypt a plaintext content string.
+    /// Encrypt an arbitrary byte payload.
     ///
     /// Returns bytes in the format: `[ENCRYPTED_MARKER (4)][nonce (12)][ciphertext+tag]`.
-    /// The nonce is randomly generated for each call.
-    pub fn encrypt_content(&self, plaintext: &str) -> Result<Vec<u8>> {
+    /// The nonce is randomly generated for each call. This is the byte-level
+    /// primitive; [`encrypt_content`](Self::encrypt_content) is the UTF-8
+    /// string convenience wrapper.
+    pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = self
             .cipher
-            .encrypt(&nonce, plaintext.as_bytes())
+            .encrypt(&nonce, plaintext)
             .map_err(|e| anyhow!("AES-256-GCM encryption failed: {}", e))?;
 
         let mut output = Vec::with_capacity(ENCRYPTED_MARKER.len() + NONCE_SIZE + ciphertext.len());
@@ -146,16 +148,21 @@ impl FieldEncryptor {
         Ok(output)
     }
 
+    /// Encrypt a plaintext content string. UTF-8 wrapper over [`encrypt_bytes`](Self::encrypt_bytes).
+    pub fn encrypt_content(&self, plaintext: &str) -> Result<Vec<u8>> {
+        self.encrypt_bytes(plaintext.as_bytes())
+    }
+
     /// Decrypt an encrypted content blob back to a plaintext string.
     ///
     /// Expects the format: `[ENCRYPTED_MARKER (4)][nonce (12)][ciphertext+tag]`.
     /// Returns an error if the data is too short, the marker is missing, or
     /// decryption/authentication fails.
-    pub fn decrypt_content(&self, data: &[u8]) -> Result<String> {
+    pub fn decrypt_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
         let min_size = ENCRYPTED_MARKER.len() + MIN_ENCRYPTED_SIZE;
         if data.len() < min_size {
             return Err(anyhow!(
-                "Encrypted content too short: {} bytes (minimum {})",
+                "Encrypted data too short: {} bytes (minimum {})",
                 data.len(),
                 min_size
             ));
@@ -169,13 +176,16 @@ impl FieldEncryptor {
         let ciphertext = &data[4 + NONCE_SIZE..];
 
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext_bytes = self
-            .cipher
+        self.cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow!("AES-256-GCM decryption failed (wrong key or corrupted data): {}", e))?;
+            .map_err(|e| anyhow!("AES-256-GCM decryption failed (wrong key or corrupted data): {}", e))
+    }
 
-        String::from_utf8(plaintext_bytes)
-            .context("Decrypted content is not valid UTF-8")
+    /// Decrypt an encrypted content blob back to a plaintext string. UTF-8
+    /// wrapper over [`decrypt_bytes`](Self::decrypt_bytes).
+    pub fn decrypt_content(&self, data: &[u8]) -> Result<String> {
+        let plaintext_bytes = self.decrypt_bytes(data)?;
+        String::from_utf8(plaintext_bytes).context("Decrypted content is not valid UTF-8")
     }
 
     /// Check whether a byte slice looks like encrypted content (has the marker prefix).
@@ -206,6 +216,18 @@ mod tests {
         let decrypted = enc.decrypt_content(&encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encrypt_decrypt_bytes_roundtrip() {
+        let enc = FieldEncryptor::new(&test_key());
+        // A non-UTF-8 binary blob (the slow store's memory_bincode is bincode).
+        let blob: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+
+        let encrypted = enc.encrypt_bytes(&blob).unwrap();
+        assert!(FieldEncryptor::is_encrypted(&encrypted));
+        assert_ne!(encrypted, blob, "ciphertext must differ from plaintext");
+        assert_eq!(enc.decrypt_bytes(&encrypted).unwrap(), blob);
     }
 
     #[test]
