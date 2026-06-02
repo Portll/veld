@@ -33,6 +33,8 @@
 //! Edit-back (the file watcher, W-003/W-004) and an authed manual-render
 //! endpoint (W-018) build on this foundation in follow-up commits.
 
+pub mod watcher;
+
 use std::error::Error;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

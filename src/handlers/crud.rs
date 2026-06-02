@@ -1357,6 +1357,11 @@ pub async fn wiki_render(
         ));
     }
 
+    // (b) Start the live edit-back watcher for this user (no-op unless
+    // VELD_WIKI_WATCH is on). The Arc is the shared AppState the watcher
+    // thread calls back into.
+    state.ensure_wiki_watcher(state.clone(), &user_id);
+
     let (target_dir, pages, edits_applied) =
         state.render_wiki(&user_id).map_err(AppError::Internal)?;
 
