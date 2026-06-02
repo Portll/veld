@@ -163,6 +163,13 @@ enum Commands {
     /// Diagnose common issues (storage, ONNX, port, server health)
     Doctor,
 
+    /// Stop a running veld server by its port
+    Stop {
+        /// Port the target server is listening on (e.g. --port 3032)
+        #[arg(long)]
+        port: u16,
+    },
+
     /// Output Claude Code hook JSON
     Hook {
         #[command(subcommand)]
@@ -350,6 +357,13 @@ async fn main() -> Result<()> {
         // =====================================================================
         Commands::Doctor => {
             handle_doctor()?;
+        }
+
+        // =====================================================================
+        // NEW: veld stop — stop a running server by port
+        // =====================================================================
+        Commands::Stop { port } => {
+            handle_stop(port)?;
         }
 
         // =====================================================================
@@ -605,6 +619,105 @@ fn handle_status(api_url: &str, api_key: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Stop a running veld server listening on `port`.
+///
+/// Resolves the pid from the instance registry first (and removes that registry
+/// file), falling back to an OS port→pid lookup for servers that predate the
+/// registry. Termination is graceful on Unix (SIGTERM → the server's shutdown
+/// handler deregisters cleanly) and forced on Windows.
+fn handle_stop(port: u16) -> Result<()> {
+    use std::process::Command;
+
+    // 1) Registry lookup — also lets us clean up the stale registry file.
+    let mut pid: Option<u32> = None;
+    let dir = veld::instance_registry::instances_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(info) =
+                    serde_json::from_str::<veld::instance_registry::InstanceInfo>(&text)
+                {
+                    if info.port == port {
+                        pid = Some(info.pid);
+                        let _ = std::fs::remove_file(&path); // best-effort cleanup
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Fallback: ask the OS which pid is listening on the port (covers servers
+    //    that predate the registry, e.g. an older :3030 build).
+    if pid.is_none() {
+        pid = pid_listening_on_port(port);
+    }
+
+    let Some(pid) = pid else {
+        anyhow::bail!("no veld server found on port {port} (not in the registry, and nothing is listening there)");
+    };
+
+    println!("Stopping veld server on port {port} (pid {pid})…");
+    let stopped = if cfg!(windows) {
+        Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    if stopped {
+        println!("✓ stopped veld on port {port} (pid {pid})");
+        Ok(())
+    } else {
+        anyhow::bail!("failed to terminate pid {pid} (port {port}) — it may need elevated permissions")
+    }
+}
+
+/// Best-effort: find the pid of the process listening on `127.0.0.1:port`.
+#[cfg(windows)]
+fn pid_listening_on_port(port: u16) -> Option<u32> {
+    let out = std::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle = format!(":{port}");
+    for line in text.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // PROTO  Local-Address  Foreign-Address  State  PID
+        if cols.len() >= 5 && cols[1].ends_with(&needle) {
+            if let Ok(pid) = cols[cols.len() - 1].parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn pid_listening_on_port(port: u16) -> Option<u32> {
+    let out = std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().and_then(|l| l.trim().parse::<u32>().ok())
 }
 
 fn handle_doctor() -> Result<()> {
