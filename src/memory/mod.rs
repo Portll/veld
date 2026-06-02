@@ -330,6 +330,10 @@ pub struct MemorySystem {
     /// `None` — inert until explicitly dialed on. See [`dials::CognitiveDials`].
     cognitive_dials: Arc<parking_lot::RwLock<dials::CognitiveDials>>,
 
+    /// Per-user alignment performance flags (v2). Seeded from `VELD_ALIGN_*` env, overlaid
+    /// with any persisted runtime value; gated behind `v2_enabled` (default off = parity).
+    alignment_config: Arc<parking_lot::RwLock<crate::embeddings::AlignmentConfig>>,
+
     /// Signal attribution from the most recent semantic retrieval.
     /// Records which scoring signals (BM25, vector, graph, cross-encoder, recency,
     /// temporal match, entity overlap) contributed to each memory's ranking.
@@ -887,6 +891,20 @@ impl MemorySystem {
         }
         hybrid_search_engine.attach_dials(cognitive_dials_arc.clone());
 
+        // Alignment v2 flags: seed from env, overlay any persisted runtime value.
+        let alignment_config_arc = Arc::new(parking_lot::RwLock::new(
+            crate::embeddings::AlignmentConfig::from_env(),
+        ));
+        if let Ok(Some(bytes)) = storage
+            .key_value_store()
+            .get_bytes(crate::embeddings::alignment_config::ALIGNMENT_CONFIG_KEY)
+        {
+            match serde_json::from_slice::<crate::embeddings::AlignmentConfig>(&bytes) {
+                Ok(persisted) => *alignment_config_arc.write() = persisted.sanitized(),
+                Err(e) => tracing::warn!("ignoring corrupt persisted alignment config: {e}"),
+            }
+        }
+
         #[cfg(feature = "multi-tenant")]
         if let Some(collective_dir) = config.collective_store_dir.as_ref() {
             if let Some((bm25, vector, graph, update_count)) =
@@ -999,6 +1017,8 @@ impl MemorySystem {
             // handle is attached to the hybrid-search engine so retrieval overrides
             // take effect). KV-persisted per-user override is wired separately.
             cognitive_dials: cognitive_dials_arc,
+            // Alignment v2 flags (seeded from env above; KV-overlaid).
+            alignment_config: alignment_config_arc,
             // Signal attribution from most recent semantic retrieval
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
@@ -1087,6 +1107,36 @@ impl MemorySystem {
             Err(e) => tracing::warn!("failed to serialize cognitive dials: {e}"),
         }
         *self.cognitive_dials.write() = d;
+    }
+
+    /// Snapshot the current alignment config (cheap clone under read lock).
+    pub fn alignment_config(&self) -> crate::embeddings::AlignmentConfig {
+        self.alignment_config.read().clone()
+    }
+
+    /// Replace the alignment config at runtime: sanitize ranges, reject configs the build
+    /// can't honor (no gradient runtime / vec2vec not compiled yet), stamp `updated_at`,
+    /// and persist (best-effort). Returns the sanitized config or a validation message.
+    pub fn set_alignment_config(
+        &self,
+        new_config: crate::embeddings::AlignmentConfig,
+    ) -> Result<crate::embeddings::AlignmentConfig, String> {
+        let mut c = new_config.sanitized();
+        c.validate(false, false)?;
+        c.updated_at = Some(chrono::Utc::now());
+        match serde_json::to_vec(&c) {
+            Ok(bytes) => {
+                if let Err(e) = self.long_term_memory.key_value_store().put_bytes(
+                    crate::embeddings::alignment_config::ALIGNMENT_CONFIG_KEY,
+                    &bytes,
+                ) {
+                    tracing::warn!("failed to persist alignment config: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize alignment config: {e}"),
+        }
+        *self.alignment_config.write() = c.clone();
+        Ok(c)
     }
 
     /// Get current External dimension scores (Sleight) (read during Layer 5 scoring).
