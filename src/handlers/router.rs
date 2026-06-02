@@ -14,7 +14,8 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
-    mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time, todos, user_auth,
+    memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
+    todos, user_auth,
     users, visualization, webhooks,
 };
 
@@ -269,6 +270,18 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // binding, never a bare ?user_id= on the public router.
         // =================================================================
         .route("/api/wiki/render", post(crud::wiki_render))
+        // =================================================================
+        // FILE ANSWER (A5) — file a synthesis as a derived memory, with the
+        // anti-autophagy guard (W-022: a derived memory can't be cited).
+        // =================================================================
+        .route("/api/file_answer", post(remember::file_answer))
+        // =================================================================
+        // MERGE / SPLIT (J3) — identity-shifting memory ops; split ranges are
+        // character indices, so multibyte content is never cut mid-codepoint
+        // (W-021).
+        // =================================================================
+        .route("/api/memory/merge", post(memory_ops::merge_memories))
+        .route("/api/memory/split", post(memory_ops::split_memory))
         // =================================================================
         // AGENT-DIRECTED TIER MOVES
         // =================================================================
