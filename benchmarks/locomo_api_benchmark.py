@@ -13,6 +13,7 @@ Reports per-category MRR, R@5, R@10, and overall MRR.
 """
 
 import json
+import os
 import sys
 import time
 import requests
@@ -625,7 +626,10 @@ def main():
             "n": n,
         }
 
-    output_path = f"benchmarks/locomo_api_{USER_ID}.json"
+    # Always write to the gitignored temp/output dir (override with VELD_BENCH_OUTPUT_DIR).
+    bench_dir = os.environ.get("VELD_BENCH_OUTPUT_DIR", "bench-output")
+    os.makedirs(bench_dir, exist_ok=True)
+    output_path = os.path.join(bench_dir, f"locomo_api_{USER_ID}.json")
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nRaw results saved to: {output_path}")
