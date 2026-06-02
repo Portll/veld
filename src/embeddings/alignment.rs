@@ -23,6 +23,12 @@ use std::path::Path;
 
 pub const MAGIC: &[u8; 8] = b"VELDALN1";
 
+/// The 7-byte format-family prefix. The 8th magic byte is an ASCII version digit, so a
+/// structural change to the on-disk format MUST bump that digit (and `MAGIC`).
+const MAGIC_PREFIX: &[u8; 7] = b"VELDALN";
+/// Highest on-disk format version this build can read (the ASCII digit in `MAGIC`).
+const CURRENT_FORMAT_VERSION: u8 = b'1';
+
 /// Identifier pair for the embedders an alignment was fitted on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AlignmentPairId {
@@ -108,34 +114,89 @@ pub fn save_alignment(path: &Path, alignment: &dyn Alignment) -> Result<()> {
     Ok(())
 }
 
+/// Reject a length field that claims more bytes than remain in the file, *before* any
+/// allocation — guards against OOM from a corrupt or hostile alignment file claiming a
+/// huge header/payload length.
+fn bounded_len(claimed: u64, remaining: u64, what: &str, path: &Path) -> Result<usize> {
+    if claimed > remaining {
+        bail!(
+            "{} declares a {} of {} bytes but only {} bytes remain in the file",
+            path.display(),
+            what,
+            claimed,
+            remaining
+        );
+    }
+    Ok(claimed as usize)
+}
+
 /// Read header and payload from disk for dispatch by method.
+///
+/// Hardened: the 8th magic byte is treated as an explicit format-version digit (a file
+/// from a newer Veld fails with an actionable error rather than a silent mis-decode —
+/// bincode headers are positional / non-self-describing), and every length field is
+/// bounded by the bytes actually remaining in the file before allocation.
 pub fn read_alignment_file(path: &Path) -> Result<(AlignmentHeader, Vec<u8>)> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file_size = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
     let mut r = BufReader::new(file);
 
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic).context("reading magic")?;
-    if &magic != MAGIC {
+    if &magic[..7] != MAGIC_PREFIX {
         bail!(
-            "alignment file magic mismatch at {}: expected {:?}, got {:?}",
+            "{} is not a Veld alignment file (bad magic {:?})",
             path.display(),
-            MAGIC,
             magic
         );
     }
+    match magic[7] {
+        CURRENT_FORMAT_VERSION => {}
+        v if v > CURRENT_FORMAT_VERSION => bail!(
+            "{} is alignment format version '{}', but this build reads version '{}' — upgrade Veld or re-fit the alignment",
+            path.display(),
+            v as char,
+            CURRENT_FORMAT_VERSION as char
+        ),
+        v => bail!(
+            "{} has an unrecognized alignment format-version byte {:#04x}",
+            path.display(),
+            v
+        ),
+    }
+
+    // Bytes left after the 8-byte magic; decremented as each section is consumed so a
+    // lying length field can never drive an unbounded allocation.
+    let mut remaining = file_size.saturating_sub(8);
 
     let mut header_len_bytes = [0u8; 4];
     r.read_exact(&mut header_len_bytes)?;
-    let header_len = u32::from_le_bytes(header_len_bytes) as usize;
+    remaining = remaining.saturating_sub(4);
+    let header_len = bounded_len(
+        u32::from_le_bytes(header_len_bytes) as u64,
+        remaining,
+        "header",
+        path,
+    )?;
     let mut header_buf = vec![0u8; header_len];
     r.read_exact(&mut header_buf)?;
+    remaining = remaining.saturating_sub(header_len as u64);
     let (header, _consumed): (AlignmentHeader, usize) =
         bincode::serde::decode_from_slice(&header_buf, bincode::config::standard())
             .context("decoding alignment header")?;
 
     let mut payload_len_bytes = [0u8; 8];
     r.read_exact(&mut payload_len_bytes)?;
-    let payload_len = u64::from_le_bytes(payload_len_bytes) as usize;
+    remaining = remaining.saturating_sub(8);
+    let payload_len = bounded_len(
+        u64::from_le_bytes(payload_len_bytes),
+        remaining,
+        "payload",
+        path,
+    )?;
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload)?;
 
@@ -286,5 +347,59 @@ mod tests {
         let f = id.cache_filename();
         assert!(!f.contains('/'));
         assert!(f.ends_with(".bin"));
+    }
+
+    /// A real V1 file (current format) still reads after the version-dispatch hardening.
+    #[test]
+    fn reads_current_v1_format() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v1.bin");
+        save_alignment(&path, &IdentityAlignment::new(8, pid())).unwrap();
+        let (header, payload) = read_alignment_file(&path).unwrap();
+        assert_eq!(header.in_dim, 8);
+        assert!(payload.is_empty());
+    }
+
+    fn valid_v1_bytes() -> Vec<u8> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v1.bin");
+        save_alignment(&path, &IdentityAlignment::new(8, pid())).unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    /// A file whose magic carries a newer version digit fails with an actionable error,
+    /// not a silent mis-decode.
+    #[test]
+    fn rejects_newer_format_version() {
+        let mut bytes = valid_v1_bytes();
+        bytes[7] = b'2';
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v2.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let err = read_alignment_file(&path).unwrap_err().to_string();
+        assert!(err.contains("version"), "unexpected error: {err}");
+    }
+
+    /// A corrupt payload-length field is rejected before any allocation (no OOM).
+    #[test]
+    fn rejects_oversized_payload_len() {
+        let mut bytes = valid_v1_bytes();
+        let n = bytes.len();
+        bytes[n - 8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge_payload.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_alignment_file(&path).is_err());
+    }
+
+    /// A corrupt header-length field is rejected before any allocation (no OOM).
+    #[test]
+    fn rejects_oversized_header_len() {
+        let mut bytes = valid_v1_bytes();
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge_header.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_alignment_file(&path).is_err());
     }
 }
