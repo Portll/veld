@@ -93,6 +93,10 @@ pub struct CrossEncoderConfig {
     /// Whether the model's ONNX graph accepts `token_type_ids`. BERT-family
     /// models do; XLM-RoBERTa-family models (BGE, Jina) do not.
     pub has_token_type_ids: bool,
+    /// Recommended candidate count for reranking with this model. Heavier
+    /// models score fewer candidates to stay under the HTTP request budget;
+    /// `VELD_RERANK_DEPTH` overrides per-process.
+    pub rerank_top_k: usize,
     /// Parameter count in millions (for the picker UI and registry table).
     pub params_millions: u32,
     /// Approximate download size in MB.
@@ -132,6 +136,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 70,
             download_mb: 280,
             year: 2024,
+            rerank_top_k: 20,
             notes:
                 "BERT; smallest current reranker. ~3x MiniLM but trained on modern QA + retrieval; \
                  the cheap upgrade path off MS-MARCO-MiniLM.",
@@ -148,6 +153,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 184,
             download_mb: 740,
             year: 2024,
+            rerank_top_k: 12,
             notes:
                 "BERT; mid-size mxbai variant. Quality close to bge-reranker-v2-m3 at a third the cost.",
         },
@@ -163,6 +169,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 33,
             download_mb: 130,
             year: 2024,
+            rerank_top_k: 20,
             notes:
                 "JinaBERT (English only); modern drop-in replacement for ms-marco-MiniLM-L-6-v2 \
                  in the same size class. ~50% larger than MiniLM, 3 years newer, broader training mix.",
@@ -179,6 +186,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 37,
             download_mb: 150,
             year: 2024,
+            rerank_top_k: 20,
             notes:
                 "JinaBERT (English only); slightly larger sibling of jina-reranker-v1-tiny-en. \
                  The mini-class option for English-only deployments wanting a small accuracy bump.",
@@ -195,20 +203,30 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 22,
             download_mb: 80,
             year: 2021,
+            rerank_top_k: 20,
             notes: "BERT-style; trained on MS MARCO web-search passages. Fast, narrow domain.",
         },
         CrossEncoderConfig {
             id: "bge-reranker-v2-m3".into(),
+            // BAAI's repo only ships safetensors. EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu
+            // is a CPU-optimised ONNX export (Olive O3 pass) that runs ~2-3x faster
+            // than the unquantised celinehoang export. External data file is fetched
+            // automatically by `download_external_data_if_present()`.
             model_url:
-                "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/main/onnx/model.onnx".into(),
+                "https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main/model.onnx"
+                    .into(),
             tokenizer_url:
-                "https://huggingface.co/BAAI/bge-reranker-v2-m3/resolve/main/tokenizer.json".into(),
+                "https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main/tokenizer.json"
+                    .into(),
             has_token_type_ids: false,
             params_millions: 568,
             download_mb: 2270,
             year: 2024,
+            rerank_top_k: 8,
             notes:
-                "XLM-RoBERTa-style; multilingual + multi-task (QA, retrieval, conversational). Default.",
+                "XLM-RoBERTa-style; multilingual + multi-task (QA, retrieval, conversational). \
+                 Best quality but biggest download (2.3 GB across model.onnx + model.onnx_data). \
+                 Source: EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu (Olive O3 CPU-optimised).",
         },
         CrossEncoderConfig {
             id: "mxbai-rerank-large-v1".into(),
@@ -222,6 +240,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 435,
             download_mb: 1740,
             year: 2024,
+            rerank_top_k: 8,
             notes: "BERT-style; trained on QA + retrieval pairs. Strong on factoid queries.",
         },
         CrossEncoderConfig {
@@ -236,6 +255,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             params_millions: 278,
             download_mb: 1110,
             year: 2024,
+            rerank_top_k: 10,
             notes:
                 "XLM-RoBERTa-style; multilingual; late-interaction-influenced training. Mid-size sweet spot.",
         },
@@ -271,6 +291,32 @@ pub fn lookup(id: &str) -> Result<CrossEncoderConfig> {
 /// privately-hosted models or fine-tunes that shouldn't be hard-coded.
 pub fn register(config: CrossEncoderConfig) {
     REGISTRY.write().insert(config.id.clone(), config);
+}
+
+/// Recommended rerank candidate count for the active cross-encoder.
+///
+/// Resolution order:
+/// 1. `VELD_RERANK_DEPTH=<usize>` — operator override, applied globally.
+/// 2. Per-model `rerank_top_k` from the registry entry pointed at by
+///    `VELD_CROSS_ENCODER` (or default).
+/// 3. Fallback constant (20) if neither is resolvable.
+pub fn current_rerank_depth() -> usize {
+    if let Ok(raw) = std::env::var("VELD_RERANK_DEPTH") {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+            tracing::warn!("VELD_RERANK_DEPTH=`{raw}` invalid (must be > 0); using model default");
+        } else {
+            tracing::warn!("VELD_RERANK_DEPTH=`{raw}` is not a usize; using model default");
+        }
+    }
+
+    let id = std::env::var("VELD_CROSS_ENCODER")
+        .ok()
+        .unwrap_or_else(|| DEFAULT_CROSS_ENCODER_ID.to_string());
+
+    lookup(&id).map(|c| c.rerank_top_k).unwrap_or(20)
 }
 
 /// Snapshot of registered models — `(id, params_M, download_MB, year, notes)`.
@@ -368,6 +414,22 @@ impl OnnxCrossEncoder {
         if !model_path.exists() {
             download_file(&self.config.model_url, &model_path)
                 .with_context(|| format!("Failed to download model for {}", self.config.id))?;
+            // ONNX exports of models >2 GB split into `model.onnx` + a companion
+            // external-data file. The exact filename varies between
+            // `model.onnx_data` and `model.onnx.data` depending on the export
+            // tool. Try both, best-effort; small models that don't need it
+            // simply 404 silently. ORT loads whichever sits next to model.onnx.
+            for ext in ["onnx_data", "onnx.data"] {
+                let data_url = derive_data_url(&self.config.model_url, ext);
+                let data_path = dir.join(format!("model.{ext}"));
+                if let Err(e) = download_file(&data_url, &data_path) {
+                    tracing::debug!(
+                        "Optional external data file not present for {} ({ext}): {e}",
+                        self.config.id
+                    );
+                    let _ = std::fs::remove_file(&data_path);
+                }
+            }
         }
         if !tokenizer_path.exists() {
             download_file(&self.config.tokenizer_url, &tokenizer_path)
@@ -498,9 +560,43 @@ impl CrossEncoderModel for OnnxCrossEncoder {
                 ])?
             };
 
+            // Output-shape dispatch:
+            //   [1, 1] — single regression logit (ms-marco-MiniLM family, mxbai).
+            //   [1, 2] — binary classifier logits (BGE-reranker-v2-m3,
+            //            most XLM-RoBERTa-based rerankers). Convert to a
+            //            relevance score via softmax then take the
+            //            "relevant" probability so it's directly
+            //            comparable to single-logit models.
             let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-            let (_shape, data) = output_tensor;
-            let score = data.first().copied().unwrap_or(0.0);
+            let (shape, data) = output_tensor;
+            let last_dim = shape.last().copied().unwrap_or(1) as usize;
+            let score = match last_dim {
+                1 => data.first().copied().unwrap_or(0.0),
+                2 => {
+                    let a = data.first().copied().unwrap_or(0.0);
+                    let b = data.get(1).copied().unwrap_or(0.0);
+                    // Stable softmax → P(relevant).
+                    let m = a.max(b);
+                    let ea = (a - m).exp();
+                    let eb = (b - m).exp();
+                    eb / (ea + eb)
+                }
+                _ => {
+                    // Unknown head shape — degrade gracefully to first slot
+                    // so the model is still callable but log once so the
+                    // misconfig is visible.
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(
+                            "cross-encoder {} returned unexpected output shape {:?}; \
+                             using data[0] as score",
+                            self.config.id,
+                            shape
+                        );
+                    });
+                    data.first().copied().unwrap_or(0.0)
+                }
+            };
             scores.push(score);
         }
 
@@ -682,6 +778,10 @@ fn download_file(url: &str, path: &PathBuf) -> Result<()> {
     let resp = ureq::get(url)
         .call()
         .with_context(|| format!("HTTP request failed: {url}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        anyhow::bail!("HTTP {status} for {url}");
+    }
 
     let mut reader = resp.into_body().into_reader();
     let mut file = std::fs::File::create(path)
@@ -689,6 +789,18 @@ fn download_file(url: &str, path: &PathBuf) -> Result<()> {
 
     std::io::copy(&mut reader, &mut file)?;
     Ok(())
+}
+
+/// Given a model.onnx URL, return the companion external-data URL with the
+/// given extension (e.g. `onnx_data` or `onnx.data`).
+fn derive_data_url(model_url: &str, ext: &str) -> String {
+    // Replace the trailing `model.onnx` with `model.<ext>`.
+    if let Some(stripped) = model_url.strip_suffix("model.onnx") {
+        format!("{stripped}model.{ext}")
+    } else {
+        // Fallback for non-standard URLs: just append.
+        format!("{model_url}.{ext}")
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -738,6 +850,7 @@ mod tests {
             params_millions: 100,
             download_mb: 400,
             year: 2026,
+            rerank_top_k: 15,
             notes: "test fixture",
         });
         let cfg = lookup("test-custom-model").unwrap();
