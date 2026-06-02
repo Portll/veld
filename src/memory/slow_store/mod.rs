@@ -29,6 +29,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
 
@@ -55,8 +56,101 @@ pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 /// Periodically synced from the RocksDB fast store (GraphMemory).
 pub struct SlowStore {
     pub(crate) conn: Mutex<Connection>,
+    /// Pool of read-only connections. WAL allows many concurrent readers
+    /// alongside the single writer, but a lone `Mutex<Connection>` serialized
+    /// every read behind every write (and behind every other read). Reads now
+    /// check a connection out of this pool, so a long gap-analysis query no
+    /// longer blocks a live projection write — or another reader.
+    read_pool: ReadPool,
     path: PathBuf,
     last_sync: Mutex<Option<std::time::Instant>>,
+}
+
+/// Maximum reader connections kept idle in the pool. Bursts beyond this open
+/// transient connections that are closed on return rather than pooled, so a
+/// spike can't pin unbounded memory (each reader carries its own page cache).
+const READ_POOL_MAX_IDLE: usize = 4;
+
+/// A pool of read-only SQLite connections over the single WAL database.
+///
+/// Connections are opened lazily and reused. Each is `query_only` (writes
+/// error) and `NO_MUTEX` (so it must be touched by one thread at a time — the
+/// checkout/return discipline guarantees that). Readers are full WAL
+/// participants: they observe a consistent snapshot concurrently with the
+/// writer.
+struct ReadPool {
+    idle: Mutex<Vec<Connection>>,
+    path: PathBuf,
+}
+
+impl ReadPool {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            path,
+        }
+    }
+
+    /// Open a fresh reader. Opened `READ_WRITE` (not `READ_ONLY`) so it can
+    /// initialise the WAL shared-memory index — a pure read-only handle can
+    /// fail to attach to a WAL database — then pinned to `query_only` so it can
+    /// never actually mutate.
+    fn open_reader(path: &Path) -> Result<Connection> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("Failed to open slow store reader connection")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "cache_size", "-4096")?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        Ok(conn)
+    }
+
+    /// Check out a reader: reuse an idle one or open a new one.
+    fn checkout(&self) -> Result<PooledConn<'_>> {
+        let reused = self.idle.lock().pop();
+        let conn = match reused {
+            Some(conn) => conn,
+            None => Self::open_reader(&self.path)?,
+        };
+        Ok(PooledConn {
+            pool: self,
+            conn: Some(conn),
+        })
+    }
+
+    /// Return a reader to the idle set, or drop it if the pool is full.
+    fn put_back(&self, conn: Connection) {
+        let mut idle = self.idle.lock();
+        if idle.len() < READ_POOL_MAX_IDLE {
+            idle.push(conn);
+        }
+    }
+}
+
+/// RAII handle to a pooled reader. Derefs to [`Connection`] and returns the
+/// connection to the pool on drop.
+pub(crate) struct PooledConn<'a> {
+    pool: &'a ReadPool,
+    conn: Option<Connection>,
+}
+
+impl Deref for PooledConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("pooled connection present until drop")
+    }
+}
+
+impl Drop for PooledConn<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.put_back(conn);
+        }
+    }
 }
 
 impl SlowStore {
@@ -83,12 +177,20 @@ impl SlowStore {
 
         let store = Self {
             conn: Mutex::new(conn),
+            read_pool: ReadPool::new(path.to_owned()),
             path: path.to_owned(),
             last_sync: Mutex::new(None),
         };
         store.create_schema()?;
         store.check_schema_version()?;
         Ok(store)
+    }
+
+    /// Check out a pooled read-only connection. All read paths use this instead
+    /// of locking the write `conn`, so reads run concurrently with the writer
+    /// (and with one another) under WAL rather than serializing on one mutex.
+    pub(crate) fn read(&self) -> Result<PooledConn<'_>> {
+        self.read_pool.checkout()
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -741,5 +843,36 @@ mod tests {
         // Empty input short-circuits.
         assert!(store.get_entity_names(&[]).unwrap().is_empty());
         assert!(store.load_embeddings(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_pool_serves_concurrent_readers() {
+        use std::sync::Arc;
+        let tmp = NamedTempFile::new().unwrap();
+        let store = Arc::new(SlowStore::open(tmp.path()).unwrap());
+
+        let a = test_entity("Alice");
+        let b = test_entity("Bob");
+        let a_id = a.uuid.to_string();
+        store.sync_from_graph(&[a, b], &[]).unwrap();
+
+        // Many readers hit the pool at once: none should deadlock or error, and
+        // all observe the committed snapshot. Exercises checkout/return plus
+        // several live reader connections concurrently (beyond MAX_IDLE).
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&store);
+            let id = a_id.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let names = s.get_entity_names(&[id.as_str()]).unwrap();
+                    assert_eq!(names.get(&id).map(String::as_str), Some("Alice"));
+                    assert_eq!(s.entity_count().unwrap(), 2);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
