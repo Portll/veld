@@ -90,8 +90,13 @@ pub struct CrossEncoderConfig {
     pub model_url: String,
     /// URL for the tokenizer JSON.
     pub tokenizer_url: String,
-    /// Whether the model's ONNX graph accepts `token_type_ids`. BERT-family
-    /// models do; XLM-RoBERTa-family models (BGE, Jina) do not.
+    /// Hint indicating whether the model's ONNX graph accepts
+    /// `token_type_ids`. BERT-family models do; XLM-RoBERTa-family models
+    /// (BGE, Jina) do not. This field is **informational only at runtime**
+    /// — the loader probes `Session.inputs()` and uses the detected value,
+    /// so a wrong hint will not produce a runtime crash, just a debug-log
+    /// diagnostic. The field is retained for external registrations and
+    /// diagnostics.
     pub has_token_type_ids: bool,
     /// Recommended candidate count for reranking with this model. Heavier
     /// models score fewer candidates to stay under the HTTP request budget;
@@ -208,15 +213,19 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
         },
         CrossEncoderConfig {
             id: "bge-reranker-v2-m3".into(),
-            // BAAI's repo only ships safetensors. EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu
-            // is a CPU-optimised ONNX export (Olive O3 pass) that runs ~2-3x faster
-            // than the unquantised celinehoang export. External data file is fetched
-            // automatically by `download_external_data_if_present()`.
+            // BAAI's repo only ships safetensors. hooman650/bge-reranker-v2-m3-onnx-o4
+            // is an Olive O4 CPU-optimised ONNX export explicitly tagged
+            // apache-2.0 (derivative of BAAI's apache-2.0 base), so it's
+            // safely redistributable. We previously pointed at
+            // EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu, which has no
+            // declared license and is therefore a gray-area dependency.
+            // External data file is fetched automatically by
+            // `download_external_data_if_present()`.
             model_url:
-                "https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main/model.onnx"
+                "https://huggingface.co/hooman650/bge-reranker-v2-m3-onnx-o4/resolve/main/model.onnx"
                     .into(),
             tokenizer_url:
-                "https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main/tokenizer.json"
+                "https://huggingface.co/hooman650/bge-reranker-v2-m3-onnx-o4/resolve/main/tokenizer.json"
                     .into(),
             has_token_type_ids: false,
             params_millions: 568,
@@ -226,7 +235,7 @@ fn built_ins() -> Vec<CrossEncoderConfig> {
             notes:
                 "XLM-RoBERTa-style; multilingual + multi-task (QA, retrieval, conversational). \
                  Best quality but biggest download (2.3 GB across model.onnx + model.onnx_data). \
-                 Source: EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu (Olive O3 CPU-optimised).",
+                 Source: hooman650/bge-reranker-v2-m3-onnx-o4 (Olive O4 CPU-optimised, apache-2.0).",
         },
         CrossEncoderConfig {
             id: "mxbai-rerank-large-v1".into(),
@@ -335,10 +344,79 @@ pub fn list_registered() -> Vec<(String, u32, u32, u16, &'static str)> {
 // ONNX cross-encoder
 // -----------------------------------------------------------------------------
 
+/// What the model's primary output head looks like — detected by inspecting
+/// the loaded ONNX graph, not the registry's hint, so a wrong (or missing)
+/// `rerank_top_k`/`has_token_type_ids` config never lets a runtime bug
+/// through.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum OutputHead {
+    /// `[…, 1]` — a single relevance logit per pair. Used by
+    /// `ms-marco-MiniLM-L-6-v2`, mxbai-rerank-* (BERT family). Score is
+    /// the logit itself.
+    Regression,
+    /// `[…, 2]` — `[not_relevant, relevant]` logits. Used by
+    /// `bge-reranker-v2-m3` and most XLM-RoBERTa-based rerankers. Score
+    /// is `softmax([neg, pos])[1]` so it's a probability in `[0, 1]` and
+    /// comparable to regression logits after sigmoid.
+    BinaryClassifier,
+}
+
+impl OutputHead {
+    /// Probe the session's first output and decide which head it is.
+    fn detect(session: &Session, ce_id: &str) -> Self {
+        let last_dim = session
+            .outputs()
+            .first()
+            .and_then(|o| match o.dtype() {
+                ort::value::ValueType::Tensor { shape, .. } => shape.last().copied(),
+                _ => None,
+            });
+        match last_dim {
+            Some(1) => Self::Regression,
+            Some(2) => Self::BinaryClassifier,
+            Some(other) => {
+                tracing::warn!(
+                    "cross-encoder `{ce_id}` has unexpected output last-dim {other}; \
+                     defaulting to regression-head interpretation"
+                );
+                Self::Regression
+            }
+            None => {
+                tracing::warn!(
+                    "cross-encoder `{ce_id}` exposes no output shape; defaulting to regression"
+                );
+                Self::Regression
+            }
+        }
+    }
+
+    /// Reduce the raw output tensor's flat `f32` slice to a single relevance
+    /// score per pair.
+    fn extract_score(&self, data: &[f32]) -> f32 {
+        match self {
+            Self::Regression => data.first().copied().unwrap_or(0.0),
+            Self::BinaryClassifier => {
+                let neg = data.first().copied().unwrap_or(0.0);
+                let pos = data.get(1).copied().unwrap_or(0.0);
+                // Numerically-stable softmax over 2 logits, return P(relevant).
+                let m = neg.max(pos);
+                let e_neg = (neg - m).exp();
+                let e_pos = (pos - m).exp();
+                e_pos / (e_neg + e_pos)
+            }
+        }
+    }
+}
+
 struct LazyOnnx {
     session: Mutex<Session>,
     tokenizer: Tokenizer,
+    /// Whether the loaded ONNX graph accepts `token_type_ids`. Detected
+    /// from `session.inputs` at load time — the registry's
+    /// `has_token_type_ids` config field is now only an unused hint.
     has_token_type_ids: bool,
+    /// Output head strategy, detected from `session.outputs[0]`'s shape.
+    output_head: OutputHead,
 }
 
 /// Cross-encoder backed by a single ONNX model.
@@ -482,10 +560,31 @@ impl OnnxCrossEncoder {
                 }
             };
 
+            // Probe the loaded graph instead of trusting the registry — this
+            // closes the [1,1] vs [1,2] output-head bug class and the
+            // input-layout mismatch class at the same time.
+            let has_token_type_ids = session
+                .inputs()
+                .iter()
+                .any(|i| i.name() == "token_type_ids");
+            let output_head = OutputHead::detect(&session, &self.config.id);
+            if has_token_type_ids != self.config.has_token_type_ids {
+                tracing::debug!(
+                    "cross-encoder `{}`: registry has_token_type_ids={} but graph says {}; \
+                     using graph value",
+                    self.config.id, self.config.has_token_type_ids, has_token_type_ids
+                );
+            }
+            tracing::info!(
+                "cross-encoder `{}` loaded: head={:?} token_type_ids={}",
+                self.config.id, output_head, has_token_type_ids
+            );
+
             Ok(LazyOnnx {
                 session: Mutex::new(session),
                 tokenizer,
-                has_token_type_ids: self.config.has_token_type_ids,
+                has_token_type_ids,
+                output_head,
             })
         });
 
@@ -560,44 +659,11 @@ impl CrossEncoderModel for OnnxCrossEncoder {
                 ])?
             };
 
-            // Output-shape dispatch:
-            //   [1, 1] — single regression logit (ms-marco-MiniLM family, mxbai).
-            //   [1, 2] — binary classifier logits (BGE-reranker-v2-m3,
-            //            most XLM-RoBERTa-based rerankers). Convert to a
-            //            relevance score via softmax then take the
-            //            "relevant" probability so it's directly
-            //            comparable to single-logit models.
+            // Output head strategy was detected at load time — no per-call
+            // shape probing, no manual branching.
             let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-            let (shape, data) = output_tensor;
-            let last_dim = shape.last().copied().unwrap_or(1) as usize;
-            let score = match last_dim {
-                1 => data.first().copied().unwrap_or(0.0),
-                2 => {
-                    let a = data.first().copied().unwrap_or(0.0);
-                    let b = data.get(1).copied().unwrap_or(0.0);
-                    // Stable softmax → P(relevant).
-                    let m = a.max(b);
-                    let ea = (a - m).exp();
-                    let eb = (b - m).exp();
-                    eb / (ea + eb)
-                }
-                _ => {
-                    // Unknown head shape — degrade gracefully to first slot
-                    // so the model is still callable but log once so the
-                    // misconfig is visible.
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!(
-                            "cross-encoder {} returned unexpected output shape {:?}; \
-                             using data[0] as score",
-                            self.config.id,
-                            shape
-                        );
-                    });
-                    data.first().copied().unwrap_or(0.0)
-                }
-            };
-            scores.push(score);
+            let (_shape, data) = output_tensor;
+            scores.push(model.output_head.extract_score(data));
         }
 
         Ok(scores)
@@ -868,5 +934,57 @@ mod tests {
     fn parse_ensemble_spec_collapses_singleton() {
         let res = parse_ensemble_spec("ms-marco-MiniLM-L-6-v2").unwrap();
         assert_eq!(res.id(), "ms-marco-MiniLM-L-6-v2");
+    }
+
+    // -- OutputHead detection --------------------------------------------
+
+    #[test]
+    fn output_head_regression_extracts_first_value() {
+        // Regression-head models emit a single relevance logit per pair —
+        // ms-marco-MiniLM, mxbai-rerank-*. Score is the raw value.
+        let data = [1.7_f32, 9.9, -3.4];
+        assert_eq!(OutputHead::Regression.extract_score(&data), 1.7);
+    }
+
+    #[test]
+    fn output_head_binary_classifier_softmaxes_pair() {
+        // P(relevant) softmax of [neg, pos]; logits equal => 0.5.
+        let equal = OutputHead::BinaryClassifier.extract_score(&[2.0, 2.0]);
+        assert!((equal - 0.5).abs() < 1e-6);
+
+        // Pos >> neg => approaches 1.0.
+        let high = OutputHead::BinaryClassifier.extract_score(&[-10.0, 10.0]);
+        assert!(high > 0.999);
+
+        // Neg >> pos => approaches 0.0.
+        let low = OutputHead::BinaryClassifier.extract_score(&[10.0, -10.0]);
+        assert!(low < 0.001);
+    }
+
+    #[test]
+    fn output_head_binary_classifier_is_numerically_stable() {
+        // Naive `exp(x)/sum(exp)` overflows around x ≈ 88 in f32; the
+        // stabilised form must not.
+        let big = OutputHead::BinaryClassifier.extract_score(&[1000.0, 1001.0]);
+        assert!(big.is_finite());
+        assert!(big > 0.7);
+    }
+
+    #[test]
+    fn binary_classifier_inverts_when_misread_as_regression() {
+        // Regression interpretation of a binary-head output reads `neg` as
+        // the score → highly relevant pairs (large positive `pos`) end up
+        // *demoted* relative to less relevant ones. This is the exact bug
+        // class that `OutputHead::detect` exists to close. The assertion
+        // documents why the dispatch matters.
+        let very_relevant = [-10.0_f32, 10.0];
+        let barely_relevant = [-1.0_f32, 1.0];
+        let reg_score_relevant = OutputHead::Regression.extract_score(&very_relevant);
+        let reg_score_barely = OutputHead::Regression.extract_score(&barely_relevant);
+        assert!(reg_score_relevant < reg_score_barely); // inverted!
+
+        let bc_score_relevant = OutputHead::BinaryClassifier.extract_score(&very_relevant);
+        let bc_score_barely = OutputHead::BinaryClassifier.extract_score(&barely_relevant);
+        assert!(bc_score_relevant > bc_score_barely); // correct ordering.
     }
 }
