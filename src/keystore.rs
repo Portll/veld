@@ -30,6 +30,7 @@ pub const SCHEMA_VERSION: u8 = 1;
 
 const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
+const NONCE_SIZE: usize = 12;
 
 /// AAD bound into the KEK wrap (domain separation / substitution resistance).
 const KEK_AAD: &[u8] = b"veld:keystore:kek:v1";
@@ -121,6 +122,81 @@ fn unwrap_key(wrapping_key: &[u8; KEY_LEN], w: &Wrapped, aad: &[u8]) -> Result<S
     let mut k = Zeroizing::new([0u8; KEY_LEN]);
     k.copy_from_slice(&plaintext);
     Ok(k)
+}
+
+/// Decode a 32-byte key from 64-char hex or 44-char base64.
+fn decode_32(s: &str) -> Result<[u8; KEY_LEN]> {
+    let t = s.trim();
+    let bytes = if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        hex::decode(t).context("invalid hex key")?
+    } else {
+        b64d(t)?
+    };
+    if bytes.len() != KEY_LEN {
+        return Err(anyhow!("key must decode to {KEY_LEN} bytes, got {}", bytes.len()));
+    }
+    let mut k = [0u8; KEY_LEN];
+    k.copy_from_slice(&bytes);
+    Ok(k)
+}
+
+/// A key-management service that wraps/unwraps the master key (P5). Real cloud
+/// KMS (AWS/GCP/Vault) implements this with server-side Encrypt/Decrypt calls;
+/// the master key never leaves wrapped form on this host. `LocalAeadKms` is the
+/// self-hosted concrete impl; an OS-keychain provider implements it too.
+pub trait KmsClient {
+    fn kms_encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
+    fn kms_decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Self-hosted KMS: AES-256-GCM under a wrapping key sourced from
+/// `VELD_KMS_WRAP_KEY` (64-hex / 44-base64). Ciphertext is `[nonce][ct+tag]`.
+/// Lets a server unseal unattended without a passphrase prompt while keeping the
+/// wrapping key off the data disk (env/secret-store). Swap for a cloud KMS by
+/// implementing `KmsClient`.
+pub struct LocalAeadKms {
+    key: SecretKey,
+}
+
+impl LocalAeadKms {
+    pub fn new(key: [u8; KEY_LEN]) -> Self {
+        Self {
+            key: Zeroizing::new(key),
+        }
+    }
+
+    /// Load from `VELD_KMS_WRAP_KEY`; `Ok(None)` if unset/empty.
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var("VELD_KMS_WRAP_KEY") {
+            Ok(s) if !s.trim().is_empty() => Ok(Some(Self::new(decode_32(&s)?))),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl KmsClient for LocalAeadKms {
+    fn kms_encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(self.key.as_slice()));
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ct = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|e| anyhow!("KMS encrypt failed: {e}"))?;
+        let mut out = Vec::with_capacity(NONCE_SIZE + ct.len());
+        out.extend_from_slice(nonce.as_slice());
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn kms_decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        if ciphertext.len() < NONCE_SIZE + 16 {
+            return Err(anyhow!("KMS ciphertext too short"));
+        }
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(self.key.as_slice()));
+        let nonce = Nonce::from_slice(&ciphertext[..NONCE_SIZE]);
+        cipher
+            .decrypt(nonce, &ciphertext[NONCE_SIZE..])
+            .map_err(|e| anyhow!("KMS decrypt failed (wrong KMS key or tampered): {e}"))
+    }
 }
 
 /// A secret wrapped under some unseal provider (passphrase in P1).
@@ -330,6 +406,41 @@ impl Keystore {
         });
         self.active_epoch = new_epoch;
         Ok(new_epoch)
+    }
+
+    /// Add (or replace) a KMS wrap of the master key, enabling unattended unseal
+    /// without a passphrase. The KMS holds the wrapping key; only the wrapped KEK
+    /// is stored here.
+    pub fn add_kms_wrap(&mut self, kek: &SecretKey, kms: &dyn KmsClient) -> Result<()> {
+        let blob = kms.kms_encrypt(kek.as_slice())?;
+        let wrap = Wrapped {
+            provider: "kms".to_string(),
+            nonce: String::new(), // KMS ciphertext is self-framed
+            ciphertext: b64e(&blob),
+        };
+        self.kek_wraps.retain(|w| w.provider != "kms");
+        self.kek_wraps.push(wrap);
+        Ok(())
+    }
+
+    /// Unseal the master key via the KMS provider.
+    pub fn unseal_with_kms(&self, kms: &dyn KmsClient) -> Result<SecretKey> {
+        let w = self
+            .kek_wraps
+            .iter()
+            .find(|w| w.provider == "kms")
+            .ok_or_else(|| anyhow!("keystore has no KMS wrap"))?;
+        let blob = b64d(&w.ciphertext)?;
+        let pt = kms.kms_decrypt(&blob)?;
+        if pt.len() != KEY_LEN {
+            return Err(anyhow!("KMS-unwrapped key has wrong length"));
+        }
+        let mut kek = Zeroizing::new([0u8; KEY_LEN]);
+        kek.copy_from_slice(&pt);
+        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
+            return Err(anyhow!("KMS unsealed an unexpected key"));
+        }
+        Ok(kek)
     }
 
     pub fn to_json(&self) -> Result<String> {
@@ -682,5 +793,34 @@ mod tests {
             dek0.as_slice()
         );
         assert_ne!(dek_active.as_slice(), dek0.as_slice());
+    }
+
+    #[test]
+    fn local_kms_encrypt_decrypt_roundtrip() {
+        let kms = LocalAeadKms::new([3u8; KEY_LEN]);
+        let blob = kms.kms_encrypt(b"master-key-bytes").unwrap();
+        assert_ne!(blob, b"master-key-bytes");
+        assert_eq!(kms.kms_decrypt(&blob).unwrap(), b"master-key-bytes");
+        assert!(LocalAeadKms::new([4u8; KEY_LEN]).kms_decrypt(&blob).is_err());
+    }
+
+    #[test]
+    fn kms_wrap_unseals_same_key_and_coexists_with_passphrase() {
+        let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        let kms = LocalAeadKms::new([9u8; KEY_LEN]);
+        ks.add_kms_wrap(&kek, &kms).unwrap();
+        assert_eq!(ks.unseal_with_kms(&kms).unwrap().as_slice(), kek.as_slice());
+        assert!(ks.unseal_with_passphrase("pw").is_ok()); // multi-wrap: passphrase still works
+        assert!(ks
+            .unseal_with_kms(&LocalAeadKms::new([1u8; KEY_LEN]))
+            .is_err()); // wrong KMS key
+    }
+
+    #[test]
+    fn decode_32_accepts_hex_and_base64() {
+        assert!(decode_32(&"00".repeat(32)).is_ok());
+        assert!(decode_32(&base64::engine::general_purpose::STANDARD.encode([0u8; 32])).is_ok());
+        assert!(decode_32("tooshort").is_err());
     }
 }
