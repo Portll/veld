@@ -261,6 +261,104 @@ impl Keystore {
     }
 }
 
+// ============================================================================
+// Record envelope (P2) — encrypt/decrypt a serialized record blob under a DEK.
+// Wire format: `ENC\0 | crypto_version(1) | epoch(4 LE) | nonce(12) | ct+tag`.
+// AAD binds the epoch (prevents cross-epoch substitution). Record-id binding is
+// a documented follow-up: it requires confirming the RocksDB key == memory id
+// invariant at every write site first (design §5).
+// ============================================================================
+
+/// 4-byte marker distinguishing an encrypted record from a legacy plaintext
+/// (bincode) record. bincode of a `Memory` never begins with `ENC\0`.
+const RECORD_MARKER: &[u8; 4] = b"ENC\x00";
+/// marker(4) + version(1) + epoch(4) + nonce(12)
+const RECORD_HEADER_LEN: usize = 4 + 1 + 4 + 12;
+/// GCM tag is 16 bytes; a valid ciphertext is at least the tag.
+const RECORD_MIN_LEN: usize = RECORD_HEADER_LEN + 16;
+
+fn record_aad(epoch: u32) -> Vec<u8> {
+    format!("veld:record:v1:epoch:{epoch}").into_bytes()
+}
+
+/// `true` if `data` carries the encrypted-record marker.
+pub fn is_encrypted_record(data: &[u8]) -> bool {
+    data.len() >= RECORD_MARKER.len() && &data[..4] == RECORD_MARKER
+}
+
+/// Read the epoch from an encrypted record header, so the reader can select the
+/// right DEK before decrypting. Returns `None` if not an encrypted record.
+pub fn record_epoch(data: &[u8]) -> Option<u32> {
+    if !is_encrypted_record(data) || data.len() < RECORD_HEADER_LEN {
+        return None;
+    }
+    Some(u32::from_le_bytes([data[5], data[6], data[7], data[8]]))
+}
+
+/// Decrypt an encrypted record blob with the DEK for its epoch. The caller is
+/// responsible for selecting `dek` matching [`record_epoch`].
+pub fn decrypt_record(dek: &SecretKey, data: &[u8]) -> Result<Vec<u8>> {
+    if !is_encrypted_record(data) {
+        return Err(anyhow!("not an encrypted record (missing marker)"));
+    }
+    if data.len() < RECORD_MIN_LEN {
+        return Err(anyhow!(
+            "encrypted record too short: {} bytes (min {RECORD_MIN_LEN})",
+            data.len()
+        ));
+    }
+    let version = data[4];
+    if version != CRYPTO_VERSION {
+        return Err(anyhow!("unsupported record crypto version {version}"));
+    }
+    let epoch = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+    let nonce = Nonce::from_slice(&data[9..RECORD_HEADER_LEN]);
+    let ciphertext = &data[RECORD_HEADER_LEN..];
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek.as_slice()));
+    cipher
+        .decrypt(nonce, Payload { msg: ciphertext, aad: &record_aad(epoch) })
+        .map_err(|e| anyhow!("record decrypt failed (wrong key/epoch or tampered): {e}"))
+}
+
+/// Encrypts serialized record blobs under a fixed active DEK/epoch. Held by the
+/// storage layer (P2 wiring). Reads of older epochs go through [`decrypt_record`]
+/// with the DEK fetched from the keystore for that epoch.
+pub struct RecordCryptor {
+    epoch: u32,
+    dek: SecretKey,
+}
+
+impl RecordCryptor {
+    pub fn new(epoch: u32, dek: SecretKey) -> Self {
+        Self { epoch, dek }
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Encrypt a serialized record blob under the active DEK.
+    pub fn encrypt_record(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(self.dek.as_slice()));
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: plaintext, aad: &record_aad(self.epoch) })
+            .map_err(|e| anyhow!("record encrypt failed: {e}"))?;
+        let mut out = Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.len());
+        out.extend_from_slice(RECORD_MARKER);
+        out.push(CRYPTO_VERSION);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(nonce.as_slice());
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// Decrypt with the active DEK (convenience for same-epoch reads/tests).
+    pub fn decrypt_record(&self, data: &[u8]) -> Result<Vec<u8>> {
+        decrypt_record(&self.dek, data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +433,58 @@ mod tests {
     fn fingerprint_is_stable_and_distinguishing() {
         assert_eq!(fingerprint(&[1u8; KEY_LEN]), fingerprint(&[1u8; KEY_LEN]));
         assert_ne!(fingerprint(&[1u8; KEY_LEN]), fingerprint(&[2u8; KEY_LEN]));
+    }
+
+    #[test]
+    fn record_encrypt_decrypt_roundtrip() {
+        let cryptor = RecordCryptor::new(0, Zeroizing::new([5u8; KEY_LEN]));
+        let plaintext = b"bincode-serialized-memory-record-bytes".to_vec();
+        let enc = cryptor.encrypt_record(&plaintext).unwrap();
+        assert!(is_encrypted_record(&enc));
+        assert_eq!(record_epoch(&enc), Some(0));
+        assert_ne!(enc, plaintext);
+        assert_eq!(cryptor.decrypt_record(&enc).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn legacy_plaintext_is_not_marked_encrypted() {
+        // A typical bincode blob won't start with ENC\0.
+        let plain = vec![0x10, 0x00, 0x00, 0x00, 0x42];
+        assert!(!is_encrypted_record(&plain));
+        assert_eq!(record_epoch(&plain), None);
+    }
+
+    #[test]
+    fn record_wrong_dek_fails() {
+        let c1 = RecordCryptor::new(0, Zeroizing::new([1u8; KEY_LEN]));
+        let enc = c1.encrypt_record(b"secret").unwrap();
+        assert!(decrypt_record(&Zeroizing::new([2u8; KEY_LEN]), &enc).is_err());
+    }
+
+    #[test]
+    fn record_tamper_is_detected() {
+        let c = RecordCryptor::new(3, Zeroizing::new([7u8; KEY_LEN]));
+        let mut enc = c.encrypt_record(b"payload").unwrap();
+        let last = enc.len() - 1;
+        enc[last] ^= 0xff; // flip a ciphertext byte
+        assert!(c.decrypt_record(&enc).is_err());
+    }
+
+    #[test]
+    fn record_epoch_in_header_matches() {
+        let c = RecordCryptor::new(42, Zeroizing::new([9u8; KEY_LEN]));
+        let enc = c.encrypt_record(b"x").unwrap();
+        assert_eq!(record_epoch(&enc), Some(42));
+        assert_eq!(c.epoch(), 42);
+    }
+
+    #[test]
+    fn record_from_keystore_dek_end_to_end() {
+        let ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        let (epoch, dek) = ks.active_data_key(&kek).unwrap();
+        let cryptor = RecordCryptor::new(epoch, dek);
+        let enc = cryptor.encrypt_record(b"end-to-end").unwrap();
+        assert_eq!(cryptor.decrypt_record(&enc).unwrap(), b"end-to-end");
     }
 }
