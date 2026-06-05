@@ -73,6 +73,22 @@ fn dek_aad(epoch: u32) -> Vec<u8> {
     format!("veld:keystore:dek:v1:epoch:{epoch}").into_bytes()
 }
 
+/// Derive the recovery-code wrapping key. The recovery code is high-entropy, so a
+/// fast hash (not Argon2) suffices — there is nothing to brute-force.
+fn recovery_key_from_code(code: &str) -> [u8; KEY_LEN] {
+    let digest = Sha256::digest(code.trim().as_bytes());
+    let mut k = [0u8; KEY_LEN];
+    k.copy_from_slice(&digest);
+    k
+}
+
+/// Generate a high-entropy, transcribable recovery code (192 bits → 48 hex chars).
+fn generate_recovery_code() -> String {
+    let mut raw = [0u8; 24];
+    OsRng.fill_bytes(&mut raw);
+    hex::encode(raw)
+}
+
 /// AES-256-GCM key-wrap: encrypt `key` under `wrapping_key` with `aad` bound in.
 fn wrap_key(wrapping_key: &[u8; KEY_LEN], key: &[u8], aad: &[u8], provider: &str) -> Result<Wrapped> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(wrapping_key));
@@ -251,6 +267,69 @@ impl Keystore {
             .find(|d| d.epoch == epoch)
             .ok_or_else(|| anyhow!("no data key for epoch {epoch}"))?;
         unwrap_key(kek, &entry.wrapped, &dek_aad(epoch))
+    }
+
+    /// Rotate the passphrase: re-derive a fresh unseal key (new salt/params) and
+    /// re-wrap the SAME master key under it. O(1) — records and indexes are
+    /// untouched (they are keyed by the DEK, not the passphrase). Other wraps
+    /// (e.g. recovery) are preserved.
+    pub fn rotate_passphrase(&mut self, old: &str, new: &str) -> Result<()> {
+        let kek = self.unseal_with_passphrase(old)?;
+        let new_kdf = KdfParams::production();
+        let unseal = new_kdf.derive(new)?;
+        let new_wrap = wrap_key(&unseal, kek.as_slice(), KEK_AAD, "passphrase")?;
+        self.kek_wraps.retain(|w| w.provider != "passphrase");
+        self.kek_wraps.push(new_wrap);
+        self.kdf = new_kdf;
+        Ok(())
+    }
+
+    /// Add (or replace) a recovery wrap of the master key and return the one-time
+    /// recovery code. Display it ONCE and never persist it — only the wrap is
+    /// stored. Survives passphrase loss as long as the keystore file survives.
+    pub fn add_recovery_code(&mut self, kek: &SecretKey) -> Result<String> {
+        let code = generate_recovery_code();
+        let wrap_key_bytes = recovery_key_from_code(&code);
+        let wrap = wrap_key(&wrap_key_bytes, kek.as_slice(), KEK_AAD, "recovery")?;
+        self.kek_wraps.retain(|w| w.provider != "recovery");
+        self.kek_wraps.push(wrap);
+        Ok(code)
+    }
+
+    /// Unseal the master key via a recovery code.
+    pub fn unseal_with_recovery_code(&self, code: &str) -> Result<SecretKey> {
+        let w = self
+            .kek_wraps
+            .iter()
+            .find(|w| w.provider == "recovery")
+            .ok_or_else(|| anyhow!("keystore has no recovery wrap"))?;
+        let kek = unwrap_key(&recovery_key_from_code(code), w, KEK_AAD)?;
+        if b64e(&fingerprint(kek.as_slice())) != self.kek_fingerprint {
+            return Err(anyhow!("recovery code unsealed an unexpected key"));
+        }
+        Ok(kek)
+    }
+
+    /// Rotate the active data key: generate a new epoch's DEK, retire the previous
+    /// active one (kept for reads of old records), and make the new one active.
+    /// Returns the new epoch. Records re-encrypt lazily on next write or via an
+    /// offline pass; old epochs stay readable via [`data_key_for_epoch`].
+    pub fn rotate_dek(&mut self, kek: &SecretKey) -> Result<u32> {
+        let new_epoch = self.deks.iter().map(|d| d.epoch).max().unwrap_or(0) + 1;
+        let dek = random_key();
+        let wrap = wrap_key(kek, dek.as_slice(), &dek_aad(new_epoch), "kek")?;
+        for d in &mut self.deks {
+            if d.state == "active" {
+                d.state = "retired".to_string();
+            }
+        }
+        self.deks.push(DekEntry {
+            epoch: new_epoch,
+            wrapped: wrap,
+            state: "active".to_string(),
+        });
+        self.active_epoch = new_epoch;
+        Ok(new_epoch)
     }
 
     pub fn to_json(&self) -> Result<String> {
@@ -540,5 +619,68 @@ mod tests {
         let cryptor = RecordCryptor::new(epoch, dek);
         let enc = cryptor.encrypt_record(b"end-to-end").unwrap();
         assert_eq!(cryptor.decrypt_record(&enc).unwrap(), b"end-to-end");
+    }
+
+    #[test]
+    fn rotate_passphrase_preserves_master_key() {
+        let mut ks = Keystore::create("old-pass", KdfParams::fast_for_tests()).unwrap();
+        let kek_before = ks.unseal_with_passphrase("old-pass").unwrap();
+        ks.rotate_passphrase("old-pass", "new-pass").unwrap();
+        assert!(ks.unseal_with_passphrase("old-pass").is_err());
+        let kek_after = ks.unseal_with_passphrase("new-pass").unwrap();
+        // Same master key -> records/index untouched by a passphrase change.
+        assert_eq!(kek_before.as_slice(), kek_after.as_slice());
+    }
+
+    #[test]
+    fn rotate_passphrase_wrong_old_is_rejected() {
+        let mut ks = Keystore::create("old", KdfParams::fast_for_tests()).unwrap();
+        assert!(ks.rotate_passphrase("not-old", "new").is_err());
+        assert!(ks.unseal_with_passphrase("old").is_ok()); // unchanged
+    }
+
+    #[test]
+    fn recovery_code_unseals_same_key() {
+        let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        let code = ks.add_recovery_code(&kek).unwrap();
+        assert_eq!(code.len(), 48);
+        assert_eq!(
+            ks.unseal_with_recovery_code(&code).unwrap().as_slice(),
+            kek.as_slice()
+        );
+        assert!(ks.unseal_with_recovery_code("deadbeef").is_err());
+    }
+
+    #[test]
+    fn recovery_survives_passphrase_rotation() {
+        let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        let code = ks.add_recovery_code(&kek).unwrap();
+        ks.rotate_passphrase("pw", "pw2").unwrap();
+        assert_eq!(
+            ks.unseal_with_recovery_code(&code).unwrap().as_slice(),
+            kek.as_slice()
+        );
+    }
+
+    #[test]
+    fn rotate_dek_adds_epoch_and_keeps_old_readable() {
+        let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        let (e0, dek0) = ks.active_data_key(&kek).unwrap();
+        assert_eq!(e0, 0);
+
+        let e1 = ks.rotate_dek(&kek).unwrap();
+        assert_eq!(e1, 1);
+        let (active_epoch, dek_active) = ks.active_data_key(&kek).unwrap();
+        assert_eq!(active_epoch, 1);
+
+        // Old epoch's DEK is still recoverable (for reading old records); new differs.
+        assert_eq!(
+            ks.data_key_for_epoch(&kek, 0).unwrap().as_slice(),
+            dek0.as_slice()
+        );
+        assert_ne!(dek_active.as_slice(), dek0.as_slice());
     }
 }
