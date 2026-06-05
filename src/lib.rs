@@ -40,6 +40,8 @@ pub mod memory;
 pub mod metrics;
 pub mod middleware;
 pub mod mif;
+pub mod oblivious;
+pub mod pir;
 pub mod query_parsing;
 pub mod query_planner;
 pub mod rate_limit_governance;
