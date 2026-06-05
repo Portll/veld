@@ -2,7 +2,7 @@ name: Docs
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
     tags: ['v*']
     paths:
       - 'docs/**'
