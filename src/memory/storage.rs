@@ -1139,6 +1139,10 @@ pub struct MemoryStorage {
     /// decrypted on read. Backed by the keystore (`storage_path/keystore.json`),
     /// unsealed via `VELD_MASTER_PASSPHRASE`; `None` means plaintext (backward compatible).
     record_cryptor: Option<crate::keystore::RecordCryptor>,
+    /// Optional index-term blinder (encryption-v2 P3). When present, exact-match
+    /// index terms (tag/entity/…) are stored as HMAC tokens, not plaintext.
+    /// Derived from the master key alongside `record_cryptor`.
+    index_blinder: Option<crate::keystore::IndexBlinder>,
 }
 
 impl MemoryStorage {
@@ -1250,19 +1254,26 @@ impl MemoryStorage {
         // passphrase and no keystore creates one. A keystore present without the
         // passphrase is a hard error (it would otherwise serve ciphertext as
         // plaintext). No keystore + no passphrase = plaintext (backward compatible).
-        let record_cryptor = Self::open_record_cryptor(&storage_path)?;
+        let (record_cryptor, index_blinder) = match Self::open_record_cryptor(&storage_path)? {
+            Some((cryptor, blinder)) => (Some(cryptor), Some(blinder)),
+            None => (None, None),
+        };
 
         Ok(Self {
             db,
             storage_path: path.to_path_buf(),
             write_mode,
             record_cryptor,
+            index_blinder,
         })
     }
 
-    /// Load — or, on first run, create — the record encryptor from the keystore.
-    fn open_record_cryptor(storage_path: &Path) -> Result<Option<crate::keystore::RecordCryptor>> {
-        use crate::keystore::{KdfParams, Keystore, RecordCryptor};
+    /// Load — or, on first run, create — the record encryptor + index blinder from the keystore.
+    #[allow(clippy::type_complexity)]
+    fn open_record_cryptor(
+        storage_path: &Path,
+    ) -> Result<Option<(crate::keystore::RecordCryptor, crate::keystore::IndexBlinder)>> {
+        use crate::keystore::{IndexBlinder, KdfParams, Keystore, RecordCryptor};
 
         let keystore_path = storage_path.join("keystore.json");
         let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
@@ -1276,8 +1287,9 @@ impl MemoryStorage {
                 let ks = Keystore::from_json(&json)?;
                 let kek = ks.unseal_with_passphrase(&pass)?;
                 let (epoch, dek) = ks.active_data_key(&kek)?;
+                let blinder = IndexBlinder::derive_from_kek(&kek);
                 tracing::info!("Record-level encryption enabled (keystore unsealed, epoch {epoch})");
-                Ok(Some(RecordCryptor::new(epoch, dek)))
+                Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
             }
             (true, None) => Err(anyhow!(
                 "keystore.json is present but VELD_MASTER_PASSPHRASE is not set; refusing to \
@@ -1297,8 +1309,9 @@ impl MemoryStorage {
                 }
                 let kek = ks.unseal_with_passphrase(&pass)?;
                 let (epoch, dek) = ks.active_data_key(&kek)?;
+                let blinder = IndexBlinder::derive_from_kek(&kek);
                 tracing::info!("Created new encryption keystore at {keystore_path:?} (epoch {epoch})");
-                Ok(Some(RecordCryptor::new(epoch, dek)))
+                Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
             }
             (false, None) => Ok(None),
         }
@@ -1349,6 +1362,16 @@ impl MemoryStorage {
             deserialize_memory(&plaintext)
         } else {
             deserialize_memory(data)
+        }
+    }
+
+    /// Blind an exact-match index term (encryption-v2 P3). Returns the HMAC token
+    /// when index blinding is enabled, else the term unchanged (plaintext index,
+    /// backward compatible). Equal terms map to equal tokens so lookups still work.
+    fn blind_term(&self, term: &str) -> String {
+        match &self.index_blinder {
+            Some(blinder) => blinder.blind(term),
+            None => term.to_string(),
         }
     }
 
@@ -1583,14 +1606,14 @@ impl MemoryStorage {
         // Index by entities (case-insensitive for tag search compatibility)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
-            let entity_key = format!("entity:{}:{}", normalized_entity, memory.id.0);
+            let entity_key = format!("entity:{}:{}", self.blind_term(&normalized_entity), memory.id.0);
             batch.put_cf(idx, entity_key.as_bytes(), b"1");
         }
 
         // Index by tags (separate from entities for explicit tag queries)
         for tag in &memory.experience.tags {
             let normalized_tag = tag.to_lowercase();
-            let tag_key = format!("tag:{}:{}", normalized_tag, memory.id.0);
+            let tag_key = format!("tag:{}:{}", self.blind_term(&normalized_tag), memory.id.0);
             batch.put_cf(idx, tag_key.as_bytes(), b"1");
         }
 
@@ -1855,14 +1878,14 @@ impl MemoryStorage {
         // Entity indices (must match the to_lowercase() normalization in update_indices)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
-            let entity_key = format!("entity:{}:{}", normalized_entity, id.0);
+            let entity_key = format!("entity:{}:{}", self.blind_term(&normalized_entity), id.0);
             batch.delete_cf(idx, entity_key.as_bytes());
         }
 
         // Tag indices
         for tag in &memory.experience.tags {
             let normalized_tag = tag.to_lowercase();
-            let tag_key = format!("tag:{}:{}", normalized_tag, id.0);
+            let tag_key = format!("tag:{}:{}", self.blind_term(&normalized_tag), id.0);
             batch.delete_cf(idx, tag_key.as_bytes());
         }
 
@@ -2132,7 +2155,7 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         // Normalize to lowercase for case-insensitive matching
         let normalized_entity = entity.to_lowercase();
-        let prefix = format!("entity:{normalized_entity}:");
+        let prefix = format!("entity:{}:", self.blind_term(&normalized_entity));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2164,7 +2187,7 @@ impl MemoryStorage {
         for tag in tags {
             // Normalize to lowercase for case-insensitive matching
             let normalized_tag = tag.to_lowercase();
-            let prefix = format!("tag:{normalized_tag}:");
+            let prefix = format!("tag:{}:", self.blind_term(&normalized_tag));
             let iter = self.db.iterator_cf(
                 self.index_cf(),
                 IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),

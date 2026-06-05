@@ -17,6 +17,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -261,6 +262,45 @@ impl Keystore {
     }
 }
 
+type HmacSha256 = Hmac<Sha256>;
+
+/// Label for deriving the (stable) index-blinding key from the master key.
+const INDEX_KEY_LABEL: &[u8] = b"veld:index-blind:v1";
+
+/// Derives deterministic index-blinding tokens: `hex(HMAC-SHA256(index_key, term))`
+/// (P3). Equal terms map to equal tokens (so exact-match index lookups still work)
+/// while the plaintext term stays off disk. Leaks term equality/frequency only
+/// (design §6 / §11 B-4). The key is derived from the KEK, so rotating the KEK
+/// requires an index rebuild.
+pub struct IndexBlinder {
+    key: SecretKey,
+}
+
+impl IndexBlinder {
+    pub fn new(key: SecretKey) -> Self {
+        Self { key }
+    }
+
+    /// Derive the stable index-blinding key from the master key (KEK).
+    pub fn derive_from_kek(kek: &SecretKey) -> Self {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(kek.as_slice()).expect("HMAC accepts any key length");
+        Mac::update(&mut mac, INDEX_KEY_LABEL);
+        let tag = Mac::finalize(mac).into_bytes();
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
+        key.copy_from_slice(&tag[..KEY_LEN]);
+        Self::new(key)
+    }
+
+    /// Blind a single index term to a hex token (safe for ':'-delimited index keys).
+    pub fn blind(&self, term: &str) -> String {
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(self.key.as_slice()).expect("HMAC accepts any key length");
+        Mac::update(&mut mac, term.as_bytes());
+        hex::encode(Mac::finalize(mac).into_bytes())
+    }
+}
+
 // ============================================================================
 // Record envelope (P2) — encrypt/decrypt a serialized record blob under a DEK.
 // Wire format: `ENC\0 | crypto_version(1) | epoch(4 LE) | nonce(12) | ct+tag`.
@@ -476,6 +516,20 @@ mod tests {
         let enc = c.encrypt_record(b"x").unwrap();
         assert_eq!(record_epoch(&enc), Some(42));
         assert_eq!(c.epoch(), 42);
+    }
+
+    #[test]
+    fn index_blinder_is_deterministic_keyed_and_hides_term() {
+        let kek = Zeroizing::new([4u8; KEY_LEN]);
+        let b1 = IndexBlinder::derive_from_kek(&kek);
+        let b2 = IndexBlinder::derive_from_kek(&kek);
+        assert_eq!(b1.blind("alice"), b2.blind("alice")); // deterministic & stable
+        assert_ne!(b1.blind("alice"), b1.blind("bob")); // distinct terms differ
+        assert!(!b1.blind("alice").contains("alice")); // plaintext term not present
+        assert_eq!(b1.blind("alice").len(), 64); // 32-byte HMAC as hex
+
+        let other = IndexBlinder::derive_from_kek(&Zeroizing::new([5u8; KEY_LEN]));
+        assert_ne!(b1.blind("alice"), other.blind("alice")); // key-dependent
     }
 
     #[test]
