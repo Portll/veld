@@ -35,6 +35,7 @@ pub mod ingest;
 pub mod instance_registry;
 pub mod intent_log;
 pub mod integrations;
+pub mod keystore;
 pub mod memory;
 pub mod metrics;
 pub mod middleware;
