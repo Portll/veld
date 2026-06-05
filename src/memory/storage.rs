@@ -1117,10 +1117,6 @@ fn crc32_simple(data: &[u8]) -> u32 {
 
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
 const CF_INDEX: &str = "memory_index";
-/// Sentinel key in `CF_INDEX` holding the 4-byte fingerprint of the encryption
-/// key, used to detect key loss/mismatch across restarts. Its `meta:` prefix does
-/// not collide with the `tag:`/`entity:`/`date:`… index-scan prefixes.
-const ENCRYPTION_KEY_FINGERPRINT_KEY: &[u8] = b"meta:encryption_key_fingerprint";
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on
@@ -1138,10 +1134,11 @@ pub struct MemoryStorage {
     storage_path: PathBuf,
     /// Write mode (sync vs async) - affects latency vs durability tradeoff
     write_mode: WriteMode,
-    /// Optional field-level encryptor for memory content (AES-256-GCM).
-    /// When present, Experience.content is encrypted before storage and decrypted on read.
-    /// Sourced from VELD_ENCRYPTION_KEY env var; None means plaintext (backward compatible).
-    encryptor: Option<crate::encryption::FieldEncryptor>,
+    /// Optional record-level encryptor (AES-256-GCM envelope, encryption-v2).
+    /// When present, the whole serialized record is encrypted before storage and
+    /// decrypted on read. Backed by the keystore (`storage_path/keystore.json`),
+    /// unsealed via `VELD_MASTER_PASSPHRASE`; `None` means plaintext (backward compatible).
+    record_cryptor: Option<crate::keystore::RecordCryptor>,
 }
 
 impl MemoryStorage {
@@ -1248,110 +1245,111 @@ impl MemoryStorage {
             }
         );
 
-        // Initialize field-level encryption from env var (None = plaintext, backward compatible)
-        let encryptor = crate::encryption::FieldEncryptor::from_env()
-            .context("Failed to initialize field-level encryption")?;
-
-        // Encryption key sentinel: detect key loss / mismatch at startup instead of
-        // silently serving ciphertext as plaintext. See FieldEncryptor::key_fingerprint.
-        if let Some(cf) = db.cf_handle(CF_INDEX) {
-            let stored = db
-                .get_cf(cf, ENCRYPTION_KEY_FINGERPRINT_KEY)
-                .context("Failed to read encryption key sentinel")?;
-            match (stored, encryptor.as_ref()) {
-                (Some(existing), Some(enc)) => {
-                    if existing.as_slice() != enc.key_fingerprint().as_slice() {
-                        return Err(anyhow!(
-                            "VELD_ENCRYPTION_KEY does not match the key fingerprint stored for this database"
-                        ));
-                    }
-                }
-                (Some(_), None) => {
-                    return Err(anyhow!(
-                        "This database has encrypted memories, but VELD_ENCRYPTION_KEY is not configured"
-                    ));
-                }
-                (None, Some(enc)) => {
-                    db.put_cf(cf, ENCRYPTION_KEY_FINGERPRINT_KEY, enc.key_fingerprint())
-                        .context("Failed to write encryption key sentinel")?;
-                }
-                (None, None) => {}
-            }
-        }
+        // Record-level encryption (encryption-v2): the keystore lives next to the
+        // data and is unsealed with VELD_MASTER_PASSPHRASE. First run with a
+        // passphrase and no keystore creates one. A keystore present without the
+        // passphrase is a hard error (it would otherwise serve ciphertext as
+        // plaintext). No keystore + no passphrase = plaintext (backward compatible).
+        let record_cryptor = Self::open_record_cryptor(&storage_path)?;
 
         Ok(Self {
             db,
             storage_path: path.to_path_buf(),
             write_mode,
-            encryptor,
+            record_cryptor,
         })
     }
 
-    // ========================================================================
-    // FIELD-LEVEL ENCRYPTION HELPERS
-    // Centralized encrypt-before-serialize / decrypt-after-deserialize logic.
-    // All serialization and deserialization of Memory structs should use these
-    // helpers instead of calling bincode directly.
-    // ========================================================================
+    /// Load — or, on first run, create — the record encryptor from the keystore.
+    fn open_record_cryptor(storage_path: &Path) -> Result<Option<crate::keystore::RecordCryptor>> {
+        use crate::keystore::{KdfParams, Keystore, RecordCryptor};
 
-    /// Serialize a memory to bytes, encrypting the content field if an encryptor is configured.
-    ///
-    /// When encryption is enabled, clones the memory, replaces `experience.content` with its
-    /// encrypted form (stored as base64 of the encrypted bytes — raw ciphertext is not valid
-    /// UTF-8 — where the leading `ENC\0` marker lets the read path detect and decrypt it),
-    /// then serializes normally.
-    fn serialize_memory(&self, memory: &Memory) -> Result<Vec<u8>> {
-        match &self.encryptor {
-            Some(enc) => {
-                let encrypted_bytes = enc
-                    .encrypt_content(&memory.experience.content)
-                    .context("Failed to encrypt memory content")?;
-                // Store encrypted bytes as base64 in the content field so it survives
-                // bincode string serialization without data loss (raw bytes aren't valid UTF-8).
-                use base64::Engine;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes);
-                let mut encrypted_memory = memory.clone();
-                encrypted_memory.experience.content = encoded;
-                bincode::serde::encode_to_vec(&encrypted_memory, bincode::config::standard())
-                    .context("Failed to serialize encrypted memory")
+        let keystore_path = storage_path.join("keystore.json");
+        let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        match (keystore_path.exists(), passphrase) {
+            (true, Some(pass)) => {
+                let json = std::fs::read_to_string(&keystore_path)
+                    .context("Failed to read keystore.json")?;
+                let ks = Keystore::from_json(&json)?;
+                let kek = ks.unseal_with_passphrase(&pass)?;
+                let (epoch, dek) = ks.active_data_key(&kek)?;
+                tracing::info!("Record-level encryption enabled (keystore unsealed, epoch {epoch})");
+                Ok(Some(RecordCryptor::new(epoch, dek)))
             }
-            None => bincode::serde::encode_to_vec(memory, bincode::config::standard())
-                .context("Failed to serialize memory"),
+            (true, None) => Err(anyhow!(
+                "keystore.json is present but VELD_MASTER_PASSPHRASE is not set; refusing to \
+                 start (encrypted records would be served as ciphertext)"
+            )),
+            (false, Some(pass)) => {
+                let ks = Keystore::create(&pass, KdfParams::production())?;
+                std::fs::write(&keystore_path, ks.to_json()?)
+                    .context("Failed to write keystore.json")?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &keystore_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                let kek = ks.unseal_with_passphrase(&pass)?;
+                let (epoch, dek) = ks.active_data_key(&kek)?;
+                tracing::info!("Created new encryption keystore at {keystore_path:?} (epoch {epoch})");
+                Ok(Some(RecordCryptor::new(epoch, dek)))
+            }
+            (false, None) => Ok(None),
         }
     }
 
-    /// Decrypt the content field of a memory in-place if it was encrypted.
-    ///
-    /// Checks whether the content looks like base64-encoded encrypted data (by decoding
-    /// and checking for the ENC\0 marker). If not encrypted, leaves content unchanged
-    /// (backward compatible with plaintext data written before encryption was enabled).
-    ///
-    /// Returns an error if the content IS encrypted but cannot be decrypted (wrong key or
-    /// corruption). Callers MUST propagate or skip rather than serve the still-encrypted
-    /// ciphertext as if it were plaintext content.
-    fn decrypt_memory_content(&self, memory: &mut Memory) -> Result<()> {
-        let enc = match &self.encryptor {
-            Some(enc) => enc,
-            None => return Ok(()),
-        };
+    // ========================================================================
+    // RECORD-LEVEL ENCRYPTION HELPERS (encryption-v2)
+    // serialize_memory encrypts the whole serialized record after bincode;
+    // decode_stored decrypts before deserialize. All storage paths route raw
+    // bytes through these instead of calling bincode/deserialize_memory directly.
+    // ========================================================================
 
-        // Try to decode the content as base64 and check for the encrypted marker
-        use base64::Engine;
-        let decoded =
-            match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
-                Ok(bytes) => bytes,
-                Err(_) => return Ok(()), // Not base64 — plaintext content, leave unchanged
-            };
-
-        if !crate::encryption::FieldEncryptor::is_encrypted(&decoded) {
-            return Ok(()); // No encryption marker — plaintext that happens to be valid base64
+    /// Serialize a memory to bytes. With record-level encryption enabled the whole
+    /// serialized record is envelope-encrypted (`ENC\0|ver|epoch|nonce|ct`);
+    /// otherwise it is plaintext bincode (backward compatible).
+    fn serialize_memory(&self, memory: &Memory) -> Result<Vec<u8>> {
+        let plaintext = bincode::serde::encode_to_vec(memory, bincode::config::standard())
+            .context("Failed to serialize memory")?;
+        match &self.record_cryptor {
+            Some(cryptor) => cryptor
+                .encrypt_record(&plaintext)
+                .context("Failed to encrypt memory record"),
+            None => Ok(plaintext),
         }
+    }
 
-        let plaintext = enc
-            .decrypt_content(&decoded)
-            .with_context(|| format!("Failed to decrypt content for memory {}", memory.id.0))?;
-        memory.experience.content = plaintext;
-        Ok(())
+    /// Decode a stored record: decrypt first if it carries the record-envelope
+    /// marker, then deserialize. Plaintext (legacy) records pass straight through.
+    ///
+    /// Errors if a record is encrypted but no key is configured, or if decryption
+    /// fails — callers must NOT treat that as a plaintext record.
+    fn decode_stored(&self, data: &[u8]) -> Result<(Memory, bool)> {
+        if crate::keystore::is_encrypted_record(data) {
+            let cryptor = self.record_cryptor.as_ref().ok_or_else(|| {
+                anyhow!("encountered an encrypted record but no keystore/key is configured")
+            })?;
+            let epoch = crate::keystore::record_epoch(data).unwrap_or(0);
+            if epoch != cryptor.epoch() {
+                // P2 has a single active epoch; multi-epoch reads arrive with rotation (P4).
+                return Err(anyhow!(
+                    "record epoch {epoch} differs from active epoch {}; key rotation not yet supported",
+                    cryptor.epoch()
+                ));
+            }
+            let plaintext = cryptor
+                .decrypt_record(data)
+                .context("Failed to decrypt memory record")?;
+            deserialize_memory(&plaintext)
+        } else {
+            deserialize_memory(data)
+        }
     }
 
     /// Open a RocksDB database with column families, automatically repairing if corruption is detected.
@@ -1729,17 +1727,9 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (mut memory, needs_migration) = deserialize_memory(&value).with_context(|| {
-                    format!(
-                        "Failed to deserialize memory {} ({} bytes)",
-                        id.0,
-                        value.len()
-                    )
+                let (memory, needs_migration) = self.decode_stored(&value).with_context(|| {
+                    format!("Failed to decode memory {} ({} bytes)", id.0, value.len())
                 })?;
-
-                // Decrypt content field if encrypted; fail the read rather than
-                // hand back ciphertext when the key is wrong/missing.
-                self.decrypt_memory_content(&mut memory)?;
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
@@ -2476,7 +2466,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&value) {
                 if memory.parent_id.is_none() {
                     roots.push(memory.id);
                 }
@@ -2588,11 +2578,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                if let Err(e) = self.decrypt_memory_content(&mut memory) {
-                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
-                    continue;
-                }
+            if let Ok((memory, _)) = self.decode_stored(&value) {
                 if !memory.is_forgotten() {
                     memories.push(memory);
                 }
@@ -2612,11 +2598,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                if let Err(e) = self.decrypt_memory_content(&mut memory) {
-                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
-                    continue;
-                }
+            if let Ok((memory, _)) = self.decode_stored(&value) {
                 if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                     memories.push(memory);
                 }
@@ -2639,11 +2621,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                if let Err(e) = self.decrypt_memory_content(&mut memory) {
-                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
-                    continue;
-                }
+            if let Ok((mut memory, _)) = self.decode_stored(&value) {
                 if memory.is_forgotten() {
                     continue;
                 }
@@ -2686,11 +2664,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                if let Err(e) = self.decrypt_memory_content(&mut memory) {
-                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
-                    continue;
-                }
+            if let Ok((mut memory, _)) = self.decode_stored(&value) {
                 if memory.is_forgotten() {
                     continue;
                 }
@@ -2731,11 +2705,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                if let Err(e) = self.decrypt_memory_content(&mut memory) {
-                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
-                    continue;
-                }
+            if let Ok((memory, _)) = self.decode_stored(&value) {
                 if regex.is_match(&memory.experience.content) {
                     to_delete.push(memory.id);
                     count += 1;
@@ -2791,7 +2761,7 @@ impl MemoryStorage {
                         continue;
                     }
 
-                    match deserialize_memory(&value) {
+                    match self.decode_stored(&value) {
                         Ok((memory, _)) => {
                             if memory.is_forgotten() {
                                 continue;
@@ -2914,13 +2884,26 @@ impl MemoryStorage {
                     key.len()
                 );
                 to_delete.push(key.to_vec());
-            } else if deserialize_memory(&value).is_err() {
-                // Key is valid but value fails all format fallbacks - truly corrupted
+            } else if !crate::keystore::is_encrypted_record(&value)
+                && deserialize_memory(&value).is_err()
+            {
+                // Plaintext record that fails all format fallbacks — truly corrupted.
                 tracing::debug!(
-                    "Marking for deletion: valid key but corrupted value ({} bytes)",
+                    "Marking for deletion: corrupted plaintext value ({} bytes)",
                     value.len()
                 );
                 to_delete.push(key.to_vec());
+            } else if crate::keystore::is_encrypted_record(&value)
+                && self.decode_stored(&value).is_err()
+            {
+                // An encrypted record that won't decode means wrong/missing key or
+                // tamper — indistinguishable in AES-GCM. NEVER auto-delete (that would
+                // risk mass data loss on a key misconfiguration); surface for a human.
+                tracing::warn!(
+                    "Encrypted record fails to decode (wrong/missing key or tamper); \
+                     NOT auto-deleting ({} bytes)",
+                    value.len()
+                );
             }
         }
 
@@ -2972,12 +2955,15 @@ impl MemoryStorage {
                 continue;
             }
 
-            // Try current format first (quick check)
-            let is_current = bincode::serde::decode_from_slice::<Memory, _>(
-                &value,
-                bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
-            )
-            .is_ok();
+            // Try current format first (quick check). An encrypted record is already
+            // in the v2 envelope format, so treat it as current rather than
+            // decrypt + re-encrypt it on every migration pass.
+            let is_current = crate::keystore::is_encrypted_record(&value)
+                || bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+                )
+                .is_ok();
 
             if is_current {
                 already_current += 1;
@@ -2985,7 +2971,7 @@ impl MemoryStorage {
             }
 
             // Not current format - try with fallback
-            match deserialize_memory(&value) {
+            match self.decode_stored(&value) {
                 Ok((memory, _)) => {
                     // Successfully deserialized legacy format - queue for migration
                     to_migrate.push((key.to_vec(), memory));
@@ -3561,7 +3547,7 @@ impl MemoryStorage {
             }
 
             // Try to deserialize as memory
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&value) {
                 // Check if vector mapping exists and has text vectors
                 let has_mapping = match self.get_vector_mapping(&memory.id) {
                     Ok(Some(entry)) => entry.text_vectors().is_some_and(|v| !v.is_empty()),
