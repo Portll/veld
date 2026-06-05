@@ -1273,7 +1273,7 @@ impl MemoryStorage {
     fn open_record_cryptor(
         storage_path: &Path,
     ) -> Result<Option<(crate::keystore::RecordCryptor, crate::keystore::IndexBlinder)>> {
-        use crate::keystore::{IndexBlinder, KdfParams, Keystore, RecordCryptor};
+        use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptor};
 
         let keystore_path = storage_path.join("keystore.json");
         let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
@@ -1291,10 +1291,28 @@ impl MemoryStorage {
                 tracing::info!("Record-level encryption enabled (keystore unsealed, epoch {epoch})");
                 Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
             }
-            (true, None) => Err(anyhow!(
-                "keystore.json is present but VELD_MASTER_PASSPHRASE is not set; refusing to \
-                 start (encrypted records would be served as ciphertext)"
-            )),
+            (true, None) => {
+                // No passphrase: try unattended KMS unseal via VELD_KMS_WRAP_KEY.
+                let json = std::fs::read_to_string(&keystore_path)
+                    .context("Failed to read keystore.json")?;
+                let ks = Keystore::from_json(&json)?;
+                match LocalAeadKms::from_env()? {
+                    Some(kms) => {
+                        let kek = ks.unseal_with_kms(&kms)?;
+                        let (epoch, dek) = ks.active_data_key(&kek)?;
+                        let blinder = IndexBlinder::derive_from_kek(&kek);
+                        tracing::info!(
+                            "Record-level encryption enabled (KMS unseal, epoch {epoch})"
+                        );
+                        Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
+                    }
+                    None => Err(anyhow!(
+                        "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
+                         VELD_KMS_WRAP_KEY is set; refusing to start (encrypted records would be \
+                         served as ciphertext)"
+                    )),
+                }
+            }
             (false, Some(pass)) => {
                 let ks = Keystore::create(&pass, KdfParams::production())?;
                 std::fs::write(&keystore_path, ks.to_json()?)
