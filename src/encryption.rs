@@ -73,6 +73,18 @@ impl FieldEncryptor {
         }
     }
 
+    /// Stable non-secret key fingerprint used to detect key loss/mismatch.
+    ///
+    /// This is the first 4 bytes of SHA-256(key). It is not used for cryptographic
+    /// authentication (AES-GCM does that) — only as a startup sentinel so operators
+    /// get an explicit error instead of silent ciphertext reads when the env key is
+    /// absent or wrong.
+    pub fn key_fingerprint(&self) -> [u8; 4] {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.key_bytes.as_slice());
+        [digest[0], digest[1], digest[2], digest[3]]
+    }
+
     /// Try to create an encryptor from the `VELD_ENCRYPTION_KEY` environment variable.
     ///
     /// Returns `Ok(Some(encryptor))` if the key is valid, `Ok(None)` if the env var

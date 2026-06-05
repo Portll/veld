@@ -1117,6 +1117,10 @@ fn crc32_simple(data: &[u8]) -> u32 {
 
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
 const CF_INDEX: &str = "memory_index";
+/// Sentinel key in `CF_INDEX` holding the 4-byte fingerprint of the encryption
+/// key, used to detect key loss/mismatch across restarts. Its `meta:` prefix does
+/// not collide with the `tag:`/`entity:`/`date:`… index-scan prefixes.
+const ENCRYPTION_KEY_FINGERPRINT_KEY: &[u8] = b"meta:encryption_key_fingerprint";
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on
@@ -1248,6 +1252,33 @@ impl MemoryStorage {
         let encryptor = crate::encryption::FieldEncryptor::from_env()
             .context("Failed to initialize field-level encryption")?;
 
+        // Encryption key sentinel: detect key loss / mismatch at startup instead of
+        // silently serving ciphertext as plaintext. See FieldEncryptor::key_fingerprint.
+        if let Some(cf) = db.cf_handle(CF_INDEX) {
+            let stored = db
+                .get_cf(cf, ENCRYPTION_KEY_FINGERPRINT_KEY)
+                .context("Failed to read encryption key sentinel")?;
+            match (stored, encryptor.as_ref()) {
+                (Some(existing), Some(enc)) => {
+                    if existing.as_slice() != enc.key_fingerprint().as_slice() {
+                        return Err(anyhow!(
+                            "VELD_ENCRYPTION_KEY does not match the key fingerprint stored for this database"
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(anyhow!(
+                        "This database has encrypted memories, but VELD_ENCRYPTION_KEY is not configured"
+                    ));
+                }
+                (None, Some(enc)) => {
+                    db.put_cf(cf, ENCRYPTION_KEY_FINGERPRINT_KEY, enc.key_fingerprint())
+                        .context("Failed to write encryption key sentinel")?;
+                }
+                (None, None) => {}
+            }
+        }
+
         Ok(Self {
             db,
             storage_path: path.to_path_buf(),
@@ -1266,8 +1297,9 @@ impl MemoryStorage {
     /// Serialize a memory to bytes, encrypting the content field if an encryptor is configured.
     ///
     /// When encryption is enabled, clones the memory, replaces `experience.content` with its
-    /// encrypted form (stored as lossy UTF-8 of the encrypted bytes — using a dedicated sentinel
-    /// prefix so we know to decrypt on read), then serializes normally.
+    /// encrypted form (stored as base64 of the encrypted bytes — raw ciphertext is not valid
+    /// UTF-8 — where the leading `ENC\0` marker lets the read path detect and decrypt it),
+    /// then serializes normally.
     fn serialize_memory(&self, memory: &Memory) -> Result<Vec<u8>> {
         match &self.encryptor {
             Some(enc) => {
@@ -1293,35 +1325,33 @@ impl MemoryStorage {
     /// Checks whether the content looks like base64-encoded encrypted data (by decoding
     /// and checking for the ENC\0 marker). If not encrypted, leaves content unchanged
     /// (backward compatible with plaintext data written before encryption was enabled).
-    fn decrypt_memory_content(&self, memory: &mut Memory) {
+    ///
+    /// Returns an error if the content IS encrypted but cannot be decrypted (wrong key or
+    /// corruption). Callers MUST propagate or skip rather than serve the still-encrypted
+    /// ciphertext as if it were plaintext content.
+    fn decrypt_memory_content(&self, memory: &mut Memory) -> Result<()> {
         let enc = match &self.encryptor {
             Some(enc) => enc,
-            None => return,
+            None => return Ok(()),
         };
 
         // Try to decode the content as base64 and check for the encrypted marker
         use base64::Engine;
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
-            Ok(bytes) => bytes,
-            Err(_) => return, // Not base64 — plaintext content, leave unchanged
-        };
+        let decoded =
+            match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(()), // Not base64 — plaintext content, leave unchanged
+            };
 
         if !crate::encryption::FieldEncryptor::is_encrypted(&decoded) {
-            return; // No encryption marker — plaintext content that happens to be valid base64
+            return Ok(()); // No encryption marker — plaintext that happens to be valid base64
         }
 
-        match enc.decrypt_content(&decoded) {
-            Ok(plaintext) => {
-                memory.experience.content = plaintext;
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to decrypt content for memory {} (leaving encrypted): {}",
-                    memory.id.0,
-                    e
-                );
-            }
-        }
+        let plaintext = enc
+            .decrypt_content(&decoded)
+            .with_context(|| format!("Failed to decrypt content for memory {}", memory.id.0))?;
+        memory.experience.content = plaintext;
+        Ok(())
     }
 
     /// Open a RocksDB database with column families, automatically repairing if corruption is detected.
@@ -1707,8 +1737,9 @@ impl MemoryStorage {
                     )
                 })?;
 
-                // Decrypt content field if encrypted
-                self.decrypt_memory_content(&mut memory);
+                // Decrypt content field if encrypted; fail the read rather than
+                // hand back ciphertext when the key is wrong/missing.
+                self.decrypt_memory_content(&mut memory)?;
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
@@ -2558,7 +2589,10 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+                if let Err(e) = self.decrypt_memory_content(&mut memory) {
+                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
+                    continue;
+                }
                 if !memory.is_forgotten() {
                     memories.push(memory);
                 }
@@ -2579,7 +2613,10 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+                if let Err(e) = self.decrypt_memory_content(&mut memory) {
+                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
+                    continue;
+                }
                 if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                     memories.push(memory);
                 }
@@ -2603,7 +2640,10 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+                if let Err(e) = self.decrypt_memory_content(&mut memory) {
+                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
+                    continue;
+                }
                 if memory.is_forgotten() {
                     continue;
                 }
@@ -2647,7 +2687,10 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+                if let Err(e) = self.decrypt_memory_content(&mut memory) {
+                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
+                    continue;
+                }
                 if memory.is_forgotten() {
                     continue;
                 }
@@ -2689,7 +2732,10 @@ impl MemoryStorage {
                 continue;
             }
             if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+                if let Err(e) = self.decrypt_memory_content(&mut memory) {
+                    tracing::warn!("Skipping memory that failed to decrypt: {e}");
+                    continue;
+                }
                 if regex.is_match(&memory.experience.content) {
                     to_delete.push(memory.id);
                     count += 1;
