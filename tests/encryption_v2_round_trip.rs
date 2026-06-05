@@ -75,6 +75,72 @@ fn record_encryption_round_trip_against_real_rocksdb() {
 }
 
 #[test]
+fn index_terms_are_blinded_on_disk() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    env::set_var("VELD_MASTER_PASSPHRASE", PASSPHRASE);
+
+    let temp = TempDir::new().expect("temp dir");
+    const SECRET_TAG: &str = "secret-tag-do-not-leak-abc123";
+    const SECRET_ENTITY: &str = "secret-entity-do-not-leak-def456";
+
+    {
+        let storage = MemoryStorage::new(temp.path(), None).expect("open storage");
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: "indexed content".to_string(),
+            tags: vec![SECRET_TAG.to_string()],
+            entities: vec![SECRET_ENTITY.to_string()],
+            ..Default::default()
+        };
+        let memory = Memory::new(MemoryId(Uuid::new_v4()), experience, 0.5, None, None, None, None);
+        storage.store(&memory).expect("store");
+    }
+
+    // Scan the memory_index CF: no plaintext tag/entity term may appear in any key.
+    let db_path = temp.path().join("storage");
+    let opts = rocksdb::Options::default();
+    let cf_names = rocksdb::DB::list_cf(&opts, &db_path).expect("list cfs");
+    let db = rocksdb::DB::open_cf_for_read_only(&opts, &db_path, &cf_names, false)
+        .expect("reopen read-only");
+    let cf = db.cf_handle("memory_index").expect("memory_index cf");
+
+    let mut saw_tag_prefix = false;
+    for item in db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+        let (key, _) = item.expect("iter");
+        let ks = String::from_utf8_lossy(&key);
+        assert!(!ks.contains(SECRET_TAG), "plaintext tag leaked in index key: {ks}");
+        assert!(
+            !ks.contains(SECRET_ENTITY),
+            "plaintext entity leaked in index key: {ks}"
+        );
+        if ks.starts_with("tag:") {
+            saw_tag_prefix = true;
+        }
+    }
+    assert!(saw_tag_prefix, "expected a blinded `tag:` index entry to exist");
+
+    env::remove_var("VELD_MASTER_PASSPHRASE");
+}
+
+#[test]
+fn rebuild_index_is_record_safe() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    env::remove_var("VELD_MASTER_PASSPHRASE"); // plaintext path: fast, no Argon2
+
+    let temp = TempDir::new().expect("temp dir");
+    let storage = MemoryStorage::new(temp.path(), None).expect("open storage");
+    let (id1, m1) = sample("alpha");
+    let (_id2, m2) = sample("beta");
+    storage.store(&m1).expect("store m1");
+    storage.store(&m2).expect("store m2");
+
+    let n = storage.rebuild_index().expect("rebuild");
+    assert_eq!(n, 2, "rebuild should re-derive all records");
+    // Records survive the rebuild unchanged.
+    assert!(storage.get(&id1).is_ok(), "record must survive index rebuild");
+}
+
+#[test]
 fn wrong_passphrase_after_keystore_created_is_hard_error() {
     let _guard = ENV_LOCK.lock().unwrap();
     let temp = TempDir::new().expect("temp dir");
