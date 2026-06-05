@@ -1574,6 +1574,35 @@ impl MemoryStorage {
     }
 
     /// Update secondary indices for efficient retrieval
+    /// Rebuild the entire secondary index (`memory_index` CF) from the primary
+    /// records. Required after the index-blinding key changes (e.g. KEK rotation):
+    /// clears the index then re-derives every memory's entries with the current
+    /// blinder. Idempotent and record-safe — records are never touched; `meta:`
+    /// keys are preserved. Run offline / single-writer. Returns the record count.
+    pub fn rebuild_index(&self) -> Result<usize> {
+        let idx = self.index_cf();
+        let stale: Vec<Box<[u8]>> = self
+            .db
+            .iterator_cf(idx, IteratorMode::Start)
+            .filter_map(|r| r.ok().map(|(k, _)| k))
+            .filter(|k| !k.starts_with(b"meta:"))
+            .collect();
+        let mut batch = rocksdb::WriteBatch::default();
+        for k in &stale {
+            batch.delete_cf(idx, k.as_ref());
+        }
+        self.db
+            .write(batch)
+            .context("Failed to clear stale index entries during rebuild")?;
+
+        let memories = self.get_all()?;
+        for memory in &memories {
+            self.update_indices(memory)?;
+        }
+        self.flush()?;
+        Ok(memories.len())
+    }
+
     fn update_indices(&self, memory: &Memory) -> Result<()> {
         let idx = self.index_cf();
         let mut batch = WriteBatch::default();
@@ -1621,7 +1650,8 @@ impl MemoryStorage {
         // Episode is the primary temporal grouping - memories in same episode are highly related
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
-                let episode_key = format!("episode:{}:{}", episode_id, memory.id.0);
+                let episode_key =
+                    format!("episode:{}:{}", self.blind_term(&episode_id.to_string()), memory.id.0);
                 batch.put_cf(idx, episode_key.as_bytes(), b"1");
 
                 // Also index by sequence within episode for temporal ordering
@@ -1637,14 +1667,15 @@ impl MemoryStorage {
         // Index by robot_id (for multi-robot systems). Read via
         // resolved_robot_id so the W3 WhoFacet SelfAgent indexes too.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!("robot:{}:{}", robot_id, memory.id.0);
+            let robot_key = format!("robot:{}:{}", self.blind_term(&robot_id.to_string()), memory.id.0);
             batch.put_cf(idx, robot_key.as_bytes(), b"1");
         }
 
         // Index by mission_id (for mission context retrieval). Read via
         // resolved_mission_id so the W3 WhyFacet goal_stack first entry counts.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!("mission:{}:{}", mission_id, memory.id.0);
+            let mission_key =
+                format!("mission:{}:{}", self.blind_term(&mission_id.to_string()), memory.id.0);
             batch.put_cf(idx, mission_key.as_bytes(), b"1");
         }
 
@@ -1661,7 +1692,8 @@ impl MemoryStorage {
 
         // Index by action_type (for action-based retrieval)
         if let Some(ref action_type) = memory.experience.action_type {
-            let action_key = format!("action:{}:{}", action_type, memory.id.0);
+            let action_key =
+                format!("action:{}:{}", self.blind_term(&action_type.to_string()), memory.id.0);
             batch.put_cf(idx, action_key.as_bytes(), b"1");
         }
 
@@ -1680,7 +1712,7 @@ impl MemoryStorage {
         // Enables O(1) duplicate detection on remember()
         {
             let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!("content_hash:{}", content_hash);
+            let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
             batch.put_cf(idx, hash_key.as_bytes(), memory.id.0.as_bytes());
         }
 
@@ -1689,7 +1721,8 @@ impl MemoryStorage {
         // Key format: external:{source}:{id}:{memory_id} -> memory_id
         // Enables O(1) lookup when syncing from external systems
         if let Some(ref external_id) = memory.external_id {
-            let external_key = format!("external:{}:{}", external_id, memory.id.0);
+            let external_key =
+                format!("external:{}:{}", self.blind_term(&external_id.to_string()), memory.id.0);
             // Store memory_id as value for direct lookup
             batch.put_cf(idx, external_key.as_bytes(), memory.id.0.as_bytes());
         }
@@ -1699,7 +1732,8 @@ impl MemoryStorage {
         // Key format: parent:{parent_id}:{child_id} -> 1
         // Enables O(1) lookup of all children for a parent
         if let Some(ref parent_id) = memory.parent_id {
-            let parent_key = format!("parent:{}:{}", parent_id.0, memory.id.0);
+            let parent_key =
+                format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), memory.id.0);
             batch.put_cf(idx, parent_key.as_bytes(), b"1");
         }
 
@@ -1722,7 +1756,7 @@ impl MemoryStorage {
     /// Returns the MemoryId if identical content was already stored.
     pub fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         let content_hash = Self::sha256_content_hash(content);
-        let hash_key = format!("content_hash:{}", content_hash);
+        let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
         let idx = self.index_cf();
         match self.db.get_cf(idx, hash_key.as_bytes()) {
             Ok(Some(value)) if value.len() == 16 => {
@@ -1789,7 +1823,7 @@ impl MemoryStorage {
     /// Used for upsert operations when syncing from external sources.
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
         // Index key format: external:{external_id}:{memory_id}
-        let prefix = format!("external:{external_id}:");
+        let prefix = format!("external:{}:", self.blind_term(&external_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -1892,7 +1926,8 @@ impl MemoryStorage {
         // Episode indices
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
-                let episode_key = format!("episode:{}:{}", episode_id, id.0);
+                let episode_key =
+                    format!("episode:{}:{}", self.blind_term(&episode_id.to_string()), id.0);
                 batch.delete_cf(idx, episode_key.as_bytes());
 
                 if let Some(seq) = ctx.episode.sequence_number {
@@ -1904,13 +1939,13 @@ impl MemoryStorage {
 
         // Robot index — must mirror update_indices's resolved_robot_id read.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!("robot:{}:{}", robot_id, id.0);
+            let robot_key = format!("robot:{}:{}", self.blind_term(&robot_id.to_string()), id.0);
             batch.delete_cf(idx, robot_key.as_bytes());
         }
 
         // Mission index — must mirror update_indices's resolved_mission_id read.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!("mission:{}:{}", mission_id, id.0);
+            let mission_key = format!("mission:{}:{}", self.blind_term(&mission_id.to_string()), id.0);
             batch.delete_cf(idx, mission_key.as_bytes());
         }
 
@@ -1923,7 +1958,7 @@ impl MemoryStorage {
 
         // Action index
         if let Some(ref action_type) = memory.experience.action_type {
-            let action_key = format!("action:{}:{}", action_type, id.0);
+            let action_key = format!("action:{}:{}", self.blind_term(&action_type.to_string()), id.0);
             batch.delete_cf(idx, action_key.as_bytes());
         }
 
@@ -1938,19 +1973,19 @@ impl MemoryStorage {
         // Content hash index (idempotency dedup)
         {
             let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!("content_hash:{}", content_hash);
+            let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
             batch.delete_cf(idx, hash_key.as_bytes());
         }
 
         // External linking index
         if let Some(ref external_id) = memory.external_id {
-            let external_key = format!("external:{}:{}", external_id, id.0);
+            let external_key = format!("external:{}:{}", self.blind_term(&external_id.to_string()), id.0);
             batch.delete_cf(idx, external_key.as_bytes());
         }
 
         // Parent index (hierarchy)
         if let Some(ref parent_id) = memory.parent_id {
-            let parent_key = format!("parent:{}:{}", parent_id.0, id.0);
+            let parent_key = format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), id.0);
             batch.delete_cf(idx, parent_key.as_bytes());
         }
 
@@ -2212,7 +2247,7 @@ impl MemoryStorage {
     /// Returns all memories in the specified episode
     fn search_by_episode(&self, episode_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("episode:{episode_id}:");
+        let prefix = format!("episode:{}:", self.blind_term(&episode_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2289,7 +2324,7 @@ impl MemoryStorage {
     /// Search memories by robot/drone identifier
     fn search_by_robot(&self, robot_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("robot:{robot_id}:");
+        let prefix = format!("robot:{}:", self.blind_term(&robot_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2313,7 +2348,7 @@ impl MemoryStorage {
     /// Search memories by mission identifier
     fn search_by_mission(&self, mission_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("mission:{mission_id}:");
+        let prefix = format!("mission:{}:", self.blind_term(&mission_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2394,7 +2429,7 @@ impl MemoryStorage {
     /// Search memories by action type
     fn search_by_action_type(&self, action_type: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("action:{action_type}:");
+        let prefix = format!("action:{}:", self.blind_term(&action_type.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2456,7 +2491,7 @@ impl MemoryStorage {
     /// Get all children of a parent memory
     fn search_by_parent(&self, parent_id: &MemoryId) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("parent:{}:", parent_id.0);
+        let prefix = format!("parent:{}:", self.blind_term(&parent_id.0.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
