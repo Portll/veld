@@ -776,17 +776,28 @@ impl SecretCryptor {
     }
 
     /// Build from the keystore at `VELD_KEYSTORE_PATH`, unsealed with
-    /// `VELD_MASTER_PASSPHRASE`, deriving a `purpose`-bound key. Returns `Ok(None)`
-    /// when either env var is unset (plaintext, backward compatible). The
-    /// keystore is created on first use.
+    /// `VELD_MASTER_PASSPHRASE`, deriving a `purpose`-bound key.
+    ///
+    /// Returns `Ok(None)` only when `VELD_KEYSTORE_PATH` is unset — no encryption
+    /// configured, plaintext, backward compatible. If the keystore path *is* set
+    /// but `VELD_MASTER_PASSPHRASE` is missing/empty this is a hard error, not
+    /// silent plaintext: it mirrors the primary record store, which refuses to
+    /// start a configured-but-unsealable keystore rather than write data that was
+    /// meant to be encrypted as plaintext-at-rest. The keystore is created on
+    /// first use.
     pub fn from_env(purpose: &str) -> Result<Option<Self>> {
         let path = match std::env::var("VELD_KEYSTORE_PATH") {
             Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
             _ => return Ok(None),
         };
+        // The keystore path is set, so encryption is intended. A missing
+        // passphrase must fail closed — never degrade to plaintext-at-rest.
         let pass = match std::env::var("VELD_MASTER_PASSPHRASE") {
             Ok(p) if !p.is_empty() => p,
-            _ => return Ok(None),
+            _ => anyhow::bail!(
+                "VELD_KEYSTORE_PATH is set but VELD_MASTER_PASSPHRASE is unset/empty; \
+                 refusing to store '{purpose}' secrets as plaintext"
+            ),
         };
         let (_ks, kek) = Keystore::open_or_create_at(&path, &pass)?;
         Ok(Some(Self::new(derive_secret_key(&kek, purpose))))
