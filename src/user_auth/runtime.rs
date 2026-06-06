@@ -24,7 +24,7 @@ use governor::{
     Quota, RateLimiter,
 };
 
-use crate::encryption::FieldEncryptor;
+use crate::keystore::SecretCryptor;
 use crate::user_auth::store::UserAuthStore;
 
 /// Default lockout window for the per-username login limiter: 5 attempts
@@ -94,14 +94,15 @@ impl LoginLimiter {
 pub struct UserAuthRuntime {
     pub store: UserAuthStore,
     pub login_limiter: LoginLimiter,
-    /// Encryptor used to seal TOTP secrets at rest. `None` when
-    /// `VELD_ENCRYPTION_KEY` is unset; production mode then refuses 2FA
-    /// enrollment (see `AuthError::TotpEncryptionRequired`).
-    pub field_encryptor: Option<FieldEncryptor>,
+    /// Encryptor used to seal TOTP secrets at rest (encryption-v2, keystore-derived
+    /// "totp" purpose key). `None` when `VELD_KEYSTORE_PATH` / `VELD_MASTER_PASSPHRASE`
+    /// are unset; production mode then refuses 2FA enrollment (see
+    /// `AuthError::TotpEncryptionRequired`).
+    pub field_encryptor: Option<SecretCryptor>,
 }
 
 impl UserAuthRuntime {
-    pub fn new(store: UserAuthStore, field_encryptor: Option<FieldEncryptor>) -> Self {
+    pub fn new(store: UserAuthStore, field_encryptor: Option<SecretCryptor>) -> Self {
         Self {
             store,
             login_limiter: LoginLimiter::default_login_throttle(),
@@ -115,7 +116,7 @@ impl UserAuthRuntime {
     pub fn with_limiter(
         store: UserAuthStore,
         login_limiter: LoginLimiter,
-        field_encryptor: Option<FieldEncryptor>,
+        field_encryptor: Option<SecretCryptor>,
     ) -> Self {
         Self {
             store,

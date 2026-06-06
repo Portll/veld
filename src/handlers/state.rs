@@ -541,12 +541,12 @@ impl MultiUserMemoryManager {
         let user_auth_runtime = if crate::user_auth::feature_enabled() {
             match crate::user_auth::store::UserAuthStore::new(shared_stores.shared_db.clone()) {
                 Ok(store) => {
-                    let field_encryptor = match crate::encryption::FieldEncryptor::from_env() {
+                    let field_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
                         Ok(encryptor) => encryptor,
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "VELD_ENCRYPTION_KEY present but malformed; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
+                                "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) present but unusable; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
                             );
                             None
                         }
