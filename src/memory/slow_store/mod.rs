@@ -88,9 +88,14 @@ impl SlowStoreEncrypt {
 }
 
 /// Encrypt `bytes` iff an encryptor is present and `enabled`; else passthrough.
-fn seal_if(enc: Option<&SecretCryptor>, bytes: &[u8], enabled: bool) -> Result<Vec<u8>> {
+fn seal_if(
+    enc: Option<&SecretCryptor>,
+    bytes: &[u8],
+    enabled: bool,
+    aad_ctx: &[u8],
+) -> Result<Vec<u8>> {
     match enc {
-        Some(e) if enabled => e.encrypt_bytes(bytes),
+        Some(e) if enabled => e.encrypt_bytes(bytes, aad_ctx),
         _ => Ok(bytes.to_vec()),
     }
 }
@@ -102,9 +107,12 @@ fn seal_text_value(
     enc: Option<&SecretCryptor>,
     s: &str,
     enabled: bool,
+    aad_ctx: &[u8],
 ) -> Result<rusqlite::types::Value> {
     match enc {
-        Some(e) if enabled => Ok(rusqlite::types::Value::Blob(e.encrypt_bytes(s.as_bytes())?)),
+        Some(e) if enabled => Ok(rusqlite::types::Value::Blob(
+            e.encrypt_bytes(s.as_bytes(), aad_ctx)?,
+        )),
         _ => Ok(rusqlite::types::Value::Text(s.to_string())),
     }
 }
@@ -112,9 +120,9 @@ fn seal_text_value(
 /// Decrypt `bytes` iff it carries the encrypted-record marker — independent of
 /// any toggle, so toggling a column off still reads previously-encrypted rows.
 /// Errors if marked but no key is configured.
-fn open_field(enc: Option<&SecretCryptor>, bytes: Vec<u8>) -> Result<Vec<u8>> {
+fn open_field(enc: Option<&SecretCryptor>, bytes: Vec<u8>, aad_ctx: &[u8]) -> Result<Vec<u8>> {
     match enc {
-        Some(e) if SecretCryptor::is_encrypted(&bytes) => e.decrypt_bytes(&bytes),
+        Some(e) if SecretCryptor::is_encrypted(&bytes) => e.decrypt_bytes(&bytes, aad_ctx),
         None if SecretCryptor::is_encrypted(&bytes) => Err(anyhow::anyhow!(
             "slow store column is encrypted but no keystore/passphrase is configured \
              (VELD_KEYSTORE_PATH / VELD_MASTER_PASSPHRASE)"
@@ -299,15 +307,20 @@ impl SlowStore {
 
     /// Encrypt a memory payload for at-rest storage when an encryptor is
     /// configured; otherwise pass the plaintext through unchanged.
-    pub(crate) fn maybe_encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        seal_if(self.encryptor.as_ref(), plaintext, self.enc.payload)
+    pub(crate) fn maybe_encrypt(&self, memory_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+        seal_if(
+            self.encryptor.as_ref(),
+            plaintext,
+            self.enc.payload,
+            memory_id.as_bytes(),
+        )
     }
 
     /// Inverse of [`maybe_encrypt`](Self::maybe_encrypt). Decrypts marked blobs,
     /// passes plaintext (pre-encryption) rows through, and errors if a blob is
     /// encrypted but no key is configured (key removed after encrypting).
-    pub(crate) fn maybe_decrypt(&self, stored: Vec<u8>) -> Result<Vec<u8>> {
-        open_field(self.encryptor.as_ref(), stored)
+    pub(crate) fn maybe_decrypt(&self, memory_id: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
+        open_field(self.encryptor.as_ref(), stored, memory_id.as_bytes())
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -597,15 +610,18 @@ impl SlowStore {
             // PLAINTEXT: the gap-detection queries (find_star_gaps etc.) read and
             // group on it, so encrypting it would need those queries to decrypt
             // (tracked follow-up). `uuid` stays plaintext for JOINs.
-            let labels_col = seal_text_value(enc, &labels_json, toggles.graph)?;
-            let summary_col = seal_text_value(enc, &entity.summary, toggles.graph)?;
+            // AAD-bind the sealed columns to this entity's uuid.
+            let entity_uuid = entity.uuid.to_string();
+            let labels_col = seal_text_value(enc, &labels_json, toggles.graph, entity_uuid.as_bytes())?;
+            let summary_col =
+                seal_text_value(enc, &entity.summary, toggles.graph, entity_uuid.as_bytes())?;
             // Embedding BLOB: encrypted when the embeddings toggle is on.
             let embedding_blob: Option<Vec<u8>> = entity
                 .name_embedding
                 .as_ref()
                 .map(|emb| -> Result<Vec<u8>> {
                     let raw: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
-                    seal_if(enc, &raw, toggles.embeddings)
+                    seal_if(enc, &raw, toggles.embeddings, entity_uuid.as_bytes())
                 })
                 .transpose()?;
 
@@ -669,7 +685,8 @@ impl SlowStore {
             // Edge free-text `context` is encrypted when the graph toggle is on
             // (no SQL readers). `relation_type` stays PLAINTEXT — the gap queries
             // read/group on it; from/to/strength are structural.
-            let context_col = seal_text_value(enc, &edge.context, toggles.graph)?;
+            let edge_uuid = edge.uuid.to_string();
+            let context_col = seal_text_value(enc, &edge.context, toggles.graph, edge_uuid.as_bytes())?;
             stmt.execute(params![
                 edge.uuid.to_string(),
                 edge.from_entity.to_string(),

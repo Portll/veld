@@ -1391,7 +1391,10 @@ impl MemoryStorage {
         match &self.record_cryptors {
             Some(cryptors) => cryptors
                 .active()
-                .encrypt_record(&plaintext)
+                // Records are epoch-bound only (empty AAD identity) for now. Binding
+                // the memory-id needs it threaded to decode_stored's callers and the
+                // rocksdb-key==memory-id invariant audited — a tracked follow-up.
+                .encrypt_record(&plaintext, b"")
                 .context("Failed to encrypt memory record"),
             None => Ok(plaintext),
         }
@@ -1418,7 +1421,7 @@ impl MemoryStorage {
                 )
             })?;
             let plaintext = cryptor
-                .decrypt_record(data)
+                .decrypt_record(data, b"")
                 .context("Failed to decrypt memory record")?;
             deserialize_memory(&plaintext)
         } else {
