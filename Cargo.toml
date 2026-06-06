@@ -103,6 +103,10 @@ name = "alignment-eval"
 path = "src/bin/alignment_eval.rs"
 
 [[bin]]
+name = "veld-keyctl"
+path = "src/bin/veld_keyctl.rs"
+
+[[bin]]
 name = "llm-eval"
 path = "src/bin/llm_eval.rs"
 
