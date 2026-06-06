@@ -128,7 +128,7 @@ fn decrypt_totp_secret(
     runtime: &crate::user_auth::runtime::UserAuthRuntime,
     stored: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
-    if crate::encryption::FieldEncryptor::is_encrypted(stored) {
+    if crate::keystore::SecretCryptor::is_encrypted(stored) {
         let enc = runtime.field_encryptor.as_ref().ok_or_else(|| {
             AuthError::internal(
                 "stored TOTP secret is encrypted but the runtime has no encryptor configured",
