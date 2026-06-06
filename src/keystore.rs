@@ -758,7 +758,7 @@ fn derive_secret_key(kek: &SecretKey, purpose: &str) -> SecretKey {
 
 /// Purpose-bound secret-blob encryptor (encryption-v2) for non-record secrets
 /// such as the slow-store memory payload and TOTP secrets. A drop-in for the
-/// legacy `FieldEncryptor` API (`encrypt_bytes` / `decrypt_bytes` / `is_encrypted`),
+/// legacy v1 field-encryptor API (`encrypt_bytes` / `decrypt_bytes` / `is_encrypted`),
 /// but XChaCha20-Poly1305 keyed by a keystore-derived, purpose-bound key — so it
 /// inherits the keystore's atomic persistence, integrity MAC, and rotation
 /// instead of a bare single `VELD_ENCRYPTION_KEY`.
@@ -777,8 +777,8 @@ impl SecretCryptor {
 
     /// Build from the keystore at `VELD_KEYSTORE_PATH`, unsealed with
     /// `VELD_MASTER_PASSPHRASE`, deriving a `purpose`-bound key. Returns `Ok(None)`
-    /// when either env var is unset (plaintext, backward compatible — mirrors
-    /// `FieldEncryptor::from_env`). The keystore is created on first use.
+    /// when either env var is unset (plaintext, backward compatible). The
+    /// keystore is created on first use.
     pub fn from_env(purpose: &str) -> Result<Option<Self>> {
         let path = match std::env::var("VELD_KEYSTORE_PATH") {
             Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),

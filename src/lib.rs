@@ -25,7 +25,6 @@ pub mod decay;
 pub mod decay_scales;
 pub mod earth;
 pub mod embeddings;
-pub mod encryption;
 pub mod errors;
 #[cfg(feature = "multi-tenant")]
 pub mod extensions;
