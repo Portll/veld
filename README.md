@@ -388,7 +388,8 @@ Linux x86_64 · Linux ARM64 · macOS Apple Silicon · macOS Intel · Windows x86
 ```bash
 VELD_ENV=production              # Production mode
 VELD_API_KEYS=key1,key2,key3     # Comma-separated API keys
-VELD_ENCRYPTION_KEY=<32-byte-key> # Required if you want encrypted memory content at rest
+VELD_KEYSTORE_PATH=/var/lib/veld/keystore.json # Enables encrypted memory content at rest
+VELD_MASTER_PASSPHRASE=<passphrase>            # Unseals the keystore (required when VELD_KEYSTORE_PATH is set)
 VELD_HOST=127.0.0.1              # Bind address (default: localhost)
 VELD_PORT=3030                   # Port (default: 3030)
 VELD_MEMORY_PATH=/var/lib/veld  # Data directory

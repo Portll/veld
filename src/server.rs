@@ -872,10 +872,21 @@ fn print_banner() {
     eprintln!();
 }
 
+/// Whether record-level encryption-at-rest is actually wired up: the keystore
+/// path is set and an unseal secret (passphrase or KMS wrap key) is available.
+/// Mirrors the gate in `memory::storage` and `keystore::SecretCryptor::from_env`.
+/// The legacy `VELD_ENCRYPTION_KEY` no longer drives any cipher.
+fn encryption_at_rest_configured() -> bool {
+    let set = |k: &str| {
+        std::env::var(k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    set("VELD_KEYSTORE_PATH") && (set("VELD_MASTER_PASSPHRASE") || set("VELD_KMS_WRAP_KEY"))
+}
+
 fn print_config(config: &ServerConfig) {
-    let encryption_enabled = std::env::var("VELD_ENCRYPTION_KEY")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
+    let encryption_enabled = encryption_at_rest_configured();
 
     eprintln!("  Configuration:");
     eprintln!(
@@ -924,13 +935,9 @@ fn log_production_security_warnings(config: &ServerConfig) {
         return;
     }
 
-    let encryption_enabled = std::env::var("VELD_ENCRYPTION_KEY")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-
-    if !encryption_enabled {
+    if !encryption_at_rest_configured() {
         warn!(
-            "PRODUCTION WARNING: VELD_ENCRYPTION_KEY is not set. Memory content will be stored in plaintext at rest."
+            "PRODUCTION WARNING: encryption-at-rest is not configured (set VELD_KEYSTORE_PATH and VELD_MASTER_PASSPHRASE). Memory content will be stored in plaintext at rest."
         );
     }
 

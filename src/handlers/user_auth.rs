@@ -116,7 +116,7 @@ fn encrypt_totp_secret(
                 Err(AuthError::TotpEncryptionRequired)
             } else {
                 tracing::warn!(
-                    "VELD_ENCRYPTION_KEY not set; storing TOTP secret as raw bytes (development mode only)"
+                    "encryption keystore not configured (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE); storing TOTP secret as raw bytes (development mode only)"
                 );
                 Ok(secret.to_vec())
             }
