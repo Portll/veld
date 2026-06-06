@@ -228,3 +228,59 @@ fn dek_rotation_keeps_old_records_readable() {
 
     env::remove_var("VELD_MASTER_PASSPHRASE");
 }
+
+#[test]
+fn keystore_rollback_is_rejected_then_overridable() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    env::set_var("VELD_MASTER_PASSPHRASE", PASSPHRASE);
+    env::remove_var("VELD_ALLOW_KEYSTORE_ROLLBACK");
+
+    let temp = TempDir::new().expect("temp dir");
+    let keystore_path = temp.path().join("storage").join("keystore.json");
+    let (id, mem) = sample("rollback-test-record");
+
+    // 1. Create the keystore (gen 0), store a record, snapshot the gen-0 keystore.
+    {
+        let storage = MemoryStorage::new(temp.path(), None).expect("open");
+        storage.store(&mem).expect("store");
+    }
+    let gen0_backup = temp.path().join("keystore.gen0.bak");
+    std::fs::copy(&keystore_path, &gen0_backup).expect("snapshot gen0 keystore");
+
+    // 2. Bump the keystore generation (add a recovery code -> gen 1; KEK/DEK
+    //    unchanged), then reopen so the DB rollback sentinel advances to 1.
+    {
+        use veld::keystore::Keystore;
+        let json = std::fs::read_to_string(&keystore_path).unwrap();
+        let mut ks = Keystore::from_json(&json).unwrap();
+        let kek = ks.unseal_with_passphrase(PASSPHRASE).unwrap();
+        let _ = ks.add_recovery_code(&kek).unwrap();
+        ks.save_to_path(&keystore_path).unwrap();
+    }
+    {
+        let storage = MemoryStorage::new(temp.path(), None).expect("reopen at gen 1");
+        assert!(storage.get(&id).is_ok());
+    }
+
+    // 3. Restore the gen-0 keystore (a legitimate keystore.json.bak restore).
+    std::fs::copy(&gen0_backup, &keystore_path).expect("restore gen0 keystore");
+
+    // 4. By default the restore is a hard error (rollback protection).
+    assert!(
+        MemoryStorage::new(temp.path(), None).is_err(),
+        "restoring an older keystore must be rejected by default"
+    );
+
+    // 5. With the explicit override the restore is accepted (sentinel reset).
+    env::set_var("VELD_ALLOW_KEYSTORE_ROLLBACK", "true");
+    {
+        let storage = MemoryStorage::new(temp.path(), None)
+            .expect("override should accept the restored keystore");
+        assert_eq!(
+            storage.get(&id).expect("read after override").experience.content,
+            "rollback-test-record"
+        );
+    }
+    env::remove_var("VELD_ALLOW_KEYSTORE_ROLLBACK");
+    env::remove_var("VELD_MASTER_PASSPHRASE");
+}
