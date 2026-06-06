@@ -111,10 +111,10 @@ impl UserRole {
 /// Persistent per-user state. Stored as bincode in the `user_auth` CF.
 ///
 /// `password_hash` is an Argon2id PHC string. `totp_secret_encrypted` is
-/// `None` until 2FA is enrolled; once enrolled, it holds either a
-/// keystore-encrypted blob (production / keystore configured via
-/// VELD_KEYSTORE_PATH + VELD_MASTER_PASSPHRASE) or the raw HMAC secret
-/// bytes (development fallback with WARN log).
+/// `None` until 2FA is enrolled; once enrolled, it holds a keystore-encrypted
+/// blob (XChaCha20-Poly1305 via the keystore configured by VELD_KEYSTORE_PATH +
+/// VELD_MASTER_PASSPHRASE). 2FA enrollment fails closed in every mode when no
+/// keystore is configured — a 2FA seed is never stored in plaintext.
 /// `recovery_code_hashes` holds one Argon2id PHC string per unused
 /// recovery code; consumed codes are removed from the vector.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,7 +154,8 @@ pub enum AuthError {
     TotpAlreadyEnrolled,
     /// Caller tried to confirm 2FA but there is no pending enrollment.
     TotpNoPendingEnrollment,
-    /// Production mode without a configured encryption keystore blocks 2FA enrollment.
+    /// Without a configured encryption keystore, 2FA enrollment is refused in
+    /// every mode (fail-closed) — a 2FA seed is never stored in plaintext.
     TotpEncryptionRequired,
     /// Submitted recovery code doesn't match any stored hash, or all codes
     /// have been consumed.

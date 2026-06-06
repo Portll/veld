@@ -30,7 +30,6 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::state::MultiUserMemoryManager;
-use crate::auth::is_production_mode;
 use crate::user_auth::{
     password, recovery_codes, session as session_mod, store::UserAuthStore, totp,
     AuthError, UserRecord, UserRole,
@@ -107,16 +106,10 @@ fn encrypt_totp_secret(
         Some(enc) => enc
             .encrypt_bytes(secret)
             .map_err(|e| AuthError::internal(format!("TOTP encrypt failed: {e}"))),
-        None => {
-            if is_production_mode() {
-                Err(AuthError::TotpEncryptionRequired)
-            } else {
-                tracing::warn!(
-                    "encryption keystore not configured (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE); storing TOTP secret as raw bytes (development mode only)"
-                );
-                Ok(secret.to_vec())
-            }
-        }
+        // Fail closed in every mode: never persist a 2FA seed as plaintext. 2FA
+        // enrollment requires a configured keystore (VELD_KEYSTORE_PATH +
+        // VELD_MASTER_PASSPHRASE) — dev included.
+        None => Err(AuthError::TotpEncryptionRequired),
     }
 }
 
