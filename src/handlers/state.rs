@@ -541,7 +541,7 @@ impl MultiUserMemoryManager {
         let user_auth_runtime = if crate::user_auth::feature_enabled() {
             match crate::user_auth::store::UserAuthStore::new(shared_stores.shared_db.clone()) {
                 Ok(store) => {
-                    let field_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
+                    let totp_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
                         Ok(encryptor) => encryptor,
                         Err(e) => {
                             tracing::warn!(
@@ -552,12 +552,12 @@ impl MultiUserMemoryManager {
                         }
                     };
                     info!(
-                        encryption = field_encryptor.is_some(),
+                        encryption = totp_encryptor.is_some(),
                         "user-auth runtime initialised (VELD_USER_AUTH_ENABLED=true)"
                     );
                     Some(crate::user_auth::runtime::UserAuthRuntime::new(
                         store,
-                        field_encryptor,
+                        totp_encryptor,
                     ))
                 }
                 Err(e) => {
