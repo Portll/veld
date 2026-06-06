@@ -14,6 +14,7 @@
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
@@ -600,7 +601,9 @@ impl IndexBlinder {
 
 // ============================================================================
 // Record envelope (P2) — encrypt/decrypt a serialized record blob under a DEK.
-// Wire format: `ENC\0 | crypto_version(1) | epoch(4 LE) | nonce(12) | ct+tag`.
+// Wire format: `ENC\0 | crypto_version(1) | epoch(4 LE) | nonce(24) | ct+tag`.
+// Records use XChaCha20-Poly1305 (192-bit nonce) so random nonces never approach
+// a collision bound; key-wrapping (low volume) stays on AES-256-GCM.
 // AAD binds the epoch (prevents cross-epoch substitution). Record-id binding is
 // a documented follow-up: it requires confirming the RocksDB key == memory id
 // invariant at every write site first (design §5).
@@ -609,9 +612,9 @@ impl IndexBlinder {
 /// 4-byte marker distinguishing an encrypted record from a legacy plaintext
 /// (bincode) record. bincode of a `Memory` never begins with `ENC\0`.
 const RECORD_MARKER: &[u8; 4] = b"ENC\x00";
-/// marker(4) + version(1) + epoch(4) + nonce(12)
-const RECORD_HEADER_LEN: usize = 4 + 1 + 4 + 12;
-/// GCM tag is 16 bytes; a valid ciphertext is at least the tag.
+/// marker(4) + version(1) + epoch(4) + nonce(24, XChaCha20)
+const RECORD_HEADER_LEN: usize = 4 + 1 + 4 + 24;
+/// Poly1305 tag is 16 bytes; a valid ciphertext is at least the tag.
 const RECORD_MIN_LEN: usize = RECORD_HEADER_LEN + 16;
 
 fn record_aad(epoch: u32) -> Vec<u8> {
@@ -649,9 +652,9 @@ pub fn decrypt_record(dek: &SecretKey, data: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("unsupported record crypto version {version}"));
     }
     let epoch = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
-    let nonce = Nonce::from_slice(&data[9..RECORD_HEADER_LEN]);
+    let nonce = XNonce::from_slice(&data[9..RECORD_HEADER_LEN]);
     let ciphertext = &data[RECORD_HEADER_LEN..];
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek.as_slice()));
+    let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(dek.as_slice()));
     cipher
         .decrypt(nonce, Payload { msg: ciphertext, aad: &record_aad(epoch) })
         .map_err(|e| anyhow!("record decrypt failed (wrong key/epoch or tampered): {e}"))
@@ -676,8 +679,8 @@ impl RecordCryptor {
 
     /// Encrypt a serialized record blob under the active DEK.
     pub fn encrypt_record(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(self.dek.as_slice()));
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let cipher = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(self.dek.as_slice()));
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = cipher
             .encrypt(&nonce, Payload { msg: plaintext, aad: &record_aad(self.epoch) })
             .map_err(|e| anyhow!("record encrypt failed: {e}"))?;
