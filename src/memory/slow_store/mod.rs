@@ -51,6 +51,78 @@ pub struct CleanupStats {
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
+/// Per-column encryption toggles for the slow store (encryption-v2). Each is
+/// independent and only takes effect when a keystore-derived encryptor is
+/// configured. Read-side decryption is marker-based, so flipping a toggle is
+/// safe for already-written rows (old rows still decode by their marker).
+///   - `payload` (default ON): the `memory_bincode` blob.
+///   - `graph` (default off): free-text content with no SQL readers — entity
+///     labels/summary + edge context. Entity `name` and edge `relation_type`
+///     stay plaintext because the gap-detection queries read and group on them
+///     (encrypting those needs the gap subsystem to decrypt — a follow-up);
+///     structural keys (uuid, from/to) stay plaintext for JOINs.
+///   - `embeddings` (default off): entity embedding BLOBs (no semantic SQL use).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlowStoreEncrypt {
+    pub payload: bool,
+    pub graph: bool,
+    pub embeddings: bool,
+}
+
+impl SlowStoreEncrypt {
+    fn from_env() -> Self {
+        let on = |k: &str, default: bool| {
+            std::env::var(k)
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(default)
+        };
+        Self {
+            payload: on("VELD_SLOW_STORE_ENCRYPT_PAYLOAD", true),
+            graph: on("VELD_SLOW_STORE_ENCRYPT_GRAPH", false),
+            embeddings: on("VELD_SLOW_STORE_ENCRYPT_EMBEDDINGS", false),
+        }
+    }
+}
+
+/// Encrypt `bytes` iff an encryptor is present and `enabled`; else passthrough.
+fn seal_if(enc: Option<&SecretCryptor>, bytes: &[u8], enabled: bool) -> Result<Vec<u8>> {
+    match enc {
+        Some(e) if enabled => e.encrypt_bytes(bytes),
+        _ => Ok(bytes.to_vec()),
+    }
+}
+
+/// Seal a TEXT column to a SQLite value: a BLOB ciphertext when an encryptor is
+/// present and `enabled`, otherwise the plaintext as TEXT (so storage class —
+/// and any TEXT reader — is unchanged when the toggle is off).
+fn seal_text_value(
+    enc: Option<&SecretCryptor>,
+    s: &str,
+    enabled: bool,
+) -> Result<rusqlite::types::Value> {
+    match enc {
+        Some(e) if enabled => Ok(rusqlite::types::Value::Blob(e.encrypt_bytes(s.as_bytes())?)),
+        _ => Ok(rusqlite::types::Value::Text(s.to_string())),
+    }
+}
+
+/// Decrypt `bytes` iff it carries the encrypted-record marker — independent of
+/// any toggle, so toggling a column off still reads previously-encrypted rows.
+/// Errors if marked but no key is configured.
+fn open_field(enc: Option<&SecretCryptor>, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    match enc {
+        Some(e) if SecretCryptor::is_encrypted(&bytes) => e.decrypt_bytes(&bytes),
+        None if SecretCryptor::is_encrypted(&bytes) => Err(anyhow::anyhow!(
+            "slow store column is encrypted but no keystore/passphrase is configured \
+             (VELD_KEYSTORE_PATH / VELD_MASTER_PASSPHRASE)"
+        )),
+        _ => Ok(bytes),
+    }
+}
+
 /// SQLite-backed slow store for relational queries on the knowledge graph.
 ///
 /// Runs in WAL mode: concurrent reads, single writer, no locking issues.
@@ -63,13 +135,14 @@ pub struct SlowStore {
     /// check a connection out of this pool, so a long gap-analysis query no
     /// longer blocks a live projection write — or another reader.
     read_pool: ReadPool,
-    /// Optional purpose-bound encryptor (encryption-v2) for the `memory_bincode`
-    /// payload. Keystore-derived (XChaCha20-Poly1305, "slow-store" purpose key),
-    /// sourced from `VELD_KEYSTORE_PATH` + `VELD_MASTER_PASSPHRASE`; `None` (unset)
-    /// stores plaintext (backward compatible). Entity/edge/gap rows match the
-    /// primary store's plaintext graph posture — the sensitive payload is the
-    /// memory blob, encrypted at rest here when a keystore is configured.
+    /// Optional purpose-bound encryptor (encryption-v2) keystore-derived
+    /// (XChaCha20-Poly1305, "slow-store" purpose key) from `VELD_KEYSTORE_PATH` +
+    /// `VELD_MASTER_PASSPHRASE`; `None` (unset) stores plaintext (backward
+    /// compatible). Which columns it covers is governed by [`enc`](Self::enc).
     encryptor: Option<SecretCryptor>,
+    /// Per-column encryption toggles (see [`SlowStoreEncrypt`]). Only meaningful
+    /// when `encryptor` is `Some`.
+    enc: SlowStoreEncrypt,
     path: PathBuf,
     last_sync: Mutex<Option<std::time::Instant>>,
 }
@@ -168,11 +241,22 @@ impl SlowStore {
         Self::open_with_encryptor(path, SecretCryptor::from_env("slow-store")?)
     }
 
-    /// Open with an explicit encryptor. Production opens via [`open`](Self::open)
-    /// (which derives the key from the keystore); tests inject a key directly.
+    /// Open with an explicit encryptor; toggles come from the environment.
+    /// Production opens via [`open`](Self::open) (which derives the key from the
+    /// keystore); tests inject a key directly.
     pub(crate) fn open_with_encryptor(
         path: &Path,
         encryptor: Option<SecretCryptor>,
+    ) -> Result<Self> {
+        Self::open_with_encryptor_and_toggles(path, encryptor, SlowStoreEncrypt::from_env())
+    }
+
+    /// Open with an explicit encryptor AND explicit per-column toggles (tests use
+    /// this to exercise graph/embedding encryption without touching process env).
+    pub(crate) fn open_with_encryptor_and_toggles(
+        path: &Path,
+        encryptor: Option<SecretCryptor>,
+        enc: SlowStoreEncrypt,
     ) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
@@ -197,6 +281,7 @@ impl SlowStore {
             conn: Mutex::new(conn),
             read_pool: ReadPool::new(path.to_owned()),
             encryptor,
+            enc,
             path: path.to_owned(),
             last_sync: Mutex::new(None),
         };
@@ -215,25 +300,14 @@ impl SlowStore {
     /// Encrypt a memory payload for at-rest storage when an encryptor is
     /// configured; otherwise pass the plaintext through unchanged.
     pub(crate) fn maybe_encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        match &self.encryptor {
-            Some(enc) => enc.encrypt_bytes(plaintext),
-            None => Ok(plaintext.to_vec()),
-        }
+        seal_if(self.encryptor.as_ref(), plaintext, self.enc.payload)
     }
 
     /// Inverse of [`maybe_encrypt`](Self::maybe_encrypt). Decrypts marked blobs,
     /// passes plaintext (pre-encryption) rows through, and errors if a blob is
     /// encrypted but no key is configured (key removed after encrypting).
     pub(crate) fn maybe_decrypt(&self, stored: Vec<u8>) -> Result<Vec<u8>> {
-        match &self.encryptor {
-            Some(enc) if SecretCryptor::is_encrypted(&stored) => enc.decrypt_bytes(&stored),
-            Some(_) => Ok(stored),
-            None if SecretCryptor::is_encrypted(&stored) => Err(anyhow::anyhow!(
-                "slow store memory payload is encrypted but no keystore/passphrase is configured \
-                 (VELD_KEYSTORE_PATH / VELD_MASTER_PASSPHRASE)"
-            )),
-            None => Ok(stored),
-        }
+        open_field(self.encryptor.as_ref(), stored)
     }
 
     fn create_schema(&self) -> Result<()> {
@@ -476,8 +550,8 @@ impl SlowStore {
         tx.execute("DELETE FROM edges", [])?;
         tx.execute("DELETE FROM entities", [])?;
 
-        Self::sync_entities(&tx, entities, &mut stats)?;
-        Self::sync_edges(&tx, edges, &mut stats)?;
+        Self::sync_entities(&tx, entities, &mut stats, self.encryptor.as_ref(), &self.enc)?;
+        Self::sync_edges(&tx, edges, &mut stats, self.encryptor.as_ref(), &self.enc)?;
 
         tx.commit()?;
         stats.duration_ms = start.elapsed().as_millis() as u64;
@@ -494,7 +568,13 @@ impl SlowStore {
         Ok(stats)
     }
 
-    fn sync_entities(tx: &Transaction, entities: &[EntityNode], stats: &mut SyncStats) -> Result<()> {
+    fn sync_entities(
+        tx: &Transaction,
+        entities: &[EntityNode],
+        stats: &mut SyncStats,
+        enc: Option<&SecretCryptor>,
+        toggles: &SlowStoreEncrypt,
+    ) -> Result<()> {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO entities (uuid, name, labels, salience, mention_count,
                                    created_at, last_seen_at, summary, embedding)
@@ -512,20 +592,32 @@ impl SlowStore {
         for entity in entities {
             let labels_json = serde_json::to_string(&entity.labels)
                 .unwrap_or_else(|_| "[]".to_string());
+            // Graph free-text content (labels, summary) is encrypted when the
+            // graph toggle is on — these have no SQL readers. `entity.name` stays
+            // PLAINTEXT: the gap-detection queries (find_star_gaps etc.) read and
+            // group on it, so encrypting it would need those queries to decrypt
+            // (tracked follow-up). `uuid` stays plaintext for JOINs.
+            let labels_col = seal_text_value(enc, &labels_json, toggles.graph)?;
+            let summary_col = seal_text_value(enc, &entity.summary, toggles.graph)?;
+            // Embedding BLOB: encrypted when the embeddings toggle is on.
             let embedding_blob: Option<Vec<u8>> = entity
                 .name_embedding
                 .as_ref()
-                .map(|emb| emb.iter().flat_map(|f| f.to_le_bytes()).collect());
+                .map(|emb| -> Result<Vec<u8>> {
+                    let raw: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    seal_if(enc, &raw, toggles.embeddings)
+                })
+                .transpose()?;
 
             stmt.execute(params![
                 entity.uuid.to_string(),
                 entity.name,
-                labels_json,
+                labels_col,
                 entity.salience,
                 entity.mention_count,
                 entity.created_at.to_rfc3339(),
                 entity.last_seen_at.to_rfc3339(),
-                entity.summary,
+                summary_col,
                 embedding_blob,
             ])?;
             stats.entities_upserted += 1;
@@ -533,7 +625,13 @@ impl SlowStore {
         Ok(())
     }
 
-    fn sync_edges(tx: &Transaction, edges: &[RelationshipEdge], stats: &mut SyncStats) -> Result<()> {
+    fn sync_edges(
+        tx: &Transaction,
+        edges: &[RelationshipEdge],
+        stats: &mut SyncStats,
+        enc: Option<&SecretCryptor>,
+        toggles: &SlowStoreEncrypt,
+    ) -> Result<()> {
         // Conflict target is the directed pair, not `uuid`. The slow store is a
         // connectivity graph (one entry per A->B, per `idx_edge_pair`), but
         // GraphMemory legitimately holds several edges per pair (one per
@@ -568,6 +666,10 @@ impl SlowStore {
                 LtpStatus::Full => "Full",
             };
 
+            // Edge free-text `context` is encrypted when the graph toggle is on
+            // (no SQL readers). `relation_type` stays PLAINTEXT — the gap queries
+            // read/group on it; from/to/strength are structural.
+            let context_col = seal_text_value(enc, &edge.context, toggles.graph)?;
             stmt.execute(params![
                 edge.uuid.to_string(),
                 edge.from_entity.to_string(),
@@ -579,7 +681,7 @@ impl SlowStore {
                 edge.activation_count,
                 edge.created_at.to_rfc3339(),
                 edge.last_activated.to_rfc3339(),
-                edge.context,
+                context_col,
             ])?;
             stats.edges_upserted += 1;
         }
@@ -964,5 +1066,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw, plaintext, "no key configured -> stored verbatim");
+    }
+
+    #[test]
+    fn graph_and_embedding_columns_encrypted_when_toggled() {
+        let tmp = NamedTempFile::new().unwrap();
+        let enc = crate::keystore::SecretCryptor::new(zeroize::Zeroizing::new([9u8; 32]));
+        let toggles = SlowStoreEncrypt {
+            payload: true,
+            graph: true,
+            embeddings: true,
+        };
+        let store =
+            SlowStore::open_with_encryptor_and_toggles(tmp.path(), Some(enc), toggles).unwrap();
+
+        let mut a = test_entity("alice-entity");
+        a.summary = "alice private summary".to_string();
+        a.name_embedding = Some(vec![0.25, -0.5, 0.75]);
+        let b = test_entity("bob-entity");
+        let mut edge = test_edge(a.uuid, b.uuid, crate::graph_memory::RelationType::WorksWith);
+        edge.context = "edge private context".to_string();
+        let a_uuid = a.uuid;
+
+        store.sync_from_graph(&[a, b], &[edge]).unwrap();
+
+        // On disk: summary + embedding (entity) and context (edge) are ENC-marked
+        // ciphertext; name + relation_type stay plaintext (gap-query inputs).
+        {
+            let conn = store.conn.lock();
+            let (summary_raw, name_raw, emb_raw): (Vec<u8>, String, Vec<u8>) = conn
+                .query_row(
+                    "SELECT summary, name, embedding FROM entities WHERE uuid = ?1",
+                    [a_uuid.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert!(
+                crate::keystore::SecretCryptor::is_encrypted(&summary_raw),
+                "entity summary must be encrypted on disk"
+            );
+            assert!(
+                crate::keystore::SecretCryptor::is_encrypted(&emb_raw),
+                "entity embedding must be encrypted on disk"
+            );
+            assert_eq!(name_raw, "alice-entity", "entity name stays plaintext (gap-query input)");
+
+            let (ctx_raw, rel_raw): (Vec<u8>, String) = conn
+                .query_row(
+                    "SELECT context, relation_type FROM edges LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(
+                crate::keystore::SecretCryptor::is_encrypted(&ctx_raw),
+                "edge context must be encrypted on disk"
+            );
+            assert!(!rel_raw.is_empty(), "relation_type stays plaintext + readable");
+        }
+
+        // Read path: the embedding decrypts and the name round-trips.
+        let all = store.load_all_embeddings().unwrap();
+        let alice = all
+            .iter()
+            .find(|(_, n, _)| n == "alice-entity")
+            .expect("alice present after sync");
+        assert_eq!(
+            alice.2,
+            vec![0.25, -0.5, 0.75],
+            "embedding round-trips through the encrypted column"
+        );
     }
 }
