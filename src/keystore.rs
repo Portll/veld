@@ -22,6 +22,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Envelope wire/format version (records + keystore). Bumped on format changes.
@@ -285,6 +286,14 @@ pub struct Keystore {
     pub active_epoch: u32,
     /// base64(4-byte KEK fingerprint) — detects unseal-to-wrong-key.
     pub kek_fingerprint: String,
+    /// Monotonic generation, bumped on every keystore mutation. Combined with a
+    /// database-side sentinel to detect rollback to an older keystore file.
+    #[serde(default)]
+    pub generation: u64,
+    /// HMAC over the keystore (keyed by a KEK-derived integrity key) detecting
+    /// in-place tampering of active_epoch / deks / wraps. Empty until sealed.
+    #[serde(default)]
+    pub mac: String,
 }
 
 impl Keystore {
@@ -299,7 +308,7 @@ impl Keystore {
         let kek_wrap = wrap_key(&unseal, kek.as_slice(), KEK_AAD, "passphrase")?;
         let dek_wrap = wrap_key(&kek, dek.as_slice(), &dek_aad(0), "kek")?;
 
-        Ok(Self {
+        let mut ks = Self {
             crypto_version: CRYPTO_VERSION,
             schema_version: SCHEMA_VERSION,
             kdf,
@@ -311,7 +320,54 @@ impl Keystore {
             }],
             active_epoch: 0,
             kek_fingerprint: b64e(&fingerprint(kek.as_slice())),
-        })
+            generation: 0,
+            mac: String::new(),
+        };
+        ks.seal(&kek)?;
+        Ok(ks)
+    }
+
+    /// Recompute and store the integrity MAC. Call after every mutation while the
+    /// KEK is in hand.
+    pub fn seal(&mut self, kek: &SecretKey) -> Result<()> {
+        self.mac = self.compute_mac(kek)?;
+        Ok(())
+    }
+
+    /// Verify the keystore has not been tampered in place (active_epoch, deks, or
+    /// wraps). Requires the unsealed KEK.
+    pub fn verify_integrity(&self, kek: &SecretKey) -> Result<()> {
+        if self.mac.is_empty() {
+            return Err(anyhow!("keystore is not integrity-sealed (missing MAC)"));
+        }
+        let expected = self.compute_mac(kek)?;
+        let ok = expected.len() == self.mac.len()
+            && bool::from(expected.as_bytes().ct_eq(self.mac.as_bytes()));
+        if ok {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "keystore integrity check failed — tampered active_epoch/deks/wraps?"
+            ))
+        }
+    }
+
+    /// HMAC-SHA256 over the keystore JSON (with the `mac` field blanked), keyed by
+    /// a KEK-derived integrity key.
+    fn compute_mac(&self, kek: &SecretKey) -> Result<String> {
+        let mut bare = self.clone();
+        bare.mac = String::new();
+        let bytes = serde_json::to_string(&bare).context("serialize keystore for MAC")?;
+
+        let mut ik = <HmacSha256 as Mac>::new_from_slice(kek.as_slice())
+            .expect("HMAC accepts any key length");
+        Mac::update(&mut ik, b"veld:keystore-integrity:v1");
+        let ikey = Mac::finalize(ik).into_bytes();
+
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(&ikey).expect("HMAC accepts any key length");
+        Mac::update(&mut mac, bytes.as_bytes());
+        Ok(hex::encode(Mac::finalize(mac).into_bytes()))
     }
 
     /// Unseal the master key (KEK) via the passphrase provider; verifies the
@@ -359,6 +415,8 @@ impl Keystore {
         self.kek_wraps.retain(|w| w.provider != "passphrase");
         self.kek_wraps.push(new_wrap);
         self.kdf = new_kdf;
+        self.generation += 1;
+        self.seal(&kek)?;
         Ok(())
     }
 
@@ -371,6 +429,8 @@ impl Keystore {
         let wrap = wrap_key(&wrap_key_bytes, kek.as_slice(), KEK_AAD, "recovery")?;
         self.kek_wraps.retain(|w| w.provider != "recovery");
         self.kek_wraps.push(wrap);
+        self.generation += 1;
+        self.seal(kek)?;
         Ok(code)
     }
 
@@ -407,6 +467,8 @@ impl Keystore {
             state: "active".to_string(),
         });
         self.active_epoch = new_epoch;
+        self.generation += 1;
+        self.seal(kek)?;
         Ok(new_epoch)
     }
 
@@ -422,6 +484,8 @@ impl Keystore {
         };
         self.kek_wraps.retain(|w| w.provider != "kms");
         self.kek_wraps.push(wrap);
+        self.generation += 1;
+        self.seal(kek)?;
         Ok(())
     }
 
@@ -882,5 +946,39 @@ mod tests {
         // A second save preserves the prior keystore as a .bak recovery copy.
         ks.save_to_path(&path).unwrap();
         assert!(path.with_extension("json.bak").exists(), "backup written");
+    }
+
+    #[test]
+    fn integrity_seal_detects_in_place_tampering() {
+        let ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+        ks.verify_integrity(&kek).unwrap(); // sealed at create
+
+        let mut tampered = ks.clone();
+        tampered.active_epoch = 99;
+        assert!(tampered.verify_integrity(&kek).is_err());
+
+        let mut t2 = ks.clone();
+        t2.kek_fingerprint = "AAAAAA==".to_string();
+        assert!(t2.verify_integrity(&kek).is_err());
+
+        // survives a JSON round-trip (mac + generation persisted)
+        let reloaded = Keystore::from_json(&ks.to_json().unwrap()).unwrap();
+        reloaded.verify_integrity(&kek).unwrap();
+    }
+
+    #[test]
+    fn generation_bumps_on_mutation_and_reseals() {
+        let mut ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+        assert_eq!(ks.generation, 0);
+        let kek = ks.unseal_with_passphrase("pw").unwrap();
+
+        ks.rotate_dek(&kek).unwrap();
+        assert_eq!(ks.generation, 1);
+        ks.verify_integrity(&kek).unwrap(); // re-sealed after mutation
+
+        ks.add_recovery_code(&kek).unwrap();
+        assert_eq!(ks.generation, 2);
+        ks.verify_integrity(&kek).unwrap();
     }
 }

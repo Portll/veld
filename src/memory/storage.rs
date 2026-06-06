@@ -1117,6 +1117,8 @@ fn crc32_simple(data: &[u8]) -> u32 {
 
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
 const CF_INDEX: &str = "memory_index";
+/// Sentinel (in `CF_INDEX`) holding the last-seen keystore generation; rollback guard.
+const KEYSTORE_GENERATION_KEY: &[u8] = b"meta:keystore_generation";
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on
@@ -1254,7 +1256,7 @@ impl MemoryStorage {
         // passphrase and no keystore creates one. A keystore present without the
         // passphrase is a hard error (it would otherwise serve ciphertext as
         // plaintext). No keystore + no passphrase = plaintext (backward compatible).
-        let (record_cryptor, index_blinder) = match Self::open_record_cryptor(&storage_path)? {
+        let (record_cryptor, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)? {
             Some((cryptor, blinder)) => (Some(cryptor), Some(blinder)),
             None => (None, None),
         };
@@ -1271,6 +1273,7 @@ impl MemoryStorage {
     /// Load — or, on first run, create — the record encryptor + index blinder from the keystore.
     #[allow(clippy::type_complexity)]
     fn open_record_cryptor(
+        db: &DB,
         storage_path: &Path,
     ) -> Result<Option<(crate::keystore::RecordCryptor, crate::keystore::IndexBlinder)>> {
         use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptor};
@@ -1280,51 +1283,74 @@ impl MemoryStorage {
             .ok()
             .filter(|s| !s.is_empty());
 
-        match (keystore_path.exists(), passphrase) {
+        let (ks, kek) = match (keystore_path.exists(), passphrase) {
             (true, Some(pass)) => {
                 let json = std::fs::read_to_string(&keystore_path)
                     .context("Failed to read keystore.json")?;
                 let ks = Keystore::from_json(&json)?;
                 let kek = ks.unseal_with_passphrase(&pass)?;
-                let (epoch, dek) = ks.active_data_key(&kek)?;
-                let blinder = IndexBlinder::derive_from_kek(&kek);
-                tracing::info!("Record-level encryption enabled (keystore unsealed, epoch {epoch})");
-                Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
+                tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
+                (ks, kek)
             }
             (true, None) => {
                 // No passphrase: try unattended KMS unseal via VELD_KMS_WRAP_KEY.
                 let json = std::fs::read_to_string(&keystore_path)
                     .context("Failed to read keystore.json")?;
                 let ks = Keystore::from_json(&json)?;
-                match LocalAeadKms::from_env()? {
-                    Some(kms) => {
-                        let kek = ks.unseal_with_kms(&kms)?;
-                        let (epoch, dek) = ks.active_data_key(&kek)?;
-                        let blinder = IndexBlinder::derive_from_kek(&kek);
-                        tracing::info!(
-                            "Record-level encryption enabled (KMS unseal, epoch {epoch})"
-                        );
-                        Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
-                    }
-                    None => Err(anyhow!(
+                let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
+                    anyhow!(
                         "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
                          VELD_KMS_WRAP_KEY is set; refusing to start (encrypted records would be \
                          served as ciphertext)"
-                    )),
-                }
+                    )
+                })?;
+                let kek = ks.unseal_with_kms(&kms)?;
+                tracing::info!("Record-level encryption: keystore unsealed (KMS)");
+                (ks, kek)
             }
             (false, Some(pass)) => {
                 let ks = Keystore::create(&pass, KdfParams::production())?;
                 ks.save_to_path(&keystore_path)
                     .context("Failed to write keystore.json")?;
                 let kek = ks.unseal_with_passphrase(&pass)?;
-                let (epoch, dek) = ks.active_data_key(&kek)?;
-                let blinder = IndexBlinder::derive_from_kek(&kek);
-                tracing::info!("Created new encryption keystore at {keystore_path:?} (epoch {epoch})");
-                Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
+                tracing::info!("Created new encryption keystore at {keystore_path:?}");
+                (ks, kek)
             }
-            (false, None) => Ok(None),
+            (false, None) => return Ok(None),
+        };
+
+        // Integrity (in-place tamper) + rollback (file-swap) guards.
+        ks.verify_integrity(&kek)
+            .context("keystore integrity verification failed")?;
+        Self::check_keystore_generation(db, ks.generation)?;
+
+        let (epoch, dek) = ks.active_data_key(&kek)?;
+        let blinder = IndexBlinder::derive_from_kek(&kek);
+        Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
+    }
+
+    /// Rollback guard: refuse a keystore whose generation is older than the last
+    /// one this database observed; advance the stored sentinel otherwise.
+    fn check_keystore_generation(db: &DB, generation: u64) -> Result<()> {
+        let cf = db
+            .cf_handle(CF_INDEX)
+            .ok_or_else(|| anyhow!("memory_index CF missing for keystore generation sentinel"))?;
+        let stored = db
+            .get_cf(cf, KEYSTORE_GENERATION_KEY)
+            .context("read keystore generation sentinel")?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        if generation < stored {
+            return Err(anyhow!(
+                "keystore rollback detected: file generation {generation} < last-seen {stored}"
+            ));
         }
+        if generation > stored {
+            db.put_cf(cf, KEYSTORE_GENERATION_KEY, generation.to_le_bytes())
+                .context("write keystore generation sentinel")?;
+        }
+        Ok(())
     }
 
     // ========================================================================
