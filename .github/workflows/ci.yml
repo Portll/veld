@@ -22,14 +22,7 @@ jobs:
           NPM_VERSION=$(grep '"version"' mcp-server/package.json | head -1 | sed 's/.*"version": "\(.*\)".*/\1/')
           PYPI_VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           normalize_core() {
-            python3 - "$1" <<'PY'
-import re
-import sys
-
-version = sys.argv[1].strip()
-match = re.match(r"^(\d+\.\d+\.\d+)", version)
-print(match.group(1) if match else version)
-PY
+            python3 -c 'import re, sys; v = sys.argv[1].strip(); m = re.match(r"^(\d+\.\d+\.\d+)", v); print(m.group(1) if m else v)' "$1"
           }
           CARGO_CORE=$(normalize_core "$CARGO_VERSION")
           NPM_CORE=$(normalize_core "$NPM_VERSION")
