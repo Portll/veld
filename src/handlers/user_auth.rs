@@ -105,7 +105,7 @@ fn encrypt_totp_secret(
 ) -> Result<Vec<u8>, AuthError> {
     match &runtime.field_encryptor {
         Some(enc) => {
-            // FieldEncryptor::encrypt_content expects str. The secret is
+            // SecretCryptor::encrypt_content expects str. The secret is
             // arbitrary bytes — encode as hex so we round-trip cleanly.
             let hex_secret = hex::encode(secret);
             enc.encrypt_content(&hex_secret)

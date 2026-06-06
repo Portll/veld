@@ -5,7 +5,7 @@
 //!   - the persistent [`store::UserAuthStore`];
 //!   - a per-username login [`LoginLimiter`] (governor::keyed, 5 attempts /
 //!     15 min) — distinct from the existing peer-IP governance layer;
-//!   - the optional [`FieldEncryptor`] used to seal TOTP secrets at rest.
+//!   - the optional [`SecretCryptor`] used to seal TOTP secrets at rest.
 //!
 //! The handlers do not own RocksDB or any cryptographic key; they consume
 //! a [`UserAuthRuntime`] and call its methods. This keeps test wiring small

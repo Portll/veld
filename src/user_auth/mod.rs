@@ -28,8 +28,9 @@
 //!
 //! ## Encryption of TOTP secrets at rest
 //!
-//! TOTP secrets are encrypted with the existing [`crate::encryption::FieldEncryptor`]
-//! when `VELD_ENCRYPTION_KEY` is set. If the env var is unset:
+//! TOTP secrets are encrypted with [`crate::keystore::SecretCryptor`] (the
+//! keystore-derived `"totp"` purpose key) when `VELD_KEYSTORE_PATH` and
+//! `VELD_MASTER_PASSPHRASE` are set. If either env var is unset:
 //!   - in development mode, the secret is stored as raw bytes with a WARN
 //!     log so dev loops aren't blocked;
 //!   - in production mode (`VELD_ENV=production`), 2FA enrollment is
