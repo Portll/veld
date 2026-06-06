@@ -21,6 +21,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Envelope wire/format version (records + keystore). Bumped on format changes.
@@ -445,6 +446,46 @@ impl Keystore {
         Ok(kek)
     }
 
+    /// Atomically persist the keystore to `path`: write a temp file, fsync it,
+    /// then rename over the target, so a crash/power-loss never leaves a truncated
+    /// or empty keystore (which would make the KEK — and thus all data —
+    /// unrecoverable). Keeps a `.bak` of the prior keystore as a recovery copy.
+    /// On unix the file is chmod 0600 and the parent dir is fsynced so the rename
+    /// is durable.
+    pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+
+        let json = self.to_json()?;
+
+        // Preserve the previous keystore as a recovery backup before overwriting.
+        if path.exists() {
+            let bak = path.with_extension("json.bak");
+            std::fs::copy(path, &bak).context("failed to back up existing keystore")?;
+        }
+
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).context("failed to create keystore temp file")?;
+            f.write_all(json.as_bytes())
+                .context("failed to write keystore temp file")?;
+            f.sync_all().context("failed to fsync keystore temp file")?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, path).context("failed to rename keystore into place")?;
+        // fsync the directory so the rename itself is durable across a crash.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).context("failed to serialize keystore")
     }
@@ -824,5 +865,22 @@ mod tests {
         assert!(decode_32(&"00".repeat(32)).is_ok());
         assert!(decode_32(&base64::engine::general_purpose::STANDARD.encode([0u8; 32])).is_ok());
         assert!(decode_32("tooshort").is_err());
+    }
+
+    #[test]
+    fn save_to_path_is_atomic_reloadable_and_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keystore.json");
+        let ks = Keystore::create("pw", KdfParams::fast_for_tests()).unwrap();
+
+        ks.save_to_path(&path).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("json.tmp").exists(), "no leftover temp");
+        let loaded = Keystore::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(loaded.unseal_with_passphrase("pw").is_ok());
+
+        // A second save preserves the prior keystore as a .bak recovery copy.
+        ks.save_to_path(&path).unwrap();
+        assert!(path.with_extension("json.bak").exists(), "backup written");
     }
 }
