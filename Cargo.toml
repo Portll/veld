@@ -245,6 +245,9 @@ notify = "6"
 
 # MIF encryption (AES-256-GCM)
 aes-gcm = "0.10"
+# XChaCha20-Poly1305 for record encryption: 192-bit random nonce removes the
+# AES-GCM ~2^32 random-nonce ceiling for the high-volume record path.
+chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 
 # User auth (Phase C) — Argon2id password + recovery code hashing and RFC 6238 TOTP.
