@@ -100,11 +100,14 @@ fn runtime(state: &AppState) -> Result<&crate::user_auth::runtime::UserAuthRunti
 
 fn encrypt_totp_secret(
     runtime: &crate::user_auth::runtime::UserAuthRuntime,
+    user_id: &[u8],
     secret: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
     match &runtime.totp_encryptor {
+        // Bind the ciphertext to this user's id (AAD): a TOTP blob copied onto a
+        // different user's record fails to decrypt, blocking cross-user seed swaps.
         Some(enc) => enc
-            .encrypt_bytes(secret)
+            .encrypt_bytes(secret, user_id)
             .map_err(|e| AuthError::internal(format!("TOTP encrypt failed: {e}"))),
         // Fail closed in every mode: never persist a 2FA seed as plaintext. 2FA
         // enrollment requires a configured keystore (VELD_KEYSTORE_PATH +
@@ -115,6 +118,7 @@ fn encrypt_totp_secret(
 
 fn decrypt_totp_secret(
     runtime: &crate::user_auth::runtime::UserAuthRuntime,
+    user_id: &[u8],
     stored: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
     if crate::keystore::SecretCryptor::is_encrypted(stored) {
@@ -123,7 +127,7 @@ fn decrypt_totp_secret(
                 "stored TOTP secret is encrypted but the runtime has no encryptor configured",
             )
         })?;
-        enc.decrypt_bytes(stored)
+        enc.decrypt_bytes(stored, user_id)
             .map_err(|e| AuthError::internal(format!("TOTP decrypt failed: {e}")))
     } else {
         // Backward-compatible: a record written in dev mode with no key.
@@ -278,6 +282,7 @@ async fn login_inner(
         };
         let secret = decrypt_totp_secret(
             runtime,
+            record.id.as_bytes(),
             record.totp_secret_encrypted.as_ref().ok_or_else(|| {
                 AuthError::internal("has_active_totp returned true but secret is None")
             })?,
@@ -359,7 +364,7 @@ async fn enroll_2fa_inner(
     let secret = totp::generate_secret();
     let provisioning_uri = totp::provisioning_uri(&secret, &user.username)?;
     let (recovery_plaintext, recovery_hashes) = recovery_codes::generate_batch_async().await?;
-    let encrypted = encrypt_totp_secret(runtime, &secret)?;
+    let encrypted = encrypt_totp_secret(runtime, user.id.as_bytes(), &secret)?;
 
     let mut record = user.clone();
     record.totp_secret_encrypted = Some(encrypted);
@@ -399,7 +404,7 @@ async fn confirm_2fa_inner(
         .totp_secret_encrypted
         .as_ref()
         .ok_or(AuthError::TotpNoPendingEnrollment)?;
-    let secret = decrypt_totp_secret(runtime, secret_blob)?;
+    let secret = decrypt_totp_secret(runtime, user.id.as_bytes(), secret_blob)?;
     if !totp::verify_code(&secret, &req.totp, totp::current_unix_time())? {
         return Err(AuthError::InvalidCredentials);
     }
