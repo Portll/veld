@@ -31,8 +31,8 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use crate::encryption::FieldEncryptor;
 use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
+use crate::keystore::SecretCryptor;
 
 /// Statistics from a graph → SQLite sync operation
 #[derive(Debug, Default)]
@@ -63,12 +63,13 @@ pub struct SlowStore {
     /// check a connection out of this pool, so a long gap-analysis query no
     /// longer blocks a live projection write — or another reader.
     read_pool: ReadPool,
-    /// Optional AES-256-GCM encryptor for the `memory_bincode` payload, mirroring
-    /// the RocksDB primary store. Sourced from `VELD_ENCRYPTION_KEY`; `None`
-    /// (unset) stores plaintext (backward compatible). Entity/edge/gap rows match
-    /// the primary store's plaintext graph posture — the sensitive payload is the
-    /// memory blob, which is encrypted at rest here when a key is configured.
-    encryptor: Option<FieldEncryptor>,
+    /// Optional purpose-bound encryptor (encryption-v2) for the `memory_bincode`
+    /// payload. Keystore-derived (XChaCha20-Poly1305, "slow-store" purpose key),
+    /// sourced from `VELD_KEYSTORE_PATH` + `VELD_MASTER_PASSPHRASE`; `None` (unset)
+    /// stores plaintext (backward compatible). Entity/edge/gap rows match the
+    /// primary store's plaintext graph posture — the sensitive payload is the
+    /// memory blob, encrypted at rest here when a keystore is configured.
+    encryptor: Option<SecretCryptor>,
     path: PathBuf,
     last_sync: Mutex<Option<std::time::Instant>>,
 }
@@ -161,17 +162,17 @@ impl Drop for PooledConn<'_> {
 }
 
 impl SlowStore {
-    /// Open or create the slow store database. Field-level encryption of the
-    /// memory payload is enabled iff `VELD_ENCRYPTION_KEY` is set.
+    /// Open or create the slow store database. Encryption of the memory payload is
+    /// enabled iff `VELD_KEYSTORE_PATH` + `VELD_MASTER_PASSPHRASE` are set.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_encryptor(path, FieldEncryptor::from_env()?)
+        Self::open_with_encryptor(path, SecretCryptor::from_env("slow-store")?)
     }
 
     /// Open with an explicit encryptor. Production opens via [`open`](Self::open)
-    /// (which reads the key from the environment); tests inject a key directly.
+    /// (which derives the key from the keystore); tests inject a key directly.
     pub(crate) fn open_with_encryptor(
         path: &Path,
-        encryptor: Option<FieldEncryptor>,
+        encryptor: Option<SecretCryptor>,
     ) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
@@ -225,10 +226,11 @@ impl SlowStore {
     /// encrypted but no key is configured (key removed after encrypting).
     pub(crate) fn maybe_decrypt(&self, stored: Vec<u8>) -> Result<Vec<u8>> {
         match &self.encryptor {
-            Some(enc) if FieldEncryptor::is_encrypted(&stored) => enc.decrypt_bytes(&stored),
+            Some(enc) if SecretCryptor::is_encrypted(&stored) => enc.decrypt_bytes(&stored),
             Some(_) => Ok(stored),
-            None if FieldEncryptor::is_encrypted(&stored) => Err(anyhow::anyhow!(
-                "slow store memory payload is encrypted but VELD_ENCRYPTION_KEY is not set"
+            None if SecretCryptor::is_encrypted(&stored) => Err(anyhow::anyhow!(
+                "slow store memory payload is encrypted but no keystore/passphrase is configured \
+                 (VELD_KEYSTORE_PATH / VELD_MASTER_PASSPHRASE)"
             )),
             None => Ok(stored),
         }
@@ -920,7 +922,7 @@ mod tests {
     #[test]
     fn memory_blob_encrypted_at_rest_when_key_configured() {
         let tmp = NamedTempFile::new().unwrap();
-        let enc = crate::encryption::FieldEncryptor::new(&[7u8; 32]);
+        let enc = crate::keystore::SecretCryptor::new(zeroize::Zeroizing::new([7u8; 32]));
         let store = SlowStore::open_with_encryptor(tmp.path(), Some(enc)).unwrap();
 
         let plaintext = b"super secret memory bincode payload".to_vec();
@@ -937,7 +939,7 @@ mod tests {
                 )
                 .unwrap();
             assert_ne!(raw, plaintext, "payload must be encrypted on disk");
-            assert!(crate::encryption::FieldEncryptor::is_encrypted(&raw));
+            assert!(crate::keystore::SecretCryptor::is_encrypted(&raw));
         }
 
         // The read path decrypts transparently.

@@ -571,6 +571,27 @@ impl Keystore {
         Ok(())
     }
 
+    /// Open an existing keystore at `path` (verifying its integrity MAC) or, if
+    /// absent, create + atomically persist one. Unseals with `passphrase` and
+    /// returns the keystore + master key. Used by standalone secret encryptors
+    /// (slow-store / TOTP) that share one keystore file but no database, so there
+    /// is no DB rollback sentinel here — file-integrity (MAC) only.
+    pub fn open_or_create_at(path: &Path, passphrase: &str) -> Result<(Self, SecretKey)> {
+        if path.exists() {
+            let ks = Self::from_json(
+                &std::fs::read_to_string(path).context("failed to read keystore")?,
+            )?;
+            let kek = ks.unseal_with_passphrase(passphrase)?;
+            ks.verify_integrity(&kek)?;
+            Ok((ks, kek))
+        } else {
+            let ks = Self::create(passphrase, KdfParams::production())?;
+            ks.save_to_path(path)?;
+            let kek = ks.unseal_with_passphrase(passphrase)?;
+            Ok((ks, kek))
+        }
+    }
+
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).context("failed to serialize keystore")
     }
@@ -683,6 +704,7 @@ pub fn decrypt_record(dek: &SecretKey, data: &[u8]) -> Result<Vec<u8>> {
 /// Encrypts serialized record blobs under a fixed active DEK/epoch. Held by the
 /// storage layer (P2 wiring). Reads of older epochs go through [`decrypt_record`]
 /// with the DEK fetched from the keystore for that epoch.
+#[derive(Clone)]
 pub struct RecordCryptor {
     epoch: u32,
     dek: SecretKey,
@@ -716,6 +738,82 @@ impl RecordCryptor {
     /// Decrypt with the active DEK (convenience for same-epoch reads/tests).
     pub fn decrypt_record(&self, data: &[u8]) -> Result<Vec<u8>> {
         decrypt_record(&self.dek, data)
+    }
+}
+
+/// Derive a purpose-bound 256-bit secret key from the master key:
+/// `HMAC-SHA256(KEK, "veld:secret:v1:" || purpose)[..32]`. Domain separation
+/// keeps each subsystem's key (slow-store, totp, …) distinct from each other and
+/// from the record DEK / index-blinding key.
+fn derive_secret_key(kek: &SecretKey, purpose: &str) -> SecretKey {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(kek.as_slice()).expect("HMAC accepts any key length");
+    Mac::update(&mut mac, b"veld:secret:v1:");
+    Mac::update(&mut mac, purpose.as_bytes());
+    let tag = Mac::finalize(mac).into_bytes();
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    key.copy_from_slice(&tag[..KEY_LEN]);
+    key
+}
+
+/// Purpose-bound secret-blob encryptor (encryption-v2) for non-record secrets
+/// such as the slow-store memory payload and TOTP secrets. A drop-in for the
+/// legacy `FieldEncryptor` API (`encrypt_bytes` / `decrypt_bytes` / `is_encrypted`),
+/// but XChaCha20-Poly1305 keyed by a keystore-derived, purpose-bound key — so it
+/// inherits the keystore's atomic persistence, integrity MAC, and rotation
+/// instead of a bare single `VELD_ENCRYPTION_KEY`.
+#[derive(Clone)]
+pub struct SecretCryptor {
+    inner: RecordCryptor,
+}
+
+impl SecretCryptor {
+    /// Construct from a raw purpose key (tests / explicit injection).
+    pub fn new(key: SecretKey) -> Self {
+        Self {
+            inner: RecordCryptor::new(0, key),
+        }
+    }
+
+    /// Build from the keystore at `VELD_KEYSTORE_PATH`, unsealed with
+    /// `VELD_MASTER_PASSPHRASE`, deriving a `purpose`-bound key. Returns `Ok(None)`
+    /// when either env var is unset (plaintext, backward compatible — mirrors
+    /// `FieldEncryptor::from_env`). The keystore is created on first use.
+    pub fn from_env(purpose: &str) -> Result<Option<Self>> {
+        let path = match std::env::var("VELD_KEYSTORE_PATH") {
+            Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+            _ => return Ok(None),
+        };
+        let pass = match std::env::var("VELD_MASTER_PASSPHRASE") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return Ok(None),
+        };
+        let (_ks, kek) = Keystore::open_or_create_at(&path, &pass)?;
+        Ok(Some(Self::new(derive_secret_key(&kek, purpose))))
+    }
+
+    pub fn encrypt_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.inner.encrypt_record(plaintext)
+    }
+
+    pub fn decrypt_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
+        self.inner.decrypt_record(data)
+    }
+
+    /// UTF-8 convenience wrapper over [`encrypt_bytes`](Self::encrypt_bytes).
+    pub fn encrypt_content(&self, plaintext: &str) -> Result<Vec<u8>> {
+        self.encrypt_bytes(plaintext.as_bytes())
+    }
+
+    /// UTF-8 convenience wrapper over [`decrypt_bytes`](Self::decrypt_bytes).
+    pub fn decrypt_content(&self, data: &[u8]) -> Result<String> {
+        String::from_utf8(self.decrypt_bytes(data)?)
+            .context("decrypted secret is not valid UTF-8")
+    }
+
+    /// `true` if `data` carries the encrypted-record marker.
+    pub fn is_encrypted(data: &[u8]) -> bool {
+        is_encrypted_record(data)
     }
 }
 
@@ -773,6 +871,21 @@ mod tests {
             salt: b64e(&[0u8; SALT_LEN]),
         };
         assert!(kdf.derive("pw").is_err());
+    }
+
+    #[test]
+    fn secret_cryptor_roundtrip_and_purpose_separation() {
+        let kek = Zeroizing::new([6u8; KEY_LEN]);
+        let slow = SecretCryptor::new(derive_secret_key(&kek, "slow-store"));
+        let totp = SecretCryptor::new(derive_secret_key(&kek, "totp"));
+
+        let ct = slow.encrypt_bytes(b"a-sensitive-blob").unwrap();
+        assert!(SecretCryptor::is_encrypted(&ct));
+        assert_ne!(ct, b"a-sensitive-blob");
+        assert_eq!(slow.decrypt_bytes(&ct).unwrap(), b"a-sensitive-blob");
+
+        // Domain separation: a different purpose derives a different key.
+        assert!(totp.decrypt_bytes(&ct).is_err());
     }
 
     #[test]
