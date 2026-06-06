@@ -1315,16 +1315,8 @@ impl MemoryStorage {
             }
             (false, Some(pass)) => {
                 let ks = Keystore::create(&pass, KdfParams::production())?;
-                std::fs::write(&keystore_path, ks.to_json()?)
+                ks.save_to_path(&keystore_path)
                     .context("Failed to write keystore.json")?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &keystore_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
                 let kek = ks.unseal_with_passphrase(&pass)?;
                 let (epoch, dek) = ks.active_data_key(&kek)?;
                 let blinder = IndexBlinder::derive_from_kek(&kek);
