@@ -162,3 +162,69 @@ fn wrong_passphrase_after_keystore_created_is_hard_error() {
 
     env::remove_var("VELD_MASTER_PASSPHRASE");
 }
+
+#[test]
+fn dek_rotation_keeps_old_records_readable() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    env::set_var("VELD_MASTER_PASSPHRASE", PASSPHRASE);
+
+    let temp = TempDir::new().expect("temp dir");
+    let (old_id, old_mem) = sample("record-written-before-rotation");
+
+    // 1. Create the keystore (epoch 0) and store a record under it.
+    {
+        let storage = MemoryStorage::new(temp.path(), None).expect("open storage");
+        storage.store(&old_mem).expect("store pre-rotation record");
+        assert_eq!(
+            storage.get(&old_id).expect("get pre-rotation").experience.content,
+            "record-written-before-rotation"
+        );
+    }
+
+    // 2. Rotate the data key out-of-process, exactly as `veld-keyctl rotate-dek`:
+    //    load the keystore, unseal, rotate the DEK to a new epoch, persist.
+    let keystore_path = temp.path().join("storage").join("keystore.json");
+    {
+        use veld::keystore::Keystore;
+        let json = std::fs::read_to_string(&keystore_path).expect("read keystore");
+        let mut ks = Keystore::from_json(&json).expect("parse keystore");
+        let kek = ks.unseal_with_passphrase(PASSPHRASE).expect("unseal");
+        let new_epoch = ks.rotate_dek(&kek).expect("rotate dek");
+        assert_eq!(new_epoch, 1, "rotation should produce epoch 1");
+        ks.save_to_path(&keystore_path).expect("persist rotated keystore");
+    }
+
+    // 3. Reopen: the pre-rotation record (epoch 0) must still decrypt via its
+    //    retained DEK, and a new record is written under the active epoch 1.
+    let (new_id, new_mem) = sample("record-written-after-rotation");
+    {
+        let storage = MemoryStorage::new(temp.path(), None).expect("reopen after rotation");
+        assert_eq!(
+            storage.get(&old_id).expect("read old record after rotation").experience.content,
+            "record-written-before-rotation",
+            "pre-rotation record must remain readable under its retired epoch key"
+        );
+        storage.store(&new_mem).expect("store post-rotation record");
+        assert_eq!(
+            storage.get(&new_id).expect("read new record").experience.content,
+            "record-written-after-rotation"
+        );
+    }
+
+    // 4. On disk the two records carry different epochs in the envelope header
+    //    (ENC\0 marker[4] | version[1] | epoch[4 LE] | nonce | ct): old=0, new=1.
+    let db_path = temp.path().join("storage");
+    let opts = rocksdb::Options::default();
+    let cf_names = rocksdb::DB::list_cf(&opts, &db_path).expect("list cfs");
+    let db = rocksdb::DB::open_cf_for_read_only(&opts, &db_path, &cf_names, false)
+        .expect("reopen read-only");
+    let epoch_of = |id: &MemoryId| -> u32 {
+        let raw = db.get(id.0.as_bytes()).expect("get").expect("present");
+        assert!(raw.starts_with(b"ENC\0"), "record must be an ENC\\0 envelope");
+        u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]])
+    };
+    assert_eq!(epoch_of(&old_id), 0, "pre-rotation record should be epoch 0");
+    assert_eq!(epoch_of(&new_id), 1, "post-rotation record should be epoch 1");
+
+    env::remove_var("VELD_MASTER_PASSPHRASE");
+}

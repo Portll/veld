@@ -1139,11 +1139,13 @@ pub struct MemoryStorage {
     /// Optional record-level encryptor (AES-256-GCM envelope, encryption-v2).
     /// When present, the whole serialized record is encrypted before storage and
     /// decrypted on read. Backed by the keystore (`storage_path/keystore.json`),
-    /// unsealed via `VELD_MASTER_PASSPHRASE`; `None` means plaintext (backward compatible).
-    record_cryptor: Option<crate::keystore::RecordCryptor>,
+    /// unsealed via `VELD_MASTER_PASSPHRASE`; `None` means plaintext (backward
+    /// compatible). Holds one cryptor per keystore epoch so records written before
+    /// a key rotation stay readable (writes always use the active epoch).
+    record_cryptors: Option<crate::keystore::RecordCryptors>,
     /// Optional index-term blinder (encryption-v2 P3). When present, exact-match
     /// index terms (tag/entity/…) are stored as HMAC tokens, not plaintext.
-    /// Derived from the master key alongside `record_cryptor`.
+    /// Derived from the master key alongside `record_cryptors`.
     index_blinder: Option<crate::keystore::IndexBlinder>,
 }
 
@@ -1256,8 +1258,8 @@ impl MemoryStorage {
         // passphrase and no keystore creates one. A keystore present without the
         // passphrase is a hard error (it would otherwise serve ciphertext as
         // plaintext). No keystore + no passphrase = plaintext (backward compatible).
-        let (record_cryptor, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)? {
-            Some((cryptor, blinder)) => (Some(cryptor), Some(blinder)),
+        let (record_cryptors, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)? {
+            Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
             None => (None, None),
         };
 
@@ -1265,7 +1267,7 @@ impl MemoryStorage {
             db,
             storage_path: path.to_path_buf(),
             write_mode,
-            record_cryptor,
+            record_cryptors,
             index_blinder,
         })
     }
@@ -1275,8 +1277,8 @@ impl MemoryStorage {
     fn open_record_cryptor(
         db: &DB,
         storage_path: &Path,
-    ) -> Result<Option<(crate::keystore::RecordCryptor, crate::keystore::IndexBlinder)>> {
-        use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptor};
+    ) -> Result<Option<(crate::keystore::RecordCryptors, crate::keystore::IndexBlinder)>> {
+        use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptors};
 
         let keystore_path = storage_path.join("keystore.json");
         let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
@@ -1324,9 +1326,9 @@ impl MemoryStorage {
             .context("keystore integrity verification failed")?;
         Self::check_keystore_generation(db, ks.generation)?;
 
-        let (epoch, dek) = ks.active_data_key(&kek)?;
+        let cryptors = RecordCryptors::from_keystore(&ks, &kek)?;
         let blinder = IndexBlinder::derive_from_kek(&kek);
-        Ok(Some((RecordCryptor::new(epoch, dek), blinder)))
+        Ok(Some((cryptors, blinder)))
     }
 
     /// Rollback guard: refuse a keystore whose generation is older than the last
@@ -1366,8 +1368,9 @@ impl MemoryStorage {
     fn serialize_memory(&self, memory: &Memory) -> Result<Vec<u8>> {
         let plaintext = bincode::serde::encode_to_vec(memory, bincode::config::standard())
             .context("Failed to serialize memory")?;
-        match &self.record_cryptor {
-            Some(cryptor) => cryptor
+        match &self.record_cryptors {
+            Some(cryptors) => cryptors
+                .active()
                 .encrypt_record(&plaintext)
                 .context("Failed to encrypt memory record"),
             None => Ok(plaintext),
@@ -1381,17 +1384,19 @@ impl MemoryStorage {
     /// fails — callers must NOT treat that as a plaintext record.
     fn decode_stored(&self, data: &[u8]) -> Result<(Memory, bool)> {
         if crate::keystore::is_encrypted_record(data) {
-            let cryptor = self.record_cryptor.as_ref().ok_or_else(|| {
+            let cryptors = self.record_cryptors.as_ref().ok_or_else(|| {
                 anyhow!("encountered an encrypted record but no keystore/key is configured")
             })?;
             let epoch = crate::keystore::record_epoch(data).unwrap_or(0);
-            if epoch != cryptor.epoch() {
-                // P2 has a single active epoch; multi-epoch reads arrive with rotation (P4).
-                return Err(anyhow!(
-                    "record epoch {epoch} differs from active epoch {}; key rotation not yet supported",
-                    cryptor.epoch()
-                ));
-            }
+            // Select the DEK for THIS record's epoch — records written before a key
+            // rotation decrypt under their original (retired) epoch key.
+            let cryptor = cryptors.for_epoch(epoch).ok_or_else(|| {
+                anyhow!(
+                    "record epoch {epoch} has no DEK in the keystore (active epoch {}); \
+                     the keystore may have been replaced or the epoch's key pruned",
+                    cryptors.active_epoch()
+                )
+            })?;
             let plaintext = cryptor
                 .decrypt_record(data)
                 .context("Failed to decrypt memory record")?;
