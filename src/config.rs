@@ -876,6 +876,8 @@ pub fn print_env_help() {
     println!("  VELD_DEV_API_KEY      - Development API key (required in dev if VELD_API_KEYS not set)");
     println!("  VELD_KEYSTORE_PATH    - Keystore file enabling encryption-at-rest (required for encrypted production)");
     println!("  VELD_MASTER_PASSPHRASE - Passphrase that unseals the keystore (required when VELD_KEYSTORE_PATH is set)");
+    println!("  VELD_SLOW_STORE_ENCRYPT_GRAPH / _EMBEDDINGS - Also encrypt the slow-store graph content / embeddings (default off; payload on)");
+    println!("  VELD_ALLOW_KEYSTORE_ROLLBACK - Accept a restored older keystore.json once, resetting the rollback sentinel (default off)");
     println!("  VELD_MAX_USERS        - Max users in memory LRU (default: 1000)");
     println!("  VELD_RATE_LIMIT       - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
     println!("  VELD_RATE_BURST       - Burst size (default: 8000)");
