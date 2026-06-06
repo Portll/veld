@@ -24,8 +24,11 @@ this boundary understood.
    environment or adopt private-ANN — out of scope here.
 2. **Vector-mapping entries** (`memory_id ↔ vector_id`) — low-sensitivity
    identifiers; currently plaintext.
-3. **Range index fields** (date / type / importance / geo / episode_seq / reward)
-   — plaintext; blinding them breaks range/order/proximity queries (design B-3).
+3. **Range/ordered index fields** (date / type / importance / geo / reward, and
+   the `seq` ordering component of `episode_seq`) — plaintext; blinding them
+   breaks range/order/proximity queries (design B-3). Note: the *episode_id* in
+   `episode_seq` IS blinded (it is an exact-match term, like the `episode` index);
+   only the sequence number is exposed.
 4. **Sibling column families** — feedback, files, prospective, todos. These hold
    user content and are **currently plaintext**. Encrypting them is a tractable but
    separate integration (route each store's blob through the record cryptor); it is
