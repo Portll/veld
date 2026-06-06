@@ -354,7 +354,7 @@ impl SlowStore {
     ) -> Result<()> {
         // Encrypt the payload at rest when a key is configured (parity with the
         // RocksDB primary store); no-op passthrough otherwise.
-        let stored = self.maybe_encrypt(memory_bincode)?;
+        let stored = self.maybe_encrypt(memory_id, memory_bincode)?;
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -445,7 +445,7 @@ impl SlowStore {
         // anyhow errors). Marked blobs decrypt; plaintext rows pass through.
         match row {
             Some(mut r) => {
-                r.memory_bincode = self.maybe_decrypt(r.memory_bincode)?;
+                r.memory_bincode = self.maybe_decrypt(memory_id, r.memory_bincode)?;
                 Ok(Some(r))
             }
             None => Ok(None),

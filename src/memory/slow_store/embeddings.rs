@@ -33,8 +33,9 @@ impl SlowStore {
         })?;
         for row in rows {
             let (uuid_str, blob) = row?;
-            // Decrypt the embedding BLOB if the embeddings toggle sealed it.
-            let blob = super::open_field(self.encryptor.as_ref(), blob)?;
+            // Decrypt the embedding BLOB if the embeddings toggle sealed it
+            // (AAD-bound to the entity uuid).
+            let blob = super::open_field(self.encryptor.as_ref(), blob, uuid_str.as_bytes())?;
             // Decode f32 embedding from little-endian bytes
             let floats: Vec<f32> = blob
                 .chunks_exact(4)
@@ -79,8 +80,9 @@ impl SlowStore {
 
         let mut results = Vec::with_capacity(raw.len());
         for (uuid, name, blob) in raw {
-            // Decrypt the embedding column if the embeddings toggle sealed it.
-            let blob = super::open_field(self.encryptor.as_ref(), blob)?;
+            // Decrypt the embedding column if the embeddings toggle sealed it
+            // (AAD-bound to the entity uuid).
+            let blob = super::open_field(self.encryptor.as_ref(), blob, uuid.as_bytes())?;
             let floats: Vec<f32> = blob
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
