@@ -103,14 +103,10 @@ fn encrypt_totp_secret(
     runtime: &crate::user_auth::runtime::UserAuthRuntime,
     secret: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
-    match &runtime.field_encryptor {
-        Some(enc) => {
-            // SecretCryptor::encrypt_content expects str. The secret is
-            // arbitrary bytes — encode as hex so we round-trip cleanly.
-            let hex_secret = hex::encode(secret);
-            enc.encrypt_content(&hex_secret)
-                .map_err(|e| AuthError::internal(format!("TOTP encrypt failed: {e}")))
-        }
+    match &runtime.totp_encryptor {
+        Some(enc) => enc
+            .encrypt_bytes(secret)
+            .map_err(|e| AuthError::internal(format!("TOTP encrypt failed: {e}"))),
         None => {
             if is_production_mode() {
                 Err(AuthError::TotpEncryptionRequired)
@@ -129,17 +125,13 @@ fn decrypt_totp_secret(
     stored: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
     if crate::keystore::SecretCryptor::is_encrypted(stored) {
-        let enc = runtime.field_encryptor.as_ref().ok_or_else(|| {
+        let enc = runtime.totp_encryptor.as_ref().ok_or_else(|| {
             AuthError::internal(
                 "stored TOTP secret is encrypted but the runtime has no encryptor configured",
             )
         })?;
-        let hex_secret = enc
-            .decrypt_content(stored)
-            .map_err(|e| AuthError::internal(format!("TOTP decrypt failed: {e}")))?;
-        hex::decode(hex_secret.trim()).map_err(|e| {
-            AuthError::internal(format!("TOTP secret hex decode failed: {e}"))
-        })
+        enc.decrypt_bytes(stored)
+            .map_err(|e| AuthError::internal(format!("TOTP decrypt failed: {e}")))
     } else {
         // Backward-compatible: a record written in dev mode with no key.
         Ok(stored.to_vec())
