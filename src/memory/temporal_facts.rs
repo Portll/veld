@@ -67,6 +67,7 @@ pub struct TemporalFact {
 }
 
 /// Resolved time representation
+// bincode: append-only — never reorder or insert; new variants go last
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResolvedTime {
     /// Exact date (e.g., "May 7, 2023")
@@ -79,6 +80,13 @@ pub enum ResolvedTime {
     RelativeDescription(String),
     /// Unknown/couldn't resolve
     Unknown,
+    // --- INFERENTIAL VARIANTS — appended after Unknown; never reorder ---
+    /// Open lower bound: "after <X>" / "since <X>" / "from <X>"
+    After(NaiveDate),
+    /// Open upper bound: "before <X>" / "prior to <X>" / "until <X>"
+    Before(NaiveDate),
+    /// Fuzzy window centred on a date: "around <X>" / "~<X>"
+    Around { centre: NaiveDate, radius_days: u32 },
 }
 
 /// A resolved temporal value projected into an interval for overlap testing.
@@ -88,9 +96,8 @@ pub enum ResolvedTime {
 /// `Point` or `Closed`; anything that cannot be resolved becomes `Unknown`,
 /// which signals the gate to fall back to `conversation_date`.
 ///
-/// Inferential/open variants (After/Before/Fuzzy) are intentionally NOT present
-/// yet — no producer emits them until the inferential resolver lands (phase-2).
-/// Adding them now would be a phantom-variant (no plug for the socket).
+/// Inferential/open variants (After/Before/Fuzzy) are produced by the
+/// inferential resolver (R4) and flow through the query gate transparently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemporalBound {
     /// Zero-width: a single day (yesterday, an exact date, last Saturday).
@@ -99,6 +106,12 @@ pub enum TemporalBound {
     Closed { start: NaiveDate, end: NaiveDate },
     /// Could not be resolved to an interval — caller uses conversation_date fallback.
     Unknown,
+    /// Open lower bound: matches anything on or after `anchor`.
+    After(NaiveDate),
+    /// Open upper bound: matches anything on or before `anchor`.
+    Before(NaiveDate),
+    /// Fuzzy closed interval: [centre − radius_days, centre + radius_days].
+    Fuzzy { centre: NaiveDate, radius_days: u32 },
 }
 
 impl TemporalBound {
@@ -106,6 +119,11 @@ impl TemporalBound {
     ///
     /// `Unknown` never overlaps — the gate handles it via the conversation_date
     /// fallback rather than this method. Inverted/empty inputs are guarded (J3).
+    ///
+    /// Inferential variants:
+    /// - `After(x)`:  overlaps iff the window extends at or past `x` (we >= x).
+    /// - `Before(x)`: overlaps iff the window starts at or before `x` (ws <= x).
+    /// - `Fuzzy{c,r}`: the fuzzy interval [c-r, c+r] intersects [ws, we].
     pub fn overlaps_range(&self, window_start: NaiveDate, window_end: NaiveDate) -> bool {
         // Guard inverted window — treat as no overlap rather than silently matching.
         if window_start > window_end {
@@ -122,12 +140,35 @@ impl TemporalBound {
                 *start <= window_end && window_start <= *end
             }
             TemporalBound::Unknown => false,
+            // Open lower bound: the "after X" interval extends to +infinity.
+            // It intersects [ws, we] iff we >= x.
+            TemporalBound::After(anchor) => window_end >= *anchor,
+            // Open upper bound: the "before X" interval extends to -infinity.
+            // It intersects [ws, we] iff ws <= x.
+            TemporalBound::Before(anchor) => window_start <= *anchor,
+            // Fuzzy interval [c-r, c+r] intersects [ws, we] via standard overlap.
+            TemporalBound::Fuzzy { centre, radius_days } => {
+                let r = Duration::days(*radius_days as i64);
+                let fuzzy_start = *centre - r;
+                let fuzzy_end = *centre + r;
+                fuzzy_start <= window_end && window_start <= fuzzy_end
+            }
         }
     }
 }
 
 impl ResolvedTime {
-    /// Convert to a sortable string for comparison
+    /// Convert to a sortable string for comparison.
+    ///
+    /// Existing arms (ExactDate/MonthYear/Year/RelativeDescription/Unknown) are
+    /// byte-identical to the pre-R4 output — do NOT change them.
+    ///
+    /// New arms use a namespace prefix that cannot collide with existing arms:
+    ///   After(d)      → "after:YYYY-MM-DD"
+    ///   Before(d)     → "before:YYYY-MM-DD"
+    ///   Around{c,r}   → "around:YYYY-MM-DD:Nd"
+    /// Existing arms never start with "after:", "before:", or "around:", so
+    /// contradiction-dedup will never conflate an inferential fact with an exact one.
     pub fn to_sortable_string(&self) -> String {
         match self {
             ResolvedTime::ExactDate(d) => d.format("%Y-%m-%d").to_string(),
@@ -135,6 +176,12 @@ impl ResolvedTime {
             ResolvedTime::Year(y) => format!("{:04}", y),
             ResolvedTime::RelativeDescription(s) => s.clone(),
             ResolvedTime::Unknown => "unknown".to_string(),
+            // Inferential — namespaced to prevent collision with exact-date arms.
+            ResolvedTime::After(d) => format!("after:{}", d.format("%Y-%m-%d")),
+            ResolvedTime::Before(d) => format!("before:{}", d.format("%Y-%m-%d")),
+            ResolvedTime::Around { centre, radius_days } => {
+                format!("around:{}:{}d", centre.format("%Y-%m-%d"), radius_days)
+            }
         }
     }
 
@@ -171,6 +218,13 @@ impl ResolvedTime {
                 }
             }
             ResolvedTime::RelativeDescription(_) | ResolvedTime::Unknown => TemporalBound::Unknown,
+            // Inferential → corresponding open/fuzzy bound.
+            ResolvedTime::After(d) => TemporalBound::After(*d),
+            ResolvedTime::Before(d) => TemporalBound::Before(*d),
+            ResolvedTime::Around { centre, radius_days } => TemporalBound::Fuzzy {
+                centre: *centre,
+                radius_days: *radius_days,
+            },
         }
     }
 }
@@ -1005,11 +1059,75 @@ fn extract_time_expression(sentence: &str) -> String {
     // particular "* weekend" must precede "* week" (it contains it), and the
     // multi-word day offsets / "earlier today" must precede the bare
     // "yesterday"/"tomorrow"/"today" tokens.
+    //
+    // Inferential prepositional patterns are placed before the phrases they
+    // contain, e.g. "after next week" before "next week".
     let time_patterns = [
         // multi-word day offsets (contain "yesterday"/"tomorrow")
         "the day before yesterday",
         "the day after tomorrow",
         "earlier today",
+        // --- inferential: "prior to" must precede "before" (substring) ---
+        "prior to next year",
+        "prior to last year",
+        "prior to this year",
+        "prior to next month",
+        "prior to last month",
+        "prior to this month",
+        "prior to next week",
+        "prior to last week",
+        "prior to yesterday",
+        "prior to tomorrow",
+        "prior to today",
+        // inferential: "since/from/after" + standard phrases
+        "since last year",
+        "since last month",
+        "since last week",
+        "since yesterday",
+        "after next year",
+        "after last year",
+        "after next month",
+        "after last month",
+        "after next week",
+        "after last week",
+        "after yesterday",
+        "after tomorrow",
+        "after today",
+        "from last year",
+        "from last month",
+        "from last week",
+        "from yesterday",
+        "from today",
+        // inferential: "before" + standard phrases (must come after "prior to")
+        "before next year",
+        "before last year",
+        "before next month",
+        "before last month",
+        "before next week",
+        "before last week",
+        "before yesterday",
+        "before tomorrow",
+        "before today",
+        // inferential: "until" + standard phrases
+        "until next year",
+        "until last year",
+        "until next month",
+        "until last month",
+        "until next week",
+        "until last week",
+        "until yesterday",
+        "until tomorrow",
+        "until today",
+        // inferential: "around" + standard phrases
+        "around next year",
+        "around last year",
+        "around next month",
+        "around last month",
+        "around next week",
+        "around last week",
+        "around yesterday",
+        "around tomorrow",
+        "around today",
         // weekends (contain "week")
         "last weekend",
         "next weekend",
@@ -1046,6 +1164,8 @@ fn extract_time_expression(sentence: &str) -> String {
         "two weeks ago",
         "a few days ago",
         "a week ago",
+        // bare "recently"
+        "recently",
     ];
 
     for pattern in time_patterns {
@@ -1206,6 +1326,107 @@ fn extract_event_from_sentence(sentence: &str) -> String {
 pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -> ResolvedTime {
     let relative_lower = relative.to_lowercase();
     let conv_date = conversation_date.date_naive();
+
+    // -----------------------------------------------------------------------
+    // INFERENTIAL PREPOSITIONS — checked before all other branches.
+    //
+    // Recognise a leading preposition, strip it, recursively resolve the
+    // remainder, then wrap in the appropriate inferential variant.
+    //
+    // Ordering: longer/more-specific prefixes must precede shorter ones that
+    // are substrings (e.g. "prior to " before "to ", "since " before bare).
+    //
+    // If the recursive resolution yields `Unknown` the whole expression is
+    // `Unknown` — no degenerate half-formed bounds are emitted.
+    // -----------------------------------------------------------------------
+
+    // "since <X>" / "from <X>" / "after <X>"
+    for prefix in &["since ", "from ", "after "] {
+        if let Some(rest) = relative_lower.strip_prefix(prefix) {
+            let inner = resolve_relative_time(rest, conversation_date);
+            return match &inner {
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => ResolvedTime::Unknown,
+                ResolvedTime::ExactDate(d) => ResolvedTime::After(*d),
+                ResolvedTime::MonthYear { month, year } => {
+                    // Take the LATEST day of the month as the anchor.
+                    match last_day_of_month(*year, *month) {
+                        Some(d) => ResolvedTime::After(d),
+                        None => ResolvedTime::Unknown,
+                    }
+                }
+                ResolvedTime::Year(y) => {
+                    // Latest day of the year.
+                    match NaiveDate::from_ymd_opt(*y, 12, 31) {
+                        Some(d) => ResolvedTime::After(d),
+                        None => ResolvedTime::Unknown,
+                    }
+                }
+                // Propagate inferential — After(After(x)) collapses to After(x).
+                ResolvedTime::After(d) => ResolvedTime::After(*d),
+                ResolvedTime::Before(d) => ResolvedTime::Before(*d),
+                ResolvedTime::Around { centre, radius_days } => ResolvedTime::Around {
+                    centre: *centre,
+                    radius_days: *radius_days,
+                },
+            };
+        }
+    }
+
+    // "prior to <X>" / "before <X>" / "until <X>"
+    for prefix in &["prior to ", "before ", "until "] {
+        if let Some(rest) = relative_lower.strip_prefix(prefix) {
+            let inner = resolve_relative_time(rest, conversation_date);
+            return match &inner {
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => ResolvedTime::Unknown,
+                ResolvedTime::ExactDate(d) => ResolvedTime::Before(*d),
+                ResolvedTime::MonthYear { month, year } => {
+                    // Take the EARLIEST day of the month as the anchor.
+                    match NaiveDate::from_ymd_opt(*year, *month, 1) {
+                        Some(d) => ResolvedTime::Before(d),
+                        None => ResolvedTime::Unknown,
+                    }
+                }
+                ResolvedTime::Year(y) => {
+                    // Earliest day of the year.
+                    match NaiveDate::from_ymd_opt(*y, 1, 1) {
+                        Some(d) => ResolvedTime::Before(d),
+                        None => ResolvedTime::Unknown,
+                    }
+                }
+                ResolvedTime::After(d) => ResolvedTime::After(*d),
+                ResolvedTime::Before(d) => ResolvedTime::Before(*d),
+                ResolvedTime::Around { centre, radius_days } => ResolvedTime::Around {
+                    centre: *centre,
+                    radius_days: *radius_days,
+                },
+            };
+        }
+    }
+
+    // "around <X>" / "~<X>"
+    for prefix in &["around ", "~"] {
+        if let Some(rest) = relative_lower.strip_prefix(prefix) {
+            let inner = resolve_relative_time(rest, conversation_date);
+            let centre = match &inner {
+                ResolvedTime::ExactDate(d) => Some(*d),
+                ResolvedTime::MonthYear { month, year } => NaiveDate::from_ymd_opt(*year, *month, 1),
+                ResolvedTime::Year(y) => NaiveDate::from_ymd_opt(*y, 7, 1),
+                _ => None,
+            };
+            return match centre {
+                Some(c) => ResolvedTime::Around { centre: c, radius_days: 7 },
+                None => ResolvedTime::Unknown,
+            };
+        }
+    }
+
+    // "recently" → fuzzy centred on the conversation date, ±14 days.
+    if relative_lower.trim() == "recently" {
+        return ResolvedTime::Around {
+            centre: conv_date,
+            radius_days: 14,
+        };
+    }
 
     // Multi-word day offsets — MUST precede the bare "yesterday"/"tomorrow"
     // branches below, which they contain as substrings.
@@ -1780,5 +2001,324 @@ mod tests {
             "entity stem '{entity_stem}' must not appear in event_stems: {:?}",
             fact.event_stems
         );
+    }
+
+    // =========================================================================
+    // R4: Inferential After/Before/Around — resolution, to_bound, overlaps_range
+    // =========================================================================
+
+    // R4 tests reuse the conv() helper defined earlier in this test module.
+
+    // -------------------------------------------------------------------------
+    // R4-1: phrase → ResolvedTime variant
+    // -------------------------------------------------------------------------
+
+    /// "after yesterday" → After(conv_date - 1)
+    #[test]
+    fn test_inferential_after_yesterday() {
+        let expected = conv().date_naive() - Duration::days(1);
+        match resolve_relative_time("after yesterday", conv()) {
+            ResolvedTime::After(d) => assert_eq!(d, expected),
+            other => panic!("expected After, got {other:?}"),
+        }
+    }
+
+    /// "since last week" → After(conv_date - 7)
+    #[test]
+    fn test_inferential_since_last_week() {
+        let expected = conv().date_naive() - Duration::days(7);
+        match resolve_relative_time("since last week", conv()) {
+            ResolvedTime::After(d) => assert_eq!(d, expected),
+            other => panic!("expected After, got {other:?}"),
+        }
+    }
+
+    /// "from last month" → After(last day of April 2023 = Apr 30)
+    #[test]
+    fn test_inferential_from_last_month() {
+        // conv is May 25, 2023 → last month = April 2023 → last day = Apr 30
+        let expected = NaiveDate::from_ymd_opt(2023, 4, 30).unwrap();
+        match resolve_relative_time("from last month", conv()) {
+            ResolvedTime::After(d) => assert_eq!(d, expected),
+            other => panic!("expected After, got {other:?}"),
+        }
+    }
+
+    /// "before next month" → Before(first day of June 2023 = Jun 1)
+    #[test]
+    fn test_inferential_before_next_month() {
+        let expected = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        match resolve_relative_time("before next month", conv()) {
+            ResolvedTime::Before(d) => assert_eq!(d, expected),
+            other => panic!("expected Before, got {other:?}"),
+        }
+    }
+
+    /// "prior to last year" → Before(Jan 1 of 2022)
+    #[test]
+    fn test_inferential_prior_to_last_year() {
+        let expected = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
+        match resolve_relative_time("prior to last year", conv()) {
+            ResolvedTime::Before(d) => assert_eq!(d, expected),
+            other => panic!("expected Before, got {other:?}"),
+        }
+    }
+
+    /// "until tomorrow" → Before(conv_date + 1)
+    #[test]
+    fn test_inferential_until_tomorrow() {
+        let expected = conv().date_naive() + Duration::days(1);
+        match resolve_relative_time("until tomorrow", conv()) {
+            ResolvedTime::Before(d) => assert_eq!(d, expected),
+            other => panic!("expected Before, got {other:?}"),
+        }
+    }
+
+    /// "around yesterday" → Around { centre: conv_date-1, radius_days: 7 }
+    #[test]
+    fn test_inferential_around_yesterday() {
+        let expected_centre = conv().date_naive() - Duration::days(1);
+        match resolve_relative_time("around yesterday", conv()) {
+            ResolvedTime::Around { centre, radius_days } => {
+                assert_eq!(centre, expected_centre);
+                assert_eq!(radius_days, 7);
+            }
+            other => panic!("expected Around, got {other:?}"),
+        }
+    }
+
+    /// "recently" → Around { centre: conv_date, radius_days: 14 }
+    #[test]
+    fn test_inferential_recently() {
+        match resolve_relative_time("recently", conv()) {
+            ResolvedTime::Around { centre, radius_days } => {
+                assert_eq!(centre, conv().date_naive());
+                assert_eq!(radius_days, 14);
+            }
+            other => panic!("expected Around for 'recently', got {other:?}"),
+        }
+    }
+
+    /// "after <unknown>" → Unknown (no degenerate bound emitted)
+    #[test]
+    fn test_inferential_after_unknown_gives_unknown() {
+        match resolve_relative_time("after something-unparseable-xyz", conv()) {
+            ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {} // pass
+            other => panic!("expected Unknown/RelativeDescription, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // R4-2: to_bound mapping
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_to_bound_after() {
+        let d = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        assert_eq!(ResolvedTime::After(d).to_bound(), TemporalBound::After(d));
+    }
+
+    #[test]
+    fn test_to_bound_before() {
+        let d = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        assert_eq!(ResolvedTime::Before(d).to_bound(), TemporalBound::Before(d));
+    }
+
+    #[test]
+    fn test_to_bound_around() {
+        let c = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
+        assert_eq!(
+            ResolvedTime::Around { centre: c, radius_days: 7 }.to_bound(),
+            TemporalBound::Fuzzy { centre: c, radius_days: 7 }
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // R4-3: overlaps_range for new variants including boundary cases
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_overlaps_range_after() {
+        let anchor = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        let bound = TemporalBound::After(anchor);
+        let jun = |d: u32| NaiveDate::from_ymd_opt(2023, 6, d).unwrap();
+
+        // window entirely after anchor → overlaps
+        assert!(bound.overlaps_range(jun(5), jun(20)));
+        // window ending exactly on anchor → overlaps
+        assert!(bound.overlaps_range(jun(1), jun(1)));
+        // window straddling anchor → overlaps
+        assert!(bound.overlaps_range(NaiveDate::from_ymd_opt(2023, 5, 25).unwrap(), jun(5)));
+        // window entirely before anchor → no overlap
+        assert!(!bound.overlaps_range(
+            NaiveDate::from_ymd_opt(2023, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 5, 31).unwrap()
+        ));
+        // inverted window → no overlap
+        assert!(!bound.overlaps_range(jun(20), jun(5)));
+    }
+
+    #[test]
+    fn test_overlaps_range_before() {
+        let anchor = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        let bound = TemporalBound::Before(anchor);
+        let may = |d: u32| NaiveDate::from_ymd_opt(2023, 5, d).unwrap();
+        let jun = |d: u32| NaiveDate::from_ymd_opt(2023, 6, d).unwrap();
+
+        // window entirely before anchor → overlaps
+        assert!(bound.overlaps_range(may(1), may(31)));
+        // window starting exactly on anchor → overlaps
+        assert!(bound.overlaps_range(jun(1), jun(1)));
+        // window entirely after anchor → no overlap
+        assert!(!bound.overlaps_range(jun(2), jun(30)));
+        // inverted window → no overlap
+        assert!(!bound.overlaps_range(may(31), may(1)));
+    }
+
+    #[test]
+    fn test_overlaps_range_fuzzy() {
+        // centre = Jun 15, radius = 7 → fuzzy window [Jun 8, Jun 22]
+        let centre = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
+        let bound = TemporalBound::Fuzzy { centre, radius_days: 7 };
+        let jun = |d: u32| NaiveDate::from_ymd_opt(2023, 6, d).unwrap();
+
+        // entirely inside fuzzy window
+        assert!(bound.overlaps_range(jun(10), jun(20)));
+        // touching left boundary
+        assert!(bound.overlaps_range(jun(1), jun(8)));
+        // touching right boundary
+        assert!(bound.overlaps_range(jun(22), jun(30)));
+        // entirely to the left of fuzzy window
+        assert!(!bound.overlaps_range(jun(1), jun(7)));
+        // entirely to the right of fuzzy window
+        assert!(!bound.overlaps_range(jun(23), jun(30)));
+        // inverted window → no overlap
+        assert!(!bound.overlaps_range(jun(20), jun(10)));
+    }
+
+    // -------------------------------------------------------------------------
+    // R4-4: sortable-string non-collision
+    // -------------------------------------------------------------------------
+
+    /// After(June 1) and ExactDate(June 1) MUST produce different sortable strings.
+    #[test]
+    fn test_sortable_string_no_collision_after_vs_exact() {
+        let d = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        let exact_str = ResolvedTime::ExactDate(d).to_sortable_string();
+        let after_str = ResolvedTime::After(d).to_sortable_string();
+        assert_ne!(
+            exact_str, after_str,
+            "After({d}) and ExactDate({d}) must not produce the same sortable string"
+        );
+        assert!(
+            after_str.starts_with("after:"),
+            "After sortable string must be namespaced: {after_str}"
+        );
+        assert_eq!(exact_str, "2023-06-01");
+        assert_eq!(after_str, "after:2023-06-01");
+    }
+
+    /// Before(June 1) must also not collide with ExactDate(June 1).
+    #[test]
+    fn test_sortable_string_no_collision_before_vs_exact() {
+        let d = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        let exact_str = ResolvedTime::ExactDate(d).to_sortable_string();
+        let before_str = ResolvedTime::Before(d).to_sortable_string();
+        assert_ne!(exact_str, before_str);
+        assert!(before_str.starts_with("before:"));
+        assert_eq!(before_str, "before:2023-06-01");
+    }
+
+    /// Around sortable string format is correct.
+    #[test]
+    fn test_sortable_string_around_format() {
+        let c = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
+        let s = ResolvedTime::Around { centre: c, radius_days: 7 }.to_sortable_string();
+        assert_eq!(s, "around:2023-06-15:7d");
+    }
+
+    // -------------------------------------------------------------------------
+    // R4-5: bincode round-trip for new variants + old-fact decode safety
+    // -------------------------------------------------------------------------
+
+    fn make_fact(resolved_time: ResolvedTime, conversation_date: DateTime<Utc>) -> TemporalFact {
+        use super::super::types::MemoryId;
+        TemporalFact {
+            id: "test-fact-id".to_string(),
+            entity: "alice".to_string(),
+            event: "test event".to_string(),
+            event_stems: vec!["test".to_string()],
+            event_type: EventType::Planned,
+            relative_time: None,
+            resolved_time,
+            source_memory_id: MemoryId(uuid::Uuid::nil()),
+            conversation_date,
+            confidence: 0.9,
+            source_text: "test source text".to_string(),
+            valid_from: None,
+            valid_until: None,
+        }
+    }
+
+    /// Encode and decode each new ResolvedTime variant; decoded value must equal encoded.
+    #[test]
+    fn test_bincode_roundtrip_new_variants() {
+        let conv = conv();
+        let d = NaiveDate::from_ymd_opt(2023, 6, 1).unwrap();
+        let centre = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
+
+        let cases: Vec<ResolvedTime> = vec![
+            ResolvedTime::After(d),
+            ResolvedTime::Before(d),
+            ResolvedTime::Around { centre, radius_days: 7 },
+        ];
+
+        for rt in cases {
+            let fact = make_fact(rt, conv);
+            let encoded = bincode::serde::encode_to_vec(&fact, bincode::config::standard())
+                .expect("encode must succeed");
+            let (decoded, _): (TemporalFact, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                    .expect("decode must succeed");
+
+            // Verify the sortable string round-trips correctly.
+            assert_eq!(
+                fact.resolved_time.to_sortable_string(),
+                decoded.resolved_time.to_sortable_string(),
+                "sortable string must be identical after round-trip"
+            );
+            assert_eq!(fact.id, decoded.id);
+            assert_eq!(fact.entity, decoded.entity);
+        }
+    }
+
+    /// Old-fact variants (ExactDate, MonthYear, Year, RelativeDescription, Unknown)
+    /// must still decode correctly — verifies append-only bincode safety.
+    #[test]
+    fn test_bincode_old_fact_decode_unchanged() {
+        let conv = conv();
+        let d = NaiveDate::from_ymd_opt(2023, 5, 20).unwrap();
+
+        let old_variants: Vec<ResolvedTime> = vec![
+            ResolvedTime::ExactDate(d),
+            ResolvedTime::MonthYear { month: 5, year: 2023 },
+            ResolvedTime::Year(2022),
+            ResolvedTime::RelativeDescription("some relative phrase".to_string()),
+            ResolvedTime::Unknown,
+        ];
+
+        for rt in old_variants {
+            let fact = make_fact(rt, conv);
+            let encoded = bincode::serde::encode_to_vec(&fact, bincode::config::standard())
+                .expect("encode must succeed");
+            let (decoded, _): (TemporalFact, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                    .expect("old-fact decode must still succeed after R4 additions");
+            assert_eq!(
+                fact.resolved_time.to_sortable_string(),
+                decoded.resolved_time.to_sortable_string(),
+                "old variant sortable string must be unchanged after round-trip"
+            );
+        }
     }
 }
