@@ -346,6 +346,13 @@ pub struct MemorySystem {
     /// Never read by the live scoring path — capture is side-effect-only.
     retrieval_trace_store: feedback::RetrievalTraceStore,
 
+    /// R3a (F3): per-user PERSISTENT store for the learned-weight ranker vector.
+    /// Closes the in-memory-only reset-on-restart defect by persisting/loading
+    /// `LearnedWeights` through this user's own KV CF. Pure persistence
+    /// infrastructure — the loaded weights are NOT read by the scoring path in
+    /// this step; nothing here changes ranking or scoring.
+    learned_weights_store: hybrid_search::LearnedWeightsStore,
+
     /// Query-level metacognition (M3) from the most recent semantic retrieval.
     /// A terminal feeling-of-knowing readout — never fed back into scoring or
     /// adaptive weight learning. The handler assembles the final score from this.
@@ -579,7 +586,8 @@ impl MemorySystem {
         storage: Arc<MemoryStorage>,
         bm25_index: Arc<hybrid_search::BM25Index>,
     ) -> Result<Self> {
-        let _storage_path = config.storage_path.clone();
+        #[cfg(feature = "multi-tenant")]
+        let storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
         //
@@ -912,6 +920,7 @@ impl MemorySystem {
                     vector,
                     graph,
                     update_count,
+                    ..Default::default()
                 });
             } else if let Ok(store) =
                 crate::extensions::collective_store::CollectiveStore::open(collective_dir)
@@ -924,6 +933,7 @@ impl MemorySystem {
                     vector,
                     graph,
                     update_count: 0,
+                    ..Default::default()
                 });
             }
         }
@@ -1022,6 +1032,18 @@ impl MemorySystem {
             retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
                 storage.key_value_store(),
             ),
+            // R3a (F3): per-user persistent learned-weight store over this user's
+            // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
+            // weights are loaded on init (below) but NOT injected into scoring.
+            learned_weights_store: {
+                let store =
+                    hybrid_search::LearnedWeightsStore::with_kv(storage.key_value_store());
+                // Load on init to exercise the read path and surface any B12
+                // fallback warning early. Intentionally discarded: R3a must not
+                // feed learned weights into the scoring path (that is R3b).
+                let _loaded_learned_weights = store.load();
+                store
+            },
             // M3: query-level metacognition readout (terminal; not fed to learner)
             last_query_metacognition: Arc::new(parking_lot::RwLock::new(None)),
             // E6: TCM drift state (encode-driven; empty until the first embed)
@@ -1159,6 +1181,14 @@ impl MemorySystem {
     /// never influence scoring or retrieval.
     pub fn retrieval_trace_store(&self) -> &feedback::RetrievalTraceStore {
         &self.retrieval_trace_store
+    }
+
+    /// R3a (F3): read-only handle on the per-user persistent learned-weight
+    /// store. Exposed so a future R3b (and tests) can load/save the vector. This
+    /// store is pure persistence side-state — accessing it here never influences
+    /// scoring or retrieval in this step.
+    pub fn learned_weights_store(&self) -> &hybrid_search::LearnedWeightsStore {
+        &self.learned_weights_store
     }
 
     /// Store a new memory with an explicit ID.

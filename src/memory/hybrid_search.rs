@@ -222,6 +222,13 @@ impl SignalScores {
     }
 }
 
+/// Current on-disk schema version for [`LearnedWeights`] (B12).
+///
+/// Bump this whenever the persisted shape changes incompatibly. On load,
+/// a mismatch (or a deser failure) falls back to [`LearnedWeights::default`]
+/// — the neutral uniform weights — and warns; it never panics.
+pub const LEARNED_WEIGHTS_SCHEMA_VERSION: u32 = 1;
+
 /// Learned retrieval weights from feedback history
 ///
 /// Updated via EMA (exponential moving average) when retrieval feedback is received.
@@ -229,16 +236,49 @@ impl SignalScores {
 ///
 /// The system starts with static defaults (well-tuned from benchmarks) and gradually
 /// shifts toward empirically-observed signal contributions as feedback accumulates.
-#[derive(Debug, Clone)]
+///
+/// R3a: `Serialize`/`Deserialize`/`Default` are derived so the vector can be
+/// persisted per-user (closes F3 — the in-memory-only ranker reset on restart).
+/// Persistence is pure infrastructure: these weights are NOT read by the scoring
+/// path in this step. Field-level `#[serde(default)]` keeps older serialized forms
+/// loadable (additive evolution); `schema_version` guards incompatible changes (B12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedWeights {
     /// Learned BM25 weight (initialized to static default)
+    #[serde(default)]
     pub bm25: f32,
     /// Learned vector weight (initialized to static default)
+    #[serde(default)]
     pub vector: f32,
     /// Learned graph weight (initialized to static default)
+    #[serde(default)]
     pub graph: f32,
     /// Number of feedback updates applied (confidence measure)
+    #[serde(default)]
     pub update_count: u64,
+    /// On-disk schema version (B12). Defaults to the current version for
+    /// older serialized forms that predate this field.
+    #[serde(default = "default_learned_weights_schema_version")]
+    pub schema_version: u32,
+}
+
+fn default_learned_weights_schema_version() -> u32 {
+    LEARNED_WEIGHTS_SCHEMA_VERSION
+}
+
+impl Default for LearnedWeights {
+    /// Neutral, static-equivalent weights: uniform 1/3 across signals, no
+    /// feedback applied. This is the B12 fallback when persisted weights are
+    /// missing, corrupt, or carry a mismatched schema version.
+    fn default() -> Self {
+        Self {
+            bm25: 1.0 / 3.0,
+            vector: 1.0 / 3.0,
+            graph: 1.0 / 3.0,
+            update_count: 0,
+            schema_version: LEARNED_WEIGHTS_SCHEMA_VERSION,
+        }
+    }
 }
 
 impl LearnedWeights {
@@ -249,6 +289,7 @@ impl LearnedWeights {
             vector: config.vector_weight,
             graph: config.graph_weight,
             update_count: 0,
+            schema_version: LEARNED_WEIGHTS_SCHEMA_VERSION,
         }
     }
 
@@ -275,6 +316,105 @@ impl LearnedWeights {
         }
 
         self.update_count += 1;
+    }
+}
+
+/// Storage key for the persisted learned-weight vector (R3a).
+///
+/// A single fixed key: the per-user key-value column family already namespaces
+/// tenants, so the `user_id` is NOT folded into the key (mirrors how
+/// `RetrievalTraceStore` relies on per-user CF isolation). One vector per user.
+pub(crate) const LEARNED_WEIGHTS_KEY: &[u8] = b"learned_weights:v1";
+
+/// Per-user persistent store for [`LearnedWeights`] (R3a).
+///
+/// Closes F3: the EMA ranker was in-memory-only and reset on every restart.
+/// This store persists/loads the vector through a per-user
+/// [`crate::storage::KeyValueStore`] handle (the same per-user CF pattern as
+/// [`crate::memory::feedback::RetrievalTraceStore`]). When no handle is
+/// configured it is a no-op: `load()` returns the neutral default and `save()`
+/// is a silent skip.
+///
+/// PURE PERSISTENCE INFRASTRUCTURE — the loaded weights are NOT read by the
+/// scoring path in this step (R3a). No ranking/scoring behavior changes.
+#[derive(Clone)]
+pub struct LearnedWeightsStore {
+    kv: Option<Arc<dyn crate::storage::KeyValueStore>>,
+}
+
+impl std::fmt::Debug for LearnedWeightsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LearnedWeightsStore")
+            .field("persistent", &self.kv.is_some())
+            .finish()
+    }
+}
+
+impl Default for LearnedWeightsStore {
+    fn default() -> Self {
+        Self { kv: None }
+    }
+}
+
+impl LearnedWeightsStore {
+    /// In-memory/no-op store (no persistence).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Persistent store over a per-user KV handle.
+    pub fn with_kv(kv: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { kv: Some(kv) }
+    }
+
+    /// Load the persisted learned weights for this user.
+    ///
+    /// B12: on a missing key, a deserialization failure, OR a `schema_version`
+    /// mismatch, returns [`LearnedWeights::default`] (neutral weights) and warns
+    /// — never panics. A KV read error is treated the same (warn + default).
+    pub fn load(&self) -> LearnedWeights {
+        let Some(kv) = &self.kv else {
+            return LearnedWeights::default();
+        };
+        match kv.get_bytes(LEARNED_WEIGHTS_KEY) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<LearnedWeights>(&bytes) {
+                Ok(w) if w.schema_version == LEARNED_WEIGHTS_SCHEMA_VERSION => w,
+                Ok(w) => {
+                    tracing::warn!(
+                        found = w.schema_version,
+                        expected = LEARNED_WEIGHTS_SCHEMA_VERSION,
+                        "learned weights: schema version mismatch, falling back to default"
+                    );
+                    LearnedWeights::default()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "learned weights: failed to deserialize, falling back to default"
+                    );
+                    LearnedWeights::default()
+                }
+            },
+            Ok(None) => LearnedWeights::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "learned weights: failed to read, falling back to default");
+                LearnedWeights::default()
+            }
+        }
+    }
+
+    /// Persist the learned weights for this user. Best-effort: serialization or
+    /// write failures are logged, never propagated (this is side-state).
+    pub fn save(&self, weights: &LearnedWeights) {
+        let Some(kv) = &self.kv else { return };
+        match serde_json::to_vec(weights) {
+            Ok(bytes) => {
+                if let Err(e) = kv.put_bytes(LEARNED_WEIGHTS_KEY, &bytes) {
+                    tracing::warn!(error = %e, "learned weights: failed to persist");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "learned weights: failed to serialize"),
+        }
     }
 }
 
@@ -1437,6 +1577,7 @@ impl HybridSearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::KeyValueStore;
 
     #[test]
     fn test_rrf_fusion_basic() {
@@ -1784,5 +1925,178 @@ mod tests {
                 sum
             );
         }
+    }
+
+    // ----- R3a: LearnedWeightsStore persistence (pure infra, no scoring change) -----
+
+    use crate::config::StorageBackend;
+    use parking_lot::Mutex as PlMutex;
+    use std::collections::BTreeMap;
+
+    /// Minimal in-memory KeyValueStore for learned-weight persistence tests.
+    /// Each instance is an isolated per-user CF stand-in.
+    #[derive(Default)]
+    struct MemKv {
+        map: PlMutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl crate::storage::KeyValueStore for MemKv {
+        fn backend(&self) -> StorageBackend {
+            StorageBackend::Redb
+        }
+        fn get_bytes(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self.map.lock().get(key).cloned())
+        }
+        fn put_bytes(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+            self.map.lock().insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn delete_bytes(&self, key: &[u8]) -> anyhow::Result<()> {
+            self.map.lock().remove(key);
+            Ok(())
+        }
+        fn scan_prefix(
+            &self,
+            prefix: &[u8],
+            limit: Option<usize>,
+        ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            let guard = self.map.lock();
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = guard
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if let Some(n) = limit {
+                out.truncate(n);
+            }
+            Ok(out)
+        }
+        fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Round-trip: save non-default weights, load them back, assert equality.
+    #[test]
+    fn test_learned_weights_store_round_trip() {
+        let store = LearnedWeightsStore::with_kv(Arc::new(MemKv::default()));
+
+        let mut weights = LearnedWeights::default();
+        weights.bm25 = 0.5;
+        weights.vector = 0.3;
+        weights.graph = 0.2;
+        weights.update_count = 42;
+        assert_ne!(weights.bm25, LearnedWeights::default().bm25);
+
+        store.save(&weights);
+        let loaded = store.load();
+
+        assert!((loaded.bm25 - 0.5).abs() < 1e-6);
+        assert!((loaded.vector - 0.3).abs() < 1e-6);
+        assert!((loaded.graph - 0.2).abs() < 1e-6);
+        assert_eq!(loaded.update_count, 42);
+        assert_eq!(loaded.schema_version, LEARNED_WEIGHTS_SCHEMA_VERSION);
+    }
+
+    /// No persisted value → neutral default, no panic.
+    #[test]
+    fn test_learned_weights_store_missing_returns_default() {
+        let store = LearnedWeightsStore::with_kv(Arc::new(MemKv::default()));
+        let loaded = store.load();
+        let def = LearnedWeights::default();
+        assert!((loaded.bm25 - def.bm25).abs() < 1e-6);
+        assert!((loaded.vector - def.vector).abs() < 1e-6);
+        assert!((loaded.graph - def.graph).abs() < 1e-6);
+        assert_eq!(loaded.update_count, 0);
+    }
+
+    /// No KV handle (no-op store) → default, save is a silent skip.
+    #[test]
+    fn test_learned_weights_store_no_kv_is_noop() {
+        let store = LearnedWeightsStore::new();
+        let mut weights = LearnedWeights::default();
+        weights.bm25 = 0.9;
+        store.save(&weights); // must not panic
+        let loaded = store.load();
+        assert!((loaded.bm25 - LearnedWeights::default().bm25).abs() < 1e-6);
+    }
+
+    /// B12: garbage bytes at the key → load returns default(), never panics.
+    #[test]
+    fn test_learned_weights_store_corrupt_bytes_fallback() {
+        let kv = Arc::new(MemKv::default());
+        kv.put_bytes(LEARNED_WEIGHTS_KEY, b"this is not valid json {{{")
+            .unwrap();
+        let store = LearnedWeightsStore::with_kv(kv);
+
+        let loaded = store.load(); // must not panic
+        let def = LearnedWeights::default();
+        assert!((loaded.bm25 - def.bm25).abs() < 1e-6);
+        assert_eq!(loaded.update_count, 0);
+        assert_eq!(loaded.schema_version, LEARNED_WEIGHTS_SCHEMA_VERSION);
+    }
+
+    /// B12: a valid payload carrying a mismatched schema_version → default().
+    #[test]
+    fn test_learned_weights_store_schema_mismatch_fallback() {
+        let kv = Arc::new(MemKv::default());
+        // Hand-craft a payload with a future/unknown schema version.
+        let payload = format!(
+            r#"{{"bm25":0.8,"vector":0.1,"graph":0.1,"update_count":99,"schema_version":{}}}"#,
+            LEARNED_WEIGHTS_SCHEMA_VERSION + 1
+        );
+        kv.put_bytes(LEARNED_WEIGHTS_KEY, payload.as_bytes())
+            .unwrap();
+        let store = LearnedWeightsStore::with_kv(kv);
+
+        let loaded = store.load();
+        let def = LearnedWeights::default();
+        // Mismatch ignored → neutral default, NOT the persisted 0.8/99.
+        assert!((loaded.bm25 - def.bm25).abs() < 1e-6);
+        assert_eq!(loaded.update_count, 0);
+    }
+
+    /// Older serialized form lacking `schema_version` loads via serde default
+    /// (treated as the current version), so it is accepted (additive evolution).
+    #[test]
+    fn test_learned_weights_store_legacy_no_schema_version_loads() {
+        let kv = Arc::new(MemKv::default());
+        // No schema_version field — predates B12.
+        kv.put_bytes(
+            LEARNED_WEIGHTS_KEY,
+            br#"{"bm25":0.6,"vector":0.25,"graph":0.15,"update_count":7}"#,
+        )
+        .unwrap();
+        let store = LearnedWeightsStore::with_kv(kv);
+
+        let loaded = store.load();
+        assert!((loaded.bm25 - 0.6).abs() < 1e-6);
+        assert_eq!(loaded.update_count, 7);
+        assert_eq!(loaded.schema_version, LEARNED_WEIGHTS_SCHEMA_VERSION);
+    }
+
+    /// Per-user isolation: two stores over distinct KV handles do not cross-read.
+    #[test]
+    fn test_learned_weights_store_per_user_isolation() {
+        let store_a = LearnedWeightsStore::with_kv(Arc::new(MemKv::default()));
+        let store_b = LearnedWeightsStore::with_kv(Arc::new(MemKv::default()));
+
+        let mut wa = LearnedWeights::default();
+        wa.bm25 = 0.7;
+        wa.vector = 0.2;
+        wa.graph = 0.1;
+        wa.update_count = 11;
+        store_a.save(&wa);
+
+        // store_b never saw user A's write → still default.
+        let lb = store_b.load();
+        let def = LearnedWeights::default();
+        assert!((lb.bm25 - def.bm25).abs() < 1e-6);
+        assert_eq!(lb.update_count, 0);
+
+        // store_a still reads its own.
+        let la = store_a.load();
+        assert!((la.bm25 - 0.7).abs() < 1e-6);
+        assert_eq!(la.update_count, 11);
     }
 }
