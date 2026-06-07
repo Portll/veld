@@ -83,6 +83,51 @@ pub enum ResolvedTime {
     Unknown,
 }
 
+/// A resolved temporal value projected into an interval for overlap testing.
+///
+/// This is the comparison form used by the retrieval validation gate
+/// (`filter_facts_by_time_window`). Discrete/bounding indicators resolve to
+/// `Point` or `Closed`; anything that cannot be resolved becomes `Unknown`,
+/// which signals the gate to fall back to `conversation_date`.
+///
+/// Inferential/open variants (After/Before/Fuzzy) are intentionally NOT present
+/// yet — no producer emits them until the inferential resolver lands (phase-2).
+/// Adding them now would be a phantom-variant (no plug for the socket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalBound {
+    /// Zero-width: a single day (yesterday, an exact date, last Saturday).
+    Point(NaiveDate),
+    /// A closed interval [start, end] (next week, last weekend, a month, a year).
+    Closed { start: NaiveDate, end: NaiveDate },
+    /// Could not be resolved to an interval — caller uses conversation_date fallback.
+    Unknown,
+}
+
+impl TemporalBound {
+    /// Returns true if this bound overlaps the inclusive window [start, end].
+    ///
+    /// `Unknown` never overlaps — the gate handles it via the conversation_date
+    /// fallback rather than this method. Inverted/empty inputs are guarded (J3).
+    pub fn overlaps_range(&self, window_start: NaiveDate, window_end: NaiveDate) -> bool {
+        // Guard inverted window — treat as no overlap rather than silently matching.
+        if window_start > window_end {
+            return false;
+        }
+        match self {
+            TemporalBound::Point(d) => *d >= window_start && *d <= window_end,
+            TemporalBound::Closed { start, end } => {
+                // Guard a malformed interval.
+                if start > end {
+                    return false;
+                }
+                // Standard inclusive interval intersection.
+                *start <= window_end && window_start <= *end
+            }
+            TemporalBound::Unknown => false,
+        }
+    }
+}
+
 impl ResolvedTime {
     /// Convert to a sortable string for comparison
     pub fn to_sortable_string(&self) -> String {
@@ -95,26 +140,52 @@ impl ResolvedTime {
         }
     }
 
-    /// Check if this time matches a query time expression
-    pub fn matches_query(&self, query: &str) -> bool {
-        let query_lower = query.to_lowercase();
-        let self_str = self.to_sortable_string().to_lowercase();
-
-        // Direct match
-        if self_str.contains(&query_lower) || query_lower.contains(&self_str) {
-            return true;
-        }
-
-        // Month name matching
+    /// Project this resolved time into a `TemporalBound` for interval-overlap
+    /// validation against a query window.
+    ///
+    /// Discrete points (exact dates, weekdays) become `Point`; spans
+    /// (month, year) become `Closed`. Unresolved values (`RelativeDescription`,
+    /// `Unknown`) become `TemporalBound::Unknown`, signalling the gate to fall
+    /// back to `conversation_date`.
+    ///
+    /// Date construction is checked (`from_ymd_opt`); corrupt stored data
+    /// (e.g. a `MonthYear { month: 13 }`) degrades to `Unknown` rather than
+    /// panicking the retrieval path.
+    pub fn to_bound(&self) -> TemporalBound {
         match self {
+            ResolvedTime::ExactDate(d) => TemporalBound::Point(*d),
             ResolvedTime::MonthYear { month, year } => {
-                let month_name = month_name(*month).to_lowercase();
-                query_lower.contains(&month_name) && query_lower.contains(&year.to_string())
+                match (
+                    NaiveDate::from_ymd_opt(*year, *month, 1),
+                    last_day_of_month(*year, *month),
+                ) {
+                    (Some(start), Some(end)) => TemporalBound::Closed { start, end },
+                    _ => TemporalBound::Unknown,
+                }
             }
-            ResolvedTime::Year(y) => query_lower.contains(&y.to_string()),
-            _ => false,
+            ResolvedTime::Year(y) => {
+                match (
+                    NaiveDate::from_ymd_opt(*y, 1, 1),
+                    NaiveDate::from_ymd_opt(*y, 12, 31),
+                ) {
+                    (Some(start), Some(end)) => TemporalBound::Closed { start, end },
+                    _ => TemporalBound::Unknown,
+                }
+            }
+            ResolvedTime::RelativeDescription(_) | ResolvedTime::Unknown => TemporalBound::Unknown,
         }
     }
+}
+
+/// Last calendar day of `month` in `year`, computed by stepping to the first of
+/// the next month and subtracting a day. Returns `None` on invalid input.
+fn last_day_of_month(year: i32, month: u32) -> Option<NaiveDate> {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    NaiveDate::from_ymd_opt(next_year, next_month, 1).map(|d| d - Duration::days(1))
 }
 
 /// How a temporal fact was invalidated
@@ -925,12 +996,29 @@ fn extract_event_and_time(sentence: &str, patterns: &[&str]) -> (String, String)
 
 /// Extract time expression from sentence
 fn extract_time_expression(sentence: &str) -> String {
+    // Ordered most-specific-first: the loop returns the first substring match,
+    // so longer phrases that CONTAIN a shorter one must precede it. In
+    // particular "* weekend" must precede "* week" (it contains it), and the
+    // multi-word day offsets / "earlier today" must precede the bare
+    // "yesterday"/"tomorrow"/"today" tokens.
     let time_patterns = [
-        "next month",
-        "next week",
-        "next year",
+        // multi-word day offsets (contain "yesterday"/"tomorrow")
+        "the day before yesterday",
+        "the day after tomorrow",
+        "earlier today",
+        // weekends (contain "week")
+        "last weekend",
+        "next weekend",
         "this weekend",
+        // months
+        "next month",
+        "last month",
         "this month",
+        // years
+        "next year",
+        "last year",
+        "this year",
+        // weekdays
         "last saturday",
         "last sunday",
         "last monday",
@@ -938,13 +1026,19 @@ fn extract_time_expression(sentence: &str) -> String {
         "last wednesday",
         "last thursday",
         "last friday",
+        // weeks
+        "next week",
         "last week",
-        "last weekend",
-        "last month",
-        "last year",
+        // time-of-day (anchor to conversation day)
+        "this morning",
+        "this afternoon",
+        "this evening",
+        "tonight",
+        // bare day tokens
         "yesterday",
         "today",
         "tomorrow",
+        // explicit "ago" phrases
         "two weeks ago",
         "a few days ago",
         "a week ago",
@@ -1109,6 +1203,15 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
     let relative_lower = relative.to_lowercase();
     let conv_date = conversation_date.date_naive();
 
+    // Multi-word day offsets — MUST precede the bare "yesterday"/"tomorrow"
+    // branches below, which they contain as substrings.
+    if relative_lower.contains("the day before yesterday") {
+        return ResolvedTime::ExactDate(conv_date - Duration::days(2));
+    }
+    if relative_lower.contains("the day after tomorrow") {
+        return ResolvedTime::ExactDate(conv_date + Duration::days(2));
+    }
+
     // "next month"
     if relative_lower.contains("next month") {
         let next_month = if conv_date.month() == 12 {
@@ -1141,6 +1244,17 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
             month: conv_date.month(),
             year: conv_date.year(),
         };
+    }
+
+    // "next year" / "last year" / "this year"
+    if relative_lower.contains("next year") {
+        return ResolvedTime::Year(conv_date.year() + 1);
+    }
+    if relative_lower.contains("last year") {
+        return ResolvedTime::Year(conv_date.year() - 1);
+    }
+    if relative_lower.contains("this year") {
+        return ResolvedTime::Year(conv_date.year());
     }
 
     // "next week"
@@ -1201,6 +1315,16 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
         }
     }
 
+    // "last weekend" — Saturday of the previous weekend.
+    if relative_lower.contains("last weekend") {
+        return ResolvedTime::ExactDate(last_weekday(conv_date, Weekday::Sat));
+    }
+
+    // "next weekend" — Saturday of the upcoming weekend.
+    if relative_lower.contains("next weekend") {
+        return ResolvedTime::ExactDate(next_weekday(conv_date, Weekday::Sat));
+    }
+
     // "this weekend"
     if relative_lower.contains("this weekend") {
         let days_until_saturday = (Weekday::Sat.num_days_from_monday() as i64
@@ -1209,6 +1333,16 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
             % 7;
         let saturday = conv_date + Duration::days(days_until_saturday);
         return ResolvedTime::ExactDate(saturday);
+    }
+
+    // Time-of-day phrases anchor to the conversation day (sub-day precision is
+    // not modeled). "earlier today" is already covered by the "today" branch.
+    if relative_lower.contains("this morning")
+        || relative_lower.contains("this afternoon")
+        || relative_lower.contains("this evening")
+        || relative_lower.contains("tonight")
+    {
+        return ResolvedTime::ExactDate(conv_date);
     }
 
     // Year only (e.g., "2022")
@@ -1265,6 +1399,11 @@ fn parse_ago_expression(expr: &str) -> Option<i64> {
         _ => num_str.parse().ok()?,
     };
 
+    // NOTE: month/year are approximated as fixed 30/365-day spans. This drifts
+    // across calendar boundaries (e.g. "2 months ago" = 60 days, not two
+    // calendar months) and is intentionally coarse — the resulting ExactDate is
+    // only compared within the gate's ±7-day window. If month-granular
+    // precision is ever needed here, resolve to MonthYear instead.
     let multiplier = match unit {
         "day" | "days" => 1,
         "week" | "weeks" => 7,
@@ -1274,25 +1413,6 @@ fn parse_ago_expression(expr: &str) -> Option<i64> {
     };
 
     Some(num * multiplier)
-}
-
-/// Get month name from number
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "January",
-        2 => "February",
-        3 => "March",
-        4 => "April",
-        5 => "May",
-        6 => "June",
-        7 => "July",
-        8 => "August",
-        9 => "September",
-        10 => "October",
-        11 => "November",
-        12 => "December",
-        _ => "Unknown",
-    }
 }
 
 #[cfg(test)]
@@ -1314,6 +1434,127 @@ mod tests {
             }
             _ => panic!("Expected MonthYear"),
         }
+    }
+
+    fn conv() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// I1: indicators that were previously extracted but unresolved must now
+    /// resolve to a concrete value, not RelativeDescription/Unknown.
+    #[test]
+    fn test_resolve_newly_supported_indicators() {
+        // "last year" / "next year" / "this year"
+        assert!(matches!(
+            resolve_relative_time("last year", conv()),
+            ResolvedTime::Year(2022)
+        ));
+        assert!(matches!(
+            resolve_relative_time("next year", conv()),
+            ResolvedTime::Year(2024)
+        ));
+        assert!(matches!(
+            resolve_relative_time("this year", conv()),
+            ResolvedTime::Year(2023)
+        ));
+        // "last weekend" / "next weekend" resolve to a concrete date, not a
+        // RelativeDescription (the old behaviour).
+        assert!(matches!(
+            resolve_relative_time("last weekend", conv()),
+            ResolvedTime::ExactDate(_)
+        ));
+        assert!(matches!(
+            resolve_relative_time("next weekend", conv()),
+            ResolvedTime::ExactDate(_)
+        ));
+        // time-of-day anchors to the conversation day
+        assert!(matches!(
+            resolve_relative_time("this morning", conv()),
+            ResolvedTime::ExactDate(d) if d == conv().date_naive()
+        ));
+        // multi-word day offsets must NOT be swallowed by yesterday/tomorrow
+        assert!(matches!(
+            resolve_relative_time("the day before yesterday", conv()),
+            ResolvedTime::ExactDate(d) if d == conv().date_naive() - Duration::days(2)
+        ));
+        assert!(matches!(
+            resolve_relative_time("the day after tomorrow", conv()),
+            ResolvedTime::ExactDate(d) if d == conv().date_naive() + Duration::days(2)
+        ));
+    }
+
+    /// Boy-scout: "last weekend" must extract as itself, not be shadowed by the
+    /// "last week" substring (which precedes it in older orderings).
+    #[test]
+    fn test_extract_weekend_not_shadowed_by_week() {
+        assert_eq!(
+            extract_time_expression("we went hiking last weekend"),
+            "last weekend"
+        );
+    }
+
+    /// I4/B1: to_bound projects each ResolvedTime variant into a TemporalBound,
+    /// and never panics on a corrupt MonthYear/Year.
+    #[test]
+    fn test_to_bound_projection() {
+        let d = NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
+        assert_eq!(ResolvedTime::ExactDate(d).to_bound(), TemporalBound::Point(d));
+
+        match (ResolvedTime::MonthYear { month: 6, year: 2023 }).to_bound() {
+            TemporalBound::Closed { start, end } => {
+                assert_eq!(start, NaiveDate::from_ymd_opt(2023, 6, 1).unwrap());
+                assert_eq!(end, NaiveDate::from_ymd_opt(2023, 6, 30).unwrap());
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        match ResolvedTime::Year(2022).to_bound() {
+            TemporalBound::Closed { start, end } => {
+                assert_eq!(start, NaiveDate::from_ymd_opt(2022, 1, 1).unwrap());
+                assert_eq!(end, NaiveDate::from_ymd_opt(2022, 12, 31).unwrap());
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        assert_eq!(
+            ResolvedTime::RelativeDescription("soon".into()).to_bound(),
+            TemporalBound::Unknown
+        );
+        // B1: corrupt month must degrade to Unknown, not panic.
+        assert_eq!(
+            (ResolvedTime::MonthYear { month: 13, year: 2023 }).to_bound(),
+            TemporalBound::Unknown
+        );
+    }
+
+    /// J3 + F5 refutation: a Point overlaps a window; a December Closed spans
+    /// the year boundary correctly; inverted windows never match.
+    #[test]
+    fn test_overlaps_range() {
+        let jun = |d| NaiveDate::from_ymd_opt(2023, 6, d).unwrap();
+        let p = TemporalBound::Point(jun(15));
+        assert!(p.overlaps_range(jun(10), jun(20)));
+        assert!(!p.overlaps_range(jun(1), jun(10)));
+        // inverted window guarded
+        assert!(!p.overlaps_range(jun(20), jun(10)));
+
+        // December MonthYear last-day computation crosses into next year.
+        match (ResolvedTime::MonthYear { month: 12, year: 2023 }).to_bound() {
+            TemporalBound::Closed { end, .. } => {
+                assert_eq!(end, NaiveDate::from_ymd_opt(2023, 12, 31).unwrap());
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+
+        // F5 refutation: a "next week" fact (single ExactDate point) is still
+        // caught by a week-scale query window thanks to the ±7 widening.
+        let next_week = match resolve_relative_time("next week", conv()).to_bound() {
+            TemporalBound::Point(d) => d,
+            other => panic!("expected Point, got {other:?}"),
+        };
+        let qstart = next_week - Duration::days(3);
+        let qend = next_week + Duration::days(3);
+        assert!(TemporalBound::Point(next_week).overlaps_range(qstart, qend));
     }
 
     #[test]
