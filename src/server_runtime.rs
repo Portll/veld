@@ -1,8 +1,7 @@
-//! Transitional Roots orchestration API.
+//! Server runtime orchestration API.
 //!
-//! `roots` is the intended orchestration layer above the `earth` substrate.
-//! This module exposes the current runtime and HTTP wiring behind that name so
-//! the architectural split can proceed incrementally.
+//! This module exposes the current runtime and HTTP wiring so the server
+//! layer can be bootstrapped and composed incrementally.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,18 +16,18 @@ pub use crate::handlers::{
 };
 pub use crate::server::ServerRunConfig;
 
-/// Blocking server bootstrap for the orchestration layer.
+/// Blocking server bootstrap.
 pub fn run(config: ServerRunConfig) -> Result<()> {
     crate::server::run(config)
 }
 
 /// Runtime wrapper around the current multi-user orchestrator state.
-pub struct RootsRuntime {
+pub struct ServerRuntime {
     manager: Arc<MultiUserMemoryManager>,
 }
 
-impl RootsRuntime {
-    /// Create a new orchestration runtime rooted at `base_path`.
+impl ServerRuntime {
+    /// Create a new server runtime rooted at `base_path`.
     pub fn new(base_path: PathBuf, server_config: ServerConfig) -> Result<Self> {
         Ok(Self {
             manager: Arc::new(MultiUserMemoryManager::new(base_path, server_config)?),

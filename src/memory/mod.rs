@@ -1,5 +1,5 @@
-//! Veld layer: Earth substrate with product semantics (consolidation, importance, decay).
-//! Earth substrate for Veld context management
+//! Veld memory substrate with product semantics (consolidation, importance, decay).
+//! Memory substrate for Veld context management
 //!
 //! A medium-complexity substrate that provides:
 //! - Hierarchical memory storage (working → session → long-term)
@@ -383,8 +383,8 @@ pub struct MemorySystem {
 
     /// R1 (J5): per-user anticipatory-prefetch side-state — cached `LearnedScales`
     /// (I9), prefetch hit-rate EMA, and the kill-switch + hysteresis flags (I4).
-    /// Lives here so it is owned per-user and freed when the user's earth is
-    /// evicted from the `user_earths` cache. Driven only by the maintenance-path
+    /// Lives here so it is owned per-user and freed when the user's memory is
+    /// evicted from the `user_memories` cache. Driven only by the maintenance-path
     /// `run_prefetch_tick`; never touched on the recall hot-path.
     prefetch_state: Arc<parking_lot::RwLock<prefetch_tick::PrefetchUserState>>,
 
@@ -7530,7 +7530,7 @@ mod prefetch_tick_integration_tests {
     }
 
     /// Per-user isolation: user A's prefetch tick never warms user B's memory,
-    /// and vice versa. Each user is a distinct MemorySystem (the per-user earth),
+    /// and vice versa. Each user is a distinct MemorySystem (the per-user memory),
     /// so a tick can only ever touch its own tiers.
     #[test]
     fn prefetch_is_per_user_isolated() {

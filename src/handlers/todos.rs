@@ -501,7 +501,7 @@ pub async fn create_reminder(
 
     // Cache embedding at creation time for context triggers (avoids recomputation on every check)
     if matches!(task.trigger, ProspectiveTrigger::OnContext { .. }) {
-        if let Ok(memory_system) = state.get_user_earth(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
             let content_for_embed = task.content.clone();
             let memory_clone = memory_system.clone();
             if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || {
@@ -699,7 +699,7 @@ pub async fn check_context_reminders(
     }
 
     let memory_system = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let context_for_embed = req.context.clone();
@@ -987,7 +987,7 @@ pub async fn create_todo(
         todo.tags.join(" ")
     );
 
-    if let Ok(memory_system) = state.get_user_earth(&req.user_id) {
+    if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
         let memory_clone = memory_system.clone();
         let embedding_text_clone = embedding_text.clone();
 
@@ -1053,7 +1053,7 @@ pub async fn create_todo(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_earth(&req.user_id) {
+    if let Ok(memory) = state.get_user_memory(&req.user_id) {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let state_clone = state.clone();
@@ -1154,7 +1154,7 @@ pub async fn list_todos(
             Vec::new()
         } else {
             let memory_system = state
-                .get_user_earth(&req.user_id)
+                .get_user_memory(&req.user_id)
                 .map_err(AppError::Internal)?;
 
             let query_clone = query.clone();
@@ -1492,7 +1492,7 @@ pub async fn update_todo(
             todo.tags.join(" ")
         );
 
-        if let Ok(memory_system) = state.get_user_earth(&req.user_id) {
+        if let Ok(memory_system) = state.get_user_memory(&req.user_id) {
             let memory_clone = memory_system.clone();
             let embedding_text_clone = embedding_text.clone();
 
@@ -1601,7 +1601,7 @@ pub async fn update_todo(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_earth(&req.user_id) {
+        if let Ok(memory) = state.get_user_memory(&req.user_id) {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -1725,7 +1725,7 @@ pub async fn complete_todo(
             ..Default::default()
         };
 
-        if let Ok(memory) = state.get_user_earth(&req.user_id) {
+        if let Ok(memory) = state.get_user_memory(&req.user_id) {
             let memory_clone = memory.clone();
             let exp_clone = experience.clone();
             let state_clone = state.clone();
@@ -2246,7 +2246,7 @@ pub async fn add_todo_comment(
         ..Default::default()
     };
 
-    if let Ok(memory) = state.get_user_earth(&req.user_id) {
+    if let Ok(memory) = state.get_user_memory(&req.user_id) {
         let memory_clone = memory.clone();
         let exp_clone = experience.clone();
         let memory_result = tokio::task::spawn_blocking(move || {

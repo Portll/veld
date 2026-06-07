@@ -115,10 +115,10 @@ pub async fn run_worker(
                     deadline_secs,
                     "sleep-time pass exceeded deadline; aborting"
                 );
-                // Best-effort event emission. If the user's earth can't be
+                // Best-effort event emission. If the user memory can't be
                 // resolved (deletion race), skip the event but still release.
-                if let Ok(earth) = orch.user_earth(&claimed.user_id) {
-                    let guard = earth.read();
+                if let Ok(user_mem) = orch.user_memory(&claimed.user_id) {
+                    let guard = user_mem.read();
                     emit_aborted(
                         guard.as_memory_system(),
                         &claimed.user_id,
@@ -213,18 +213,18 @@ async fn process_item(
     let user_id = &item.user_id;
     let mode = item.mode;
 
-    // Resolve the user's Earth (multi-tenant routing). We acquire the read
+    // Resolve the user's memory (multi-tenant routing). We acquire the read
     // guard *only* during the synchronous evidence-assembly and post-LLM
     // application phases — never across an `.await`, because parking_lot's
     // guard is `!Send`.
-    let earth = match orch.user_earth(user_id) {
+    let user_mem = match orch.user_memory(user_id) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
                 worker = %worker_id,
                 user_id = %user_id,
                 error = %e,
-                "could not resolve user earth; releasing claim"
+                "could not resolve user memory; releasing claim"
             );
             return ProcessOutcome::Retryable;
         }
@@ -232,8 +232,8 @@ async fn process_item(
 
     // ---- Phase A (sync): assemble evidence + pre-flight budget --------------
     let phase_a = (|| -> Result<Option<super::types::EvidencePack>, ProcessOutcome> {
-        let earth_guard = earth.read();
-        let mem_sys = earth_guard.as_memory_system();
+        let user_mem_guard = user_mem.read();
+        let mem_sys = user_mem_guard.as_memory_system();
 
         let pack = match assemble_evidence_pack(
             mem_sys,
@@ -289,12 +289,12 @@ async fn process_item(
         Err(outcome) => return outcome,
     };
 
-    // ---- Phase B (async): LLM call — NO earth guard held --------------------
+    // ---- Phase B (async): LLM call — NO user memory guard held --------------------
     let rewriter_result = orch.rewriter().rewrite(&pack).await;
 
     // ---- Phase C (sync): settle spend, apply, persist, emit -----------------
-    let earth_guard = earth.read();
-    let mem_sys = earth_guard.as_memory_system();
+    let user_mem_guard = user_mem.read();
+    let mem_sys = user_mem_guard.as_memory_system();
 
     let rewriter_output = match rewriter_result {
         Ok(out) => out,

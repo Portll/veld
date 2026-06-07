@@ -1,6 +1,6 @@
-//! Transitional Earth substrate API.
+//! User memory substrate API.
 //!
-//! This module establishes the intended `earth` boundary inside the existing
+//! This module establishes the user-memory boundary inside the existing
 //! `veld` crate so new code can depend on the substrate API without
 //! waiting for a repo or crate rename.
 
@@ -21,19 +21,19 @@ pub use crate::storage::{
 
 use crate::memory::MemorySystem;
 
-/// Shared substrate handle used by the orchestration layer.
-pub type SharedEarth = Arc<parking_lot::RwLock<Earth>>;
+/// Shared user-memory handle used by the orchestration layer.
+pub type SharedUserMemory = Arc<parking_lot::RwLock<UserMemory>>;
 
 /// Stable substrate wrapper over [`MemorySystem`].
 ///
-/// `earth` is the intended database and memory substrate boundary. During the
+/// `UserMemory` is the database and memory substrate boundary. During the
 /// transition, this wrapper gives higher layers a clear type to depend on while
 /// preserving the current implementation internally.
-pub struct Earth {
+pub struct UserMemory {
     inner: MemorySystem,
 }
 
-impl Earth {
+impl UserMemory {
     /// Create a substrate using the current default storage bootstrap path.
     pub fn new(config: MemoryConfig, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
         Ok(Self {
@@ -83,7 +83,7 @@ impl Earth {
     }
 }
 
-impl Deref for Earth {
+impl Deref for UserMemory {
     type Target = MemorySystem;
 
     fn deref(&self) -> &Self::Target {
@@ -91,7 +91,7 @@ impl Deref for Earth {
     }
 }
 
-impl DerefMut for Earth {
+impl DerefMut for UserMemory {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }

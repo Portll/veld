@@ -23,7 +23,7 @@ pub mod constants;
 pub mod datasets;
 pub mod decay;
 pub mod decay_scales;
-pub mod earth;
+pub mod user_memory;
 pub mod embeddings;
 pub mod errors;
 #[cfg(feature = "multi-tenant")]
@@ -45,7 +45,7 @@ pub mod query_parsing;
 pub mod query_planner;
 pub mod rate_limit_governance;
 pub mod relevance;
-pub mod roots;
+pub mod server_runtime;
 pub mod server;
 pub mod similarity;
 pub mod storage;

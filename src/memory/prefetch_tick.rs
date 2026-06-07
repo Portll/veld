@@ -15,7 +15,7 @@
 //!   a hysteresis band and a periodic re-probe (trial window), so a transient
 //!   precision dip never disables a user permanently.
 //! - **J5 (lifecycle)**: this state lives on `MemorySystem`, which is owned
-//!   per-user in the `user_earths` cache and dropped on user eviction — no
+//!   per-user in the `user_memories` cache and dropped on user eviction — no
 //!   global per-user map that leaks.
 
 use chrono::{DateTime, Utc};
@@ -30,7 +30,7 @@ use crate::decay_scales::LearnedScales;
 /// Per-user anticipatory-prefetch side-state.
 ///
 /// Held inside [`crate::memory::MemorySystem`] (one per user), so it is freed
-/// when the user's earth is evicted (J5 lifecycle). All fields are runtime-only;
+/// when the user's memory is evicted (J5 lifecycle). All fields are runtime-only;
 /// they are intentionally NOT serialized — on restart the scales recompute from
 /// the (persisted) access histories on the first heavy tick, and the kill-switch
 /// re-probes from the enabled state.

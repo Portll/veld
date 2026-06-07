@@ -1,7 +1,7 @@
 //! Multi-User Runtime Manager - Core State Management
 //!
-//! This module contains the central state manager for the Veld server and Roots runtime.
-//! It handles per-user Earth handles, graph stores, audit logs, and all
+//! This module contains the central state manager for the Veld server and server runtime.
+//! It handles per-user UserMemory handles, graph stores, audit logs, and all
 //! subsidiary stores (todos, reminders, files, etc.).
 
 use anyhow::{Context, Result};
@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
-use crate::earth::{Earth, SharedEarth};
+use crate::user_memory::{UserMemory, SharedUserMemory};
 /// Static regex for extracting all-caps terms (API, TUI, NER, REST, etc.)
 fn allcaps_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -133,10 +133,10 @@ impl MultiUserMemoryManagerRotationHelper {
     }
 }
 
-/// Multi-user Veld manager for the Roots runtime.
+/// Multi-user Veld manager for the server runtime.
 pub struct MultiUserMemoryManager {
-    /// Per-user Earth handles with LRU eviction.
-    pub user_earths: moka::sync::Cache<String, SharedEarth>,
+    /// Per-user UserMemory handles with LRU eviction.
+    pub user_memories: moka::sync::Cache<String, SharedUserMemory>,
 
     /// Per-user audit logs (in-memory cache)
     pub audit_logs: Arc<DashMap<String, Arc<parking_lot::RwLock<VecDeque<AuditEvent>>>>>,
@@ -215,14 +215,14 @@ pub struct MultiUserMemoryManager {
     /// At 300s intervals, heavy cycles fire every 30 minutes.
     maintenance_cycle: std::sync::atomic::AtomicU64,
 
-    /// Per-user creation locks to prevent TOCTOU races in get_user_earth.
+    /// Per-user creation locks to prevent TOCTOU races in get_user_memory.
     /// Without this, concurrent first-access requests for the same user_id can both
     /// miss the cache check, both try to open RocksDB, and the second open fails
     /// because RocksDB holds an exclusive file lock.
-    user_earth_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
+    user_memory_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
 
     /// Separate per-user creation locks for graph memory.
-    /// Must be separate from user_earth_init_locks because get_user_earth()
+    /// Must be separate from user_memory_init_locks because get_user_memory()
     /// calls get_user_graph() while holding its lock, and parking_lot::Mutex
     /// is not re-entrant — sharing a single lock map would deadlock.
     user_graph_init_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
@@ -253,7 +253,7 @@ pub struct MultiUserMemoryManager {
     /// the underlying log + projections — only one writer at a time per
     /// tenant.
     ///
-    /// Wired up here (and not in the per-user Earth) because the
+    /// Wired up here (and not in the per-user UserMemory) because the
     /// projection list is a runtime construct that may grow over time
     /// (Vamana, BM25, Postgres) and we want one place to register them.
     pub journaled_writers: DashMap<
@@ -398,10 +398,10 @@ impl MultiUserMemoryManager {
         #[cfg(feature = "multi-tenant")]
         let eviction_multi_tenant = server_config.multi_tenant_mode;
 
-        let user_earths = moka::sync::Cache::builder()
+        let user_memories = moka::sync::Cache::builder()
             .max_capacity(server_config.max_users_in_memory as u64)
             .time_to_idle(std::time::Duration::from_secs(3600))
-            .eviction_listener(move |key: Arc<String>, value: SharedEarth, cause| {
+            .eviction_listener(move |key: Arc<String>, value: SharedUserMemory, cause| {
                 if matches!(cause, moka::notification::RemovalCause::Size | moka::notification::RemovalCause::Expired) {
                     evictions_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -411,7 +411,7 @@ impl MultiUserMemoryManager {
                     // during I/O. The eviction listener runs synchronously inside moka,
                     // so we must not block here for disk writes.
                     //
-                    // CRITICAL: We must drop the Arc<RwLock<Earth>> as soon as
+                    // CRITICAL: We must drop the Arc<RwLock<UserMemory>> as soon as
                     // possible after saving, otherwise the RocksDB file lock is held
                     // until the thread exits. If a new request arrives for the same user
                     // while the lock is held, MemorySystem::new() fails with a lock error.
@@ -573,7 +573,7 @@ impl MultiUserMemoryManager {
         };
 
         let manager = Self {
-            user_earths,
+            user_memories,
             audit_logs: Arc::new(DashMap::new()),
             shared_db: shared_stores.shared_db,
             audit_store: shared_stores.audit_store,
@@ -609,7 +609,7 @@ impl MultiUserMemoryManager {
             session_store: Arc::new(SessionStore::new()),
             relevance_engine,
             maintenance_cycle: std::sync::atomic::AtomicU64::new(0),
-            user_earth_init_locks: DashMap::new(),
+            user_memory_init_locks: DashMap::new(),
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
             slow_stores: DashMap::new(),
@@ -999,7 +999,7 @@ impl MultiUserMemoryManager {
         }
     }
 
-    fn open_user_earth(&self, user_id: &str, config: MemoryConfig) -> Result<Earth> {
+    fn open_user_memory(&self, user_id: &str, config: MemoryConfig) -> Result<UserMemory> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
                 let primary_store = RocksDbPrimaryMemoryStore::open(
@@ -1019,7 +1019,7 @@ impl MultiUserMemoryManager {
                 // replay reconverged them.
                 let bm25_index = self.get_user_bm25_index(user_id)?;
 
-                Earth::with_storage_and_bm25_index(
+                UserMemory::with_storage_and_bm25_index(
                     config,
                     Arc::new(primary_store.into_inner()),
                     bm25_index,
@@ -1054,27 +1054,27 @@ impl MultiUserMemoryManager {
         }
     }
 
-    /// Get or create an Earth substrate for a user.
+    /// Get or create a UserMemory substrate for a user.
     ///
     /// Uses double-checked locking to prevent TOCTOU races where concurrent
     /// first-access requests both miss the cache and try to open RocksDB.
     /// RocksDB holds exclusive file locks, so the second open would fail.
-    pub fn get_user_earth(&self, user_id: &str) -> Result<SharedEarth> {
+    pub fn get_user_memory(&self, user_id: &str) -> Result<SharedUserMemory> {
         // Fast path: already cached
-        if let Some(memory) = self.user_earths.get(user_id) {
+        if let Some(memory) = self.user_memories.get(user_id) {
             return Ok(memory);
         }
 
         // Acquire per-user creation lock to serialize initialization
         let lock = self
-            .user_earth_init_locks
+            .user_memory_init_locks
             .entry(user_id.to_string())
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
         let _guard = lock.lock();
 
         // Re-check after acquiring lock (another thread may have created it)
-        if let Some(memory) = self.user_earths.get(user_id) {
+        if let Some(memory) = self.user_memories.get(user_id) {
             return Ok(memory);
         }
 
@@ -1092,19 +1092,19 @@ impl MultiUserMemoryManager {
         // Retry with backoff for RocksDB lock contention. This can happen when a
         // moka eviction thread is still saving the vector index for this user (the
         // old MemorySystem holds the DB lock until the save thread drops its Arc).
-        let mut earth = {
+        let mut user_mem = {
             let mut last_err = None;
             let mut created = None;
             for attempt in 0..4u32 {
-                match self.open_user_earth(user_id, config.clone()) {
-                    Ok(earth) => {
+                match self.open_user_memory(user_id, config.clone()) {
+                    Ok(user_mem) => {
                         if attempt > 0 {
                             info!(
-                                "Earth for user '{}' created after {} retries (lock contention resolved)",
+                                "UserMemory for user '{}' created after {} retries (lock contention resolved)",
                                 user_id, attempt
                             );
                         }
-                        created = Some(earth);
+                        created = Some(user_mem);
                         break;
                     }
                     Err(e) => {
@@ -1120,18 +1120,18 @@ impl MultiUserMemoryManager {
                         } else {
                             // Non-lock error, fail immediately
                             return Err(e).with_context(|| {
-                                format!("Failed to initialize Earth for user '{user_id}'")
+                                format!("Failed to initialize UserMemory for user '{user_id}'")
                             });
                         }
                     }
                 }
             }
             match created {
-                Some(earth) => earth,
+                Some(user_mem) => user_mem,
                 None => {
                     return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
                         format!(
-                            "Failed to initialize Earth for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
+                            "Failed to initialize UserMemory for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
                             user_id
                         )
                     });
@@ -1140,21 +1140,21 @@ impl MultiUserMemoryManager {
         };
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
         let graph = self.get_user_graph(user_id)?;
-        earth.set_graph_memory(graph);
+        user_mem.set_graph_memory(graph);
         // Wire up FeedbackStore for PIPE-9 (feedback momentum in all retrieval paths)
-        earth.set_feedback_store(self.feedback_store.clone());
+        user_mem.set_feedback_store(self.feedback_store.clone());
 
-        let memory_arc: SharedEarth = Arc::new(parking_lot::RwLock::new(earth));
+        let memory_arc: SharedUserMemory = Arc::new(parking_lot::RwLock::new(user_mem));
 
-        self.user_earths
+        self.user_memories
             .insert(user_id.to_string(), memory_arc.clone());
 
         info!("Created memory system for user: {}", user_id);
 
         // C2 (W-001): one-time-per-process store↔log reconcile. Runs after
-        // the earth is cached so the writer-open path resolves it via the
+        // the user memory is cached so the writer-open path resolves it via the
         // fast cache path without re-entering this per-user init lock.
-        // Non-fatal — a reconcile failure must not block earth creation.
+        // Non-fatal — a reconcile failure must not block user memory creation.
         if self.reconciled_users.insert(user_id.to_string(), ()).is_none() {
             if let Err(e) = self.reconcile_store_with_intent_log(user_id, &memory_arc) {
                 tracing::warn!(
@@ -1171,16 +1171,16 @@ impl MultiUserMemoryManager {
     /// Evict a user's memory and graph from in-memory caches (releases DB handles).
     /// Does NOT delete data — used before restore to release file locks.
     pub fn evict_user(&self, user_id: &str) {
-        self.user_earths.invalidate(user_id);
+        self.user_memories.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
-        self.user_earths.run_pending_tasks();
+        self.user_memories.run_pending_tasks();
         self.graph_memories.run_pending_tasks();
 
         #[cfg(target_os = "windows")]
         {
             // Windows needs extra time to release file handles
             std::thread::sleep(std::time::Duration::from_millis(200));
-            self.user_earths.run_pending_tasks();
+            self.user_memories.run_pending_tasks();
             self.graph_memories.run_pending_tasks();
         }
 
@@ -1190,20 +1190,20 @@ impl MultiUserMemoryManager {
     /// Delete user data (GDPR compliance)
     ///
     /// Cleans up:
-    /// 1. In-memory caches (user_earths, graph_memories)
+    /// 1. In-memory caches (user_memories, graph_memories)
     /// 2. Shared RocksDB: todos, projects, todo indices, reminders, files, feedback, audit
     /// 3. Per-user filesystem: per-user RocksDB, graph DB, vector indices
     pub fn forget_user(&self, user_id: &str) -> Result<()> {
-        self.user_earths.invalidate(user_id);
+        self.user_memories.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
 
-        self.user_earths.run_pending_tasks();
+        self.user_memories.run_pending_tasks();
         self.graph_memories.run_pending_tasks();
 
         #[cfg(target_os = "windows")]
         {
             std::thread::sleep(std::time::Duration::from_millis(200));
-            self.user_earths.run_pending_tasks();
+            self.user_memories.run_pending_tasks();
             self.graph_memories.run_pending_tasks();
         }
 
@@ -1382,7 +1382,7 @@ impl MultiUserMemoryManager {
 
     /// Get statistics for a user
     pub fn get_stats(&self, user_id: &str) -> Result<MemoryStats> {
-        let memory = self.get_user_earth(user_id)?;
+        let memory = self.get_user_memory(user_id)?;
         let memory_guard = memory.read();
         let mut stats = memory_guard.stats();
 
@@ -1433,7 +1433,7 @@ impl MultiUserMemoryManager {
 
     /// List users currently loaded in the Moka cache (no filesystem scan)
     pub fn list_cached_users(&self) -> Vec<String> {
-        self.user_earths
+        self.user_memories
             .iter()
             .map(|(id, _)| id.to_string())
             .collect()
@@ -1463,8 +1463,8 @@ impl MultiUserMemoryManager {
             .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
         info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
 
-        let user_entries: Vec<(String, SharedEarth)> = self
-            .user_earths
+        let user_entries: Vec<(String, SharedUserMemory)> = self
+            .user_memories
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
@@ -1494,8 +1494,8 @@ impl MultiUserMemoryManager {
     pub fn save_all_vector_indices(&self) -> Result<()> {
         info!("Saving vector indices to disk...");
 
-        let user_entries: Vec<(String, SharedEarth)> = self
-            .user_earths
+        let user_entries: Vec<(String, SharedUserMemory)> = self
+            .user_memories
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
@@ -1583,7 +1583,7 @@ impl MultiUserMemoryManager {
 
     /// Get or create graph memory for a user
     ///
-    /// Uses the same per-user creation lock as get_user_earth to prevent
+    /// Uses the same per-user creation lock as get_user_memory to prevent
     /// concurrent RocksDB open races on the graph directory.
     pub fn get_user_graph(&self, user_id: &str) -> Result<Arc<parking_lot::RwLock<GraphMemory>>> {
         // Fast path: already cached
@@ -1591,8 +1591,8 @@ impl MultiUserMemoryManager {
             return Ok(graph);
         }
 
-        // Acquire per-user graph creation lock (separate from Earth lock
-        // to avoid deadlock when get_user_earth() calls get_user_graph())
+        // Acquire per-user graph creation lock (separate from UserMemory lock
+        // to avoid deadlock when get_user_memory() calls get_user_graph())
         let lock = self
             .user_graph_init_locks
             .entry(user_id.to_string())
@@ -1605,7 +1605,7 @@ impl MultiUserMemoryManager {
             return Ok(graph);
         }
 
-        // Retry with backoff for RocksDB lock contention (same pattern as get_user_earth).
+        // Retry with backoff for RocksDB lock contention (same pattern as get_user_memory).
         // Graph eviction drops synchronously so contention is rare, but possible on Windows
         // where file handle release can lag.
         let graph_memory = {
@@ -1691,7 +1691,7 @@ impl MultiUserMemoryManager {
     /// 1. the `Bm25Projection` driven off the user's intent log (writes,
     ///    via `JournaledWriter::record_and_apply`), and
     /// 2. the retrieval-side `HybridSearchEngine` living inside the
-    ///    user's `Earth` (reads, via `MemorySystem::with_storage_and_bm25_index`).
+    ///    user's `UserMemory` (reads, via `MemorySystem::with_storage_and_bm25_index`).
     ///
     /// Sharing the `Arc` means tantivy's single-writer / multi-reader
     /// constraint is respected (the projection holds the only
@@ -1835,7 +1835,7 @@ impl MultiUserMemoryManager {
         // on the first memory whose embedding-for-that-kind is present
         // (during replay or live writes). This avoids coupling the
         // projection's open to the embedder cache (the embedder is
-        // constructed lazily per-tenant via `get_user_earth`, which can
+        // constructed lazily per-tenant via `get_user_memory`, which can
         // be a different lifecycle than `get_user_journaled_writer`).
         // The first embedded memory tells us the dim — that's the same
         // dim every subsequent memory of the same kind must match (each
@@ -2153,10 +2153,10 @@ impl MultiUserMemoryManager {
             Err(_) => return Ok(false),
         };
         let mid = crate::memory::types::MemoryId(uuid);
-        let earth = self.get_user_earth(user_id)?;
+        let user_mem = self.get_user_memory(user_id)?;
         let new_content = new_body.trim_end().to_string();
         let updated_bincode = {
-            let guard = earth.read();
+            let guard = user_mem.read();
             let mut mem = match guard.get_memory(&mid) {
                 Ok(m) => m,
                 Err(_) => return Ok(false), // unknown memory — ignore
@@ -2196,7 +2196,7 @@ impl MultiUserMemoryManager {
     fn reconcile_store_with_intent_log(
         &self,
         user_id: &str,
-        earth: &SharedEarth,
+        user_mem: &SharedUserMemory,
     ) -> Result<usize> {
         // Ids the log already covers (Remember/Update/Anchor present, minus
         // Forget), via the clock-independent Lsn scan (C4). Writer lock is
@@ -2210,7 +2210,7 @@ impl MultiUserMemoryManager {
         };
 
         let store_ids = {
-            let guard = earth.read();
+            let guard = user_mem.read();
             guard.all_memory_ids()?
         };
 
@@ -2223,7 +2223,7 @@ impl MultiUserMemoryManager {
             // store-ahead-of-log: snapshot the memory and backfill a
             // `Remember` frame so the log is a complete record of the store.
             let snapshot = {
-                let guard = earth.read();
+                let guard = user_mem.read();
                 match guard.get_memory(&id) {
                     Ok(mem) => {
                         match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
@@ -2313,7 +2313,7 @@ impl MultiUserMemoryManager {
         let mut total_feedback_events = 0u64;
 
         let user_ids: Vec<String> = self
-            .user_earths
+            .user_memories
             .iter()
             .map(|(id, _)| id.to_string())
             .collect();
@@ -2326,7 +2326,7 @@ impl MultiUserMemoryManager {
         let mut total_facts_reinforced = 0;
 
         for user_id in user_ids {
-            let maintenance_result = if let Ok(memory_lock) = self.get_user_earth(&user_id) {
+            let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
                 #[cfg(feature = "multi-tenant")]
                 if self.server_config.multi_tenant_mode {
@@ -2363,7 +2363,7 @@ impl MultiUserMemoryManager {
 
                                 // Direction 1: Apply edge promotion boosts to memory importance
                                 if !promotion_boosts.is_empty() {
-                                    if let Ok(memory_lock) = self.get_user_earth(&user_id) {
+                                    if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                                         let memory = memory_lock.read();
                                         match memory.apply_edge_promotion_boosts(&promotion_boosts)
                                         {
@@ -2435,7 +2435,7 @@ impl MultiUserMemoryManager {
 
                         // Direction 2: Compensate memories that lost all graph edges
                         if !decay_result.orphaned_entity_ids.is_empty() {
-                            if let Ok(memory_lock) = self.get_user_earth(&user_id) {
+                            if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                                 let memory = memory_lock.read();
                                 match memory
                                     .compensate_orphaned_memories(&decay_result.orphaned_entity_ids)
@@ -2485,7 +2485,7 @@ impl MultiUserMemoryManager {
                             }
 
                             if !decay_result.orphaned_entity_ids.is_empty() {
-                                if let Ok(memory_lock) = self.get_user_earth(&user_id) {
+                                if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                                     let memory = memory_lock.read();
                                     let _ = memory.compensate_orphaned_memories(
                                         &decay_result.orphaned_entity_ids,
@@ -2544,12 +2544,12 @@ impl MultiUserMemoryManager {
                 // configured threshold.
                 let threshold =
                     crate::memory::sleep_time::DEFAULT_GRADUATION_ACCESS_THRESHOLD;
-                for (user_id_arc, _) in self.user_earths.iter() {
+                for (user_id_arc, _) in self.user_memories.iter() {
                     let user_id = user_id_arc.as_ref();
-                    if let Ok(earth) = self.get_user_earth(user_id) {
-                        let earth_guard = earth.read();
+                    if let Ok(user_mem) = self.get_user_memory(user_id) {
+                        let user_mem_guard = user_mem.read();
                         match crate::memory::sleep_time::graduate_eligible_observations(
-                            earth_guard.as_memory_system(),
+                            user_mem_guard.as_memory_system(),
                             orch.graduation_store(),
                             threshold,
                         ) {
@@ -2578,16 +2578,16 @@ impl MultiUserMemoryManager {
         }
 
         // Heavy cycle: R1 anticipatory prefetch tick (Physarum-anticipation).
-        // Per-user, isolated to each user's earth. Warms rhythm-predicted memories
+        // Per-user, isolated to each user's memory. Warms rhythm-predicted memories
         // into the session tier via add_shared (idempotent, size-bounded). Adds a
         // maintenance STEP; removes none. Best-effort — never aborts the cycle.
         if is_heavy {
             let mut total_warmed = 0usize;
-            for (user_id_arc, _) in self.user_earths.iter() {
+            for (user_id_arc, _) in self.user_memories.iter() {
                 let user_id = user_id_arc.as_ref();
-                if let Ok(earth) = self.get_user_earth(user_id) {
-                    let earth_guard = earth.read();
-                    total_warmed += earth_guard.run_prefetch_tick(user_id);
+                if let Ok(user_mem) = self.get_user_memory(user_id) {
+                    let user_mem_guard = user_mem.read();
+                    total_warmed += user_mem_guard.run_prefetch_tick(user_id);
                 }
             }
             if total_warmed > 0 {
@@ -2600,7 +2600,7 @@ impl MultiUserMemoryManager {
 
         // Heavy cycle: clean up old triggered/dismissed reminders (C4 fix)
         if is_heavy {
-            for (user_id_arc, _) in self.user_earths.iter() {
+            for (user_id_arc, _) in self.user_memories.iter() {
                 let user_id = user_id_arc.as_ref();
                 match self.prospective_store.cleanup_old_tasks(user_id, 30) {
                     Ok(deleted) if deleted > 0 => {
@@ -2632,11 +2632,11 @@ impl MultiUserMemoryManager {
             // Prune init locks: remove entries for users no longer in cache.
             // This prevents unbounded growth of the DashMaps over time.
             let active_users: std::collections::HashSet<String> = self
-                .user_earths
+                .user_memories
                 .iter()
                 .map(|(id, _)| id.to_string())
                 .collect();
-            self.user_earth_init_locks
+            self.user_memory_init_locks
                 .retain(|user_id, _| active_users.contains(user_id));
             self.user_graph_init_locks
                 .retain(|user_id, _| active_users.contains(user_id));
@@ -2764,7 +2764,7 @@ impl MultiUserMemoryManager {
 
     /// Get users in cache count
     pub fn users_in_cache(&self) -> usize {
-        self.user_earths.entry_count() as usize
+        self.user_memories.entry_count() as usize
     }
 
     /// Lightweight readiness check for public probes.
@@ -2872,7 +2872,7 @@ impl MultiUserMemoryManager {
     pub fn create_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
-                let memory_sys = self.get_user_earth(user_id)?;
+                let memory_sys = self.get_user_memory(user_id)?;
                 let memory_guard = memory_sys.read();
                 let db = memory_guard.get_db();
 
@@ -3037,7 +3037,7 @@ impl MultiUserMemoryManager {
                     continue;
                 }
 
-                if self.get_user_earth(name).is_ok() {
+                if self.get_user_memory(name).is_ok() {
                     match self.create_user_backup(name) {
                         Ok(metadata) => {
                             tracing::info!(
@@ -3529,7 +3529,7 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
 ///
 /// The memory↔entity link lives on the `Memory` itself (its `entity_refs`
 /// set), not in `GraphMemory`, so these primitives read the tenant's
-/// `Earth`. Each returns owned ids and releases the `Earth` read lock
+/// `UserMemory`. Each returns owned ids and releases the `UserMemory` read lock
 /// before returning — the querier never holds it across an `await`.
 ///
 /// `memory_ids_with_entity` / `memory_ids_in_episode` scan the tenant's
@@ -3540,7 +3540,7 @@ impl crate::query_planner::adapters::VamanaProvider for MultiUserMemoryManager {
 /// scan on large corpora.
 impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
     fn entity_ids_of_memory(&self, user_id: &str, memory_id: &str) -> Vec<uuid::Uuid> {
-        let earth = match self.get_user_earth(user_id) {
+        let user_mem = match self.get_user_memory(user_id) {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
@@ -3548,7 +3548,7 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
             Ok(u) => crate::memory::MemoryId(u),
             Err(_) => return Vec::new(),
         };
-        let guard = earth.read();
+        let guard = user_mem.read();
         match guard.get_memory(&parsed) {
             Ok(memory) => memory.entity_ids(),
             Err(_) => Vec::new(),
@@ -3556,11 +3556,11 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
     }
 
     fn memory_ids_with_entity(&self, user_id: &str, entity_id: &uuid::Uuid) -> Vec<String> {
-        let earth = match self.get_user_earth(user_id) {
+        let user_mem = match self.get_user_memory(user_id) {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let guard = earth.read();
+        let guard = user_mem.read();
         let memories = match guard.get_all_memories() {
             Ok(m) => m,
             Err(_) => return Vec::new(),
@@ -3573,11 +3573,11 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
     }
 
     fn memory_ids_in_episode(&self, user_id: &str, episode_id: &uuid::Uuid) -> Vec<String> {
-        let earth = match self.get_user_earth(user_id) {
+        let user_mem = match self.get_user_memory(user_id) {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let guard = earth.read();
+        let guard = user_mem.read();
         let memories = match guard.get_all_memories() {
             Ok(m) => m,
             Err(_) => return Vec::new(),
