@@ -107,7 +107,7 @@ pub async fn linear_webhook(
     };
 
     let memory_system = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
 
     let (memory_id, was_update) = {
@@ -174,7 +174,7 @@ pub async fn linear_sync(
     let mut errors = Vec::new();
 
     let memory_system = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     for issue in issues {
@@ -341,7 +341,7 @@ pub async fn github_webhook(
     };
 
     let memory_system = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
 
     let (memory_id, was_update) = {
@@ -406,7 +406,7 @@ pub async fn github_sync(
     let mut errors = Vec::new();
 
     let memory_system = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     // Sync issues

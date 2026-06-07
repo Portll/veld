@@ -8,7 +8,7 @@ use axum::{extract::State, response::Json};
 
 use super::health::AppState;
 use super::types::MemoryEvent;
-use crate::earth::SharedEarth;
+use crate::user_memory::SharedUserMemory;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::{
     types::{
@@ -326,10 +326,10 @@ pub async fn file_answer(
 
     // Anti-autophagy guard (W-022): refuse to cite a derived memory.
     if !req.cited_sources.is_empty() {
-        let earth = state
-            .get_user_earth(&req.user_id)
+        let user_mem = state
+            .get_user_memory(&req.user_id)
             .map_err(AppError::Internal)?;
-        let guard = earth.read();
+        let guard = user_mem.read();
         for src in &req.cited_sources {
             if let Ok(uuid) = uuid::Uuid::parse_str(src.trim()) {
                 if let Ok(mem) = guard.get_memory(&crate::memory::types::MemoryId(uuid)) {
@@ -554,7 +554,7 @@ pub async fn remember(
     };
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_id = {
@@ -907,7 +907,7 @@ pub async fn remember(
 /// Reference: Bai et al. (2026) §4.2.3 — H-MEM weight regulation, WISE side-memory
 fn detect_and_resolve_conflicts(
     state: &AppState,
-    memory_arc: &SharedEarth,
+    memory_arc: &SharedUserMemory,
     user_id: &str,
     new_memory_id: &crate::memory::MemoryId,
 ) -> anyhow::Result<()> {
@@ -1115,7 +1115,7 @@ pub async fn batch_remember(
     }
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let extract_entities = req.options.extract_entities;
@@ -1654,7 +1654,7 @@ pub async fn upsert_memory(
     };
 
     let memory_system = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let external_id = req.external_id.clone();

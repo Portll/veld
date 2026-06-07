@@ -69,7 +69,7 @@ pub async fn push_dimensions(
     }
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::earth::SharedEarth;
+use crate::user_memory::SharedUserMemory;
 use crate::embeddings::{NerEntity, NeuralNer};
 use crate::graph_memory::GraphMemory;
 use crate::memory::{Experience, ExperienceType, Query as MemoryQuery};
@@ -771,7 +771,7 @@ impl StreamingMemoryExtractor {
         &self,
         session_id: &str,
         message: StreamMessage,
-        memory_system: SharedEarth,
+        memory_system: SharedUserMemory,
     ) -> ExtractionResult {
         let mut sessions = self.sessions.write().await;
 
@@ -973,7 +973,7 @@ impl StreamingMemoryExtractor {
     async fn extract_memories(
         &self,
         session_id: &str,
-        memory_system: SharedEarth,
+        memory_system: SharedUserMemory,
     ) -> ExtractionResult {
         let start = std::time::Instant::now();
 
@@ -1208,7 +1208,7 @@ impl StreamingMemoryExtractor {
         &self,
         session_id: &str,
         content: &str,
-        memory_system: SharedEarth,
+        memory_system: SharedUserMemory,
         graph_memory: Arc<parking_lot::RwLock<GraphMemory>>,
     ) -> Option<ExtractionResult> {
         let start = std::time::Instant::now();
