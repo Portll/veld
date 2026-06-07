@@ -1819,11 +1819,139 @@ impl MemoryStorage {
             batch.put_cf(idx, parent_key.as_bytes(), b"1");
         }
 
+        // === Inbound-Reference Reverse Index (R7 / F2) ===
+        // For every forward MemoryId reference this memory holds (it points AT a
+        // target), record the inverse edge so we can answer "does anything still
+        // point at memory X?" in O(1) via a prefix scan, without scanning the
+        // whole corpus. Consumed by a later merge/GC step (R6) to gate
+        // garbage-collection on inbound_refs == 0. Key format:
+        //   inbound_ref:{blinded(target_id)}:{holder_id} -> {holder_id bytes}
+        // De-duplicated so a memory that references the same target twice (e.g.
+        // both related_memories and a CausalLink) yields a single entry.
+        for target in Self::forward_ref_targets(memory) {
+            let inbound_key = format!(
+                "inbound_ref:{}:{}",
+                self.blind_term(&target.0.to_string()),
+                memory.id.0
+            );
+            batch.put_cf(idx, inbound_key.as_bytes(), memory.id.0.as_bytes());
+        }
+
         // Use write mode based on configuration
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.db.write_opt(batch, &write_opts)?;
         Ok(())
+    }
+
+    /// Collect every distinct target `MemoryId` this memory points AT — the
+    /// forward references that the inbound-reference reverse index inverts (R7).
+    ///
+    /// Harvested fields (each whose VALUE is a MemoryId reference):
+    /// - `experience.related_memories` (types.rs)
+    /// - `experience.causal_chain` (types.rs)
+    /// - `parent_id` (types.rs)
+    /// - `experience.context.why.causes[*].other` — WhyFacet CausalLink (facets.rs)
+    ///
+    /// NOT harvested:
+    /// - `related_todo_ids` — these are `TodoId`, not `MemoryId` (types.rs:1740).
+    /// - `derived_from` — the spec located this on `WhatFacet`, but it actually
+    ///   lives on `LearningFacet` (facets.rs:349), which is NOT a field on
+    ///   `Memory`/`Experience`/`RichContext` (unattached scaffold facet — never
+    ///   populated on a stored memory). There is nothing to harvest until a
+    ///   future change attaches it; revisit then.
+    /// - `SemanticFact.source_memories` — SemanticFacts live in a SEPARATE store
+    ///   (`SemanticFactStore`, facts.rs) with its own write path and its own id
+    ///   space (FactId holders, not MemoryId holders). Indexing them here would
+    ///   require a second write path into a different store and would mix two id
+    ///   spaces into one index. DEFERRED to keep R7 inside the Memory-store
+    ///   maintenance path. NOTE for R6 GC completeness: a memory cited only by a
+    ///   SemanticFact's `source_memories` will report zero inbound refs here even
+    ///   though a fact still depends on it. R6's GC must also consult fact-source
+    ///   refs (or a future extension must index them) before reclaiming.
+    fn forward_ref_targets(memory: &Memory) -> Vec<MemoryId> {
+        // Order-preserving de-dup so repeated references collapse to one entry.
+        let mut targets: Vec<MemoryId> = Vec::new();
+        let push = |id: &MemoryId, targets: &mut Vec<MemoryId>| {
+            // A memory referencing itself is not a meaningful inbound edge for GC.
+            if *id != memory.id && !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        };
+
+        for id in &memory.experience.related_memories {
+            push(id, &mut targets);
+        }
+        for id in &memory.experience.causal_chain {
+            push(id, &mut targets);
+        }
+        if let Some(ref parent_id) = memory.parent_id {
+            push(parent_id, &mut targets);
+        }
+        if let Some(ctx) = &memory.experience.context {
+            for link in &ctx.why.causes {
+                push(&link.other, &mut targets);
+            }
+        }
+
+        targets
+    }
+
+    /// Public query API (R7) — enumerate the holders that still point AT `target`.
+    ///
+    /// Prefix-scans the inbound-reference reverse index for
+    /// `inbound_ref:{blinded(target)}:` and returns the distinct holder
+    /// `MemoryId`s. A later merge/GC step (R6) consumes this to know which
+    /// records must be repointed before a target can be reclaimed. Per-user
+    /// isolated: this store is the per-user `MemoryStorage`, so it can never
+    /// return another tenant's holders.
+    pub fn inbound_refs(&self, target: &MemoryId) -> Result<Vec<MemoryId>> {
+        let prefix = format!("inbound_ref:{}:", self.blind_term(&target.0.to_string()));
+        let idx = self.index_cf();
+        let iter = self.db.iterator_cf(
+            idx,
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        let mut holders = Vec::new();
+        for (key, value) in iter.log_errors() {
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            // The holder id is stored as the value (16 raw UUID bytes). Fall back
+            // to parsing it out of the key suffix if the value is unexpected.
+            let holder = if value.len() == 16 {
+                uuid::Uuid::from_slice(&value).ok().map(MemoryId)
+            } else {
+                let key_str = String::from_utf8_lossy(&key);
+                key_str
+                    .strip_prefix(&prefix)
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    .map(MemoryId)
+            };
+            if let Some(id) = holder {
+                holders.push(id);
+            }
+        }
+        Ok(holders)
+    }
+
+    /// Public query API (R7) — short-circuit existence check for the GC gate.
+    ///
+    /// Returns `true` as soon as a single holder is found, without materializing
+    /// the full holder list. R6's GC reads this to refuse reclaiming a target
+    /// that anything still references (the "zero inbound refs" gate).
+    pub fn has_inbound_refs(&self, target: &MemoryId) -> Result<bool> {
+        let prefix = format!("inbound_ref:{}:", self.blind_term(&target.0.to_string()));
+        let idx = self.index_cf();
+        let mut iter = self.db.iterator_cf(
+            idx,
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
+        match iter.next() {
+            Some(Ok((key, _))) => Ok(key.starts_with(prefix.as_bytes())),
+            _ => Ok(false),
+        }
     }
 
     /// Compute SHA256 hex digest for content dedup indexing (issue #109)
@@ -2074,6 +2202,34 @@ impl MemoryStorage {
         if let Some(ref parent_id) = memory.parent_id {
             let parent_key = format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), id.0);
             batch.delete_cf(idx, parent_key.as_bytes());
+        }
+
+        // === Inbound-Reference Reverse Index teardown (R7 / F2) ===
+        // Remove every reverse entry whose HOLDER is this memory, regardless of
+        // target. Keys are `inbound_ref:{blinded(target)}:{holder}`, so the holder
+        // is NOT a prefix — we scan the whole `inbound_ref:` keyspace and match on
+        // the holder suffix. This is the update-diff–safe teardown (Option b): we
+        // do NOT reconstruct the OLD memory's targets, so entries for targets that
+        // an update DROPPED are also removed. `storage.update()` calls
+        // remove_from_indices(old) then store(new); removing by holder-suffix here
+        // guarantees no stale `inbound_ref` survives the diff. The reverse entries
+        // for which this memory is the TARGET (i.e. other holders pointing AT it)
+        // are intentionally left — those holders still reference it.
+        {
+            let holder_suffix = format!(":{}", id.0);
+            let scan_prefix = b"inbound_ref:";
+            let inbound_iter = self.db.iterator_cf(
+                idx,
+                IteratorMode::From(scan_prefix, rocksdb::Direction::Forward),
+            );
+            for (key, _value) in inbound_iter.log_errors() {
+                if !key.starts_with(scan_prefix) {
+                    break;
+                }
+                if key.ends_with(holder_suffix.as_bytes()) {
+                    batch.delete_cf(idx, key.as_ref());
+                }
+            }
         }
 
         // Use write mode based on configuration
@@ -4187,5 +4343,241 @@ mod tests {
         assert_eq!(mv.vector_ids.len(), 3);
         assert_eq!(mv.dimension, 384);
         assert!(mv.chunk_ranges.is_none());
+    }
+
+    // ========================================================================
+    // R7 — inbound-reference reverse index (F2)
+    // ========================================================================
+
+    /// Spin up a real per-user MemoryStorage backed by a temp dir.
+    fn test_storage() -> (MemoryStorage, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+        (storage, dir)
+    }
+
+    /// Build a memory whose experience.related_memories points at `targets`.
+    fn memory_referencing(id: MemoryId, targets: &[MemoryId]) -> Memory {
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: format!("holder {}", id.0),
+            related_memories: targets.to_vec(),
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            id,
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn r7_forward_ref_targets_harvests_all_memory_id_fields() {
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let c = MemoryId(uuid::Uuid::new_v4());
+        let d = MemoryId(uuid::Uuid::new_v4());
+        let holder = MemoryId(uuid::Uuid::new_v4());
+
+        let now = Utc::now();
+        let mut ctx = crate::memory::context::ContextBuilder::new().build();
+        ctx.why.causes = vec![CausalLink {
+            other: d.clone(),
+            relation: crate::memory::facets::CausalRelation::Caused,
+            confidence: 0.7,
+            inferred: false,
+        }];
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: "multi-ref holder".to_string(),
+            related_memories: vec![a.clone()],
+            causal_chain: vec![b.clone()],
+            context: Some(ctx),
+            ..Default::default()
+        };
+        let mut memory = Memory::from_legacy(
+            holder.clone(),
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        memory.parent_id = Some(c.clone());
+
+        let targets = MemoryStorage::forward_ref_targets(&memory);
+        assert!(targets.contains(&a), "related_memories harvested");
+        assert!(targets.contains(&b), "causal_chain harvested");
+        assert!(targets.contains(&c), "parent_id harvested");
+        assert!(targets.contains(&d), "WhyFacet CausalLink.other harvested");
+        assert_eq!(targets.len(), 4, "exactly the four distinct targets");
+    }
+
+    #[test]
+    fn r7_forward_ref_targets_dedups_and_excludes_self() {
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let holder = MemoryId(uuid::Uuid::new_v4());
+        // Reference A twice (related + causal) and reference self once.
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: "dup holder".to_string(),
+            related_memories: vec![a.clone(), holder.clone()],
+            causal_chain: vec![a.clone()],
+            ..Default::default()
+        };
+        let memory = Memory::from_legacy(
+            holder.clone(),
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        let targets = MemoryStorage::forward_ref_targets(&memory);
+        assert_eq!(targets, vec![a], "A once, self excluded");
+    }
+
+    /// (1) store M referencing A,B → inbound_refs(A) contains M; has_inbound_refs(A) true.
+    #[test]
+    fn r7_store_records_inbound_refs() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+
+        storage
+            .store(&memory_referencing(m.clone(), &[a.clone(), b.clone()]))
+            .unwrap();
+
+        let holders_a = storage.inbound_refs(&a).unwrap();
+        assert!(holders_a.contains(&m), "A's inbound refs include M");
+        assert!(storage.has_inbound_refs(&a).unwrap(), "A has inbound refs");
+        assert!(storage.inbound_refs(&b).unwrap().contains(&m), "B too");
+        assert!(storage.has_inbound_refs(&b).unwrap());
+
+        // A target nobody references has no inbound refs.
+        let unref = MemoryId(uuid::Uuid::new_v4());
+        assert!(!storage.has_inbound_refs(&unref).unwrap());
+        assert!(storage.inbound_refs(&unref).unwrap().is_empty());
+    }
+
+    /// (2) delete M → has_inbound_refs(A) false (teardown).
+    #[test]
+    fn r7_delete_tears_down_inbound_refs() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+
+        storage.store(&memory_referencing(m.clone(), &[a.clone()])).unwrap();
+        assert!(storage.has_inbound_refs(&a).unwrap());
+
+        storage.delete(&m).unwrap();
+        assert!(
+            !storage.has_inbound_refs(&a).unwrap(),
+            "deleting holder M tears down A's inbound ref"
+        );
+        assert!(storage.inbound_refs(&a).unwrap().is_empty());
+    }
+
+    /// (3) update M to DROP ref to A → inbound_refs(A) no longer contains M.
+    /// This is the update-diff hazard: update() does remove_from_indices(old)
+    /// then store(new); Option-b teardown (remove all inbound_ref:*:{M}) must
+    /// purge the stale A-entry even though the NEW memory no longer names A.
+    #[test]
+    fn r7_update_drop_ref_clears_stale_inbound() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+
+        // M references A and B.
+        storage.store(&memory_referencing(m.clone(), &[a.clone(), b.clone()])).unwrap();
+        assert!(storage.inbound_refs(&a).unwrap().contains(&m));
+        assert!(storage.inbound_refs(&b).unwrap().contains(&m));
+
+        // Update M to reference only B (drops A).
+        storage.update(&memory_referencing(m.clone(), &[b.clone()])).unwrap();
+
+        assert!(
+            !storage.inbound_refs(&a).unwrap().contains(&m),
+            "stale inbound ref to dropped target A removed on update"
+        );
+        assert!(!storage.has_inbound_refs(&a).unwrap());
+        assert!(
+            storage.inbound_refs(&b).unwrap().contains(&m),
+            "retained target B still has M as inbound holder"
+        );
+    }
+
+    /// (4) per-user isolation: user-A's index never returns user-B's holders.
+    /// Each user has its own MemoryStorage (separate DB), so a target id that
+    /// exists in both stores resolves only to the local holder.
+    #[test]
+    fn r7_per_user_isolation() {
+        let (store_a, _dir_a) = test_storage();
+        let (store_b, _dir_b) = test_storage();
+
+        // Same target id referenced by a different holder in each user store.
+        let target = MemoryId(uuid::Uuid::new_v4());
+        let holder_a = MemoryId(uuid::Uuid::new_v4());
+        let holder_b = MemoryId(uuid::Uuid::new_v4());
+
+        store_a.store(&memory_referencing(holder_a.clone(), &[target.clone()])).unwrap();
+        store_b.store(&memory_referencing(holder_b.clone(), &[target.clone()])).unwrap();
+
+        let a_holders = store_a.inbound_refs(&target).unwrap();
+        let b_holders = store_b.inbound_refs(&target).unwrap();
+
+        assert_eq!(a_holders, vec![holder_a.clone()], "store A sees only its holder");
+        assert_eq!(b_holders, vec![holder_b.clone()], "store B sees only its holder");
+        assert!(!a_holders.contains(&holder_b), "no cross-tenant holder leak");
+        assert!(!b_holders.contains(&holder_a), "no cross-tenant holder leak");
     }
 }

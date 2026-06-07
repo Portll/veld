@@ -2577,6 +2577,27 @@ impl MultiUserMemoryManager {
             }
         }
 
+        // Heavy cycle: R1 anticipatory prefetch tick (Physarum-anticipation).
+        // Per-user, isolated to each user's earth. Warms rhythm-predicted memories
+        // into the session tier via add_shared (idempotent, size-bounded). Adds a
+        // maintenance STEP; removes none. Best-effort — never aborts the cycle.
+        if is_heavy {
+            let mut total_warmed = 0usize;
+            for (user_id_arc, _) in self.user_earths.iter() {
+                let user_id = user_id_arc.as_ref();
+                if let Ok(earth) = self.get_user_earth(user_id) {
+                    let earth_guard = earth.read();
+                    total_warmed += earth_guard.run_prefetch_tick(user_id);
+                }
+            }
+            if total_warmed > 0 {
+                tracing::info!(
+                    warmed = total_warmed,
+                    "anticipatory prefetch warmed memories into session tiers (R1)"
+                );
+            }
+        }
+
         // Heavy cycle: clean up old triggered/dismissed reminders (C4 fix)
         if is_heavy {
             for (user_id_arc, _) in self.user_earths.iter() {
