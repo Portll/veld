@@ -71,3 +71,24 @@ pub async fn set_dials(
     );
     Ok(Json(result))
 }
+
+/// `GET /api/dials/schema` — default / recommended / absolute ranges for the recall
+/// sliders, so the monitor can render each slider (track = absolute, shaded band =
+/// recommended, tick = default) without hard-coding any bounds.
+pub async fn get_dials_schema() -> Json<serde_json::Value> {
+    let sliders: Vec<serde_json::Value> = crate::memory::dials::RECALL_SLIDER_SPECS
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "group": s.group,
+                "label": s.label,
+                "default": s.default,
+                "recommended": [s.rec_lo, s.rec_hi],
+                "absolute": [s.abs_lo, s.abs_hi],
+                "step": s.step,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "sliders": sliders }))
+}

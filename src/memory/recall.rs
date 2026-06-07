@@ -1047,7 +1047,7 @@ impl super::MemorySystem {
         let mut vector_results: Vec<(MemoryId, f32)> = if decomposed {
             // --- Decomposed path: weighted RRF merge of sub-query vector results ---
             use crate::constants::QUERY_DECOMPOSITION_SUB_WEIGHT;
-            const DECOMP_RRF_K: f32 = 20.0;
+            let decomp_rrf_k: f32 = self.cognitive_dials.read().rrf_k_decomp.unwrap_or(20.0);
 
             let mut merged: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
@@ -1140,7 +1140,7 @@ impl super::MemorySystem {
 
                 // Weighted RRF: score = weight / (K + rank)
                 for (rank, (id, _sim)) in filtered.iter().enumerate() {
-                    let rrf_score = weight / (DECOMP_RRF_K + (rank + 1) as f32);
+                    let rrf_score = weight / (decomp_rrf_k + (rank + 1) as f32);
                     let entry = merged.entry(id.clone()).or_insert(0.0);
                     *entry = entry.max(rrf_score).max(*entry);
                     // Use max-merge: keep the highest RRF contribution per memory
@@ -1442,8 +1442,11 @@ impl super::MemorySystem {
             // This follows ACT-R's additive activation model.
             // K controls top-rank discrimination: K=20 → rank-1 vs rank-5 gap is 19%
             // (vs 12% at K=30). Higher K = more equal weighting, lower K = sharper.
-            // Configurable per-query via rrf_k; defaults to 20.0.
-            let k: f32 = query.rrf_k.unwrap_or(20.0);
+            // Precedence: per-query rrf_k → live dial `rrf_k_outer` → const 20.0.
+            let k: f32 = query
+                .rrf_k
+                .or_else(|| self.cognitive_dials.read().rrf_k_outer)
+                .unwrap_or(20.0);
             let mut fused: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
             let mut heb: std::collections::HashMap<MemoryId, f32> =
@@ -1558,17 +1561,17 @@ impl super::MemorySystem {
             // Source memories of matching temporal facts get a precision-tuned boost.
             // Fires for all temporal intents (including WhenQuestion) and broader
             // temporal keywords to surface fact-sourced memories.
-            // Uses TEMPORAL_RECALL_BOOST (0.20) — calibrated to lift temporal-source
+            // Uses temporal_recall_boost (0.20) — calibrated to lift temporal-source
             // memories by ~2 RRF positions without overriding strong semantic matches.
             if !temporal_fact_boost_ids.is_empty() {
-                use crate::constants::TEMPORAL_RECALL_BOOST;
+                let temporal_recall_boost = self.cognitive_dials.read().temporal_recall_boost.unwrap_or(crate::constants::TEMPORAL_RECALL_BOOST);
                 let mut boosted_count = 0;
                 for id in &temporal_fact_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += TEMPORAL_RECALL_BOOST;
+                        *score += temporal_recall_boost;
                         boosted_count += 1;
                     } else {
-                        fused.insert(id.clone(), TEMPORAL_RECALL_BOOST);
+                        fused.insert(id.clone(), temporal_recall_boost);
                         boosted_count += 1;
                     }
                     // Signal attribution: mark temporal match
@@ -2121,8 +2124,8 @@ impl super::MemorySystem {
                                 .count();
                             if type_matches > 0 {
                                 let boost = (type_matches as f32
-                                    * crate::constants::ONTOLOGICAL_RERANK_BOOST)
-                                    .min(crate::constants::ONTOLOGICAL_RERANK_MAX);
+                                    * self.cognitive_dials.read().onto_rerank_boost.unwrap_or(crate::constants::ONTOLOGICAL_RERANK_BOOST))
+                                    .min(self.cognitive_dials.read().onto_rerank_max.unwrap_or(crate::constants::ONTOLOGICAL_RERANK_MAX));
                                 *fused_score += boost;
                                 boosted_count += 1;
                                 crate::metrics::ONTOLOGICAL_RERANK_BOOST_APPLIED
@@ -2134,7 +2137,7 @@ impl super::MemorySystem {
                                 // Memory has entities but NONE match expected types.
                                 // Apply penalty only at high confidence to avoid
                                 // punishing NER extraction gaps.
-                                *fused_score += crate::constants::ONTOLOGICAL_RERANK_PENALTY;
+                                *fused_score += self.cognitive_dials.read().onto_rerank_penalty.unwrap_or(crate::constants::ONTOLOGICAL_RERANK_PENALTY);
                                 penalized_count += 1;
                             }
                         }
@@ -2921,13 +2924,13 @@ impl super::MemorySystem {
                     // onboarding for "performance improvements"). Lower lambda
                     // reduces the redundancy penalty threshold.
                     if decomposed {
-                        Some(crate::constants::MMR_LAMBDA_ABSTRACT)
+                        Some(self.cognitive_dials.read().mmr_lambda_abstract.unwrap_or(crate::constants::MMR_LAMBDA_ABSTRACT))
                     } else {
-                        Some(crate::constants::MMR_LAMBDA_EXPLORATORY)
+                        Some(self.cognitive_dials.read().mmr_lambda_exploratory.unwrap_or(crate::constants::MMR_LAMBDA_EXPLORATORY))
                     }
                 }
                 query_parser::QueryType::Temporal => {
-                    Some(crate::constants::MMR_LAMBDA_RELATIONSHIP)
+                    Some(self.cognitive_dials.read().mmr_lambda_relationship.unwrap_or(crate::constants::MMR_LAMBDA_RELATIONSHIP))
                 }
             };
             if let Some(lambda) = mmr_lambda {
