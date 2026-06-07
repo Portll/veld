@@ -48,6 +48,46 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
+import glob
+
+# --- OOTB judge/dataset config (cross-platform: mac / windows / linux) ----------
+# Reasoning judges (Qwen3, QwQ, DeepSeek-R1, ...) emit a long chain-of-thought
+# before the answer; a small token cap truncates them to empty output and the
+# parser then silently defaults to option 0. Keep this generous; override via env.
+JUDGE_MAX_TOKENS = int(os.environ.get("LOCOMO_JUDGE_MAX_TOKENS", "16384"))
+
+
+def _extract_answer_text(message) -> str:
+    """Answer text from an OpenAI-style message, tolerating reasoning models that
+    place chain-of-thought in `reasoning_content` and may leave `content` empty."""
+    text = getattr(message, "content", None) or ""
+    text = text.strip() if hasattr(text, "strip") else ""
+    if not text:
+        rc = getattr(message, "reasoning_content", None) or ""
+        text = rc.strip() if hasattr(rc, "strip") else ""
+    return text
+
+
+def find_mc10_dataset():
+    """Locate LoCoMo-MC10 dataset independent of the HF snapshot hash, cross-platform.
+    Order: LOCOMO_MC10_PATH, HF cache under HOME, HF_HOME, HUGGINGFACE_HUB_CACHE."""
+    override = os.environ.get("LOCOMO_MC10_PATH")
+    if override and os.path.exists(override):
+        return override
+    roots = [os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")]
+    if os.environ.get("HF_HOME"):
+        roots.append(os.path.join(os.environ["HF_HOME"], "hub"))
+    if os.environ.get("HUGGINGFACE_HUB_CACHE"):
+        roots.append(os.environ["HUGGINGFACE_HUB_CACHE"])
+    for root in roots:
+        pattern = os.path.join(root, "datasets--Percena--locomo-mc10",
+                               "snapshots", "*", "data", "locomo_mc10.json")
+        hits = sorted(glob.glob(pattern))
+        if hits:
+            return hits[-1]
+    return None
+# --------------------------------------------------------------------------------
+
 # Dataset loaded from local cache (no need for datasets library)
 
 try:
@@ -112,10 +152,10 @@ class OpenAIProvider(LLMProvider):
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=10,
+            max_tokens=JUDGE_MAX_TOKENS,
             temperature=0
         )
-        return response.choices[0].message.content.strip()
+        return _extract_answer_text(response.choices[0].message)
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -133,10 +173,10 @@ class OpenAICompatibleProvider(LLMProvider):
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=10,
+            max_tokens=JUDGE_MAX_TOKENS,
             temperature=0
         )
-        return response.choices[0].message.content.strip()
+        return _extract_answer_text(response.choices[0].message)
 
 
 class AnthropicProvider(LLMProvider):
@@ -150,7 +190,7 @@ class AnthropicProvider(LLMProvider):
     def complete(self, prompt: str) -> str:
         response = self.client.messages.create(
             model=self.model,
-            max_tokens=10,
+            max_tokens=JUDGE_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}]
         )
         return response.content[0].text.strip()
@@ -174,7 +214,7 @@ class OllamaProvider(LLMProvider):
         response = ollama.chat(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": 10}
+            options={"temperature": 0, "num_predict": JUDGE_MAX_TOKENS}
         )
         return response["message"]["content"].strip()
 
@@ -200,7 +240,7 @@ class BasetenProvider(LLMProvider):
             headers={"Authorization": f"Api-Key {self.api_key}"},
             json={
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 10,
+                "max_tokens": JUDGE_MAX_TOKENS,
                 "temperature": 0
             }
         )
@@ -482,11 +522,11 @@ def run_evaluation(
 
     # Load dataset from local cache
     print("Loading LoCoMo-MC10 dataset...")
-    mc10_path = os.path.expanduser('~/.cache/huggingface/hub/datasets--Percena--locomo-mc10/snapshots/7d59a0463d83f97b042684310c0b3d17553004cd/data/locomo_mc10.json')
-
-    if not os.path.exists(mc10_path):
-        print(f"Dataset not found at {mc10_path}")
-        print("Please download: from datasets import load_dataset; load_dataset('Percena/locomo-mc10')")
+    mc10_path = find_mc10_dataset()
+    if not mc10_path:
+        print("LoCoMo-MC10 dataset not found in the HuggingFace cache.")
+        print("Download it with: python -c \"from datasets import load_dataset; load_dataset('Percena/locomo-mc10')\"")
+        print("Or point LOCOMO_MC10_PATH at a local locomo_mc10.json file.")
         exit(1)
 
     with open(mc10_path, 'r', encoding='utf-8') as f:
