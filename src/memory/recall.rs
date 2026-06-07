@@ -121,11 +121,13 @@ impl super::MemorySystem {
         }
 
         // Hebbian learning: co-activation strengthens associations between memories
-        // When memories are retrieved together, they form/strengthen edges in the memory graph
+        // When memories are retrieved together, they form/strengthen edges in the memory graph.
+        // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
+                let retrieval_id = uuid::Uuid::new_v4();
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
+                match graph.read().apply_reinforcement(retrieval_id, &memory_uuids[0], &memory_uuids[1..]) {
                     Ok(result) => {
                         // BRIDGE-4: Consume edge tier promotions — boost memory importance
                         for promo in &result.promotions {
@@ -3736,10 +3738,12 @@ impl super::MemorySystem {
         // form/strengthen edges in the memory graph. Suppressed memories don't
         // participate in coactivation (biological: "neurons that fire together
         // wire together" but suppressed neurons don't fire).
+        // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
+                let retrieval_id = uuid::Uuid::new_v4();
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
+                match graph.read().apply_reinforcement(retrieval_id, &memory_uuids[0], &memory_uuids[1..]) {
                     Ok(ref result) if result.edges_updated > 0 => {
                         // Record consolidation events for coactivation visibility
                         for i in 0..memories.len().min(5) {
@@ -4523,12 +4527,14 @@ impl super::MemorySystem {
         };
 
         // Hebbian coactivation: strengthen associations between co-retrieved memories
-        // Uses GraphMemory if available, otherwise counts pair associations directly
+        // Uses GraphMemory if available, otherwise counts pair associations directly.
+        // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
         if !matches!(outcome, RetrievalOutcome::Misleading) && memory_ids.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memory_ids.iter().map(|id| id.0).collect();
                 if memory_uuids.len() >= 2 {
-                    match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
+                    let retrieval_id = uuid::Uuid::new_v4();
+                    match graph.read().apply_reinforcement(retrieval_id, &memory_uuids[0], &memory_uuids[1..]) {
                         Ok(result) => {
                             stats.associations_strengthened = result.edges_updated;
                             // BRIDGE-4: Boost importance for memories linked by promoted edges
