@@ -543,6 +543,29 @@ impl OnnxCrossEncoder {
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let num_threads = 2;
 
+            // ort's `load-dynamic` PANICS (not Errs) when libonnxruntime cannot be
+            // dlopen'd, and this server is built with `panic = "abort"` — so an
+            // unresolved runtime here aborts the whole process instead of engaging
+            // the lazy fallback below. Resolve + verify the runtime path before
+            // touching any ort API, and fail soft (cross-encoder disabled) if it is
+            // unavailable. Cross-platform: checks the resolved .dylib/.dll/.so path.
+            super::minilm::pre_init_ort_runtime(
+                std::env::var("VELD_OFFLINE").is_ok_and(|v| v == "true" || v == "1"),
+            );
+            let ort_ready = std::env::var("ORT_DYLIB_PATH")
+                .ok()
+                .map(|p| std::path::Path::new(&p).exists())
+                .unwrap_or(false);
+            if !ort_ready {
+                self.available
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(format!(
+                    "ONNX Runtime unavailable for {} (ORT_DYLIB_PATH unset or missing); \
+                     cross-encoder disabled, lazy fallback engaged",
+                    self.config.id
+                ));
+            }
+
             let session = match (|| -> Result<Session> {
                 let builder = Session::builder()
                     .context("Failed to create session builder")?
