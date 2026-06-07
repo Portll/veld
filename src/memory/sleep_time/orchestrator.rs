@@ -28,7 +28,7 @@ use super::rewriter::Rewriter;
 use super::supersession::SupersessionStore;
 use super::types::{BudgetState, SleepMode, SleepTimeResult, SleepTimeTrigger};
 use crate::config::SleepTimeConfig;
-use crate::earth::SharedEarth;
+use crate::user_memory::SharedUserMemory;
 use crate::handlers::state::MultiUserMemoryManager;
 use crate::memory::context_blocks::ContextBlockStore;
 
@@ -71,9 +71,9 @@ pub struct SleepTimeOrchestrator {
     /// Weak reference to the manager to break the Arc cycle:
     /// `MultiUserMemoryManager` holds the orchestrator inside its
     /// `sleep_time_orchestrator` field, and the orchestrator routes back to
-    /// the manager to resolve per-user `SharedEarth` (and thus
+    /// the manager to resolve per-user `SharedUserMemory` (and thus
     /// `MemorySystem`). `Weak` lets the manager be dropped first; on
-    /// shutdown the orchestrator's `user_earth` calls fail cleanly.
+    /// shutdown the orchestrator's `user_memory` calls fail cleanly.
     manager: Weak<MultiUserMemoryManager>,
 
     block_store: Arc<ContextBlockStore>,
@@ -202,21 +202,21 @@ impl SleepTimeOrchestrator {
         &self.config
     }
 
-    /// Resolve the per-user [`SharedEarth`] from the manager. Returns
+    /// Resolve the per-user [`SharedUserMemory`] from the manager. Returns
     /// `Err` if the manager has been dropped (orchestrator outliving its
     /// owner — should only happen during shutdown) or if the user has no
-    /// earth yet.
-    pub(super) fn user_earth(&self, user_id: &str) -> Result<SharedEarth> {
+    /// user memory yet.
+    pub(super) fn user_memory(&self, user_id: &str) -> Result<SharedUserMemory> {
         let manager = self
             .manager
             .upgrade()
-            .context("MultiUserMemoryManager dropped; orchestrator cannot resolve user earth")?;
-        manager.get_user_earth(user_id)
+            .context("MultiUserMemoryManager dropped; orchestrator cannot resolve user memory")?;
+        manager.get_user_memory(user_id)
     }
 
     /// Resolve the per-user [`GraphMemory`] handle. Used by the worker to
     /// apply REM edge proposals (R43). Same drop-resilience pattern as
-    /// [`Self::user_earth`].
+    /// [`Self::user_memory`].
     pub(super) fn user_graph(
         &self,
         user_id: &str,

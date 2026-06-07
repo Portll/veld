@@ -71,10 +71,10 @@ pub async fn merge_memories(
     }
 
     let (content, tags) = {
-        let earth = state
-            .get_user_earth(&req.user_id)
+        let user_mem = state
+            .get_user_memory(&req.user_id)
             .map_err(AppError::Internal)?;
-        let guard = earth.read();
+        let guard = user_mem.read();
         let mut bodies = Vec::with_capacity(req.ids.len());
         let mut tagset: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for id in &req.ids {
@@ -170,10 +170,10 @@ pub async fn split_memory(
     })?;
 
     let (content, parent_tags) = {
-        let earth = state
-            .get_user_earth(&req.user_id)
+        let user_mem = state
+            .get_user_memory(&req.user_id)
             .map_err(AppError::Internal)?;
-        let guard = earth.read();
+        let guard = user_mem.read();
         let mem = guard
             .get_memory(&MemoryId(uuid))
             .map_err(|_| AppError::InvalidInput {

@@ -17,7 +17,7 @@ use crate::{
     config::{ServerConfig, StorageBackend},
     embeddings::minilm::pre_init_ort_runtime,
     rate_limit_governance::{RateLimitGovernanceLayer, ResetHandle},
-    roots::{AppState, RootsRuntime},
+    server_runtime::{AppState, ServerRuntime},
     metrics, middleware,
 };
 
@@ -255,7 +255,7 @@ async fn async_main() -> Result<()> {
             "relational backend wired: memories projection cutover + datasets + query planner active"
         );
     }
-    let runtime = RootsRuntime::from_manager(Arc::new(manager_inner));
+    let runtime = ServerRuntime::from_manager(Arc::new(manager_inner));
     let manager: AppState = runtime.state();
 
     // Print storage stats

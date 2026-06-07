@@ -149,7 +149,7 @@ pub async fn health_ready_user(
     }
 
     let memory = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
     let Some(guard) = memory.try_read() else {
         return Ok((
@@ -233,7 +233,7 @@ pub async fn health_index(
     let mut users_checked: usize = 0;
     let mut users_needing_rebuild: usize = 0;
     for user_id in state.list_cached_users() {
-        if let Ok(memory) = state.get_user_earth(&user_id) {
+        if let Ok(memory) = state.get_user_memory(&user_id) {
             let guard = memory.read();
             let h = guard.index_health();
             total_vectors += h.total_vectors;
@@ -273,7 +273,7 @@ pub async fn health_index_user(
     )?;
 
     let memory = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
     let guard = memory.read();
     let health = guard.index_health();
@@ -315,7 +315,7 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
     let mut total_vectors = 0i64;
 
     for user_id in state.list_users().iter().take(100) {
-        if let Ok(memory_sys) = state.get_user_earth(user_id) {
+        if let Ok(memory_sys) = state.get_user_memory(user_id) {
             if let Some(guard) = memory_sys.try_read() {
                 let stats = guard.stats();
                 total_working += stats.working_memory_count as i64;

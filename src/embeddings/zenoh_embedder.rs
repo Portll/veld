@@ -1,4 +1,4 @@
-//! Roots layer: Zenoh-routed embedder for cluster peer embedding requests.
+//! Zenoh-routed embedder for cluster peer embedding requests.
 //!
 //! Routes embedding requests to peer veld instances over Zenoh. Used as a
 //! secondary embedder when the local node lacks a model but a cluster peer
