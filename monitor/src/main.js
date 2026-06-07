@@ -346,6 +346,40 @@ const DIAL_NUMBERS = [
   },
 ];
 
+// Recall ranking sliders — overlay the engine constants; null = engine default.
+// Ranges mirror the server's GET /api/dials/schema (RECALL_SLIDER_SPECS). Double-click
+// a value to reset that knob to its engine default (null).
+const DIAL_RECALL = [
+  { key: "rrf_k_outer", group: "Fusion", label: "RRF k · graph+hybrid", def: 20, recLo: 20, recHi: 35, min: 5, max: 100, step: 1,
+    desc: "Outer fusion rank-discount; higher = flatter (later ranks count more).", info: "20 = veld default (sharp) · 30 = shodh's tuned value." },
+  { key: "rrf_k_decomp", group: "Fusion", label: "RRF k · sub-query", def: 20, recLo: 20, recHi: 30, min: 5, max: 100, step: 1,
+    desc: "Rank-discount for the decomposed sub-query merge.", info: "20 default · raise toward 30 to flatten." },
+  { key: "rrf_k_inner", group: "Fusion", label: "RRF k · BM25+vector", def: 45, recLo: 30, recHi: 60, min: 5, max: 100, step: 1,
+    desc: "Inner BM25↔vector blend sharpness.", info: "45 default · lower = sharper top ranks." },
+  { key: "secondary_rrf_ratio", group: "Fusion", label: "Secondary index weight", def: 0.5, recLo: 0.3, recHi: 0.7, min: 0, max: 1, step: 0.05,
+    desc: "Weight of the 768d secondary vector signal.", info: "0.5 default; refinement signal, not a replacement." },
+  { key: "bm25_min_score", group: "Candidates", label: "BM25 min score", def: 0.1, recLo: 0, recHi: 0.2, min: 0, max: 1, step: 0.01,
+    desc: "Lexical-candidate noise floor; lower admits weak-but-correct hits.", info: "0.1 default · 0 = admit all lexical matches." },
+  { key: "onto_rerank_boost", group: "Rerank", label: "Ontological boost / match", def: 0.15, recLo: 0.05, recHi: 0.15, min: 0, max: 1, step: 0.01,
+    desc: "Per entity-label-match rerank boost.", info: "0.15 = veld · 0.08 = shodh (veld may over-promote label matches)." },
+  { key: "onto_rerank_max", group: "Rerank", label: "Ontological boost cap", def: 0.40, recLo: 0.20, recHi: 0.40, min: 0, max: 1, step: 0.01,
+    desc: "Cap on total ontological boost.", info: "0.40 = veld · 0.25 = shodh." },
+  { key: "onto_rerank_penalty", group: "Rerank", label: "Ontological mismatch penalty", def: -0.08, recLo: -0.20, recHi: 0, min: -1, max: 0, step: 0.01,
+    desc: "Demotion when entities match none of the expected types.", info: "-0.08 default; only applied at high confidence." },
+  { key: "ce_blend", group: "Rerank", label: "Cross-encoder blend", def: 0.4, recLo: 0, recHi: 0.6, min: 0, max: 1, step: 0.05,
+    desc: "Cross-encoder contribution to the fused score.", info: "Set 0 if the cross-encoder model is unavailable (token_type_ids)." },
+  { key: "temporal_recall_boost", group: "Temporal", label: "Temporal source boost", def: 0.20, recLo: 0.10, recHi: 0.40, min: 0, max: 1, step: 0.01,
+    desc: "Boost for memories that source a matching temporal fact.", info: "0.20 default ≈ +2 RRF positions." },
+  { key: "mmr_lambda_exploratory", group: "Diversity", label: "MMR λ · exploratory", def: 0.6, recLo: 0.5, recHi: 0.9, min: 0, max: 1, step: 0.05,
+    desc: "Relevance↔diversity for exploratory queries.", info: "1 = pure relevance · 0 = pure diversity · 0.6 default." },
+  { key: "mmr_lambda_abstract", group: "Diversity", label: "MMR λ · abstract", def: 0.5, recLo: 0.5, recHi: 0.9, min: 0, max: 1, step: 0.05,
+    desc: "Relevance↔diversity for abstract/decomposed queries.", info: "0.5 default (more diversity)." },
+  { key: "mmr_lambda_relationship", group: "Diversity", label: "MMR λ · relationship", def: 0.7, recLo: 0.5, recHi: 0.9, min: 0, max: 1, step: 0.05,
+    desc: "Relevance↔diversity for relationship queries.", info: "0.7 default (more relevance)." },
+  { key: "density_linguistic_w", group: "Weights", label: "Linguistic weight", def: 0.15, recLo: 0.05, recHi: 0.25, min: 0, max: 1, step: 0.01,
+    desc: "Linguistic leg weight in the density-adaptive fusion mix.", info: "0.15 default." },
+];
+
 function fmtOpt(v) {
   return v === null || v === undefined ? "—" : String(v);
 }
@@ -463,6 +497,62 @@ function renderDialsBody() {
     desc.className = "dial-desc";
     desc.textContent = d.desc;
 
+    dial.append(head, desc);
+    body.appendChild(dial);
+  }
+
+  // ---- Recall ranking sliders (grouped; recommended band shaded on the track) ----
+  let lastGroup = null;
+  for (const d of DIAL_RECALL) {
+    if (d.group !== lastGroup) {
+      const h = document.createElement("p");
+      h.className = "dial-group";
+      h.textContent = d.group;
+      body.appendChild(h);
+      lastGroup = d.group;
+    }
+    const dial = document.createElement("div");
+    dial.className = "dial dial-slider";
+
+    const head = document.createElement("div");
+    head.className = "dial-head";
+
+    const cur = currentDials[d.key];
+    const isDefault = cur === null || cur === undefined;
+    const val = isDefault ? d.def : cur;
+
+    const control = document.createElement("div");
+    control.className = "dial-control";
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.className = "dial-rangeinput";
+    slider.min = String(d.min);
+    slider.max = String(d.max);
+    slider.step = String(d.step);
+    slider.value = String(val);
+    // Shade the recommended [recLo, recHi] band green on the track.
+    const lo = ((d.recLo - d.min) / (d.max - d.min)) * 100;
+    const hi = ((d.recHi - d.min) / (d.max - d.min)) * 100;
+    slider.style.background =
+      "linear-gradient(to right,#333 " + lo + "%,#2e6f4e " + lo + "%,#2e6f4e " + hi + "%,#333 " + hi + "%)";
+
+    const readout = document.createElement("span");
+    readout.className = "dial-readout";
+    readout.textContent = isDefault ? "default (" + d.def + ")" : String(val);
+    readout.title = "double-click to reset to engine default";
+    slider.addEventListener("input", () => { readout.textContent = slider.value; });
+    slider.addEventListener("change", () => {
+      saveDials({ ...currentDials, [d.key]: parseFloat(slider.value) });
+    });
+    readout.addEventListener("dblclick", () => {
+      saveDials({ ...currentDials, [d.key]: null });
+    });
+    control.append(slider, readout);
+
+    head.append(makeDialLabel(d.label, d.info), control);
+    const desc = document.createElement("p");
+    desc.className = "dial-desc";
+    desc.textContent = d.desc + "  ·  rec " + d.recLo + "–" + d.recHi + " · default " + d.def;
     dial.append(head, desc);
     body.appendChild(dial);
   }

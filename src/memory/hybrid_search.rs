@@ -1344,7 +1344,7 @@ impl HybridSearchEngine {
         // Filter low BM25 scores
         let bm25_results: Vec<_> = bm25_results
             .into_iter()
-            .filter(|(_, score)| *score >= self.config.min_bm25_score)
+            .filter(|(_, score)| *score >= dial.as_ref().and_then(|d| d.bm25_min_score).unwrap_or(self.config.min_bm25_score))
             .collect();
 
         // Calculate dynamic weights based on keyword discriminativeness
@@ -1393,7 +1393,7 @@ impl HybridSearchEngine {
         }
 
         // 2. RRF Fusion with dynamic weights
-        let rrf = RRFusion::new(self.config.rrf_k, vec![bm25_weight, vector_weight]);
+        let rrf = RRFusion::new(dial.as_ref().and_then(|d| d.rrf_k_inner).unwrap_or(self.config.rrf_k), vec![bm25_weight, vector_weight]);
 
         let fused = rrf.fuse(vec![bm25_results.clone(), vector_results.clone()]);
 
@@ -1451,7 +1451,7 @@ impl HybridSearchEngine {
 
                 // Combine reranked results with non-reranked
                 // Blend: 0.6 * RRF + 0.4 * normalized_rerank (preserves RRF scale)
-                const RERANK_BLEND: f32 = 0.4;
+                let rerank_blend: f32 = dial.as_ref().and_then(|d| d.ce_blend).unwrap_or(0.4);
                 let mut results: Vec<HybridSearchResult> = Vec::new();
 
                 for (memory_id, rrf_score) in fused {
@@ -1463,7 +1463,7 @@ impl HybridSearchEngine {
                     let final_score = if let Some(norm_rerank) =
                         rerank_normalized.get(&memory_id).copied()
                     {
-                        (1.0 - RERANK_BLEND) * rrf_score + RERANK_BLEND * norm_rerank * rrf_score
+                        (1.0 - rerank_blend) * rrf_score + rerank_blend * norm_rerank * rrf_score
                     } else {
                         rrf_score
                     };
