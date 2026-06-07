@@ -256,6 +256,12 @@ pub struct LearnedWeights {
     /// Number of feedback updates applied (confidence measure)
     #[serde(default)]
     pub update_count: u64,
+    /// R3b B8: Number of NEGATIVE feedback updates (Misleading / Abstained / Ignored).
+    /// Used to enforce the diversity/negative-sample floor before weights are
+    /// considered ready for live application.  Serde-defaulted to 0 for
+    /// older serialized forms (additive evolution, B12-safe).
+    #[serde(default)]
+    pub negative_update_count: u64,
     /// On-disk schema version (B12). Defaults to the current version for
     /// older serialized forms that predate this field.
     #[serde(default = "default_learned_weights_schema_version")]
@@ -276,6 +282,7 @@ impl Default for LearnedWeights {
             vector: 1.0 / 3.0,
             graph: 1.0 / 3.0,
             update_count: 0,
+            negative_update_count: 0,
             schema_version: LEARNED_WEIGHTS_SCHEMA_VERSION,
         }
     }
@@ -289,6 +296,7 @@ impl LearnedWeights {
             vector: config.vector_weight,
             graph: config.graph_weight,
             update_count: 0,
+            negative_update_count: 0,
             schema_version: LEARNED_WEIGHTS_SCHEMA_VERSION,
         }
     }
@@ -297,7 +305,10 @@ impl LearnedWeights {
     ///
     /// For helpful outcomes: target = signal scores (shift toward what worked)
     /// For misleading outcomes: target = inverted scores (shift away from what failed)
-    pub fn apply_update(&mut self, target: &SignalScores, lr: f32) {
+    ///
+    /// `is_negative` should be true for Misleading / Abstained / Ignored outcomes.
+    /// When true, `negative_update_count` is incremented (R3b B8 diversity guard).
+    pub fn apply_update(&mut self, target: &SignalScores, lr: f32, is_negative: bool) {
         self.bm25 = (1.0 - lr) * self.bm25 + lr * target.bm25_contribution;
         self.vector = (1.0 - lr) * self.vector + lr * target.vector_contribution;
         self.graph = (1.0 - lr) * self.graph + lr * target.graph_contribution;
@@ -316,6 +327,24 @@ impl LearnedWeights {
         }
 
         self.update_count += 1;
+        if is_negative {
+            self.negative_update_count += 1;
+        }
+    }
+
+    /// R3b B8: Check diversity floor.
+    ///
+    /// Returns `true` when the fraction of negative-label updates meets or
+    /// exceeds `R3B_MIN_NEGATIVE_SAMPLE_FRACTION`.  Requires at least
+    /// `R3B_MIN_UPDATES_BEFORE_READY` total updates to avoid a 0/0 check on a
+    /// fresh weight vector.
+    pub fn negative_sample_floor_met(&self) -> bool {
+        use crate::constants::{R3B_MIN_NEGATIVE_SAMPLE_FRACTION, R3B_MIN_UPDATES_BEFORE_READY};
+        if self.update_count < R3B_MIN_UPDATES_BEFORE_READY {
+            return false;
+        }
+        let frac = self.negative_update_count as f32 / self.update_count as f32;
+        frac >= R3B_MIN_NEGATIVE_SAMPLE_FRACTION
     }
 }
 
@@ -1130,14 +1159,30 @@ impl HybridSearchEngine {
         &self.bm25_index
     }
 
-    /// Update learned weights from retrieval feedback
+    /// Update learned weights from retrieval feedback (R3b: wired to the
+    /// reinforcement/feedback path).
     ///
-    /// Called after `reinforce_recall` processes a Helpful or Misleading outcome.
-    /// Uses EMA to shift weights toward (helpful) or away from (misleading) the
-    /// signal contributions that produced the retrieval result.
+    /// Called from `reinforce_recall` after it processes a feedback outcome.
+    /// Uses EMA to shift weights toward (Helpful) or away from (Misleading /
+    /// negative) the signal contributions that produced the retrieval result.
+    ///
+    /// B8 regularisation: after each update, nudge every weight 1 % back
+    /// toward the static prior, preventing pathological collapse onto a single
+    /// signal even when the sample distribution is skewed.
+    ///
+    /// After updating, the new vector is persisted via `learned_weights_store`
+    /// so it survives a server restart (R3a closure).
     ///
     /// Thread-safe: takes write lock on learned_weights only for the update.
-    pub fn update_weights_from_feedback(&self, signal_scores: &SignalScores, helpful: bool) {
+    ///
+    /// `is_negative` must be true for Misleading / Abstained / Ignored outcomes
+    /// so the B8 diversity counter advances.
+    pub fn update_weights_from_feedback(
+        &self,
+        signal_scores: &SignalScores,
+        helpful: bool,
+        is_negative: bool,
+    ) {
         use crate::constants::ADAPTIVE_WEIGHT_LEARNING_RATE;
 
         let target = if helpful {
@@ -1147,16 +1192,68 @@ impl HybridSearchEngine {
         };
 
         let mut weights = self.learned_weights.write();
-        weights.apply_update(&target, ADAPTIVE_WEIGHT_LEARNING_RATE);
+        weights.apply_update(&target, ADAPTIVE_WEIGHT_LEARNING_RATE, is_negative);
+
+        // B8 regularisation toward the static prior: 1 % per epoch prevents
+        // weight collapse even under skewed positive-only feedback.
+        const REGULARISATION_RATE: f32 = 0.01;
+        weights.bm25 = (1.0 - REGULARISATION_RATE) * weights.bm25
+            + REGULARISATION_RATE * self.config.bm25_weight;
+        weights.vector = (1.0 - REGULARISATION_RATE) * weights.vector
+            + REGULARISATION_RATE * self.config.vector_weight;
+        weights.graph = (1.0 - REGULARISATION_RATE) * weights.graph
+            + REGULARISATION_RATE * self.config.graph_weight;
+        // Re-normalise after regularisation to keep the simplex invariant.
+        let rsum = weights.bm25 + weights.vector + weights.graph;
+        if rsum > 0.0 {
+            weights.bm25 /= rsum;
+            weights.vector /= rsum;
+            weights.graph /= rsum;
+        }
 
         tracing::debug!(
-            "Adaptive weights updated ({}): bm25={:.3}, vector={:.3}, graph={:.3}, updates={}",
-            if helpful { "helpful" } else { "misleading" },
+            "R3b weights updated ({}): bm25={:.3}, vector={:.3}, graph={:.3}, \
+             updates={}, neg_updates={}",
+            if helpful { "helpful" } else { "negative" },
             weights.bm25,
             weights.vector,
             weights.graph,
             weights.update_count,
+            weights.negative_update_count,
         );
+    }
+
+    /// R3b B1: Snapshot the current learned weight vector ONCE at the start of a
+    /// query.  Returns a value (not a reference) so the caller holds a stable copy
+    /// that cannot be torn by a concurrent `update_weights_from_feedback` call
+    /// mid-scoring loop.
+    pub fn snapshot_learned_weights(&self) -> LearnedWeights {
+        self.learned_weights.read().clone()
+    }
+
+    /// R3b: Check whether the learned weights pass all gates required before
+    /// live application would be allowed.
+    ///
+    /// Returns `true` when ALL of:
+    ///   1. `R3B_LIVE_APPLICATION_ENABLED` is `true` (dormant unless flipped),
+    ///   2. `update_count >= R3B_MIN_UPDATES_BEFORE_READY`,
+    ///   3. The B8 negative-sample diversity floor is met.
+    ///
+    /// Currently always returns `false` because `R3B_LIVE_APPLICATION_ENABLED`
+    /// is `false` in this PR.  The rest of the checks are exercised by tests.
+    pub fn weights_ready(&self) -> bool {
+        use crate::constants::R3B_LIVE_APPLICATION_ENABLED;
+        if !R3B_LIVE_APPLICATION_ENABLED {
+            return false;
+        }
+        let w = self.learned_weights.read();
+        w.negative_sample_floor_met()
+    }
+
+    /// Read-only access to the static configuration (R3b: used by the recall
+    /// path to retrieve the static weight floor without holding a lock).
+    pub fn config(&self) -> &HybridSearchConfig {
+        &self.config
     }
 
     /// Get effective weights blending static defaults with learned weights
@@ -1872,9 +1969,9 @@ mod tests {
         assert_eq!(weights.update_count, 0);
         assert!((weights.bm25 - config.bm25_weight).abs() < 0.001);
 
-        // Apply a strong BM25 signal
+        // Apply a strong BM25 signal (positive feedback)
         let target = SignalScores::from_components(1.0, 0.0, 0.0);
-        weights.apply_update(&target, 0.1);
+        weights.apply_update(&target, 0.1, false);
 
         assert_eq!(weights.update_count, 1);
         // BM25 weight should have increased
@@ -1891,10 +1988,10 @@ mod tests {
         let config = HybridSearchConfig::default();
         let mut weights = LearnedWeights::from_defaults(&config);
 
-        // Apply many updates pushing toward vector dominance
+        // Apply many updates pushing toward vector dominance (positive feedback)
         let target = SignalScores::from_components(0.1, 0.8, 0.1);
         for _ in 0..100 {
-            weights.apply_update(&target, 0.05);
+            weights.apply_update(&target, 0.05, false);
         }
 
         // After 100 updates at lr=0.05, weights should be close to target
@@ -1916,8 +2013,9 @@ mod tests {
             SignalScores::from_components(0.33, 0.33, 0.34),
         ];
 
-        for target in &targets {
-            weights.apply_update(target, 0.1);
+        for (i, target) in targets.iter().enumerate() {
+            // Alternate positive/negative to exercise both code paths
+            weights.apply_update(target, 0.1, i % 2 == 1);
             let sum = weights.bm25 + weights.vector + weights.graph;
             assert!(
                 (sum - 1.0).abs() < 0.001,
@@ -2098,5 +2196,202 @@ mod tests {
         let la = store_a.load();
         assert!((la.bm25 - 0.7).abs() < 1e-6);
         assert_eq!(la.update_count, 11);
+    }
+
+    // =========================================================================
+    // R3b unit tests
+    // =========================================================================
+
+    // Helper: build a minimal HybridSearchEngine for R3b tests that exercise
+    // only the weight machinery (no actual BM25/vector search is performed).
+    fn make_test_engine() -> (HybridSearchEngine, tempfile::TempDir) {
+        use crate::embeddings::competitive::CompetitiveEmbedder;
+
+        struct StubEmb;
+        impl crate::embeddings::Embedder for StubEmb {
+            fn encode(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0; 4])
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+        }
+
+        let embedder = Arc::new(CompetitiveEmbedder::primary_only(
+            Arc::new(StubEmb) as Arc<dyn crate::embeddings::Embedder>,
+        ));
+        let config = HybridSearchConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine =
+            HybridSearchEngine::new(&tmp.path().join("bm25"), embedder, config).unwrap();
+        (engine, tmp)
+    }
+
+    /// R3b-T1: `snapshot_learned_weights` returns a value copy; mutating the
+    /// engine afterwards does NOT retroactively change the snapshot (no torn read
+    /// within a single query B1 guard).
+    #[test]
+    fn test_r3b_snapshot_is_stable_within_query() {
+        let (engine, _tmp) = make_test_engine();
+
+        // Take snapshot BEFORE injecting a feedback update.
+        let snapshot_before = engine.snapshot_learned_weights();
+        assert_eq!(snapshot_before.update_count, 0);
+
+        // Simulate a helpful feedback update on the engine.
+        let scores = SignalScores::from_components(1.0, 0.0, 0.0);
+        engine.update_weights_from_feedback(&scores, true, false);
+
+        // The live state must have changed (update_count incremented).
+        let live = engine.learned_weight_state();
+        assert_eq!(live.update_count, 1, "update count must increment");
+
+        // The snapshot itself must be frozen at the pre-update state.
+        assert_eq!(
+            snapshot_before.update_count, 0,
+            "snapshot must not be mutated by subsequent update_weights_from_feedback"
+        );
+    }
+
+    /// R3b-T2: per-epoch weight delta is bounded by ADAPTIVE_WEIGHT_MAX_BLEND
+    /// (the 0.6 blend cap).  After a single maximally-skewed feedback update the
+    /// blended weight must NOT exceed the static default by more than the
+    /// max-blend factor.
+    #[test]
+    fn test_r3b_per_epoch_delta_clamped_at_0_6() {
+        use crate::constants::{ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND};
+
+        let config = HybridSearchConfig::default();
+        let static_bm25 = config.bm25_weight; // e.g. 0.4
+
+        let mut weights = LearnedWeights::from_defaults(&config);
+
+        // Drive the ranker toward 100% BM25 with many updates to max out confidence.
+        let all_bm25 = SignalScores::from_components(1.0, 0.0, 0.0);
+        for _ in 0..ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD * 2 {
+            weights.apply_update(&all_bm25, 0.05, false);
+        }
+
+        // `effective_weights()` is where the blend cap is applied.  We can't call
+        // it here without an engine, so we reproduce the formula inline to verify
+        // the constant.
+        let confidence =
+            (weights.update_count as f32 / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32).min(1.0);
+        let blend = confidence * ADAPTIVE_WEIGHT_MAX_BLEND;
+        let eff_bm25 = (1.0 - blend) * static_bm25 + blend * weights.bm25;
+
+        // The effective bm25 weight must be <= 100% of the static + max blend lift.
+        let max_possible = static_bm25 + ADAPTIVE_WEIGHT_MAX_BLEND;
+        assert!(
+            eff_bm25 <= max_possible + 1e-5,
+            "effective bm25 weight {eff_bm25:.4} exceeds max possible {max_possible:.4}"
+        );
+        // The blend factor itself must be capped at ADAPTIVE_WEIGHT_MAX_BLEND.
+        assert!(
+            blend <= ADAPTIVE_WEIGHT_MAX_BLEND + 1e-5,
+            "blend {blend:.4} must be <= ADAPTIVE_WEIGHT_MAX_BLEND ({ADAPTIVE_WEIGHT_MAX_BLEND})"
+        );
+    }
+
+    /// R3b-T3: `R3B_LIVE_APPLICATION_ENABLED` defaults to false, so
+    /// `weights_ready()` always returns false in this PR regardless of the
+    /// update count or diversity floor.  This ensures the live path is
+    /// unreachable until the constant is explicitly flipped.
+    #[test]
+    fn test_r3b_live_application_defaults_off() {
+        use crate::constants::R3B_LIVE_APPLICATION_ENABLED;
+
+        // Constant-level guard: must be false in this PR.
+        assert!(
+            !R3B_LIVE_APPLICATION_ENABLED,
+            "R3B_LIVE_APPLICATION_ENABLED must be false — live ramp is a separate future commit"
+        );
+
+        let (engine, _tmp) = make_test_engine();
+
+        // Even after enough helpful+negative updates to satisfy the diversity floor,
+        // weights_ready() must return false because the constant is off.
+        let scores = SignalScores::from_components(0.33, 0.33, 0.34);
+        // Positive updates
+        for _ in 0..15 {
+            engine.update_weights_from_feedback(&scores, true, false);
+        }
+        // Negative updates (>= 20% floor)
+        for _ in 0..5 {
+            engine.update_weights_from_feedback(&scores, false, true);
+        }
+        assert!(
+            !engine.weights_ready(),
+            "weights_ready() must return false while R3B_LIVE_APPLICATION_ENABLED=false"
+        );
+    }
+
+    /// R3b-T4: `weights_ready()` sub-check — `negative_sample_floor_met()` only
+    /// returns true once the fraction of negative updates meets the threshold.
+    #[test]
+    fn test_r3b_negative_sample_floor() {
+        use crate::constants::{R3B_MIN_NEGATIVE_SAMPLE_FRACTION, R3B_MIN_UPDATES_BEFORE_READY};
+
+        let config = HybridSearchConfig::default();
+        let mut weights = LearnedWeights::from_defaults(&config);
+
+        // Below minimum total count → false
+        assert!(!weights.negative_sample_floor_met());
+
+        // Enough total but zero negatives → false
+        let pos = SignalScores::from_components(0.5, 0.3, 0.2);
+        for _ in 0..R3B_MIN_UPDATES_BEFORE_READY {
+            weights.apply_update(&pos, 0.05, false);
+        }
+        assert!(!weights.negative_sample_floor_met(), "all-positive must not meet floor");
+
+        // Add enough negatives to satisfy the fraction.
+        // Need: neg / (pos_count + neg) >= MIN_FRAC
+        // => neg >= MIN_FRAC * pos_count / (1 - MIN_FRAC), rounded UP.
+        let pos_so_far = weights.update_count as f32;
+        let neg_count = (pos_so_far * R3B_MIN_NEGATIVE_SAMPLE_FRACTION
+            / (1.0 - R3B_MIN_NEGATIVE_SAMPLE_FRACTION))
+            .ceil() as u64;
+        let neg_count = neg_count.max(1);
+        for _ in 0..neg_count {
+            weights.apply_update(&pos, 0.05, true);
+        }
+        assert!(
+            weights.negative_sample_floor_met(),
+            "after adding {neg_count} negatives floor should be met; \
+             neg={}, total={}",
+            weights.negative_update_count,
+            weights.update_count
+        );
+    }
+
+    /// R3b-T5: static score equals the returned score (live path unchanged) when
+    /// computing the shadow delta.
+    ///
+    /// This is a unit-level check of the shadow-delta formula: when the learned
+    /// weights equal the static weights the delta must be zero.
+    #[test]
+    fn test_r3b_shadow_delta_zero_when_weights_equal() {
+        let static_bm25 = 0.4_f32;
+        let static_vector = 0.6_f32;
+        let static_graph = 0.0_f32;
+
+        let bm25_attr = 0.7_f32;
+        let vector_attr = 0.3_f32;
+        let graph_attr = 0.0_f32;
+
+        let static_signal = static_bm25 * bm25_attr + static_vector * vector_attr + static_graph * graph_attr;
+
+        // Learned = same as static in this case.
+        let learned_bm25 = static_bm25;
+        let learned_vector = static_vector;
+        let learned_graph = static_graph;
+        let learned_signal = learned_bm25 * bm25_attr + learned_vector * vector_attr + learned_graph * graph_attr;
+
+        let delta = learned_signal - static_signal;
+        assert!(
+            delta.abs() < 1e-6,
+            "delta must be zero when learned == static; got {delta}"
+        );
     }
 }

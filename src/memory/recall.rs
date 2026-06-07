@@ -2342,6 +2342,18 @@ impl super::MemorySystem {
         // Acts as a global quality multiplier: high-quality graphs boost all scores.
         let external_dim_multiplier = self.external_aggregate_score().unwrap_or(1.0);
 
+        // R3b B1 — WEIGHT SNAPSHOT: snapshot the learned weight vector ONCE before
+        // the scoring loop.  Reading inside the loop would risk a torn read if a
+        // concurrent `update_weights_from_feedback` call fires mid-query.  The
+        // snapshot is a value copy (`Clone`) so it is immune to further mutations.
+        // NOTE: this snapshot is used ONLY for the shadow computation below; the
+        // static path (what is actually returned) is unchanged.
+        let r3b_learned_snapshot = self.hybrid_search.snapshot_learned_weights();
+        // Static config weights — the floor that the live path always uses.
+        let r3b_static_bm25 = self.hybrid_search.config().bm25_weight;
+        let r3b_static_vector = self.hybrid_search.config().vector_weight;
+        let r3b_static_graph = self.hybrid_search.config().graph_weight;
+
         // R2 (LTR) SHADOW CAPTURE side-map. The `with_unified_score` closure
         // (re-bound each loop iteration) borrows this by reference and inserts one
         // ScoringFeatures per scored memory keyed by MemoryId. It lives outside the
@@ -4014,6 +4026,57 @@ impl super::MemorySystem {
             // (after all rows for this retrieval are written) rather than once
             // per result row. Avoids a full KV prefix scan per insert.
             self.retrieval_trace_store.enforce_pending_bound();
+
+            // R3b SHADOW DELTA — compute the learned-weighted score alongside
+            // the static score and log the delta.  PURELY READ-ONLY w.r.t. the
+            // live result: `memories`, `m.score`, and the returned order are
+            // byte-for-byte unchanged.  The static score is the live score.
+            //
+            // Shadow formula (per memory):
+            //   static_signal  = static_bm25  * bm25_attr
+            //                  + static_vector * vector_attr
+            //                  + static_graph  * graph_attr
+            //   learned_signal = learned_bm25  * bm25_attr
+            //                  + learned_vector * vector_attr
+            //                  + learned_graph  * graph_attr
+            //   delta          = learned_signal − static_signal
+            //   shadow_score   = static_final_score + delta
+            //
+            // The three raw signal contributions come from `last_signal_attributions`
+            // (populated just above; guarded so only surviving memories are present).
+            // If a memory has no attribution (e.g. a re-cued augmentation row) we
+            // log delta=0 so the accounting is complete without fabricating data.
+            //
+            // B8 gate: only log if the gate flag is false (which it always is in
+            // this PR), ensuring the comment stays true: live OFF, shadow logged.
+            if !crate::constants::R3B_LIVE_APPLICATION_ENABLED {
+                let attr_guard = self.last_signal_attributions.read();
+                for m in memories.iter() {
+                    let static_score = m.score.unwrap_or(0.0);
+                    let (delta, learned_score) =
+                        if let Some(attr) = attr_guard.get(&m.id) {
+                            let static_signal = r3b_static_bm25 * attr.bm25_contribution
+                                + r3b_static_vector * attr.vector_contribution
+                                + r3b_static_graph * attr.graph_contribution;
+                            let learned_signal = r3b_learned_snapshot.bm25
+                                * attr.bm25_contribution
+                                + r3b_learned_snapshot.vector * attr.vector_contribution
+                                + r3b_learned_snapshot.graph * attr.graph_contribution;
+                            let d = learned_signal - static_signal;
+                            (d, static_score + d)
+                        } else {
+                            (0.0_f32, static_score)
+                        };
+                    tracing::trace!(
+                        memory_id = %m.id.0,
+                        static_score,
+                        learned_score,
+                        delta,
+                        learned_updates = r3b_learned_snapshot.update_count,
+                        "R3b shadow: learned-vs-static delta (live path unchanged)"
+                    );
+                }
+            }
         }
 
         Ok(memories)
@@ -4770,6 +4833,54 @@ impl super::MemorySystem {
                 ?outcome,
                 "LTR trace: graduated pending rows to TRAINING on feedback"
             );
+        }
+
+        // R3b: wire adaptive-weight update from the feedback signal.
+        //
+        // For each reinforced memory, look up its signal attribution (BM25 /
+        // vector / graph contribution fractions) from the most-recent recall.
+        // Call `update_weights_from_feedback` on the hybrid search engine so the
+        // EMA ranker learns from this signal.  After all updates, persist the new
+        // vector via `learned_weights_store` (R3a F3 closure: survives restarts).
+        //
+        // The B8 clamp (max blend = 0.6) lives inside `effective_weights()`; the
+        // per-epoch regularisation and negative-count tracking live inside
+        // `update_weights_from_feedback`.  Per-user blast radius is contained by
+        // construction (this MemorySystem is per-user).
+        //
+        // SHADOW ONLY: `update_weights_from_feedback` mutates `learned_weights`
+        // on the engine, but those weights are NOT consumed by the scoring path
+        // in this PR (`R3B_LIVE_APPLICATION_ENABLED = false`).
+        {
+            let is_negative = matches!(
+                outcome,
+                RetrievalOutcome::Misleading
+                    | RetrievalOutcome::Abstained
+                    | RetrievalOutcome::Ignored
+            );
+            let is_helpful = matches!(outcome, RetrievalOutcome::Helpful);
+            // Only update on actionable outcomes — Neutral carries no gradient signal.
+            if is_helpful || is_negative {
+                let attr_guard = self.last_signal_attributions.read();
+                for id in memory_ids {
+                    if let Some(attr) = attr_guard.get(id) {
+                        let signal_scores =
+                            crate::memory::hybrid_search::SignalScores::from_components(
+                                attr.bm25_contribution,
+                                attr.vector_contribution,
+                                attr.graph_contribution,
+                            );
+                        self.hybrid_search.update_weights_from_feedback(
+                            &signal_scores,
+                            is_helpful,
+                            is_negative,
+                        );
+                    }
+                }
+                // Persist the updated weight vector so it survives a restart (R3a).
+                let updated = self.hybrid_search.learned_weight_state();
+                self.learned_weights_store.save(&updated);
+            }
         }
 
         Ok(stats)
