@@ -1,11 +1,11 @@
-//! Glue layer between the user-auth store, the field encryptor, and the
+//! Glue layer between the user-auth store, the TOTP secret encryptor, and the
 //! per-username login throttle.
 //!
 //! Holds the long-lived state every user-auth handler needs:
 //!   - the persistent [`store::UserAuthStore`];
 //!   - a per-username login [`LoginLimiter`] (governor::keyed, 5 attempts /
 //!     15 min) — distinct from the existing peer-IP governance layer;
-//!   - the optional [`FieldEncryptor`] used to seal TOTP secrets at rest.
+//!   - the optional [`SecretCryptor`] used to seal TOTP secrets at rest.
 //!
 //! The handlers do not own RocksDB or any cryptographic key; they consume
 //! a [`UserAuthRuntime`] and call its methods. This keeps test wiring small
@@ -24,7 +24,7 @@ use governor::{
     Quota, RateLimiter,
 };
 
-use crate::encryption::FieldEncryptor;
+use crate::keystore::SecretCryptor;
 use crate::user_auth::store::UserAuthStore;
 
 /// Default lockout window for the per-username login limiter: 5 attempts
@@ -94,18 +94,19 @@ impl LoginLimiter {
 pub struct UserAuthRuntime {
     pub store: UserAuthStore,
     pub login_limiter: LoginLimiter,
-    /// Encryptor used to seal TOTP secrets at rest. `None` when
-    /// `VELD_ENCRYPTION_KEY` is unset; production mode then refuses 2FA
-    /// enrollment (see `AuthError::TotpEncryptionRequired`).
-    pub field_encryptor: Option<FieldEncryptor>,
+    /// Encryptor used to seal TOTP secrets at rest (encryption-v2, keystore-derived
+    /// "totp" purpose key). `None` when `VELD_KEYSTORE_PATH` / `VELD_MASTER_PASSPHRASE`
+    /// are unset; production mode then refuses 2FA enrollment (see
+    /// `AuthError::TotpEncryptionRequired`).
+    pub totp_encryptor: Option<SecretCryptor>,
 }
 
 impl UserAuthRuntime {
-    pub fn new(store: UserAuthStore, field_encryptor: Option<FieldEncryptor>) -> Self {
+    pub fn new(store: UserAuthStore, totp_encryptor: Option<SecretCryptor>) -> Self {
         Self {
             store,
             login_limiter: LoginLimiter::default_login_throttle(),
-            field_encryptor,
+            totp_encryptor,
         }
     }
 
@@ -115,12 +116,12 @@ impl UserAuthRuntime {
     pub fn with_limiter(
         store: UserAuthStore,
         login_limiter: LoginLimiter,
-        field_encryptor: Option<FieldEncryptor>,
+        totp_encryptor: Option<SecretCryptor>,
     ) -> Self {
         Self {
             store,
             login_limiter,
-            field_encryptor,
+            totp_encryptor,
         }
     }
 }

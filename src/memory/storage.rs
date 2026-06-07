@@ -1117,6 +1117,8 @@ fn crc32_simple(data: &[u8]) -> u32 {
 
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
 const CF_INDEX: &str = "memory_index";
+/// Sentinel (in `CF_INDEX`) holding the last-seen keystore generation; rollback guard.
+const KEYSTORE_GENERATION_KEY: &[u8] = b"meta:keystore_generation";
 /// General-purpose key-value column family for small per-user blobs (e.g. the
 /// `CognitiveDials` tuning surface) that don't fit the memory/index schemas.
 /// Created on open via `create_missing_column_families`, so it materializes on
@@ -1134,10 +1136,17 @@ pub struct MemoryStorage {
     storage_path: PathBuf,
     /// Write mode (sync vs async) - affects latency vs durability tradeoff
     write_mode: WriteMode,
-    /// Optional field-level encryptor for memory content (AES-256-GCM).
-    /// When present, Experience.content is encrypted before storage and decrypted on read.
-    /// Sourced from VELD_ENCRYPTION_KEY env var; None means plaintext (backward compatible).
-    encryptor: Option<crate::encryption::FieldEncryptor>,
+    /// Optional record-level encryptor (AES-256-GCM envelope, encryption-v2).
+    /// When present, the whole serialized record is encrypted before storage and
+    /// decrypted on read. Backed by the keystore (`storage_path/keystore.json`),
+    /// unsealed via `VELD_MASTER_PASSPHRASE`; `None` means plaintext (backward
+    /// compatible). Holds one cryptor per keystore epoch so records written before
+    /// a key rotation stay readable (writes always use the active epoch).
+    record_cryptors: Option<crate::keystore::RecordCryptors>,
+    /// Optional index-term blinder (encryption-v2 P3). When present, exact-match
+    /// index terms (tag/entity/…) are stored as HMAC tokens, not plaintext.
+    /// Derived from the master key alongside `record_cryptors`.
+    index_blinder: Option<crate::keystore::IndexBlinder>,
 }
 
 impl MemoryStorage {
@@ -1244,83 +1253,195 @@ impl MemoryStorage {
             }
         );
 
-        // Initialize field-level encryption from env var (None = plaintext, backward compatible)
-        let encryptor = crate::encryption::FieldEncryptor::from_env()
-            .context("Failed to initialize field-level encryption")?;
+        // Record-level encryption (encryption-v2): the keystore lives next to the
+        // data and is unsealed with VELD_MASTER_PASSPHRASE. First run with a
+        // passphrase and no keystore creates one. A keystore present without the
+        // passphrase is a hard error (it would otherwise serve ciphertext as
+        // plaintext). No keystore + no passphrase = plaintext (backward compatible).
+        let (record_cryptors, index_blinder) = match Self::open_record_cryptor(&db, &storage_path)? {
+            Some((cryptors, blinder)) => (Some(cryptors), Some(blinder)),
+            None => (None, None),
+        };
 
         Ok(Self {
             db,
             storage_path: path.to_path_buf(),
             write_mode,
-            encryptor,
+            record_cryptors,
+            index_blinder,
         })
     }
 
+    /// Load — or, on first run, create — the record encryptor + index blinder from the keystore.
+    #[allow(clippy::type_complexity)]
+    fn open_record_cryptor(
+        db: &DB,
+        storage_path: &Path,
+    ) -> Result<Option<(crate::keystore::RecordCryptors, crate::keystore::IndexBlinder)>> {
+        use crate::keystore::{IndexBlinder, KdfParams, Keystore, LocalAeadKms, RecordCryptors};
+
+        let keystore_path = storage_path.join("keystore.json");
+        let passphrase = std::env::var("VELD_MASTER_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let (ks, kek) = match (keystore_path.exists(), passphrase) {
+            (true, Some(pass)) => {
+                let json = std::fs::read_to_string(&keystore_path)
+                    .context("Failed to read keystore.json")?;
+                let ks = Keystore::from_json(&json)?;
+                let kek = ks.unseal_with_passphrase(&pass)?;
+                tracing::info!("Record-level encryption: keystore unsealed (passphrase)");
+                (ks, kek)
+            }
+            (true, None) => {
+                // No passphrase: try unattended KMS unseal via VELD_KMS_WRAP_KEY.
+                let json = std::fs::read_to_string(&keystore_path)
+                    .context("Failed to read keystore.json")?;
+                let ks = Keystore::from_json(&json)?;
+                let kms = LocalAeadKms::from_env()?.ok_or_else(|| {
+                    anyhow!(
+                        "keystore.json is present but neither VELD_MASTER_PASSPHRASE nor \
+                         VELD_KMS_WRAP_KEY is set; refusing to start (encrypted records would be \
+                         served as ciphertext)"
+                    )
+                })?;
+                let kek = ks.unseal_with_kms(&kms)?;
+                tracing::info!("Record-level encryption: keystore unsealed (KMS)");
+                (ks, kek)
+            }
+            (false, Some(pass)) => {
+                let ks = Keystore::create(&pass, KdfParams::production())?;
+                ks.save_to_path(&keystore_path)
+                    .context("Failed to write keystore.json")?;
+                let kek = ks.unseal_with_passphrase(&pass)?;
+                tracing::info!("Created new encryption keystore at {keystore_path:?}");
+                (ks, kek)
+            }
+            (false, None) => return Ok(None),
+        };
+
+        // Integrity (in-place tamper) + rollback (file-swap) guards.
+        ks.verify_integrity(&kek)
+            .context("keystore integrity verification failed")?;
+        Self::check_keystore_generation(db, ks.generation)?;
+
+        let cryptors = RecordCryptors::from_keystore(&ks, &kek)?;
+        let blinder = IndexBlinder::derive_from_kek(&kek);
+        Ok(Some((cryptors, blinder)))
+    }
+
+    /// Rollback guard: refuse a keystore whose generation is older than the last
+    /// one this database observed; advance the stored sentinel otherwise.
+    fn check_keystore_generation(db: &DB, generation: u64) -> Result<()> {
+        let cf = db
+            .cf_handle(CF_INDEX)
+            .ok_or_else(|| anyhow!("memory_index CF missing for keystore generation sentinel"))?;
+        let stored = db
+            .get_cf(cf, KEYSTORE_GENERATION_KEY)
+            .context("read keystore generation sentinel")?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        if generation < stored {
+            let allow_rollback = std::env::var("VELD_ALLOW_KEYSTORE_ROLLBACK")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false);
+            if !allow_rollback {
+                return Err(anyhow!(
+                    "keystore rollback detected: file generation {generation} < last-seen {stored}. \
+                     If you intentionally restored an older keystore (e.g. keystore.json.bak), set \
+                     VELD_ALLOW_KEYSTORE_ROLLBACK=true once to accept it and reset the sentinel."
+                ));
+            }
+            tracing::warn!(
+                file_generation = generation,
+                last_seen = stored,
+                "VELD_ALLOW_KEYSTORE_ROLLBACK set: accepting an older keystore generation (restored \
+                 keystore?) and resetting the rollback sentinel to it. Rollback protection is \
+                 bypassed for this start — unset the variable afterward."
+            );
+            db.put_cf(cf, KEYSTORE_GENERATION_KEY, generation.to_le_bytes())
+                .context("reset keystore generation sentinel")?;
+            return Ok(());
+        }
+        if generation > stored {
+            db.put_cf(cf, KEYSTORE_GENERATION_KEY, generation.to_le_bytes())
+                .context("write keystore generation sentinel")?;
+        }
+        Ok(())
+    }
+
     // ========================================================================
-    // FIELD-LEVEL ENCRYPTION HELPERS
-    // Centralized encrypt-before-serialize / decrypt-after-deserialize logic.
-    // All serialization and deserialization of Memory structs should use these
-    // helpers instead of calling bincode directly.
+    // RECORD-LEVEL ENCRYPTION HELPERS (encryption-v2)
+    // serialize_memory encrypts the whole serialized record after bincode;
+    // decode_stored decrypts before deserialize. All storage paths route raw
+    // bytes through these instead of calling bincode/deserialize_memory directly.
     // ========================================================================
 
-    /// Serialize a memory to bytes, encrypting the content field if an encryptor is configured.
-    ///
-    /// When encryption is enabled, clones the memory, replaces `experience.content` with its
-    /// encrypted form (stored as lossy UTF-8 of the encrypted bytes — using a dedicated sentinel
-    /// prefix so we know to decrypt on read), then serializes normally.
+    /// Serialize a memory to bytes. With record-level encryption enabled the whole
+    /// serialized record is envelope-encrypted (`ENC\0|ver|epoch|nonce|ct`);
+    /// otherwise it is plaintext bincode (backward compatible).
     fn serialize_memory(&self, memory: &Memory) -> Result<Vec<u8>> {
-        match &self.encryptor {
-            Some(enc) => {
-                let encrypted_bytes = enc
-                    .encrypt_content(&memory.experience.content)
-                    .context("Failed to encrypt memory content")?;
-                // Store encrypted bytes as base64 in the content field so it survives
-                // bincode string serialization without data loss (raw bytes aren't valid UTF-8).
-                use base64::Engine;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted_bytes);
-                let mut encrypted_memory = memory.clone();
-                encrypted_memory.experience.content = encoded;
-                bincode::serde::encode_to_vec(&encrypted_memory, bincode::config::standard())
-                    .context("Failed to serialize encrypted memory")
-            }
-            None => bincode::serde::encode_to_vec(memory, bincode::config::standard())
-                .context("Failed to serialize memory"),
+        let plaintext = bincode::serde::encode_to_vec(memory, bincode::config::standard())
+            .context("Failed to serialize memory")?;
+        match &self.record_cryptors {
+            Some(cryptors) => cryptors
+                .active()
+                // Bind the record to its identity: AAD = the memory-id (== the
+                // primary-CF key, id.0.as_bytes()). A ciphertext lifted from one
+                // key and replanted at another fails to decrypt (anti-swap /
+                // anti-relocation), and tamper of the stored id is caught.
+                .encrypt_record(&plaintext, memory.id.0.as_bytes())
+                .context("Failed to encrypt memory record"),
+            None => Ok(plaintext),
         }
     }
 
-    /// Decrypt the content field of a memory in-place if it was encrypted.
+    /// Decode a stored record: decrypt first if it carries the record-envelope
+    /// marker, then deserialize. Plaintext (legacy) records pass straight through.
     ///
-    /// Checks whether the content looks like base64-encoded encrypted data (by decoding
-    /// and checking for the ENC\0 marker). If not encrypted, leaves content unchanged
-    /// (backward compatible with plaintext data written before encryption was enabled).
-    fn decrypt_memory_content(&self, memory: &mut Memory) {
-        let enc = match &self.encryptor {
-            Some(enc) => enc,
-            None => return,
-        };
-
-        // Try to decode the content as base64 and check for the encrypted marker
-        use base64::Engine;
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
-            Ok(bytes) => bytes,
-            Err(_) => return, // Not base64 — plaintext content, leave unchanged
-        };
-
-        if !crate::encryption::FieldEncryptor::is_encrypted(&decoded) {
-            return; // No encryption marker — plaintext content that happens to be valid base64
+    /// Errors if a record is encrypted but no key is configured, or if decryption
+    /// fails — callers must NOT treat that as a plaintext record.
+    ///
+    /// `id` is the record's identity (its primary-CF key, id.0.as_bytes()), bound
+    /// into the AEAD AAD by serialize_memory. Pass the rocksdb key the value was
+    /// read at; a mismatch fails decryption (anti-swap). Unused on the plaintext
+    /// (legacy) path.
+    fn decode_stored(&self, id: &[u8], data: &[u8]) -> Result<(Memory, bool)> {
+        if crate::keystore::is_encrypted_record(data) {
+            let cryptors = self.record_cryptors.as_ref().ok_or_else(|| {
+                anyhow!("encountered an encrypted record but no keystore/key is configured")
+            })?;
+            let epoch = crate::keystore::record_epoch(data).unwrap_or(0);
+            // Select the DEK for THIS record's epoch — records written before a key
+            // rotation decrypt under their original (retired) epoch key.
+            let cryptor = cryptors.for_epoch(epoch).ok_or_else(|| {
+                anyhow!(
+                    "record epoch {epoch} has no DEK in the keystore (active epoch {}); \
+                     the keystore may have been replaced or the epoch's key pruned",
+                    cryptors.active_epoch()
+                )
+            })?;
+            let plaintext = cryptor
+                .decrypt_record(data, id)
+                .context("Failed to decrypt memory record")?;
+            deserialize_memory(&plaintext)
+        } else {
+            deserialize_memory(data)
         }
+    }
 
-        match enc.decrypt_content(&decoded) {
-            Ok(plaintext) => {
-                memory.experience.content = plaintext;
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to decrypt content for memory {} (leaving encrypted): {}",
-                    memory.id.0,
-                    e
-                );
-            }
+    /// Blind an exact-match index term (encryption-v2 P3). Returns the HMAC token
+    /// when index blinding is enabled, else the term unchanged (plaintext index,
+    /// backward compatible). Equal terms map to equal tokens so lookups still work.
+    fn blind_term(&self, term: &str) -> String {
+        match &self.index_blinder {
+            Some(blinder) => blinder.blind(term),
+            None => term.to_string(),
         }
     }
 
@@ -1523,6 +1644,35 @@ impl MemoryStorage {
     }
 
     /// Update secondary indices for efficient retrieval
+    /// Rebuild the entire secondary index (`memory_index` CF) from the primary
+    /// records. Required after the index-blinding key changes (e.g. KEK rotation):
+    /// clears the index then re-derives every memory's entries with the current
+    /// blinder. Idempotent and record-safe — records are never touched; `meta:`
+    /// keys are preserved. Run offline / single-writer. Returns the record count.
+    pub fn rebuild_index(&self) -> Result<usize> {
+        let idx = self.index_cf();
+        let stale: Vec<Box<[u8]>> = self
+            .db
+            .iterator_cf(idx, IteratorMode::Start)
+            .filter_map(|r| r.ok().map(|(k, _)| k))
+            .filter(|k| !k.starts_with(b"meta:"))
+            .collect();
+        let mut batch = rocksdb::WriteBatch::default();
+        for k in &stale {
+            batch.delete_cf(idx, k.as_ref());
+        }
+        self.db
+            .write(batch)
+            .context("Failed to clear stale index entries during rebuild")?;
+
+        let memories = self.get_all()?;
+        for memory in &memories {
+            self.update_indices(memory)?;
+        }
+        self.flush()?;
+        Ok(memories.len())
+    }
+
     fn update_indices(&self, memory: &Memory) -> Result<()> {
         let idx = self.index_cf();
         let mut batch = WriteBatch::default();
@@ -1555,14 +1705,14 @@ impl MemoryStorage {
         // Index by entities (case-insensitive for tag search compatibility)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
-            let entity_key = format!("entity:{}:{}", normalized_entity, memory.id.0);
+            let entity_key = format!("entity:{}:{}", self.blind_term(&normalized_entity), memory.id.0);
             batch.put_cf(idx, entity_key.as_bytes(), b"1");
         }
 
         // Index by tags (separate from entities for explicit tag queries)
         for tag in &memory.experience.tags {
             let normalized_tag = tag.to_lowercase();
-            let tag_key = format!("tag:{}:{}", normalized_tag, memory.id.0);
+            let tag_key = format!("tag:{}:{}", self.blind_term(&normalized_tag), memory.id.0);
             batch.put_cf(idx, tag_key.as_bytes(), b"1");
         }
 
@@ -1570,12 +1720,18 @@ impl MemoryStorage {
         // Episode is the primary temporal grouping - memories in same episode are highly related
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
-                let episode_key = format!("episode:{}:{}", episode_id, memory.id.0);
+                let episode_key =
+                    format!("episode:{}:{}", self.blind_term(&episode_id.to_string()), memory.id.0);
                 batch.put_cf(idx, episode_key.as_bytes(), b"1");
 
                 // Also index by sequence within episode for temporal ordering
                 if let Some(seq) = ctx.episode.sequence_number {
-                    let seq_key = format!("episode_seq:{}:{}:{}", episode_id, seq, memory.id.0);
+                    let seq_key = format!(
+                        "episode_seq:{}:{}:{}",
+                        self.blind_term(&episode_id.to_string()),
+                        seq,
+                        memory.id.0
+                    );
                     batch.put_cf(idx, seq_key.as_bytes(), b"1");
                 }
             }
@@ -1586,14 +1742,15 @@ impl MemoryStorage {
         // Index by robot_id (for multi-robot systems). Read via
         // resolved_robot_id so the W3 WhoFacet SelfAgent indexes too.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!("robot:{}:{}", robot_id, memory.id.0);
+            let robot_key = format!("robot:{}:{}", self.blind_term(&robot_id.to_string()), memory.id.0);
             batch.put_cf(idx, robot_key.as_bytes(), b"1");
         }
 
         // Index by mission_id (for mission context retrieval). Read via
         // resolved_mission_id so the W3 WhyFacet goal_stack first entry counts.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!("mission:{}:{}", mission_id, memory.id.0);
+            let mission_key =
+                format!("mission:{}:{}", self.blind_term(&mission_id.to_string()), memory.id.0);
             batch.put_cf(idx, mission_key.as_bytes(), b"1");
         }
 
@@ -1601,6 +1758,13 @@ impl MemoryStorage {
         // Key format: geo:GEOHASH:memory_id (geohash precision 10 = ~1.2m x 60cm).
         // Read via resolved_geo so both Place::Geo (W3) and the legacy flat
         // field are indexed.
+        //
+        // SECURITY (residual): the geohash is stored UNBLINDED, unlike the
+        // exact-match index terms. Spatial search scans by geohash *prefix*
+        // (proximity), so HMAC-blinding would destroy the prefix structure and
+        // break nearby-queries. Precise location (~1.2m) is therefore visible in
+        // the index CF to anyone who can read it — same class as the date/type/
+        // importance range keys. See docs/ENCRYPTION-SECURITY.md.
         if let Some((lat, lon, _alt)) = memory.experience.resolved_geo() {
             // Precision 10 — warehouse-level accuracy (~1.2m cells).
             let geohash = super::types::geohash_encode(lat, lon, 10);
@@ -1610,7 +1774,8 @@ impl MemoryStorage {
 
         // Index by action_type (for action-based retrieval)
         if let Some(ref action_type) = memory.experience.action_type {
-            let action_key = format!("action:{}:{}", action_type, memory.id.0);
+            let action_key =
+                format!("action:{}:{}", self.blind_term(&action_type.to_string()), memory.id.0);
             batch.put_cf(idx, action_key.as_bytes(), b"1");
         }
 
@@ -1629,7 +1794,7 @@ impl MemoryStorage {
         // Enables O(1) duplicate detection on remember()
         {
             let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!("content_hash:{}", content_hash);
+            let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
             batch.put_cf(idx, hash_key.as_bytes(), memory.id.0.as_bytes());
         }
 
@@ -1638,7 +1803,8 @@ impl MemoryStorage {
         // Key format: external:{source}:{id}:{memory_id} -> memory_id
         // Enables O(1) lookup when syncing from external systems
         if let Some(ref external_id) = memory.external_id {
-            let external_key = format!("external:{}:{}", external_id, memory.id.0);
+            let external_key =
+                format!("external:{}:{}", self.blind_term(&external_id.to_string()), memory.id.0);
             // Store memory_id as value for direct lookup
             batch.put_cf(idx, external_key.as_bytes(), memory.id.0.as_bytes());
         }
@@ -1648,8 +1814,27 @@ impl MemoryStorage {
         // Key format: parent:{parent_id}:{child_id} -> 1
         // Enables O(1) lookup of all children for a parent
         if let Some(ref parent_id) = memory.parent_id {
-            let parent_key = format!("parent:{}:{}", parent_id.0, memory.id.0);
+            let parent_key =
+                format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), memory.id.0);
             batch.put_cf(idx, parent_key.as_bytes(), b"1");
+        }
+
+        // === Inbound-Reference Reverse Index (R7 / F2) ===
+        // For every forward MemoryId reference this memory holds (it points AT a
+        // target), record the inverse edge so we can answer "does anything still
+        // point at memory X?" in O(1) via a prefix scan, without scanning the
+        // whole corpus. Consumed by a later merge/GC step (R6) to gate
+        // garbage-collection on inbound_refs == 0. Key format:
+        //   inbound_ref:{blinded(target_id)}:{holder_id} -> {holder_id bytes}
+        // De-duplicated so a memory that references the same target twice (e.g.
+        // both related_memories and a CausalLink) yields a single entry.
+        for target in Self::forward_ref_targets(memory) {
+            let inbound_key = format!(
+                "inbound_ref:{}:{}",
+                self.blind_term(&target.0.to_string()),
+                memory.id.0
+            );
+            batch.put_cf(idx, inbound_key.as_bytes(), memory.id.0.as_bytes());
         }
 
         // Use write mode based on configuration
@@ -1657,6 +1842,116 @@ impl MemoryStorage {
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.db.write_opt(batch, &write_opts)?;
         Ok(())
+    }
+
+    /// Collect every distinct target `MemoryId` this memory points AT — the
+    /// forward references that the inbound-reference reverse index inverts (R7).
+    ///
+    /// Harvested fields (each whose VALUE is a MemoryId reference):
+    /// - `experience.related_memories` (types.rs)
+    /// - `experience.causal_chain` (types.rs)
+    /// - `parent_id` (types.rs)
+    /// - `experience.context.why.causes[*].other` — WhyFacet CausalLink (facets.rs)
+    ///
+    /// NOT harvested:
+    /// - `related_todo_ids` — these are `TodoId`, not `MemoryId` (types.rs:1740).
+    /// - `derived_from` — the spec located this on `WhatFacet`, but it actually
+    ///   lives on `LearningFacet` (facets.rs:349), which is NOT a field on
+    ///   `Memory`/`Experience`/`RichContext` (unattached scaffold facet — never
+    ///   populated on a stored memory). There is nothing to harvest until a
+    ///   future change attaches it; revisit then.
+    /// - `SemanticFact.source_memories` — SemanticFacts live in a SEPARATE store
+    ///   (`SemanticFactStore`, facts.rs) with its own write path and its own id
+    ///   space (FactId holders, not MemoryId holders). Indexing them here would
+    ///   require a second write path into a different store and would mix two id
+    ///   spaces into one index. DEFERRED to keep R7 inside the Memory-store
+    ///   maintenance path. NOTE for R6 GC completeness: a memory cited only by a
+    ///   SemanticFact's `source_memories` will report zero inbound refs here even
+    ///   though a fact still depends on it. R6's GC must also consult fact-source
+    ///   refs (or a future extension must index them) before reclaiming.
+    fn forward_ref_targets(memory: &Memory) -> Vec<MemoryId> {
+        // Order-preserving de-dup so repeated references collapse to one entry.
+        let mut targets: Vec<MemoryId> = Vec::new();
+        let push = |id: &MemoryId, targets: &mut Vec<MemoryId>| {
+            // A memory referencing itself is not a meaningful inbound edge for GC.
+            if *id != memory.id && !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        };
+
+        for id in &memory.experience.related_memories {
+            push(id, &mut targets);
+        }
+        for id in &memory.experience.causal_chain {
+            push(id, &mut targets);
+        }
+        if let Some(ref parent_id) = memory.parent_id {
+            push(parent_id, &mut targets);
+        }
+        if let Some(ctx) = &memory.experience.context {
+            for link in &ctx.why.causes {
+                push(&link.other, &mut targets);
+            }
+        }
+
+        targets
+    }
+
+    /// Public query API (R7) — enumerate the holders that still point AT `target`.
+    ///
+    /// Prefix-scans the inbound-reference reverse index for
+    /// `inbound_ref:{blinded(target)}:` and returns the distinct holder
+    /// `MemoryId`s. A later merge/GC step (R6) consumes this to know which
+    /// records must be repointed before a target can be reclaimed. Per-user
+    /// isolated: this store is the per-user `MemoryStorage`, so it can never
+    /// return another tenant's holders.
+    pub fn inbound_refs(&self, target: &MemoryId) -> Result<Vec<MemoryId>> {
+        let prefix = format!("inbound_ref:{}:", self.blind_term(&target.0.to_string()));
+        let idx = self.index_cf();
+        let iter = self.db.iterator_cf(
+            idx,
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        let mut holders = Vec::new();
+        for (key, value) in iter.log_errors() {
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            // The holder id is stored as the value (16 raw UUID bytes). Fall back
+            // to parsing it out of the key suffix if the value is unexpected.
+            let holder = if value.len() == 16 {
+                uuid::Uuid::from_slice(&value).ok().map(MemoryId)
+            } else {
+                let key_str = String::from_utf8_lossy(&key);
+                key_str
+                    .strip_prefix(&prefix)
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    .map(MemoryId)
+            };
+            if let Some(id) = holder {
+                holders.push(id);
+            }
+        }
+        Ok(holders)
+    }
+
+    /// Public query API (R7) — short-circuit existence check for the GC gate.
+    ///
+    /// Returns `true` as soon as a single holder is found, without materializing
+    /// the full holder list. R6's GC reads this to refuse reclaiming a target
+    /// that anything still references (the "zero inbound refs" gate).
+    pub fn has_inbound_refs(&self, target: &MemoryId) -> Result<bool> {
+        let prefix = format!("inbound_ref:{}:", self.blind_term(&target.0.to_string()));
+        let idx = self.index_cf();
+        let mut iter = self.db.iterator_cf(
+            idx,
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+        );
+        match iter.next() {
+            Some(Ok((key, _))) => Ok(key.starts_with(prefix.as_bytes())),
+            _ => Ok(false),
+        }
     }
 
     /// Compute SHA256 hex digest for content dedup indexing (issue #109)
@@ -1671,7 +1966,7 @@ impl MemoryStorage {
     /// Returns the MemoryId if identical content was already stored.
     pub fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         let content_hash = Self::sha256_content_hash(content);
-        let hash_key = format!("content_hash:{}", content_hash);
+        let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
         let idx = self.index_cf();
         match self.db.get_cf(idx, hash_key.as_bytes()) {
             Ok(Some(value)) if value.len() == 16 => {
@@ -1699,16 +1994,9 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (mut memory, needs_migration) = deserialize_memory(&value).with_context(|| {
-                    format!(
-                        "Failed to deserialize memory {} ({} bytes)",
-                        id.0,
-                        value.len()
-                    )
+                let (memory, needs_migration) = self.decode_stored(key, &value).with_context(|| {
+                    format!("Failed to decode memory {} ({} bytes)", id.0, value.len())
                 })?;
-
-                // Decrypt content field if encrypted
-                self.decrypt_memory_content(&mut memory);
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
@@ -1745,7 +2033,7 @@ impl MemoryStorage {
     /// Used for upsert operations when syncing from external sources.
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
         // Index key format: external:{external_id}:{memory_id}
-        let prefix = format!("external:{external_id}:");
+        let prefix = format!("external:{}:", self.blind_term(&external_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -1834,25 +2122,31 @@ impl MemoryStorage {
         // Entity indices (must match the to_lowercase() normalization in update_indices)
         for entity in &memory.experience.entities {
             let normalized_entity = entity.to_lowercase();
-            let entity_key = format!("entity:{}:{}", normalized_entity, id.0);
+            let entity_key = format!("entity:{}:{}", self.blind_term(&normalized_entity), id.0);
             batch.delete_cf(idx, entity_key.as_bytes());
         }
 
         // Tag indices
         for tag in &memory.experience.tags {
             let normalized_tag = tag.to_lowercase();
-            let tag_key = format!("tag:{}:{}", normalized_tag, id.0);
+            let tag_key = format!("tag:{}:{}", self.blind_term(&normalized_tag), id.0);
             batch.delete_cf(idx, tag_key.as_bytes());
         }
 
         // Episode indices
         if let Some(ctx) = &memory.experience.context {
             if let Some(episode_id) = &ctx.episode.episode_id {
-                let episode_key = format!("episode:{}:{}", episode_id, id.0);
+                let episode_key =
+                    format!("episode:{}:{}", self.blind_term(&episode_id.to_string()), id.0);
                 batch.delete_cf(idx, episode_key.as_bytes());
 
                 if let Some(seq) = ctx.episode.sequence_number {
-                    let seq_key = format!("episode_seq:{}:{}:{}", episode_id, seq, id.0);
+                    let seq_key = format!(
+                        "episode_seq:{}:{}:{}",
+                        self.blind_term(&episode_id.to_string()),
+                        seq,
+                        id.0
+                    );
                     batch.delete_cf(idx, seq_key.as_bytes());
                 }
             }
@@ -1860,13 +2154,13 @@ impl MemoryStorage {
 
         // Robot index — must mirror update_indices's resolved_robot_id read.
         if let Some(robot_id) = memory.experience.resolved_robot_id() {
-            let robot_key = format!("robot:{}:{}", robot_id, id.0);
+            let robot_key = format!("robot:{}:{}", self.blind_term(&robot_id.to_string()), id.0);
             batch.delete_cf(idx, robot_key.as_bytes());
         }
 
         // Mission index — must mirror update_indices's resolved_mission_id read.
         if let Some(mission_id) = memory.experience.resolved_mission_id() {
-            let mission_key = format!("mission:{}:{}", mission_id, id.0);
+            let mission_key = format!("mission:{}:{}", self.blind_term(&mission_id.to_string()), id.0);
             batch.delete_cf(idx, mission_key.as_bytes());
         }
 
@@ -1879,7 +2173,7 @@ impl MemoryStorage {
 
         // Action index
         if let Some(ref action_type) = memory.experience.action_type {
-            let action_key = format!("action:{}:{}", action_type, id.0);
+            let action_key = format!("action:{}:{}", self.blind_term(&action_type.to_string()), id.0);
             batch.delete_cf(idx, action_key.as_bytes());
         }
 
@@ -1894,20 +2188,48 @@ impl MemoryStorage {
         // Content hash index (idempotency dedup)
         {
             let content_hash = Self::sha256_content_hash(&memory.experience.content);
-            let hash_key = format!("content_hash:{}", content_hash);
+            let hash_key = format!("content_hash:{}", self.blind_term(&content_hash.to_string()));
             batch.delete_cf(idx, hash_key.as_bytes());
         }
 
         // External linking index
         if let Some(ref external_id) = memory.external_id {
-            let external_key = format!("external:{}:{}", external_id, id.0);
+            let external_key = format!("external:{}:{}", self.blind_term(&external_id.to_string()), id.0);
             batch.delete_cf(idx, external_key.as_bytes());
         }
 
         // Parent index (hierarchy)
         if let Some(ref parent_id) = memory.parent_id {
-            let parent_key = format!("parent:{}:{}", parent_id.0, id.0);
+            let parent_key = format!("parent:{}:{}", self.blind_term(&parent_id.0.to_string()), id.0);
             batch.delete_cf(idx, parent_key.as_bytes());
+        }
+
+        // === Inbound-Reference Reverse Index teardown (R7 / F2) ===
+        // Remove every reverse entry whose HOLDER is this memory, regardless of
+        // target. Keys are `inbound_ref:{blinded(target)}:{holder}`, so the holder
+        // is NOT a prefix — we scan the whole `inbound_ref:` keyspace and match on
+        // the holder suffix. This is the update-diff–safe teardown (Option b): we
+        // do NOT reconstruct the OLD memory's targets, so entries for targets that
+        // an update DROPPED are also removed. `storage.update()` calls
+        // remove_from_indices(old) then store(new); removing by holder-suffix here
+        // guarantees no stale `inbound_ref` survives the diff. The reverse entries
+        // for which this memory is the TARGET (i.e. other holders pointing AT it)
+        // are intentionally left — those holders still reference it.
+        {
+            let holder_suffix = format!(":{}", id.0);
+            let scan_prefix = b"inbound_ref:";
+            let inbound_iter = self.db.iterator_cf(
+                idx,
+                IteratorMode::From(scan_prefix, rocksdb::Direction::Forward),
+            );
+            for (key, _value) in inbound_iter.log_errors() {
+                if !key.starts_with(scan_prefix) {
+                    break;
+                }
+                if key.ends_with(holder_suffix.as_bytes()) {
+                    batch.delete_cf(idx, key.as_ref());
+                }
+            }
         }
 
         // Use write mode based on configuration
@@ -2111,7 +2433,7 @@ impl MemoryStorage {
         let mut ids = Vec::new();
         // Normalize to lowercase for case-insensitive matching
         let normalized_entity = entity.to_lowercase();
-        let prefix = format!("entity:{normalized_entity}:");
+        let prefix = format!("entity:{}:", self.blind_term(&normalized_entity));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2143,7 +2465,7 @@ impl MemoryStorage {
         for tag in tags {
             // Normalize to lowercase for case-insensitive matching
             let normalized_tag = tag.to_lowercase();
-            let prefix = format!("tag:{normalized_tag}:");
+            let prefix = format!("tag:{}:", self.blind_term(&normalized_tag));
             let iter = self.db.iterator_cf(
                 self.index_cf(),
                 IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
@@ -2168,7 +2490,7 @@ impl MemoryStorage {
     /// Returns all memories in the specified episode
     fn search_by_episode(&self, episode_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("episode:{episode_id}:");
+        let prefix = format!("episode:{}:", self.blind_term(&episode_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2199,8 +2521,11 @@ impl MemoryStorage {
     ) -> Result<Vec<MemoryId>> {
         let mut results: Vec<(u32, MemoryId)> = Vec::new();
 
-        // Scan the episode_seq index which has format: episode_seq:{episode_id}:{seq}:{memory_id}
-        let prefix = format!("episode_seq:{episode_id}:");
+        // Scan the episode_seq index which has format:
+        //   episode_seq:{blinded episode_id}:{seq}:{memory_id}
+        // The episode_id is blinded (HMAC) to match update_indices; seq stays
+        // plaintext as the in-episode ordering key (sorted in memory below).
+        let prefix = format!("episode_seq:{}:", self.blind_term(episode_id));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2245,7 +2570,7 @@ impl MemoryStorage {
     /// Search memories by robot/drone identifier
     fn search_by_robot(&self, robot_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("robot:{robot_id}:");
+        let prefix = format!("robot:{}:", self.blind_term(&robot_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2269,7 +2594,7 @@ impl MemoryStorage {
     /// Search memories by mission identifier
     fn search_by_mission(&self, mission_id: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("mission:{mission_id}:");
+        let prefix = format!("mission:{}:", self.blind_term(&mission_id.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2350,7 +2675,7 @@ impl MemoryStorage {
     /// Search memories by action type
     fn search_by_action_type(&self, action_type: &str) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("action:{action_type}:");
+        let prefix = format!("action:{}:", self.blind_term(&action_type.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2412,7 +2737,7 @@ impl MemoryStorage {
     /// Get all children of a parent memory
     fn search_by_parent(&self, parent_id: &MemoryId) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
-        let prefix = format!("parent:{}:", parent_id.0);
+        let prefix = format!("parent:{}:", self.blind_term(&parent_id.0.to_string()));
 
         let iter = self.db.iterator_cf(
             self.index_cf(),
@@ -2445,7 +2770,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if memory.parent_id.is_none() {
                     roots.push(memory.id);
                 }
@@ -2557,8 +2882,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if !memory.is_forgotten() {
                     memories.push(memory);
                 }
@@ -2578,8 +2902,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                     memories.push(memory);
                 }
@@ -2602,24 +2925,31 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
-                if memory.is_forgotten() {
-                    continue;
-                }
-                if memory.created_at < cutoff {
-                    flagged_ids.push(memory.id.clone());
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten".to_string(), "true".to_string());
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten_at".to_string(), now.clone());
+            match self.decode_stored(&key, &value) {
+                Ok((mut memory, _)) => {
+                    if memory.is_forgotten() {
+                        continue;
+                    }
+                    if memory.created_at < cutoff {
+                        flagged_ids.push(memory.id.clone());
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten".to_string(), "true".to_string());
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten_at".to_string(), now.clone());
 
-                    let updated_value = self.serialize_memory(&memory)?;
-                    batch.put(&key, updated_value);
+                        let updated_value = self.serialize_memory(&memory)?;
+                        batch.put(&key, updated_value);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "skipping a record that failed to decrypt/deserialize during forget-by-age (corruption, wrong key, or unsupported epoch)"
+                    );
                 }
             }
         }
@@ -2646,24 +2976,31 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
-                if memory.is_forgotten() {
-                    continue;
-                }
-                if memory.importance() < threshold {
-                    flagged_ids.push(memory.id.clone());
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten".to_string(), "true".to_string());
-                    memory
-                        .experience
-                        .metadata
-                        .insert("forgotten_at".to_string(), now.clone());
+            match self.decode_stored(&key, &value) {
+                Ok((mut memory, _)) => {
+                    if memory.is_forgotten() {
+                        continue;
+                    }
+                    if memory.importance() < threshold {
+                        flagged_ids.push(memory.id.clone());
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten".to_string(), "true".to_string());
+                        memory
+                            .experience
+                            .metadata
+                            .insert("forgotten_at".to_string(), now.clone());
 
-                    let updated_value = self.serialize_memory(&memory)?;
-                    batch.put(&key, updated_value);
+                        let updated_value = self.serialize_memory(&memory)?;
+                        batch.put(&key, updated_value);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "skipping a record that failed to decrypt/deserialize during forget-by-importance (corruption, wrong key, or unsupported epoch)"
+                    );
                 }
             }
         }
@@ -2688,8 +3025,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((mut memory, _)) = deserialize_memory(&value) {
-                self.decrypt_memory_content(&mut memory);
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if regex.is_match(&memory.experience.content) {
                     to_delete.push(memory.id);
                     count += 1;
@@ -2745,7 +3081,7 @@ impl MemoryStorage {
                         continue;
                     }
 
-                    match deserialize_memory(&value) {
+                    match self.decode_stored(&key, &value) {
                         Ok((memory, _)) => {
                             if memory.is_forgotten() {
                                 continue;
@@ -2868,13 +3204,26 @@ impl MemoryStorage {
                     key.len()
                 );
                 to_delete.push(key.to_vec());
-            } else if deserialize_memory(&value).is_err() {
-                // Key is valid but value fails all format fallbacks - truly corrupted
+            } else if !crate::keystore::is_encrypted_record(&value)
+                && deserialize_memory(&value).is_err()
+            {
+                // Plaintext record that fails all format fallbacks — truly corrupted.
                 tracing::debug!(
-                    "Marking for deletion: valid key but corrupted value ({} bytes)",
+                    "Marking for deletion: corrupted plaintext value ({} bytes)",
                     value.len()
                 );
                 to_delete.push(key.to_vec());
+            } else if crate::keystore::is_encrypted_record(&value)
+                && self.decode_stored(&key, &value).is_err()
+            {
+                // An encrypted record that won't decode means wrong/missing key or
+                // tamper — indistinguishable in AES-GCM. NEVER auto-delete (that would
+                // risk mass data loss on a key misconfiguration); surface for a human.
+                tracing::warn!(
+                    "Encrypted record fails to decode (wrong/missing key or tamper); \
+                     NOT auto-deleting ({} bytes)",
+                    value.len()
+                );
             }
         }
 
@@ -2926,12 +3275,15 @@ impl MemoryStorage {
                 continue;
             }
 
-            // Try current format first (quick check)
-            let is_current = bincode::serde::decode_from_slice::<Memory, _>(
-                &value,
-                bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
-            )
-            .is_ok();
+            // Try current format first (quick check). An encrypted record is already
+            // in the v2 envelope format, so treat it as current rather than
+            // decrypt + re-encrypt it on every migration pass.
+            let is_current = crate::keystore::is_encrypted_record(&value)
+                || bincode::serde::decode_from_slice::<Memory, _>(
+                    &value,
+                    bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+                )
+                .is_ok();
 
             if is_current {
                 already_current += 1;
@@ -2939,7 +3291,7 @@ impl MemoryStorage {
             }
 
             // Not current format - try with fallback
-            match deserialize_memory(&value) {
+            match self.decode_stored(&key, &value) {
                 Ok((memory, _)) => {
                     // Successfully deserialized legacy format - queue for migration
                     to_migrate.push((key.to_vec(), memory));
@@ -3515,7 +3867,7 @@ impl MemoryStorage {
             }
 
             // Try to deserialize as memory
-            if let Ok((memory, _)) = deserialize_memory(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 // Check if vector mapping exists and has text vectors
                 let has_mapping = match self.get_vector_mapping(&memory.id) {
                     Ok(Some(entry)) => entry.text_vectors().is_some_and(|v| !v.is_empty()),
@@ -3991,5 +4343,241 @@ mod tests {
         assert_eq!(mv.vector_ids.len(), 3);
         assert_eq!(mv.dimension, 384);
         assert!(mv.chunk_ranges.is_none());
+    }
+
+    // ========================================================================
+    // R7 — inbound-reference reverse index (F2)
+    // ========================================================================
+
+    /// Spin up a real per-user MemoryStorage backed by a temp dir.
+    fn test_storage() -> (MemoryStorage, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let storage = MemoryStorage::new(dir.path(), None).expect("open storage");
+        (storage, dir)
+    }
+
+    /// Build a memory whose experience.related_memories points at `targets`.
+    fn memory_referencing(id: MemoryId, targets: &[MemoryId]) -> Memory {
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: format!("holder {}", id.0),
+            related_memories: targets.to_vec(),
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            id,
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn r7_forward_ref_targets_harvests_all_memory_id_fields() {
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let c = MemoryId(uuid::Uuid::new_v4());
+        let d = MemoryId(uuid::Uuid::new_v4());
+        let holder = MemoryId(uuid::Uuid::new_v4());
+
+        let now = Utc::now();
+        let mut ctx = crate::memory::context::ContextBuilder::new().build();
+        ctx.why.causes = vec![CausalLink {
+            other: d.clone(),
+            relation: crate::memory::facets::CausalRelation::Caused,
+            confidence: 0.7,
+            inferred: false,
+        }];
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: "multi-ref holder".to_string(),
+            related_memories: vec![a.clone()],
+            causal_chain: vec![b.clone()],
+            context: Some(ctx),
+            ..Default::default()
+        };
+        let mut memory = Memory::from_legacy(
+            holder.clone(),
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        memory.parent_id = Some(c.clone());
+
+        let targets = MemoryStorage::forward_ref_targets(&memory);
+        assert!(targets.contains(&a), "related_memories harvested");
+        assert!(targets.contains(&b), "causal_chain harvested");
+        assert!(targets.contains(&c), "parent_id harvested");
+        assert!(targets.contains(&d), "WhyFacet CausalLink.other harvested");
+        assert_eq!(targets.len(), 4, "exactly the four distinct targets");
+    }
+
+    #[test]
+    fn r7_forward_ref_targets_dedups_and_excludes_self() {
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let holder = MemoryId(uuid::Uuid::new_v4());
+        // Reference A twice (related + causal) and reference self once.
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: "dup holder".to_string(),
+            related_memories: vec![a.clone(), holder.clone()],
+            causal_chain: vec![a.clone()],
+            ..Default::default()
+        };
+        let memory = Memory::from_legacy(
+            holder.clone(),
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        let targets = MemoryStorage::forward_ref_targets(&memory);
+        assert_eq!(targets, vec![a], "A once, self excluded");
+    }
+
+    /// (1) store M referencing A,B → inbound_refs(A) contains M; has_inbound_refs(A) true.
+    #[test]
+    fn r7_store_records_inbound_refs() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+
+        storage
+            .store(&memory_referencing(m.clone(), &[a.clone(), b.clone()]))
+            .unwrap();
+
+        let holders_a = storage.inbound_refs(&a).unwrap();
+        assert!(holders_a.contains(&m), "A's inbound refs include M");
+        assert!(storage.has_inbound_refs(&a).unwrap(), "A has inbound refs");
+        assert!(storage.inbound_refs(&b).unwrap().contains(&m), "B too");
+        assert!(storage.has_inbound_refs(&b).unwrap());
+
+        // A target nobody references has no inbound refs.
+        let unref = MemoryId(uuid::Uuid::new_v4());
+        assert!(!storage.has_inbound_refs(&unref).unwrap());
+        assert!(storage.inbound_refs(&unref).unwrap().is_empty());
+    }
+
+    /// (2) delete M → has_inbound_refs(A) false (teardown).
+    #[test]
+    fn r7_delete_tears_down_inbound_refs() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+
+        storage.store(&memory_referencing(m.clone(), &[a.clone()])).unwrap();
+        assert!(storage.has_inbound_refs(&a).unwrap());
+
+        storage.delete(&m).unwrap();
+        assert!(
+            !storage.has_inbound_refs(&a).unwrap(),
+            "deleting holder M tears down A's inbound ref"
+        );
+        assert!(storage.inbound_refs(&a).unwrap().is_empty());
+    }
+
+    /// (3) update M to DROP ref to A → inbound_refs(A) no longer contains M.
+    /// This is the update-diff hazard: update() does remove_from_indices(old)
+    /// then store(new); Option-b teardown (remove all inbound_ref:*:{M}) must
+    /// purge the stale A-entry even though the NEW memory no longer names A.
+    #[test]
+    fn r7_update_drop_ref_clears_stale_inbound() {
+        let (storage, _dir) = test_storage();
+        let a = MemoryId(uuid::Uuid::new_v4());
+        let b = MemoryId(uuid::Uuid::new_v4());
+        let m = MemoryId(uuid::Uuid::new_v4());
+
+        // M references A and B.
+        storage.store(&memory_referencing(m.clone(), &[a.clone(), b.clone()])).unwrap();
+        assert!(storage.inbound_refs(&a).unwrap().contains(&m));
+        assert!(storage.inbound_refs(&b).unwrap().contains(&m));
+
+        // Update M to reference only B (drops A).
+        storage.update(&memory_referencing(m.clone(), &[b.clone()])).unwrap();
+
+        assert!(
+            !storage.inbound_refs(&a).unwrap().contains(&m),
+            "stale inbound ref to dropped target A removed on update"
+        );
+        assert!(!storage.has_inbound_refs(&a).unwrap());
+        assert!(
+            storage.inbound_refs(&b).unwrap().contains(&m),
+            "retained target B still has M as inbound holder"
+        );
+    }
+
+    /// (4) per-user isolation: user-A's index never returns user-B's holders.
+    /// Each user has its own MemoryStorage (separate DB), so a target id that
+    /// exists in both stores resolves only to the local holder.
+    #[test]
+    fn r7_per_user_isolation() {
+        let (store_a, _dir_a) = test_storage();
+        let (store_b, _dir_b) = test_storage();
+
+        // Same target id referenced by a different holder in each user store.
+        let target = MemoryId(uuid::Uuid::new_v4());
+        let holder_a = MemoryId(uuid::Uuid::new_v4());
+        let holder_b = MemoryId(uuid::Uuid::new_v4());
+
+        store_a.store(&memory_referencing(holder_a.clone(), &[target.clone()])).unwrap();
+        store_b.store(&memory_referencing(holder_b.clone(), &[target.clone()])).unwrap();
+
+        let a_holders = store_a.inbound_refs(&target).unwrap();
+        let b_holders = store_b.inbound_refs(&target).unwrap();
+
+        assert_eq!(a_holders, vec![holder_a.clone()], "store A sees only its holder");
+        assert_eq!(b_holders, vec![holder_b.clone()], "store B sees only its holder");
+        assert!(!a_holders.contains(&holder_b), "no cross-tenant holder leak");
+        assert!(!b_holders.contains(&holder_a), "no cross-tenant holder leak");
     }
 }
