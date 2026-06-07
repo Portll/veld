@@ -151,6 +151,17 @@ fn decode_semantic_fact_with_fallback(data: &[u8]) -> Result<(SemanticFact, bool
     }
 }
 
+/// Minimal deserializer for the GC-path scanner in `storage.rs`.
+///
+/// Decodes a raw RocksDB value (primary-record format, including legacy
+/// shapes) into a [`SemanticFact`] so that `storage::MemoryStorage::
+/// semantic_fact_cites_memory` can inspect `source_memories` without
+/// depending on the full `SemanticFactStore` API.
+/// `pub(super)` — visible only within the `memory` module subtree.
+pub(super) fn decode_for_gc(data: &[u8]) -> anyhow::Result<SemanticFact> {
+    decode_semantic_fact_with_fallback(data).map(|(fact, _)| fact)
+}
+
 /// Universal active-fact predicate used by every "currently-true" reader path
 /// in [`SemanticFactStore`]. Excludes BOTH bi-temporally expired AND
 /// administratively purged facts. Centralized so that adding future state
