@@ -818,10 +818,12 @@ fn extract_planning_fact(
     // Resolve relative time
     let resolved_time = resolve_relative_time(&relative_time, conversation_date);
 
+    let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
     let event_stems: Vec<String> = event
         .split_whitespace()
         .filter(|w| w.len() > 2)
         .map(|w| stemmer.stem(&w.to_lowercase()).to_string())
+        .filter(|s| s != &entity_stem)
         .collect();
 
     Some(TemporalFact {
@@ -897,10 +899,12 @@ fn extract_occurred_fact(
     // Resolve relative time
     let resolved_time = resolve_relative_time(&relative_time, conversation_date);
 
+    let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
     let event_stems: Vec<String> = event
         .split_whitespace()
         .filter(|w| w.len() > 2)
         .map(|w| stemmer.stem(&w.to_lowercase()).to_string())
+        .filter(|s| s != &entity_stem)
         .collect();
 
     Some(TemporalFact {
@@ -950,10 +954,12 @@ fn extract_historical_fact(
         return None;
     }
 
+    let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
     let event_stems: Vec<String> = event
         .split_whitespace()
         .filter(|w| w.len() > 2)
         .map(|w| stemmer.stem(&w.to_lowercase()).to_string())
+        .filter(|s| s != &entity_stem)
         .collect();
 
     Some(TemporalFact {
@@ -1306,10 +1312,30 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
         }
     }
 
-    // "X weeks/days ago"
+    // "N months/years ago" → calendar-aware MonthYear / Year (F8).
+    // "N days/weeks ago"   → ExactDate (fine as before).
     if relative_lower.contains("ago") {
-        if let Some(days) = parse_ago_expression(&relative_lower) {
-            return ResolvedTime::ExactDate(conv_date - Duration::days(days));
+        if let Some((n, unit)) = parse_ago_unit(&relative_lower) {
+            match unit {
+                AgoUnit::Months => {
+                    let total_months = conv_date.month() as i64 - n;
+                    let (year, month) = if total_months <= 0 {
+                        let years_back = ((-total_months) / 12) + 1;
+                        let month = ((total_months + years_back * 12) % 12) as u32;
+                        let month = if month == 0 { 12 } else { month };
+                        (conv_date.year() - years_back as i32, month)
+                    } else {
+                        (conv_date.year(), total_months as u32)
+                    };
+                    return ResolvedTime::MonthYear { month, year };
+                }
+                AgoUnit::Years => {
+                    return ResolvedTime::Year(conv_date.year() - n as i32);
+                }
+                AgoUnit::DaysOrWeeks(days) => {
+                    return ResolvedTime::ExactDate(conv_date - Duration::days(days));
+                }
+            }
         }
     }
 
@@ -1373,11 +1399,26 @@ fn next_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
     from + Duration::days(days_forward)
 }
 
-/// Parse "X days/weeks ago" expressions
-fn parse_ago_expression(expr: &str) -> Option<i64> {
+/// Unit classification returned by `parse_ago_unit`.
+enum AgoUnit {
+    /// Calendar-month subtraction: resolve to `MonthYear`.
+    Months,
+    /// Calendar-year subtraction: resolve to `Year`.
+    Years,
+    /// Day/week: already an exact day-count, resolve to `ExactDate`.
+    DaysOrWeeks(i64),
+}
+
+/// Parse "N days/weeks/months/years ago" and return the numeric count and unit.
+///
+/// Month and year expressions are returned as `AgoUnit::Months` / `AgoUnit::Years`
+/// so callers can do calendar-correct subtraction (F8). Day and week expressions
+/// are folded into a day count (`AgoUnit::DaysOrWeeks`).
+///
+/// Returns `None` for unrecognised or malformed expressions.
+fn parse_ago_unit(expr: &str) -> Option<(i64, AgoUnit)> {
     let words: Vec<&str> = expr.split_whitespace().collect();
 
-    // Find "ago" position
     let ago_pos = words.iter().position(|w| *w == "ago")?;
     if ago_pos < 2 {
         return None;
@@ -1386,7 +1427,7 @@ fn parse_ago_expression(expr: &str) -> Option<i64> {
     let unit = words[ago_pos - 1];
     let num_str = words[ago_pos - 2];
 
-    let num: i64 = match num_str {
+    let n: i64 = match num_str {
         "a" | "one" => 1,
         "two" => 2,
         "three" => 3,
@@ -1397,20 +1438,15 @@ fn parse_ago_expression(expr: &str) -> Option<i64> {
         _ => num_str.parse().ok()?,
     };
 
-    // NOTE: month/year are approximated as fixed 30/365-day spans. This drifts
-    // across calendar boundaries (e.g. "2 months ago" = 60 days, not two
-    // calendar months) and is intentionally coarse — the resulting ExactDate is
-    // only compared within the gate's ±7-day window. If month-granular
-    // precision is ever needed here, resolve to MonthYear instead.
-    let multiplier = match unit {
-        "day" | "days" => 1,
-        "week" | "weeks" => 7,
-        "month" | "months" => 30,
-        "year" | "years" => 365,
+    let ago_unit = match unit {
+        "day" | "days" => AgoUnit::DaysOrWeeks(n),
+        "week" | "weeks" => AgoUnit::DaysOrWeeks(n * 7),
+        "month" | "months" => AgoUnit::Months,
+        "year" | "years" => AgoUnit::Years,
         _ => return None,
     };
 
-    Some(num * multiplier)
+    Some((n, ago_unit))
 }
 
 #[cfg(test)]
@@ -1647,5 +1683,102 @@ mod tests {
             .as_of("user-1", t1 - chrono::Duration::days(1), 100)
             .unwrap();
         assert!(before_t1.is_empty(), "before t1: nothing yet");
+    }
+
+    // -------------------------------------------------------------------------
+    // F8: "N months ago" → MonthYear (calendar-correct, no 30-day drift)
+    // -------------------------------------------------------------------------
+
+    /// "2 months ago" from May 2023 → MonthYear { month: 3, year: 2023 }
+    #[test]
+    fn test_two_months_ago_resolves_to_month_year() {
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        match resolve_relative_time("2 months ago", conv) {
+            ResolvedTime::MonthYear { month, year } => {
+                assert_eq!(month, 3, "2 months before May is March");
+                assert_eq!(year, 2023);
+            }
+            other => panic!("expected MonthYear, got {other:?}"),
+        }
+    }
+
+    /// "2 months ago" crossing a year boundary: Feb 2023 → Dec 2022
+    #[test]
+    fn test_months_ago_year_wraparound() {
+        let conv = DateTime::parse_from_rfc3339("2023-01-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        match resolve_relative_time("2 months ago", conv) {
+            ResolvedTime::MonthYear { month, year } => {
+                assert_eq!(month, 11, "2 months before Jan is Nov");
+                assert_eq!(year, 2022);
+            }
+            other => panic!("expected MonthYear, got {other:?}"),
+        }
+    }
+
+    /// "3 years ago" → Year(conv_year - 3)
+    #[test]
+    fn test_three_years_ago_resolves_to_year() {
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        match resolve_relative_time("3 years ago", conv) {
+            ResolvedTime::Year(y) => assert_eq!(y, 2020),
+            other => panic!("expected Year, got {other:?}"),
+        }
+    }
+
+    /// Days/weeks "ago" still produces ExactDate (no regression).
+    #[test]
+    fn test_days_and_weeks_ago_still_exact_date() {
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(matches!(
+            resolve_relative_time("3 days ago", conv),
+            ResolvedTime::ExactDate(_)
+        ));
+        assert!(matches!(
+            resolve_relative_time("2 weeks ago", conv),
+            ResolvedTime::ExactDate(_)
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // F9: entity name must not appear in event_stems
+    // -------------------------------------------------------------------------
+
+    /// When extract_planning_fact processes "Melanie is planning to go camping
+    /// next month", the stem of "Melanie" must not be in event_stems.
+    #[test]
+    fn test_event_stems_do_not_contain_entity_name() {
+        use super::super::types::MemoryId;
+        use rust_stemmers::{Algorithm, Stemmer};
+
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+        let stemmer = Stemmer::create(Algorithm::English);
+        let entity = "Melanie";
+
+        let fact = extract_planning_fact(
+            "Melanie is planning to go camping next month",
+            entity,
+            &memory_id,
+            conv,
+            &stemmer,
+        )
+        .expect("should extract a planning fact");
+
+        let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
+        assert!(
+            !fact.event_stems.contains(&entity_stem),
+            "entity stem '{entity_stem}' must not appear in event_stems: {:?}",
+            fact.event_stems
+        );
     }
 }
