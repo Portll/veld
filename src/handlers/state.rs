@@ -541,23 +541,23 @@ impl MultiUserMemoryManager {
         let user_auth_runtime = if crate::user_auth::feature_enabled() {
             match crate::user_auth::store::UserAuthStore::new(shared_stores.shared_db.clone()) {
                 Ok(store) => {
-                    let field_encryptor = match crate::encryption::FieldEncryptor::from_env() {
+                    let totp_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
                         Ok(encryptor) => encryptor,
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "VELD_ENCRYPTION_KEY present but malformed; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
+                                "keystore (VELD_KEYSTORE_PATH/VELD_MASTER_PASSPHRASE) present but unusable; user-auth runtime starts without an encryptor (2FA enrollment will be refused in production mode)"
                             );
                             None
                         }
                     };
                     info!(
-                        encryption = field_encryptor.is_some(),
+                        encryption = totp_encryptor.is_some(),
                         "user-auth runtime initialised (VELD_USER_AUTH_ENABLED=true)"
                     );
                     Some(crate::user_auth::runtime::UserAuthRuntime::new(
                         store,
-                        field_encryptor,
+                        totp_encryptor,
                     ))
                 }
                 Err(e) => {
@@ -1772,7 +1772,13 @@ impl MultiUserMemoryManager {
         let log_path = user_path.join("intent.log");
         let checkpoint_path = user_path.join("projection_checkpoints.bin");
 
-        let log = crate::intent_log::IntentLog::open(&log_path)
+        // Seal the journal's frame payloads at rest (encryption-v2) using a
+        // keystore-derived "journal" purpose key — so the WAL never holds
+        // plaintext memory snapshots on disk (or in backups). `None` (no keystore
+        // configured) keeps the journal plaintext, backward compatible.
+        let journal_cryptor = crate::keystore::SecretCryptor::from_env("journal")
+            .with_context(|| format!("derive journal encryptor for user {user_id}"))?;
+        let log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, journal_cryptor)
             .with_context(|| format!("open intent log for user {user_id}"))?;
         let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
             crate::intent_log::CheckpointStore::open(&checkpoint_path)
@@ -2568,6 +2574,27 @@ impl MultiUserMemoryManager {
                         }
                     }
                 }
+            }
+        }
+
+        // Heavy cycle: R1 anticipatory prefetch tick (Physarum-anticipation).
+        // Per-user, isolated to each user's earth. Warms rhythm-predicted memories
+        // into the session tier via add_shared (idempotent, size-bounded). Adds a
+        // maintenance STEP; removes none. Best-effort — never aborts the cycle.
+        if is_heavy {
+            let mut total_warmed = 0usize;
+            for (user_id_arc, _) in self.user_earths.iter() {
+                let user_id = user_id_arc.as_ref();
+                if let Ok(earth) = self.get_user_earth(user_id) {
+                    let earth_guard = earth.read();
+                    total_warmed += earth_guard.run_prefetch_tick(user_id);
+                }
+            }
+            if total_warmed > 0 {
+                tracing::info!(
+                    warmed = total_warmed,
+                    "anticipatory prefetch warmed memories into session tiers (R1)"
+                );
             }
         }
 

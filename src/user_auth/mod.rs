@@ -28,8 +28,9 @@
 //!
 //! ## Encryption of TOTP secrets at rest
 //!
-//! TOTP secrets are encrypted with the existing [`crate::encryption::FieldEncryptor`]
-//! when `VELD_ENCRYPTION_KEY` is set. If the env var is unset:
+//! TOTP secrets are encrypted with [`crate::keystore::SecretCryptor`] (the
+//! keystore-derived `"totp"` purpose key) when `VELD_KEYSTORE_PATH` and
+//! `VELD_MASTER_PASSPHRASE` are set. If either env var is unset:
 //!   - in development mode, the secret is stored as raw bytes with a WARN
 //!     log so dev loops aren't blocked;
 //!   - in production mode (`VELD_ENV=production`), 2FA enrollment is
@@ -110,9 +111,10 @@ impl UserRole {
 /// Persistent per-user state. Stored as bincode in the `user_auth` CF.
 ///
 /// `password_hash` is an Argon2id PHC string. `totp_secret_encrypted` is
-/// `None` until 2FA is enrolled; once enrolled, it holds either an
-/// AES-256-GCM-encrypted blob (production / VELD_ENCRYPTION_KEY set) or
-/// the raw HMAC secret bytes (development fallback with WARN log).
+/// `None` until 2FA is enrolled; once enrolled, it holds a keystore-encrypted
+/// blob (XChaCha20-Poly1305 via the keystore configured by VELD_KEYSTORE_PATH +
+/// VELD_MASTER_PASSPHRASE). 2FA enrollment fails closed in every mode when no
+/// keystore is configured — a 2FA seed is never stored in plaintext.
 /// `recovery_code_hashes` holds one Argon2id PHC string per unused
 /// recovery code; consumed codes are removed from the vector.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,7 +154,8 @@ pub enum AuthError {
     TotpAlreadyEnrolled,
     /// Caller tried to confirm 2FA but there is no pending enrollment.
     TotpNoPendingEnrollment,
-    /// Production mode + missing `VELD_ENCRYPTION_KEY` blocks 2FA enrollment.
+    /// Without a configured encryption keystore, 2FA enrollment is refused in
+    /// every mode (fail-closed) — a 2FA seed is never stored in plaintext.
     TotpEncryptionRequired,
     /// Submitted recovery code doesn't match any stored hash, or all codes
     /// have been consumed.
@@ -237,7 +240,8 @@ impl AuthError {
                 "No pending 2FA enrollment; call /2fa/enroll first".to_string()
             }
             Self::TotpEncryptionRequired => {
-                "2FA enrollment in production mode requires VELD_ENCRYPTION_KEY to be set"
+                "2FA enrollment in production mode requires an encryption keystore \
+                 (set VELD_KEYSTORE_PATH and VELD_MASTER_PASSPHRASE)"
                     .to_string()
             }
             Self::InvalidRecoveryCode => "Recovery code is invalid or already used".to_string(),

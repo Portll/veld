@@ -167,6 +167,13 @@ pub struct IntentLog {
     /// file starts with a valid [`IntentLogHeader`]; `Legacy` means it
     /// was created before headers existed and frames start at offset 0.
     mode: LogMode,
+    /// Optional per-frame payload encryptor (encryption-v2). When present, each
+    /// frame's payload bytes are sealed on append and opened on read, so the
+    /// journal never holds plaintext memory snapshots at rest. `None` = plaintext
+    /// journal (backward compatible). Keystore-derived ("journal" purpose) like
+    /// the slow store. The CRC is computed over the on-disk (sealed) bytes, so
+    /// `scan_for_tail` validates frames without decrypting.
+    cryptor: Option<crate::keystore::SecretCryptor>,
 }
 
 /// Versioning mode for an open intent log.
@@ -208,6 +215,16 @@ impl IntentLog {
     /// avoids silently destroying data when the file is unexpectedly short
     /// (e.g. disk full mid-write that's about to be retried).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IntentLogError> {
+        Self::open_with_cryptor(path, None)
+    }
+
+    /// Like [`open`](Self::open), but seals each frame's payload with `cryptor`
+    /// on append and opens it on read (encryption-v2). `None` keeps the journal
+    /// plaintext (backward compatible).
+    pub fn open_with_cryptor<P: AsRef<Path>>(
+        path: P,
+        cryptor: Option<crate::keystore::SecretCryptor>,
+    ) -> Result<Self, IntentLogError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -269,6 +286,7 @@ impl IntentLog {
             next_lsn,
             durable_end_offset: durable_end,
             mode,
+            cryptor,
         })
     }
 
@@ -369,18 +387,27 @@ impl IntentLog {
         }
 
         let lsn = self.next_lsn;
-        let len = payload.len() as u32;
+        // Seal the payload at rest (encryption-v2) when a journal cryptor is
+        // configured; len + CRC + the durable-offset accounting all use the
+        // sealed (on-disk) bytes, so scan_for_tail validates frames without a key.
+        let sealed: Vec<u8> = match &self.cryptor {
+            Some(c) => c.encrypt_bytes(payload, b"").map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("journal seal failed: {e}"))
+            })?,
+            None => payload.to_vec(),
+        };
+        let len = sealed.len() as u32;
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&len.to_le_bytes());
         hasher.update(&lsn.0.to_le_bytes());
-        hasher.update(payload);
+        hasher.update(&sealed);
         let crc = hasher.finalize();
 
         if let Err(e) = (|| -> io::Result<()> {
             self.writer.write_all(&len.to_le_bytes())?;
             self.writer.write_all(&lsn.0.to_le_bytes())?;
-            self.writer.write_all(payload)?;
+            self.writer.write_all(&sealed)?;
             self.writer.write_all(&crc.to_le_bytes())?;
             Ok(())
         })() {
@@ -396,7 +423,7 @@ impl IntentLog {
         }
 
         self.next_lsn = lsn.next();
-        self.durable_end_offset += (FRAME_HEADER_BYTES + payload.len() + FRAME_TRAILER_BYTES) as u64;
+        self.durable_end_offset += (FRAME_HEADER_BYTES + sealed.len() + FRAME_TRAILER_BYTES) as u64;
 
         INTENT_LOG_APPEND_TOTAL.with_label_values(&["ok"]).inc();
         INTENT_LOG_NEXT_LSN.set(self.next_lsn.0 as i64);
@@ -454,7 +481,11 @@ impl IntentLog {
     /// iterator is independent of the writer — it opens its own read
     /// handle. The header (if any) is skipped before iteration begins.
     pub fn iter(&self) -> Result<IntentLogIter, IntentLogError> {
-        IntentLogIter::open(&self.path, self.mode.frame_region_start())
+        IntentLogIter::open(
+            &self.path,
+            self.mode.frame_region_start(),
+            self.cryptor.clone(),
+        )
     }
 
     /// Truncate the file so its length equals `durable_end_offset`. Used to
@@ -601,6 +632,9 @@ pub struct IntentLogIter {
     file: File,
     offset: u64,
     finished: bool,
+    /// Opens (decrypts) each frame's sealed payload before yielding. `None` =
+    /// payloads yielded as-is (plaintext journal, or a structural-only scan).
+    cryptor: Option<crate::keystore::SecretCryptor>,
 }
 
 impl IntentLogIter {
@@ -614,16 +648,22 @@ impl IntentLogIter {
     /// 36-byte header; a legacy log starts at offset 0.
     pub fn open_for_scan(path: &Path) -> Result<Self, IntentLogError> {
         let mode = probe_mode(path)?;
-        Self::open(path, mode.frame_region_start())
+        // Structural scan only — yields sealed payloads as-is (no key needed).
+        Self::open(path, mode.frame_region_start(), None)
     }
 
-    fn open(path: &Path, start_offset: u64) -> Result<Self, IntentLogError> {
+    fn open(
+        path: &Path,
+        start_offset: u64,
+        cryptor: Option<crate::keystore::SecretCryptor>,
+    ) -> Result<Self, IntentLogError> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start_offset))?;
         Ok(Self {
             file,
             offset: start_offset,
             finished: false,
+            cryptor,
         })
     }
 
@@ -752,6 +792,24 @@ impl Iterator for IntentLogIter {
 
         self.offset += (FRAME_HEADER_BYTES + len + FRAME_TRAILER_BYTES) as u64;
 
+        // Open (decrypt) the sealed payload when a journal cryptor is configured.
+        // Plaintext frames (no cryptor, or pre-encryption journals) pass through.
+        let payload = match &self.cryptor {
+            Some(c) if crate::keystore::SecretCryptor::is_encrypted(&payload) => {
+                match c.decrypt_bytes(&payload, b"") {
+                    Ok(pt) => pt,
+                    Err(e) => {
+                        self.finished = true;
+                        return Some(Err(IntentLogError::Io(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("journal payload open failed at offset {frame_start}: {e}"),
+                        ))));
+                    }
+                }
+            }
+            _ => payload,
+        };
+
         Some(Ok(IntentRecord {
             lsn: Lsn(lsn),
             payload,
@@ -804,7 +862,9 @@ fn scan_for_tail(path: &Path, frame_region_start: u64) -> Result<(Lsn, u64), Int
         // File exists but has nothing after the header — clean empty log.
         return Ok((Lsn::ZERO, frame_region_start));
     }
-    let mut iter = IntentLogIter::open(path, frame_region_start)?;
+    // Tail scan only needs frame structure (lsn/offset/CRC), not payload content,
+    // so it reads sealed payloads as-is (no key required).
+    let mut iter = IntentLogIter::open(path, frame_region_start, None)?;
     let mut last_lsn = None;
     let mut last_good_offset = frame_region_start;
     loop {
@@ -936,6 +996,38 @@ mod tests {
         // the post-header offset, not literally zero.
         assert_eq!(log.durable_end_offset(), HEADER_BYTES as u64);
         assert!(log.mode().is_versioned());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encrypted_journal_seals_on_disk_and_opens_on_read() {
+        let path = tmp_log_path("enc");
+        let cryptor =
+            || Some(crate::keystore::SecretCryptor::new(zeroize::Zeroizing::new([7u8; 32])));
+        const SECRET: &[u8] = b"sensitive-memory-snapshot-do-not-leak-into-the-journal";
+        {
+            let mut log = IntentLog::open_with_cryptor(&path, cryptor()).unwrap();
+            log.append(SECRET).unwrap();
+            log.append(b"second-frame").unwrap();
+            log.sync().unwrap();
+        }
+        // On disk the plaintext must NOT appear and each frame payload is an
+        // ENC\0 sealed blob.
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(SECRET.len()).any(|w| w == SECRET),
+            "plaintext payload leaked into the journal file"
+        );
+        assert!(
+            raw.windows(4).any(|w| w == b"ENC\0"),
+            "frame payload should be an ENC\\0 sealed blob"
+        );
+        // Reopen with the key: frames decrypt back to the original plaintext.
+        let log = IntentLog::open_with_cryptor(&path, cryptor()).unwrap();
+        let records: Vec<_> = log.iter().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].payload, SECRET);
+        assert_eq!(records[1].payload, b"second-frame");
         let _ = std::fs::remove_file(&path);
     }
 
