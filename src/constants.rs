@@ -2731,3 +2731,43 @@ pub const SLEEP_TIME_QUEUE_COLD_START_TTL_HOURS: i64 = 2;
 pub const SLEEP_TIME_CLAIM_LEASE_SECS: i64 = 600;
 
 // =============================================================================
+// S-R6: SEMANTIC MERGE — TOMBSTONE + AUDIT FEATURE FLAG
+// =============================================================================
+//
+// Semantic merge consumes near-duplicate memories by pooling evidence from the
+// loser into the winner, appending an immutable `MergeAudit` log entry, and
+// tombstoning the loser.  The audit log is the atomic commit point; the lazy
+// remap-on-miss read path is always-on (but is a no-op when no audits exist).
+//
+// Default: FALSE.  Flip to true in a future commit once the merge is validated
+// on production data and the nDCG(merged) ≥ nDCG(baseline) bar is met.
+// =============================================================================
+
+/// S-R6 gate: enable semantic merge of near-duplicate memories.
+///
+/// `false` (default, this PR): no merges are triggered; existing memories are
+/// left exactly as-is.  The audit-replay-on-miss read path is still compiled in
+/// but is a strict no-op (no audits exist → zero overhead).
+///
+/// Set to `true` in a FUTURE commit after nDCG validation on production data.
+pub const SEMANTIC_MERGE_ENABLED: bool = false;
+
+/// S-R6: cosine-similarity threshold above which two memories are merge candidates.
+///
+/// 0.97 ≈ vectors that differ by at most ~14° — near-verbatim duplicates.
+/// Tuned conservatively to avoid merging semantically-related but distinct memories.
+pub const SEMANTIC_MERGE_SIMILARITY_THRESHOLD: f32 = 0.97;
+
+/// S-R6: quiescence window (seconds) a tombstone must be at rest before GC reclaims it.
+///
+/// Gives in-flight readers (R2 traces, prefetch buffers) time to observe the
+/// audit and remap before the loser row is physically deleted.
+pub const SEMANTIC_MERGE_GC_QUIESCENCE_SECS: i64 = 300;
+
+/// S-R6: maximum age (seconds) for force-GC orphan sweep on the maintenance tick (J2).
+///
+/// Tombstones older than this AND with no inbound refs are force-collected even
+/// if they were added after a restart (ensures eventual GC for all orphans).
+pub const SEMANTIC_MERGE_GC_MAX_AGE_SECS: i64 = 86_400; // 24 hours
+
+// =============================================================================

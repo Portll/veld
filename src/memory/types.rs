@@ -2282,6 +2282,15 @@ impl Memory {
         self.metadata.lock().importance = importance.clamp(0.0, 1.0);
     }
 
+    /// Set the raw access count (thread-safe).
+    ///
+    /// Used by the S-R6 semantic merge pass to pool evidence from the loser
+    /// memory into the winner.  Not exposed on the public API surface —
+    /// `pub(crate)` limits callers to within the `veld` library.
+    pub(crate) fn set_access_count(&self, count: u32) {
+        self.metadata.lock().access_count = count;
+    }
+
     /// Test-only: overwrite the access-history ring buffer and `last_accessed`
     /// so a synthetic access rhythm can be exercised deterministically by the
     /// anticipatory-prefetch tick (R1).
