@@ -1131,6 +1131,50 @@ pub const ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD: u64 = 10;
 pub const ADAPTIVE_WEIGHT_MAX_BLEND: f32 = 0.6;
 
 // =============================================================================
+// R3b: SHADOW WEIGHT INJECTION + DORMANT LIVE-APPLICATION GATE
+// =============================================================================
+//
+// R3b lands the learned ranker in SHADOW MODE ONLY.  The live scoring path is
+// byte-for-byte unchanged (static weights drive returned order).  The shadow
+// path computes a learned-weighted score in parallel, logs the delta, and
+// updates the weight vector from feedback.  A future commit enables live
+// application once nDCG(learned) >= nDCG(static) on a held-out eval set.
+//
+// Poisoning guards (B8):
+//   - Per-epoch weight delta is clamped to ADAPTIVE_WEIGHT_MAX_BLEND (0.6)
+//     via the existing `effective_weights()` blend-factor cap.
+//   - Learned weights are regularised back toward the static prior each epoch.
+//   - A minimum negative-sample floor is enforced before weights are "ready".
+//   - Per-user weights contain blast radius to a single tenant by construction.
+
+/// R3b gate: live application of learned weights.
+///
+/// FALSE (default, this PR): the static score is always returned; the learned
+/// score is computed and logged as a shadow only.
+///
+/// Set to true in a FUTURE separate commit once nDCG(learned) >= nDCG(static)
+/// is confirmed on a held-out evaluation set.
+pub const R3B_LIVE_APPLICATION_ENABLED: bool = false;
+
+/// R3b gate: minimum number of weight-vector updates required before the
+/// learned weights are considered "ready" for the live ramp.
+///
+/// Even if R3B_LIVE_APPLICATION_ENABLED were flipped to true, the effective
+/// blend factor inside `effective_weights()` is 0.0 until `update_count`
+/// crosses ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD (10), so this acts as an
+/// additional, explicit floor.  Aligned with the existing threshold.
+pub const R3B_MIN_UPDATES_BEFORE_READY: u64 = 10;
+
+/// R3b B8 poisoning guard: minimum fraction of NEGATIVE (Misleading / Abstained /
+/// Ignored) feedback events required in the update history before weights are
+/// considered diverse enough to use.
+///
+/// A ranker trained only on positive signal converges to pathological BM25/vector
+/// dominance. Requiring ≥ 20 % negative-label coverage ensures the gradient has
+/// seen both directions. Checked inside `weights_ready()` on the engine.
+pub const R3B_MIN_NEGATIVE_SAMPLE_FRACTION: f32 = 0.20;
+
+// =============================================================================
 // EDGE-TIER TRUST WEIGHTS FOR SPREADING ACTIVATION
 // Based on hippocampal-cortical consolidation: edges that survive decay are
 // more reliable for graph traversal. Dense graphs (L1) are noisy for search,
