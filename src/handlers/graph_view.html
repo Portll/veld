@@ -294,7 +294,12 @@
     </div>
 
     <script>
-        const userId = "{{USER_ID}}";
+        const userId = {{USER_ID_JSON}};
+        const hashParams = new URLSearchParams(window.location.hash.slice(1));
+        const graphApiKey = hashParams.get('api_key') || '';
+        if (window.location.hash) {
+            history.replaceState(null, '', window.location.pathname + window.location.search);
+        }
         let currentMode = '3d';
         let graphData = { nodes: [], edges: [], stats: {} };
 
@@ -565,9 +570,21 @@
             else update2DVisibility();
         }
 
+        function graphFetch(path) {
+            const options = graphApiKey
+                ? { headers: { 'X-API-Key': graphApiKey } }
+                : {};
+            return fetch(path, options).then(async r => {
+                if (!r.ok) {
+                    const body = await r.text();
+                    throw new Error(`HTTP ${r.status}: ${body || r.statusText}`);
+                }
+                return r.json();
+            });
+        }
+
         function loadGraph() {
-            fetch(`/api/graph/data/${userId}`)
-                .then(r => r.json())
+            graphFetch(`/api/graph/data/${encodeURIComponent(userId)}`)
                 .then(data => {
                     graphData = data;
                     updateStats(data.stats);
@@ -641,17 +658,12 @@
             controls3d.autoRotate = e.target.checked;
         });
 
-        // SSE for live updates
-        const evtSource = new EventSource('/api/events/sse');
-        evtSource.addEventListener('MEMORY_CREATE', (e) => {
-            const data = JSON.parse(e.data);
-            if (data.user_id === userId) setTimeout(loadGraph, 1000);
-        });
+        // EventSource cannot attach X-API-Key headers; the authenticated
+        // auto-refresh below keeps the preview live without triggering 401s.
 
         // Auto-refresh every 10 seconds
         setInterval(() => {
-            fetch(`/api/graph/data/${userId}`)
-                .then(r => r.json())
+            graphFetch(`/api/graph/data/${encodeURIComponent(userId)}`)
                 .then(data => {
                     updateStats(data.stats);
                     if (Math.abs(data.nodes.length - graphData.nodes.length) > 3) {
