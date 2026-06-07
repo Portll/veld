@@ -2481,12 +2481,16 @@ impl MemorySystem {
             .find_by_event_filtered(user_id, event, limit, include_expired)
     }
 
-    /// Filter temporal facts to those whose conversation_date falls within
-    /// the parsed query time window (±7 days around the date range).
+    /// Filter temporal facts to those whose EVENT time overlaps the parsed
+    /// query time window (±7 days around the date range).
     ///
-    /// Returns the subset of `facts` that overlap the window. If
-    /// `query_temporal` has no parsed refs, returns an empty vec so callers
-    /// can fall through to the unfiltered set.
+    /// Validation is on `resolved_time` (when the event is) when it can be
+    /// resolved, falling back to `conversation_date` (when the fact was
+    /// mentioned) only when the event time is `Unknown`. This matters for
+    /// planned/historical facts whose event time differs from the moment they
+    /// were said. Returns the subset of `facts` that overlap the window. If
+    /// `query_temporal` has no parsed refs, returns an empty vec so callers can
+    /// fall through to the unfiltered set.
     fn filter_facts_by_time_window<'a>(
         facts: &'a [temporal_facts::TemporalFact],
         query_temporal: &query_parser::TemporalExtraction,
