@@ -37,6 +37,8 @@ wheels/
 
 # Memory data
 veld_data/
+shodh-internal/
+shodh_memory_data/
 *.db
 *.rocksdb/
 
