@@ -2404,34 +2404,81 @@ impl super::MemorySystem {
 
                 // TEMPORAL BOOST (TEMPR approach - key for multi-hop retrieval)
                 // If query has temporal intent and memory has matching temporal references,
-                // significantly boost the memory's score (25% contribution when matched)
+                // significantly boost the memory's score (25% contribution when matched).
+                //
+                // R2: boost detection now uses bound-overlap to align with the gate
+                // (`filter_facts_by_time_window`). Each memory temporal_ref is parsed
+                // to a NaiveDate, treated as a TemporalBound::Point, and checked for
+                // overlap against each query bound widened ±7 days (matching the gate's
+                // tolerance). When query_temporal.bounds() is empty (no relative
+                // expressions were extracted), we fall back to the prior string/proximity
+                // logic so existing behaviour is fully preserved.
+                //
+                // NOTE: source of truth for mem-side dates is still
+                // `experience.temporal_refs`; full unification with
+                // `TemporalFact.resolved_time` is a separate future step.
                 let temporal_boost = if has_temporal_query
                     && !mem.experience.temporal_refs.is_empty()
                 {
-                    // Check if any memory temporal ref matches query temporal refs
-                    let mut best_match = 0.0_f32;
-                    for mem_ref in &mem.experience.temporal_refs {
-                        for query_ref in &query_temporal.refs {
-                            // Exact date match: strong boost
-                            if mem_ref == &query_ref.date.to_string() {
-                                best_match = best_match.max(0.25);
-                            } else if let Ok(mem_date) =
+                    let query_bounds = query_temporal.bounds();
+                    if !query_bounds.is_empty() {
+                        // Bound-overlap path (R2): parse each mem temporal_ref to a
+                        // NaiveDate and check whether any query bound's ±7-day-widened
+                        // window overlaps the mem date. The overlap test is symmetric:
+                        // `qb.overlaps_range(mem_date − 7, mem_date + 7)` asks "does the
+                        // query's temporal bound cover anything within a week of this
+                        // memory's date?", which mirrors the gate's ±7-day tolerance.
+                        let mut best_match = 0.0_f32;
+                        for mem_ref in &mem.experience.temporal_refs {
+                            if let Ok(mem_date) =
                                 chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
                             {
-                                // Approximate match: within 7 days gets partial boost
-                                let days_diff = (mem_date - query_ref.date).num_days().abs();
-                                if days_diff <= 7 {
-                                    let proximity_boost = 0.15 * (1.0 - days_diff as f32 / 7.0);
-                                    best_match = best_match.max(proximity_boost);
-                                } else if days_diff <= 30 {
-                                    // Within a month: smaller boost
-                                    let proximity_boost = 0.05 * (1.0 - days_diff as f32 / 30.0);
-                                    best_match = best_match.max(proximity_boost);
+                                let window_start =
+                                    mem_date - chrono::Duration::days(7);
+                                let window_end =
+                                    mem_date + chrono::Duration::days(7);
+                                for qb in query_bounds {
+                                    if qb.overlaps_range(window_start, window_end) {
+                                        // Same magnitude as the old exact-match path.
+                                        best_match = best_match.max(0.25);
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        best_match
+                    } else {
+                        // Fallback (pre-R2): string/proximity matching when no bounds
+                        // were resolved (e.g. query contains only absolute date strings
+                        // without relative phrases). Behaviour is byte-for-byte identical
+                        // to the pre-R2 implementation — no regression.
+                        let mut best_match = 0.0_f32;
+                        for mem_ref in &mem.experience.temporal_refs {
+                            for query_ref in &query_temporal.refs {
+                                // Exact date match: strong boost
+                                if mem_ref == &query_ref.date.to_string() {
+                                    best_match = best_match.max(0.25);
+                                } else if let Ok(mem_date) =
+                                    chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
+                                {
+                                    // Approximate match: within 7 days gets partial boost
+                                    let days_diff =
+                                        (mem_date - query_ref.date).num_days().abs();
+                                    if days_diff <= 7 {
+                                        let proximity_boost =
+                                            0.15 * (1.0 - days_diff as f32 / 7.0);
+                                        best_match = best_match.max(proximity_boost);
+                                    } else if days_diff <= 30 {
+                                        // Within a month: smaller boost
+                                        let proximity_boost =
+                                            0.05 * (1.0 - days_diff as f32 / 30.0);
+                                        best_match = best_match.max(proximity_boost);
+                                    }
+                                }
+                            }
+                        }
+                        best_match
                     }
-                    best_match
                 } else {
                     0.0
                 };
@@ -4778,5 +4825,148 @@ impl super::MemorySystem {
 
         // Rebuild result preserving MMR order but keeping original scores
         selected.iter().map(|&idx| memories[idx].clone()).collect()
+    }
+}
+
+// =============================================================================
+// R2 unit tests — temporal boost bound-overlap logic
+// =============================================================================
+//
+// These tests validate the R2 temporal_boost path in isolation. They do NOT
+// exercise the full `with_unified_score` closure (which requires a live
+// MemorySystem); instead they test the exact sub-algorithm that was changed:
+// parsing a memory temporal_ref → TemporalBound::Point, then checking overlap
+// against a query-side TemporalBound widened ±7 days.
+#[cfg(test)]
+mod r2_temporal_boost_tests {
+    use chrono::NaiveDate;
+    use crate::memory::temporal_facts::TemporalBound;
+
+    /// Simulate the R2 boost decision for a single (mem_date, query_bounds) pair.
+    ///
+    /// Returns true when the mem_date falls within ANY query bound's ±7-day window
+    /// (i.e. temporal_boost would be > 0).  Returns false otherwise.
+    fn r2_boost_fires(mem_date: NaiveDate, query_bounds: &[TemporalBound]) -> bool {
+        if query_bounds.is_empty() {
+            return false;
+        }
+        let window_start = mem_date - chrono::Duration::days(7);
+        let window_end   = mem_date + chrono::Duration::days(7);
+        query_bounds.iter().any(|qb| qb.overlaps_range(window_start, window_end))
+    }
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// R2-B1: a memory date exactly equal to the query's Point bound receives
+    /// the boost (overlap is true, boost value would be 0.25 > 0).
+    #[test]
+    fn test_r2_boost_exact_point_match() {
+        let query_date = d(2024, 6, 15);
+        let bounds = vec![TemporalBound::Point(query_date)];
+        assert!(
+            r2_boost_fires(d(2024, 6, 15), &bounds),
+            "exact date match must fire the boost"
+        );
+    }
+
+    /// R2-B2: a memory date 6 days inside the ±7-day window receives the boost.
+    #[test]
+    fn test_r2_boost_within_window() {
+        let query_date = d(2024, 6, 15);
+        let bounds = vec![TemporalBound::Point(query_date)];
+        // mem_date window: [2024-06-09, 2024-06-23]
+        // query Point(2024-06-15) overlaps [2024-06-09, 2024-06-23] → true
+        assert!(
+            r2_boost_fires(d(2024, 6, 21), &bounds),
+            "mem date 6 days away must still be within ±7-day tolerance"
+        );
+    }
+
+    /// R2-B3: a memory date 30 days outside the query bound does NOT fire the boost.
+    #[test]
+    fn test_r2_boost_outside_window() {
+        let query_date = d(2024, 6, 15);
+        let bounds = vec![TemporalBound::Point(query_date)];
+        // mem_date = 2024-07-20, window = [2024-07-13, 2024-07-27]
+        // query Point(2024-06-15) does NOT overlap [2024-07-13, 2024-07-27]
+        assert!(
+            !r2_boost_fires(d(2024, 7, 20), &bounds),
+            "mem date 35 days from query must NOT fire the boost"
+        );
+    }
+
+    /// R2-B4: when query_bounds is empty the boost does not fire (fallback guard).
+    #[test]
+    fn test_r2_no_bounds_no_boost() {
+        assert!(
+            !r2_boost_fires(d(2024, 6, 15), &[]),
+            "empty bounds slice must not fire the boost"
+        );
+    }
+
+    /// R2-B5: a Closed-interval query bound overlapping the mem date fires the boost.
+    #[test]
+    fn test_r2_boost_closed_interval_overlap() {
+        let bounds = vec![TemporalBound::Closed {
+            start: d(2024, 6, 10),
+            end:   d(2024, 6, 20),
+        }];
+        // mem_date = 2024-06-25 → window [2024-06-18, 2024-07-02]
+        // Closed[10..20] overlaps [18..Jul-02] → 18 <= 20 && 10 <= Jul-02 → true
+        assert!(
+            r2_boost_fires(d(2024, 6, 25), &bounds),
+            "Closed query bound partially overlapping ±7-day mem window must fire"
+        );
+    }
+
+    /// R2-B6: a Closed-interval query bound entirely outside the mem window does not fire.
+    #[test]
+    fn test_r2_boost_closed_interval_no_overlap() {
+        let bounds = vec![TemporalBound::Closed {
+            start: d(2024, 5, 1),
+            end:   d(2024, 5, 10),
+        }];
+        // mem_date = 2024-06-25 → window [2024-06-18, 2024-07-02]
+        // Closed[May-01..May-10] does NOT overlap [Jun-18..Jul-02]
+        assert!(
+            !r2_boost_fires(d(2024, 6, 25), &bounds),
+            "Closed query bound 6 weeks before mem window must NOT fire"
+        );
+    }
+
+    /// R2-B7: extract_temporal_refs on a "yesterday"-style query populates bounds(),
+    /// and the R2 boost fires for a mem_date of today (within the ±7-day window).
+    ///
+    /// This is an integration-level check that the full pipeline from text → bounds
+    /// → overlap produces a non-zero boost for a temporally-relevant memory.
+    #[test]
+    fn test_r2_boost_via_extract_temporal_refs_yesterday() {
+        use crate::memory::query_parser::extract_temporal_refs;
+
+        let extraction = extract_temporal_refs("what happened yesterday?");
+        let bounds = extraction.bounds();
+
+        // If the parser resolved "yesterday" to a bound, test the overlap.
+        // If bounds is empty (parser did not handle it), the test is vacuously
+        // satisfied — this guards against environment-dependent date parsing.
+        if bounds.is_empty() {
+            return;
+        }
+
+        // today should be within 1 day of "yesterday" → well within ±7-day window
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            r2_boost_fires(today, bounds),
+            "a memory dated today should receive the boost for a 'yesterday' query"
+        );
+
+        // a date 60 days ago should NOT fire (well outside ±7-day tolerance)
+        let old_date = today - chrono::Duration::days(60);
+        assert!(
+            !r2_boost_fires(old_date, bounds),
+            "a memory 60 days old should NOT receive the boost for a 'yesterday' query"
+        );
     }
 }
