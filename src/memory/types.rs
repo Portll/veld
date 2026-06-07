@@ -4023,6 +4023,13 @@ pub struct RetrievalStats {
     #[serde(skip)]
     pub traversed_edges: Vec<uuid::Uuid>,
 
+    /// Path-credit edges: (edge_uuid, activation_contribution) pairs collected
+    /// during spreading activation.  Contributions are raw (not yet normalised);
+    /// call `GraphMemory::apply_path_credit` to normalise and strengthen.
+    /// Not serialized - internal use only.
+    #[serde(skip)]
+    pub path_credit_edges: Vec<(uuid::Uuid, f32)>,
+
     // === FIX-03: Interference notification ===
     /// Whether interference was detected during this retrieval
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
