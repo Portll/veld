@@ -7629,6 +7629,7 @@ mod temporal_gate_regression_tests {
             refs: vec![],          // unused by filter_facts_by_time_window
             earliest: Some(start),
             latest: Some(end),
+            query_bounds: vec![], // F6 added this field; tests don't exercise it
         }
     }
 
