@@ -2384,6 +2384,29 @@ pub const TIER_RETRIEVAL_SUCCESS_BOOST: f32 = 0.25;
 /// Edges above 0.8 weight are considered "potentiated" and decay even slower.
 pub const TIER_LTP_THRESHOLD: f32 = 0.8;
 
+// === SPONTANEOUS RECOVERY (Dussutour habituation-with-recovery) ===
+// Slow upward-drift recovery term applied during each decay call.
+// Allows down-weighted edges to drift back toward their equilibrium over time.
+// Recovery is bounded strictly below the tier prune threshold so a
+// recovering edge can NEVER self-rescue from prune-eligible territory.
+
+/// Per-decay-call recovery drift added to edge strength.
+///
+/// Calibrated to be biologically slow: at typical 5-minute maintenance intervals
+/// (300 s), this adds ~0.001 per call, reaching +0.06 over ~60 calls (≈5 hours).
+/// Kept small so recovery is a background process, not an amplifier.
+pub const EDGE_RECOVERY_RATE: f32 = 0.001;
+
+/// Recovery cap expressed as a fraction of the tier prune threshold.
+///
+/// Recovery can push `strength` up to at most `prune_threshold * EDGE_RECOVERY_CAP_FACTOR`.
+/// This value MUST be strictly < 1.0 so recovering edges never reach the prune threshold,
+/// preserving the invariant that any edge at or below the threshold still gets pruned.
+///
+/// 0.95 gives roughly 5% headroom below each tier's threshold:
+///   L1 cap = 0.095, L2 cap = 0.19, L3 cap = 0.285
+pub const EDGE_RECOVERY_CAP_FACTOR: f32 = 0.95;
+
 // =============================================================================
 // INTRUSIVE RECOLLECTION ARCHITECTURE (Berntsen functional constraints)
 // Based on: Ehlers & Clark (2000), Berntsen (2021), Nader et al. (2000)

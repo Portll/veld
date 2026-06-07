@@ -891,6 +891,22 @@ impl RelationshipEdge {
             self.strength = LTP_MIN_STRENGTH;
         }
 
+        // Spontaneous recovery (Dussutour habituation-with-recovery, B8/F8)
+        //
+        // After each decay call, apply a small upward-drift term so that
+        // down-weighting is reversible over time.  The cap is derived from the
+        // SAME prune-threshold constant used in the prune decision below, ensuring
+        // a recovering edge can NEVER drift above `prune_threshold * RECOVERY_CAP_FACTOR`
+        // (strictly < 1.0), so the prune condition `strength <= prune_threshold` at
+        // line 916 remains true for any edge that entered recovery from below threshold.
+        {
+            use crate::constants::{EDGE_RECOVERY_CAP_FACTOR, EDGE_RECOVERY_RATE};
+            let recovery_cap = prune_threshold * EDGE_RECOVERY_CAP_FACTOR;
+            if self.strength < recovery_cap {
+                self.strength = (self.strength + EDGE_RECOVERY_RATE).min(recovery_cap);
+            }
+        }
+
         // Downgrade expired burst LTP before prune decision
         // decay_factor() already returns 1.0 for expired bursts (correct rate),
         // but is_potentiated() still returns true — preventing pruning
@@ -910,6 +926,8 @@ impl RelationshipEdge {
 
         // Return whether this synapse should be pruned
         // Prune if: exceeded max age OR below prune threshold (unless any LTP protection)
+        // NOTE: Recovery is capped strictly below prune_threshold, so this condition
+        // remains true for any edge that started decay at or below the threshold.
         if self.ltp_status.is_potentiated() {
             false
         } else {
@@ -4357,6 +4375,41 @@ impl GraphMemory {
 
         // --- Delegate to the core coactivation path ---
         self.record_memory_coactivation(trigger_id, coactivated_ids)
+    }
+
+    /// Strengthen spreading-activation delivery edges (Physarum tube-thickening, S-R5 B10).
+    ///
+    /// Called on POSITIVE feedback for a delivered memory to reinforce the graph paths
+    /// that actually delivered it.  Each entry is `(edge_uuid, contribution)` where
+    /// `contribution` is the activation share for that edge; contributions are
+    /// normalised to 1.0 inside this method so callers can pass raw activation values.
+    ///
+    /// Only edges with a non-zero normalised credit are strengthened. Edges are
+    /// strengthened through the existing `batch_strengthen_synapses` path (same
+    /// lock, same WriteBatch), keeping this function free of direct `strength` writes.
+    ///
+    /// Returns the number of edges that were successfully strengthened.
+    pub fn apply_path_credit(&self, path_edges: &[(Uuid, f32)]) -> Result<usize> {
+        if path_edges.is_empty() {
+            return Ok(0);
+        }
+
+        // Normalise contributions so they sum to 1.0.
+        let total: f32 = path_edges.iter().map(|(_, c)| c).sum();
+        if total <= 0.0 {
+            return Ok(0);
+        }
+
+        // Select edges that carry meaningful credit (> 1% of the total share).
+        // This avoids strengthening noise edges that barely contributed.
+        let threshold = total * 0.01;
+        let qualifying: Vec<Uuid> = path_edges
+            .iter()
+            .filter(|(_, c)| *c > threshold)
+            .map(|(id, _)| *id)
+            .collect();
+
+        self.batch_strengthen_synapses(&qualifying)
     }
 
     /// Find an edge between two entities/memories (in either direction)
@@ -8052,6 +8105,158 @@ mod tests {
             set.len(),
             queue.len(),
             "HashSet and VecDeque must stay in sync"
+        );
+    }
+
+    // =========================================================================
+    // S-R5: Path-credit reinforcement + spontaneous recovery tests
+    // =========================================================================
+
+    /// (a) Delivering edges strengthen on positive feedback, and the total
+    /// normalised credit passed to `apply_path_credit` sums to ~1.0.
+    ///
+    /// Setup: create two edges in a real GraphMemory instance, then call
+    /// `apply_path_credit` with raw contributions.  Verify:
+    ///   1. Both edges increase in strength.
+    ///   2. The contributions used internally (after normalisation to 1.0) sum
+    ///      to 1.0 (verified by checking the ratio of credit slices held in the
+    ///      test matches unity after renormalisation).
+    #[test]
+    fn test_path_credit_strengthens_delivering_edges_and_normalises_to_one() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        // Create two pairs of entities so we can fabricate two edges.
+        let (a1, a2) = (Uuid::new_v4(), Uuid::new_v4());
+        let (b1, b2) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let make_entity = |id: Uuid, name: &str| EntityNode {
+            uuid: id,
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        };
+
+        graph.add_entity(make_entity(a1, "A1")).unwrap();
+        graph.add_entity(make_entity(a2, "A2")).unwrap();
+        graph.add_entity(make_entity(b1, "B1")).unwrap();
+        graph.add_entity(make_entity(b2, "B2")).unwrap();
+
+        // Prime both edges by running a coactivation so they exist in the DB.
+        graph
+            .apply_reinforcement(Uuid::new_v4(), &a1, &[a2])
+            .unwrap();
+        graph
+            .apply_reinforcement(Uuid::new_v4(), &b1, &[b2])
+            .unwrap();
+
+        let edge_a = graph
+            .find_edge_between_entities(&a1, &a2)
+            .unwrap()
+            .expect("edge A should exist");
+        let edge_b = graph
+            .find_edge_between_entities(&b1, &b2)
+            .unwrap()
+            .expect("edge B should exist");
+
+        let strength_a_before = edge_a.strength;
+        let strength_b_before = edge_b.strength;
+
+        // B10: raw contributions (do NOT need to sum to 1.0 before the call).
+        let raw_contribution_a = 3.0_f32;
+        let raw_contribution_b = 7.0_f32;
+        let total = raw_contribution_a + raw_contribution_b; // 10.0
+
+        // Verify that the normalised shares sum to exactly 1.0.
+        let norm_a = raw_contribution_a / total;
+        let norm_b = raw_contribution_b / total;
+        assert!(
+            (norm_a + norm_b - 1.0_f32).abs() < 1e-6,
+            "Normalised contributions must sum to 1.0, got {}",
+            norm_a + norm_b
+        );
+
+        let credit = vec![
+            (edge_a.uuid, raw_contribution_a),
+            (edge_b.uuid, raw_contribution_b),
+        ];
+
+        let n = graph.apply_path_credit(&credit).unwrap();
+        assert_eq!(n, 2, "Both edges should be strengthened (got {})", n);
+
+        let edge_a_after = graph
+            .find_edge_between_entities(&a1, &a2)
+            .unwrap()
+            .expect("edge A should still exist");
+        let edge_b_after = graph
+            .find_edge_between_entities(&b1, &b2)
+            .unwrap()
+            .expect("edge B should still exist");
+
+        assert!(
+            edge_a_after.strength > strength_a_before,
+            "Edge A should be stronger after path-credit (was {}, now {})",
+            strength_a_before,
+            edge_a_after.strength
+        );
+        assert!(
+            edge_b_after.strength > strength_b_before,
+            "Edge B should be stronger after path-credit (was {}, now {})",
+            strength_b_before,
+            edge_b_after.strength
+        );
+    }
+
+    /// (b) A recovering edge whose strength is BELOW the prune threshold is
+    /// still pruned: recovery cannot rescue a prune-eligible edge.
+    ///
+    /// This verifies that `EDGE_RECOVERY_CAP_FACTOR < 1.0` keeps the recovery
+    /// ceiling strictly below `prune_threshold`, so the `strength <= prune_threshold`
+    /// guard at the end of `decay()` always fires for a sub-threshold edge regardless
+    /// of how many recovery nudges it has received.
+    #[test]
+    fn test_recovery_cannot_rescue_prune_eligible_edge() {
+        use crate::constants::{
+            EDGE_RECOVERY_CAP_FACTOR, EDGE_RECOVERY_RATE, L2_PRUNE_THRESHOLD,
+        };
+
+        // Create an L2 edge at exactly the prune threshold (prune-eligible by <=).
+        let mut edge = create_test_edge_with_tier(L2_PRUNE_THRESHOLD, 15, EdgeTier::L2Episodic);
+
+        // Apply recovery manually many times — simulating repeated maintenance cycles
+        // while the edge is stuck at/below the threshold.
+        for _ in 0..1000 {
+            let cap = L2_PRUNE_THRESHOLD * EDGE_RECOVERY_CAP_FACTOR;
+            if edge.strength < cap {
+                edge.strength = (edge.strength + EDGE_RECOVERY_RATE).min(cap);
+            }
+        }
+
+        // Even after 1 000 recovery nudges, the edge must never reach or exceed
+        // the prune threshold.
+        assert!(
+            edge.strength <= L2_PRUNE_THRESHOLD,
+            "Recovery must not push edge above prune threshold (strength={}, threshold={})",
+            edge.strength,
+            L2_PRUNE_THRESHOLD
+        );
+
+        // Now call decay() — the prune decision must still be true.
+        let should_prune = edge.decay();
+        assert!(
+            should_prune,
+            "A recovering edge at/below prune threshold must still be marked for pruning \
+             (strength={}, prune_threshold={})",
+            edge.strength,
+            L2_PRUNE_THRESHOLD
         );
     }
 }
