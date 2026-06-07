@@ -67,6 +67,19 @@ fn url_short(base: &str) -> String {
     }
 }
 
+fn encode_url_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Spawn a status client for `base_url`. Returns its snapshot handle alongside.
 /// Must be called within a tokio runtime (StatusClient::spawn spawns tasks).
 fn spawn_client(
@@ -170,6 +183,7 @@ pub fn run() {
             quit_app,
             get_dials_for,
             set_dials_for,
+            graph_view_url_for,
             first_run_check,
             mark_initialized,
             seed_project,
@@ -293,6 +307,26 @@ async fn set_dials_for(
     StatusClient::set_dials(&base_url, &key, &user, dials, timeout)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Build an authenticated graph-view URL for an iframe.
+///
+/// The API key is carried in the URL fragment, not the query string, so it is
+/// not sent with the public `/graph/view` request. The graph page reads it
+/// locally and uses it as an `X-API-Key` header for protected JSON fetches.
+#[tauri::command]
+fn graph_view_url_for(state: State<'_, MonitorState>, base_url: String) -> Result<String, String> {
+    let base = norm(&base_url);
+    if base.is_empty() {
+        return Err("base_url is empty".to_string());
+    }
+
+    let user = encode_url_component(&state.user_id);
+    let key = encode_url_component(&state.api_key);
+    let bust = chrono::Utc::now().timestamp_millis();
+    Ok(format!(
+        "{base}/graph/view?user_id={user}&_t={bust}#api_key={key}"
+    ))
 }
 
 /// Marker written after first-run setup completes: `<config>/veld/monitor-initialized`.
