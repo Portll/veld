@@ -4071,6 +4071,12 @@ impl super::MemorySystem {
             "recall [spreading_activation] complete"
         );
 
+        // S-R5: Cache path-credit edges for the next reinforce_recall(Helpful) call.
+        // Stash the raw contributions; reinforce_recall will drain and apply them.
+        if !retrieval_stats.path_credit_edges.is_empty() {
+            *self.spreading_path_credit.lock() = retrieval_stats.path_credit_edges;
+        }
+
         // Extract SharedMemory from ActivatedMemory, preserving score ordering
         let memories: Vec<SharedMemory> = activated_memories
             .into_iter()
@@ -4570,6 +4576,31 @@ impl super::MemorySystem {
                 // No graph memory available — count pairs directly
                 let n = memory_ids.len();
                 stats.associations_strengthened = n * (n - 1) / 2;
+            }
+        }
+
+        // S-R5: Path-credit reinforcement (Physarum tube-thickening, B10)
+        // On Helpful outcome, strengthen the spreading-activation edges that actually
+        // delivered the memories.  Credit is normalised to 1.0 inside apply_path_credit.
+        if matches!(outcome, RetrievalOutcome::Helpful) {
+            if let Some(graph) = &self.graph_memory {
+                // Drain the stashed path-credit edges from the most recent retrieval.
+                let path_edges: Vec<(uuid::Uuid, f32)> =
+                    std::mem::take(&mut *self.spreading_path_credit.lock());
+                if !path_edges.is_empty() {
+                    match graph.read().apply_path_credit(&path_edges) {
+                        Ok(n) => {
+                            tracing::debug!(
+                                n,
+                                "S-R5: path-credit applied to {} spreading-activation edges",
+                                n
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "S-R5: path-credit apply failed (non-critical)");
+                        }
+                    }
+                }
             }
         }
 

@@ -386,6 +386,13 @@ pub struct MemorySystem {
     /// evicted from the `user_earths` cache. Driven only by the maintenance-path
     /// `run_prefetch_tick`; never touched on the recall hot-path.
     prefetch_state: Arc<parking_lot::RwLock<prefetch_tick::PrefetchUserState>>,
+
+    /// S-R5: path-credit pending edges from the most recent spreading-activation
+    /// retrieval.  Populated by `spreading_activation_recall`; drained by
+    /// `reinforce_recall` on a Helpful outcome.  The inner Vec holds
+    /// (edge_uuid, raw_contribution) pairs — normalisation to 1.0 happens inside
+    /// `GraphMemory::apply_path_credit`.
+    spreading_path_credit: Arc<parking_lot::Mutex<Vec<(uuid::Uuid, f32)>>>,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -1056,6 +1063,7 @@ impl MemorySystem {
             prefetch_state: Arc::new(parking_lot::RwLock::new(
                 prefetch_tick::PrefetchUserState::default(),
             )),
+            spreading_path_credit: Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 

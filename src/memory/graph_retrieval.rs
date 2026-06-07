@@ -238,7 +238,7 @@ pub fn calculate_adaptive_hops(graph_density: Option<f32>) -> usize {
 /// Spread activation from a set of seed entities for a fixed number of hops
 ///
 /// This is a single-direction spread used by bidirectional algorithm.
-/// Returns the activation map after spreading.
+/// Returns the activation map, traversed edge UUIDs, and path-credit contributions.
 fn spread_single_direction(
     seeds: &[(Uuid, f32)],
     graph: &GraphMemory,
@@ -246,9 +246,11 @@ fn spread_single_direction(
     threshold: f32,
     ontological_intent: Option<&OntologicalIntent>,
     entity_label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
-) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>)> {
+) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, Vec<(Uuid, f32)>)> {
     let mut activation_map: HashMap<Uuid, f32> = seeds.iter().cloned().collect();
     let mut traversed_edges: Vec<Uuid> = Vec::new();
+    // Path-credit: raw (edge_uuid, spread_amount) contributions across all hops.
+    let mut credit_edges: Vec<(Uuid, f32)> = Vec::new();
 
     for hop in 1..=max_hops {
         let current_activated: Vec<(Uuid, f32)> =
@@ -361,6 +363,8 @@ fn spread_single_direction(
 
                 if spread_amount > 0.01 {
                     traversed_edges.push(edge.uuid);
+                    // Record (edge, contribution) for path-credit normalisation.
+                    credit_edges.push((edge.uuid, spread_amount));
                 }
             }
         }
@@ -383,7 +387,7 @@ fn spread_single_direction(
         activation_map.retain(|_, activation| *activation > threshold);
     }
 
-    Ok((activation_map, traversed_edges))
+    Ok((activation_map, traversed_edges, credit_edges))
 }
 
 /// Bidirectional spreading activation with intersection boost (PIPE-7)
@@ -397,14 +401,14 @@ fn spread_single_direction(
 /// - `total_salience`: Sum of entity saliences for normalization
 /// - `hops_per_direction`: Density-adaptive hop count (2-4)
 ///
-/// Returns: (combined_activation_map, traversed_edges, intersection_count)
+/// Returns: (combined_activation_map, traversed_edges, path_credit_edges, intersection_count)
 fn bidirectional_spread(
     entity_data: &[(Uuid, String, f32, f32)], // (uuid, name, ic_weight, salience)
     graph: &GraphMemory,
     total_salience: f32,
     hops_per_direction: usize,
     ontological_intent: Option<&OntologicalIntent>,
-) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, usize)> {
+) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, Vec<(Uuid, f32)>, usize)> {
     // Split entities into forward/backward sets (alternating assignment)
     // This distributes entities evenly regardless of count
     let mut forward_seeds: Vec<(Uuid, f32)> = Vec::new();
@@ -438,7 +442,7 @@ fn bidirectional_spread(
     // across both forward and backward passes.
     let mut entity_label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
     let threshold = SPREADING_ACTIVATION_THRESHOLD;
-    let (forward_map, forward_edges) = spread_single_direction(
+    let (forward_map, forward_edges, forward_credit) = spread_single_direction(
         &forward_seeds,
         graph,
         hops_per_direction,
@@ -447,7 +451,7 @@ fn bidirectional_spread(
         &mut entity_label_cache,
     )?;
 
-    let (backward_map, backward_edges) = spread_single_direction(
+    let (backward_map, backward_edges, backward_credit) = spread_single_direction(
         &backward_seeds,
         graph,
         hops_per_direction,
@@ -487,9 +491,11 @@ fn bidirectional_spread(
         combined_map.insert(entity_uuid, combined_activation);
     }
 
-    // Combine traversed edges
+    // Combine traversed edges and path-credit contributions
     let mut all_edges = forward_edges;
     all_edges.extend(backward_edges);
+    let mut all_credit = forward_credit;
+    all_credit.extend(backward_credit);
 
     tracing::debug!(
         "🔀 Bidirectional result: {} entities ({} intersections), {} edges",
@@ -498,7 +504,7 @@ fn bidirectional_spread(
         all_edges.len()
     );
 
-    Ok((combined_map, all_edges, intersection_count))
+    Ok((combined_map, all_edges, all_credit, intersection_count))
 }
 
 /// Spreading activation retrieval (legacy - uses fixed weights)
@@ -765,6 +771,8 @@ pub fn spreading_activation_retrieve_with_stats(
     // PIPE-7: Use bidirectional spreading when 2+ focal entities, else unidirectional
     let graph_start = Instant::now();
     let mut traversed_edges: Vec<Uuid>;
+    // Path-credit raw contributions (edge_uuid, spread_amount) — normalised later.
+    let raw_credit_edges: Vec<(Uuid, f32)>;
 
     if entity_data.len() >= BIDIRECTIONAL_MIN_ENTITIES {
         // PIPE-7: Bidirectional spreading activation
@@ -779,7 +787,7 @@ pub fn spreading_activation_retrieve_with_stats(
             graph_density.unwrap_or(0.0)
         );
 
-        let (bidirectional_map, edges, intersection_count) = bidirectional_spread(
+        let (bidirectional_map, edges, credit, intersection_count) = bidirectional_spread(
             &entity_data,
             graph,
             total_salience,
@@ -789,6 +797,7 @@ pub fn spreading_activation_retrieve_with_stats(
 
         activation_map = bidirectional_map;
         traversed_edges = edges;
+        raw_credit_edges = credit;
         stats.entities_activated = activation_map.len();
         stats.graph_hops = adaptive_hops * 2; // Effective depth (forward + backward)
 
@@ -806,6 +815,7 @@ pub fn spreading_activation_retrieve_with_stats(
         );
 
         let mut edges_collected: Vec<Uuid> = Vec::new();
+        let mut credit_collected: Vec<(Uuid, f32)> = Vec::new();
         let mut current_threshold = SPREADING_ACTIVATION_THRESHOLD;
         // Entity label cache: each entity is read from RocksDB at most once across all hops.
         let mut entity_label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
@@ -904,6 +914,8 @@ pub fn spreading_activation_retrieve_with_stats(
 
                     if spread_amount > 0.01 {
                         edges_collected.push(edge.uuid);
+                        // Record contribution for path-credit normalisation (B10).
+                        credit_collected.push((edge.uuid, spread_amount));
                     }
 
                     if *new_activation >= current_threshold
@@ -979,6 +991,7 @@ pub fn spreading_activation_retrieve_with_stats(
         }
 
         traversed_edges = edges_collected;
+        raw_credit_edges = credit_collected;
     }
 
     stats.graph_time_us = graph_start.elapsed().as_micros() as u64;
@@ -1123,6 +1136,18 @@ pub fn spreading_activation_retrieve_with_stats(
     traversed_edges.sort();
     traversed_edges.dedup();
     stats.traversed_edges = traversed_edges;
+
+    // Path-credit normalisation (B10): merge duplicate edge entries by summing their
+    // contributions, then store raw sums in stats.  GraphMemory::apply_path_credit will
+    // perform the final normalisation to 1.0 when called at feedback time.
+    {
+        let mut credit_map: std::collections::HashMap<Uuid, f32> =
+            std::collections::HashMap::new();
+        for (edge_uuid, contrib) in raw_credit_edges {
+            *credit_map.entry(edge_uuid).or_insert(0.0) += contrib;
+        }
+        stats.path_credit_edges = credit_map.into_iter().collect();
+    }
 
     // FIX-08: Populate retrieval mode recommendation based on graph state
     let density = stats.graph_density;
