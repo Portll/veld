@@ -94,6 +94,7 @@ let currentUserId = "";
 // Multi-instance: the fleet of discovered veld instances + which tab is active.
 let instances = [];
 let activeBaseUrl = "";
+let userSelectedInstance = false;
 
 function fmtCount(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -510,9 +511,27 @@ async function pullInstances() {
     diagPush("ERROR", "list_instances failed: " + (err?.message || err));
     return;
   }
-  // Default to the pinned (first) instance; recover if the active one vanished.
-  if (instances.length && !instances.some((i) => i.base_url === activeBaseUrl)) {
-    activeBaseUrl = instances[0].base_url;
+  const active = instances.find((i) => i.base_url === activeBaseUrl);
+  const online = instances.find((i) => i.online);
+  let nextBaseUrl = activeBaseUrl;
+
+  if (instances.length && !active) {
+    userSelectedInstance = false;
+    nextBaseUrl = (online || instances[0]).base_url;
+  } else if (
+    instances.length &&
+    online &&
+    !userSelectedInstance &&
+    (!activeBaseUrl || (active?.pinned && !active.online))
+  ) {
+    nextBaseUrl = online.base_url;
+  }
+
+  if (nextBaseUrl && nextBaseUrl !== activeBaseUrl) {
+    activeBaseUrl = nextBaseUrl;
+    currentDials = null;
+    pull();
+    pullDials();
   }
   renderTabs();
 }
@@ -544,6 +563,7 @@ function renderTabs() {
 
 function setActiveInstance(base) {
   if (base === activeBaseUrl) return;
+  userSelectedInstance = true;
   activeBaseUrl = base;
   currentDials = null; // force a dials reload for the newly-selected instance
   renderTabs();
@@ -659,15 +679,17 @@ async function init() {
   const graphFrame = document.getElementById("graph-frame");
   const graphClose = document.getElementById("graph-close");
   const graphReload = document.getElementById("graph-reload");
-  function loadGraphFrame() {
-    const base = (currentBaseUrl || "").replace(/\/+$/, "");
+  async function loadGraphFrame() {
+    const base = (activeBaseUrl || currentBaseUrl || "").replace(/\/+$/, "");
     if (!base) {
       diagPush("ERROR", "graph: no base_url known yet — is the server up?");
       return;
     }
-    const user = encodeURIComponent(currentUserId || "claude-code");
-    // Cache-bust so Reload always re-requests (recovers after the server was down).
-    graphFrame.src = `${base}/graph/view?user_id=${user}&_t=${Date.now()}`;
+    try {
+      graphFrame.src = await invoke("graph_view_url_for", { baseUrl: base });
+    } catch (err) {
+      diagPush("ERROR", "graph_view_url_for failed: " + (err?.message || err));
+    }
   }
   if (openGraph && graphOverlay && graphFrame) {
     openGraph.addEventListener("click", () => {
