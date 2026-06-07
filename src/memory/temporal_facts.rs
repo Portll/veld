@@ -377,6 +377,18 @@ pub fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
     false
 }
 
+/// Minimal deserializer for the GC-path scanner in `storage.rs`.
+///
+/// Decodes a raw RocksDB value into a [`TemporalFact`] so that
+/// `storage::MemoryStorage::temporal_fact_cites_memory` can inspect
+/// `source_memory_id` without depending on the full `TemporalFactStore` API.
+/// `pub(super)` — visible only within the `memory` module subtree.
+pub(super) fn decode_for_gc(data: &[u8]) -> anyhow::Result<TemporalFact> {
+    let (fact, _): (TemporalFact, _) =
+        bincode::serde::decode_from_slice(data, bincode::config::standard())?;
+    Ok(fact)
+}
+
 /// Storage for temporal facts
 pub struct TemporalFactStore {
     db: Arc<DB>,
