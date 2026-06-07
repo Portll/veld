@@ -3959,6 +3959,10 @@ impl super::MemorySystem {
                     self.retrieval_trace_store.record_pending(&trace);
                 }
             }
+            // B9 batch enforcement: enforce the PENDING bound once per recall
+            // (after all rows for this retrieval are written) rather than once
+            // per result row. Avoids a full KV prefix scan per insert.
+            self.retrieval_trace_store.enforce_pending_bound();
         }
 
         Ok(memories)
