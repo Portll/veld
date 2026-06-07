@@ -1,0 +1,75 @@
+name: Recall + Latency Guard
+
+# Opt-in only: this job requires a live veld server with the embedding model
+# loaded (ORT_DYLIB_PATH + VELD_MODEL_PATH).  GitHub hosted runners cannot
+# provide those, so we do NOT block PRs with this workflow.
+#
+# Wire it to a self-hosted runner (see bench/README.md) or trigger manually
+# from the Actions tab before merging any recall-path change.
+on:
+  workflow_dispatch:
+    inputs:
+      veld_url:
+        description: "veld server URL"
+        required: false
+        default: "http://127.0.0.1:3030"
+      multi_hop_r10_floor:
+        description: "multi_hop R@10 floor (0–1)"
+        required: false
+        default: "0.60"
+      p99_latency_ceiling_ms:
+        description: "p99 recall latency ceiling (ms)"
+        required: false
+        default: "3000"
+
+jobs:
+  recall-guard:
+    name: Evidence-Recall + Latency Guard
+    # Change to [self-hosted] when a runner with veld + model is available.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check veld reachability
+        run: |
+          curl -sf "${{ github.event.inputs.veld_url || 'http://127.0.0.1:3030' }}/health" \
+            || { echo "::error::veld server not reachable — start it before running this workflow."; exit 1; }
+
+      - name: Run recall + latency guard
+        env:
+          VELD_URL: ${{ github.event.inputs.veld_url || 'http://127.0.0.1:3030' }}
+          VELD_API_KEY: ${{ secrets.VELD_API_KEY || 'dev-key-local' }}
+          MULTI_HOP_R10_FLOOR: ${{ github.event.inputs.multi_hop_r10_floor || '0.60' }}
+          P99_LATENCY_CEILING_MS: ${{ github.event.inputs.p99_latency_ceiling_ms || '3000' }}
+          # ORT and model path must be set on the runner host via /etc/environment
+          # or the runner's env config — they are not passed as secrets here.
+        run: |
+          python bench/recall_latency_guard.py 2>&1 | tee guard-output.txt
+          # Propagate the exit code (tee masks it by default)
+          exit "${PIPESTATUS[0]}"
+
+      - name: Post guard summary
+        if: always()
+        run: |
+          echo "## Recall + Latency Guard" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat guard-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload guard output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recall-guard-output
+          path: guard-output.txt
+          if-no-files-found: ignore
