@@ -1772,7 +1772,13 @@ impl MultiUserMemoryManager {
         let log_path = user_path.join("intent.log");
         let checkpoint_path = user_path.join("projection_checkpoints.bin");
 
-        let log = crate::intent_log::IntentLog::open(&log_path)
+        // Seal the journal's frame payloads at rest (encryption-v2) using a
+        // keystore-derived "journal" purpose key — so the WAL never holds
+        // plaintext memory snapshots on disk (or in backups). `None` (no keystore
+        // configured) keeps the journal plaintext, backward compatible.
+        let journal_cryptor = crate::keystore::SecretCryptor::from_env("journal")
+            .with_context(|| format!("derive journal encryptor for user {user_id}"))?;
+        let log = crate::intent_log::IntentLog::open_with_cryptor(&log_path, journal_cryptor)
             .with_context(|| format!("open intent log for user {user_id}"))?;
         let checkpoint_store = std::sync::Arc::new(parking_lot::Mutex::new(
             crate::intent_log::CheckpointStore::open(&checkpoint_path)
