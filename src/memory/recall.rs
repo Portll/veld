@@ -2337,6 +2337,17 @@ impl super::MemorySystem {
         // Acts as a global quality multiplier: high-quality graphs boost all scores.
         let external_dim_multiplier = self.external_aggregate_score().unwrap_or(1.0);
 
+        // R2 (LTR) SHADOW CAPTURE side-map. The `with_unified_score` closure
+        // (re-bound each loop iteration) borrows this by reference and inserts one
+        // ScoringFeatures per scored memory keyed by MemoryId. It lives outside the
+        // loop so it accumulates across all iterations and survives to the single
+        // trace write-site at the end of the function. This is READ-ONLY w.r.t. the
+        // score path: it captures already-computed locals and never feeds back into
+        // `final_score`, `set_score`, ordering, or any live behaviour.
+        let scoring_features: std::cell::RefCell<
+            std::collections::HashMap<MemoryId, crate::memory::types::ScoringFeatures>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+
         for (memory_id, score) in memory_ids {
             // Hebbian boost from learned graph weights (10% contribution)
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
@@ -2603,6 +2614,38 @@ impl super::MemorySystem {
                     * feedback_multiplier
                     * confidence_gate
                     * external_dim_multiplier;
+
+                // R2 (LTR) SHADOW CAPTURE: read every component that just produced
+                // `final_score` into the feature side-map. This READS the locals
+                // already computed above — it recomputes nothing and writes nothing
+                // back to `mem`, `base`, or `final_score`. The live score path below
+                // (`set_score(final_score)`) is byte-for-byte unchanged.
+                scoring_features.borrow_mut().insert(
+                    mem.id.clone(),
+                    crate::memory::types::ScoringFeatures {
+                        base_score: base,
+                        recency_boost,
+                        arousal_boost,
+                        credibility_boost,
+                        valence_boost,
+                        temporal_boost,
+                        session_boost,
+                        access_boost,
+                        graph_boost,
+                        episode_boost,
+                        sequence_boost,
+                        richness_boost,
+                        activation_boost,
+                        temporal_density,
+                        entity_density,
+                        elaboration_boost,
+                        burstiness_boost,
+                        feedback_multiplier,
+                        confidence_gate,
+                        external_dim_multiplier,
+                        unified_final: final_score,
+                    },
+                );
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);
@@ -3888,6 +3931,33 @@ impl super::MemorySystem {
                 });
         }
 
+        // R2 (LTR) SHADOW WRITE-SITE — the SINGLE place a trace row is emitted, so
+        // there is exactly one PENDING row per (recall, memory). It runs AFTER all
+        // reordering (competition, hierarchy expansion, re-cue, final sort), so
+        // `rank` reflects the truly final returned order and `m.score` is the final
+        // returned score. Best-effort and READ-ONLY w.r.t. the result: it reads the
+        // already-finalized `memories` and the captured feature side-map, then
+        // persists; it never mutates `memories`, scores, or ordering. Only memories
+        // that were scored through the closure carry captured features; re-cued
+        // augmentation rows (which bypass the closure) have no features and are
+        // skipped — they were never part of the learned-ranking surface.
+        {
+            let features = scoring_features.into_inner();
+            for (rank, m) in memories.iter().enumerate() {
+                if let Some(feat) = features.get(&m.id) {
+                    let trace = crate::memory::feedback::RetrievalTrace::new_pending(
+                        m.id.clone(),
+                        query_text.to_string(),
+                        rank,
+                        feat.clone(),
+                        feat.base_score,
+                        m.score.unwrap_or(feat.unified_final),
+                    );
+                    self.retrieval_trace_store.record_pending(&trace);
+                }
+            }
+        }
+
         Ok(memories)
     }
 
@@ -4523,7 +4593,11 @@ impl super::MemorySystem {
                         memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
                         stats.importance_decays += 1;
                     }
-                    RetrievalOutcome::Neutral => {
+                    // I8: Abstained/Ignored are shadow-neutral for live reinforcement
+                    // (access-only); they carry their negative label to the trace store.
+                    RetrievalOutcome::Neutral
+                    | RetrievalOutcome::Abstained
+                    | RetrievalOutcome::Ignored => {
                         // Just access recorded
                     }
                 }
@@ -4551,7 +4625,11 @@ impl super::MemorySystem {
                                 memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
                                 stats.importance_decays += 1;
                             }
-                            RetrievalOutcome::Neutral => {
+                            // I8: shadow-neutral live behaviour; negative label captured
+                            // to the trace store, not to importance/confidence.
+                            RetrievalOutcome::Neutral
+                            | RetrievalOutcome::Abstained
+                            | RetrievalOutcome::Ignored => {
                                 // Just access recorded
                             }
                         }
@@ -4582,6 +4660,24 @@ impl super::MemorySystem {
             tracing::error!(
                 failure_count = persist_failures.len(),
                 "Hebbian reinforcement had persistence failures - learning feedback partially lost"
+            );
+        }
+
+        // R2 (LTR) JOIN HOOK: a feedback label has arrived for these memories.
+        // Graduate the matching PENDING trace rows (captured at recall time) to
+        // TRAINING, stamping them with `outcome`. Joins by `memory_id` because the
+        // live feedback path (reinforce_feedback handler → reinforce_recall) carries
+        // NO retrieval/trace id — memory_id + outcome is the only correlation
+        // available here; join_feedback picks the most-recent un-expired pending row
+        // per memory. Best-effort: it returns a graduated count and never errors out
+        // of the reinforcement path. Does not affect the importance/Hebbian updates
+        // above (shadow side-channel only).
+        let graduated = self.retrieval_trace_store.join_feedback(memory_ids, outcome);
+        if graduated > 0 {
+            tracing::debug!(
+                graduated,
+                ?outcome,
+                "LTR trace: graduated pending rows to TRAINING on feedback"
             );
         }
 

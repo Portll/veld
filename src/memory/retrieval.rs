@@ -2301,6 +2301,15 @@ pub enum RetrievalOutcome {
     /// Triggers: +access count only (neutral)
     #[default]
     Neutral,
+    /// I8 (R2/LTR): the retrieval abstained — surfaced but the system declined to
+    /// act on it (e.g. confidence-gated below threshold). A negative training label
+    /// for the future learned ranker; behaviourally treated as Neutral by live
+    /// reinforcement (no importance change), captured only for the trace store.
+    Abstained,
+    /// I8 (R2/LTR): the memory was returned but the user/agent ignored it entirely.
+    /// Like `Abstained`, this is a negative label for the learned ranker captured to
+    /// the trace store; live reinforcement treats it as Neutral (no score change).
+    Ignored,
 }
 
 /// Result of a retrieval with tracking for feedback
@@ -2428,7 +2437,13 @@ impl RetrievalEngine {
                 }
                 // Don't strengthen associations for misleading memories
             }
-            RetrievalOutcome::Neutral => {
+            // I8 (R2/LTR): Abstained/Ignored are negative TRAINING labels for the
+            // future learned ranker, captured to the trace store elsewhere. For LIVE
+            // reinforcement they are SHADOW-neutral — same access-only behaviour as
+            // Neutral, so adding the labels changes no importance/confidence.
+            RetrievalOutcome::Neutral
+            | RetrievalOutcome::Abstained
+            | RetrievalOutcome::Ignored => {
                 // Just record access, mild reinforcement - PERSIST to storage
                 for id in memory_ids {
                     if let Ok(memory) = self.storage.get(id) {

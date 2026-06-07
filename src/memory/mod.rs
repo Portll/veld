@@ -26,6 +26,7 @@ pub mod lineage;
 pub mod mapper;
 pub mod pattern_detection;
 pub mod persistence;
+pub mod prefetch_tick;
 pub mod prospective;
 pub mod acl;
 pub mod llm;
@@ -103,7 +104,7 @@ pub use crate::memory::feedback::{
     detect_negative_keywords, extract_entities_simple, process_implicit_feedback,
     process_implicit_feedback_with_semantics, signal_from_entity_flow, ContextFingerprint,
     FeedbackMomentum, FeedbackStore, FeedbackStoreStats, PendingFeedback, PreviousContext,
-    SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
+    RetrievalTrace, RetrievalTraceStore, SignalRecord, SignalTrigger, SurfacedMemoryInfo, Trend,
 };
 pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{
@@ -338,6 +339,20 @@ pub struct MemorySystem {
     last_signal_attributions:
         Arc<parking_lot::RwLock<std::collections::HashMap<MemoryId, types::SignalAttribution>>>,
 
+    /// R2 (LTR): SHADOW-ONLY retrieval-trace store. Captures the full unified
+    /// feature vector + base/final score + query/rank per (recall, memory) at
+    /// recall time (PENDING), then joins the eventual feedback label and graduates
+    /// the row to TRAINING. Per-user (backed by this MemorySystem's own KV store).
+    /// Never read by the live scoring path — capture is side-effect-only.
+    retrieval_trace_store: feedback::RetrievalTraceStore,
+
+    /// R3a (F3): per-user PERSISTENT store for the learned-weight ranker vector.
+    /// Closes the in-memory-only reset-on-restart defect by persisting/loading
+    /// `LearnedWeights` through this user's own KV CF. Pure persistence
+    /// infrastructure — the loaded weights are NOT read by the scoring path in
+    /// this step; nothing here changes ranking or scoring.
+    learned_weights_store: hybrid_search::LearnedWeightsStore,
+
     /// Query-level metacognition (M3) from the most recent semantic retrieval.
     /// A terminal feeling-of-knowing readout — never fed back into scoring or
     /// adaptive weight learning. The handler assembles the final score from this.
@@ -364,6 +379,13 @@ pub struct MemorySystem {
     /// Stored as f32 bits in AtomicU32 for lock-free reads during retrieval.
     /// When 0, falls back to the static ABSTENTION_THRESHOLD constant.
     calibrated_abstention_threshold: std::sync::atomic::AtomicU32,
+
+    /// R1 (J5): per-user anticipatory-prefetch side-state — cached `LearnedScales`
+    /// (I9), prefetch hit-rate EMA, and the kill-switch + hysteresis flags (I4).
+    /// Lives here so it is owned per-user and freed when the user's earth is
+    /// evicted from the `user_earths` cache. Driven only by the maintenance-path
+    /// `run_prefetch_tick`; never touched on the recall hot-path.
+    prefetch_state: Arc<parking_lot::RwLock<prefetch_tick::PrefetchUserState>>,
 }
 
 /// Extract causal entity pairs from memory content.
@@ -564,7 +586,8 @@ impl MemorySystem {
         storage: Arc<MemoryStorage>,
         bm25_index: Arc<hybrid_search::BM25Index>,
     ) -> Result<Self> {
-        let _storage_path = config.storage_path.clone();
+        #[cfg(feature = "multi-tenant")]
+        let storage_path = config.storage_path.clone();
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
         //
@@ -897,6 +920,7 @@ impl MemorySystem {
                     vector,
                     graph,
                     update_count,
+                    ..Default::default()
                 });
             } else if let Ok(store) =
                 crate::extensions::collective_store::CollectiveStore::open(collective_dir)
@@ -909,6 +933,7 @@ impl MemorySystem {
                     vector,
                     graph,
                     update_count: 0,
+                    ..Default::default()
                 });
             }
         }
@@ -952,7 +977,7 @@ impl MemorySystem {
             session_memory: Arc::new(RwLock::new(SessionMemory::new(
                 config.session_memory_size_mb,
             ))),
-            long_term_memory: storage,
+            long_term_memory: storage.clone(),
             compressor: CompressionPipeline::new(),
             retriever,
             embedder,
@@ -1003,6 +1028,22 @@ impl MemorySystem {
             last_signal_attributions: Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            // R2 (LTR): per-user retrieval-trace store over this user's own KV CF.
+            retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
+                storage.key_value_store(),
+            ),
+            // R3a (F3): per-user persistent learned-weight store over this user's
+            // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
+            // weights are loaded on init (below) but NOT injected into scoring.
+            learned_weights_store: {
+                let store =
+                    hybrid_search::LearnedWeightsStore::with_kv(storage.key_value_store());
+                // Load on init to exercise the read path and surface any B12
+                // fallback warning early. Intentionally discarded: R3a must not
+                // feed learned weights into the scoring path (that is R3b).
+                let _loaded_learned_weights = store.load();
+                store
+            },
             // M3: query-level metacognition readout (terminal; not fed to learner)
             last_query_metacognition: Arc::new(parking_lot::RwLock::new(None)),
             // E6: TCM drift state (encode-driven; empty until the first embed)
@@ -1011,6 +1052,10 @@ impl MemorySystem {
             write_lock: parking_lot::Mutex::new(()),
             // Drift-adaptive abstention: 0 = use static constant
             calibrated_abstention_threshold: std::sync::atomic::AtomicU32::new(0),
+            // R1 (J5): per-user prefetch side-state, freed on user eviction.
+            prefetch_state: Arc::new(parking_lot::RwLock::new(
+                prefetch_tick::PrefetchUserState::default(),
+            )),
         })
     }
 
@@ -1128,6 +1173,22 @@ impl MemorySystem {
     /// Get signal attribution for a specific memory from the most recent retrieval.
     pub fn signal_attribution_for(&self, id: &MemoryId) -> Option<types::SignalAttribution> {
         self.last_signal_attributions.read().get(id).cloned()
+    }
+
+    /// R2 (LTR): read-only handle on the per-user retrieval-trace store. Exposed
+    /// so callers (and the shadow-invariant test) can inspect captured PENDING /
+    /// graduated TRAINING rows. The store is a side-channel — reading it here can
+    /// never influence scoring or retrieval.
+    pub fn retrieval_trace_store(&self) -> &feedback::RetrievalTraceStore {
+        &self.retrieval_trace_store
+    }
+
+    /// R3a (F3): read-only handle on the per-user persistent learned-weight
+    /// store. Exposed so a future R3b (and tests) can load/save the vector. This
+    /// store is pure persistence side-state — accessing it here never influences
+    /// scoring or retrieval in this step.
+    pub fn learned_weights_store(&self) -> &hybrid_search::LearnedWeightsStore {
+        &self.learned_weights_store
     }
 
     /// Store a new memory with an explicit ID.
@@ -2435,15 +2496,31 @@ impl MemorySystem {
             None => return Vec::new(),
         };
 
-        // Widen the window by 7 days on each side to tolerate fuzzy dates
+        // Widen the query window by 7 days on each side to tolerate fuzzy dates.
         let window_start = earliest - chrono::Duration::days(7);
         let window_end = latest + chrono::Duration::days(7);
 
         facts
             .iter()
             .filter(|f| {
-                let fact_date = f.conversation_date.date_naive();
-                fact_date >= window_start && fact_date <= window_end
+                // Validate on EVENT time (resolved_time) when it is known, so a
+                // fact about a future/past event ("camping next month",
+                // "painted in 2022") is matched by when the event IS, not when
+                // it happened to be mentioned. Falls back to conversation_date
+                // only when the event time could not be resolved — never
+                // silently drops a fact.
+                match f.resolved_time.to_bound() {
+                    temporal_facts::TemporalBound::Unknown => {
+                        tracing::debug!(
+                            fact_id = %f.id,
+                            relative_time = ?f.relative_time,
+                            "temporal gate: resolved_time Unknown, conversation_date fallback"
+                        );
+                        let fact_date = f.conversation_date.date_naive();
+                        fact_date >= window_start && fact_date <= window_end
+                    }
+                    bound => bound.overlaps_range(window_start, window_end),
+                }
             })
             .collect()
     }
@@ -6053,6 +6130,251 @@ impl MemorySystem {
         })
     }
 
+    /// Test-only: clear the session tier so a subsequent prefetch tick is the
+    /// only thing that can re-warm a memory into it.
+    #[cfg(test)]
+    pub(crate) fn test_clear_session(&self) {
+        self.session_memory.write().clear();
+    }
+
+    /// Test-only: is `id` currently warm in the session tier?
+    #[cfg(test)]
+    pub(crate) fn test_session_contains(&self, id: &MemoryId) -> bool {
+        self.session_memory.read().contains(id)
+    }
+
+    /// Test-only: force `access_history` + `last_accessed` on a stored memory so
+    /// a synthetic access rhythm can be exercised deterministically. Updates both
+    /// the long-term store and the in-memory session/working copies so the tick's
+    /// aggregate access-stream scan observes the synthetic rhythm.
+    #[cfg(test)]
+    pub(crate) fn test_set_access_history(
+        &self,
+        id: &MemoryId,
+        history: Vec<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let mem = self.long_term_memory.get(id)?;
+        mem.test_set_access_history(history.clone());
+        self.long_term_memory.update(&mem)?;
+        if let Some(m) = self.session_memory.read().get(id) {
+            m.test_set_access_history(history.clone());
+        }
+        if let Some(m) = self.working_memory.read().get(id) {
+            m.test_set_access_history(history);
+        }
+        Ok(())
+    }
+
+    /// R1 — Anticipatory prefetch tick (Physarum-anticipation).
+    ///
+    /// Wires the pre-existing [`retrieval::AnticipatoryPrefetch`] +
+    /// [`crate::decay_scales::learn_decay_scales`] infra onto the maintenance
+    /// path. Intended to be called ONCE per user on the HEAVY maintenance cycle
+    /// (the caller in `run_maintenance_all_users` gates on `is_heavy`).
+    ///
+    /// Per-user isolation: operates ONLY on `self` (one `MemorySystem` per user).
+    /// No cross-tenant access is possible from here.
+    ///
+    /// Pipeline (honoring the R1 amendments):
+    /// 1. **B4**: collect the user's AGGREGATE access stream and run at most ONE
+    ///    FFT (`learn_decay_scales`) over it. **I9**: the FFT is skipped entirely
+    ///    when the cached [`prefetch_tick::PrefetchUserState::scales`] are fresh.
+    /// 2. Predict which memories are due (dominant period + `last_accessed`) —
+    ///    a cheap O(n) scan, NOT a per-memory FFT.
+    /// 3. Build a [`retrieval::PrefetchContext`], call the existing
+    ///    `generate_prefetch_query()`, and execute it into a LOCAL staging buffer.
+    ///    **B1**: the session write lock is NOT held during the FFT or the query.
+    /// 4. **B1**: swap the staged candidates into the session tier under ONE
+    ///    short write lock, via `add_shared` (idempotent by id, size-bounded).
+    /// 5. **I4/J5**: update the per-user hit-rate EMA and the kill-switch
+    ///    (hysteresis band + periodic re-probe).
+    /// 6. **B11**: emit prefetch precision/volume gauges via structured tracing.
+    ///
+    /// Returns the number of memories warmed into the session tier (0 when
+    /// disabled, when no rhythm/context signal exists, or when nothing was due).
+    pub fn run_prefetch_tick(&self, user_id: &str) -> usize {
+        let now = chrono::Utc::now();
+
+        // --- Kill-switch / re-probe gate (I4/J5) -----------------------------
+        // Decide up front whether to run at all, without holding any tier lock.
+        let (run_this_tick, is_reprobe) = {
+            let st = self.prefetch_state.read();
+            (st.should_run_this_tick(), st.should_reprobe())
+        };
+        if !run_this_tick {
+            // Disabled and not yet at a re-probe window: advance the counter and
+            // bail. No FFT, no query, no lock.
+            self.prefetch_state.write().note_skipped_while_disabled();
+            tracing::debug!(
+                user_id = %user_id,
+                "prefetch tick skipped (kill-switch engaged, awaiting re-probe)"
+            );
+            return 0;
+        }
+
+        // --- Gather the per-user aggregate access stream (B4) ----------------
+        // ONE pass over the in-memory tiers; build both the aggregate timestamp
+        // stream (for the single FFT) and the per-memory last-access list (for
+        // the cheap due-prediction scan). No lock held beyond these reads.
+        let mut access_stream: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
+        let mut last_access: Vec<(MemoryId, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        {
+            let session = self.session_memory.read();
+            for mem in session.all_memories() {
+                let meta = mem.metadata_snapshot();
+                access_stream.extend(meta.access_history.iter().copied());
+                last_access.push((mem.id.clone(), meta.last_accessed));
+            }
+        }
+        {
+            let working = self.working_memory.read();
+            for mem in working.all_memories() {
+                let meta = mem.metadata_snapshot();
+                access_stream.extend(meta.access_history.iter().copied());
+                last_access.push((mem.id.clone(), meta.last_accessed));
+            }
+        }
+        let sample_count = access_stream.len();
+
+        // --- Refresh learned scales (B4 single FFT, I9 cached) ---------------
+        let need_recompute = self
+            .prefetch_state
+            .read()
+            .scales_need_recompute(sample_count, now);
+        if need_recompute {
+            // The ONE FFT for this user this tick. learn_decay_scales falls back
+            // to default scales (confidence 0) when the stream is too small.
+            access_stream.sort();
+            let learned = crate::decay_scales::learn_decay_scales(&access_stream);
+            self.prefetch_state.write().scales = Some(learned);
+        }
+
+        // Dominant (fastest) rhythm period = smallest learned scale.
+        let dominant_period_days = self
+            .prefetch_state
+            .read()
+            .scales
+            .as_ref()
+            .map(|s| s.scales[0])
+            .unwrap_or(crate::constants::LOG_PERIODIC_SCALES[0]);
+
+        // --- Predict due memories (cheap scan, no per-memory FFT) ------------
+        let due_ids = prefetch_tick::predict_due_memories(
+            &last_access,
+            dominant_period_days,
+            now,
+            crate::constants::PREFETCH_TICK_MAX_WARM,
+        );
+
+        // --- Build context + prefetch query (reuse existing infra) -----------
+        // Recent entities are seeded from the due memories so the existing
+        // entity_query path can broaden beyond the exact due set; falls back to
+        // the temporal-pattern query (time-of-day) when no entities are present.
+        let mut recent_entities: Vec<String> = Vec::new();
+        if due_ids.len() >= crate::constants::PREFETCH_MIN_DUE_CANDIDATES {
+            let due_set: std::collections::HashSet<&MemoryId> = due_ids.iter().collect();
+            let session = self.session_memory.read();
+            for mem in session.all_memories() {
+                if due_set.contains(&mem.id) {
+                    for e in mem.experience.entities.iter().take(3) {
+                        if !recent_entities.contains(e) {
+                            recent_entities.push(e.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut context = retrieval::PrefetchContext::from_current_time();
+        context.recent_entities = recent_entities;
+
+        let engine = retrieval::AnticipatoryPrefetch::with_limit(
+            crate::constants::PREFETCH_TICK_MAX_WARM,
+        );
+        let query = match engine.generate_prefetch_query(&context) {
+            Some(q) => q,
+            None => {
+                // No actionable signal this tick. Treat as a neutral (no-op)
+                // precision sample so a signal-less tick does not punish the EMA.
+                if is_reprobe {
+                    // A re-probe that produced no signal should still advance the
+                    // disabled counter rather than re-trigger immediately.
+                    self.prefetch_state.write().note_skipped_while_disabled();
+                }
+                tracing::debug!(
+                    user_id = %user_id,
+                    sample_count,
+                    "prefetch tick produced no query (no rhythm/context signal)"
+                );
+                self.prefetch_state.write().ticks_run += 1;
+                return 0;
+            }
+        };
+
+        // --- Execute the query into a LOCAL staging buffer (B1) --------------
+        // NO session write lock held here — the search may touch storage/ANN.
+        let staged: Vec<SharedMemory> = match self
+            .retriever
+            .search(&query, crate::constants::PREFETCH_TICK_MAX_WARM)
+        {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::debug!(user_id = %user_id, error = %e, "prefetch query failed");
+                Vec::new()
+            }
+        };
+
+        // --- Swap into the session tier under ONE short write lock (B1) ------
+        // add_shared is idempotent by id and honors the session tier's
+        // size-bounded eviction. We count how many were genuinely NEW (not
+        // already warm) — that is the precision proxy for the EMA.
+        let staged_total = staged.len();
+        let mut newly_warmed = 0usize;
+        if staged_total > 0 {
+            let mut session = self.session_memory.write();
+            for mem in staged {
+                let already = session.contains(&mem.id);
+                if session.add_shared(mem).is_ok() && !already {
+                    newly_warmed += 1;
+                }
+            }
+        }
+
+        // --- Update hit-rate EMA + kill-switch (I4/J5) -----------------------
+        // Precision = fraction of warmed candidates that were genuinely new.
+        let precision = if staged_total > 0 {
+            newly_warmed as f64 / staged_total as f64
+        } else {
+            0.0
+        };
+        {
+            let mut st = self.prefetch_state.write();
+            st.record_precision(precision);
+            st.ticks_run += 1;
+        }
+        let (ema_after, enabled_after) = {
+            let st = self.prefetch_state.read();
+            (st.hitrate_ema, st.enabled)
+        };
+
+        // --- B11: emit precision/volume gauges via structured tracing --------
+        tracing::info!(
+            target: "veld::prefetch",
+            user_id = %user_id,
+            prefetch_warmed = newly_warmed,
+            prefetch_candidates = staged_total,
+            prefetch_due = due_ids.len(),
+            prefetch_precision = precision,
+            prefetch_hitrate_ema = ema_after,
+            prefetch_enabled = enabled_after,
+            prefetch_reprobe = is_reprobe,
+            prefetch_samples = sample_count,
+            "anticipatory prefetch tick"
+        );
+
+        newly_warmed
+    }
+
     // =========================================================================
     // CONSOLIDATION INTROSPECTION API
     // =========================================================================
@@ -7111,5 +7433,120 @@ mod reconsolidation_expiry_tests {
             sys.has_active_shadow(&working_id),
             "working-memory-class shadow retained"
         );
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tick_integration_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fresh_system() -> (MemorySystem, TempDir) {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let sys = MemorySystem::new(config, None).expect("memory system");
+        (sys, tmp)
+    }
+
+    fn remember_now(sys: &MemorySystem, content: &str) -> MemoryId {
+        let exp = Experience {
+            content: content.to_string(),
+            ..Default::default()
+        };
+        sys.remember(exp, Some(chrono::Utc::now()))
+            .expect("remember")
+    }
+
+    /// A memory accessed on a synthetic weekly rhythm is warmed back into the
+    /// session tier by a simulated heavy prefetch tick.
+    #[test]
+    fn periodic_memory_is_warm_in_session_after_tick() {
+        let (sys, _tmp) = fresh_system();
+        let now = chrono::Utc::now();
+
+        let id = remember_now(&sys, "weekly standup notes for the platform team");
+
+        // Synthetic weekly rhythm: last access exactly one fallback-period
+        // (7 days) ago => the due-predictor marks it due under the default
+        // [7,30,365] scales (sample_count < 50 => FFT falls back, dominant = 7d).
+        let history: Vec<chrono::DateTime<chrono::Utc>> = (0..6)
+            .rev()
+            .map(|w| now - chrono::Duration::days(7 * (w + 1)))
+            .collect();
+        sys.test_set_access_history(&id, history)
+            .expect("set access history");
+
+        // Clear the session tier so ONLY the prefetch tick can re-warm it.
+        sys.test_clear_session();
+        assert!(
+            !sys.test_session_contains(&id),
+            "precondition: memory must not be warm before the tick"
+        );
+
+        let warmed = sys.run_prefetch_tick("user_a");
+
+        assert!(
+            sys.test_session_contains(&id),
+            "rhythm-predicted memory must be warm in the session tier after a heavy tick (warmed={warmed})"
+        );
+        assert!(warmed >= 1, "tick must report >=1 warmed memory");
+    }
+
+    /// Per-user isolation: user A's prefetch tick never warms user B's memory,
+    /// and vice versa. Each user is a distinct MemorySystem (the per-user earth),
+    /// so a tick can only ever touch its own tiers.
+    #[test]
+    fn prefetch_is_per_user_isolated() {
+        let (sys_a, _tmp_a) = fresh_system();
+        let (sys_b, _tmp_b) = fresh_system();
+        let now = chrono::Utc::now();
+
+        let id_a = remember_now(&sys_a, "user A private retrospective doc");
+        let id_b = remember_now(&sys_b, "user B private architecture doc");
+
+        let history: Vec<chrono::DateTime<chrono::Utc>> = (0..6)
+            .rev()
+            .map(|w| now - chrono::Duration::days(7 * (w + 1)))
+            .collect();
+        sys_a
+            .test_set_access_history(&id_a, history.clone())
+            .expect("set A history");
+        sys_b
+            .test_set_access_history(&id_b, history)
+            .expect("set B history");
+
+        sys_a.test_clear_session();
+        sys_b.test_clear_session();
+
+        // Run A's tick. It must only ever touch A's tiers.
+        sys_a.run_prefetch_tick("user_a");
+
+        assert!(
+            !sys_a.test_session_contains(&id_b),
+            "user A's session must NEVER contain user B's memory"
+        );
+        assert!(
+            !sys_b.test_session_contains(&id_a),
+            "user B's session must NEVER contain user A's memory"
+        );
+        // B's tick did not run; B's session stays empty of A's id regardless.
+        sys_b.run_prefetch_tick("user_b");
+        assert!(
+            !sys_b.test_session_contains(&id_a),
+            "user B's tick must not warm user A's memory"
+        );
+    }
+
+    /// The tick is a no-op-safe addition: running it on an empty system warms
+    /// nothing and never panics (reversion guard — existing behavior unchanged
+    /// when prefetch yields nothing).
+    #[test]
+    fn tick_on_empty_system_is_safe_noop() {
+        let (sys, _tmp) = fresh_system();
+        let warmed = sys.run_prefetch_tick("user_empty");
+        assert_eq!(warmed, 0, "empty system warms nothing");
     }
 }

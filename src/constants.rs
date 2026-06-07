@@ -1798,6 +1798,48 @@ pub const PREFETCH_RECENCY_PARTIAL_BOOST: f32 = 0.05;
 pub const PREFETCH_TEMPORAL_WINDOW_HOURS: i32 = 2;
 
 // =============================================================================
+// ANTICIPATORY PREFETCH TICK CONSTANTS (R1 — Physarum-anticipation wiring)
+// Governs the per-user prefetch tick run on the HEAVY maintenance cycle.
+// =============================================================================
+
+/// Maximum number of memories warmed into the session tier per prefetch tick.
+/// Bounds the write volume of a single tick; the session tier's own
+/// size-bounded eviction is the hard ceiling.
+pub const PREFETCH_TICK_MAX_WARM: usize = 20;
+
+/// I9: minimum growth in the per-user access-sample count before the cached
+/// `LearnedScales` FFT is recomputed. Below this delta the cached scales are
+/// reused, so the FFT does NOT run every tick.
+pub const PREFETCH_SCALES_RECOMPUTE_SAMPLE_DELTA: usize = 25;
+
+/// I9: maximum age (hours) of cached `LearnedScales` before they are considered
+/// stale and recomputed regardless of sample growth.
+pub const PREFETCH_SCALES_STALE_HOURS: i64 = 24;
+
+/// I4: EMA smoothing factor for the per-user prefetch hit-rate (precision).
+/// Higher = more responsive to recent ticks; lower = smoother.
+pub const PREFETCH_HITRATE_EMA_ALPHA: f64 = 0.3;
+
+/// I4/J5: precision floor below which prefetch is disabled for a user
+/// (kill-switch engages). Hysteresis: must drop below this to disable.
+pub const PREFETCH_PRECISION_DISABLE_FLOOR: f64 = 0.1;
+
+/// I4/J5: precision ceiling above which a disabled user's prefetch is
+/// re-enabled. The gap between disable-floor and re-enable-ceiling is the
+/// hysteresis band, preventing flapping around a single threshold.
+pub const PREFETCH_PRECISION_REENABLE_CEILING: f64 = 0.25;
+
+/// J5: number of heavy ticks a disabled user waits before a re-probe (trial
+/// window). On a re-probe tick prefetch runs once even while disabled, so a
+/// transient precision dip cannot disable a user permanently.
+pub const PREFETCH_REPROBE_INTERVAL_TICKS: u32 = 8;
+
+/// Minimum number of due candidates required before a tick predicts memories
+/// from the per-memory rhythm path (below this, the aggregate-context path is
+/// used alone). Keeps the tick cheap on cold/sparse users.
+pub const PREFETCH_MIN_DUE_CANDIDATES: usize = 1;
+
+// =============================================================================
 // MEMORY REPLAY CONSTANTS (SHO-105)
 // Based on sleep consolidation research: hippocampal replay during rest
 // strengthens important memory traces through co-activation
