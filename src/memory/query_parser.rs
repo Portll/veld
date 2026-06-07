@@ -26,6 +26,7 @@
 //! - Based on TEMPR approach (Hindsight paper achieving 89.6% on LoCoMo)
 
 use crate::constants::{IC_ADJECTIVE, IC_NOUN, IC_VERB};
+use crate::memory::temporal_facts::{resolve_relative_time, TemporalBound};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
@@ -208,6 +209,16 @@ pub struct TemporalExtraction {
     pub earliest: Option<NaiveDate>,
     /// Latest date mentioned
     pub latest: Option<NaiveDate>,
+    /// Query-side temporal bounds resolved from relative expressions.
+    ///
+    /// Populated by the relative pre-pass in `extract_temporal_refs` when the
+    /// query contains phrases like "yesterday", "last week", "next month", etc.
+    /// Each entry corresponds to one matched relative phrase, in text order.
+    ///
+    /// Callers should treat these as opaque — do NOT match on specific
+    /// `TemporalBound` variants here; a later pass (R4) will add After/Before/Fuzzy
+    /// variants that must flow through transparently.
+    pub query_bounds: Vec<TemporalBound>,
 }
 
 impl TemporalExtraction {
@@ -225,7 +236,56 @@ impl TemporalExtraction {
             (None, None) => None,
         }
     }
+
+    /// Return the query-side `TemporalBound`s resolved from relative phrases.
+    ///
+    /// Returns an empty slice when no relative expressions were found (the
+    /// behaviour is identical to pre-R1: callers that do not use bounds
+    /// are unaffected).
+    pub fn bounds(&self) -> &[TemporalBound] {
+        &self.query_bounds
+    }
 }
+
+/// Extract temporal references from text
+///
+/// Uses date_time_parser crate for natural language date parsing.
+/// Handles:
+/// - Absolute dates: "May 7, 2023", "2023-05-07", "07/05/2023"
+/// - Relative dates: "yesterday", "last week", "3 days ago"
+/// - Day of week: "on Monday", "last Tuesday"
+/// - Month/year: "in May", "last year", "2023"
+/// Ordered list of relative-time phrase patterns that `resolve_relative_time`
+/// handles.  Listed longest-first so substring matches don't shadow longer
+/// ones (e.g. "the day before yesterday" before "yesterday").
+///
+/// Phrases are lower-cased; callers pass `text.to_lowercase()` for matching.
+const RELATIVE_PHRASES: &[&str] = &[
+    // Multi-word — must come before any substring they contain.
+    "the day before yesterday",
+    "the day after tomorrow",
+    "last weekend",
+    "next weekend",
+    "this weekend",
+    "this morning",
+    "this afternoon",
+    "this evening",
+    "next month",
+    "last month",
+    "this month",
+    "next year",
+    "last year",
+    "this year",
+    "next week",
+    "last week",
+    "this week",
+    // Single-word / short phrases.
+    "yesterday",
+    "tomorrow",
+    "today",
+    // "N units ago" — matched by a trailing-" ago" scan below; not listed here.
+    // Day-of-week compounds are also handled in the scan loop below.
+];
 
 /// Extract temporal references from text
 ///
@@ -240,6 +300,148 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
     let mut refs = Vec::new();
     let mut earliest: Option<NaiveDate> = None;
     let mut latest: Option<NaiveDate> = None;
+
+    // -----------------------------------------------------------------------
+    // Relative-date pre-pass (F6 fix)
+    //
+    // `dateparser` is absolute-date oriented and returns Err for all relative
+    // phrases like "yesterday", "last week", "next month".  This pre-pass
+    // detects the same vocabulary handled by `resolve_relative_time` (the
+    // write-side resolver), calls it with the current wall-clock time, and
+    // stores the resulting `TemporalBound` in `query_bounds`.
+    //
+    // CRITICAL: results are forwarded OPAQUELY — we never match on specific
+    // TemporalBound variants here so that After/Before/Fuzzy added in R4 pass
+    // through without any change to this function.
+    // -----------------------------------------------------------------------
+    let text_lower = text.to_lowercase();
+    let mut query_bounds: Vec<TemporalBound> = Vec::new();
+
+    // Pass 1: fixed-phrase matches.
+    for &phrase in RELATIVE_PHRASES {
+        if text_lower.contains(phrase) {
+            let resolved = resolve_relative_time(phrase, now);
+            let bound = resolved.to_bound();
+            query_bounds.push(bound);
+
+            // Also synthesise a TemporalRef so existing callers that inspect
+            // `refs`/`earliest`/`latest` benefit from the resolved date.
+            if let crate::memory::temporal_facts::ResolvedTime::ExactDate(d) = resolved {
+                let pos = text_lower.find(phrase).unwrap_or(0);
+                if !refs.iter().any(|r: &TemporalRef| r.date == d) {
+                    refs.push(TemporalRef {
+                        date: d,
+                        original_text: phrase.to_string(),
+                        confidence: 0.9,
+                        position: pos,
+                        ref_type: TemporalRefType::Relative,
+                    });
+                    update_bounds(&mut earliest, &mut latest, d);
+                }
+            } else if let crate::memory::temporal_facts::ResolvedTime::MonthYear { month, year } =
+                resolve_relative_time(phrase, now)
+            {
+                // Use the first day of the month as the representative date.
+                if let Some(d) = NaiveDate::from_ymd_opt(year, month, 1) {
+                    let pos = text_lower.find(phrase).unwrap_or(0);
+                    if !refs.iter().any(|r: &TemporalRef| r.date == d) {
+                        refs.push(TemporalRef {
+                            date: d,
+                            original_text: phrase.to_string(),
+                            confidence: 0.85,
+                            position: pos,
+                            ref_type: TemporalRefType::Relative,
+                        });
+                        update_bounds(&mut earliest, &mut latest, d);
+                    }
+                }
+            } else if let crate::memory::temporal_facts::ResolvedTime::Year(year) =
+                resolve_relative_time(phrase, now)
+            {
+                if let Some(d) = NaiveDate::from_ymd_opt(year, 1, 1) {
+                    let pos = text_lower.find(phrase).unwrap_or(0);
+                    if !refs.iter().any(|r: &TemporalRef| r.date == d) {
+                        refs.push(TemporalRef {
+                            date: d,
+                            original_text: phrase.to_string(),
+                            confidence: 0.8,
+                            position: pos,
+                            ref_type: TemporalRefType::Relative,
+                        });
+                        update_bounds(&mut earliest, &mut latest, d);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: "N days/weeks/months ago" — scan for " ago" suffix.
+    if text_lower.contains(" ago") {
+        // Try to resolve the entire text as an "ago" expression.
+        let resolved = resolve_relative_time(&text_lower, now);
+        if let crate::memory::temporal_facts::ResolvedTime::ExactDate(d) = resolved {
+            let bound = crate::memory::temporal_facts::ResolvedTime::ExactDate(d).to_bound();
+            if !query_bounds
+                .iter()
+                .any(|b| matches!(b, TemporalBound::Point(p) if *p == d))
+            {
+                query_bounds.push(bound);
+                if !refs.iter().any(|r: &TemporalRef| r.date == d) {
+                    refs.push(TemporalRef {
+                        date: d,
+                        original_text: text.to_string(),
+                        confidence: 0.85,
+                        position: 0,
+                        ref_type: TemporalRefType::Relative,
+                    });
+                    update_bounds(&mut earliest, &mut latest, d);
+                }
+            }
+        }
+    }
+
+    // Pass 3: "last/next <weekday>" compounds.
+    let weekday_names = [
+        "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    ];
+    for day in weekday_names {
+        for prefix in ["last ", "next ", "this "] {
+            let phrase = format!("{}{}", prefix, day);
+            if text_lower.contains(&phrase) {
+                let resolved = resolve_relative_time(&phrase, now);
+                if let crate::memory::temporal_facts::ResolvedTime::ExactDate(d) = resolved {
+                    let bound =
+                        crate::memory::temporal_facts::ResolvedTime::ExactDate(d).to_bound();
+                    if !query_bounds
+                        .iter()
+                        .any(|b| matches!(b, TemporalBound::Point(p) if *p == d))
+                    {
+                        query_bounds.push(bound);
+                        if !refs.iter().any(|r: &TemporalRef| r.date == d) {
+                            let pos = text_lower.find(&phrase).unwrap_or(0);
+                            refs.push(TemporalRef {
+                                date: d,
+                                original_text: phrase.clone(),
+                                confidence: 0.9,
+                                position: pos,
+                                ref_type: TemporalRefType::Relative,
+                            });
+                            update_bounds(&mut earliest, &mut latest, d);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Emit a debug trace when no temporal window was resolved — this is the
+    // silent no-op where the retrieval gate returns all facts unfiltered.
+    if query_bounds.is_empty() {
+        tracing::debug!(
+            query = %text,
+            "temporal pre-pass: no relative phrases matched; query temporal window is unresolved"
+        );
+    }
 
     // Helper to validate date is in reasonable range (1900-2100)
     let is_valid_date = |date: &NaiveDate| -> bool {
@@ -309,6 +511,7 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
         refs,
         earliest,
         latest,
+        query_bounds,
     }
 }
 
@@ -4472,5 +4675,103 @@ mod tests {
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
         assert!(subs.len() >= 2, "Should decompose comparison query, got {:?}", subs);
+    }
+
+    // =====================================================================
+    // RELATIVE-DATE PRE-PASS TESTS (R1 / F6)
+    // =====================================================================
+
+    /// Verify that dateparser alone cannot resolve relative expressions —
+    /// confirms F6 gap is real and the pre-pass is necessary.
+    #[test]
+    fn probe_dateparser_relative_expressions() {
+        // Record which inputs dateparser resolves vs. fails.
+        // All five should return Err; any Ok would reduce the scope of the fix.
+        let cases = [
+            "next month",
+            "yesterday",
+            "last week",
+            "3 days ago",
+            "tomorrow",
+        ];
+        for input in cases {
+            let result = dateparser::parse(input);
+            assert!(
+                result.is_err(),
+                "dateparser unexpectedly resolved {:?} — F6 gap may be narrower than assumed",
+                input
+            );
+        }
+    }
+
+    /// "yesterday" query must yield at least one resolved TemporalBound via bounds().
+    #[test]
+    fn test_relative_prepass_yesterday_produces_bound() {
+        let extraction = extract_temporal_refs("what did she do yesterday");
+        let bounds = extraction.bounds();
+        assert!(
+            !bounds.is_empty(),
+            "Expected at least one TemporalBound for 'yesterday' query, got none"
+        );
+        // The bound must be a resolved Point (not Unknown), but we deliberately
+        // avoid matching on the variant name to stay R4-transparent.
+        let has_resolved = bounds
+            .iter()
+            .any(|b| !matches!(b, crate::memory::temporal_facts::TemporalBound::Unknown));
+        assert!(
+            has_resolved,
+            "Expected a non-Unknown TemporalBound for 'yesterday', got: {:?}",
+            bounds
+        );
+    }
+
+    /// "next month" query must yield at least one resolved TemporalBound.
+    #[test]
+    fn test_relative_prepass_next_month_produces_bound() {
+        let extraction = extract_temporal_refs("what are we planning next month");
+        let bounds = extraction.bounds();
+        assert!(
+            !bounds.is_empty(),
+            "Expected at least one TemporalBound for 'next month' query, got none"
+        );
+        let has_resolved = bounds
+            .iter()
+            .any(|b| !matches!(b, crate::memory::temporal_facts::TemporalBound::Unknown));
+        assert!(
+            has_resolved,
+            "Expected a non-Unknown TemporalBound for 'next month', got: {:?}",
+            bounds
+        );
+    }
+
+    /// A query with no relative phrases must produce no query_bounds and still
+    /// behave exactly as before — regression guard for the additive contract.
+    #[test]
+    fn test_relative_prepass_no_false_positives_for_absolute_query() {
+        let extraction = extract_temporal_refs("robot detected obstacle");
+        assert!(
+            extraction.bounds().is_empty(),
+            "Non-temporal query should produce zero query_bounds, got: {:?}",
+            extraction.bounds()
+        );
+    }
+
+    /// "last week" query must produce a bound and also populate refs/earliest/latest
+    /// — the additive guarantee (existing fields are still updated).
+    #[test]
+    fn test_relative_prepass_last_week_populates_refs_and_bounds() {
+        let extraction = extract_temporal_refs("what happened last week");
+        assert!(
+            !extraction.bounds().is_empty(),
+            "Expected bounds for 'last week'"
+        );
+        assert!(
+            extraction.has_temporal_refs(),
+            "Expected refs to be populated for 'last week'"
+        );
+        assert!(
+            extraction.earliest.is_some(),
+            "Expected earliest to be set for 'last week'"
+        );
     }
 }
