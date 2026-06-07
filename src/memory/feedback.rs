@@ -2061,6 +2061,12 @@ impl RetrievalTraceStore {
 
     /// Capture one PENDING trace row (one per (recall, memory)). Best-effort:
     /// failures are logged, never propagated to the recall path.
+    ///
+    /// Bound enforcement (B9 — TTL eviction + reservoir cap) is intentionally
+    /// NOT called here. The recall write-site emits one row per result in a
+    /// tight loop; calling `enforce_pending_bound` per insert would run a full
+    /// KV prefix scan per row. Callers MUST call `enforce_pending_bound` once
+    /// after the loop (batch enforcement), not once per insert.
     pub fn record_pending(&self, trace: &RetrievalTrace) {
         let Some(kv) = &self.kv else { return };
         match serde_json::to_vec(trace) {
@@ -2071,8 +2077,6 @@ impl RetrievalTraceStore {
             }
             Err(e) => tracing::warn!(error = %e, "LTR trace: failed to serialize pending row"),
         }
-        // Bound the PENDING stage after each insert (B9). Cheap when under cap.
-        self.enforce_pending_bound();
     }
 
     /// Read all PENDING rows (un-labeled), newest-irrelevant ordering.
@@ -2911,8 +2915,9 @@ mod tests {
     }
 
     /// J3: a PENDING row past its TTL with no label is EVICTED and counted as a
-    /// label-join miss — never silently dropped. We assert the metric increments
-    /// by exactly the number of expired rows and that the row leaves PENDING.
+    /// label-join miss — never silently dropped. Enforcement is now BATCHED:
+    /// `record_pending` no longer triggers a full scan per insert; eviction fires
+    /// on the first `enforce_pending_bound` call after the batch of inserts.
     #[test]
     fn test_trace_ttl_eviction_counts_join_miss() {
         let store = mem_store();
@@ -2921,40 +2926,94 @@ mod tests {
         let fresh = MemoryId(Uuid::new_v4());
         store.record_pending(&pending_trace(fresh.clone(), 0));
 
-        // `record_pending` eagerly enforces the PENDING bound (B9), so an expired
-        // row is evicted AND counted as a join-miss at INSERTION time. Capture the
-        // counter before inserting the expired row to measure exactly that.
-        let before = crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.get();
-
         let stale = MemoryId(Uuid::new_v4());
         let mut stale_row = pending_trace(stale.clone(), 1);
         stale_row.created_at = Utc::now()
             - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
         store.record_pending(&stale_row);
 
+        // After the batch of inserts the expired row is still in KV — eviction
+        // has NOT fired yet (no per-insert scan). Both rows are visible.
+        assert_eq!(
+            store.pending_count(),
+            2,
+            "expired row not yet evicted — enforcement is deferred to batch call"
+        );
+
+        // Now simulate the batch-enforcement call (one per recall, not per insert).
+        let before = crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.get();
+        let evicted = store.enforce_pending_bound();
         let after = crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.get();
 
+        assert_eq!(evicted, 1, "enforce evicts exactly the one expired row");
         // The expired row's lost label is COUNTED, not silently dropped (J3).
-        // >= before+1 (not == ): the counter is process-global and unit tests run in
-        // parallel, so another test may also increment it concurrently.
+        // >= before+1: counter is process-global; parallel tests may also increment.
         assert!(
             after >= before + 1,
             "the lost label is COUNTED as a join miss, not silently dropped \
              (before={before}, after={after})"
         );
 
-        // An explicit enforce is now a no-op: the expired row was already evicted at
-        // insert time, and the fresh row is not past TTL.
+        // A second enforce is now a no-op: only the fresh row remains.
         assert_eq!(
             store.enforce_pending_bound(),
             0,
-            "expired row already evicted at insert; fresh row survives"
+            "second enforce is a no-op; fresh row survives"
         );
 
         // Fresh row preserved; expired row gone.
         let pend = store.load_pending();
         assert_eq!(pend.len(), 1);
         assert_eq!(pend[0].memory_id, fresh);
+    }
+
+    /// Confirms that a single insert does NOT trigger a full scan (no per-insert
+    /// enforcement), and that calling `enforce_pending_bound` once after N inserts
+    /// still correctly applies the TTL and reservoir cap.
+    #[test]
+    fn test_pending_bound_batch_enforced_not_per_insert() {
+        let store = mem_store();
+
+        // Insert N fresh rows — none should be evicted by record_pending itself.
+        const N: usize = 5;
+        let fresh_ids: Vec<MemoryId> = (0..N).map(|_| MemoryId(Uuid::new_v4())).collect();
+        for (rank, mid) in fresh_ids.iter().enumerate() {
+            store.record_pending(&pending_trace(mid.clone(), rank));
+        }
+
+        // Also insert two expired rows.
+        let expired_ids: Vec<MemoryId> = (0..2).map(|_| MemoryId(Uuid::new_v4())).collect();
+        for (rank, mid) in expired_ids.iter().enumerate() {
+            let mut row = pending_trace(mid.clone(), N + rank);
+            row.created_at = Utc::now() - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+            store.record_pending(&row);
+        }
+
+        // No enforcement has fired yet — all N+2 rows are in KV.
+        assert_eq!(
+            store.pending_count(),
+            N + 2,
+            "no per-insert enforcement; all rows present before batch call"
+        );
+
+        // One batch enforce: only the 2 expired rows should be evicted.
+        let evicted = store.enforce_pending_bound();
+        assert_eq!(evicted, 2, "batch enforce evicts exactly the expired rows");
+        assert_eq!(
+            store.pending_count(),
+            N,
+            "fresh rows survive the batch enforce"
+        );
+
+        // Confirm the surviving rows are the originally-fresh ones.
+        let pend_ids: std::collections::HashSet<MemoryId> =
+            store.load_pending().into_iter().map(|t| t.memory_id).collect();
+        for mid in &fresh_ids {
+            assert!(pend_ids.contains(mid), "fresh row {mid:?} must survive");
+        }
+        for mid in &expired_ids {
+            assert!(!pend_ids.contains(mid), "expired row {mid:?} must be evicted");
+        }
     }
 
     /// An expired PENDING row can no longer be joined (it is past TTL): the join
