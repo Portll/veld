@@ -1391,10 +1391,11 @@ impl MemoryStorage {
         match &self.record_cryptors {
             Some(cryptors) => cryptors
                 .active()
-                // Records are epoch-bound only (empty AAD identity) for now. Binding
-                // the memory-id needs it threaded to decode_stored's callers and the
-                // rocksdb-key==memory-id invariant audited — a tracked follow-up.
-                .encrypt_record(&plaintext, b"")
+                // Bind the record to its identity: AAD = the memory-id (== the
+                // primary-CF key, id.0.as_bytes()). A ciphertext lifted from one
+                // key and replanted at another fails to decrypt (anti-swap /
+                // anti-relocation), and tamper of the stored id is caught.
+                .encrypt_record(&plaintext, memory.id.0.as_bytes())
                 .context("Failed to encrypt memory record"),
             None => Ok(plaintext),
         }
@@ -1405,7 +1406,12 @@ impl MemoryStorage {
     ///
     /// Errors if a record is encrypted but no key is configured, or if decryption
     /// fails — callers must NOT treat that as a plaintext record.
-    fn decode_stored(&self, data: &[u8]) -> Result<(Memory, bool)> {
+    ///
+    /// `id` is the record's identity (its primary-CF key, id.0.as_bytes()), bound
+    /// into the AEAD AAD by serialize_memory. Pass the rocksdb key the value was
+    /// read at; a mismatch fails decryption (anti-swap). Unused on the plaintext
+    /// (legacy) path.
+    fn decode_stored(&self, id: &[u8], data: &[u8]) -> Result<(Memory, bool)> {
         if crate::keystore::is_encrypted_record(data) {
             let cryptors = self.record_cryptors.as_ref().ok_or_else(|| {
                 anyhow!("encountered an encrypted record but no keystore/key is configured")
@@ -1421,7 +1427,7 @@ impl MemoryStorage {
                 )
             })?;
             let plaintext = cryptor
-                .decrypt_record(data, b"")
+                .decrypt_record(data, id)
                 .context("Failed to decrypt memory record")?;
             deserialize_memory(&plaintext)
         } else {
@@ -1860,7 +1866,7 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (memory, needs_migration) = self.decode_stored(&value).with_context(|| {
+                let (memory, needs_migration) = self.decode_stored(key, &value).with_context(|| {
                     format!("Failed to decode memory {} ({} bytes)", id.0, value.len())
                 })?;
 
@@ -2608,7 +2614,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = self.decode_stored(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if memory.parent_id.is_none() {
                     roots.push(memory.id);
                 }
@@ -2720,7 +2726,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = self.decode_stored(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if !memory.is_forgotten() {
                     memories.push(memory);
                 }
@@ -2740,7 +2746,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = self.decode_stored(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if !memory.compressed && !memory.is_forgotten() && memory.created_at < cutoff {
                     memories.push(memory);
                 }
@@ -2763,7 +2769,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            match self.decode_stored(&value) {
+            match self.decode_stored(&key, &value) {
                 Ok((mut memory, _)) => {
                     if memory.is_forgotten() {
                         continue;
@@ -2814,7 +2820,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            match self.decode_stored(&value) {
+            match self.decode_stored(&key, &value) {
                 Ok((mut memory, _)) => {
                     if memory.is_forgotten() {
                         continue;
@@ -2863,7 +2869,7 @@ impl MemoryStorage {
             if key.len() != 16 {
                 continue;
             }
-            if let Ok((memory, _)) = self.decode_stored(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 if regex.is_match(&memory.experience.content) {
                     to_delete.push(memory.id);
                     count += 1;
@@ -2919,7 +2925,7 @@ impl MemoryStorage {
                         continue;
                     }
 
-                    match self.decode_stored(&value) {
+                    match self.decode_stored(&key, &value) {
                         Ok((memory, _)) => {
                             if memory.is_forgotten() {
                                 continue;
@@ -3052,7 +3058,7 @@ impl MemoryStorage {
                 );
                 to_delete.push(key.to_vec());
             } else if crate::keystore::is_encrypted_record(&value)
-                && self.decode_stored(&value).is_err()
+                && self.decode_stored(&key, &value).is_err()
             {
                 // An encrypted record that won't decode means wrong/missing key or
                 // tamper — indistinguishable in AES-GCM. NEVER auto-delete (that would
@@ -3129,7 +3135,7 @@ impl MemoryStorage {
             }
 
             // Not current format - try with fallback
-            match self.decode_stored(&value) {
+            match self.decode_stored(&key, &value) {
                 Ok((memory, _)) => {
                     // Successfully deserialized legacy format - queue for migration
                     to_migrate.push((key.to_vec(), memory));
@@ -3705,7 +3711,7 @@ impl MemoryStorage {
             }
 
             // Try to deserialize as memory
-            if let Ok((memory, _)) = self.decode_stored(&value) {
+            if let Ok((memory, _)) = self.decode_stored(&key, &value) {
                 // Check if vector mapping exists and has text vectors
                 let has_mapping = match self.get_vector_mapping(&memory.id) {
                     Ok(Some(entry)) => entry.text_vectors().is_some_and(|v| !v.is_empty()),
