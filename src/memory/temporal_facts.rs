@@ -30,8 +30,6 @@ pub enum EventType {
     Occurred,
     /// Event was mentioned in past tense referring to history ("I painted that in 2022")
     Historical,
-    /// Recurring event ("We always go camping in summer")
-    Recurring,
 }
 
 /// A temporal fact extracted from conversation
