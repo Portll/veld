@@ -778,6 +778,261 @@ impl TemporalFactStore {
 
         Ok(facts)
     }
+
+    // =========================================================================
+    // R5: named-event second-hop resolution (write-time, cycle-safe, B2/B3)
+    // =========================================================================
+
+    /// Resolve the `resolved_time` of a single fact whose relative time
+    /// expression references a NAMED EVENT (e.g. "after the wedding") rather
+    /// than a calendar phrase.
+    ///
+    /// **B2 — write-time only.**  Resolution is performed once, at store time,
+    /// against facts that ALREADY exist in the database.  If the referenced
+    /// event is not yet stored (forward reference), the bound stays `Unknown`.
+    /// No back-fill cascade is ever triggered when later events arrive.
+    ///
+    /// **B3 — depth-bounded + cycle-safe.**  The hop depth is capped at 2 and a
+    /// `visited` set of fact-ids prevents infinite loops such as
+    /// "A after B" + "B after A".
+    ///
+    /// Returns an updated copy of `fact` if the hop succeeded, or the original
+    /// unchanged fact if: (a) the resolved_time is already concrete, (b) the
+    /// relative_time contains no recognised after/before preposition, (c) the
+    /// stripped object resolves to a date (not a named event), or (d) no
+    /// matching stored fact is found.
+    pub fn resolve_named_event_hop(
+        &self,
+        user_id: &str,
+        fact: &TemporalFact,
+        visited: &mut HashSet<String>,
+        depth: u8,
+    ) -> TemporalFact {
+        // Hard depth limit.
+        if depth >= 2 {
+            return fact.clone();
+        }
+
+        // Only attempt resolution when the current resolved_time is Unknown or
+        // RelativeDescription — if it is already concrete we have nothing to do.
+        match &fact.resolved_time {
+            ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {}
+            _ => return fact.clone(),
+        }
+
+        // Extract the relative_time string — nothing to do without one.
+        let rel = match &fact.relative_time {
+            Some(r) => r.clone(),
+            None => return fact.clone(),
+        };
+        let rel_lower = rel.to_lowercase();
+
+        // Detect a leading preposition and strip it.
+        // Returns (is_after: bool, object_phrase: &str) or None.
+        let (is_after, object_phrase) = {
+            let after_prefixes = ["since ", "from ", "after "];
+            let before_prefixes = ["prior to ", "before ", "until "];
+
+            if let Some(rest) = after_prefixes
+                .iter()
+                .find_map(|p| rel_lower.strip_prefix(p))
+            {
+                (true, rest)
+            } else if let Some(rest) = before_prefixes
+                .iter()
+                .find_map(|p| rel_lower.strip_prefix(p))
+            {
+                (false, rest)
+            } else {
+                // No recognised preposition — not a named-event phrase.
+                return fact.clone();
+            }
+        };
+
+        // Guard: if the object phrase already resolves to a concrete date via
+        // `resolve_relative_time`, the R4 path already handled it correctly and
+        // we must not override.
+        let probe = resolve_relative_time(object_phrase, fact.conversation_date);
+        match &probe {
+            ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {
+                // Object is a named event — continue with second-hop lookup.
+            }
+            _ => {
+                // The object is a date/relative-date phrase; R4 would have handled
+                // it, but if it still arrived here as Unknown the probe now gives
+                // us a concrete anchor — use it directly.
+                let resolved = if is_after {
+                    match &probe {
+                        ResolvedTime::ExactDate(d) => ResolvedTime::After(*d),
+                        ResolvedTime::MonthYear { month, year } => {
+                            match last_day_of_month(*year, *month) {
+                                Some(d) => ResolvedTime::After(d),
+                                None => return fact.clone(),
+                            }
+                        }
+                        ResolvedTime::Year(y) => {
+                            match NaiveDate::from_ymd_opt(*y, 12, 31) {
+                                Some(d) => ResolvedTime::After(d),
+                                None => return fact.clone(),
+                            }
+                        }
+                        other => other.clone(),
+                    }
+                } else {
+                    match &probe {
+                        ResolvedTime::ExactDate(d) => ResolvedTime::Before(*d),
+                        ResolvedTime::MonthYear { month, year } => {
+                            match NaiveDate::from_ymd_opt(*year, *month, 1) {
+                                Some(d) => ResolvedTime::Before(d),
+                                None => return fact.clone(),
+                            }
+                        }
+                        ResolvedTime::Year(y) => {
+                            match NaiveDate::from_ymd_opt(*y, 1, 1) {
+                                Some(d) => ResolvedTime::Before(d),
+                                None => return fact.clone(),
+                            }
+                        }
+                        other => other.clone(),
+                    }
+                };
+                let mut updated = fact.clone();
+                updated.resolved_time = resolved;
+                return updated;
+            }
+        }
+
+        // Stem each word in the object phrase and search the event index.
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stopwords: HashSet<&str> = [
+            "the", "a", "an", "of", "in", "at", "on", "to", "for", "and", "or",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let keywords: Vec<String> = object_phrase
+            .split_whitespace()
+            .filter(|w| w.len() > 1 && !stopwords.contains(*w))
+            .map(|w| stemmer.stem(w).to_string())
+            .collect();
+
+        if keywords.is_empty() {
+            return fact.clone();
+        }
+
+        // Search by each keyword stem; collect all candidate fact ids.
+        let mut candidates: Vec<TemporalFact> = Vec::new();
+        for kw in &keywords {
+            if let Ok(found) = self.find_by_event(user_id, kw, 10) {
+                for f in found {
+                    if !candidates.iter().any(|c: &TemporalFact| c.id == f.id) {
+                        candidates.push(f);
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            // Forward reference — no matching event stored yet.  B2: leave Unknown.
+            return fact.clone();
+        }
+
+        // Pick the most recent candidate by conversation_date.
+        // For "after X" we want the event's latest date to anchor the lower bound.
+        // For "before X" we want the event's earliest date to anchor the upper bound.
+        let anchor_fact = if is_after {
+            candidates
+                .iter()
+                .max_by_key(|f| f.conversation_date)
+                .unwrap()
+        } else {
+            candidates
+                .iter()
+                .min_by_key(|f| f.conversation_date)
+                .unwrap()
+        };
+
+        // Cycle guard: if anchor fact's id is already in the visited set, stop.
+        if visited.contains(&anchor_fact.id) {
+            return fact.clone();
+        }
+        visited.insert(fact.id.clone());
+
+        // Recursively resolve the anchor fact if it is itself unresolved,
+        // within the depth budget (depth+1).
+        let anchor_resolved: ResolvedTime = match &anchor_fact.resolved_time {
+            ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {
+                // Recurse one level deeper to resolve the anchor.
+                let resolved_anchor =
+                    self.resolve_named_event_hop(user_id, anchor_fact, visited, depth + 1);
+                resolved_anchor.resolved_time
+            }
+            other => other.clone(),
+        };
+
+        // Extract the anchor date from the resolved time.
+        let anchor_date: Option<NaiveDate> = if is_after {
+            // For "after X": use the LATEST day covered by the anchor's resolved time.
+            match &anchor_resolved {
+                ResolvedTime::ExactDate(d) => Some(*d),
+                ResolvedTime::MonthYear { month, year } => last_day_of_month(*year, *month),
+                ResolvedTime::Year(y) => NaiveDate::from_ymd_opt(*y, 12, 31),
+                ResolvedTime::After(d) | ResolvedTime::Before(d) => Some(*d),
+                ResolvedTime::Around { centre, .. } => Some(*centre),
+                _ => None,
+            }
+        } else {
+            // For "before X": use the EARLIEST day covered by the anchor's resolved time.
+            match &anchor_resolved {
+                ResolvedTime::ExactDate(d) => Some(*d),
+                ResolvedTime::MonthYear { month, year } => NaiveDate::from_ymd_opt(*year, *month, 1),
+                ResolvedTime::Year(y) => NaiveDate::from_ymd_opt(*y, 1, 1),
+                ResolvedTime::After(d) | ResolvedTime::Before(d) => Some(*d),
+                ResolvedTime::Around { centre, .. } => Some(*centre),
+                _ => None,
+            }
+        };
+
+        match anchor_date {
+            Some(d) => {
+                let mut updated = fact.clone();
+                updated.resolved_time = if is_after {
+                    ResolvedTime::After(d)
+                } else {
+                    ResolvedTime::Before(d)
+                };
+                updated
+            }
+            None => fact.clone(),
+        }
+    }
+
+    /// Apply named-event second-hop resolution to a batch of newly extracted
+    /// facts (before they are stored).
+    ///
+    /// Each fact is resolved independently; the call is idempotent on facts
+    /// that already have a concrete `resolved_time`.  The visited set is
+    /// per-fact (not shared across facts) so facts in the batch do not
+    /// influence each other's cycle detection.
+    ///
+    /// Facts that are already indexed (from prior store calls) may also be used
+    /// as anchors — this is intentional and correct.  Facts in `new_facts` are
+    /// NOT used as anchors for each other (forward references within the same
+    /// batch stay `Unknown`) because they have not yet been indexed.
+    pub fn resolve_named_event_hops(
+        &self,
+        user_id: &str,
+        new_facts: Vec<TemporalFact>,
+    ) -> Vec<TemporalFact> {
+        new_facts
+            .into_iter()
+            .map(|fact| {
+                let mut visited = HashSet::new();
+                self.resolve_named_event_hop(user_id, &fact, &mut visited, 0)
+            })
+            .collect()
+    }
 }
 
 // ============================================================================
@@ -2320,5 +2575,208 @@ mod tests {
                 "old variant sortable string must be unchanged after round-trip"
             );
         }
+    }
+
+    // =========================================================================
+    // R5: named-event second-hop resolution
+    // =========================================================================
+    //
+    // All three tests below use the TempDir+DB+TemporalFactStore pattern from
+    // `test_temporal_fact_as_of_returns_historical_state`.
+    //
+    // Design constraints verified:
+    //   B2 — write-time only: forward-ref (event stored AFTER the referencing
+    //        fact) stays Unknown (test b).
+    //   B3 — cycle-safe: A "after B" + B "after A" terminates without
+    //        hang/overflow (test c).
+
+    /// (a) A "wedding" fact is stored first (ExactDate).  A second fact with
+    /// relative_time "after the wedding" resolves to After(wedding_date).
+    #[test]
+    fn test_r5_named_event_resolves_after_wedding() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let conv = conv();
+        let wedding_date = NaiveDate::from_ymd_opt(2023, 3, 15).unwrap();
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        // Store the wedding fact first.
+        let wedding_fact = TemporalFact {
+            id: "tf-wedding".to_string(),
+            entity: "alice".to_string(),
+            event: "wedding".to_string(),
+            event_stems: vec!["wed".to_string()],
+            event_type: EventType::Occurred,
+            relative_time: Some("2023-03-15".to_string()),
+            resolved_time: ResolvedTime::ExactDate(wedding_date),
+            source_memory_id: memory_id.clone(),
+            conversation_date: conv,
+            confidence: 0.9,
+            source_text: "Alice had her wedding on March 15, 2023".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+        store.store("user-r5a", &wedding_fact).unwrap();
+
+        // Now create a fact that references "after the wedding" (Unknown resolved).
+        let after_fact = TemporalFact {
+            id: "tf-after-wedding".to_string(),
+            entity: "alice".to_string(),
+            event: "honeymoon".to_string(),
+            event_stems: vec!["honeymoon".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the wedding".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id,
+            conversation_date: conv,
+            confidence: 0.8,
+            source_text: "Alice is planning the honeymoon after the wedding".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        let mut visited = std::collections::HashSet::new();
+        let resolved = store.resolve_named_event_hop("user-r5a", &after_fact, &mut visited, 0);
+
+        match resolved.resolved_time {
+            ResolvedTime::After(d) => {
+                assert_eq!(d, wedding_date, "should anchor on wedding date");
+            }
+            other => panic!("expected After(wedding_date), got {other:?}"),
+        }
+    }
+
+    /// (b) Forward reference: the referencing fact is resolved BEFORE the
+    /// wedding fact exists.  The result must stay Unknown (B2: no cascade).
+    #[test]
+    fn test_r5_forward_ref_stays_unknown() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let conv = conv();
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        // No wedding fact stored — this is the forward-reference scenario.
+        let after_fact = TemporalFact {
+            id: "tf-after-wedding-fwd".to_string(),
+            entity: "alice".to_string(),
+            event: "honeymoon".to_string(),
+            event_stems: vec!["honeymoon".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the wedding".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id,
+            conversation_date: conv,
+            confidence: 0.8,
+            source_text: "Alice is planning the honeymoon after the wedding".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        let mut visited = std::collections::HashSet::new();
+        let resolved = store.resolve_named_event_hop("user-r5b", &after_fact, &mut visited, 0);
+
+        // Must remain Unknown — no cascade, no back-fill.
+        assert!(
+            matches!(
+                resolved.resolved_time,
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_)
+            ),
+            "forward ref must stay Unknown, got {:?}",
+            resolved.resolved_time
+        );
+    }
+
+    /// (c) Cycle: A references "after B event", B references "after A event".
+    /// Must terminate (no stack overflow / hang) and both end up Unknown.
+    #[test]
+    fn test_r5_cycle_terminates() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let conv = conv();
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        // Fact A: event "party", relative "after the move".
+        let fact_a = TemporalFact {
+            id: "tf-cycle-a".to_string(),
+            entity: "bob".to_string(),
+            event: "party".to_string(),
+            event_stems: vec!["parti".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the move".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id.clone(),
+            conversation_date: conv,
+            confidence: 0.7,
+            source_text: "Bob will have a party after the move".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        // Fact B: event "move", relative "after the party".
+        let fact_b = TemporalFact {
+            id: "tf-cycle-b".to_string(),
+            entity: "bob".to_string(),
+            event: "move".to_string(),
+            event_stems: vec!["move".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the party".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id,
+            conversation_date: conv,
+            confidence: 0.7,
+            source_text: "Bob is moving after the party".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        // Store both facts so each lookup finds the other.
+        store.store("user-r5c", &fact_a).unwrap();
+        store.store("user-r5c", &fact_b).unwrap();
+
+        // Attempt to resolve fact_a — must not hang or overflow.
+        let mut visited_a = std::collections::HashSet::new();
+        let resolved_a =
+            store.resolve_named_event_hop("user-r5c", &fact_a, &mut visited_a, 0);
+
+        // Attempt to resolve fact_b — must not hang or overflow.
+        let mut visited_b = std::collections::HashSet::new();
+        let resolved_b =
+            store.resolve_named_event_hop("user-r5c", &fact_b, &mut visited_b, 0);
+
+        // Both must remain Unknown (cycle broken by depth/visited guards).
+        assert!(
+            matches!(
+                resolved_a.resolved_time,
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_)
+            ),
+            "cycle fact A must remain Unknown, got {:?}",
+            resolved_a.resolved_time
+        );
+        assert!(
+            matches!(
+                resolved_b.resolved_time,
+                ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_)
+            ),
+            "cycle fact B must remain Unknown, got {:?}",
+            resolved_b.resolved_time
+        );
     }
 }

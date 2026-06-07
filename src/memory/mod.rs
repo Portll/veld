@@ -2341,11 +2341,22 @@ impl MemorySystem {
         entities: &[String],
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<usize> {
-        let facts =
+        let raw_facts =
             temporal_facts::extract_temporal_facts(content, memory_id, created_at, entities);
-        if facts.is_empty() {
+        if raw_facts.is_empty() {
             return Ok(0);
         }
+
+        // R5: Resolve named-event second hops BEFORE contradiction detection and
+        // storage.  Facts whose relative_time is a prepositional phrase referencing
+        // a NAMED EVENT (e.g. "after the wedding") get their resolved_time updated
+        // to After/Before(anchor_date) if a matching fact already exists in the
+        // store.  Forward references (event not yet stored) stay Unknown — no
+        // back-fill cascade is ever triggered (B2).  The hop is depth-bounded at 2
+        // with a per-fact visited set to break cycles (B3).
+        let facts = self
+            .temporal_fact_store
+            .resolve_named_event_hops(user_id, raw_facts);
 
         // Run contradiction detection before storing each new fact.
         // This invalidates old facts that the new fact supersedes.
