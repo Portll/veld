@@ -10,6 +10,7 @@
 pub mod alignment_onboarding;
 pub mod bm25_projection;
 pub mod compression;
+pub mod merge;
 pub mod context;
 pub mod context_blocks;
 pub mod facets;
@@ -6120,6 +6121,16 @@ impl MemorySystem {
         // repair_vector_index() does a full RocksDB scan + ONNX inference per orphan
         if is_heavy {
             self.auto_repair_and_compact();
+        }
+
+        // 5.5. S-R6: Semantic merge pass + GC sweep (heavy only, flag-gated).
+        //
+        // `run_merge_pass` is a no-op when SEMANTIC_MERGE_ENABLED == false (default).
+        // `gc_merge_tombstones` is always run on heavy cycles so quiescence-expired
+        // tombstones from any prior enabled run are eventually reclaimed (J2).
+        if is_heavy {
+            let _merges = self.long_term_memory.run_merge_pass(user_id, 32);
+            let _gc = self.long_term_memory.gc_merge_tombstones(user_id);
         }
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
