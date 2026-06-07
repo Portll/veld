@@ -136,6 +136,69 @@ pub struct SignalAttribution {
     pub entity_overlap: bool,
 }
 
+/// Full unified-scoring feature vector for one retrieved memory (R2 / LTR).
+///
+/// SHADOW-ONLY capture: these are the EXACT additive components and multiplicative
+/// gates read out of the unified scoring assembly (recall.rs ~2586-2605) at the
+/// moment `final_score` is computed. They are recorded for a FUTURE learned ranker
+/// (R3) and never feed back into the live score. `base_score` is the fused RRF +
+/// Hebbian input; `unified_final` is `(sum of additive terms) * feedback_multiplier
+/// * confidence_gate * external_dim_multiplier` — i.e. the closure's output before
+/// any later cross-encoder / MMR / demotion stages.
+///
+/// All fields are additive serde (`#[serde(default)]`) so older serialized
+/// `RetrievalTrace` rows still deserialize after the schema grows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScoringFeatures {
+    /// Fused base score (RRF score + hebbian_boost * 0.1) — the closure input.
+    #[serde(default)]
+    pub base_score: f32,
+    // --- 17 additive components (recall.rs:2586-2602) ---
+    #[serde(default)]
+    pub recency_boost: f32,
+    #[serde(default)]
+    pub arousal_boost: f32,
+    #[serde(default)]
+    pub credibility_boost: f32,
+    #[serde(default)]
+    pub valence_boost: f32,
+    #[serde(default)]
+    pub temporal_boost: f32,
+    #[serde(default)]
+    pub session_boost: f32,
+    #[serde(default)]
+    pub access_boost: f32,
+    #[serde(default)]
+    pub graph_boost: f32,
+    #[serde(default)]
+    pub episode_boost: f32,
+    #[serde(default)]
+    pub sequence_boost: f32,
+    #[serde(default)]
+    pub richness_boost: f32,
+    #[serde(default)]
+    pub activation_boost: f32,
+    #[serde(default)]
+    pub temporal_density: f32,
+    #[serde(default)]
+    pub entity_density: f32,
+    #[serde(default)]
+    pub elaboration_boost: f32,
+    #[serde(default)]
+    pub burstiness_boost: f32,
+    // --- 3 multiplicative gates (recall.rs:2603-2605) ---
+    #[serde(default)]
+    pub feedback_multiplier: f32,
+    #[serde(default)]
+    pub confidence_gate: f32,
+    #[serde(default)]
+    pub external_dim_multiplier: f32,
+    /// The unified score the closure produced for this memory (pre cross-encoder /
+    /// MMR / demotion). Captured READ-ONLY alongside the live `set_score`.
+    #[serde(default)]
+    pub unified_final: f32,
+}
+
 /// Query-level metacognition (M3): a returned feeling-of-knowing readout.
 ///
 /// Computed as a TERMINAL readout after retrieval — advisory, and never fed back
@@ -2217,6 +2280,18 @@ impl Memory {
     /// Set importance (thread-safe, clamped to [0.0, 1.0])
     pub fn set_importance(&self, importance: f32) {
         self.metadata.lock().importance = importance.clamp(0.0, 1.0);
+    }
+
+    /// Test-only: overwrite the access-history ring buffer and `last_accessed`
+    /// so a synthetic access rhythm can be exercised deterministically by the
+    /// anticipatory-prefetch tick (R1).
+    #[cfg(test)]
+    pub fn test_set_access_history(&self, history: Vec<DateTime<Utc>>) {
+        let mut meta = self.metadata.lock();
+        if let Some(last) = history.last().copied() {
+            meta.last_accessed = last;
+        }
+        meta.access_history = history;
     }
 
     /// Set temporal relevance (thread-safe)

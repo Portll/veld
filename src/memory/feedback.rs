@@ -1913,6 +1913,333 @@ pub struct FeedbackStoreStats {
     pub avg_stability: f32,
 }
 
+// =============================================================================
+// R2 — RETRIEVAL TRACE STORE (LTR shadow feature/label capture)
+// =============================================================================
+//
+// SHADOW-ONLY. This store records, per (recall, memory), the full unified-scoring
+// feature vector + base/final score + query/rank at recall time, then JOINS the
+// eventual feedback label and graduates the row to a TRAINING set for a future
+// learned ranker (R3). It is a side-effect-only observer: nothing here is read by
+// the live scoring path. It writes ONLY to its own per-user KV namespace.
+//
+// Two-stage buffer (J3 — fixes silent label loss):
+//   - PENDING: un-labeled rows. TTL >= realistic feedback latency. Bounded by a
+//     reservoir cap. Evicting a PENDING row before its label arrives is a LOST
+//     join → increments `LTR_TRACE_LABEL_JOIN_MISS` (B9; never a silent drop).
+//   - TRAINING: labeled+joined rows (the compacted store). Bounded by a ring cap.
+//
+// Per-user by construction: the store is handed the user's own `KeyValueStore`
+// (one RocksDB CF per user), so trace rows never cross tenants.
+
+/// Key prefix for un-labeled (PENDING) trace rows in the per-user KV store.
+pub(crate) const TRACE_PENDING_PREFIX: &str = "ltr_trace_pending:";
+/// Key prefix for labeled (TRAINING) trace rows in the per-user KV store.
+pub(crate) const TRACE_TRAIN_PREFIX: &str = "ltr_trace_train:";
+
+/// TTL for a PENDING (un-labeled) trace row. Must be >= a realistic feedback
+/// latency window (feedback lags recall by minutes to hours). Rows older than this
+/// with no label are evicted and counted as a join miss — never dropped silently.
+pub(crate) const TRACE_PENDING_TTL_HOURS: i64 = 48;
+/// Reservoir cap on PENDING rows. When exceeded, the OLDEST pending rows are
+/// evicted (by created_at, not by recency of access) — i.e. rows closest to TTL
+/// expiry go first, so we never evict a fresh row whose label may still be coming.
+/// Each such eviction is a join miss (B9).
+pub(crate) const TRACE_PENDING_MAX: usize = 50_000;
+/// Ring cap on TRAINING rows. When exceeded, the oldest labeled rows are dropped
+/// (a labeled row has already served its purpose for the join; pure-recency
+/// eviction here is fine because the (features,label) pair is preserved-or-trained).
+pub(crate) const TRACE_TRAIN_MAX: usize = 200_000;
+
+/// A single retrieval-trace row (R2 / LTR).
+///
+/// I1: keyed in storage by the surrogate `trace_id`, NOT `memory_id` — so the row
+/// survives a future merge that remaps memory ids (`memory_id` is a COLUMN here).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetrievalTrace {
+    /// Surrogate key (UUID). Storage key = prefix + trace_id.
+    pub trace_id: String,
+    /// The memory this row describes — a COLUMN, joinable, merge-remappable.
+    pub memory_id: MemoryId,
+    /// The query text that produced this retrieval.
+    #[serde(default)]
+    pub query_text: String,
+    /// 0-based rank of this memory in the FINAL returned, ordered result set.
+    #[serde(default)]
+    pub rank: usize,
+    /// Full unified-scoring feature vector (read out of the score path, never written to it).
+    #[serde(default)]
+    pub features: crate::memory::types::ScoringFeatures,
+    /// Fused base score (closure input).
+    #[serde(default)]
+    pub base_score: f32,
+    /// FINAL ordered score of the returned memory (`m.score` at return time).
+    #[serde(default)]
+    pub final_score: f32,
+    /// The joined feedback label. `None` while PENDING; `Some(_)` once graduated.
+    #[serde(default)]
+    pub outcome: Option<crate::memory::retrieval::RetrievalOutcome>,
+    /// Recall timestamp (drives the PENDING TTL).
+    pub created_at: DateTime<Utc>,
+    /// Feedback-join timestamp (set on graduation to TRAINING).
+    #[serde(default)]
+    pub labeled_at: Option<DateTime<Utc>>,
+}
+
+impl RetrievalTrace {
+    /// Build an un-labeled (PENDING) trace row at recall time.
+    pub fn new_pending(
+        memory_id: MemoryId,
+        query_text: String,
+        rank: usize,
+        features: crate::memory::types::ScoringFeatures,
+        base_score: f32,
+        final_score: f32,
+    ) -> Self {
+        Self {
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            memory_id,
+            query_text,
+            rank,
+            features,
+            base_score,
+            final_score,
+            outcome: None,
+            created_at: Utc::now(),
+            labeled_at: None,
+        }
+    }
+
+    fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        self.outcome.is_none()
+            && (now - self.created_at).num_hours() >= TRACE_PENDING_TTL_HOURS
+    }
+}
+
+/// Per-user retrieval-trace store backing the LTR shadow capture (R2).
+///
+/// Persists through a per-user [`crate::storage::KeyValueStore`] handle; when none
+/// is configured it operates as a no-op observer (capture is best-effort and must
+/// never affect the request).
+#[derive(Clone)]
+pub struct RetrievalTraceStore {
+    kv: Option<Arc<dyn crate::storage::KeyValueStore>>,
+}
+
+impl std::fmt::Debug for RetrievalTraceStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetrievalTraceStore")
+            .field("persistent", &self.kv.is_some())
+            .finish()
+    }
+}
+
+impl Default for RetrievalTraceStore {
+    fn default() -> Self {
+        Self { kv: None }
+    }
+}
+
+impl RetrievalTraceStore {
+    /// In-memory/no-op store (no persistence).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Persistent store over a per-user KV handle.
+    pub fn with_kv(kv: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { kv: Some(kv) }
+    }
+
+    fn pending_key(trace_id: &str) -> Vec<u8> {
+        format!("{TRACE_PENDING_PREFIX}{trace_id}").into_bytes()
+    }
+
+    fn train_key(trace_id: &str) -> Vec<u8> {
+        format!("{TRACE_TRAIN_PREFIX}{trace_id}").into_bytes()
+    }
+
+    /// Capture one PENDING trace row (one per (recall, memory)). Best-effort:
+    /// failures are logged, never propagated to the recall path.
+    pub fn record_pending(&self, trace: &RetrievalTrace) {
+        let Some(kv) = &self.kv else { return };
+        match serde_json::to_vec(trace) {
+            Ok(bytes) => {
+                if let Err(e) = kv.put_bytes(&Self::pending_key(&trace.trace_id), &bytes) {
+                    tracing::warn!(error = %e, "LTR trace: failed to persist pending row");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "LTR trace: failed to serialize pending row"),
+        }
+        // Bound the PENDING stage after each insert (B9). Cheap when under cap.
+        self.enforce_pending_bound();
+    }
+
+    /// Read all PENDING rows (un-labeled), newest-irrelevant ordering.
+    pub fn load_pending(&self) -> Vec<RetrievalTrace> {
+        let Some(kv) = &self.kv else { return Vec::new() };
+        match kv.scan_prefix(TRACE_PENDING_PREFIX.as_bytes(), None) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|(_, v)| serde_json::from_slice::<RetrievalTrace>(&v).ok())
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "LTR trace: failed to scan pending rows");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Read all TRAINING rows (labeled + joined). Used by tests and a future R3.
+    pub fn load_training(&self) -> Vec<RetrievalTrace> {
+        let Some(kv) = &self.kv else { return Vec::new() };
+        match kv.scan_prefix(TRACE_TRAIN_PREFIX.as_bytes(), None) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|(_, v)| serde_json::from_slice::<RetrievalTrace>(&v).ok())
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "LTR trace: failed to scan training rows");
+                Vec::new()
+            }
+        }
+    }
+
+    /// J3/JOIN: a feedback label arrived for these memories. Graduate the matching
+    /// PENDING rows to TRAINING with the label. Joins by `memory_id` (feedback
+    /// correlates by memory id, not retrieval id), taking the MOST RECENT pending
+    /// row per memory. Returns the number of rows graduated.
+    pub fn join_feedback(
+        &self,
+        memory_ids: &[MemoryId],
+        outcome: crate::memory::retrieval::RetrievalOutcome,
+    ) -> usize {
+        let Some(kv) = &self.kv else { return 0 };
+        if memory_ids.is_empty() {
+            return 0;
+        }
+        let wanted: HashSet<&MemoryId> = memory_ids.iter().collect();
+
+        // Pick the most-recent un-expired pending row per wanted memory_id.
+        let now = Utc::now();
+        let mut best: HashMap<MemoryId, RetrievalTrace> = HashMap::new();
+        for t in self.load_pending() {
+            if t.outcome.is_some() || t.is_expired(now) {
+                continue;
+            }
+            if !wanted.contains(&t.memory_id) {
+                continue;
+            }
+            match best.get(&t.memory_id) {
+                Some(existing) if existing.created_at >= t.created_at => {}
+                _ => {
+                    best.insert(t.memory_id.clone(), t);
+                }
+            }
+        }
+
+        let mut graduated = 0;
+        for (_mid, mut trace) in best {
+            trace.outcome = Some(outcome);
+            trace.labeled_at = Some(now);
+            // Write to TRAINING, remove from PENDING (atomic enough: training row is
+            // the commit; a crash between writes only re-graduates idempotently).
+            match serde_json::to_vec(&trace) {
+                Ok(bytes) => {
+                    if kv.put_bytes(&Self::train_key(&trace.trace_id), &bytes).is_ok() {
+                        let _ = kv.delete_bytes(&Self::pending_key(&trace.trace_id));
+                        graduated += 1;
+                        crate::metrics::LTR_TRACE_GRADUATED_TOTAL.inc();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "LTR trace: failed to serialize graduated row")
+                }
+            }
+        }
+        if graduated > 0 {
+            self.enforce_training_bound();
+        }
+        graduated
+    }
+
+    /// B9/J3: bound the PENDING stage. Evict TTL-expired rows AND, if still over the
+    /// reservoir cap, the oldest rows (closest to expiry) — each eviction of an
+    /// un-labeled row is a LOST join, counted, never silent. Returns evicted count.
+    pub fn enforce_pending_bound(&self) -> usize {
+        let Some(kv) = &self.kv else { return 0 };
+        let now = Utc::now();
+        let mut rows = self.load_pending();
+
+        let mut evicted = 0;
+        // 1) TTL eviction.
+        rows.retain(|t| {
+            if t.is_expired(now) {
+                let _ = kv.delete_bytes(&Self::pending_key(&t.trace_id));
+                crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.inc();
+                evicted += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // 2) Reservoir cap: evict OLDEST first (closest to TTL), so fresh rows whose
+        // label may still arrive are preserved (do NOT evict by pure recency ahead
+        // of TTL — J3).
+        if rows.len() > TRACE_PENDING_MAX {
+            rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            let overflow = rows.len() - TRACE_PENDING_MAX;
+            for t in rows.iter().take(overflow) {
+                let _ = kv.delete_bytes(&Self::pending_key(&t.trace_id));
+                crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.inc();
+                evicted += 1;
+            }
+        }
+
+        if evicted > 0 {
+            tracing::info!(
+                evicted,
+                "LTR trace: evicted pending rows before label (join_miss counted)"
+            );
+        }
+        evicted
+    }
+
+    /// Bound the TRAINING stage (ring): drop oldest labeled rows over the cap.
+    /// Labeled rows are not join-misses — the (features,label) pair already exists.
+    fn enforce_training_bound(&self) -> usize {
+        let Some(kv) = &self.kv else { return 0 };
+        let mut rows = self.load_training();
+        if rows.len() <= TRACE_TRAIN_MAX {
+            return 0;
+        }
+        rows.sort_by(|a, b| {
+            a.labeled_at
+                .unwrap_or(a.created_at)
+                .cmp(&b.labeled_at.unwrap_or(b.created_at))
+        });
+        let overflow = rows.len() - TRACE_TRAIN_MAX;
+        let mut evicted = 0;
+        for t in rows.iter().take(overflow) {
+            if kv.delete_bytes(&Self::train_key(&t.trace_id)).is_ok() {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Count of PENDING rows (test/diagnostic).
+    pub fn pending_count(&self) -> usize {
+        self.load_pending().len()
+    }
+
+    /// Count of TRAINING rows (test/diagnostic).
+    pub fn training_count(&self) -> usize {
+        self.load_training().len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2425,5 +2752,260 @@ mod tests {
             }
             _ => panic!("Expected EntityFlow trigger"),
         }
+    }
+
+    // =====================================================================
+    // R2 (LTR) retrieval-trace store tests.
+    //
+    // These exercise the trace store directly over an in-test HashMap-backed
+    // KeyValueStore (no RocksDB/redb files needed), so the PENDING→TRAINING
+    // join, the J3 bounded-eviction join-miss accounting, and per-user
+    // isolation are deterministic and fast. The SHADOW-INVARIANT guarantee
+    // (capture never perturbs final_score or result order) is asserted in a
+    // separate integration test in recall.rs where the full scoring path runs.
+    // =====================================================================
+
+    use crate::memory::retrieval::RetrievalOutcome;
+    use crate::storage::KeyValueStore;
+    use crate::config::StorageBackend;
+    use parking_lot::Mutex as PlMutex;
+    use std::collections::BTreeMap;
+
+    /// Minimal in-memory KeyValueStore for trace-store tests. A BTreeMap gives
+    /// ordered prefix scans for free; Mutex makes it Send+Sync.
+    #[derive(Default)]
+    struct MemKv {
+        map: PlMutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    impl KeyValueStore for MemKv {
+        fn backend(&self) -> StorageBackend {
+            StorageBackend::Redb
+        }
+        fn get_bytes(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self.map.lock().get(key).cloned())
+        }
+        fn put_bytes(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+            self.map.lock().insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn delete_bytes(&self, key: &[u8]) -> anyhow::Result<()> {
+            self.map.lock().remove(key);
+            Ok(())
+        }
+        fn scan_prefix(
+            &self,
+            prefix: &[u8],
+            limit: Option<usize>,
+        ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            let guard = self.map.lock();
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = guard
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if let Some(n) = limit {
+                out.truncate(n);
+            }
+            Ok(out)
+        }
+        fn flush(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mem_store() -> RetrievalTraceStore {
+        RetrievalTraceStore::with_kv(Arc::new(MemKv::default()))
+    }
+
+    fn pending_trace(memory_id: MemoryId, rank: usize) -> RetrievalTrace {
+        RetrievalTrace::new_pending(
+            memory_id,
+            "what are our priorities".to_string(),
+            rank,
+            crate::memory::types::ScoringFeatures {
+                base_score: 0.5,
+                unified_final: 0.9,
+                ..Default::default()
+            },
+            0.5,
+            0.9,
+        )
+    }
+
+    /// PENDING → feedback → TRAINING join graduates exactly the matching row,
+    /// stamps the outcome label + labeled_at, and removes it from PENDING.
+    #[test]
+    fn test_trace_join_graduates_to_training() {
+        let store = mem_store();
+        let mid = MemoryId(Uuid::new_v4());
+        store.record_pending(&pending_trace(mid.clone(), 0));
+        // An unrelated pending row that must NOT graduate.
+        let other = MemoryId(Uuid::new_v4());
+        store.record_pending(&pending_trace(other.clone(), 1));
+
+        assert_eq!(store.pending_count(), 2);
+        assert_eq!(store.training_count(), 0);
+
+        let graduated = store.join_feedback(&[mid.clone()], RetrievalOutcome::Helpful);
+        assert_eq!(graduated, 1, "exactly the matched memory graduates");
+
+        assert_eq!(store.pending_count(), 1, "graduated row left PENDING");
+        assert_eq!(store.training_count(), 1, "graduated row is in TRAINING");
+
+        let train = store.load_training();
+        assert_eq!(train.len(), 1);
+        assert_eq!(train[0].memory_id, mid);
+        assert_eq!(train[0].outcome, Some(RetrievalOutcome::Helpful));
+        assert!(train[0].labeled_at.is_some(), "label timestamp stamped");
+
+        // The non-matched row is still pending and un-labeled.
+        let pend = store.load_pending();
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].memory_id, other);
+        assert!(pend[0].outcome.is_none());
+    }
+
+    /// A negative outcome (Abstained/Ignored — I8) is a valid training LABEL: the
+    /// row still graduates, carrying its negative label for the future ranker.
+    #[test]
+    fn test_trace_join_carries_negative_label() {
+        let store = mem_store();
+        let mid = MemoryId(Uuid::new_v4());
+        store.record_pending(&pending_trace(mid.clone(), 0));
+
+        let graduated = store.join_feedback(&[mid.clone()], RetrievalOutcome::Ignored);
+        assert_eq!(graduated, 1);
+        let train = store.load_training();
+        assert_eq!(train[0].outcome, Some(RetrievalOutcome::Ignored));
+    }
+
+    /// One (recall, memory) → one PENDING row: re-recording the same memory across
+    /// two recalls makes two rows, and the join graduates the MOST RECENT one.
+    #[test]
+    fn test_trace_join_picks_most_recent_pending() {
+        let store = mem_store();
+        let mid = MemoryId(Uuid::new_v4());
+
+        let mut older = pending_trace(mid.clone(), 5);
+        older.created_at = Utc::now() - chrono::Duration::hours(1);
+        older.final_score = 0.10;
+        store.record_pending(&older);
+
+        let mut newer = pending_trace(mid.clone(), 0);
+        newer.final_score = 0.90;
+        store.record_pending(&newer);
+
+        assert_eq!(store.pending_count(), 2, "one row per recall for same memory");
+
+        let graduated = store.join_feedback(&[mid.clone()], RetrievalOutcome::Helpful);
+        assert_eq!(graduated, 1);
+        let train = store.load_training();
+        assert_eq!(train.len(), 1);
+        assert!(
+            (train[0].final_score - 0.90).abs() < 1e-6,
+            "the most-recent pending row is the one graduated"
+        );
+        // The older row remains PENDING (it will later TTL-evict as a join miss).
+        assert_eq!(store.pending_count(), 1);
+    }
+
+    /// J3: a PENDING row past its TTL with no label is EVICTED and counted as a
+    /// label-join miss — never silently dropped. We assert the metric increments
+    /// by exactly the number of expired rows and that the row leaves PENDING.
+    #[test]
+    fn test_trace_ttl_eviction_counts_join_miss() {
+        let store = mem_store();
+
+        // A fresh row (must survive).
+        let fresh = MemoryId(Uuid::new_v4());
+        store.record_pending(&pending_trace(fresh.clone(), 0));
+
+        // `record_pending` eagerly enforces the PENDING bound (B9), so an expired
+        // row is evicted AND counted as a join-miss at INSERTION time. Capture the
+        // counter before inserting the expired row to measure exactly that.
+        let before = crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.get();
+
+        let stale = MemoryId(Uuid::new_v4());
+        let mut stale_row = pending_trace(stale.clone(), 1);
+        stale_row.created_at = Utc::now()
+            - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+        store.record_pending(&stale_row);
+
+        let after = crate::metrics::LTR_TRACE_LABEL_JOIN_MISS.get();
+
+        // The expired row's lost label is COUNTED, not silently dropped (J3).
+        // >= before+1 (not == ): the counter is process-global and unit tests run in
+        // parallel, so another test may also increment it concurrently.
+        assert!(
+            after >= before + 1,
+            "the lost label is COUNTED as a join miss, not silently dropped \
+             (before={before}, after={after})"
+        );
+
+        // An explicit enforce is now a no-op: the expired row was already evicted at
+        // insert time, and the fresh row is not past TTL.
+        assert_eq!(
+            store.enforce_pending_bound(),
+            0,
+            "expired row already evicted at insert; fresh row survives"
+        );
+
+        // Fresh row preserved; expired row gone.
+        let pend = store.load_pending();
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].memory_id, fresh);
+    }
+
+    /// An expired PENDING row can no longer be joined (it is past TTL): the join
+    /// returns 0 and does not resurrect it into TRAINING.
+    #[test]
+    fn test_trace_join_skips_expired_pending() {
+        let store = mem_store();
+        let mid = MemoryId(Uuid::new_v4());
+        let mut expired = pending_trace(mid.clone(), 0);
+        expired.created_at = Utc::now()
+            - chrono::Duration::hours(TRACE_PENDING_TTL_HOURS + 1);
+        store.record_pending(&expired);
+
+        let graduated = store.join_feedback(&[mid.clone()], RetrievalOutcome::Helpful);
+        assert_eq!(graduated, 0, "expired pending rows are not joinable");
+        assert_eq!(store.training_count(), 0);
+    }
+
+    /// Per-user isolation: two stores over DISTINCT KV handles (the per-user CF
+    /// model) never see each other's rows. A join on store A graduates nothing in
+    /// store B, and B's pending row is untouched.
+    #[test]
+    fn test_trace_per_user_isolation() {
+        let store_a = mem_store();
+        let store_b = mem_store();
+
+        let shared_mid = MemoryId(Uuid::new_v4());
+        store_a.record_pending(&pending_trace(shared_mid.clone(), 0));
+        store_b.record_pending(&pending_trace(shared_mid.clone(), 0));
+
+        // Feedback arrives "for user A" — joins only A's store.
+        let graduated_a = store_a.join_feedback(&[shared_mid.clone()], RetrievalOutcome::Helpful);
+        assert_eq!(graduated_a, 1);
+
+        assert_eq!(store_a.training_count(), 1);
+        assert_eq!(store_a.pending_count(), 0);
+
+        // B is completely untouched by A's feedback.
+        assert_eq!(store_b.training_count(), 0, "user B sees no training row");
+        assert_eq!(store_b.pending_count(), 1, "user B's pending row intact");
+    }
+
+    /// A no-op (no KV) store is a silent observer: capture and join never panic
+    /// and never persist — the recall path is never affected when unconfigured.
+    #[test]
+    fn test_trace_noop_store_is_inert() {
+        let store = RetrievalTraceStore::new();
+        let mid = MemoryId(Uuid::new_v4());
+        store.record_pending(&pending_trace(mid.clone(), 0));
+        assert_eq!(store.pending_count(), 0);
+        assert_eq!(store.join_feedback(&[mid], RetrievalOutcome::Helpful), 0);
+        assert_eq!(store.enforce_pending_bound(), 0);
     }
 }

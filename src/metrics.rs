@@ -185,6 +185,31 @@ pub static ONTOLOGICAL_DENSITY_SKIP_TOTAL: LazyLock<IntCounter> = LazyLock::new(
 });
 
 // ============================================================================
+// LTR Trace Metrics (R2: shadow feature/label capture)
+// ============================================================================
+
+/// Pending retrieval-trace rows evicted (TTL or reservoir bound) BEFORE their
+/// feedback label arrived — i.e. a lost (features, label) join. Never a silent
+/// drop: every eviction of an un-labeled row increments this counter (B9/J3).
+pub static LTR_TRACE_LABEL_JOIN_MISS: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_ltr_trace_label_join_miss_total",
+        "Pending LTR trace rows evicted before a feedback label arrived (lost join)",
+    )
+    .expect("LTR_TRACE_LABEL_JOIN_MISS metric must be valid at compile time")
+});
+
+/// Pending trace rows that successfully joined a feedback label and graduated to
+/// the TRAINING stage.
+pub static LTR_TRACE_GRADUATED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "veld_ltr_trace_graduated_total",
+        "LTR trace rows graduated from PENDING to TRAINING after a feedback join",
+    )
+    .expect("LTR_TRACE_GRADUATED_TOTAL metric must be valid at compile time")
+});
+
+// ============================================================================
 // Embedding Metrics (P1.2: Instrument embed operations)
 // ============================================================================
 
@@ -823,6 +848,8 @@ fn do_register_metrics() -> Result<(), MetricsError> {
         "ONTOLOGICAL_RERANK_BOOST_APPLIED"
     );
     register!(ONTOLOGICAL_FALLBACK_TOTAL, "ONTOLOGICAL_FALLBACK_TOTAL");
+    register!(LTR_TRACE_LABEL_JOIN_MISS, "LTR_TRACE_LABEL_JOIN_MISS");
+    register!(LTR_TRACE_GRADUATED_TOTAL, "LTR_TRACE_GRADUATED_TOTAL");
     register!(
         ONTOLOGICAL_DENSITY_SKIP_TOTAL,
         "ONTOLOGICAL_DENSITY_SKIP_TOTAL"
