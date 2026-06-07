@@ -4198,6 +4198,25 @@ impl MemoryStorage {
 
         Ok(count)
     }
+
+    // =========================================================================
+    // S-R6 accessors — used by merge.rs (same crate, super-module visibility)
+    // =========================================================================
+
+    /// Returns `true` when the storage is in sync (fsync-on-write) mode.
+    /// Used by `merge.rs` to set `WriteOptions::set_sync` without accessing
+    /// the private `write_mode` field directly from a sibling module.
+    pub(super) fn write_mode_is_sync(&self) -> bool {
+        self.write_mode == WriteMode::Sync
+    }
+
+    /// Return the tombstone key for `(user_id, loser_id)`.
+    /// Exposed `pub(super)` so `merge.rs` tests can back-date tombstones
+    /// without duplicating the key format.
+    pub(super) fn tombstone_key(user_id: &str, loser_id: &MemoryId) -> String {
+        use crate::memory::merge::TOMBSTONE_PREFIX;
+        format!("{}{user_id}:{}", TOMBSTONE_PREFIX, loser_id.0)
+    }
 }
 
 #[cfg(test)]
