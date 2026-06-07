@@ -125,10 +125,90 @@ pub struct CognitiveDials {
     #[serde(default)]
     pub rrf_weights: Option<(f32, f32, f32)>,
 
+    // ---- Recall ranking sliders (None = compile-time constant default) ---------------
+    // Overlay the historical `const`s in recall.rs / hybrid_search.rs / constants.rs.
+    // Rendered as sliders in the monitor "Dials" tab; see [`RECALL_SLIDER_SPECS`] for
+    // each one's default / recommended / absolute range.
+    /// RRF k for the outer graph+hybrid fusion (recall.rs Layer 4). Default 20.
+    #[serde(default)]
+    pub rrf_k_outer: Option<f32>,
+    /// RRF k for the decomposed sub-query merge. Default 20.
+    #[serde(default)]
+    pub rrf_k_decomp: Option<f32>,
+    /// RRF k for the inner BM25+vector fusion (hybrid_search). Default 45.
+    #[serde(default)]
+    pub rrf_k_inner: Option<f32>,
+    /// Weight ratio of the secondary (768d) vector index signal. Default 0.5.
+    #[serde(default)]
+    pub secondary_rrf_ratio: Option<f32>,
+    /// BM25 minimum-score floor for lexical candidates. Default 0.1.
+    #[serde(default)]
+    pub bm25_min_score: Option<f32>,
+    /// Ontological rerank boost per entity-label match. Default 0.15.
+    #[serde(default)]
+    pub onto_rerank_boost: Option<f32>,
+    /// Ontological rerank boost cap. Default 0.40.
+    #[serde(default)]
+    pub onto_rerank_max: Option<f32>,
+    /// Ontological rerank mismatch penalty (negative). Default -0.08.
+    #[serde(default)]
+    pub onto_rerank_penalty: Option<f32>,
+    /// Cross-encoder blend weight into the fused score. Default 0.4.
+    #[serde(default)]
+    pub ce_blend: Option<f32>,
+    /// Temporal-fact source-memory boost. Default 0.20.
+    #[serde(default)]
+    pub temporal_recall_boost: Option<f32>,
+    /// MMR diversity λ for exploratory queries. Default 0.6.
+    #[serde(default)]
+    pub mmr_lambda_exploratory: Option<f32>,
+    /// MMR diversity λ for abstract queries. Default 0.5.
+    #[serde(default)]
+    pub mmr_lambda_abstract: Option<f32>,
+    /// MMR diversity λ for relationship queries. Default 0.7.
+    #[serde(default)]
+    pub mmr_lambda_relationship: Option<f32>,
+    /// Linguistic weight in the density-adaptive fusion mix. Default 0.15.
+    #[serde(default)]
+    pub density_linguistic_w: Option<f32>,
+
     /// Last time these dials were set (set by the writer; informational).
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }
+
+/// UI/range metadata for a recall slider (consumed by `GET /api/dials/schema`).
+pub struct RecallSliderSpec {
+    pub id: &'static str,
+    pub group: &'static str,
+    pub label: &'static str,
+    pub default: f64,
+    pub rec_lo: f64,
+    pub rec_hi: f64,
+    pub abs_lo: f64,
+    pub abs_hi: f64,
+    pub step: f64,
+}
+
+/// Default / recommended / absolute ranges for every recall slider. Defaults mirror the
+/// historical constants; recommended bands are anchored on veld's value and shodh's
+/// tuned counterpart; absolute bounds are where the stage no-ops or the math breaks.
+pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
+    RecallSliderSpec { id: "rrf_k_outer", group: "Fusion", label: "RRF k (graph+hybrid)", default: 20.0, rec_lo: 20.0, rec_hi: 35.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
+    RecallSliderSpec { id: "rrf_k_decomp", group: "Fusion", label: "RRF k (sub-query)", default: 20.0, rec_lo: 20.0, rec_hi: 30.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
+    RecallSliderSpec { id: "rrf_k_inner", group: "Fusion", label: "RRF k (BM25+vector)", default: 45.0, rec_lo: 30.0, rec_hi: 60.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
+    RecallSliderSpec { id: "secondary_rrf_ratio", group: "Fusion", label: "Secondary index weight", default: 0.5, rec_lo: 0.3, rec_hi: 0.7, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
+    RecallSliderSpec { id: "bm25_min_score", group: "Candidates", label: "BM25 min score", default: 0.1, rec_lo: 0.0, rec_hi: 0.2, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
+    RecallSliderSpec { id: "onto_rerank_boost", group: "Rerank", label: "Ontological boost / match", default: 0.15, rec_lo: 0.05, rec_hi: 0.15, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
+    RecallSliderSpec { id: "onto_rerank_max", group: "Rerank", label: "Ontological boost cap", default: 0.40, rec_lo: 0.20, rec_hi: 0.40, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
+    RecallSliderSpec { id: "onto_rerank_penalty", group: "Rerank", label: "Ontological mismatch penalty", default: -0.08, rec_lo: -0.20, rec_hi: 0.0, abs_lo: -1.0, abs_hi: 0.0, step: 0.01 },
+    RecallSliderSpec { id: "ce_blend", group: "Rerank", label: "Cross-encoder blend", default: 0.4, rec_lo: 0.0, rec_hi: 0.6, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
+    RecallSliderSpec { id: "temporal_recall_boost", group: "Temporal", label: "Temporal source boost", default: 0.20, rec_lo: 0.10, rec_hi: 0.40, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
+    RecallSliderSpec { id: "mmr_lambda_exploratory", group: "Diversity", label: "MMR λ exploratory", default: 0.6, rec_lo: 0.5, rec_hi: 0.9, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
+    RecallSliderSpec { id: "mmr_lambda_abstract", group: "Diversity", label: "MMR λ abstract", default: 0.5, rec_lo: 0.5, rec_hi: 0.9, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
+    RecallSliderSpec { id: "mmr_lambda_relationship", group: "Diversity", label: "MMR λ relationship", default: 0.7, rec_lo: 0.5, rec_hi: 0.9, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
+    RecallSliderSpec { id: "density_linguistic_w", group: "Weights", label: "Linguistic weight", default: 0.15, rec_lo: 0.05, rec_hi: 0.25, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
+];
 
 /// Outcome of one reconsolidation-expiry pass (a single `run_maintenance` cycle).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +242,20 @@ impl Default for CognitiveDials {
             candidate_count: None,
             rerank_count: None,
             rrf_weights: None,
+            rrf_k_outer: None,
+            rrf_k_decomp: None,
+            rrf_k_inner: None,
+            secondary_rrf_ratio: None,
+            bm25_min_score: None,
+            onto_rerank_boost: None,
+            onto_rerank_max: None,
+            onto_rerank_penalty: None,
+            ce_blend: None,
+            temporal_recall_boost: None,
+            mmr_lambda_exploratory: None,
+            mmr_lambda_abstract: None,
+            mmr_lambda_relationship: None,
+            density_linguistic_w: None,
             updated_at: None,
         }
     }
@@ -185,6 +279,26 @@ impl CognitiveDials {
         if let Some((b, v, g)) = self.rrf_weights {
             self.rrf_weights = Some((b.clamp(0.0, 1.0), v.clamp(0.0, 1.0), g.clamp(0.0, 1.0)));
         }
+        // Recall sliders — clamp any override to its absolute range (mirrors RECALL_SLIDER_SPECS).
+        fn cl(o: &mut Option<f32>, lo: f32, hi: f32) {
+            if let Some(x) = o {
+                *o = Some(x.clamp(lo, hi));
+            }
+        }
+        cl(&mut self.rrf_k_outer, 5.0, 100.0);
+        cl(&mut self.rrf_k_decomp, 5.0, 100.0);
+        cl(&mut self.rrf_k_inner, 5.0, 100.0);
+        cl(&mut self.secondary_rrf_ratio, 0.0, 1.0);
+        cl(&mut self.bm25_min_score, 0.0, 1.0);
+        cl(&mut self.onto_rerank_boost, 0.0, 1.0);
+        cl(&mut self.onto_rerank_max, 0.0, 1.0);
+        cl(&mut self.onto_rerank_penalty, -1.0, 0.0);
+        cl(&mut self.ce_blend, 0.0, 1.0);
+        cl(&mut self.temporal_recall_boost, 0.0, 1.0);
+        cl(&mut self.mmr_lambda_exploratory, 0.0, 1.0);
+        cl(&mut self.mmr_lambda_abstract, 0.0, 1.0);
+        cl(&mut self.mmr_lambda_relationship, 0.0, 1.0);
+        cl(&mut self.density_linguistic_w, 0.0, 1.0);
         self
     }
 
@@ -251,6 +365,21 @@ impl CognitiveDials {
         if let Some(v) = env_parse::<usize>("VELD_DIALS_RERANK_COUNT") {
             d.rerank_count = Some(v);
         }
+        // Recall sliders — VELD_TUNE_* (unset keeps the const default).
+        d.rrf_k_outer = env_parse::<f32>("VELD_TUNE_RRF_K_OUTER").or(d.rrf_k_outer);
+        d.rrf_k_decomp = env_parse::<f32>("VELD_TUNE_RRF_K_DECOMP").or(d.rrf_k_decomp);
+        d.rrf_k_inner = env_parse::<f32>("VELD_TUNE_RRF_K_INNER").or(d.rrf_k_inner);
+        d.secondary_rrf_ratio = env_parse::<f32>("VELD_TUNE_SECONDARY_RRF_RATIO").or(d.secondary_rrf_ratio);
+        d.bm25_min_score = env_parse::<f32>("VELD_TUNE_BM25_MIN_SCORE").or(d.bm25_min_score);
+        d.onto_rerank_boost = env_parse::<f32>("VELD_TUNE_ONTO_RERANK_BOOST").or(d.onto_rerank_boost);
+        d.onto_rerank_max = env_parse::<f32>("VELD_TUNE_ONTO_RERANK_MAX").or(d.onto_rerank_max);
+        d.onto_rerank_penalty = env_parse::<f32>("VELD_TUNE_ONTO_RERANK_PENALTY").or(d.onto_rerank_penalty);
+        d.ce_blend = env_parse::<f32>("VELD_TUNE_CE_BLEND").or(d.ce_blend);
+        d.temporal_recall_boost = env_parse::<f32>("VELD_TUNE_TEMPORAL_RECALL_BOOST").or(d.temporal_recall_boost);
+        d.mmr_lambda_exploratory = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_EXPLORATORY").or(d.mmr_lambda_exploratory);
+        d.mmr_lambda_abstract = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_ABSTRACT").or(d.mmr_lambda_abstract);
+        d.mmr_lambda_relationship = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_RELATIONSHIP").or(d.mmr_lambda_relationship);
+        d.density_linguistic_w = env_parse::<f32>("VELD_TUNE_DENSITY_LINGUISTIC_W").or(d.density_linguistic_w);
         d.sanitized()
     }
 }

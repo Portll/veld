@@ -635,6 +635,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             "/api/dials",
             get(dials::get_dials).put(dials::set_dials),
         )
+        .route("/api/dials/schema", get(dials::get_dials_schema))
         // backward-compat aliases
         .route(
             "/api/external/dimensions",
