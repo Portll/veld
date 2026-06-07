@@ -30,6 +30,10 @@ const CF_NAME_INDEX: &str = "name_index";
 const CF_LOWERCASE_INDEX: &str = "lowercase_index";
 const CF_STEMMED_INDEX: &str = "stemmed_index";
 
+/// Maximum number of retrieval IDs held in the idempotency guard (S-R4).
+/// Oldest entries are evicted FIFO once this cap is reached.
+const SEEN_RETRIEVALS_CAPACITY: usize = 1024;
+
 const GRAPH_CF_NAMES: &[&str] = &[
     CF_ENTITIES,
     CF_RELATIONSHIPS,
@@ -563,7 +567,13 @@ impl RelationshipEdge {
     /// Returns `Some((old_tier_name, new_tier_name))` if a tier promotion occurred,
     /// `None` otherwise. This enables the memory-edge coupling: edge promotions
     /// can signal the memory layer to boost the associated memory's importance.
-    pub fn strengthen(&mut self) -> Option<(String, String)> {
+    /// Hebbian strengthening — private to the graph module.
+    ///
+    /// All external `edge.strength` mutations must go through
+    /// `GraphMemory::apply_reinforcement` or its internal delegate
+    /// `record_memory_coactivation`.  Making this `pub(crate)` prevents
+    /// callers outside this crate from writing `edge.strength` directly.
+    pub(crate) fn strengthen(&mut self) -> Option<(String, String)> {
         use crate::constants::*;
 
         let now = Utc::now();
@@ -847,7 +857,7 @@ impl RelationshipEdge {
     /// repeated calls.
     ///
     /// Returns true if synapse should be pruned (below tier's threshold)
-    pub fn decay(&mut self) -> bool {
+    pub(crate) fn decay(&mut self) -> bool {
         use crate::decay::tier_decay_factor;
 
         let now = Utc::now();
@@ -1028,7 +1038,7 @@ impl RelationshipEdge {
     /// Note: Does NOT modify `self.strength` — the undirected strength is managed
     /// independently by `strengthen()` and represents overall edge health.
     /// Directional fields track asymmetry only.
-    pub fn strengthen_forward(&mut self) {
+    pub(crate) fn strengthen_forward(&mut self) {
         use crate::constants::COACTIVATION_FORWARD_BOOST;
         self.ensure_directional();
         let delta = COACTIVATION_FORWARD_BOOST * (1.0 - self.forward_strength);
@@ -1043,7 +1053,7 @@ impl RelationshipEdge {
     /// Note: Does NOT modify `self.strength` — the undirected strength is managed
     /// independently by `strengthen()` and represents overall edge health.
     /// Directional fields track asymmetry only.
-    pub fn strengthen_backward(&mut self) {
+    pub(crate) fn strengthen_backward(&mut self) {
         use crate::constants::COACTIVATION_BACKWARD_BOOST;
         self.ensure_directional();
         let delta = COACTIVATION_BACKWARD_BOOST * (1.0 - self.backward_strength);
@@ -1447,6 +1457,20 @@ pub struct GraphMemory {
     /// Entities that may have become orphaned from pruned edges.
     /// Checked during flush_pending_maintenance().
     pending_orphan_checks: parking_lot::Mutex<Vec<Uuid>>,
+
+    /// Idempotency guard for Hebbian reinforcement (S-R4).
+    ///
+    /// Tracks the most recent `retrieval_id` values that have already been
+    /// reinforced. A second `apply_reinforcement` call with the same
+    /// `retrieval_id` is a no-op, closing the cardinality>1 retry-compounding
+    /// hazard. Capacity is bounded at `SEEN_RETRIEVALS_CAPACITY`; oldest
+    /// entries are evicted FIFO when the cap is reached.
+    ///
+    /// B5 note: this lock is held only during the O(1) set-membership check +
+    /// insert, NOT during the actual edge-strength mutations.  Per-edge
+    /// mutation is still serialised by `synapse_update_lock` (fine-grained),
+    /// so no coarse graph-write lock is introduced.
+    seen_retrievals: parking_lot::Mutex<(std::collections::HashSet<Uuid>, std::collections::VecDeque<Uuid>)>,
 }
 
 impl GraphMemory {
@@ -1620,6 +1644,10 @@ impl GraphMemory {
             entity_embedding_cache: Arc::new(parking_lot::RwLock::new(entity_embedding_cache)),
             pending_prune: parking_lot::Mutex::new(Vec::new()),
             pending_orphan_checks: parking_lot::Mutex::new(Vec::new()),
+            seen_retrievals: parking_lot::Mutex::new((
+                std::collections::HashSet::new(),
+                std::collections::VecDeque::new(),
+            )),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
@@ -4051,7 +4079,13 @@ impl GraphMemory {
     /// Returns the number of edges created/strengthened.
     /// Result of memory coactivation recording, including edge tier promotions.
     /// Promotions signal the memory layer to boost associated memory importance.
-    pub fn record_memory_coactivation(
+    ///
+    /// Internal implementation called only through `apply_reinforcement`.
+    /// Made `pub(crate)` so the handlers (which hold their own Arc<RwLock<GraphMemory>>
+    /// guard) can still call it directly when they already have a unique context
+    /// (e.g. fire-and-forget spawned tasks that generate a fresh retrieval_id).
+    /// New callers should prefer `apply_reinforcement`.
+    pub(crate) fn record_memory_coactivation(
         &self,
         trigger_id: &Uuid,
         coactivated_ids: &[Uuid],
@@ -4256,6 +4290,73 @@ impl GraphMemory {
             edges_updated,
             promotions,
         })
+    }
+
+    /// Idempotent reinforcement coordinator (S-R4).
+    ///
+    /// **This is the single authoritative path through which all
+    /// Hebbian co-activation `edge.strength` mutations must flow.**
+    /// Path-credit and lateral-inhibition writers added in the future
+    /// should call this method rather than `record_memory_coactivation`
+    /// directly.
+    ///
+    /// # Idempotency
+    ///
+    /// Calling this method twice with the same `retrieval_id` is a **no-op**
+    /// on the second call — the same strength boost is *not* applied twice.
+    /// This closes the cardinality>1 / retry-compounding hazard: a client
+    /// that retries a retrieval request (network glitch, at-least-once
+    /// delivery) will not compound edge strength beyond the intended single
+    /// reinforcement.
+    ///
+    /// # Behavior delta
+    ///
+    /// Compared with the pre-S-R4 code, duplicate `retrieval_id` calls now
+    /// produce **no** additional strength increment.  The first call is
+    /// identical to the old behaviour.  Callers that previously relied on
+    /// repeated calls accumulating strength (e.g., intentional multi-pass
+    /// retrieval loops) must use distinct `retrieval_id` values per logical
+    /// reinforcement event.
+    ///
+    /// # Locking model (B5 compliance)
+    ///
+    /// The `seen_retrievals` mutex is held **only** for the O(1)
+    /// set-membership check + insert, and is released *before* calling
+    /// `record_memory_coactivation`.  Per-edge mutation continues to be
+    /// serialised by `synapse_update_lock` (fine-grained).  No coarse
+    /// graph-write lock is introduced.
+    pub fn apply_reinforcement(
+        &self,
+        retrieval_id: Uuid,
+        trigger_id: &Uuid,
+        coactivated_ids: &[Uuid],
+    ) -> Result<CoactivationResult> {
+        // --- Idempotency check (O(1), short critical section) ---
+        {
+            let mut guard = self.seen_retrievals.lock();
+            let (seen_set, seen_queue) = &mut *guard;
+            if seen_set.contains(&retrieval_id) {
+                tracing::trace!(
+                    %retrieval_id,
+                    "apply_reinforcement: duplicate retrieval_id — skipping (idempotent)"
+                );
+                return Ok(CoactivationResult {
+                    edges_updated: 0,
+                    promotions: Vec::new(),
+                });
+            }
+            // Evict oldest entry when at capacity
+            if seen_queue.len() >= SEEN_RETRIEVALS_CAPACITY {
+                if let Some(oldest) = seen_queue.pop_front() {
+                    seen_set.remove(&oldest);
+                }
+            }
+            seen_set.insert(retrieval_id);
+            seen_queue.push_back(retrieval_id);
+        } // `seen_retrievals` mutex released here — before any edge mutation
+
+        // --- Delegate to the core coactivation path ---
+        self.record_memory_coactivation(trigger_id, coactivated_ids)
     }
 
     /// Find an edge between two entities/memories (in either direction)
@@ -7821,5 +7922,136 @@ mod tests {
         // Delete the edge — should decrement by activation_count (which is now 4)
         graph.delete_relationship(&edge_uuid).unwrap();
         assert_eq!(graph.total_activations.load(Ordering::Relaxed), 0);
+    }
+
+    // ── S-R4: idempotency guard ────────────────────────────────────────────
+
+    /// Reinforcing the same `retrieval_id` twice must produce the same final
+    /// edge strength as reinforcing it once (idempotent).
+    ///
+    /// This verifies the cardinality>1 / retry-compounding fix introduced in
+    /// substrate pass S-R4.  The second call with the same `retrieval_id` is
+    /// expected to be a complete no-op — `edges_updated` should be 0 and the
+    /// edge strength should be unchanged from the first call.
+    #[test]
+    fn test_apply_reinforcement_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        // Create two memory entities to act as the trigger and co-activated node.
+        let trigger_id = Uuid::new_v4();
+        let coact_id = Uuid::new_v4();
+
+        let make_entity = |id: Uuid, name: &str| EntityNode {
+            uuid: id,
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            pii_classification: PiiClassification::Clean,
+        };
+        graph.add_entity(make_entity(trigger_id, "MemA")).unwrap();
+        graph.add_entity(make_entity(coact_id, "MemB")).unwrap();
+
+        let retrieval_id = Uuid::new_v4();
+
+        // First reinforcement — should create an edge and return edges_updated > 0.
+        let first = graph
+            .apply_reinforcement(retrieval_id, &trigger_id, &[coact_id])
+            .expect("first apply_reinforcement should succeed");
+        assert!(
+            first.edges_updated > 0,
+            "First reinforcement should create/update an edge (got {})",
+            first.edges_updated
+        );
+
+        // Read back the edge strength after the first reinforcement.
+        let edge_after_first = graph
+            .find_edge_between_entities(&trigger_id, &coact_id)
+            .expect("lookup should not error")
+            .expect("edge should exist after first reinforcement");
+        let strength_after_first = edge_after_first.strength;
+
+        // Second reinforcement with the SAME retrieval_id — must be a no-op.
+        let second = graph
+            .apply_reinforcement(retrieval_id, &trigger_id, &[coact_id])
+            .expect("second apply_reinforcement should succeed");
+        assert_eq!(
+            second.edges_updated, 0,
+            "Second reinforcement with same retrieval_id must be no-op (edges_updated = 0)"
+        );
+
+        // Edge strength must not have changed.
+        let edge_after_second = graph
+            .find_edge_between_entities(&trigger_id, &coact_id)
+            .expect("lookup should not error")
+            .expect("edge should still exist");
+        assert!(
+            (edge_after_second.strength - strength_after_first).abs() < f32::EPSILON,
+            "Edge strength must not change on duplicate retrieval_id: {} → {}",
+            strength_after_first,
+            edge_after_second.strength
+        );
+
+        // A DIFFERENT retrieval_id must still apply reinforcement.
+        let different_retrieval_id = Uuid::new_v4();
+        let third = graph
+            .apply_reinforcement(different_retrieval_id, &trigger_id, &[coact_id])
+            .expect("third apply_reinforcement with new id should succeed");
+        assert!(
+            third.edges_updated > 0,
+            "New retrieval_id must produce a real reinforcement (got {})",
+            third.edges_updated
+        );
+        let edge_after_third = graph
+            .find_edge_between_entities(&trigger_id, &coact_id)
+            .expect("lookup should not error")
+            .expect("edge should still exist");
+        assert!(
+            edge_after_third.strength >= strength_after_first,
+            "A new retrieval_id should strengthen the edge further: {} (was {})",
+            edge_after_third.strength,
+            strength_after_first
+        );
+    }
+
+    /// Confirm that `seen_retrievals` correctly evicts the oldest entry when the
+    /// capacity cap (`SEEN_RETRIEVALS_CAPACITY`) is reached, so the guard never
+    /// grows unboundedly.
+    #[test]
+    fn test_seen_retrievals_evicts_at_capacity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        // Overflow the seen_retrievals ring by inserting CAPACITY+1 distinct IDs.
+        for _ in 0..=SEEN_RETRIEVALS_CAPACITY {
+            let id = Uuid::new_v4();
+            let guard = graph.seen_retrievals.lock();
+            drop(guard); // just ensure lock is accessible
+            // We exercise the code path through apply_reinforcement without needing
+            // real entities — a missing trigger simply returns Ok with 0 edges.
+            let _ = graph.apply_reinforcement(id, &Uuid::new_v4(), &[Uuid::new_v4()]);
+        }
+
+        // After cap+1 insertions the queue length must not exceed SEEN_RETRIEVALS_CAPACITY.
+        let guard = graph.seen_retrievals.lock();
+        let (ref set, ref queue) = *guard;
+        assert!(
+            queue.len() <= SEEN_RETRIEVALS_CAPACITY,
+            "VecDeque len {} exceeds cap {}",
+            queue.len(),
+            SEEN_RETRIEVALS_CAPACITY
+        );
+        assert_eq!(
+            set.len(),
+            queue.len(),
+            "HashSet and VecDeque must stay in sync"
+        );
     }
 }

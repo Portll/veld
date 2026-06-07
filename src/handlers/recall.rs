@@ -1780,6 +1780,9 @@ pub async fn proactive_context(
 
     // 2.5. Record directional coactivation - fire-and-forget (doesn't affect response)
     // First memory (highest score) is the trigger; rest are co-retrieved.
+    // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
+    // Changed graph.write() → graph.read(): record_memory_coactivation uses its own
+    // fine-grained synapse_update_lock; no coarse graph write lock is needed.
     if memories.len() >= 2 {
         let graph = graph_memory.clone();
         let memory_ids: Vec<uuid::Uuid> = memories
@@ -1789,18 +1792,19 @@ pub async fn proactive_context(
         if memory_ids.len() >= 2 {
             let trigger_id = memory_ids[0];
             let coactivated_ids: Vec<uuid::Uuid> = memory_ids[1..].to_vec();
+            let retrieval_id = uuid::Uuid::new_v4();
             tokio::task::spawn(async move {
                 if let Err(e) = tokio::task::spawn_blocking(move || {
-                    let graph_guard = graph.write();
+                    let graph_guard = graph.read();
                     if let Err(e) =
-                        graph_guard.record_memory_coactivation(&trigger_id, &coactivated_ids)
+                        graph_guard.apply_reinforcement(retrieval_id, &trigger_id, &coactivated_ids)
                     {
-                        tracing::warn!("record_memory_coactivation failed: {e}");
+                        tracing::warn!("apply_reinforcement failed: {e}");
                     }
                 })
                 .await
                 {
-                    tracing::warn!("record_memory_coactivation task panicked: {e}");
+                    tracing::warn!("apply_reinforcement task panicked: {e}");
                 }
             });
         }
