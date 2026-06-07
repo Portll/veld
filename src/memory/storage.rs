@@ -1954,6 +1954,113 @@ impl MemoryStorage {
         }
     }
 
+    // =========================================================================
+    // R7b — Fold-3 fact-source coverage for the inbound-ref GC gate
+    // =========================================================================
+    //
+    // `has_inbound_refs` (R7) only covers the Memory-store reverse index.
+    // Two additional citation sources exist that can make a memory non-reclaimable
+    // even when its Memory-store ref-count drops to zero:
+    //
+    //   (F3a) `SemanticFact.source_memories: Vec<MemoryId>`  — facts.rs
+    //   (F3b) `TemporalFact.source_memory_id: MemoryId`      — temporal_facts.rs
+    //
+    // Both stores share this RocksDB instance via `self.db` (default CF, key
+    // prefixes `facts:{user_id}:…` and `temporal_facts:{user_id}:…`).  No new
+    // state is required — we do a short-circuit prefix scan and bail as soon as
+    // one citing record is found.  This is a READ-ONLY path; nothing is written.
+    //
+    // Call `has_any_inbound_refs(target, user_id)` from the GC gate in place of
+    // (or in addition to) `has_inbound_refs`; the former is the complete guard.
+
+    /// Returns `true` as soon as a `SemanticFact` is found whose `source_memories`
+    /// contains `target`.  Scans `facts:{user_id}:*` records in the default CF.
+    /// Short-circuits on the first hit; inactive/expired facts are included because
+    /// a fact that references a memory is still a provenance citation regardless of
+    /// its validity window.
+    fn semantic_fact_cites_memory(&self, target: &MemoryId, user_id: &str) -> Result<bool> {
+        use super::facts::decode_for_gc as decode_semantic;
+        let prefix = format!("facts:{}:", user_id);
+        let iter = self.db.iterator(IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            // Skip secondary index keys (entity/type indices have >2 colons after
+            // the `facts:` prefix — exact primary keys are `facts:{uid}:{fact_id}`
+            // which have exactly 2 colons).
+            if key_str.matches(':').count() > 2 {
+                continue;
+            }
+            if let Ok(fact) = decode_semantic(&value) {
+                if fact.source_memories.contains(target) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns `true` as soon as a `TemporalFact` is found whose `source_memory_id`
+    /// equals `target`.  Scans `temporal_facts:{user_id}:*` records in the default CF.
+    /// Short-circuits on the first hit; expired facts are included (same provenance
+    /// reasoning as for `semantic_fact_cites_memory`).
+    fn temporal_fact_cites_memory(&self, target: &MemoryId, user_id: &str) -> Result<bool> {
+        use super::temporal_facts::decode_for_gc as decode_temporal;
+        let prefix = format!("temporal_facts:{}:", user_id);
+        let iter = self.db.iterator(IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            // Skip secondary index entries (`temporal_by_entity:…`, `temporal_by_event:…`)
+            // — primary keys have the form `temporal_facts:{uid}:{fact_id}` (2 colons
+            // in the `temporal_facts:` portion).
+            if key_str.matches(':').count() > 2 {
+                continue;
+            }
+            if let Ok(fact) = decode_temporal(&value) {
+                if fact.source_memory_id == *target {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Full GC guard (R7b) — returns `true` if `target` has ANY inbound reference
+    /// from the three citation sources:
+    ///
+    ///   1. Memory-store reverse index (R7 / F2) — `has_inbound_refs`
+    ///   2. `SemanticFact.source_memories`        — `semantic_fact_cites_memory`
+    ///   3. `TemporalFact.source_memory_id`        — `temporal_fact_cites_memory`
+    ///
+    /// The future merge/GC pass (R6) MUST call this instead of bare
+    /// `has_inbound_refs` to avoid orphaning facts whose only provenance anchor
+    /// is a `source_memory_id` / `source_memories` entry.
+    ///
+    /// `user_id` is the tenant prefix used by both fact stores to namespace their
+    /// keys.  Pass the same `user_id` that was used when storing the facts.
+    pub fn has_any_inbound_refs(&self, target: &MemoryId, user_id: &str) -> Result<bool> {
+        if self.has_inbound_refs(target)? {
+            return Ok(true);
+        }
+        if self.semantic_fact_cites_memory(target, user_id)? {
+            return Ok(true);
+        }
+        self.temporal_fact_cites_memory(target, user_id)
+    }
+
     /// Compute SHA256 hex digest for content dedup indexing (issue #109)
     fn sha256_content_hash(content: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -4577,7 +4684,123 @@ mod tests {
 
         assert_eq!(a_holders, vec![holder_a.clone()], "store A sees only its holder");
         assert_eq!(b_holders, vec![holder_b.clone()], "store B sees only its holder");
-        assert!(!a_holders.contains(&holder_b), "no cross-tenant holder leak");
+        assert!(!a_holders.contains(&holder_b), "no cross-tenant leader leak");
         assert!(!b_holders.contains(&holder_a), "no cross-tenant holder leak");
+    }
+
+    // ========================================================================
+    // R7b — Fold-3 fact-source coverage tests
+    // ========================================================================
+    //
+    // Three properties must hold for the GC gate to be safe:
+    //   (a) A memory cited ONLY by SemanticFact.source_memories → has_any_inbound_refs == true
+    //   (b) A memory cited ONLY by TemporalFact.source_memory_id → has_any_inbound_refs == true
+    //   (c) A memory with no citations from any source → has_any_inbound_refs == false
+
+    /// (R7b-a) Memory cited only by a SemanticFact.source_memories entry reports
+    /// has_any_inbound_refs == true even though the Memory-store reverse index is
+    /// empty for it (no Memory-to-Memory edges point at it).
+    #[test]
+    fn r7b_semantic_fact_source_memories_detected() {
+        use super::super::compression::{FactType, SemanticFact};
+        use super::super::facts::SemanticFactStore;
+
+        let (storage, _dir) = test_storage();
+        let target = MemoryId(uuid::Uuid::new_v4());
+
+        // Sanity: Memory-store reverse index is empty for `target`.
+        assert!(
+            !storage.has_inbound_refs(&target).unwrap(),
+            "no memory-store refs yet"
+        );
+
+        // Store a SemanticFact whose source_memories contains target, using the
+        // same underlying DB as the MemoryStorage.
+        let fact_store = SemanticFactStore::new(storage.db());
+        let fact = SemanticFact {
+            id: "sf-r7b-a".to_string(),
+            fact: "test fact for r7b".to_string(),
+            confidence: 0.9,
+            support_count: 1,
+            source_memories: vec![target.clone()],
+            related_entities: vec![],
+            created_at: Utc::now(),
+            last_reinforced: Utc::now(),
+            fact_type: FactType::Pattern,
+            valid_from: None,
+            valid_until: None,
+            superseded_by: None,
+            supersedes: vec![],
+            purged_at: None,
+            purge_reason: None,
+        };
+        fact_store.store("test-user", &fact).unwrap();
+
+        // Full GC guard must now report true.
+        assert!(
+            storage.has_any_inbound_refs(&target, "test-user").unwrap(),
+            "memory cited by SemanticFact.source_memories must have inbound refs"
+        );
+        // Bare Memory-store reverse index is still empty — this distinguishes the
+        // two checks and confirms R7b adds coverage on top of R7.
+        assert!(
+            !storage.has_inbound_refs(&target).unwrap(),
+            "Memory-store reverse index must NOT be affected"
+        );
+    }
+
+    /// (R7b-b) Memory cited only by a TemporalFact.source_memory_id entry reports
+    /// has_any_inbound_refs == true.
+    #[test]
+    fn r7b_temporal_fact_source_memory_id_detected() {
+        use super::super::temporal_facts::{EventType, ResolvedTime, TemporalFact, TemporalFactStore};
+
+        let (storage, _dir) = test_storage();
+        let target = MemoryId(uuid::Uuid::new_v4());
+
+        assert!(
+            !storage.has_inbound_refs(&target).unwrap(),
+            "no memory-store refs yet"
+        );
+
+        let temporal_store = TemporalFactStore::new(storage.db());
+        let fact = TemporalFact {
+            id: "tf-r7b-b".to_string(),
+            entity: "Alice".to_string(),
+            event: "camping".to_string(),
+            event_stems: vec!["camp".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("next month".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: target.clone(),
+            conversation_date: Utc::now(),
+            confidence: 0.85,
+            source_text: "Alice is planning to go camping next month.".to_string(),
+            valid_from: None,
+            valid_until: None,
+        };
+        temporal_store.store("test-user", &fact).unwrap();
+
+        assert!(
+            storage.has_any_inbound_refs(&target, "test-user").unwrap(),
+            "memory cited by TemporalFact.source_memory_id must have inbound refs"
+        );
+        assert!(
+            !storage.has_inbound_refs(&target).unwrap(),
+            "Memory-store reverse index must NOT be affected"
+        );
+    }
+
+    /// (R7b-c) A memory with no refs from any source (no Memory-to-Memory edges,
+    /// no SemanticFact citations, no TemporalFact citations) reports false.
+    #[test]
+    fn r7b_unreferenced_memory_reports_false() {
+        let (storage, _dir) = test_storage();
+        let orphan = MemoryId(uuid::Uuid::new_v4());
+
+        assert!(
+            !storage.has_any_inbound_refs(&orphan, "test-user").unwrap(),
+            "completely unreferenced memory must report false"
+        );
     }
 }
