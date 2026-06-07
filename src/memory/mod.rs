@@ -7554,3 +7554,276 @@ mod prefetch_tick_integration_tests {
         assert_eq!(warmed, 0, "empty system warms nothing");
     }
 }
+
+// =============================================================================
+// Temporal validation gate — event-time regression guard (R0)
+// =============================================================================
+//
+// These tests call `MemorySystem::filter_facts_by_time_window` directly
+// (accessible here because we are inside the `memory` module — `use super::*`
+// in the outer test modules does not reach private associated fns, but this
+// module IS `memory::mod`, so private items are visible).
+//
+// CLOCK-STABILITY RATIONALE (B5)
+// --------------------------------
+// All dates used here are fixed absolute values chosen to be far from any
+// realistic wall-clock "now":
+//
+//   • Planned-event test : conversation_date 2025-01-15, event March 2025
+//     → won't overlap with current date until at least March 2025 (and the
+//       test is deterministic regardless: the gate is exercised by comparing
+//       a FIXED window against a FIXED event date, not against Utc::now()).
+//
+//   • Historical test    : conversation_date 2025-06-10, event Year(2022)
+//     → 2022 is a past absolute year; will never be "now".
+//
+//   • Unknown-fallback   : conversation_date 2030-05-15
+//     → Far in the future; no expiry is set so `is_expired` (which does call
+//       Utc::now()) always returns false.
+//
+//   • Excluded sentinel  : event Year(2019)
+//     → A different absolute year; never ambiguous.
+//
+// The function under test (`filter_facts_by_time_window`) computes its window
+// from `query_temporal.date_range()` which we provide as hand-built
+// `TemporalExtraction` structs carrying fixed NaiveDates — no Utc::now()
+// involved in the gate itself.
+//
+// Tests are NOT #[ignore] so they run in the standard `cargo test` pass.
+// =============================================================================
+#[cfg(test)]
+mod temporal_gate_regression_tests {
+    use super::*;
+    use chrono::{NaiveDate, TimeZone};
+
+    /// Build a minimal TemporalFact whose only variable fields are
+    /// `resolved_time`, `conversation_date`, and `source_memory_id`.
+    /// All other fields are stable test fixtures.
+    fn make_fact(
+        id: &str,
+        resolved_time: temporal_facts::ResolvedTime,
+        conversation_date: chrono::DateTime<chrono::Utc>,
+    ) -> temporal_facts::TemporalFact {
+        temporal_facts::TemporalFact {
+            id: id.to_string(),
+            entity: "test_entity".to_string(),
+            event: "test_event".to_string(),
+            event_stems: vec!["test".to_string()],
+            event_type: temporal_facts::EventType::Planned,
+            relative_time: None,
+            resolved_time,
+            source_memory_id: MemoryId(uuid::Uuid::new_v4()),
+            conversation_date,
+            confidence: 1.0,
+            source_text: "test source text".to_string(),
+            valid_from: None,
+            valid_until: None,
+        }
+    }
+
+    /// Build a `TemporalExtraction` with a single inclusive date window.
+    /// The gate widens by ±7 days internally, but we set the window to cover
+    /// the target month exactly, so the ±7 days expansion only helps, not hurts.
+    fn make_window(start: NaiveDate, end: NaiveDate) -> query_parser::TemporalExtraction {
+        query_parser::TemporalExtraction {
+            refs: vec![],          // unused by filter_facts_by_time_window
+            earliest: Some(start),
+            latest: Some(end),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 1 — PLANNED event
+    //
+    // Scenario: on 2025-01-15 someone says "we're planning to go camping in
+    //           March 2025".  The fact is stored with
+    //           • conversation_date = 2025-01-15  (when mentioned)
+    //           • resolved_time    = MonthYear { month: 3, year: 2025 }
+    //                                (when the event IS)
+    //
+    // A query asking "what is happening in March 2025?" supplies a window of
+    // [2025-03-01, 2025-03-31].  The gate MUST validate on event time and
+    // RETAIN the fact.  If it incorrectly used conversation_date (Jan 15) the
+    // fact would fall outside the March window and be silently dropped.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn planned_event_retained_by_event_time_not_mention_time() {
+        // conversation_date: 2025-01-15 — when the user mentioned camping
+        let mention_date = chrono::Utc
+            .with_ymd_and_hms(2025, 1, 15, 12, 0, 0)
+            .unwrap();
+
+        let fact = make_fact(
+            "planned-camping-2025",
+            temporal_facts::ResolvedTime::MonthYear {
+                month: 3,
+                year: 2025,
+            },
+            mention_date,
+        );
+
+        // Query window: all of March 2025
+        let window = make_window(
+            NaiveDate::from_ymd_opt(2025, 3, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 3, 31).unwrap(),
+        );
+
+        let facts = [fact];
+        let retained = MemorySystem::filter_facts_by_time_window(&facts, &window);
+
+        assert_eq!(
+            retained.len(),
+            1,
+            "planned event in March 2025 MUST be retained when querying March 2025 \
+             (gate uses event-time, not mention-time)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 2 — HISTORICAL event
+    //
+    // Scenario: on 2025-06-10 someone recalls "I painted that in 2022".  The
+    //           fact is stored with
+    //           • conversation_date = 2025-06-10  (when mentioned)
+    //           • resolved_time    = Year(2022)   (when the event happened)
+    //
+    // A query for "what happened in 2022?" supplies a window of
+    // [2022-01-01, 2022-12-31].  The gate MUST validate on event time and
+    // RETAIN the fact.  Using conversation_date (2025) would incorrectly drop it.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn historical_event_retained_by_event_time_not_mention_time() {
+        // conversation_date: 2025-06-10 — when the user mentioned the painting
+        let mention_date = chrono::Utc
+            .with_ymd_and_hms(2025, 6, 10, 9, 0, 0)
+            .unwrap();
+
+        let fact = make_fact(
+            "historical-painting-2022",
+            temporal_facts::ResolvedTime::Year(2022),
+            mention_date,
+        );
+
+        // Query window: full calendar year 2022
+        let window = make_window(
+            NaiveDate::from_ymd_opt(2022, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2022, 12, 31).unwrap(),
+        );
+
+        let facts = [fact];
+        let retained = MemorySystem::filter_facts_by_time_window(&facts, &window);
+
+        assert_eq!(
+            retained.len(),
+            1,
+            "historical event in 2022 MUST be retained when querying 2022 \
+             (gate uses event-time, not mention-time)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 3 — UNKNOWN resolved time falls back to conversation_date
+    //
+    // Scenario: a fact cannot resolve its event time
+    //           (resolved_time = Unknown).  The gate falls back to
+    //           conversation_date per the documented contract.
+    //
+    //           conversation_date = 2030-05-15; query window = May 2030.
+    //           The fact MUST be retained via the fallback path.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn unknown_resolved_time_falls_back_to_conversation_date() {
+        // conversation_date: 2030-05-15
+        let conv_date = chrono::Utc
+            .with_ymd_and_hms(2030, 5, 15, 8, 0, 0)
+            .unwrap();
+
+        let fact = make_fact(
+            "unknown-time-fact",
+            temporal_facts::ResolvedTime::Unknown,
+            conv_date,
+        );
+
+        // Query window: all of May 2030
+        let window = make_window(
+            NaiveDate::from_ymd_opt(2030, 5, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2030, 5, 31).unwrap(),
+        );
+
+        let facts = [fact];
+        let retained = MemorySystem::filter_facts_by_time_window(&facts, &window);
+
+        assert_eq!(
+            retained.len(),
+            1,
+            "fact with Unknown resolved_time MUST be retained when \
+             conversation_date falls in the query window (fallback path)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 4 — Sentinel: fact outside the query window is EXCLUDED
+    //
+    // A fact with event Year(2019) queried against a 2022 window must NOT be
+    // returned.  This ensures the gate is actually filtering, not passing
+    // everything through.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn fact_outside_window_is_excluded() {
+        let conv_date = chrono::Utc
+            .with_ymd_and_hms(2025, 6, 1, 0, 0, 0)
+            .unwrap();
+
+        let fact = make_fact(
+            "sentinel-2019-event",
+            temporal_facts::ResolvedTime::Year(2019),
+            conv_date,
+        );
+
+        // Query window: full calendar year 2022
+        let window = make_window(
+            NaiveDate::from_ymd_opt(2022, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2022, 12, 31).unwrap(),
+        );
+
+        let facts = [fact];
+        let retained = MemorySystem::filter_facts_by_time_window(&facts, &window);
+
+        assert_eq!(
+            retained.len(),
+            0,
+            "fact with event in 2019 MUST be excluded from a 2022 query window"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Case 5 — No temporal refs → gate returns empty vec (caller falls through)
+    //
+    // When the query carries no parsed temporal refs, the gate contract says it
+    // returns an empty Vec so callers can fall through to unfiltered results.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn empty_query_window_returns_empty() {
+        let conv_date = chrono::Utc
+            .with_ymd_and_hms(2025, 3, 15, 0, 0, 0)
+            .unwrap();
+
+        let fact = make_fact(
+            "any-fact",
+            temporal_facts::ResolvedTime::Year(2025),
+            conv_date,
+        );
+
+        // A TemporalExtraction with no refs and no date bounds
+        let empty_window = query_parser::TemporalExtraction::default();
+
+        let facts = [fact];
+        let result = MemorySystem::filter_facts_by_time_window(&facts, &empty_window);
+
+        assert!(
+            result.is_empty(),
+            "gate MUST return empty vec when query has no temporal refs \
+             (contract: callers fall through to unfiltered results)"
+        );
+    }
+}
