@@ -1,4 +1,4 @@
-//! Earth↔Veld seam: takes Earth capabilities (embedder, vector index) and applies Veld search strategy.
+//! UserMemory↔Veld seam: takes UserMemory capabilities (embedder, vector index) and applies Veld search strategy.
 //! Production-grade retrieval engine for memory search
 //! Integrated with Vamana graph-based ANN and MiniLM embeddings
 //!

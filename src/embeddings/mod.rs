@@ -1,4 +1,4 @@
-//! Earth layer: embedding infrastructure (model loading, inference, trait definitions).
+//! Embedding infrastructure (model loading, inference, trait definitions).
 //! Embedding generation module
 //!
 //! Provides semantic embedding generation for memory retrieval.

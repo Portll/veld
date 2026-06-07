@@ -213,7 +213,7 @@ pub async fn get_memory(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -256,7 +256,7 @@ pub async fn list_memories(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -363,7 +363,7 @@ async fn list_memories_inner(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let all_memories = {
@@ -446,7 +446,7 @@ pub async fn update_memory(
     }
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -505,7 +505,7 @@ pub async fn delete_memory(
 
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
+    let memory = state.get_user_memory(&user_id).map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
     let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -573,7 +573,7 @@ pub async fn forget_by_id(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
@@ -636,7 +636,7 @@ pub async fn patch_memory(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
@@ -736,7 +736,7 @@ pub async fn forget_by_age(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -780,7 +780,7 @@ pub async fn forget_by_importance(
     }
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -831,7 +831,7 @@ pub async fn forget_by_pattern(
     }
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -875,7 +875,7 @@ pub async fn forget_by_tags(
     }
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -931,7 +931,7 @@ pub async fn forget_by_date(
     }
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -988,7 +988,7 @@ pub async fn bulk_delete_memories(
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1059,7 +1059,7 @@ pub async fn clear_all_memories(
     }
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_guard = memory_sys.read();
@@ -1164,7 +1164,7 @@ pub async fn get_memory_health(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let memory = state
-        .get_user_earth(&user_id)
+        .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
 
     let mem = {
@@ -1268,7 +1268,7 @@ pub async fn anchor_memory(
     let memory_id = memory::MemoryId(uuid);
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let anchor_value = req.anchor;
@@ -1437,7 +1437,7 @@ pub async fn move_memory_tier(
     let target_tier = parse_memory_tier(&req.target_tier)?;
 
     let memory_sys = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let mid = memory_id.clone();

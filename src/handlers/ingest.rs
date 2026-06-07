@@ -229,7 +229,7 @@ pub async fn ingest(
     };
 
     let memory = state
-        .get_user_earth(&req.user_id)
+        .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
     let memory_id = {

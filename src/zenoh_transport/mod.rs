@@ -1,5 +1,5 @@
-//! Roots layer: transport infrastructure. Zenoh protocol routing for distributed Earth coordination.
-//! Zenoh Transport Layer for Roots
+//! Zenoh transport layer: infrastructure for routing Veld operations over the Zenoh protocol.
+//! Zenoh Transport Layer
 //!
 //! Exposes Veld operations over [Eclipse Zenoh](https://zenoh.io/) pub/sub and
 //! request/reply primitives. Runs alongside the Axum HTTP server, sharing the same
@@ -474,10 +474,10 @@ async fn register_stream_subscribers(
                                 }
                             };
 
-                            let earth = match mgr.get_user_earth(&user_id) {
+                            let user_mem = match mgr.get_user_memory(&user_id) {
                                 Ok(m) => m,
                                 Err(e) => {
-                                    error!(user_id = %user_id, "Failed to get user earth: {}", e);
+                                    error!(user_id = %user_id, "Failed to get user memory: {}", e);
                                     continue;
                                 }
                             };
@@ -485,7 +485,7 @@ async fn register_stream_subscribers(
                             let mgr_clone = Arc::clone(&mgr);
                             let sid = session_id.clone();
                             tokio::spawn(async move {
-                                handlers::handle_stream_message(msg, &sid, earth, &mgr_clone).await;
+                                handlers::handle_stream_message(msg, &sid, user_mem, &mgr_clone).await;
                             });
                         }
                         Err(e) => {
@@ -1095,9 +1095,9 @@ async fn register_auto_topic(
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create stream session for auto-topic: {e}"))?;
 
-    let _earth = manager
-        .get_user_earth(&topic.user_id)
-        .map_err(|e| anyhow::anyhow!("Failed to get user earth for auto-topic: {e}"))?;
+    let _user_mem = manager
+        .get_user_memory(&topic.user_id)
+        .map_err(|e| anyhow::anyhow!("Failed to get user memory for auto-topic: {e}"))?;
 
     let mgr = Arc::clone(manager);
     let user_id = topic.user_id.clone();
