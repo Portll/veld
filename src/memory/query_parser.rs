@@ -672,6 +672,234 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
     }
 }
 
+/// Extract temporal references from text, with an optional named-event resolver
+/// for query-time anchor resolution (B2).
+///
+/// Behaves identically to `extract_temporal_refs` except that when Pass 0 finds
+/// an anchor-relative pattern ("the Sunday before the wedding") but
+/// `try_parse_anchor_date` fails (because the anchor is a named event, not a
+/// calendar date), it calls `event_resolver(anchor_str)` to look up the event's
+/// stored date from the `TemporalFactStore`.
+///
+/// **Plumbing note**: `extract_temporal_refs` is a free function called from
+/// `detect_temporal_intent` / `requires_temporal_filtering` without store access;
+/// those callers are unaffected.  `recall.rs` calls this variant so that the
+/// store is available for event lookup.
+///
+/// The `event_resolver` closure is called at most once per query (one anchor
+/// phrase per Pass 0 pattern match).  Returning `None` from the closure leaves
+/// the anchor unresolved and Pass 0 emits nothing — later passes still run.
+pub fn extract_temporal_refs_with_events(
+    text: &str,
+    event_resolver: Option<&dyn Fn(&str) -> Option<NaiveDate>>,
+) -> TemporalExtraction {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // Run the standard extractor first — covers absolute-date anchors (B1) and
+    // all existing passes (relative, "N ago", weekdays).
+    let base = extract_temporal_refs(text);
+
+    // If Pass 0 already emitted at least one bound, or there is no event
+    // resolver, return the base result unchanged.
+    let resolver = match event_resolver {
+        Some(r) => r,
+        None => return base,
+    };
+
+    // Re-check Pass 0 patterns: if any matched and the anchor was NOT resolved
+    // by `try_parse_anchor_date` (i.e. no bound was emitted yet from Pass 0),
+    // try the event resolver as a fallback.
+    //
+    // We detect "Pass 0 would have matched but didn't" by checking whether the
+    // text matches one of the three regexes AND the base result has no bounds
+    // that could have come from that match (i.e. base.query_bounds is empty or
+    // only contains non-Point bounds from later passes).
+    //
+    // For simplicity we re-run the regexes and, if try_parse_anchor_date returns
+    // None, call the event resolver.  This is intentionally additive: existing
+    // bounds from base are preserved.
+
+    fn try_parse_anchor_date(anchor: &str) -> Option<NaiveDate> {
+        let anchor = anchor.trim();
+        let explicit = extract_explicit_dates(anchor);
+        if let Some((d, _, _)) = explicit.into_iter().next() {
+            return Some(d);
+        }
+        if let Ok(parsed) = dateparser::parse(anchor) {
+            let d = parsed.date_naive();
+            if (1900..=2100).contains(&d.year()) {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    fn parse_weekday_b2(s: &str) -> Option<Weekday> {
+        match s {
+            "monday" => Some(Weekday::Mon),
+            "tuesday" => Some(Weekday::Tue),
+            "wednesday" => Some(Weekday::Wed),
+            "thursday" => Some(Weekday::Thu),
+            "friday" => Some(Weekday::Fri),
+            "saturday" => Some(Weekday::Sat),
+            "sunday" => Some(Weekday::Sun),
+            _ => None,
+        }
+    }
+
+    static WEEKDAY_REL_B2: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\bthe\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(before|after)\s+(.+)",
+        )
+        .unwrap()
+    });
+    static DAY_REL_B2: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\bthe\s+day\s+(before|after)\s+(.+)").unwrap()
+    });
+    static N_UNIT_REL_B2: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(\d+)\s+(days?|weeks?)\s+(before|after)\s+(.+)").unwrap()
+    });
+
+    let text_lower = text.to_lowercase();
+
+    // Determine which pattern matched and extract the anchor string.
+    // If try_parse_anchor_date succeeds on the anchor, base already handled it.
+    // We only call the event resolver when try_parse_anchor_date returns None.
+
+    struct AnchorHit {
+        anchor_str: String,
+        kind: AnchorKind,
+        matched_text: String,
+        pos: usize,
+    }
+    enum AnchorKind {
+        Weekday { weekday: Weekday, direction: String },
+        Day { direction: String },
+        NUnit { n: i64, direction: String },
+    }
+
+    let hit: Option<AnchorHit> = if let Some(caps) = WEEKDAY_REL_B2.captures(&text_lower) {
+        let wday_str = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+        let direction = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let anchor_str = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+        let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
+        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+        if try_parse_anchor_date(&anchor_str).is_none() {
+            parse_weekday_b2(&wday_str).map(|weekday| AnchorHit {
+                anchor_str,
+                kind: AnchorKind::Weekday { weekday, direction },
+                matched_text: matched,
+                pos,
+            })
+        } else {
+            None
+        }
+    } else if let Some(caps) = DAY_REL_B2.captures(&text_lower) {
+        let direction = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+        let anchor_str = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
+        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+        if try_parse_anchor_date(&anchor_str).is_none() {
+            Some(AnchorHit {
+                anchor_str,
+                kind: AnchorKind::Day { direction },
+                matched_text: matched,
+                pos,
+            })
+        } else {
+            None
+        }
+    } else if let Some(caps) = N_UNIT_REL_B2.captures(&text_lower) {
+        let n: i64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let direction = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+        let anchor_str = caps.get(4).map(|m| m.as_str()).unwrap_or("").to_string();
+        let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
+        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
+        if n > 0 && try_parse_anchor_date(&anchor_str).is_none() {
+            Some(AnchorHit {
+                anchor_str,
+                kind: AnchorKind::NUnit {
+                    n,
+                    direction: format!("{}:{}", direction, unit),
+                },
+                matched_text: matched,
+                pos,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let hit = match hit {
+        Some(h) => h,
+        None => return base,
+    };
+
+    // Call the event resolver with the anchor phrase.
+    let anchor_date = match resolver(&hit.anchor_str) {
+        Some(d) => d,
+        None => return base,
+    };
+
+    // Compute the target date using B1's existing helpers.
+    let computed = match &hit.kind {
+        AnchorKind::Weekday { weekday, direction } => {
+            if direction == "before" {
+                crate::memory::temporal_facts::last_weekday(anchor_date, *weekday)
+            } else {
+                crate::memory::temporal_facts::next_weekday(anchor_date, *weekday)
+            }
+        }
+        AnchorKind::Day { direction } => {
+            if direction == "before" {
+                anchor_date - Duration::days(1)
+            } else {
+                anchor_date + Duration::days(1)
+            }
+        }
+        AnchorKind::NUnit { n, direction } => {
+            // direction is encoded as "before:days?" or "after:weeks?"
+            let parts: Vec<&str> = direction.splitn(2, ':').collect();
+            let dir = parts.first().copied().unwrap_or("");
+            let unit = parts.get(1).copied().unwrap_or("");
+            let days = if unit.starts_with("week") { n * 7 } else { *n };
+            if dir == "before" {
+                anchor_date - Duration::days(days)
+            } else {
+                anchor_date + Duration::days(days)
+            }
+        }
+    };
+
+    // Build the augmented extraction from the base, adding the newly resolved bound.
+    let mut augmented = base;
+
+    // Only add if not already present (reversion guard: don't duplicate).
+    if !augmented
+        .query_bounds
+        .iter()
+        .any(|b| matches!(b, TemporalBound::Point(p) if *p == computed))
+    {
+        augmented.query_bounds.push(TemporalBound::Point(computed));
+    }
+    if !augmented.refs.iter().any(|r| r.date == computed) {
+        augmented.refs.push(TemporalRef {
+            date: computed,
+            original_text: hit.matched_text,
+            confidence: 0.88,
+            position: hit.pos,
+            ref_type: TemporalRefType::Relative,
+        });
+        update_bounds(&mut augmented.earliest, &mut augmented.latest, computed);
+    }
+
+    augmented
+}
+
 /// Classify the type of temporal reference
 fn classify_temporal_ref(text: &str, date: &NaiveDate, now: &DateTime<Utc>) -> TemporalRefType {
     let text_lower = text.to_lowercase();
@@ -5044,6 +5272,117 @@ mod tests {
         assert!(
             !extraction.bounds().is_empty(),
             "Expected bounds for 'yesterday' after B1 pass added"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // B2: named-event anchor resolution tests
+    // -------------------------------------------------------------------------
+
+    /// "the Sunday before the wedding" with a resolver that returns wedding = 2023-05-25
+    /// (Thursday) → Sunday before = 2023-05-21.
+    #[test]
+    fn test_b2_sunday_before_named_event() {
+        use crate::memory::temporal_facts::TemporalBound;
+
+        let wedding_date = chrono::NaiveDate::from_ymd_opt(2023, 5, 25).unwrap();
+        let resolver = |phrase: &str| -> Option<chrono::NaiveDate> {
+            if phrase.contains("wedding") {
+                Some(wedding_date)
+            } else {
+                None
+            }
+        };
+
+        let extraction =
+            extract_temporal_refs_with_events("the Sunday before the wedding", Some(&resolver));
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
+
+        let has_ref = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            has_ref,
+            "Expected 2023-05-21 in refs for 'Sunday before the wedding', got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+
+        let has_bound = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, TemporalBound::Point(p) if *p == expected));
+        assert!(
+            has_bound,
+            "Expected TemporalBound::Point(2023-05-21) in bounds, got: {:?}",
+            extraction.bounds()
+        );
+    }
+
+    /// B2: forward ref — no event stored → resolver returns None → no bounds emitted.
+    #[test]
+    fn test_b2_forward_ref_no_bound_emitted() {
+        let resolver = |_phrase: &str| -> Option<chrono::NaiveDate> { None };
+        let extraction =
+            extract_temporal_refs_with_events("the Sunday before the wedding", Some(&resolver));
+        assert!(
+            extraction.bounds().is_empty(),
+            "Forward ref with None resolver must emit no bounds, got: {:?}",
+            extraction.bounds()
+        );
+    }
+
+    /// B2: absolute-date anchor still works unchanged (reversion guard).
+    #[test]
+    fn test_b2_absolute_anchor_unchanged() {
+        use std::cell::Cell;
+        // Resolver is present but should NOT be called for an absolute-date anchor.
+        let called = Cell::new(false);
+        let resolver = |_phrase: &str| -> Option<chrono::NaiveDate> {
+            called.set(true);
+            None
+        };
+        let extraction = extract_temporal_refs_with_events(
+            "the Sunday before 2023-05-25",
+            Some(&resolver),
+        );
+        // B1 already resolved this; resolver must not have been called.
+        assert!(
+            !called.get(),
+            "Resolver must NOT be called when anchor is an absolute date"
+        );
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
+        let has_ref = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            has_ref,
+            "Absolute-date anchor path must still produce 2023-05-21, got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+    }
+
+    /// B2: "3 days before the graduation" with event resolver → correct offset.
+    #[test]
+    fn test_b2_n_days_before_named_event() {
+        use crate::memory::temporal_facts::TemporalBound;
+
+        let grad_date = chrono::NaiveDate::from_ymd_opt(2023, 6, 15).unwrap();
+        let resolver = |phrase: &str| -> Option<chrono::NaiveDate> {
+            if phrase.contains("graduation") {
+                Some(grad_date)
+            } else {
+                None
+            }
+        };
+
+        let extraction =
+            extract_temporal_refs_with_events("3 days before the graduation", Some(&resolver));
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 6, 12).unwrap();
+
+        let has_bound = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, TemporalBound::Point(p) if *p == expected));
+        assert!(
+            has_bound,
+            "Expected TemporalBound::Point(2023-06-12) for '3 days before graduation', got: {:?}",
+            extraction.bounds()
         );
     }
 }
