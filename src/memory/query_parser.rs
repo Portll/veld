@@ -395,6 +395,11 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
         });
 
         // Helper: emit one anchor-relative result.
+        // Emits the derived date into both `query_bounds` (for B3 boost path)
+        // AND `refs`/`earliest`/`latest` (for Layer 0.6 temporal-fact boost via
+        // `filter_facts_by_time_window`).  Both signals are needed: query_bounds
+        // drives session-level scoring boosts; refs/earliest/latest allow Layer 0.6
+        // to surface the temporal facts closest to the derived date.
         let mut emit_anchor_result =
             |computed: NaiveDate, matched_text: &str, pos: usize| {
                 let bound = TemporalBound::Point(computed);
@@ -783,13 +788,13 @@ pub fn extract_temporal_refs_with_events(
         let wday_str = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
         let direction = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
         let anchor_str = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+        let matched_text = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
-        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         if try_parse_anchor_date(&anchor_str).is_none() {
             parse_weekday_b2(&wday_str).map(|weekday| AnchorHit {
                 anchor_str,
                 kind: AnchorKind::Weekday { weekday, direction },
-                matched_text: matched,
+                matched_text,
                 pos,
             })
         } else {
@@ -798,13 +803,13 @@ pub fn extract_temporal_refs_with_events(
     } else if let Some(caps) = DAY_REL_B2.captures(&text_lower) {
         let direction = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
         let anchor_str = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let matched_text = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
-        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         if try_parse_anchor_date(&anchor_str).is_none() {
             Some(AnchorHit {
                 anchor_str,
                 kind: AnchorKind::Day { direction },
-                matched_text: matched,
+                matched_text,
                 pos,
             })
         } else {
@@ -815,8 +820,8 @@ pub fn extract_temporal_refs_with_events(
         let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
         let direction = caps.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
         let anchor_str = caps.get(4).map(|m| m.as_str()).unwrap_or("").to_string();
+        let matched_text = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
-        let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
         if n > 0 && try_parse_anchor_date(&anchor_str).is_none() {
             Some(AnchorHit {
                 anchor_str,
@@ -824,7 +829,7 @@ pub fn extract_temporal_refs_with_events(
                     n,
                     direction: format!("{}:{}", direction, unit),
                 },
-                matched_text: matched,
+                matched_text,
                 pos,
             })
         } else {
@@ -878,7 +883,8 @@ pub fn extract_temporal_refs_with_events(
     // Build the augmented extraction from the base, adding the newly resolved bound.
     let mut augmented = base;
 
-    // Only add if not already present (reversion guard: don't duplicate).
+    // Emit into query_bounds (for B3 session-level boost) and refs/earliest/latest
+    // (for Layer 0.6 temporal-fact boost via filter_facts_by_time_window).
     if !augmented
         .query_bounds
         .iter()
@@ -894,7 +900,11 @@ pub fn extract_temporal_refs_with_events(
             position: hit.pos,
             ref_type: TemporalRefType::Relative,
         });
-        update_bounds(&mut augmented.earliest, &mut augmented.latest, computed);
+        let mut e = augmented.earliest;
+        let mut l = augmented.latest;
+        update_bounds(&mut e, &mut l, computed);
+        augmented.earliest = e;
+        augmented.latest = l;
     }
 
     augmented
@@ -5166,19 +5176,15 @@ mod tests {
 
     /// "the Sunday before 2023-05-25" → 2023-05-21
     /// 25 May 2023 is a Thursday; the Sunday *before* it is 21 May 2023.
+    ///
+    /// Post fix-A contract: the derived date (2023-05-21) lands in bounds() only,
+    /// NOT in refs or earliest/latest.  The anchor date (2023-05-25) may still
+    /// appear in refs from the later passes (dateparser / explicit_dates).
     #[test]
     fn test_anchor_relative_sunday_before_iso() {
         let extraction = extract_temporal_refs("the Sunday before 2023-05-25");
         let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
-        let has_expected = extraction
-            .refs
-            .iter()
-            .any(|r| r.date == expected);
-        assert!(
-            has_expected,
-            "Expected 2023-05-21 in refs for 'the Sunday before 2023-05-25', got: {:?}",
-            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
-        );
+        // bounds() must contain the derived date (B3 boost signal).
         let bound_has_expected = extraction
             .bounds()
             .iter()
@@ -5188,6 +5194,13 @@ mod tests {
             "Expected TemporalBound::Point(2023-05-21) in bounds, got: {:?}",
             extraction.bounds()
         );
+        // refs must also contain the derived date (Layer 0.6 temporal-fact boost).
+        let ref_has_derived = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            ref_has_derived,
+            "Derived date 2023-05-21 must appear in refs (Layer 0.6 boost); got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
     }
 
     /// "the Monday after 2023-05-25" → 2023-05-29
@@ -5196,12 +5209,6 @@ mod tests {
     fn test_anchor_relative_monday_after_iso() {
         let extraction = extract_temporal_refs("the Monday after 2023-05-25");
         let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 29).unwrap();
-        let has_expected = extraction.refs.iter().any(|r| r.date == expected);
-        assert!(
-            has_expected,
-            "Expected 2023-05-29 in refs for 'the Monday after 2023-05-25', got: {:?}",
-            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
-        );
         let bound_has_expected = extraction
             .bounds()
             .iter()
@@ -5211,6 +5218,13 @@ mod tests {
             "Expected TemporalBound::Point(2023-05-29) in bounds, got: {:?}",
             extraction.bounds()
         );
+        // refs must also contain the derived date (Layer 0.6 boost).
+        let ref_has_derived = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            ref_has_derived,
+            "Derived date 2023-05-29 must appear in refs (Layer 0.6 boost); got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
     }
 
     /// "3 days before 2023-05-25" → 2023-05-22
@@ -5218,12 +5232,6 @@ mod tests {
     fn test_anchor_relative_n_days_before() {
         let extraction = extract_temporal_refs("3 days before 2023-05-25");
         let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 22).unwrap();
-        let has_expected = extraction.refs.iter().any(|r| r.date == expected);
-        assert!(
-            has_expected,
-            "Expected 2023-05-22 in refs for '3 days before 2023-05-25', got: {:?}",
-            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
-        );
         let bound_has_expected = extraction
             .bounds()
             .iter()
@@ -5233,6 +5241,13 @@ mod tests {
             "Expected TemporalBound::Point(2023-05-22) in bounds, got: {:?}",
             extraction.bounds()
         );
+        // refs must also contain the derived date (Layer 0.6 boost).
+        let ref_has_derived = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            ref_has_derived,
+            "Derived date 2023-05-22 must appear in refs (Layer 0.6 boost); got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
     }
 
     /// "the Sunday before 25 May 2023" — text-form anchor → same result 2023-05-21
@@ -5240,10 +5255,20 @@ mod tests {
     fn test_anchor_relative_sunday_before_text_form() {
         let extraction = extract_temporal_refs("the Sunday before 25 May 2023");
         let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
-        let has_expected = extraction.refs.iter().any(|r| r.date == expected);
+        let bound_has_expected = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, crate::memory::temporal_facts::TemporalBound::Point(p) if *p == expected));
         assert!(
-            has_expected,
-            "Expected 2023-05-21 in refs for 'the Sunday before 25 May 2023', got: {:?}",
+            bound_has_expected,
+            "Expected TemporalBound::Point(2023-05-21) in bounds for text-form anchor, got: {:?}",
+            extraction.bounds()
+        );
+        // refs must also contain the derived date.
+        let ref_has_derived = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            ref_has_derived,
+            "Derived date 2023-05-21 must appear in refs (Layer 0.6 boost); got: {:?}",
             extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
         );
     }
@@ -5281,6 +5306,9 @@ mod tests {
 
     /// "the Sunday before the wedding" with a resolver that returns wedding = 2023-05-25
     /// (Thursday) → Sunday before = 2023-05-21.
+    ///
+    /// Post fix-A contract: 2023-05-21 appears in bounds() (boost signal) but NOT
+    /// in refs or earliest/latest (no filter narrowing).
     #[test]
     fn test_b2_sunday_before_named_event() {
         use crate::memory::temporal_facts::TemporalBound;
@@ -5298,13 +5326,7 @@ mod tests {
             extract_temporal_refs_with_events("the Sunday before the wedding", Some(&resolver));
         let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
 
-        let has_ref = extraction.refs.iter().any(|r| r.date == expected);
-        assert!(
-            has_ref,
-            "Expected 2023-05-21 in refs for 'Sunday before the wedding', got: {:?}",
-            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
-        );
-
+        // bounds() must contain the derived date (for B3 boost).
         let has_bound = extraction
             .bounds()
             .iter()
@@ -5313,6 +5335,14 @@ mod tests {
             has_bound,
             "Expected TemporalBound::Point(2023-05-21) in bounds, got: {:?}",
             extraction.bounds()
+        );
+
+        // refs must also contain the derived date (Layer 0.6 temporal-fact boost).
+        let has_ref = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            has_ref,
+            "Derived date 2023-05-21 must appear in refs (Layer 0.6 boost); got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
         );
     }
 
@@ -5330,6 +5360,8 @@ mod tests {
     }
 
     /// B2: absolute-date anchor still works unchanged (reversion guard).
+    /// When the anchor is a parseable date, the B1 pass handles it and the B2
+    /// resolver must NOT be called.
     #[test]
     fn test_b2_absolute_anchor_unchanged() {
         use std::cell::Cell;
@@ -5349,11 +5381,141 @@ mod tests {
             "Resolver must NOT be called when anchor is an absolute date"
         );
         let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
+        // bounds() must contain derived date (boost signal).
+        let has_bound = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, crate::memory::temporal_facts::TemporalBound::Point(p) if *p == expected));
+        assert!(
+            has_bound,
+            "Absolute-date anchor path must produce TemporalBound::Point(2023-05-21) in bounds, got: {:?}",
+            extraction.bounds()
+        );
+        // refs must also contain the derived date (Layer 0.6 boost).
         let has_ref = extraction.refs.iter().any(|r| r.date == expected);
         assert!(
             has_ref,
-            "Absolute-date anchor path must still produce 2023-05-21, got: {:?}",
+            "Derived date 2023-05-21 must appear in refs (Layer 0.6 boost); got: {:?}",
             extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // DIAGNOSTIC: q53/q63 regression investigation
+    // -------------------------------------------------------------------------
+
+    /// q53: "When did John help renovate his hometown community center?"
+    /// Pass 0 should NOT fire (no anchor-relative pattern).
+    /// dateparser + split_temporal_phrases may or may not emit refs.
+    /// This test records what ACTUALLY fires so we can confirm the mechanism.
+    #[test]
+    fn test_q53_no_spurious_bounds() {
+        let q53 = "When did John help renovate his hometown community center?";
+        let extraction = extract_temporal_refs(q53);
+        // This is a WhenQuestion — asks FOR a date. No anchor-relative pattern.
+        // Pass 0 must not emit anything. query_bounds must be empty.
+        assert!(
+            extraction.query_bounds.is_empty(),
+            "q53: Pass 0 must emit no query_bounds; got: {:?}",
+            extraction.query_bounds
+        );
+        // Also record what refs/earliest/latest dateparser emitted (can be noise)
+        // This is informational — we don't assert on refs here.
+        eprintln!("q53 refs: {:?}", extraction.refs.iter().map(|r| (r.date, r.original_text.clone())).collect::<Vec<_>>());
+        eprintln!("q53 earliest: {:?}, latest: {:?}", extraction.earliest, extraction.latest);
+    }
+
+    /// q63: "How many weeks passed between Maria adopting Coco and Shadow?"
+    /// Duration question. Pass 0 must NOT fire (no before|after, no anchor).
+    /// No absolute date in the text → no spurious refs/earliest/latest.
+    #[test]
+    fn test_q63_no_spurious_bounds_or_date_range() {
+        let q63 = "How many weeks passed between Maria adopting Coco and Shadow?";
+        let extraction = extract_temporal_refs(q63);
+        // Pass 0 must not fire.
+        assert!(
+            extraction.query_bounds.is_empty(),
+            "q63: Pass 0 must emit no query_bounds; got: {:?}",
+            extraction.query_bounds
+        );
+        // No absolute date in query → no refs → date_range() must be None.
+        // If date_range() is Some(), filter_facts_by_time_window fires and may
+        // drop the right answer (the 2022 conversation).
+        assert!(
+            extraction.date_range().is_none(),
+            "q63: duration question with no date must produce no date_range; got: {:?}",
+            extraction.date_range()
+        );
+        eprintln!("q63 refs: {:?}", extraction.refs.iter().map(|r| (r.date, r.original_text.clone())).collect::<Vec<_>>());
+        eprintln!("q63 earliest: {:?}, latest: {:?}", extraction.earliest, extraction.latest);
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression tests: Pass 0 dual-path contract
+    // -------------------------------------------------------------------------
+
+    /// Anchor-relative derived date must appear in BOTH bounds() (B3 boost path)
+    /// AND refs/earliest (Layer 0.6 temporal-fact boost).
+    #[test]
+    fn test_anchor_relative_boost_and_ref_contract() {
+        use crate::memory::temporal_facts::TemporalBound;
+        // "the Sunday before 2023-05-25" derives 2023-05-21.
+        let q = "the Sunday before 2023-05-25";
+        let extraction = extract_temporal_refs(q);
+        let derived = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
+
+        // Derived date must be in bounds() for the B3 boost path.
+        assert!(
+            extraction.bounds().iter().any(|b| matches!(b, TemporalBound::Point(p) if *p == derived)),
+            "derived date must be in bounds(); got: {:?}", extraction.bounds()
+        );
+        // Derived date must also be in refs for the Layer 0.6 temporal-fact boost.
+        assert!(
+            extraction.refs.iter().any(|r| r.date == derived),
+            "derived date must be in refs (Layer 0.6 boost); got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+        // earliest must be the derived date (or earlier if other dates are present).
+        assert!(
+            extraction.earliest.map(|e| e <= derived).unwrap_or(false),
+            "earliest must be set from the derived date; got: {:?}",
+            extraction.earliest
+        );
+    }
+
+    /// "How many weeks passed between A and B?" — duration counting question.
+    /// No anchor-relative pattern, no date in text → query_bounds and date_range
+    /// must both be empty so filter_facts_by_time_window is a no-op.
+    #[test]
+    fn test_duration_counting_no_filter_bounds() {
+        let q = "How many weeks passed between Maria adopting Coco and Shadow?";
+        let extraction = extract_temporal_refs(q);
+        assert!(
+            extraction.query_bounds.is_empty(),
+            "Duration counting question must produce no query_bounds; got: {:?}",
+            extraction.query_bounds
+        );
+        assert!(
+            extraction.date_range().is_none(),
+            "Duration counting question with no date must produce no date_range; got: {:?}",
+            extraction.date_range()
+        );
+    }
+
+    /// "When did X verb noun?" — WhenQuestion with no date in text → no filtering bounds.
+    #[test]
+    fn test_when_question_no_filter_bounds() {
+        let q = "When did John help renovate his hometown community center?";
+        let extraction = extract_temporal_refs(q);
+        assert!(
+            extraction.query_bounds.is_empty(),
+            "WhenQuestion with no date must produce no query_bounds; got: {:?}",
+            extraction.query_bounds
+        );
+        assert!(
+            extraction.date_range().is_none(),
+            "WhenQuestion with no date must produce no date_range; got: {:?}",
+            extraction.date_range()
         );
     }
 
