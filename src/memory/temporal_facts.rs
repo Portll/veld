@@ -1868,7 +1868,7 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
 }
 
 /// Find the last occurrence of a weekday before the given date
-fn last_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
+pub fn last_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
     let current_weekday = from.weekday();
     let days_back =
         (current_weekday.num_days_from_monday() as i64 - target.num_days_from_monday() as i64 + 7)
@@ -1878,7 +1878,7 @@ fn last_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
 }
 
 /// Find the next occurrence of a weekday after the given date
-fn next_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
+pub fn next_weekday(from: NaiveDate, target: Weekday) -> NaiveDate {
     let current_weekday = from.weekday();
     let days_forward =
         (target.num_days_from_monday() as i64 - current_weekday.num_days_from_monday() as i64 + 7)
