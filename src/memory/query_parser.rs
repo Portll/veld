@@ -26,8 +26,8 @@
 //! - Based on TEMPR approach (Hindsight paper achieving 89.6% on LoCoMo)
 
 use crate::constants::{IC_ADJECTIVE, IC_NOUN, IC_VERB};
-use crate::memory::temporal_facts::{resolve_relative_time, TemporalBound};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use crate::memory::temporal_facts::{last_weekday, next_weekday, resolve_relative_time, TemporalBound};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -316,6 +316,163 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
     // -----------------------------------------------------------------------
     let text_lower = text.to_lowercase();
     let mut query_bounds: Vec<TemporalBound> = Vec::new();
+
+    // -----------------------------------------------------------------------
+    // Pass 0: anchor-relative expressions (B1).
+    //
+    // Handles patterns of the form:
+    //   "the <weekday> before <anchor-date>"
+    //   "the <weekday> after <anchor-date>"
+    //   "the day before <anchor-date>" / "the day after <anchor-date>"
+    //   "<N> day|days|week|weeks before|after <anchor-date>"
+    //
+    // The anchor must be an absolute date resolvable by `try_parse_anchor_date`.
+    // If the anchor cannot be resolved (e.g. it is a named event — B2's scope),
+    // this pass silently skips and the query falls through to later passes.
+    //
+    // Results are emitted as TemporalBound::Point + a synthesised TemporalRef
+    // so that `refs`/`earliest`/`latest`/`query_bounds` are all populated,
+    // matching the additive contract of the existing relative pre-pass.
+    // -----------------------------------------------------------------------
+    {
+        use regex::Regex;
+        use std::sync::LazyLock;
+
+        /// Parse an anchor string into a `NaiveDate` by reusing the existing
+        /// `extract_explicit_dates` path (which handles "25 May 2023",
+        /// "2023-05-25", "May 25, 2023") and falling back to `dateparser`.
+        fn try_parse_anchor_date(anchor: &str) -> Option<NaiveDate> {
+            let anchor = anchor.trim();
+            // Reuse the explicit-date regex extractor.
+            let explicit = extract_explicit_dates(anchor);
+            if let Some((d, _, _)) = explicit.into_iter().next() {
+                return Some(d);
+            }
+            // Fallback: dateparser for ISO strings, etc.
+            if let Ok(parsed) = dateparser::parse(anchor) {
+                let d = parsed.date_naive();
+                if (1900..=2100).contains(&d.year()) {
+                    return Some(d);
+                }
+            }
+            None
+        }
+
+        /// Map a lower-cased weekday name to a `chrono::Weekday`.
+        fn parse_weekday(s: &str) -> Option<Weekday> {
+            match s {
+                "monday" => Some(Weekday::Mon),
+                "tuesday" => Some(Weekday::Tue),
+                "wednesday" => Some(Weekday::Wed),
+                "thursday" => Some(Weekday::Thu),
+                "friday" => Some(Weekday::Fri),
+                "saturday" => Some(Weekday::Sat),
+                "sunday" => Some(Weekday::Sun),
+                _ => None,
+            }
+        }
+
+        // Patterns — ordered most-specific first so longer phrases are not
+        // shadowed by shorter ones.  All patterns share the same named group
+        // `anchor` for the tail date string.
+
+        // 1. "the <weekday> before|after <anchor>"
+        static WEEKDAY_REL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?i)\bthe\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(before|after)\s+(.+)",
+            )
+            .unwrap()
+        });
+
+        // 2. "the day before|after <anchor>"
+        static DAY_REL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)\bthe\s+day\s+(before|after)\s+(.+)").unwrap()
+        });
+
+        // 3. "<N> day|days|week|weeks before|after <anchor>"
+        static N_UNIT_REL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)\b(\d+)\s+(days?|weeks?)\s+(before|after)\s+(.+)").unwrap()
+        });
+
+        // Helper: emit one anchor-relative result.
+        let mut emit_anchor_result =
+            |computed: NaiveDate, matched_text: &str, pos: usize| {
+                let bound = TemporalBound::Point(computed);
+                if !query_bounds
+                    .iter()
+                    .any(|b| matches!(b, TemporalBound::Point(p) if *p == computed))
+                {
+                    query_bounds.push(bound);
+                }
+                if !refs.iter().any(|r: &TemporalRef| r.date == computed) {
+                    refs.push(TemporalRef {
+                        date: computed,
+                        original_text: matched_text.to_string(),
+                        confidence: 0.92,
+                        position: pos,
+                        ref_type: TemporalRefType::Relative,
+                    });
+                    update_bounds(&mut earliest, &mut latest, computed);
+                }
+            };
+
+        // Check pattern 1: "the <weekday> before|after <anchor>"
+        if let Some(caps) = WEEKDAY_REL.captures(&text_lower) {
+            let wday_str = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let direction = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let anchor_str = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            if let (Some(weekday), Some(anchor_date)) =
+                (parse_weekday(wday_str), try_parse_anchor_date(anchor_str))
+            {
+                let computed = if direction == "before" {
+                    last_weekday(anchor_date, weekday)
+                } else {
+                    next_weekday(anchor_date, weekday)
+                };
+                let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
+                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                emit_anchor_result(computed, matched, pos);
+            }
+        }
+        // Check pattern 2: "the day before|after <anchor>"
+        else if let Some(caps) = DAY_REL.captures(&text_lower) {
+            let direction = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let anchor_str = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if let Some(anchor_date) = try_parse_anchor_date(anchor_str) {
+                let computed = if direction == "before" {
+                    anchor_date - Duration::days(1)
+                } else {
+                    anchor_date + Duration::days(1)
+                };
+                let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
+                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                emit_anchor_result(computed, matched, pos);
+            }
+        }
+        // Check pattern 3: "<N> day|days|week|weeks before|after <anchor>"
+        else if let Some(caps) = N_UNIT_REL.captures(&text_lower) {
+            let n: i64 = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(0);
+            let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let direction = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let anchor_str = caps.get(4).map(|m| m.as_str()).unwrap_or("");
+            if n > 0 {
+                if let Some(anchor_date) = try_parse_anchor_date(anchor_str) {
+                    let days = if unit.starts_with("week") { n * 7 } else { n };
+                    let computed = if direction == "before" {
+                        anchor_date - Duration::days(days)
+                    } else {
+                        anchor_date + Duration::days(days)
+                    };
+                    let pos = caps.get(0).map(|m| m.start()).unwrap_or(0);
+                    let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                    emit_anchor_result(computed, matched, pos);
+                }
+            }
+        }
+    }
 
     // Pass 1: fixed-phrase matches.
     for &phrase in RELATIVE_PHRASES {
@@ -4772,6 +4929,121 @@ mod tests {
         assert!(
             extraction.earliest.is_some(),
             "Expected earliest to be set for 'last week'"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // B1: anchor-relative date resolution tests
+    // -------------------------------------------------------------------------
+
+    /// "the Sunday before 2023-05-25" → 2023-05-21
+    /// 25 May 2023 is a Thursday; the Sunday *before* it is 21 May 2023.
+    #[test]
+    fn test_anchor_relative_sunday_before_iso() {
+        let extraction = extract_temporal_refs("the Sunday before 2023-05-25");
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
+        let has_expected = extraction
+            .refs
+            .iter()
+            .any(|r| r.date == expected);
+        assert!(
+            has_expected,
+            "Expected 2023-05-21 in refs for 'the Sunday before 2023-05-25', got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+        let bound_has_expected = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, crate::memory::temporal_facts::TemporalBound::Point(p) if *p == expected));
+        assert!(
+            bound_has_expected,
+            "Expected TemporalBound::Point(2023-05-21) in bounds, got: {:?}",
+            extraction.bounds()
+        );
+    }
+
+    /// "the Monday after 2023-05-25" → 2023-05-29
+    /// 25 May 2023 is a Thursday; the Monday *after* it is 29 May 2023.
+    #[test]
+    fn test_anchor_relative_monday_after_iso() {
+        let extraction = extract_temporal_refs("the Monday after 2023-05-25");
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 29).unwrap();
+        let has_expected = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            has_expected,
+            "Expected 2023-05-29 in refs for 'the Monday after 2023-05-25', got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+        let bound_has_expected = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, crate::memory::temporal_facts::TemporalBound::Point(p) if *p == expected));
+        assert!(
+            bound_has_expected,
+            "Expected TemporalBound::Point(2023-05-29) in bounds, got: {:?}",
+            extraction.bounds()
+        );
+    }
+
+    /// "3 days before 2023-05-25" → 2023-05-22
+    #[test]
+    fn test_anchor_relative_n_days_before() {
+        let extraction = extract_temporal_refs("3 days before 2023-05-25");
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 22).unwrap();
+        let has_expected = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            has_expected,
+            "Expected 2023-05-22 in refs for '3 days before 2023-05-25', got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+        let bound_has_expected = extraction
+            .bounds()
+            .iter()
+            .any(|b| matches!(b, crate::memory::temporal_facts::TemporalBound::Point(p) if *p == expected));
+        assert!(
+            bound_has_expected,
+            "Expected TemporalBound::Point(2023-05-22) in bounds, got: {:?}",
+            extraction.bounds()
+        );
+    }
+
+    /// "the Sunday before 25 May 2023" — text-form anchor → same result 2023-05-21
+    #[test]
+    fn test_anchor_relative_sunday_before_text_form() {
+        let extraction = extract_temporal_refs("the Sunday before 25 May 2023");
+        let expected = chrono::NaiveDate::from_ymd_opt(2023, 5, 21).unwrap();
+        let has_expected = extraction.refs.iter().any(|r| r.date == expected);
+        assert!(
+            has_expected,
+            "Expected 2023-05-21 in refs for 'the Sunday before 25 May 2023', got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+    }
+
+    /// Non-anchor-relative query must be unchanged — no spurious bounds.
+    #[test]
+    fn test_non_anchor_relative_query_unchanged() {
+        let extraction = extract_temporal_refs("robot detected obstacle");
+        // Additive contract: existing behaviour is preserved.
+        assert!(
+            extraction.bounds().is_empty(),
+            "Non-temporal query should produce zero query_bounds, got: {:?}",
+            extraction.bounds()
+        );
+        assert!(
+            extraction.refs.is_empty(),
+            "Non-temporal query should produce zero refs, got: {:?}",
+            extraction.refs.iter().map(|r| r.date).collect::<Vec<_>>()
+        );
+    }
+
+    /// "yesterday" still works — existing relative pass not broken by B1 pass.
+    #[test]
+    fn test_b1_does_not_break_existing_relative_pass() {
+        let extraction = extract_temporal_refs("what did she do yesterday");
+        assert!(
+            !extraction.bounds().is_empty(),
+            "Expected bounds for 'yesterday' after B1 pass added"
         );
     }
 }
