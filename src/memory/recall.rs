@@ -256,7 +256,21 @@ impl super::MemorySystem {
         // ===========================================================================
         // Key insight: Temporal filtering is critical for multi-hop retrieval accuracy.
         // Extract temporal constraints from query and use them to boost/filter results.
-        let query_temporal = query_parser::extract_temporal_refs(query_text);
+        // B2: pass an event-resolver closure so named-event anchors ("the Sunday
+        // before the wedding") are resolved via the TemporalFactStore at query time.
+        let tfs_for_resolver = Arc::clone(&self.temporal_fact_store);
+        let user_id_for_resolver = query.user_id.clone().unwrap_or_default();
+        let event_resolver = move |event_phrase: &str| -> Option<chrono::NaiveDate> {
+            let mut visited = std::collections::HashSet::new();
+            tfs_for_resolver.resolve_event_to_date(
+                &user_id_for_resolver,
+                event_phrase,
+                &mut visited,
+                0,
+            )
+        };
+        let query_temporal =
+            query_parser::extract_temporal_refs_with_events(query_text, Some(&event_resolver));
         let has_temporal_query = query_parser::requires_temporal_filtering(query_text);
         // Broader temporal intent detection: includes WhenQuestion, SpecificTime,
         // Duration, Ordering — any query with temporal semantics should boost
