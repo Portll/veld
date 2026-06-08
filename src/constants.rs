@@ -2238,6 +2238,17 @@ pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 /// RRF positions without overriding strong semantic matches.
 pub const TEMPORAL_RECALL_BOOST: f32 = 0.20;
 
+/// Additional additive boost for memories whose temporal facts land on the
+/// *exact* date derived by an anchor-relative expression (B1/B2 Pass 0).
+///
+/// This fires on top of `TEMPORAL_RECALL_BOOST` when a `query_bounds`
+/// `TemporalBound::Point(d)` produced by "the Sunday before <anchor>" or
+/// "<N> days before <event>" matches a fact's `resolved_time` within ±1 day
+/// (tighter than the ±7-day gate tolerance).  0.15 is calibrated to ensure the
+/// session at the derived date ranks above sessions in the surrounding ±7-day
+/// window without crowding out a strongly semantically-matched memory.
+pub const DERIVED_DATE_EXACT_BOOST: f32 = 0.15;
+
 /// Minimum inter-memory gap (seconds) marking a session boundary.
 /// Haar wavelet coefficient at this scale exceeds threshold iff gap > 7200s.
 pub const SESSION_GAP_THRESHOLD_SECS: i64 = 7200;

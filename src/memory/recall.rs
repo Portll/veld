@@ -630,6 +630,83 @@ impl super::MemorySystem {
         };
 
         // ===========================================================================
+        // LAYER 0.6b: DERIVED-DATE EXACT-MATCH IDs (B3)
+        // ===========================================================================
+        // When B1/B2 (Pass 0) produced one or more anchor-relative derived dates
+        // (stored as `TemporalBound::Point` in `query_temporal.bounds()`), build a
+        // tighter set of source-memory IDs whose facts land within ±1 day of that
+        // derived date.  These IDs receive `DERIVED_DATE_EXACT_BOOST` at Layer 4.55
+        // on top of the standard `TEMPORAL_RECALL_BOOST`, ensuring that the session
+        // at the implied date ranks above sessions merely within the ±7-day gate window.
+        //
+        // This pass is additive-only:
+        //  • Non-temporal queries:      query_bounds is empty → HashSet::new()
+        //  • Queries without Point bounds (e.g. only After/Before): no fire
+        //  • No user_id:               skipped
+        //  • Does not modify boosted or the normal temporal gate in any way.
+        let derived_date_exact_ids: HashSet<MemoryId> = {
+            // Only Point bounds from Pass 0 are "derived dates".  After/Before/Fuzzy
+            // have no single precise date, so they don't get the exact-match bonus.
+            let derived_points: Vec<chrono::NaiveDate> = query_temporal
+                .bounds()
+                .iter()
+                .filter_map(|b| {
+                    if let crate::memory::temporal_facts::TemporalBound::Point(d) = b {
+                        Some(*d)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !derived_points.is_empty() && temporal_gate {
+                if let Some(user_id) = &query.user_id {
+                    match self.temporal_fact_store.list_filtered(user_id, 300, false) {
+                        Ok(all_facts) if !all_facts.is_empty() => {
+                            let mut exact_ids: HashSet<MemoryId> = HashSet::new();
+                            for fact in &all_facts {
+                                let fact_point = match fact.resolved_time.to_bound() {
+                                    crate::memory::temporal_facts::TemporalBound::Point(d) => {
+                                        Some(d)
+                                    }
+                                    // Unknown: fall back to conversation_date as a Point
+                                    crate::memory::temporal_facts::TemporalBound::Unknown => {
+                                        Some(fact.conversation_date.date_naive())
+                                    }
+                                    // Wider bounds (Closed, After, Before, Fuzzy, Year, Month)
+                                    // are not "exact" — skip the extra boost for them.
+                                    _ => None,
+                                };
+                                if let Some(fp) = fact_point {
+                                    let is_exact = derived_points.iter().any(|dp| {
+                                        let diff = (*dp - fp).num_days().abs();
+                                        diff <= 1
+                                    });
+                                    if is_exact {
+                                        exact_ids.insert(fact.source_memory_id.clone());
+                                    }
+                                }
+                            }
+                            if !exact_ids.is_empty() {
+                                tracing::info!(
+                                    "Layer 0.6b: {} exact derived-date source memories (±1 day of {:?})",
+                                    exact_ids.len(),
+                                    derived_points
+                                );
+                            }
+                            exact_ids
+                        }
+                        _ => HashSet::new(),
+                    }
+                } else {
+                    HashSet::new()
+                }
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // ===========================================================================
         // LAYER 0.7: SEMANTIC FACT SOURCE LOOKUP
         // ===========================================================================
         // Pre-fetch facts by query entities to boost their source memories in Layer 4.8.
@@ -1598,6 +1675,39 @@ impl super::MemorySystem {
                         "Temporal boost applied to {} memories from {} matching facts",
                         boosted_count,
                         temporal_fact_boost_ids.len()
+                    );
+                }
+            }
+
+            // ===========================================================================
+            // LAYER 4.55b: DERIVED-DATE EXACT-MATCH BOOST (B3)
+            // ===========================================================================
+            // Facts whose resolved_time is within ±1 day of a `TemporalBound::Point`
+            // produced by an anchor-relative expression (B1/B2 Pass 0, e.g.
+            // "the Sunday before 25 May") receive an additional additive boost on top
+            // of the standard TEMPORAL_RECALL_BOOST.  This ensures that the session at
+            // the *exact* derived date ranks above sessions that merely fall within the
+            // ±7-day gate tolerance.  Non-temporal queries always produce an empty
+            // derived_date_exact_ids, so this block is a no-op for them.
+            if !derived_date_exact_ids.is_empty() {
+                const EXACT_BOOST: f32 = crate::constants::DERIVED_DATE_EXACT_BOOST;
+                let mut exact_boosted = 0usize;
+                for id in &derived_date_exact_ids {
+                    if let Some(score) = fused.get_mut(id) {
+                        *score += EXACT_BOOST;
+                        exact_boosted += 1;
+                    } else {
+                        fused.insert(id.clone(), EXACT_BOOST);
+                        exact_boosted += 1;
+                    }
+                    // Attribution: flag that this memory matched the derived date exactly
+                    attr.entry(id.clone()).or_default().temporal_match = true;
+                }
+                if exact_boosted > 0 {
+                    tracing::info!(
+                        "Layer 4.55b: Derived-date exact boost (+{}) applied to {} memories",
+                        EXACT_BOOST,
+                        exact_boosted
                     );
                 }
             }
@@ -5135,6 +5245,146 @@ mod r2_temporal_boost_tests {
         assert!(
             !r2_boost_fires(old_date, bounds),
             "a memory 60 days old should NOT receive the boost for a 'yesterday' query"
+        );
+    }
+}
+
+// =============================================================================
+// B3: Derived-date exact-match boost — unit tests
+//
+// These tests validate the ±1-day exact-match predicate used in Layer 0.6b and
+// the distinction between the broad ±7-day R2 boost and the tighter derived-date
+// exact boost.  They do NOT require a live MemorySystem.
+// =============================================================================
+#[cfg(test)]
+mod b3_derived_date_exact_boost_tests {
+    use chrono::NaiveDate;
+    use crate::memory::temporal_facts::TemporalBound;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// Simulate the Layer 0.6b exact-match predicate:
+    /// Returns true when `fact_point` is within ±1 day of any derived Point in
+    /// `query_bounds`.  This mirrors the closure inside `derived_date_exact_ids`.
+    fn exact_match_fires(fact_point: NaiveDate, query_bounds: &[TemporalBound]) -> bool {
+        query_bounds.iter().any(|b| {
+            if let TemporalBound::Point(dp) = b {
+                (*dp - fact_point).num_days().abs() <= 1
+            } else {
+                false
+            }
+        })
+    }
+
+    /// B3-E1: a fact date exactly equal to the derived Point fires the exact boost.
+    #[test]
+    fn test_exact_match_on_derived_point() {
+        let derived = d(2023, 5, 21); // Sunday before 2023-05-25
+        let bounds = vec![TemporalBound::Point(derived)];
+        assert!(
+            exact_match_fires(d(2023, 5, 21), &bounds),
+            "fact on the exact derived date must fire the exact boost"
+        );
+    }
+
+    /// B3-E2: a fact 1 day away from the derived Point still fires (tolerance edge).
+    #[test]
+    fn test_exact_match_one_day_off() {
+        let derived = d(2023, 5, 21);
+        let bounds = vec![TemporalBound::Point(derived)];
+        assert!(
+            exact_match_fires(d(2023, 5, 22), &bounds),
+            "fact 1 day from derived date must fire the exact boost (±1 tolerance)"
+        );
+        assert!(
+            exact_match_fires(d(2023, 5, 20), &bounds),
+            "fact 1 day before derived date must fire the exact boost (±1 tolerance)"
+        );
+    }
+
+    /// B3-E3: a fact 4 days away does NOT fire the exact boost even though it would
+    /// fire the broader ±7-day R2 boost.  This is the key distinction.
+    #[test]
+    fn test_exact_match_does_not_fire_for_broad_window_only() {
+        let derived = d(2023, 5, 21);
+        let bounds = vec![TemporalBound::Point(derived)];
+        // 4 days away: within R2 ±7 window but NOT within ±1 exact window
+        assert!(
+            !exact_match_fires(d(2023, 5, 25), &bounds),
+            "fact 4 days from derived date must NOT fire the exact boost (only ±1)"
+        );
+    }
+
+    /// B3-E4: a non-Point query bound (After/Before/Fuzzy) never fires the exact boost
+    /// even if the fact date would numerically be close.
+    #[test]
+    fn test_exact_match_non_point_bound_does_not_fire() {
+        let bounds = vec![
+            TemporalBound::After(d(2023, 5, 20)),
+            TemporalBound::Before(d(2023, 5, 22)),
+        ];
+        // Fact is at 2023-05-21, sandwiched between the bounds — but there is no
+        // Point bound, so the exact boost must NOT fire.
+        assert!(
+            !exact_match_fires(d(2023, 5, 21), &bounds),
+            "non-Point bounds (After/Before) must not fire the derived-date exact boost"
+        );
+    }
+
+    /// B3-E5: when query_bounds is empty (non-temporal query) no boost fires.
+    #[test]
+    fn test_exact_match_empty_bounds_does_not_fire() {
+        assert!(
+            !exact_match_fires(d(2023, 5, 21), &[]),
+            "empty bounds must not fire the exact boost"
+        );
+    }
+
+    /// B3-E6 (integration): extract_temporal_refs_with_events on "the Sunday before
+    /// 2023-05-25" resolves to 2023-05-21 as a Point bound; the exact-match predicate
+    /// fires for a fact at 2023-05-21 but NOT for a fact at 2023-05-26 (5 days away).
+    ///
+    /// The anchor uses ISO format (2023-05-25) which is reliably parsed by B1's
+    /// `extract_explicit_dates` YYYY-MM-DD path.
+    #[test]
+    fn test_extract_with_events_sunday_before_populates_exact_match() {
+        use crate::memory::query_parser::extract_temporal_refs_with_events;
+
+        let extraction = extract_temporal_refs_with_events(
+            "what happened the Sunday before 2023-05-25?",
+            None::<&dyn Fn(&str) -> Option<chrono::NaiveDate>>,
+        );
+        let bounds = extraction.bounds();
+
+        // B1 must have produced at least one Point bound.
+        assert!(
+            !bounds.is_empty(),
+            "B1 must produce at least one query bound for 'the Sunday before 2023-05-25'"
+        );
+
+        let expected_sunday = d(2023, 5, 21);
+        let has_point = bounds.iter().any(|b| {
+            matches!(b, TemporalBound::Point(p) if *p == expected_sunday)
+        });
+        assert!(
+            has_point,
+            "query_bounds must contain Point(2023-05-21) for 'the Sunday before 2023-05-25'; got: {:?}",
+            bounds
+        );
+
+        // Exact-match fires for the target date (2023-05-21).
+        assert!(
+            exact_match_fires(expected_sunday, bounds),
+            "exact_match_fires must be true for a fact ON 2023-05-21"
+        );
+
+        // Exact-match does NOT fire for a fact 5 days later (2023-05-26),
+        // which would still receive the broader ±7-day R2 boost.
+        assert!(
+            !exact_match_fires(d(2023, 5, 26), bounds),
+            "exact_match_fires must be false for a fact 5 days from the derived date"
         );
     }
 }
