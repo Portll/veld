@@ -1508,6 +1508,20 @@ impl HybridSearchEngine {
             .collect();
 
         // 3. Optional cross-encoder reranking + LLM refiner pass
+        //
+        // CE DE-DUPLICATION (perf/a2): The cross-encoder is run exactly ONCE per
+        // query — at recall Layer 5.3, AFTER Layer-5 unified scoring (recency,
+        // arousal, feedback, Hebbian signals), on the final merged candidate set.
+        // Running it here a second time on raw RRF candidates would fire two
+        // sequential full-batch ONNX passes (~7 s each → ~14 s total at N=20).
+        //
+        // `use_cross_encoder` is therefore hardcoded to `false` here. The
+        // `reranker` field is still populated and accessible via `self.reranker()`
+        // so recall Layer 5.3 can invoke it. The `rerank_score` field on
+        // `HybridSearchResult` will be `None` (used only for signal attribution
+        // telemetry, not for score computation).
+        //
+        // The LLM refiner pass is unaffected and continues to run when configured.
         let effective_rerank_count = rerank_count_override
             .or_else(|| dial.as_ref().and_then(|d| d.rerank_count))
             .unwrap_or(self.config.rerank_count);
@@ -1515,10 +1529,7 @@ impl HybridSearchEngine {
             .as_ref()
             .and_then(|d| d.refiner_mode)
             .unwrap_or(self.config.refiner_mode);
-        let use_cross_encoder = dial
-            .as_ref()
-            .and_then(|d| d.use_reranking)
-            .unwrap_or(matches!(mode, RefinerMode::CrossEncoder | RefinerMode::Stacked));
+        let use_cross_encoder = false; // CE runs once at recall Layer 5.3 (batched, dial-gated)
         let use_refiner = matches!(mode, RefinerMode::Llm | RefinerMode::Stacked);
 
         let mut final_results: Vec<HybridSearchResult> = if let Some(reranker) =
