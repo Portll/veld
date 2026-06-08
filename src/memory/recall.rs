@@ -2859,12 +2859,24 @@ impl super::MemorySystem {
         // without overriding the multi-signal pipeline.
         //
         // Only runs on the top `rerank_budget` candidates to keep latency bounded.
-        if memories.len() > 1 {
+        //
+        // Dial gate: VELD_DIALS_USE_RERANKING=false (or cognitive_dials.use_reranking =
+        // Some(false)) fully skips this layer. The `rerank_count` dial caps the
+        // candidate budget; absent that, the hardcoded ce_cap applies.
+        let (layer53_use_reranking, layer53_rerank_count_dial) = {
+            let d = self.cognitive_dials.read();
+            (d.use_reranking, d.rerank_count)
+        };
+        if memories.len() > 1 && layer53_use_reranking.unwrap_or(true) {
             if let Some(reranker) = self.hybrid_search.reranker() {
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
                 let ce_cap = if decomposed { 30 } else { 20 };
-                let rerank_budget = memories.len().min(query.max_results * 2).min(ce_cap);
+                // rerank_count dial caps the budget when set (query-level or dials-level).
+                let dial_cap = layer53_rerank_count_dial
+                    .or(query.rerank_count)
+                    .unwrap_or(ce_cap);
+                let rerank_budget = memories.len().min(query.max_results * 2).min(dial_cap);
                 // Pass each candidate's stored embedding so the reranker's
                 // bi-encoder pass can reuse it instead of re-embedding via the
                 // HTTP embedder (5–6s/call for CPU Nomic). The reranker

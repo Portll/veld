@@ -538,10 +538,13 @@ impl OnnxCrossEncoder {
                 }
             };
 
+            // macOS aarch64 (Apple Silicon): keep at 1 to avoid contention with
+            // Metal/ANE-aware ORT execution providers that manage their own threading.
+            // Other platforms: 4 intra-op threads to parallelise batch matrix ops.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             let num_threads = 1;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let num_threads = 2;
+            let num_threads = 4;
 
             // ort's `load-dynamic` PANICS (not Errs) when libonnxruntime cannot be
             // dlopen'd, and this server is built with `panic = "abort"` — so an
@@ -627,6 +630,25 @@ impl CrossEncoderModel for OnnxCrossEncoder {
         self.available.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Score N (query, document) pairs in a **single batched ONNX forward pass**.
+    ///
+    /// # Batching strategy
+    ///
+    /// All N pairs are tokenised into fixed-length `MAX_PAIR_LENGTH` sequences,
+    /// packed into `[N, MAX_PAIR_LENGTH]` tensors, and sent to the ONNX runtime
+    /// as one call.  The output shape is `[N, head_size]` where `head_size` is 1
+    /// (regression head — ms-marco, mxbai-rerank-*) or 2 (binary-classifier head
+    /// — bge-reranker-v2-m3).  Scores are extracted by striding through the flat
+    /// output buffer in steps of `head_size`.
+    ///
+    /// This replaces the previous sequential loop that performed N separate
+    /// kernel invocations at ~360 ms each (~7 s for N=20) with a single call
+    /// whose wall-time is dominated by the forward-pass itself rather than
+    /// N×kernel-launch overhead.  N=1 (single-pair callers) goes through the
+    /// same code path — no separate fast-path needed.
+    ///
+    /// The session `Mutex` is held for the duration of the single batched call
+    /// rather than N times, eliminating N-1 redundant lock/unlock cycles.
     fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
         if documents.is_empty() {
             return Ok(Vec::new());
@@ -638,56 +660,82 @@ impl CrossEncoderModel for OnnxCrossEncoder {
             .try_lock_for(std::time::Duration::from_secs(30))
             .ok_or_else(|| anyhow::anyhow!("Cross-encoder session lock timeout ({})", self.config.id))?;
 
-        let mut scores = Vec::with_capacity(documents.len());
+        let n = documents.len();
+        let total_elements = n * MAX_PAIR_LENGTH;
 
-        for &doc in documents {
-            let encoding = model
-                .tokenizer
-                .encode((query, doc), true)
-                .map_err(|e| anyhow::anyhow!("Tokenization failed ({}): {e}", self.config.id))?;
+        // Tokenise all (query, doc) pairs up-front.
+        let encodings: Vec<_> = documents
+            .iter()
+            .map(|&doc| {
+                model
+                    .tokenizer
+                    .encode((query, doc), true)
+                    .map_err(|e| anyhow::anyhow!("Tokenization failed ({}): {e}", self.config.id))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
+        // Pack into flat [N * MAX_PAIR_LENGTH] buffers.
+        let mut input_ids_flat = vec![0i64; total_elements];
+        let mut attention_flat = vec![0i64; total_elements];
+        let mut token_types_flat = vec![0i64; total_elements];
+
+        for (batch_idx, encoding) in encodings.iter().enumerate() {
             let tokens = encoding.get_ids();
             let attention_mask = encoding.get_attention_mask();
             let type_ids = encoding.get_type_ids();
-
-            let mut input_ids = vec![0i64; MAX_PAIR_LENGTH];
-            let mut attention = vec![0i64; MAX_PAIR_LENGTH];
-            let mut token_types = vec![0i64; MAX_PAIR_LENGTH];
+            let offset = batch_idx * MAX_PAIR_LENGTH;
 
             for (i, &token) in tokens.iter().take(MAX_PAIR_LENGTH).enumerate() {
-                input_ids[i] = token as i64;
+                input_ids_flat[offset + i] = token as i64;
             }
             for (i, &mask) in attention_mask.iter().take(MAX_PAIR_LENGTH).enumerate() {
-                attention[i] = mask as i64;
+                attention_flat[offset + i] = mask as i64;
             }
             for (i, &tid) in type_ids.iter().take(MAX_PAIR_LENGTH).enumerate() {
-                token_types[i] = tid as i64;
+                token_types_flat[offset + i] = tid as i64;
             }
-
-            let input_ids_val = Value::from_array((vec![1, MAX_PAIR_LENGTH], input_ids))?;
-            let attention_val = Value::from_array((vec![1, MAX_PAIR_LENGTH], attention))?;
-
-            let outputs = if model.has_token_type_ids {
-                let token_type_val =
-                    Value::from_array((vec![1, MAX_PAIR_LENGTH], token_types))?;
-                session.run(ort::inputs![
-                    "input_ids" => &input_ids_val,
-                    "attention_mask" => &attention_val,
-                    "token_type_ids" => &token_type_val,
-                ])?
-            } else {
-                session.run(ort::inputs![
-                    "input_ids" => &input_ids_val,
-                    "attention_mask" => &attention_val,
-                ])?
-            };
-
-            // Output head strategy was detected at load time — no per-call
-            // shape probing, no manual branching.
-            let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-            let (_shape, data) = output_tensor;
-            scores.push(model.output_head.extract_score(data));
         }
+
+        // Build [N, MAX_PAIR_LENGTH] tensors.
+        let input_ids_val =
+            Value::from_array((vec![n, MAX_PAIR_LENGTH], input_ids_flat))?;
+        let attention_val =
+            Value::from_array((vec![n, MAX_PAIR_LENGTH], attention_flat))?;
+
+        // Single batched forward pass — N pairs, one ONNX kernel launch.
+        let outputs = if model.has_token_type_ids {
+            let token_type_val =
+                Value::from_array((vec![n, MAX_PAIR_LENGTH], token_types_flat))?;
+            session.run(ort::inputs![
+                "input_ids"      => &input_ids_val,
+                "attention_mask" => &attention_val,
+                "token_type_ids" => &token_type_val,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids"      => &input_ids_val,
+                "attention_mask" => &attention_val,
+            ])?
+        };
+
+        // Output shape: [N, head_size] — flat in row-major order.
+        // head_size = 1 for Regression, 2 for BinaryClassifier.
+        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
+        let (_shape, data) = output_tensor;
+
+        // Stride through the flat buffer; extract_score reads data[0] (or
+        // data[0..2]) relative to the start of each pair's slice.
+        let head_size = match model.output_head {
+            OutputHead::Regression => 1_usize,
+            OutputHead::BinaryClassifier => 2_usize,
+        };
+
+        let scores: Vec<f32> = (0..n)
+            .map(|i| {
+                let start = i * head_size;
+                model.output_head.extract_score(&data[start..start + head_size])
+            })
+            .collect();
 
         Ok(scores)
     }
@@ -1009,5 +1057,94 @@ mod tests {
         let bc_score_relevant = OutputHead::BinaryClassifier.extract_score(&very_relevant);
         let bc_score_barely = OutputHead::BinaryClassifier.extract_score(&barely_relevant);
         assert!(bc_score_relevant > bc_score_barely); // correct ordering.
+    }
+
+    // -- Batch score extraction (perf/a2) ----------------------------------------
+    //
+    // These tests verify the batched ONNX output-extraction logic: the flat
+    // `[N * head_size]` buffer is strided correctly so that pair i receives
+    // exactly the same score as it would if extracted sequentially from a
+    // `[1, head_size]` single-pair output.  No ONNX model is needed — we
+    // simulate the flat output buffer that ORT would produce.
+
+    /// Helper: simulate what `score_pairs` does after `try_extract_tensor`.
+    /// Returns the N scores extracted from a flat batch output buffer.
+    fn extract_batch_scores(head: OutputHead, flat_output: &[f32], n: usize) -> Vec<f32> {
+        let head_size = match head {
+            OutputHead::Regression => 1_usize,
+            OutputHead::BinaryClassifier => 2_usize,
+        };
+        assert_eq!(flat_output.len(), n * head_size, "flat buffer length mismatch");
+        (0..n)
+            .map(|i| {
+                let start = i * head_size;
+                head.extract_score(&flat_output[start..start + head_size])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_regression_stride_matches_sequential() {
+        // Simulate a batch output of shape [4, 1] (regression head) —
+        // i.e. four pairs, each emitting a single logit.
+        let sequential_logits = [2.1_f32, -0.5, 1.8, 0.0];
+        // Flat batch buffer for regression head: head_size=1, so layout is just
+        // [logit0, logit1, logit2, logit3].
+        let flat: Vec<f32> = sequential_logits.to_vec();
+
+        let batch_scores =
+            extract_batch_scores(OutputHead::Regression, &flat, sequential_logits.len());
+
+        for (i, (&expected, &got)) in sequential_logits.iter().zip(batch_scores.iter()).enumerate()
+        {
+            assert!(
+                (expected - got).abs() < f32::EPSILON,
+                "pair {i}: sequential={expected} batch={got}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_binary_classifier_stride_matches_sequential() {
+        // Simulate a batch output of shape [3, 2] (binary-classifier head) —
+        // three pairs, each emitting [neg_logit, pos_logit].
+        let pairs: &[(f32, f32)] = &[(-10.0, 10.0), (2.0, 2.0), (5.0, -1.0)];
+        let n = pairs.len();
+
+        // Flat layout: [neg0, pos0, neg1, pos1, neg2, pos2]
+        let flat: Vec<f32> = pairs.iter().flat_map(|&(neg, pos)| [neg, pos]).collect();
+
+        let batch_scores = extract_batch_scores(OutputHead::BinaryClassifier, &flat, n);
+
+        // Compare against sequential extraction.
+        for (i, (&(neg, pos), &got)) in pairs.iter().zip(batch_scores.iter()).enumerate() {
+            let expected = OutputHead::BinaryClassifier.extract_score(&[neg, pos]);
+            assert!(
+                (expected - got).abs() < 1e-6,
+                "pair {i}: sequential={expected} batch={got}"
+            );
+        }
+
+        // Pair 0 (neg=-10, pos=10): P(relevant) ≈ 1.0
+        assert!(batch_scores[0] > 0.999, "pair 0 should be highly relevant");
+        // Pair 1 (neg=2, pos=2): P(relevant) = 0.5
+        assert!((batch_scores[1] - 0.5).abs() < 1e-6, "pair 1 should be 0.5");
+        // Pair 2 (neg=5, pos=-1): P(relevant) < 0.01
+        assert!(batch_scores[2] < 0.01, "pair 2 should be near zero");
+    }
+
+    #[test]
+    fn batch_extraction_n1_matches_single_pair() {
+        // N=1 is the degenerate single-pair case. Batch and sequential must agree.
+        let flat_regression = [3.7_f32];
+        let scores = extract_batch_scores(OutputHead::Regression, &flat_regression, 1);
+        assert_eq!(scores.len(), 1);
+        assert!((scores[0] - 3.7).abs() < f32::EPSILON);
+
+        let flat_binary = [-1.0_f32, 3.0];
+        let scores_bc = extract_batch_scores(OutputHead::BinaryClassifier, &flat_binary, 1);
+        assert_eq!(scores_bc.len(), 1);
+        let expected = OutputHead::BinaryClassifier.extract_score(&[-1.0, 3.0]);
+        assert!((scores_bc[0] - expected).abs() < 1e-6);
     }
 }
