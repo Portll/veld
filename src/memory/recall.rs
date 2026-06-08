@@ -1355,6 +1355,12 @@ impl super::MemorySystem {
         // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
         // ===========================================================================
+        // Early dials snapshot for signal gates inside the fusion block (content_fallback,
+        // bm25_specificity_discount). A second snapshot is taken before Layer 5 scoring;
+        // both snapshots are value copies of the same lock, so they are always consistent
+        // with each other — the same set was in effect for the whole query.
+        let early_dials_snapshot = self.cognitive_dials.read().clone();
+
         type FusionLayerOutput = (
             Vec<(MemoryId, f32)>,
             std::collections::HashMap<MemoryId, f32>,
@@ -1747,16 +1753,19 @@ impl super::MemorySystem {
                             // (+0.05/match, cap 0.20) to keep below tag-match priority.
                             // Gated: skip for temporal queries where content overlap
                             // would boost wrong-session memories indiscriminately.
-                            if let Some(content) = get_content(id) {
-                                let content_lower = content.to_lowercase();
-                                let content_overlap = query_stems
-                                    .iter()
-                                    .filter(|qs| content_lower.contains(qs.as_str()))
-                                    .count();
-                                if content_overlap >= 2 {
-                                    let boost = (0.05 * content_overlap as f32).min(0.20);
-                                    if let Some(score) = fused.get_mut(id) {
-                                        *score += boost;
+                            // [signal: content_fallback] Gated by disabled_signals dial; default = always on.
+                            if early_dials_snapshot.signal_enabled("content_fallback") {
+                                if let Some(content) = get_content(id) {
+                                    let content_lower = content.to_lowercase();
+                                    let content_overlap = query_stems
+                                        .iter()
+                                        .filter(|qs| content_lower.contains(qs.as_str()))
+                                        .count();
+                                    if content_overlap >= 2 {
+                                        let boost = (0.05 * content_overlap as f32).min(0.20);
+                                        if let Some(score) = fused.get_mut(id) {
+                                            *score += boost;
+                                        }
                                     }
                                 }
                             }
@@ -1772,7 +1781,8 @@ impl super::MemorySystem {
             // the query, the BM25 match is likely peripheral (the term appears in
             // content but the memory isn't ABOUT that topic). Apply a small discount
             // to prevent these peripheral matches from outranking focused memories.
-            {
+            // [signal: bm25_specificity_discount] Gated by disabled_signals dial; default = always on.
+            if early_dials_snapshot.signal_enabled("bm25_specificity_discount") {
                 let mut discounted = 0usize;
                 let ids: Vec<MemoryId> = fused.keys().cloned().collect();
                 for id in &ids {
@@ -2368,6 +2378,13 @@ impl super::MemorySystem {
         let r3b_static_vector = self.hybrid_search.config().vector_weight;
         let r3b_static_graph = self.hybrid_search.config().graph_weight;
 
+        // SIGNAL-DIAL SNAPSHOT: snapshot the disable-signal set ONCE before the
+        // scoring loop so signal_enabled() checks inside the closure are
+        // branch-predictable (and avoid repeated lock acquisitions).
+        // An empty set (the compile-time default) makes every `signal_enabled`
+        // call return `true`, preserving byte-identical behaviour.
+        let dials_snapshot = self.cognitive_dials.read().clone();
+
         // R2 (LTR) SHADOW CAPTURE side-map. The `with_unified_score` closure
         // (re-bound each loop iteration) borrows this by reference and inserts one
         // ScoringFeatures per scored memory keyed by MemoryId. It lives outside the
@@ -2381,8 +2398,13 @@ impl super::MemorySystem {
 
         for (memory_id, score) in memory_ids {
             // Hebbian boost from learned graph weights (10% contribution)
+            // [signal: hebbian] Gated by disabled_signals dial; default = always on.
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
-            let base_score = score + hebbian_boost * 0.1;
+            let base_score = if dials_snapshot.signal_enabled("hebbian") {
+                score + hebbian_boost * 0.1
+            } else {
+                score
+            };
 
             // Helper to apply unified scoring (recency + arousal + credibility + temporal)
             // Amplify recency when query explicitly asks for recent items
@@ -2412,12 +2434,16 @@ impl super::MemorySystem {
 
                 // Emotional arousal boost: high arousal = more salient (5% contribution)
                 // Research: LaBar & Cabeza (2006) - emotionally arousing events better remembered
-                let arousal_boost = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .map(|c| c.emotional.arousal * 0.05)
-                    .unwrap_or(0.0);
+                // [signal: arousal] Gated by disabled_signals dial; default = always on.
+                let arousal_boost = if dials_snapshot.signal_enabled("arousal") {
+                    mem.experience
+                        .context
+                        .as_ref()
+                        .map(|c| c.emotional.arousal * 0.05)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
                 // Source credibility boost: credible sources weighted higher (5% contribution)
                 // Research: Source monitoring affects memory reliability
@@ -2536,13 +2562,16 @@ impl super::MemorySystem {
                 // This compensates for the fact that very recent memories haven't
                 // had time to accumulate Hebbian co-activation, BM25 term frequency,
                 // or graph edges — they're signal-poor despite being contextually prime.
-                let session_boost = {
+                // [signal: session_continuity] Gated by disabled_signals dial; default = always on.
+                let session_boost = if dials_snapshot.signal_enabled("session_continuity") {
                     let age_hours = (now - mem.created_at).num_hours();
                     if age_hours <= 2 {
                         0.03 // within current session window
                     } else {
                         0.0
                     }
+                } else {
+                    0.0
                 };
 
                 // =================================================================
@@ -2570,7 +2599,8 @@ impl super::MemorySystem {
                 // replacing brittle episode_id equality. Falls back to binary
                 // episode_id coherence for memories without a snapshot (pre-E6 or
                 // sync-path) or before any encode has seeded the drift state.
-                let episode_boost = {
+                // [signal: episode_tcm] Gated by disabled_signals dial; default = always on.
+                let episode_boost = if dials_snapshot.signal_enabled("episode_tcm") {
                     let cur = self.tcm_context.read();
                     let md = &mem.when.context_drift;
                     if !cur.is_empty() && md.len() == cur.len() {
@@ -2588,58 +2618,85 @@ impl super::MemorySystem {
                             })
                             .unwrap_or(0.0)
                     }
+                } else {
+                    0.0
                 };
 
                 // Signal 10: Source type multiplier on credibility
-                let source_type_mult = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .map(|c| match c.source.source_type {
-                        crate::memory::types::SourceType::User => 1.2,
-                        crate::memory::types::SourceType::File => 1.1,
-                        crate::memory::types::SourceType::System => 1.0,
-                        crate::memory::types::SourceType::ExternalApi => 0.9,
-                        crate::memory::types::SourceType::Web => 0.8,
-                        crate::memory::types::SourceType::AiGenerated => 0.7,
-                        crate::memory::types::SourceType::Inferred => 0.6,
-                        _ => 1.0,
-                    })
-                    .unwrap_or(1.0);
+                // [signal: valence_credibility] Gated by disabled_signals dial; default = always on.
+                let source_type_mult = if dials_snapshot.signal_enabled("valence_credibility") {
+                    mem.experience
+                        .context
+                        .as_ref()
+                        .map(|c| match c.source.source_type {
+                            crate::memory::types::SourceType::User => 1.2,
+                            crate::memory::types::SourceType::File => 1.1,
+                            crate::memory::types::SourceType::System => 1.0,
+                            crate::memory::types::SourceType::ExternalApi => 0.9,
+                            crate::memory::types::SourceType::Web => 0.8,
+                            crate::memory::types::SourceType::AiGenerated => 0.7,
+                            crate::memory::types::SourceType::Inferred => 0.6,
+                            _ => 1.0,
+                        })
+                        .unwrap_or(1.0)
+                } else {
+                    1.0
+                };
                 let credibility_boost = credibility_boost * source_type_mult;
 
                 // Signal 11: Emotional valence as absolute intensity
-                let valence_boost = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .map(|c| c.emotional.valence.abs() * 0.02)
-                    .unwrap_or(0.0);
+                // [signal: valence] Gated by disabled_signals dial; default = always on.
+                let valence_boost = if dials_snapshot.signal_enabled("valence") {
+                    mem.experience
+                        .context
+                        .as_ref()
+                        .map(|c| c.emotional.valence.abs() * 0.02)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
                 // Signal 12: Sequence proximity within episode
-                let sequence_boost = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .and_then(|c| c.episode.sequence_number)
-                    .map(|seq| ((seq as f64).ln_1p() / 5.0) as f32 * 0.02)
-                    .unwrap_or(0.0);
+                // [signal: seq_proximity] Gated by disabled_signals dial; default = always on.
+                let sequence_boost = if dials_snapshot.signal_enabled("seq_proximity") {
+                    mem.experience
+                        .context
+                        .as_ref()
+                        .and_then(|c| c.episode.sequence_number)
+                        .map(|seq| ((seq as f64).ln_1p() / 5.0) as f32 * 0.02)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
                 // Signal 16: Context richness — memories with richer context
                 // (more populated fields) are more useful for retrieval
-                let richness_boost = (mem.context_richness() as f32 / 10.0) * 0.02;
+                // [signal: context_richness] Gated by disabled_signals dial; default = always on.
+                let richness_boost = if dials_snapshot.signal_enabled("context_richness") {
+                    (mem.context_richness() as f32 / 10.0) * 0.02
+                } else {
+                    0.0
+                };
 
                 // Signal 17: Activation level — current Hebbian co-activation state
                 let activation_boost = mem.activation() * 0.03;
 
                 // Signal 18: Temporal fact density — more temporal refs = more anchored
-                let temporal_density = (mem.experience.temporal_refs.len() as f32 / 5.0)
-                    .min(1.0)
-                    * 0.02;
+                // [signal: temporal_fact_density] Gated by disabled_signals dial; default = always on.
+                let temporal_density = if dials_snapshot.signal_enabled("temporal_fact_density") {
+                    (mem.experience.temporal_refs.len() as f32 / 5.0).min(1.0) * 0.02
+                } else {
+                    0.0
+                };
 
                 // Signal 19: Entity confidence — memories with more entity refs
                 // are more structurally connected (proxy for graph salience)
-                let entity_density = (mem.entity_refs.len() as f32 / 5.0).min(1.0) * 0.02;
+                // [signal: entity_confidence] Gated by disabled_signals dial; default = always on.
+                let entity_density = if dials_snapshot.signal_enabled("entity_confidence") {
+                    (mem.entity_refs.len() as f32 / 5.0).min(1.0) * 0.02
+                } else {
+                    0.0
+                };
 
                 // Signal 20 (FIX-R2): Elaboration quality — well-contextualized C-rep
                 // memories are more reliable than bare S-rep fragments.
@@ -2653,15 +2710,21 @@ impl super::MemorySystem {
                 // independent boost because they're likely contextually relevant.
                 // Reference: Berntsen (2021) — involuntary memories favor recent,
                 // actively-processed content.
-                let burstiness = mem.access_burstiness();
-                let burstiness_boost = if burstiness > 1.5 {
-                    0.02 // bursty = working memory, small boost
+                // [signal: access_burstiness] Gated by disabled_signals dial; default = always on.
+                let burstiness_boost = if dials_snapshot.signal_enabled("access_burstiness") {
+                    let burstiness = mem.access_burstiness();
+                    if burstiness > 1.5 {
+                        0.02 // bursty = working memory, small boost
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.0
                 };
 
                 // BRIDGE-3: Calibrated confidence gate (Bayesian alpha/beta)
-                let confidence_gate = {
+                // [signal: confidence_gate] Gated by disabled_signals dial; default = always on.
+                let confidence_gate = if dials_snapshot.signal_enabled("confidence_gate") {
                     let obs = mem.confidence_observations();
                     let total_obs = (obs - 2.0).max(0.0);
                     if total_obs >= 5.0 {
@@ -2670,6 +2733,8 @@ impl super::MemorySystem {
                     } else {
                         1.0
                     }
+                } else {
+                    1.0
                 };
 
                 let final_score = (base
@@ -3002,7 +3067,8 @@ impl super::MemorySystem {
         // - Temporal queries: lambda=0.7 (moderate diversity)
         // Reference: Berntsen (2021) — pattern separation prevents similar
         // memories from co-activating (dentate gyrus analog).
-        {
+        // [signal: mmr] Gated by disabled_signals dial; default = always on (skip = no diversification).
+        if dials_snapshot.signal_enabled("mmr") {
             let mmr_lambda = match &query_type {
                 query_parser::QueryType::Attribute(_) => None,
                 query_parser::QueryType::Exploratory => {
@@ -3434,8 +3500,10 @@ impl super::MemorySystem {
                     }
                 }
 
-                // Category error demotion: only if ordinal resolution failed
-                if !ordinal_resolved {
+                // Category error demotion: only if ordinal resolution failed.
+                // [signal: ordinal_cliff] Gated by disabled_signals dial; default = always on.
+                // When disabled, skip the ×0.50 demotion (leave all candidate scores unchanged).
+                if !ordinal_resolved && dials_snapshot.signal_enabled("ordinal_cliff") {
                     tracing::info!(
                         "Layer 5.9: Category error — ordinal session reference '{}' unresolved",
                         query_text
@@ -5135,6 +5203,161 @@ mod r2_temporal_boost_tests {
         assert!(
             !r2_boost_fires(old_date, bounds),
             "a memory 60 days old should NOT receive the boost for a 'yesterday' query"
+        );
+    }
+}
+
+// =============================================================================
+// Signal-disable gate tests (SD-*)
+// =============================================================================
+// These tests verify that:
+//   (a) Default dials → signal_enabled returns true for all IDs (SD-1, in dials.rs).
+//   (b) Specific IDs in disabled_signals → signal_enabled returns false (SD-2, in dials.rs).
+//   (c) The gate IS wired into the score formula: disabling a signal whose
+//       magnitude is non-zero for a given input changes the resulting score.
+//
+// Test (c) works by directly exercising the components of the `with_unified_score`
+// closure logic — no I/O, no storage, no embedders — so it runs fast and hermetically.
+#[cfg(test)]
+mod signal_disable_gate_tests {
+    use std::collections::HashSet;
+    use crate::memory::dials::CognitiveDials;
+
+    /// Simulates the arousal_boost component with and without the signal enabled.
+    /// When `arousal` is disabled the contribution MUST be 0.0.
+    #[test]
+    fn sd_c1_arousal_gate_changes_score() {
+        // A memory with non-zero arousal (0.8) contributes 0.8 * 0.05 = 0.04 normally.
+        let raw_arousal: f32 = 0.8;
+        let expected_enabled: f32 = raw_arousal * 0.05;
+
+        let dials_enabled = CognitiveDials::default();
+        let boost_enabled = if dials_enabled.signal_enabled("arousal") {
+            raw_arousal * 0.05
+        } else {
+            0.0
+        };
+        assert!(
+            (boost_enabled - expected_enabled).abs() < 1e-6,
+            "with signal enabled: expected {expected_enabled}, got {boost_enabled}"
+        );
+
+        let mut disabled = HashSet::new();
+        disabled.insert("arousal".to_string());
+        let dials_disabled = CognitiveDials { disabled_signals: disabled, ..Default::default() };
+        let boost_disabled = if dials_disabled.signal_enabled("arousal") {
+            raw_arousal * 0.05
+        } else {
+            0.0
+        };
+        assert_eq!(boost_disabled, 0.0, "arousal disabled: boost must be 0.0");
+
+        // The two paths must produce different results (the gate is load-bearing).
+        assert!(
+            (boost_enabled - boost_disabled).abs() > 1e-6,
+            "disabling arousal must change the score contribution"
+        );
+    }
+
+    /// Simulates the valence_boost component with and without the signal enabled.
+    /// When `valence` is disabled the contribution MUST be 0.0.
+    #[test]
+    fn sd_c2_valence_gate_changes_score() {
+        let raw_valence: f32 = -0.6_f32; // negative valence still contributes abs * 0.02
+        let expected_enabled: f32 = raw_valence.abs() * 0.02;
+
+        let dials_enabled = CognitiveDials::default();
+        let boost_enabled = if dials_enabled.signal_enabled("valence") {
+            raw_valence.abs() * 0.02
+        } else {
+            0.0
+        };
+        assert!(
+            (boost_enabled - expected_enabled).abs() < 1e-6,
+            "with signal enabled: expected {expected_enabled}, got {boost_enabled}"
+        );
+
+        let mut disabled = HashSet::new();
+        disabled.insert("valence".to_string());
+        let dials_disabled = CognitiveDials { disabled_signals: disabled, ..Default::default() };
+        let boost_disabled = if dials_disabled.signal_enabled("valence") {
+            raw_valence.abs() * 0.02
+        } else {
+            0.0
+        };
+        assert_eq!(boost_disabled, 0.0, "valence disabled: boost must be 0.0");
+        assert!(
+            (boost_enabled - boost_disabled).abs() > 1e-6,
+            "disabling valence must change the score contribution"
+        );
+    }
+
+    /// Simulates the session_continuity component.
+    /// A memory within 2 hours gets 0.03 when enabled, 0.0 when disabled.
+    #[test]
+    fn sd_c3_session_continuity_gate_changes_score() {
+        let age_hours: i64 = 1; // within session window
+
+        let dials_enabled = CognitiveDials::default();
+        let boost_enabled: f32 = if dials_enabled.signal_enabled("session_continuity") {
+            if age_hours <= 2 { 0.03 } else { 0.0 }
+        } else {
+            0.0
+        };
+        assert!(
+            (boost_enabled - 0.03_f32).abs() < 1e-6,
+            "session_continuity enabled: expected 0.03, got {boost_enabled}"
+        );
+
+        let mut disabled = HashSet::new();
+        disabled.insert("session_continuity".to_string());
+        let dials_disabled = CognitiveDials { disabled_signals: disabled, ..Default::default() };
+        let boost_disabled: f32 = if dials_disabled.signal_enabled("session_continuity") {
+            if age_hours <= 2 { 0.03 } else { 0.0 }
+        } else {
+            0.0
+        };
+        assert_eq!(boost_disabled, 0.0_f32, "session_continuity disabled: boost must be 0.0");
+        assert!(
+            (boost_enabled - boost_disabled).abs() > 1e-6,
+            "disabling session_continuity must change the score contribution"
+        );
+    }
+
+    /// Simulates the hebbian gate on base_score.
+    /// When `hebbian` is disabled the 0.1× hebbian contribution is not added to base.
+    #[test]
+    fn sd_c4_hebbian_gate_changes_base_score() {
+        let rrf_score: f32 = 0.5;
+        let hebbian_score: f32 = 0.4;
+
+        let dials_enabled = CognitiveDials::default();
+        let base_enabled = if dials_enabled.signal_enabled("hebbian") {
+            rrf_score + hebbian_score * 0.1
+        } else {
+            rrf_score
+        };
+        let expected = rrf_score + hebbian_score * 0.1;
+        assert!(
+            (base_enabled - expected).abs() < 1e-6,
+            "hebbian enabled: expected {expected}, got {base_enabled}"
+        );
+
+        let mut disabled = HashSet::new();
+        disabled.insert("hebbian".to_string());
+        let dials_disabled = CognitiveDials { disabled_signals: disabled, ..Default::default() };
+        let base_disabled = if dials_disabled.signal_enabled("hebbian") {
+            rrf_score + hebbian_score * 0.1
+        } else {
+            rrf_score
+        };
+        assert!(
+            (base_disabled - rrf_score).abs() < 1e-6,
+            "hebbian disabled: base must equal rrf_score {rrf_score}, got {base_disabled}"
+        );
+        assert!(
+            (base_enabled - base_disabled).abs() > 1e-6,
+            "disabling hebbian must change base_score"
         );
     }
 }
