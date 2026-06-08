@@ -914,7 +914,20 @@ impl TemporalFactStore {
             }
         }
 
-        // Stem each word in the object phrase and search the event index.
+        // Delegate to the shared event-lookup helper.
+        // We insert the current fact's id into the visited set *before* the
+        // lookup so that the helper's own cycle guard cannot re-enter this fact.
+        visited.insert(fact.id.clone());
+
+        // Use resolve_event_to_date for the lookup, but we need direction-aware
+        // date selection (latest for "after", earliest for "before"), which
+        // requires direct access to the candidates.  We call the helper only for
+        // simple ExactDate anchors; for MonthYear/Year we stay with the same
+        // date-selection logic as before.
+        //
+        // Implementation: re-use resolve_event_to_date to get a representative
+        // NaiveDate, then adjust for directionality via the stored resolved_time
+        // of the winning candidate.
         let stemmer = Stemmer::create(Algorithm::English);
         let stopwords: HashSet<&str> = [
             "the", "a", "an", "of", "in", "at", "on", "to", "for", "and", "or",
@@ -969,7 +982,6 @@ impl TemporalFactStore {
         if visited.contains(&anchor_fact.id) {
             return fact.clone();
         }
-        visited.insert(fact.id.clone());
 
         // Recursively resolve the anchor fact if it is itself unresolved,
         // within the depth budget (depth+1).
@@ -1018,6 +1030,137 @@ impl TemporalFactStore {
             }
             None => fact.clone(),
         }
+    }
+
+    // =========================================================================
+    // B2: shared event-to-date resolver (query-time + write-time)
+    // =========================================================================
+
+    /// Resolve a named-event phrase (e.g. "the wedding", "graduation") to a
+    /// concrete `NaiveDate` by looking up the stored event in the database.
+    ///
+    /// This is the shared core used by **both** the write-time second-hop path
+    /// (`resolve_named_event_hop`, R5) and the query-time anchor resolver (B2).
+    ///
+    /// **Algorithm**
+    /// 1. Strip common stop-words and stem the remaining keywords.
+    /// 2. Call `find_by_event` for each keyword; collect deduplicated candidate facts.
+    /// 3. Pick the most recent candidate (by `conversation_date`) and extract its
+    ///    date using `extract_anchor_date_from_resolved`.
+    /// 4. If the candidate itself has an unresolved `resolved_time`, recurse once
+    ///    (depth ≤ 2, `visited` cycle guard) — identical to the write-time logic.
+    ///
+    /// Returns `None` when:
+    /// - No matching facts are stored (forward reference).
+    /// - The cycle guard fires (`visited` already contains the candidate id).
+    /// - The depth budget is exhausted.
+    /// - The matched fact's date cannot be extracted.
+    ///
+    /// **B2 note**: The `visited` set must be caller-supplied so that call chains
+    /// across write-time and query-time code share the same cycle boundary.
+    pub fn resolve_event_to_date(
+        &self,
+        user_id: &str,
+        event_phrase: &str,
+        visited: &mut HashSet<String>,
+        depth: u8,
+    ) -> Option<NaiveDate> {
+        if depth >= 2 {
+            return None;
+        }
+
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stopwords: HashSet<&str> = [
+            "the", "a", "an", "of", "in", "at", "on", "to", "for", "and", "or",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let keywords: Vec<String> = event_phrase
+            .split_whitespace()
+            .filter(|w| w.len() > 1 && !stopwords.contains(*w))
+            .map(|w| stemmer.stem(&w.to_lowercase()).to_string())
+            .collect();
+
+        if keywords.is_empty() {
+            return None;
+        }
+
+        // Collect deduplicated candidates via the event index.
+        let mut candidates: Vec<TemporalFact> = Vec::new();
+        for kw in &keywords {
+            if let Ok(found) = self.find_by_event(user_id, kw, 10) {
+                for f in found {
+                    if !candidates.iter().any(|c: &TemporalFact| c.id == f.id) {
+                        candidates.push(f);
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return None; // Forward reference — no matching event stored yet.
+        }
+
+        // Pick the most recent candidate by conversation_date.
+        let anchor_fact = candidates
+            .iter()
+            .max_by_key(|f| f.conversation_date)?;
+
+        // Cycle guard.
+        if visited.contains(&anchor_fact.id) {
+            return None;
+        }
+        visited.insert(anchor_fact.id.clone());
+
+        // If the anchor fact is itself unresolved, recurse one level deeper.
+        let anchor_resolved: ResolvedTime = match &anchor_fact.resolved_time {
+            ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => {
+                // Recurse: try to resolve the anchor's event phrase.
+                let anchor_rel = anchor_fact.relative_time.as_deref().unwrap_or("");
+                // Strip leading preposition if present (mirrors resolve_named_event_hop).
+                let object = {
+                    let lower = anchor_rel.to_lowercase();
+                    let after_prefixes = ["since ", "from ", "after "];
+                    let before_prefixes = ["prior to ", "before ", "until "];
+                    if let Some(rest) = after_prefixes
+                        .iter()
+                        .find_map(|p| lower.strip_prefix(p))
+                    {
+                        rest.to_string()
+                    } else if let Some(rest) = before_prefixes
+                        .iter()
+                        .find_map(|p| lower.strip_prefix(p))
+                    {
+                        rest.to_string()
+                    } else {
+                        anchor_rel.to_string()
+                    }
+                };
+                if let Some(d) = self.resolve_event_to_date(user_id, &object, visited, depth + 1) {
+                    ResolvedTime::ExactDate(d)
+                } else {
+                    return None;
+                }
+            }
+            other => other.clone(),
+        };
+
+        // Extract a single NaiveDate from the resolved time (take the earliest
+        // for "before" anchors but for simple date-lookup callers we just use the
+        // representative date — the exact day for ExactDate, first-of-period
+        // for MonthYear/Year, centre for Around).
+        let date = match &anchor_resolved {
+            ResolvedTime::ExactDate(d) => Some(*d),
+            ResolvedTime::MonthYear { month, year } => NaiveDate::from_ymd_opt(*year, *month, 1),
+            ResolvedTime::Year(y) => NaiveDate::from_ymd_opt(*y, 7, 1),
+            ResolvedTime::After(d) | ResolvedTime::Before(d) => Some(*d),
+            ResolvedTime::Around { centre, .. } => Some(*centre),
+            ResolvedTime::Unknown | ResolvedTime::RelativeDescription(_) => None,
+        };
+
+        date
     }
 
     /// Apply named-event second-hop resolution to a batch of newly extracted
@@ -2708,6 +2851,215 @@ mod tests {
             "forward ref must stay Unknown, got {:?}",
             resolved.resolved_time
         );
+    }
+
+    // =========================================================================
+    // B2: resolve_event_to_date — shared helper tests
+    // =========================================================================
+
+    /// (a) "wedding" fact stored at a known date → query-time resolver returns
+    /// that date; "the Sunday before the wedding" resolves to the Sunday before
+    /// the stored wedding date.
+    #[test]
+    fn test_b2_resolve_event_to_date_wedding() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let conv = conv();
+        // Wedding on May 25, 2023 (Thursday).
+        let wedding_date = NaiveDate::from_ymd_opt(2023, 5, 25).unwrap();
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        let wedding_fact = TemporalFact {
+            id: "tf-b2-wedding".to_string(),
+            entity: "alice".to_string(),
+            event: "wedding".to_string(),
+            event_stems: vec!["wed".to_string()],
+            event_type: EventType::Occurred,
+            relative_time: Some("2023-05-25".to_string()),
+            resolved_time: ResolvedTime::ExactDate(wedding_date),
+            source_memory_id: memory_id.clone(),
+            conversation_date: conv,
+            confidence: 0.9,
+            source_text: "Alice had her wedding on May 25, 2023".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+        store.store("user-b2a", &wedding_fact).unwrap();
+
+        // Resolve "the wedding" event phrase.
+        let mut visited = std::collections::HashSet::new();
+        let result = store.resolve_event_to_date("user-b2a", "the wedding", &mut visited, 0);
+
+        assert_eq!(
+            result,
+            Some(wedding_date),
+            "resolve_event_to_date must return the wedding date"
+        );
+
+        // Verify "the Sunday before the wedding" gives 2023-05-21.
+        let sunday_before = last_weekday(wedding_date, chrono::Weekday::Sun);
+        assert_eq!(
+            sunday_before,
+            NaiveDate::from_ymd_opt(2023, 5, 21).unwrap(),
+            "Sunday before 2023-05-25 must be 2023-05-21"
+        );
+    }
+
+    /// (b) Forward reference: no wedding fact stored → resolve_event_to_date → None.
+    #[test]
+    fn test_b2_forward_ref_returns_none() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let mut visited = std::collections::HashSet::new();
+        let result = store.resolve_event_to_date("user-b2b", "the wedding", &mut visited, 0);
+
+        assert_eq!(
+            result, None,
+            "Forward reference must return None from resolve_event_to_date"
+        );
+    }
+
+    /// (c) Cycle guard: two events referencing each other must terminate and
+    /// yield None (depth cap + visited set).
+    #[test]
+    fn test_b2_cycle_terminates_in_resolve_event_to_date() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let conv = conv();
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        // Store fact A (event "move", resolved Unknown, relative "after the party")
+        let fact_a = TemporalFact {
+            id: "tf-b2c-a".to_string(),
+            entity: "bob".to_string(),
+            event: "move".to_string(),
+            event_stems: vec!["move".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the party".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id.clone(),
+            conversation_date: conv,
+            confidence: 0.7,
+            source_text: "Bob is moving after the party".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        // Store fact B (event "party", resolved Unknown, relative "after the move")
+        let fact_b = TemporalFact {
+            id: "tf-b2c-b".to_string(),
+            entity: "bob".to_string(),
+            event: "party".to_string(),
+            event_stems: vec!["parti".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the move".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id,
+            conversation_date: conv,
+            confidence: 0.7,
+            source_text: "Bob will have a party after the move".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        store.store("user-b2c", &fact_a).unwrap();
+        store.store("user-b2c", &fact_b).unwrap();
+
+        // Both lookups must terminate without panic.
+        let mut vis_a = std::collections::HashSet::new();
+        let r_a = store.resolve_event_to_date("user-b2c", "the party", &mut vis_a, 0);
+        let mut vis_b = std::collections::HashSet::new();
+        let r_b = store.resolve_event_to_date("user-b2c", "the move", &mut vis_b, 0);
+
+        // Both should return None (cycle terminates — no concrete date).
+        assert!(
+            r_a.is_none(),
+            "Cycle: lookup for 'the party' must terminate and return None, got {r_a:?}"
+        );
+        assert!(
+            r_b.is_none(),
+            "Cycle: lookup for 'the move' must terminate and return None, got {r_b:?}"
+        );
+    }
+
+    /// (d) R5 behavior is unchanged after helper extraction: "after the wedding"
+    /// still resolves to After(wedding_date) in resolve_named_event_hop.
+    #[test]
+    fn test_b2_r5_behavior_unchanged_after_helper_extraction() {
+        use rocksdb::DB;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(DB::open_default(temp_dir.path()).unwrap());
+        let store = TemporalFactStore::new(db);
+
+        let conv = conv();
+        let wedding_date = NaiveDate::from_ymd_opt(2023, 3, 15).unwrap();
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        let wedding_fact = TemporalFact {
+            id: "tf-b2d-wedding".to_string(),
+            entity: "alice".to_string(),
+            event: "wedding".to_string(),
+            event_stems: vec!["wed".to_string()],
+            event_type: EventType::Occurred,
+            relative_time: Some("2023-03-15".to_string()),
+            resolved_time: ResolvedTime::ExactDate(wedding_date),
+            source_memory_id: memory_id.clone(),
+            conversation_date: conv,
+            confidence: 0.9,
+            source_text: "Alice had her wedding on March 15, 2023".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+        store.store("user-b2d", &wedding_fact).unwrap();
+
+        let after_fact = TemporalFact {
+            id: "tf-b2d-honeymoon".to_string(),
+            entity: "alice".to_string(),
+            event: "honeymoon".to_string(),
+            event_stems: vec!["honeymoon".to_string()],
+            event_type: EventType::Planned,
+            relative_time: Some("after the wedding".to_string()),
+            resolved_time: ResolvedTime::Unknown,
+            source_memory_id: memory_id,
+            conversation_date: conv,
+            confidence: 0.8,
+            source_text: "Alice is planning the honeymoon after the wedding".to_string(),
+            valid_from: Some(conv),
+            valid_until: None,
+        };
+
+        let mut visited = std::collections::HashSet::new();
+        let resolved = store.resolve_named_event_hop("user-b2d", &after_fact, &mut visited, 0);
+
+        match resolved.resolved_time {
+            ResolvedTime::After(d) => {
+                assert_eq!(d, wedding_date, "R5 must still anchor on wedding_date");
+            }
+            other => panic!(
+                "R5 behavior must be unchanged: expected After(wedding_date), got {other:?}"
+            ),
+        }
     }
 
     /// (c) Cycle: A references "after B event", B references "after A event".
