@@ -7858,3 +7858,179 @@ mod temporal_gate_regression_tests {
         );
     }
 }
+
+// =============================================================================
+// B3 — Derived-date ranking tests
+//
+// Verify that the combined scoring from `TEMPORAL_RECALL_BOOST` (Layer 4.55) and
+// `DERIVED_DATE_EXACT_BOOST` (Layer 4.55b) makes a fact at the exact derived date
+// rank above facts that only fall within the broader ±7-day gate window.
+//
+// These tests work directly with the score arithmetic so they don't need a live
+// MemorySystem; they mirror the logic used in recall.rs layers 4.55 and 4.55b.
+// =============================================================================
+#[cfg(test)]
+mod b3_retrieval_ranking_tests {
+    use super::*;
+    use chrono::{NaiveDate, TimeZone};
+    use crate::memory::temporal_facts::{ResolvedTime, TemporalBound};
+    use crate::memory::query_parser::extract_temporal_refs_with_events;
+    use crate::constants::{TEMPORAL_RECALL_BOOST, DERIVED_DATE_EXACT_BOOST};
+
+    fn nd(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn utc(y: i32, m: u32, day: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, m, day as u32, 12, 0, 0).unwrap()
+    }
+
+    /// Build a minimal TemporalFact (reuse the same pattern as gate regression tests).
+    fn make_fact(
+        id: &str,
+        resolved: ResolvedTime,
+        conv: chrono::DateTime<chrono::Utc>,
+    ) -> temporal_facts::TemporalFact {
+        temporal_facts::TemporalFact {
+            id: id.to_string(),
+            entity: "alice".to_string(),
+            event: "session".to_string(),
+            event_stems: vec!["session".to_string()],
+            event_type: temporal_facts::EventType::Occurred,
+            relative_time: None,
+            resolved_time: resolved,
+            source_memory_id: MemoryId(uuid::Uuid::new_v4()),
+            conversation_date: conv,
+            confidence: 0.9,
+            source_text: "test".to_string(),
+            valid_from: None,
+            valid_until: None,
+        }
+    }
+
+    /// Simulate the Layer 0.6b exact-match predicate from recall.rs.
+    fn is_exact_match(
+        fact: &temporal_facts::TemporalFact,
+        derived_points: &[NaiveDate],
+    ) -> bool {
+        let fact_point = match fact.resolved_time.to_bound() {
+            TemporalBound::Point(d) => Some(d),
+            TemporalBound::Unknown => Some(fact.conversation_date.date_naive()),
+            _ => None,
+        };
+        if let Some(fp) = fact_point {
+            derived_points.iter().any(|dp| (*dp - fp).num_days().abs() <= 1)
+        } else {
+            false
+        }
+    }
+
+    /// Compute the additive score contribution for a fact given the scoring rules
+    /// from layers 4.55 and 4.55b.
+    ///
+    /// base:        0.0 (no prior semantic score — isolates the temporal signal)
+    /// in_gate:     +TEMPORAL_RECALL_BOOST if the fact is in temporal_fact_boost_ids
+    /// exact_match: +DERIVED_DATE_EXACT_BOOST on top of that if the fact is in
+    ///              derived_date_exact_ids
+    fn temporal_score(in_gate: bool, exact_match: bool) -> f32 {
+        let mut s = 0.0_f32;
+        if in_gate     { s += TEMPORAL_RECALL_BOOST; }
+        if exact_match { s += DERIVED_DATE_EXACT_BOOST; }
+        s
+    }
+
+    /// B3-R1: a fact stored on the exact derived date (2023-05-21, the Sunday
+    /// before 2023-05-25) must score higher than a fact stored 5 days later
+    /// (2023-05-26) when the query is "the Sunday before 25 May 2023".
+    ///
+    /// Both facts pass the ±7-day gate filter, so both get TEMPORAL_RECALL_BOOST.
+    /// Only the exact-date fact gets the additional DERIVED_DATE_EXACT_BOOST.
+    #[test]
+    fn derived_date_fact_ranks_above_nearby_facts() {
+        // Query: "what happened the Sunday before 2023-05-25?"
+        // Derived date via B1: Sunday before 2023-05-25 = 2023-05-21.
+        // ISO anchor format is used so B1's YYYY-MM-DD path reliably parses it.
+        let extraction = extract_temporal_refs_with_events(
+            "what happened the Sunday before 2023-05-25?",
+            None::<&dyn Fn(&str) -> Option<NaiveDate>>,
+        );
+
+        let derived_points: Vec<NaiveDate> = extraction.bounds().iter()
+            .filter_map(|b| if let TemporalBound::Point(d) = b { Some(*d) } else { None })
+            .collect();
+
+        // B1 must have resolved the expression.
+        assert!(
+            !derived_points.is_empty(),
+            "B1 must produce at least one derived Point for 'the Sunday before 25 May 2023'"
+        );
+
+        // Fact A: stored on the exact derived date (2023-05-21)
+        let fact_exact = make_fact(
+            "session-2023-05-21",
+            ResolvedTime::ExactDate(nd(2023, 5, 21)),
+            utc(2023, 5, 21),
+        );
+
+        // Fact B: stored 5 days later (2023-05-26) — within ±7-day gate but NOT exact
+        let fact_nearby = make_fact(
+            "session-2023-05-26",
+            ResolvedTime::ExactDate(nd(2023, 5, 26)),
+            utc(2023, 5, 26),
+        );
+
+        // Fact C: stored 30 days away — outside ±7-day gate entirely
+        let fact_far = make_fact(
+            "session-2023-06-20",
+            ResolvedTime::ExactDate(nd(2023, 6, 20)),
+            utc(2023, 6, 20),
+        );
+
+        let facts = [fact_exact.clone(), fact_nearby.clone(), fact_far.clone()];
+
+        // Gate: which facts survive the ±7-day window?
+        let retained = MemorySystem::filter_facts_by_time_window(&facts, &extraction);
+        let retained_ids: std::collections::HashSet<&str> =
+            retained.iter().map(|f| f.id.as_str()).collect();
+
+        assert!(
+            retained_ids.contains("session-2023-05-21"),
+            "exact-date fact must survive the ±7-day gate"
+        );
+        assert!(
+            retained_ids.contains("session-2023-05-26"),
+            "nearby fact (5 days) must survive the ±7-day gate"
+        );
+        assert!(
+            !retained_ids.contains("session-2023-06-20"),
+            "far fact (30 days) must be excluded by the ±7-day gate"
+        );
+
+        // Exact-match predicate
+        let exact_a = is_exact_match(&fact_exact, &derived_points);
+        let exact_b = is_exact_match(&fact_nearby, &derived_points);
+        let exact_c = is_exact_match(&fact_far, &derived_points);
+
+        assert!(exact_a, "fact_exact (2023-05-21) must be an exact match");
+        assert!(!exact_b, "fact_nearby (2023-05-26, 5 days away) must NOT be an exact match");
+        assert!(!exact_c, "fact_far (2023-06-20) must NOT be an exact match");
+
+        // Score comparison — exact-date fact ranks highest
+        let score_exact  = temporal_score(retained_ids.contains("session-2023-05-21"), exact_a);
+        let score_nearby = temporal_score(retained_ids.contains("session-2023-05-26"), exact_b);
+        let score_far    = temporal_score(retained_ids.contains("session-2023-06-20"), exact_c);
+
+        assert!(
+            score_exact > score_nearby,
+            "derived-date exact fact (score {:.2}) must rank above nearby fact (score {:.2})",
+            score_exact,
+            score_nearby
+        );
+        assert!(
+            score_nearby > score_far,
+            "nearby fact (score {:.2}) must rank above far fact (score {:.2})",
+            score_nearby,
+            score_far
+        );
+    }
+}
