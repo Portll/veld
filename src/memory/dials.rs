@@ -18,6 +18,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::memory::hybrid_search::RefinerMode;
 
@@ -175,6 +176,21 @@ pub struct CognitiveDials {
     /// Last time these dials were set (set by the writer; informational).
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+
+    // ---- Signal disable switches (ablation / benchmarking) -------------------
+    /// Set of signal IDs that are disabled at runtime. An empty set (the
+    /// default) means every signal runs exactly as compiled — **no behaviour
+    /// change**.  Populated from `VELD_DIALS_DISABLE_SIGNALS` (comma-separated
+    /// IDs) at startup, or via the `PUT /api/dials` HTTP endpoint at runtime.
+    ///
+    /// Stable signal IDs:
+    /// `seq_proximity`, `context_richness`, `temporal_fact_density`,
+    /// `entity_confidence`, `access_burstiness`, `valence`,
+    /// `bm25_specificity_discount`, `episode_tcm`, `confidence_gate`,
+    /// `content_fallback`, `mmr`, `ordinal_cliff`, `arousal`,
+    /// `valence_credibility`, `session_continuity`, `hebbian`.
+    #[serde(default)]
+    pub disabled_signals: HashSet<String>,
 }
 
 /// UI/range metadata for a recall slider (consumed by `GET /api/dials/schema`).
@@ -257,6 +273,7 @@ impl Default for CognitiveDials {
             mmr_lambda_relationship: None,
             density_linguistic_w: None,
             updated_at: None,
+            disabled_signals: HashSet::new(),
         }
     }
 }
@@ -308,6 +325,15 @@ impl CognitiveDials {
         self.re_encode_graph_strengthen
             || self.re_encode_entity_enrich
             || self.re_encode_embedding_nudge
+    }
+
+    /// Returns `true` when the named recall signal is **enabled** (i.e. not in the
+    /// `disabled_signals` set). An empty set (the default) means every signal runs —
+    /// the `if` guards in recall.rs that call this are always `true` by default, so
+    /// they add zero overhead when no signals are disabled.
+    #[inline]
+    pub fn signal_enabled(&self, id: &str) -> bool {
+        !self.disabled_signals.contains(id)
     }
 
     /// Seed dials from process environment (`VELD_*`), overlaying [`Default`]. Used at
@@ -380,6 +406,16 @@ impl CognitiveDials {
         d.mmr_lambda_abstract = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_ABSTRACT").or(d.mmr_lambda_abstract);
         d.mmr_lambda_relationship = env_parse::<f32>("VELD_TUNE_MMR_LAMBDA_RELATIONSHIP").or(d.mmr_lambda_relationship);
         d.density_linguistic_w = env_parse::<f32>("VELD_TUNE_DENSITY_LINGUISTIC_W").or(d.density_linguistic_w);
+        // Disable-signals: VELD_DIALS_DISABLE_SIGNALS=id1,id2,...
+        // Empty string or unset → empty set (every signal enabled, default behaviour).
+        if let Ok(raw) = std::env::var("VELD_DIALS_DISABLE_SIGNALS") {
+            d.disabled_signals = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+        }
         d.sanitized()
     }
 }
@@ -401,6 +437,102 @@ mod tests {
             d.reconsolidation_window_secs,
             crate::constants::RECONSOLIDATION_LABILE_WINDOW_SECS
         );
+        // disabled_signals must be empty by default — every signal enabled.
+        assert!(d.disabled_signals.is_empty());
+    }
+
+    /// SD-1: With empty disabled_signals, signal_enabled returns true for every
+    /// known signal ID (default behaviour is fully unchanged).
+    #[test]
+    fn signal_enabled_all_on_by_default() {
+        let d = CognitiveDials::default();
+        let all_ids = [
+            "seq_proximity",
+            "context_richness",
+            "temporal_fact_density",
+            "entity_confidence",
+            "access_burstiness",
+            "valence",
+            "bm25_specificity_discount",
+            "episode_tcm",
+            "confidence_gate",
+            "content_fallback",
+            "mmr",
+            "ordinal_cliff",
+            "arousal",
+            "valence_credibility",
+            "session_continuity",
+            "hebbian",
+        ];
+        for id in &all_ids {
+            assert!(
+                d.signal_enabled(id),
+                "signal '{}' must be enabled by default (empty disabled_signals)",
+                id
+            );
+        }
+    }
+
+    /// SD-2: Constructing dials with disabled_signals containing specific IDs causes
+    /// signal_enabled to return false for those IDs and true for all others.
+    #[test]
+    fn signal_enabled_respects_disabled_set() {
+        let mut disabled = HashSet::new();
+        disabled.insert("seq_proximity".to_string());
+        disabled.insert("valence".to_string());
+
+        let d = CognitiveDials {
+            disabled_signals: disabled,
+            ..Default::default()
+        };
+
+        // These two must be disabled.
+        assert!(!d.signal_enabled("seq_proximity"), "seq_proximity should be disabled");
+        assert!(!d.signal_enabled("valence"), "valence should be disabled");
+
+        // All others must remain enabled.
+        for id in &[
+            "context_richness",
+            "temporal_fact_density",
+            "entity_confidence",
+            "access_burstiness",
+            "bm25_specificity_discount",
+            "episode_tcm",
+            "confidence_gate",
+            "content_fallback",
+            "mmr",
+            "ordinal_cliff",
+            "arousal",
+            "valence_credibility",
+            "session_continuity",
+            "hebbian",
+        ] {
+            assert!(
+                d.signal_enabled(id),
+                "signal '{}' must still be enabled",
+                id
+            );
+        }
+    }
+
+    /// SD-3: VELD_DIALS_DISABLE_SIGNALS env var is parsed and produces the correct
+    /// disabled set; all other env-reading behaviour is unchanged.
+    #[test]
+    fn from_env_parses_disable_signals() {
+        // Temporarily set the env var for this test only. This is safe because
+        // cargo test runs each #[test] in the same process, but serial tests
+        // that set+unset the same var are racey only when run in parallel;
+        // here we use a unique-enough var name and restore it after the call.
+        std::env::set_var("VELD_DIALS_DISABLE_SIGNALS", "seq_proximity,valence");
+        let d = CognitiveDials::from_env();
+        std::env::remove_var("VELD_DIALS_DISABLE_SIGNALS");
+
+        assert!(!d.signal_enabled("seq_proximity"), "seq_proximity must be disabled via env");
+        assert!(!d.signal_enabled("valence"), "valence must be disabled via env");
+        assert!(d.signal_enabled("arousal"), "arousal must remain enabled");
+        assert!(d.signal_enabled("hebbian"), "hebbian must remain enabled");
+        // Default reconsolidation state must be preserved.
+        assert!(!d.reconsolidation_enabled);
     }
 
     #[test]
