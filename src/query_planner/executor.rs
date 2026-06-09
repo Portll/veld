@@ -366,6 +366,7 @@ mod tests {
             graph: vec![],
             limit: 10,
             stage_caps: StageCaps::default(),
+            query_text: None,
         };
         let plan = planner::plan(&query);
         match &plan.ordered_ops[0] {
@@ -440,6 +441,7 @@ mod tests {
             graph: vec![],
             limit: 100,
             stage_caps: StageCaps::default(),
+            query_text: None,
         };
 
         let plan = planner::plan(&query);
@@ -515,6 +517,7 @@ mod tests {
             graph: vec![],
             limit: 100,
             stage_caps: StageCaps::default(),
+            query_text: None,
         };
 
         let plan = planner::plan(&query);
@@ -557,6 +560,7 @@ mod tests {
                 graph: 1000,
                 relational: 10_000,
             },
+            query_text: None,
         };
         let plan = planner::plan(&query);
         match &plan.ordered_ops[0] {
@@ -584,6 +588,7 @@ mod tests {
             graph: vec![],
             limit: 5,
             stage_caps: StageCaps::default(),
+            query_text: None,
         };
         let plan = planner::plan(&query);
         let s = &plan.explain;
@@ -647,6 +652,7 @@ mod tests {
             graph: vec![gp],
             limit: 10,
             stage_caps: StageCaps::default(),
+            query_text: None,
         };
 
         let plan = planner::plan(&query);
@@ -676,6 +682,7 @@ mod tests {
             graph: vec![],
             limit: 7,
             stage_caps: StageCaps::default(),
+            query_text: None,
         };
         let plan = planner::plan(&query);
         assert_eq!(plan.ordered_ops.len(), 1);
