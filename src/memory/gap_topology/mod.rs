@@ -24,7 +24,12 @@ use super::slow_store::{RawDiamondGap, RawOpenTriad, RawStarGap};
 pub trait GapStore: Send + Sync {
     fn find_open_triads(&self, min_strength: f32, limit: usize) -> Result<Vec<RawOpenTriad>>;
     fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> Result<Vec<RawDiamondGap>>;
-    fn find_star_gaps(&self, min_spokes: usize, max_connectivity: f32, limit: usize) -> Result<Vec<RawStarGap>>;
+    fn find_star_gaps(
+        &self,
+        min_spokes: usize,
+        max_connectivity: f32,
+        limit: usize,
+    ) -> Result<Vec<RawStarGap>>;
     fn get_adjacency_list(&self, min_strength: f32) -> Result<HashMap<String, Vec<String>>>;
     fn get_entity_names(&self, uuids: &[&str]) -> Result<HashMap<String, String>>;
     fn load_embeddings(&self, uuids: &[&str]) -> Result<HashMap<String, Vec<f32>>>;
@@ -106,7 +111,10 @@ impl ShapeSignature {
             existing_edges: spoke_count,
             missing_edges: missing,
             sparsity,
-            canonical: format!("star:hub={},spokes={},missing={}", hub_name, spoke_count, missing),
+            canonical: format!(
+                "star:hub={},spokes={},missing={}",
+                hub_name, spoke_count, missing
+            ),
         }
     }
 
@@ -372,7 +380,9 @@ mod tests {
         let emb_c: Vec<f32> = vec![0.3, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
         let encode_emb = |emb: &[f32]| -> Vec<u8> {
-            emb.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()
+            emb.iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect::<Vec<u8>>()
         };
 
         // Insert entities directly via SQL
@@ -416,10 +426,7 @@ mod tests {
         );
 
         // Verify at least one gap is an OpenTriad type
-        let has_open_triad = result
-            .gaps
-            .iter()
-            .any(|g| g.gap_type == GapType::OpenTriad);
+        let has_open_triad = result.gaps.iter().any(|g| g.gap_type == GapType::OpenTriad);
         assert!(
             has_open_triad,
             "Expected at least one OpenTriad gap, found types: {:?}",
@@ -440,8 +447,7 @@ mod tests {
             .iter()
             .flat_map(|g| g.entities.iter().map(|e| e.name.as_str()))
             .collect();
-        let has_rust_or_graph =
-            entity_names.contains(&"Rust") || entity_names.contains(&"Graph");
+        let has_rust_or_graph = entity_names.contains(&"Rust") || entity_names.contains(&"Graph");
         assert!(
             has_rust_or_graph,
             "Expected gap entities to include 'Rust' and/or 'Graph', found: {:?}",

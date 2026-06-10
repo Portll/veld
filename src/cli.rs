@@ -26,8 +26,8 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use veld::config::{promote_env_aliases, StorageBackend};
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use veld::config::{promote_env_aliases, StorageBackend};
 
 // =============================================================================
 // CLI STRUCTURE
@@ -96,11 +96,7 @@ enum Commands {
     /// Launch the TUI dashboard
     Tui {
         /// API URL for the Veld server
-        #[arg(
-            long,
-            env = "VELD_SERVER_URL",
-            default_value = "http://127.0.0.1:3030"
-        )]
+        #[arg(long, env = "VELD_SERVER_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
@@ -664,8 +660,16 @@ fn handle_version() {
     eprintln!("Veld {}", env!("VELD_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
-    eprintln!("  Target backend: {}", veld::config::default_requested_storage_backend());
-    eprintln!("  Runtime backend: {}", veld::config::effective_storage_backend_for_current_build(veld::config::default_requested_storage_backend()));
+    eprintln!(
+        "  Target backend: {}",
+        veld::config::default_requested_storage_backend()
+    );
+    eprintln!(
+        "  Runtime backend: {}",
+        veld::config::effective_storage_backend_for_current_build(
+            veld::config::default_requested_storage_backend()
+        )
+    );
     eprintln!("  License:  BUSL-1.1");
     eprintln!("  Repo:     https://github.com/Portll/veld");
 }

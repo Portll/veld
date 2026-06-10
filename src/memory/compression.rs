@@ -573,8 +573,7 @@ pub struct SemanticFact {
 }
 
 /// Types of semantic facts
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FactType {
     /// User preference: "prefers concise code"
     Preference,
@@ -590,7 +589,6 @@ pub enum FactType {
     #[default]
     Pattern,
 }
-
 
 /// Result of consolidation operation
 #[derive(Debug, Clone, Default)]
@@ -1035,8 +1033,7 @@ impl SemanticConsolidator {
                 let subject = &content[subject_start..pos];
 
                 if subject.len() >= 2 {
-                    let def_end = content[pos + marker.len()..]
-                        .find(['.', '!', '?', ',']);
+                    let def_end = content[pos + marker.len()..].find(['.', '!', '?', ',']);
                     let def_end = def_end
                         .map(|i| pos + marker.len() + i)
                         .unwrap_or(content.len().min(pos + marker.len() + 100));

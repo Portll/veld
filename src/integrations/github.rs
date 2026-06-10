@@ -882,10 +882,7 @@ mod tests {
         };
 
         let commit_id = GitHubWebhook::commit_external_id(&repo, "abc123def456");
-        assert_eq!(
-            commit_id,
-            "github:Portll/veld#commit-abc123def456"
-        );
+        assert_eq!(commit_id, "github:Portll/veld#commit-abc123def456");
     }
 
     #[test]

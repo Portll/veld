@@ -212,9 +212,7 @@ pub async fn get_memory(
 
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
     let memory_guard = memory.read();
 
     let shared_memory = resolve_memory(&memory_guard, &memory_id)?;
@@ -255,9 +253,7 @@ pub async fn list_memories(
     )?;
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
 
     let all_memories = {
         let memory = memory.clone();
@@ -1091,9 +1087,7 @@ pub async fn get_memory_health(
         })?;
     validation::validate_user_id(user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(user_id).map_err(AppError::Internal)?;
 
     let mem = {
         let guard = memory.read();

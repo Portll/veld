@@ -19,7 +19,9 @@ use super::VeldMcpServer;
 impl VeldMcpServer {
     pub(crate) fn create(api_url: String, api_key: String, user_id: String) -> Self {
         Self {
-            client: Arc::new(super::client::AsyncApiClient::new(api_url, api_key, user_id)),
+            client: Arc::new(super::client::AsyncApiClient::new(
+                api_url, api_key, user_id,
+            )),
             tool_router: Self::tool_router(),
         }
     }

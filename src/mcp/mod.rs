@@ -14,9 +14,7 @@ pub mod types;
 use anyhow::Result;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
-    model::{
-        Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
-    },
+    model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
     tool_handler, ServerHandler, ServiceExt,
 };
 use std::sync::Arc;
@@ -97,7 +95,12 @@ fn output_hook(event_name: &str, context: &str) {
 // HOOK HANDLERS
 // =============================================================================
 
-pub fn handle_session_start(api_url: &str, api_key: &str, user_id: &str, project_dir: Option<&str>) {
+pub fn handle_session_start(
+    api_url: &str,
+    api_key: &str,
+    user_id: &str,
+    project_dir: Option<&str>,
+) {
     let client = BlockingApiClient::new(api_url.to_string(), api_key.to_string());
 
     let dir_name = project_dir

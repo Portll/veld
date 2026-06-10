@@ -39,8 +39,7 @@ pub fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
-    let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "veld".to_string());
+    let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "veld".to_string());
 
     // Build span exporter using the new builder API (opentelemetry 0.27+)
     let exporter = SpanExporter::builder()

@@ -18,8 +18,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::Result;
 use clap::Parser;
-use veld::config::{promote_env_aliases, StorageBackend};
 use std::path::PathBuf;
+use veld::config::{promote_env_aliases, StorageBackend};
 
 const LONG_ABOUT: &str = r#"
 Veld is the adaptive memory runtime for AI agents and robots, featuring:
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
     veld::fortress::init();
 
     unsafe {
-      promote_env_aliases();
+        promote_env_aliases();
     }
 
     let cli = Cli::parse();
@@ -114,7 +114,7 @@ fn main() -> Result<()> {
         host: cli.host,
         port: cli.port,
         storage_path: cli.storage_path,
-      storage_backend: cli.storage_backend,
+        storage_backend: cli.storage_backend,
         production: cli.production,
         rate_limit: cli.rate_limit,
         max_concurrent: cli.max_concurrent,

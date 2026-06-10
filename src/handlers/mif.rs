@@ -49,9 +49,7 @@ pub async fn export_mif(
     let user_id = req.user_id.clone();
 
     // Gather data
-    let memory_sys = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory_sys = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
     let memories = {
         let guard = memory_sys.read();
         guard.get_all_memories().unwrap_or_default()

@@ -805,13 +805,11 @@ pub async fn recall(
                         continue;
                     };
                     // Cooldown: skip if accessed recently
-                    let secs_since = (chrono::Utc::now() - mem.last_accessed())
-                        .num_seconds();
+                    let secs_since = (chrono::Utc::now() - mem.last_accessed()).num_seconds();
                     if secs_since < crate::constants::RECONSOLIDATION_COOLDOWN_SECS {
                         continue;
                     }
-                    let boost =
-                        crate::constants::RECONSOLIDATION_BOOST * relevance_score;
+                    let boost = crate::constants::RECONSOLIDATION_BOOST * relevance_score;
                     mem.boost_importance(boost);
                     let _ = guard.update_memory(&mem);
                     metrics::RECONSOLIDATION_TOTAL.inc();
@@ -1571,14 +1569,13 @@ pub async fn proactive_context(
 
                     // FIX-R4: Compute temporal distance + intrusion markers
                     let now = chrono::Utc::now();
-                    let hours_since_created =
-                        (now - m.created_at).num_minutes() as f32 / 60.0;
+                    let hours_since_created = (now - m.created_at).num_minutes() as f32 / 60.0;
                     let hours_since_last_accessed =
                         (now - m.last_accessed()).num_minutes() as f32 / 60.0;
                     let access_count = m.access_count();
                     let activation_level = m.activation();
-                    let intrusion_score = activation_level
-                        * (1.0 / hours_since_last_accessed.max(0.1));
+                    let intrusion_score =
+                        activation_level * (1.0 / hours_since_last_accessed.max(0.1));
                     // FIX-R1: Detect co-activation via reconsolidation shadow
                     let retrieval_trigger = if memory_guard.has_active_shadow(&m.id) {
                         "co_activation".to_string()
@@ -1645,8 +1642,7 @@ pub async fn proactive_context(
             tokio::task::spawn(async move {
                 let _ = tokio::task::spawn_blocking(move || {
                     let graph_guard = graph.write();
-                    let _ =
-                        graph_guard.record_memory_coactivation(&trigger_id, &coactivated_ids);
+                    let _ = graph_guard.record_memory_coactivation(&trigger_id, &coactivated_ids);
                 })
                 .await;
             });

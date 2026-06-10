@@ -215,7 +215,9 @@ pub struct TemporalFactsResponse {
 
 fn temporal_fact_to_entry(fact: &TemporalFact) -> TemporalFactEntry {
     let is_valid = fact.valid_until.is_none()
-        || fact.valid_until.is_some_and(|until| until >= chrono::Utc::now());
+        || fact
+            .valid_until
+            .is_some_and(|until| until >= chrono::Utc::now());
     TemporalFactEntry {
         entity: fact.entity.clone(),
         event: fact.event.clone(),
@@ -342,10 +344,7 @@ pub async fn search_temporal_facts(
                     fact.event.to_lowercase(),
                     fact.source_text.to_lowercase()
                 );
-                keywords
-                    .iter()
-                    .filter(|kw| combined.contains(*kw))
-                    .count()
+                keywords.iter().filter(|kw| combined.contains(*kw)).count()
             };
             score(b).cmp(&score(a))
         });

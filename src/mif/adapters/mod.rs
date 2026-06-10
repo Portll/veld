@@ -68,7 +68,11 @@ impl AdapterRegistry {
 
     /// Import using a specific adapter by format ID.
     pub fn import_with(&self, format_id: &str, data: &[u8]) -> Result<MifDocument> {
-        let format_id = if format_id == "shodh" { "veld" } else { format_id };
+        let format_id = if format_id == "shodh" {
+            "veld"
+        } else {
+            format_id
+        };
         for adapter in &self.adapters {
             if adapter.format_id() == format_id {
                 return adapter.to_mif(data);
@@ -83,7 +87,11 @@ impl AdapterRegistry {
 
     /// Export using a specific adapter by format ID.
     pub fn export_with(&self, format_id: &str, doc: &MifDocument) -> Result<Vec<u8>> {
-        let format_id = if format_id == "shodh" { "veld" } else { format_id };
+        let format_id = if format_id == "shodh" {
+            "veld"
+        } else {
+            format_id
+        };
         for adapter in &self.adapters {
             if adapter.format_id() == format_id {
                 return adapter.from_mif(doc);

@@ -320,13 +320,16 @@ impl BM25Index {
             let existing = Index::open(dir).context("Failed to open existing BM25 index")?;
             // Schema migration: if existing index lacks stemmed_content, rebuild
             if existing.schema().get_field("stemmed_content").is_err() {
-                tracing::warn!("BM25 schema missing stemmed_content — rebuilding index for stemming support");
+                tracing::warn!(
+                    "BM25 schema missing stemmed_content — rebuilding index for stemming support"
+                );
                 drop(existing);
                 if let Err(e) = std::fs::remove_dir_all(path) {
                     tracing::warn!("Failed to remove old BM25 index: {e}");
                 }
                 std::fs::create_dir_all(path)?;
-                Index::create_in_dir(path, schema).context("Failed to create BM25 index with stemmed_content")?
+                Index::create_in_dir(path, schema)
+                    .context("Failed to create BM25 index with stemmed_content")?
             } else {
                 existing
             }
@@ -683,9 +686,7 @@ impl CrossEncoderReranker {
     pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         Self {
             embedder,
-            cross_encoder: Arc::new(
-                crate::embeddings::cross_encoder::CrossEncoder::new(),
-            ),
+            cross_encoder: Arc::new(crate::embeddings::cross_encoder::CrossEncoder::new()),
         }
     }
 
@@ -899,9 +900,7 @@ impl HybridSearchEngine {
     ///
     /// Returns (bm25_weight, vector_weight, graph_weight) normalized to sum to 1.0
     pub fn effective_weights(&self) -> (f32, f32, f32) {
-        use crate::constants::{
-            ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND,
-        };
+        use crate::constants::{ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD, ADAPTIVE_WEIGHT_MAX_BLEND};
 
         let learned = self.learned_weights.read();
 
@@ -914,9 +913,8 @@ impl HybridSearchEngine {
         }
 
         // Confidence ramp: linearly increase blend factor with update count
-        let confidence = (learned.update_count as f32
-            / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32)
-            .min(1.0);
+        let confidence =
+            (learned.update_count as f32 / ADAPTIVE_WEIGHT_CONFIDENCE_THRESHOLD as f32).min(1.0);
         let blend = confidence * ADAPTIVE_WEIGHT_MAX_BLEND;
 
         let bm25 = (1.0 - blend) * self.config.bm25_weight + blend * learned.bm25;
@@ -1571,7 +1569,10 @@ mod tests {
     fn test_signal_scores_zero_input() {
         let scores = SignalScores::from_components(0.0, 0.0, 0.0);
         let sum = scores.bm25_contribution + scores.vector_contribution + scores.graph_contribution;
-        assert!((sum - 1.0).abs() < 0.001, "Zero input should produce uniform weights");
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Zero input should produce uniform weights"
+        );
         assert!((scores.bm25_contribution - 1.0 / 3.0).abs() < 0.001);
     }
 
@@ -1582,8 +1583,12 @@ mod tests {
         // High BM25 contribution should become low after inversion
         assert!(inverted.bm25_contribution < inverted.vector_contribution);
         assert!(inverted.bm25_contribution < inverted.graph_contribution);
-        let sum = inverted.bm25_contribution + inverted.vector_contribution + inverted.graph_contribution;
-        assert!((sum - 1.0).abs() < 0.001, "Inverted scores should sum to 1.0");
+        let sum =
+            inverted.bm25_contribution + inverted.vector_contribution + inverted.graph_contribution;
+        assert!(
+            (sum - 1.0).abs() < 0.001,
+            "Inverted scores should sum to 1.0"
+        );
     }
 
     #[test]
@@ -1620,9 +1625,17 @@ mod tests {
         }
 
         // After 100 updates at lr=0.05, weights should be close to target
-        assert!(weights.vector > 0.6, "Vector should dominate after many updates: {}", weights.vector);
+        assert!(
+            weights.vector > 0.6,
+            "Vector should dominate after many updates: {}",
+            weights.vector
+        );
         assert!(weights.bm25 < 0.2, "BM25 should be low: {}", weights.bm25);
-        assert!(weights.graph < 0.2, "Graph should be low: {}", weights.graph);
+        assert!(
+            weights.graph < 0.2,
+            "Graph should be low: {}",
+            weights.graph
+        );
     }
 
     #[test]

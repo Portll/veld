@@ -9,13 +9,13 @@
 
 use std::sync::Arc;
 
+use tempfile::TempDir;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::graph_memory::GraphMemory;
 use veld::memory::{
     Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem, MemoryTier,
 };
 use veld::uuid::Uuid;
-use tempfile::TempDir;
 
 /// Create fallback NER for testing (rule-based, no ONNX required)
 fn setup_fallback_ner() -> NeuralNer {

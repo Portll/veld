@@ -9,12 +9,10 @@
 //! - Importance-based promotion to session
 //! - NER integration for entity extraction
 
-use veld::embeddings::ner::{NerConfig, NeuralNer};
-use veld::memory::{
-    Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode,
-};
 use std::path::PathBuf;
 use tempfile::TempDir;
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem, Query, RetrievalMode};
 
 /// Create fallback NER instance for testing
 fn setup_fallback_ner() -> NeuralNer {
@@ -618,9 +616,7 @@ fn test_geo_filter_retrieval() {
     // Search near San Francisco
     let query = Query {
         query_text: Some("obstacle warehouse".to_string()),
-        geo_filter: Some(veld::memory::GeoFilter::new(
-            37.7749, -122.4194, 1000.0,
-        )),
+        geo_filter: Some(veld::memory::GeoFilter::new(37.7749, -122.4194, 1000.0)),
         max_results: 5,
         ..Default::default()
     };

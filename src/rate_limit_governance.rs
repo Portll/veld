@@ -68,8 +68,7 @@ fn build_quota(rps: u64, burst: u32) -> Quota {
 pub fn wait_time_cap_secs(rps: u64, burst: u32) -> u64 {
     let rps = rps.max(1);
     // Use nanosecond math to avoid losing precision when burst*cell < 1s.
-    let total_nanos =
-        (burst.max(1) as u128).saturating_mul(1_000_000_000u128 / rps as u128);
+    let total_nanos = (burst.max(1) as u128).saturating_mul(1_000_000_000u128 / rps as u128);
     let secs = (total_nanos / 1_000_000_000) as u64;
     // Always allow at least 1s so retry-after is meaningful.
     secs.max(1)
@@ -161,8 +160,7 @@ where
 {
     type Response = Response<Body>;
     type Error = S::Error;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -399,5 +397,4 @@ mod tests {
             resp.status()
         );
     }
-
 }

@@ -576,10 +576,7 @@ impl SegmentationEngine {
     /// Two consecutive turns share a topic tag if their stemmed-token Jaccard
     /// similarity >= 0.3. The tag is formatted as "topic:{stem1}+{stem2}+..." using
     /// the intersection stems (alphabetically sorted).
-    fn compute_topic_threads(
-        &self,
-        turns: &[(AtomicMemory, String)],
-    ) -> Vec<Vec<String>> {
+    fn compute_topic_threads(&self, turns: &[(AtomicMemory, String)]) -> Vec<Vec<String>> {
         let stemmer = Stemmer::create(Algorithm::English);
         let mut tags_per_turn: Vec<Vec<String>> = vec![Vec::new(); turns.len()];
 
@@ -621,15 +618,15 @@ impl SegmentationEngine {
     fn stemmed_tokens(stemmer: &Stemmer, content: &str) -> HashSet<String> {
         let stopwords: HashSet<&str> = [
             "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has",
-            "had", "do", "does", "did", "will", "would", "could", "should", "may", "might",
-            "must", "shall", "can", "need", "to", "of", "in", "for", "on", "with", "at", "by",
-            "from", "as", "into", "through", "during", "before", "after", "above", "below",
-            "between", "under", "again", "further", "then", "once", "here", "there", "when",
-            "where", "why", "how", "all", "each", "few", "more", "most", "other", "some",
-            "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very",
-            "just", "and", "but", "or", "if", "because", "while", "although", "this", "that",
-            "these", "those", "i", "you", "he", "she", "it", "we", "they", "what", "which",
-            "who", "whom", "its", "his", "her", "their", "my", "your", "our",
+            "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "must",
+            "shall", "can", "need", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+            "as", "into", "through", "during", "before", "after", "above", "below", "between",
+            "under", "again", "further", "then", "once", "here", "there", "when", "where", "why",
+            "how", "all", "each", "few", "more", "most", "other", "some", "such", "no", "nor",
+            "not", "only", "own", "same", "so", "than", "too", "very", "just", "and", "but", "or",
+            "if", "because", "while", "although", "this", "that", "these", "those", "i", "you",
+            "he", "she", "it", "we", "they", "what", "which", "who", "whom", "its", "his", "her",
+            "their", "my", "your", "our",
         ]
         .into_iter()
         .collect();
@@ -1119,7 +1116,9 @@ mod tests {
             },
             ConversationTurn {
                 role: "Assistant".to_string(),
-                content: "The Rust compiler caught three lifetime errors in the authentication module.".to_string(),
+                content:
+                    "The Rust compiler caught three lifetime errors in the authentication module."
+                        .to_string(),
             },
         ];
 
@@ -1235,7 +1234,9 @@ mod tests {
             },
             ConversationTurn {
                 role: "Assistant".to_string(),
-                content: "Hebbian learning strengthens connections between neurons that fire together.".to_string(),
+                content:
+                    "Hebbian learning strengthens connections between neurons that fire together."
+                        .to_string(),
             },
         ];
 
@@ -1284,7 +1285,8 @@ mod tests {
     #[test]
     fn test_stemmed_tokens() {
         let stemmer = Stemmer::create(Algorithm::English);
-        let tokens = SegmentationEngine::stemmed_tokens(&stemmer, "Running performances are impressive");
+        let tokens =
+            SegmentationEngine::stemmed_tokens(&stemmer, "Running performances are impressive");
         // "running" -> "run", "performances" -> "perform", "impressive" -> "impress"
         // "are" is a stopword
         assert!(tokens.contains("run") || tokens.contains("running"));

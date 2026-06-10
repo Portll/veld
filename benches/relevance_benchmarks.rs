@@ -6,12 +6,12 @@
 //! - Configuration impact on latency
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use veld::embeddings::ner::{NerConfig, NeuralNer};
-use veld::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem};
-use veld::relevance::{RelevanceConfig, RelevanceEngine};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{Experience, ExperienceType, MemoryConfig, MemorySystem};
+use veld::relevance::{RelevanceConfig, RelevanceEngine};
 
 /// Create test memory system
 fn setup_memory_system() -> (MemorySystem, TempDir) {

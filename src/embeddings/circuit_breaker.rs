@@ -308,7 +308,8 @@ impl ResilientEmbedder {
 
 impl Embedder for ResilientEmbedder {
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
-        self.encode_with_status(text).map(|(embedding, _)| embedding)
+        self.encode_with_status(text)
+            .map(|(embedding, _)| embedding)
     }
 
     fn dimension(&self) -> usize {

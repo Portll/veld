@@ -101,7 +101,10 @@ pub trait GraphStore: Send + Sync {
     fn put_entity(&self, entity: &EntityNode) -> Result<()>;
     fn get_relationship(&self, uuid: &uuid::Uuid) -> Result<Option<RelationshipEdge>>;
     fn put_relationship(&self, edge: &RelationshipEdge) -> Result<()>;
-    fn list_relationships_for_entity(&self, entity_uuid: &uuid::Uuid) -> Result<Vec<RelationshipEdge>>;
+    fn list_relationships_for_entity(
+        &self,
+        entity_uuid: &uuid::Uuid,
+    ) -> Result<Vec<RelationshipEdge>>;
     fn get_episode(&self, uuid: &uuid::Uuid) -> Result<Option<EpisodicNode>>;
     fn put_episode(&self, episode: &EpisodicNode) -> Result<()>;
     fn stats(&self) -> Result<GraphStats>;

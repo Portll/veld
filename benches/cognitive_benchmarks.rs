@@ -9,13 +9,13 @@
 //! - NER integration for entity extraction
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use tempfile::TempDir;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::memory::{
     EntityRef, Experience, ExperienceType, Memory, MemoryConfig, MemoryId, MemorySystem,
     MemoryTier, Query, RetrievalOutcome,
 };
 use veld::uuid::Uuid;
-use tempfile::TempDir;
 
 /// Create test memory system
 fn setup_memory_system() -> (MemorySystem, TempDir) {

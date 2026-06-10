@@ -10,15 +10,15 @@
 //!
 //! This test proves shodh-memory's cognitive architecture works at scale.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tempfile::TempDir;
 use veld::embeddings::ner::{NerConfig, NeuralNer};
 use veld::graph_memory::GraphMemory;
 use veld::memory::{
     Experience, ExperienceType, MemoryConfig, MemoryId, MemorySystem, Query, RetrievalOutcome,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
-use tempfile::TempDir;
 
 // =============================================================================
 // TEST CONFIGURATION - PRODUCTION SCALE
@@ -153,9 +153,7 @@ fn setup_memory_system(working_size: usize) -> (MemorySystem, TempDir) {
     // Wire up GraphMemory for entity relationships and spreading activation
     let graph_path = temp_dir.path().join("graph");
     let graph_memory = GraphMemory::new(&graph_path, None).expect("Failed to create graph memory");
-    memory_system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(
-        graph_memory,
-    )));
+    memory_system.set_graph_memory(Arc::new(veld::parking_lot::RwLock::new(graph_memory)));
 
     (memory_system, temp_dir)
 }

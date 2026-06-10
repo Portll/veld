@@ -45,16 +45,25 @@ impl ZenohEmbedderConfig {
         Self {
             prefix: crate::config::env_var("VELD_ZENOH_EMBED_PREFIX", "SHODH_ZENOH_EMBED_PREFIX")
                 .unwrap_or_else(|_| "veld".into()),
-            target_model: crate::config::env_var("VELD_ZENOH_EMBED_MODEL", "SHODH_ZENOH_EMBED_MODEL")
-                .unwrap_or_else(|_| "minilm-l6-v2".into()),
-            dimension: crate::config::env_var("VELD_ZENOH_EMBED_DIMENSION", "SHODH_ZENOH_EMBED_DIMENSION")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(384),
-            timeout_ms: crate::config::env_var("VELD_ZENOH_EMBED_TIMEOUT_MS", "SHODH_ZENOH_EMBED_TIMEOUT_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5000),
+            target_model: crate::config::env_var(
+                "VELD_ZENOH_EMBED_MODEL",
+                "SHODH_ZENOH_EMBED_MODEL",
+            )
+            .unwrap_or_else(|_| "minilm-l6-v2".into()),
+            dimension: crate::config::env_var(
+                "VELD_ZENOH_EMBED_DIMENSION",
+                "SHODH_ZENOH_EMBED_DIMENSION",
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(384),
+            timeout_ms: crate::config::env_var(
+                "VELD_ZENOH_EMBED_TIMEOUT_MS",
+                "SHODH_ZENOH_EMBED_TIMEOUT_MS",
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000),
             connect_endpoints: crate::config::env_var("VELD_ZENOH_CONNECT", "SHODH_ZENOH_CONNECT")
                 .map(|s| {
                     s.split(',')
@@ -126,7 +135,11 @@ impl ZenohEmbedder {
             .enable_all()
             .build()
             .context("Failed to create ZenohEmbedder runtime")?;
-        Ok(Self { session, config, runtime })
+        Ok(Self {
+            session,
+            config,
+            runtime,
+        })
     }
 
     /// Open a Zenoh session and create a new embedder (standalone mode).
@@ -141,29 +154,39 @@ impl ZenohEmbedder {
             .context("Failed to create ZenohEmbedder runtime")?;
 
         let connect_endpoints = config.connect_endpoints.clone();
-        let session = runtime.block_on(async {
-            let mut zenoh_config = zenoh::Config::default();
-            zenoh_config
-                .insert_json5("mode", r#""peer""#)
-                .map_err(|e| anyhow::anyhow!("Failed to set Zenoh mode: {e}"))?;
-
-            if !connect_endpoints.is_empty() {
-                let endpoints_json = serde_json::to_string(&connect_endpoints)?;
+        let session = runtime
+            .block_on(async {
+                let mut zenoh_config = zenoh::Config::default();
                 zenoh_config
-                    .insert_json5("connect/endpoints", &endpoints_json)
-                    .map_err(|e| anyhow::anyhow!("Failed to set connect endpoints: {e}"))?;
-            }
+                    .insert_json5("mode", r#""peer""#)
+                    .map_err(|e| anyhow::anyhow!("Failed to set Zenoh mode: {e}"))?;
 
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                zenoh::open(zenoh_config),
-            ).await {
-                Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to open Zenoh session: {e}")),
-                Err(_) => anyhow::bail!("Zenoh session open timed out after 10s"),
-            }
-        }).context("Failed to open Zenoh session for embedding routing")?;
+                if !connect_endpoints.is_empty() {
+                    let endpoints_json = serde_json::to_string(&connect_endpoints)?;
+                    zenoh_config
+                        .insert_json5("connect/endpoints", &endpoints_json)
+                        .map_err(|e| anyhow::anyhow!("Failed to set connect endpoints: {e}"))?;
+                }
 
-        Ok(Self { session, config, runtime })
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    zenoh::open(zenoh_config),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result.map_err(|e| anyhow::anyhow!("Failed to open Zenoh session: {e}"))
+                    }
+                    Err(_) => anyhow::bail!("Zenoh session open timed out after 10s"),
+                }
+            })
+            .context("Failed to open Zenoh session for embedding routing")?;
+
+        Ok(Self {
+            session,
+            config,
+            runtime,
+        })
     }
 
     /// Check if any peers with embedding capability are reachable.
@@ -243,8 +266,7 @@ impl ZenohEmbedder {
 
             let overall_deadline = query_start + overall_timeout;
             // Collect window is bounded by the overall timeout.
-            let collect_deadline =
-                (query_start + collect_window).min(overall_deadline);
+            let collect_deadline = (query_start + collect_window).min(overall_deadline);
 
             // (embeddings, elapsed_since_query_start)
             let mut best: Option<(Vec<Vec<f32>>, std::time::Duration)> = None;
@@ -315,10 +337,7 @@ impl ZenohEmbedder {
                     // No valid reply collected — check whether we already hit the
                     // overall timeout or simply found no matching peer.
                     if query_start.elapsed() >= overall_timeout {
-                        anyhow::bail!(
-                            "Embed request timed out after {}ms",
-                            self.config.timeout_ms
-                        );
+                        anyhow::bail!("Embed request timed out after {}ms", self.config.timeout_ms);
                     }
                     anyhow::bail!(
                         "No peer responded with valid {}-dim embeddings",

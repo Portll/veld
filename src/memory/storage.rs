@@ -652,7 +652,8 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
     if data.len() > BINCODE_ALLOC_LIMIT {
         return Err(anyhow!(
             "Memory data too large: {} bytes (limit: {} bytes). Likely corrupt.",
-            data.len(), BINCODE_ALLOC_LIMIT
+            data.len(),
+            BINCODE_ALLOC_LIMIT
         ));
     }
 
@@ -751,10 +752,11 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
 
     // Try current format first (bincode 2.x with current Memory/Experience)
     // This is the hot path — avoid any allocations before this check.
-    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
-        Ok((memory, _)) => {
-            Ok((memory, false))
-        } // Current format, no migration needed
+    match bincode::serde::decode_from_slice::<Memory, _>(
+        data,
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+    ) {
+        Ok((memory, _)) => Ok((memory, false)), // Current format, no migration needed
         Err(e) => {
             // Current format failed — enter fallback chain.
             // From here on we collect errors for diagnostics.
@@ -778,7 +780,8 @@ fn deserialize_legacy_fallback(
     if data.len() > BINCODE_ALLOC_LIMIT {
         return Err(anyhow!(
             "Data too large for memory deserialization: {} bytes (limit: {} bytes)",
-            data.len(), BINCODE_ALLOC_LIMIT
+            data.len(),
+            BINCODE_ALLOC_LIMIT
         ));
     }
     // Log detailed errors for first entry only to help debug format issues
@@ -792,7 +795,10 @@ fn deserialize_legacy_fallback(
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
-    match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
+    match bincode::serde::decode_from_slice::<MinimalMemory, _>(
+        data,
+        bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+    ) {
         Ok((minimal, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x minimal format");
             record_branch("bincode2_minimal");
@@ -1186,10 +1192,11 @@ impl MemoryStorage {
 
         // Try to decode the content as base64 and check for the encrypted marker
         use base64::Engine;
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
-            Ok(bytes) => bytes,
-            Err(_) => return, // Not base64 — plaintext content, leave unchanged
-        };
+        let decoded =
+            match base64::engine::general_purpose::STANDARD.decode(&memory.experience.content) {
+                Ok(bytes) => bytes,
+                Err(_) => return, // Not base64 — plaintext content, leave unchanged
+            };
 
         if !crate::encryption::FieldEncryptor::is_encrypted(&decoded) {
             return; // No encryption marker — plaintext content that happens to be valid base64
@@ -1583,13 +1590,14 @@ impl MemoryStorage {
         let key = id.0.as_bytes();
         match self.db.get(key)? {
             Some(value) => {
-                let (mut memory, needs_migration) = deserialize_memory(&value).with_context(|| {
-                    format!(
-                        "Failed to deserialize memory {} ({} bytes)",
-                        id.0,
-                        value.len()
-                    )
-                })?;
+                let (mut memory, needs_migration) =
+                    deserialize_memory(&value).with_context(|| {
+                        format!(
+                            "Failed to deserialize memory {} ({} bytes)",
+                            id.0,
+                            value.len()
+                        )
+                    })?;
 
                 // Decrypt content field if encrypted
                 self.decrypt_memory_content(&mut memory);
@@ -3232,9 +3240,11 @@ impl MemoryStorage {
         let mapping_key = format!("vmapping:{}", memory_id.0);
         match self.db.get(mapping_key.as_bytes())? {
             Some(data) => {
-                let (entry, _): (VectorMappingEntry, _) =
-                    bincode::serde::decode_from_slice(&data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>())
-                        .context("Failed to deserialize vector mapping")?;
+                let (entry, _): (VectorMappingEntry, _) = bincode::serde::decode_from_slice(
+                    &data,
+                    bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
+                )
+                .context("Failed to deserialize vector mapping")?;
                 Ok(Some(entry))
             }
             None => Ok(None),
@@ -3570,9 +3580,9 @@ impl MemoryStorage {
         let key = format!("_watermark:fact_extraction:{user_id}");
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        if let Err(e) =
-            self.db
-                .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
+        if let Err(e) = self
+            .db
+            .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
         {
             tracing::warn!("Failed to persist fact extraction watermark: {e}");
         }

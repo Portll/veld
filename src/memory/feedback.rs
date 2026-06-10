@@ -1343,15 +1343,15 @@ impl RetrievalQualityTracker {
 
         // Update per-entity stats
         for entity in entity_names {
-            let stats = self
-                .entity_stats
-                .entry(entity.clone())
-                .or_insert_with(|| EntityRetrievalStats {
-                    retrieval_count: 0,
-                    success_count: 0,
-                    avg_signal: 0.0,
-                    last_retrieval: now,
-                });
+            let stats =
+                self.entity_stats
+                    .entry(entity.clone())
+                    .or_insert_with(|| EntityRetrievalStats {
+                        retrieval_count: 0,
+                        success_count: 0,
+                        avg_signal: 0.0,
+                        last_retrieval: now,
+                    });
             stats.retrieval_count += 1;
             if is_success {
                 stats.success_count += 1;
@@ -1473,7 +1473,6 @@ impl std::fmt::Debug for FeedbackStore {
             .finish()
     }
 }
-
 
 impl FeedbackStore {
     /// Create in-memory only store (no persistence)

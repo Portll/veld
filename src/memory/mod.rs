@@ -32,13 +32,13 @@ pub mod segmentation;
 pub mod sessions;
 pub mod slow_store;
 pub mod storage;
-pub mod wavelet_sessions;
 pub mod temporal_facts;
 pub mod todo_formatter;
-pub mod voronoi;
 pub mod todos;
 pub mod types;
 pub mod visualization;
+pub mod voronoi;
+pub mod wavelet_sessions;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -54,8 +54,7 @@ use crate::metrics::{EMBEDDING_CACHE_CONTENT, EMBEDDING_CACHE_CONTENT_SIZE};
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
     DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, EDGE_SEMANTIC_WEIGHT_FLOOR,
-    POTENTIATION_ACCESS_THRESHOLD,
-    POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
+    POTENTIATION_ACCESS_THRESHOLD, POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
     TIER_PROMOTION_SESSION_IMPORTANCE, TIER_PROMOTION_WORKING_AGE_SECS,
     TIER_PROMOTION_WORKING_IMPORTANCE,
 };
@@ -85,6 +84,7 @@ use crate::memory::compression::CompressionPipeline;
 pub use crate::memory::compression::{
     ConsolidationResult, FactType, SemanticConsolidator, SemanticFact,
 };
+pub use crate::memory::context_blocks::{ContextBlock, ContextBlockStore};
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
     apply_context_pattern_signals, calculate_entity_flow, calculate_entity_overlap,
@@ -124,13 +124,13 @@ pub use crate::memory::retrieval::{
     PrefetchResult, ReinforcementStats, RetrievalFeedback, RetrievalOutcome, TrackedRetrieval,
 };
 pub use crate::memory::segmentation::{
-    AtomicMemory, ConversationMemory, ConversationTurn, DeduplicationEngine, DeduplicationResult, InputSource, SegmentationEngine, SpeakerEntity,
+    AtomicMemory, ConversationMemory, ConversationTurn, DeduplicationEngine, DeduplicationResult,
+    InputSource, SegmentationEngine, SpeakerEntity,
 };
 pub use crate::memory::sessions::{
     Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore, SessionStoreStats,
     SessionSummary, TemporalContext, TimeOfDay,
 };
-pub use crate::memory::context_blocks::{ContextBlock, ContextBlockStore};
 pub use crate::memory::temporal_facts::{
     ContradictionType, EventType, ResolvedTime, TemporalFact, TemporalFactStore,
 };
@@ -382,9 +382,7 @@ fn extract_causal_pairs(
             let cause = entities
                 .iter()
                 .rfind(|e| before.contains(&e.to_lowercase()));
-            let effect = entities
-                .iter()
-                .find(|e| after.contains(&e.to_lowercase()));
+            let effect = entities.iter().find(|e| after.contains(&e.to_lowercase()));
 
             if let (Some(c), Some(e)) = (cause, effect) {
                 if c != e {
@@ -407,9 +405,7 @@ fn extract_causal_pairs(
             let effect = entities
                 .iter()
                 .rfind(|e| before.contains(&e.to_lowercase()));
-            let cause = entities
-                .iter()
-                .find(|e| after.contains(&e.to_lowercase()));
+            let cause = entities.iter().find(|e| after.contains(&e.to_lowercase()));
 
             if let (Some(c), Some(e)) = (cause, effect) {
                 if c != e {
@@ -508,7 +504,9 @@ impl MemorySystem {
                     crate::embeddings::nomic::NomicConfig::from_env(),
                 ) {
                     Ok(nomic) => {
-                        tracing::info!("Nomic-embed-text-v1.5 ONNX loaded (768d) — dual-embedder active");
+                        tracing::info!(
+                            "Nomic-embed-text-v1.5 ONNX loaded (768d) — dual-embedder active"
+                        );
                         Some(Arc::new(nomic))
                     }
                     Err(e) => {
@@ -554,17 +552,22 @@ impl MemorySystem {
                 });
                 let mut guard = cache.lock().unwrap();
                 // Re-probe every 30 seconds if no available embedder cached
-                if !guard.available && guard.last_probe.elapsed() > std::time::Duration::from_secs(30) {
+                if !guard.available
+                    && guard.last_probe.elapsed() > std::time::Duration::from_secs(30)
+                {
                     guard.last_probe = std::time::Instant::now();
                     if let Some(ref ze) = guard.embedder {
                         // Re-check existing session for newly available peers
                         if ze.is_available() {
-                            tracing::info!("Zenoh cluster embedder now available — routing to peer");
+                            tracing::info!(
+                                "Zenoh cluster embedder now available — routing to peer"
+                            );
                             guard.available = true;
                         }
                     } else {
                         // First init — prefer the shared transport session if available
-                        let config = crate::embeddings::zenoh_embedder::ZenohEmbedderConfig::from_env();
+                        let config =
+                            crate::embeddings::zenoh_embedder::ZenohEmbedderConfig::from_env();
                         let result = if let Some(session) = SHARED_ZENOH_SESSION.get() {
                             tracing::debug!("ZenohEmbedder: reusing shared transport session");
                             crate::embeddings::zenoh_embedder::ZenohEmbedder::new_with_session(
@@ -579,7 +582,9 @@ impl MemorySystem {
                             Ok(ze) => {
                                 let avail = ze.is_available();
                                 if avail {
-                                    tracing::info!("Zenoh cluster embedder available — routing to peer");
+                                    tracing::info!(
+                                        "Zenoh cluster embedder available — routing to peer"
+                                    );
                                 }
                                 guard.embedder = Some(Arc::new(ze));
                                 guard.available = avail;
@@ -591,7 +596,11 @@ impl MemorySystem {
                     }
                 }
                 if guard.available {
-                    guard.embedder.as_ref().map(|e| Arc::clone(e) as Arc<dyn crate::embeddings::Embedder>).or(secondary)
+                    guard
+                        .embedder
+                        .as_ref()
+                        .map(|e| Arc::clone(e) as Arc<dyn crate::embeddings::Embedder>)
+                        .or(secondary)
                 } else {
                     secondary
                 }
@@ -602,9 +611,9 @@ impl MemorySystem {
             secondary
         };
 
-        let embedder = Arc::new(
-            crate::embeddings::competitive::CompetitiveEmbedder::new(primary, secondary),
-        );
+        let embedder = Arc::new(crate::embeddings::competitive::CompetitiveEmbedder::new(
+            primary, secondary,
+        ));
 
         // Create consolidation event buffer first so we can share it with retriever
         let consolidation_events = Arc::new(RwLock::new(ConsolidationEventBuffer::new()));
@@ -736,12 +745,12 @@ impl MemorySystem {
         // Initialize hybrid search engine (BM25 + Vector + RRF + Reranking)
         let bm25_path = storage_path.join("bm25_index");
         let hybrid_search_config = hybrid_search::HybridSearchConfig::default();
-            #[cfg(feature = "multi-tenant")]
-            let default_collective_weights = (
-                hybrid_search_config.bm25_weight,
-                hybrid_search_config.vector_weight,
-                hybrid_search_config.graph_weight,
-            );
+        #[cfg(feature = "multi-tenant")]
+        let default_collective_weights = (
+            hybrid_search_config.bm25_weight,
+            hybrid_search_config.vector_weight,
+            hybrid_search_config.graph_weight,
+        );
         let hybrid_search_engine = hybrid_search::HybridSearchEngine::new(
             &bm25_path,
             embedder.clone(),
@@ -943,18 +952,20 @@ impl MemorySystem {
     /// Returns None if Sleight hasn't pushed scores or they're stale.
     pub fn external_aggregate_score(&self) -> Option<f32> {
         let guard = self.external_scores.read();
-        guard.as_ref().and_then(|s: &types::ExternalDimensionScores| {
-            if s.is_stale() {
-                None
-            } else {
-                let agg = s.aggregate();
-                if (agg - 1.0).abs() < f32::EPSILON {
-                    None // neutral = no external evaluator data
+        guard
+            .as_ref()
+            .and_then(|s: &types::ExternalDimensionScores| {
+                if s.is_stale() {
+                    None
                 } else {
-                    Some(agg)
+                    let agg = s.aggregate();
+                    if (agg - 1.0).abs() < f32::EPSILON {
+                        None // neutral = no external evaluator data
+                    } else {
+                        Some(agg)
+                    }
                 }
-            }
-        })
+            })
     }
 
     /// Get signal attributions from the most recent semantic retrieval.
@@ -1263,112 +1274,118 @@ impl MemorySystem {
         // Find similar memories and apply retroactive/proactive interference.
         // Skipped when defer_embedding=true — embed_and_index() runs this later.
         if !defer_embedding {
-        if let Some(embedding) = &memory.experience.embeddings {
-            // Search for similar memories (excluding the new one)
-            if let Ok(similar_ids) =
-                self.retriever
-                    .search_by_embedding(embedding, 5, Some(&memory.id))
-            {
-                if !similar_ids.is_empty() {
-                    // Collect similar memory data for interference check
-                    let similar_memories: Vec<_> = similar_ids
-                        .iter()
-                        .filter_map(|(id, similarity)| {
-                            self.retriever.get_from_storage(id).ok().map(|m| {
-                                (
-                                    id.0.to_string(),
-                                    *similarity,
-                                    m.importance(),
-                                    m.created_at,
-                                    m.experience.content.chars().take(50).collect::<String>(),
-                                )
+            if let Some(embedding) = &memory.experience.embeddings {
+                // Search for similar memories (excluding the new one)
+                if let Ok(similar_ids) =
+                    self.retriever
+                        .search_by_embedding(embedding, 5, Some(&memory.id))
+                {
+                    if !similar_ids.is_empty() {
+                        // Collect similar memory data for interference check
+                        let similar_memories: Vec<_> = similar_ids
+                            .iter()
+                            .filter_map(|(id, similarity)| {
+                                self.retriever.get_from_storage(id).ok().map(|m| {
+                                    (
+                                        id.0.to_string(),
+                                        *similarity,
+                                        m.importance(),
+                                        m.created_at,
+                                        m.experience.content.chars().take(50).collect::<String>(),
+                                    )
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    if !similar_memories.is_empty() {
-                        let interference_result =
-                            self.interference_detector.write().check_interference(
-                                &memory.id.0.to_string(),
-                                importance,
-                                memory.created_at,
-                                &similar_memories,
-                            );
+                        if !similar_memories.is_empty() {
+                            let interference_result =
+                                self.interference_detector.write().check_interference(
+                                    &memory.id.0.to_string(),
+                                    importance,
+                                    memory.created_at,
+                                    &similar_memories,
+                                );
 
-                        // Apply retroactive interference (weaken old memories)
-                        for (old_id, _similarity, decay_amount) in
-                            &interference_result.retroactive_targets
-                        {
-                            if let Ok(old_uuid) = uuid::Uuid::parse_str(old_id) {
-                                if let Ok(old_memory) =
-                                    self.long_term_memory.get(&MemoryId(old_uuid))
-                                {
-                                    old_memory.decay_importance(*decay_amount);
-                                    if let Err(e) = self.long_term_memory.update(&old_memory) {
-                                        tracing::debug!("Failed to persist retroactive decay: {e}");
+                            // Apply retroactive interference (weaken old memories)
+                            for (old_id, _similarity, decay_amount) in
+                                &interference_result.retroactive_targets
+                            {
+                                if let Ok(old_uuid) = uuid::Uuid::parse_str(old_id) {
+                                    if let Ok(old_memory) =
+                                        self.long_term_memory.get(&MemoryId(old_uuid))
+                                    {
+                                        old_memory.decay_importance(*decay_amount);
+                                        if let Err(e) = self.long_term_memory.update(&old_memory) {
+                                            tracing::debug!(
+                                                "Failed to persist retroactive decay: {e}"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "Skipping retroactive decay: malformed UUID '{old_id}'"
+                                    );
+                                }
+                            }
+
+                            // Apply proactive interference (reduce new memory importance)
+                            if interference_result.proactive_decay > 0.0 {
+                                memory.decay_importance(interference_result.proactive_decay);
+                                if let Err(e) = self.long_term_memory.update(&memory) {
+                                    tracing::debug!("Failed to persist proactive decay: {e}");
+                                }
+                            }
+
+                            // Record interference events
+                            for event in &interference_result.events {
+                                self.record_consolidation_event(event.clone());
+                            }
+
+                            // Handle duplicates: suppress the near-duplicate to near-zero importance
+                            // so it decays naturally. We can't delete it here because callers
+                            // expect the returned MemoryId to be retrievable.
+                            if interference_result.is_duplicate {
+                                tracing::info!(
+                                    memory_id = %memory.id.0,
+                                    "Near-duplicate detected (≥0.95 cosine), suppressing importance"
+                                );
+                                // Heavy decay: drop to ~1% importance so natural decay removes it
+                                memory.decay_importance(0.99);
+                                if let Err(e) = self.long_term_memory.update(&memory) {
+                                    tracing::debug!("Failed to suppress duplicate importance: {e}");
+                                }
+                            }
+
+                            // Persist affected interference records to RocksDB
+                            {
+                                let detector = self.interference_detector.read();
+                                let affected_ids = detector.get_affected_ids_from_check(
+                                    &memory.id.0.to_string(),
+                                    &interference_result,
+                                );
+                                for (id, records) in detector.get_records_for_ids(&affected_ids) {
+                                    if let Err(e) =
+                                        self.long_term_memory.save_interference_records(id, records)
+                                    {
+                                        tracing::debug!(
+                                            "Failed to persist interference records: {e}"
+                                        );
                                     }
                                 }
-                            } else {
-                                tracing::warn!(
-                                    "Skipping retroactive decay: malformed UUID '{old_id}'"
-                                );
-                            }
-                        }
-
-                        // Apply proactive interference (reduce new memory importance)
-                        if interference_result.proactive_decay > 0.0 {
-                            memory.decay_importance(interference_result.proactive_decay);
-                            if let Err(e) = self.long_term_memory.update(&memory) {
-                                tracing::debug!("Failed to persist proactive decay: {e}");
-                            }
-                        }
-
-                        // Record interference events
-                        for event in &interference_result.events {
-                            self.record_consolidation_event(event.clone());
-                        }
-
-                        // Handle duplicates: suppress the near-duplicate to near-zero importance
-                        // so it decays naturally. We can't delete it here because callers
-                        // expect the returned MemoryId to be retrievable.
-                        if interference_result.is_duplicate {
-                            tracing::info!(
-                                memory_id = %memory.id.0,
-                                "Near-duplicate detected (≥0.95 cosine), suppressing importance"
-                            );
-                            // Heavy decay: drop to ~1% importance so natural decay removes it
-                            memory.decay_importance(0.99);
-                            if let Err(e) = self.long_term_memory.update(&memory) {
-                                tracing::debug!("Failed to suppress duplicate importance: {e}");
-                            }
-                        }
-
-                        // Persist affected interference records to RocksDB
-                        {
-                            let detector = self.interference_detector.read();
-                            let affected_ids = detector.get_affected_ids_from_check(
-                                &memory.id.0.to_string(),
-                                &interference_result,
-                            );
-                            for (id, records) in detector.get_records_for_ids(&affected_ids) {
-                                if let Err(e) =
-                                    self.long_term_memory.save_interference_records(id, records)
+                                let (total_events, _) = detector.stats();
+                                if let Err(e) = self
+                                    .long_term_memory
+                                    .save_interference_event_count(total_events)
                                 {
-                                    tracing::debug!("Failed to persist interference records: {e}");
+                                    tracing::debug!(
+                                        "Failed to persist interference event count: {e}"
+                                    );
                                 }
-                            }
-                            let (total_events, _) = detector.stats();
-                            if let Err(e) = self
-                                .long_term_memory
-                                .save_interference_event_count(total_events)
-                            {
-                                tracing::debug!("Failed to persist interference event count: {e}");
                             }
                         }
                     }
                 }
             }
-        }
         } // end if !defer_embedding (interference)
 
         // If important enough, prepare for session storage
@@ -1450,8 +1467,7 @@ impl MemorySystem {
                 match self.embedder.encode(&searchable_text) {
                     Ok(embedding) => {
                         self.content_cache.insert(content_hash, embedding.clone());
-                        EMBEDDING_CACHE_CONTENT_SIZE
-                            .set(self.content_cache.entry_count() as i64);
+                        EMBEDDING_CACHE_CONTENT_SIZE.set(self.content_cache.entry_count() as i64);
                         memory.experience.embeddings = Some(embedding);
                     }
                     Err(e) => {
@@ -1471,10 +1487,7 @@ impl MemorySystem {
         // Vector index (uses pre-computed embedding for short content, re-embeds chunks)
         let memory_arc = Arc::new(memory);
         if let Err(e) = self.retriever.index_memory(&memory_arc) {
-            tracing::warn!(
-                "Background vector indexing failed for {}: {e}",
-                memory_id.0
-            );
+            tracing::warn!("Background vector indexing failed for {}: {e}", memory_id.0);
         } else {
             self.stats.write().vector_index_count += 1;
         }
@@ -1507,9 +1520,8 @@ impl MemorySystem {
                     // memory into the existing one rather than keeping both.
                     let total_memories = self.stats.read().total_memories;
                     if total_memories >= crate::constants::WRITE_GATE_COLD_START_BYPASS {
-                        if let Some((best_id, best_sim, _, _, _)) = similar_memories
-                            .iter()
-                            .max_by(|a, b| {
+                        if let Some((best_id, best_sim, _, _, _)) =
+                            similar_memories.iter().max_by(|a, b| {
                                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                             })
                         {
@@ -1874,10 +1886,8 @@ impl MemorySystem {
             // Phase 4: Extract causal edges from content
             // Detect causal language patterns (because, therefore, as a result, etc.)
             // and create directed Causes/ResultsIn edges between co-occurring entities.
-            let causal_pairs = extract_causal_pairs(
-                &memory.experience.content,
-                &memory.experience.entities,
-            );
+            let causal_pairs =
+                extract_causal_pairs(&memory.experience.content, &memory.experience.entities);
             if !causal_pairs.is_empty() {
                 let causal_context = format!("Causal relation in memory {}", memory.id.0);
                 for (cause_entity, effect_entity, relation) in &causal_pairs {
@@ -1962,7 +1972,6 @@ impl MemorySystem {
 
         Ok(memory_id)
     }
-
 
     // ==========================================================================
     // TEMPORAL FACT EXTRACTION (for multi-hop temporal queries)
@@ -2084,7 +2093,8 @@ impl MemorySystem {
         entity: &str,
         limit: usize,
     ) -> Result<Vec<temporal_facts::TemporalFact>> {
-        self.temporal_fact_store.find_by_entity(user_id, entity, limit)
+        self.temporal_fact_store
+            .find_by_entity(user_id, entity, limit)
     }
 
     /// Find temporal facts by entity name, optionally including expired facts.
@@ -2106,7 +2116,8 @@ impl MemorySystem {
         event: &str,
         limit: usize,
     ) -> Result<Vec<temporal_facts::TemporalFact>> {
-        self.temporal_fact_store.find_by_event(user_id, event, limit)
+        self.temporal_fact_store
+            .find_by_event(user_id, event, limit)
     }
 
     /// Find temporal facts by event keyword, optionally including expired facts.
@@ -2148,7 +2159,6 @@ impl MemorySystem {
             })
             .collect()
     }
-
 
     /// Compute SHA256 hash of text for stable cache keys
     ///
@@ -2545,17 +2555,21 @@ impl MemorySystem {
         score += (entity_count as f32 / 5.0).min(1.0);
 
         // 3. Emotional signals present (0 or 1)
-        let has_emotion = memory.experience.context.as_ref().is_some_and(|ctx| {
-            ctx.emotional.valence != 0.0 || ctx.emotional.arousal != 0.0
-        });
+        let has_emotion = memory
+            .experience
+            .context
+            .as_ref()
+            .is_some_and(|ctx| ctx.emotional.valence != 0.0 || ctx.emotional.arousal != 0.0);
         if has_emotion {
             score += 1.0;
         }
 
         // 4. Episode threading (0 or 1): linked to preceding memory
-        let has_threading = memory.experience.context.as_ref().is_some_and(|ctx| {
-            ctx.episode.preceding_memory_id.is_some()
-        });
+        let has_threading = memory
+            .experience
+            .context
+            .as_ref()
+            .is_some_and(|ctx| ctx.episode.preceding_memory_id.is_some());
         if has_threading {
             score += 1.0;
         }
@@ -3999,10 +4013,9 @@ impl MemorySystem {
 
         let mut orphaned_ids = Vec::new();
         for memory in &all_memories {
-            if !indexed_ids.contains(&memory.id)
-                && orphaned_ids.len() < 100 {
-                    orphaned_ids.push(memory.id.clone());
-                }
+            if !indexed_ids.contains(&memory.id) && orphaned_ids.len() < 100 {
+                orphaned_ids.push(memory.id.clone());
+            }
         }
 
         let orphaned_count = total_storage.saturating_sub(total_indexed);
@@ -4960,10 +4973,8 @@ impl MemorySystem {
 
                     // Quality gate: reject facts whose embeddings diverge from
                     // source cluster centroid. Prevents hallucinated consolidations.
-                    let quality_threshold =
-                        crate::constants::CONSOLIDATION_QUALITY_GATE_THRESHOLD;
-                    let max_sources =
-                        crate::constants::CONSOLIDATION_QUALITY_GATE_MAX_SOURCES;
+                    let quality_threshold = crate::constants::CONSOLIDATION_QUALITY_GATE_THRESHOLD;
+                    let max_sources = crate::constants::CONSOLIDATION_QUALITY_GATE_MAX_SOURCES;
 
                     let gated: Vec<(SemanticFact, Option<Vec<f32>>)> = consolidation_result
                         .new_facts
@@ -5017,8 +5028,7 @@ impl MemorySystem {
 
                     let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
 
-                    for (fact, embedding) in gated.into_iter()
-                    {
+                    for (fact, embedding) in gated.into_iter() {
                         // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
                         match self.fact_store.find_similar(
                             user_id,
@@ -5560,72 +5570,71 @@ impl MemorySystem {
         if !result.new_facts.is_empty() {
             // Quality gate: reject facts whose embeddings diverge from
             // source cluster centroid. Prevents hallucinated consolidations.
-            let quality_threshold =
-                crate::constants::CONSOLIDATION_QUALITY_GATE_THRESHOLD;
-            let max_sources =
-                crate::constants::CONSOLIDATION_QUALITY_GATE_MAX_SOURCES;
+            let quality_threshold = crate::constants::CONSOLIDATION_QUALITY_GATE_THRESHOLD;
+            let max_sources = crate::constants::CONSOLIDATION_QUALITY_GATE_MAX_SOURCES;
 
             // Encode all fact texts
             let fact_texts: Vec<&str> = result.new_facts.iter().map(|f| f.fact.as_str()).collect();
-            let fact_embeddings: Vec<Option<Vec<f32>>> = match self.embedder.encode_batch(&fact_texts) {
-                Ok(embs) => embs.into_iter().map(Some).collect(),
-                Err(e) => {
-                    tracing::warn!("Failed to encode facts for quality gate: {e}");
-                    vec![None; fact_texts.len()]
-                }
-            };
-
-            let gated_facts: Vec<(SemanticFact, Option<Vec<f32>>)> = std::mem::take(&mut result.new_facts)
-                .into_iter()
-                .zip(fact_embeddings)
-                .filter(|(fact, fact_emb)| {
-                    let Some(ref fv) = fact_emb else { return true };
-                    let source_texts: Vec<&str> = fact
-                        .source_memories
-                        .iter()
-                        .filter_map(|id| {
-                            memories.iter().find(|m| &m.id == id)
-                        })
-                        .take(max_sources)
-                        .map(|m| m.experience.content.as_str())
-                        .collect();
-                    if source_texts.is_empty() {
-                        return true;
+            let fact_embeddings: Vec<Option<Vec<f32>>> =
+                match self.embedder.encode_batch(&fact_texts) {
+                    Ok(embs) => embs.into_iter().map(Some).collect(),
+                    Err(e) => {
+                        tracing::warn!("Failed to encode facts for quality gate: {e}");
+                        vec![None; fact_texts.len()]
                     }
-                    match self.embedder.encode_batch(&source_texts) {
-                        Ok(src_embs) if !src_embs.is_empty() => {
-                            let dim = src_embs[0].len();
-                            let mut centroid = vec![0.0f32; dim];
-                            for emb in &src_embs {
-                                for (i, &v) in emb.iter().enumerate() {
-                                    if i < dim {
-                                        centroid[i] += v;
+                };
+
+            let gated_facts: Vec<(SemanticFact, Option<Vec<f32>>)> =
+                std::mem::take(&mut result.new_facts)
+                    .into_iter()
+                    .zip(fact_embeddings)
+                    .filter(|(fact, fact_emb)| {
+                        let Some(ref fv) = fact_emb else { return true };
+                        let source_texts: Vec<&str> = fact
+                            .source_memories
+                            .iter()
+                            .filter_map(|id| memories.iter().find(|m| &m.id == id))
+                            .take(max_sources)
+                            .map(|m| m.experience.content.as_str())
+                            .collect();
+                        if source_texts.is_empty() {
+                            return true;
+                        }
+                        match self.embedder.encode_batch(&source_texts) {
+                            Ok(src_embs) if !src_embs.is_empty() => {
+                                let dim = src_embs[0].len();
+                                let mut centroid = vec![0.0f32; dim];
+                                for emb in &src_embs {
+                                    for (i, &v) in emb.iter().enumerate() {
+                                        if i < dim {
+                                            centroid[i] += v;
+                                        }
                                     }
                                 }
+                                let n = src_embs.len() as f32;
+                                for v in &mut centroid {
+                                    *v /= n;
+                                }
+                                let sim = crate::similarity::cosine_similarity(fv, &centroid);
+                                if sim < quality_threshold {
+                                    tracing::debug!(
+                                        fact = %fact.fact,
+                                        similarity = %format!("{sim:.3}"),
+                                        threshold = quality_threshold,
+                                        "Quality gate: rejected fact diverging from source centroid"
+                                    );
+                                    return false;
+                                }
+                                true
                             }
-                            let n = src_embs.len() as f32;
-                            for v in &mut centroid {
-                                *v /= n;
-                            }
-                            let sim = crate::similarity::cosine_similarity(fv, &centroid);
-                            if sim < quality_threshold {
-                                tracing::debug!(
-                                    fact = %fact.fact,
-                                    similarity = %format!("{sim:.3}"),
-                                    threshold = quality_threshold,
-                                    "Quality gate: rejected fact diverging from source centroid"
-                                );
-                                return false;
-                            }
-                            true
+                            _ => true,
                         }
-                        _ => true,
-                    }
-                })
-                .collect();
+                    })
+                    .collect();
             let facts_gated = result.facts_extracted.saturating_sub(gated_facts.len());
 
-            let gated_fact_refs: Vec<SemanticFact> = gated_facts.iter().map(|(f, _)| f.clone()).collect();
+            let gated_fact_refs: Vec<SemanticFact> =
+                gated_facts.iter().map(|(f, _)| f.clone()).collect();
             let stored = self.fact_store.store_batch(user_id, &gated_fact_refs)?;
             tracing::info!(
                 user_id = %user_id,

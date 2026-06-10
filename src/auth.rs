@@ -286,7 +286,9 @@ fn key_user_bindings_path() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(feature = "multi-tenant")]
-fn validate_api_key_with_optional_binding(plaintext_key: &str) -> Result<Option<String>, AuthError> {
+fn validate_api_key_with_optional_binding(
+    plaintext_key: &str,
+) -> Result<Option<String>, AuthError> {
     if !multi_tenant_auth_enabled() {
         validate_api_key(plaintext_key)?;
         return Ok(None);
@@ -990,7 +992,9 @@ mod tests {
 
         let bindings_file = NamedTempFile::new().unwrap();
         let bindings = KeyUserBindings::open(bindings_file.path()).unwrap();
-        bindings.register("bound-key", "alice", Some("test")).unwrap();
+        bindings
+            .register("bound-key", "alice", Some("test"))
+            .unwrap();
         env::set_var(KEY_USER_BINDINGS_PATH_ENV, bindings_file.path());
 
         let app = Router::new()
@@ -1043,7 +1047,9 @@ mod tests {
 
         let bindings_file = NamedTempFile::new().unwrap();
         let bindings = KeyUserBindings::open(bindings_file.path()).unwrap();
-        bindings.register("bound-key", "alice", Some("test")).unwrap();
+        bindings
+            .register("bound-key", "alice", Some("test"))
+            .unwrap();
         env::set_var(KEY_USER_BINDINGS_PATH_ENV, bindings_file.path());
 
         let app = Router::new()

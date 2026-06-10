@@ -10,14 +10,14 @@
 //! Compare against industry standards (Neo4j, Memgraph, etc.)
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use std::collections::HashMap;
+use tempfile::TempDir;
 use veld::chrono::Utc;
 use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 use veld::graph_memory::{
     EdgeSource, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType, RelationshipEdge,
 };
 use veld::uuid::Uuid;
-use std::collections::HashMap;
-use tempfile::TempDir;
 
 /// Create fallback NER instance for testing
 fn setup_fallback_ner() -> NeuralNer {

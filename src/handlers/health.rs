@@ -72,7 +72,11 @@ pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<se
     let users_in_cache = state.users_in_cache();
     let ready = state.is_ready();
 
-    let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     let status_str = if ready { "ready" } else { "not_ready" };
 
     (

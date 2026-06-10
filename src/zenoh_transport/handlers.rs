@@ -27,9 +27,7 @@ use crate::handlers::types::{
 };
 use crate::memory::feedback::{self, PendingFeedback, SurfacedMemoryInfo, ToolAction};
 use crate::memory::types::{ForgetCriteria, GeoFilter, MemoryId};
-use crate::memory::{
-    Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus,
-};
+use crate::memory::{Experience, Query as MemoryQuery, RetrievalMode, SessionEvent, TodoStatus};
 use crate::metrics;
 use crate::streaming::{ExtractionConfig, StreamHandshake, StreamMessage, StreamMode};
 use crate::validation;

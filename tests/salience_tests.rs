@@ -8,12 +8,12 @@
 //! - NER-based entity extraction and salience assignment
 
 use chrono::Utc;
-use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
-use veld::graph_memory::{EntityLabel, EntityNode, GraphMemory};
-use veld::uuid::Uuid;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
+use veld::graph_memory::{EntityLabel, EntityNode, GraphMemory};
+use veld::uuid::Uuid;
 
 /// Create a fallback NER instance for testing
 fn create_test_ner() -> NeuralNer {

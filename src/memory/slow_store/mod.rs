@@ -21,12 +21,12 @@ pub use storage::{StoredGap, StoredThought};
 
 use super::gap_topology::GapStore;
 
+use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use std::path::{Path, PathBuf};
-use crate::graph_memory::{EdgeTier, EntityNode, LtpStatus, RelationshipEdge};
 
 /// Statistics from a graph → SQLite sync operation
 #[derive(Debug, Default)]
@@ -188,11 +188,9 @@ impl SlowStore {
         let conn = self.conn.lock();
 
         let current_version: Option<i32> = conn
-            .query_row(
-                "SELECT MAX(version) FROM schema_version",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .context("Failed to query schema version")?;
 
         match current_version {
@@ -203,7 +201,10 @@ impl SlowStore {
                     "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                     params![CURRENT_SCHEMA_VERSION, now],
                 )?;
-                tracing::info!("SlowStore: initialized schema version {}", CURRENT_SCHEMA_VERSION);
+                tracing::info!(
+                    "SlowStore: initialized schema version {}",
+                    CURRENT_SCHEMA_VERSION
+                );
             }
             Some(v) if v < CURRENT_SCHEMA_VERSION => {
                 // Run migrations from v+1 to CURRENT_SCHEMA_VERSION
@@ -308,7 +309,11 @@ impl SlowStore {
         Ok(stats)
     }
 
-    fn sync_entities(tx: &Transaction, entities: &[EntityNode], stats: &mut SyncStats) -> Result<()> {
+    fn sync_entities(
+        tx: &Transaction,
+        entities: &[EntityNode],
+        stats: &mut SyncStats,
+    ) -> Result<()> {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO entities (uuid, name, labels, salience, mention_count,
                                    created_at, last_seen_at, summary, embedding)
@@ -324,8 +329,8 @@ impl SlowStore {
         )?;
 
         for entity in entities {
-            let labels_json = serde_json::to_string(&entity.labels)
-                .unwrap_or_else(|_| "[]".to_string());
+            let labels_json =
+                serde_json::to_string(&entity.labels).unwrap_or_else(|_| "[]".to_string());
             let embedding_blob: Option<Vec<u8>> = entity
                 .name_embedding
                 .as_ref()
@@ -347,7 +352,11 @@ impl SlowStore {
         Ok(())
     }
 
-    fn sync_edges(tx: &Transaction, edges: &[RelationshipEdge], stats: &mut SyncStats) -> Result<()> {
+    fn sync_edges(
+        tx: &Transaction,
+        edges: &[RelationshipEdge],
+        stats: &mut SyncStats,
+    ) -> Result<()> {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO edges (uuid, from_entity, to_entity, relation_type, strength,
                                 tier, ltp_status, activation_count, created_at,
@@ -399,25 +408,46 @@ impl SlowStore {
     }
 }
 
-
 /// SlowStore implements GapStore for SQL-backed gap detection.
 impl GapStore for SlowStore {
-    fn find_open_triads(&self, min_strength: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawOpenTriad>> {
+    fn find_open_triads(
+        &self,
+        min_strength: f32,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::slow_store::RawOpenTriad>> {
         SlowStore::find_open_triads(self, min_strength, limit)
     }
-    fn find_diamond_gaps(&self, min_strength: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawDiamondGap>> {
+    fn find_diamond_gaps(
+        &self,
+        min_strength: f32,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::slow_store::RawDiamondGap>> {
         SlowStore::find_diamond_gaps(self, min_strength, limit)
     }
-    fn find_star_gaps(&self, min_spokes: usize, max_connectivity: f32, limit: usize) -> anyhow::Result<Vec<super::slow_store::RawStarGap>> {
+    fn find_star_gaps(
+        &self,
+        min_spokes: usize,
+        max_connectivity: f32,
+        limit: usize,
+    ) -> anyhow::Result<Vec<super::slow_store::RawStarGap>> {
         SlowStore::find_star_gaps(self, min_spokes, max_connectivity, limit)
     }
-    fn get_adjacency_list(&self, min_strength: f32) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+    fn get_adjacency_list(
+        &self,
+        min_strength: f32,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
         SlowStore::get_adjacency_list(self, min_strength)
     }
-    fn get_entity_names(&self, uuids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    fn get_entity_names(
+        &self,
+        uuids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         SlowStore::get_entity_names(self, uuids)
     }
-    fn load_embeddings(&self, uuids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, Vec<f32>>> {
+    fn load_embeddings(
+        &self,
+        uuids: &[&str],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<f32>>> {
         SlowStore::load_embeddings(self, uuids)
     }
 }
@@ -439,8 +469,19 @@ mod tests {
     fn test_store_and_get_thought() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_thought("t-001", "missing_connection", "content", 0.85,
-            "A and C should connect", Some("B mediates"), "[]", 0.7, "[]").unwrap();
+        store
+            .store_thought(
+                "t-001",
+                "missing_connection",
+                "content",
+                0.85,
+                "A and C should connect",
+                Some("B mediates"),
+                "[]",
+                0.7,
+                "[]",
+            )
+            .unwrap();
         let thoughts = store.get_active_thoughts(10).unwrap();
         assert_eq!(thoughts.len(), 1);
         assert_eq!(thoughts[0].id, "t-001");
@@ -451,7 +492,11 @@ mod tests {
     fn test_dismiss_thought() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_thought("t-002", "silo", "content", 0.5, "desc", None, "[]", 0.3, "[]").unwrap();
+        store
+            .store_thought(
+                "t-002", "silo", "content", 0.5, "desc", None, "[]", 0.3, "[]",
+            )
+            .unwrap();
         assert_eq!(store.get_active_thoughts(10).unwrap().len(), 1);
         store.dismiss_thought("t-002").unwrap();
         assert_eq!(store.get_active_thoughts(10).unwrap().len(), 0);
@@ -461,17 +506,39 @@ mod tests {
     fn test_store_and_resolve_gap() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_gap("g-001", "open_triad", "A-B-C", "[]", "[]", 0.9, Some(0.45), 0.8, "content").unwrap();
-        assert_eq!(store.get_unresolved_gaps("open_triad", 10).unwrap().len(), 1);
+        store
+            .store_gap(
+                "g-001",
+                "open_triad",
+                "A-B-C",
+                "[]",
+                "[]",
+                0.9,
+                Some(0.45),
+                0.8,
+                "content",
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_unresolved_gaps("open_triad", 10).unwrap().len(),
+            1
+        );
         store.resolve_gap("g-001").unwrap();
-        assert!(store.get_unresolved_gaps("open_triad", 10).unwrap().is_empty());
+        assert!(store
+            .get_unresolved_gaps("open_triad", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn test_mark_thought_surfaced() {
         let tmp = NamedTempFile::new().unwrap();
         let store = SlowStore::open(tmp.path()).unwrap();
-        store.store_thought("t-003", "golden", "content", 0.6, "desc", None, "[]", 0.5, "[]").unwrap();
+        store
+            .store_thought(
+                "t-003", "golden", "content", 0.6, "desc", None, "[]", 0.5, "[]",
+            )
+            .unwrap();
         store.mark_thought_surfaced("t-003").unwrap();
         store.mark_thought_surfaced("t-003").unwrap();
         assert_eq!(store.get_active_thoughts(10).unwrap()[0].surfaced_count, 2);

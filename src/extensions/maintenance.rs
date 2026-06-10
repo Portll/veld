@@ -70,7 +70,12 @@ pub fn load_learned_weights(path: &Path) -> Option<(f32, f32, f32, u64)> {
     let weights_path = path.join("learned_weights.json");
     let data = std::fs::read_to_string(&weights_path).ok()?;
     let snapshot: LearnedWeightsSnapshot = serde_json::from_str(&data).ok()?;
-    Some((snapshot.bm25, snapshot.vector, snapshot.graph, snapshot.update_count))
+    Some((
+        snapshot.bm25,
+        snapshot.vector,
+        snapshot.graph,
+        snapshot.update_count,
+    ))
 }
 
 pub fn run_maintenance_cycle(

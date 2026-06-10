@@ -930,9 +930,7 @@ fn extract_entity_after_verb(query: &str) -> Option<String> {
 
 /// Normalize an attribute name (e.g., "relationship status" → "relationship_status")
 fn normalize_attribute(attr: &str) -> String {
-    attr.trim()
-        .to_lowercase()
-        .replace([' ', '-'], "_")
+    attr.trim().to_lowercase().replace([' ', '-'], "_")
 }
 
 /// Get synonyms for common attributes
@@ -1890,8 +1888,7 @@ pub struct Relation {
 /// - Needle: Looking for specific facts → favor BM25/Vector (high precision)
 /// - Exploratory: Seeking related concepts → favor Graph (high recall)
 /// - Hybrid: Balanced query → use all retrieval methods equally
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueryIntent {
     /// Needle query: Seeking specific information
     /// Examples: "What is John's email?", "When did we deploy v2.0?"
@@ -1909,7 +1906,6 @@ pub enum QueryIntent {
     #[default]
     Hybrid,
 }
-
 
 /// Complete linguistic analysis of a query
 #[derive(Debug, Clone)]
@@ -4008,31 +4004,76 @@ pub fn expand_abstract_terms_for_bm25(query: &str) -> Option<String> {
     // overwhelming the original query terms.
     const EXPANSION_BOOST: &str = "^0.3";
     static EXPANSIONS: &[(&str, &[&str])] = &[
-        ("pattern", &["decisions", "choices", "recurring", "repeated", "trend"]),
-        ("prioriti", &["goals", "focus", "important", "urgent", "next"]),
-        ("risk", &["concerns", "issues", "problems", "challenges", "threats"]),
+        (
+            "pattern",
+            &["decisions", "choices", "recurring", "repeated", "trend"],
+        ),
+        (
+            "prioriti",
+            &["goals", "focus", "important", "urgent", "next"],
+        ),
+        (
+            "risk",
+            &["concerns", "issues", "problems", "challenges", "threats"],
+        ),
         ("strategi", &["plan", "approach", "direction", "roadmap"]),
         ("lesson", &["learned", "mistakes", "insights", "takeaways"]),
-        ("progress", &["status", "milestone", "completed", "remaining"]),
+        (
+            "progress",
+            &["status", "milestone", "completed", "remaining"],
+        ),
         ("impact", &["effect", "consequence", "result", "outcome"]),
         ("blocker", &["obstacle", "impediment", "stuck", "waiting"]),
         ("tradeoff", &["compromise", "versus", "cost", "benefit"]),
-        ("retrospect", &["review", "reflection", "improvement", "feedback"]),
+        (
+            "retrospect",
+            &["review", "reflection", "improvement", "feedback"],
+        ),
         ("evolv", &["changed", "grew", "adapted", "shifted"]),
         ("evolut", &["changed", "grew", "adapted", "shifted"]),
         ("theme", &["recurring", "common", "trend", "motif"]),
         // Open-domain / aggregative vocabulary (v0.7.1)
-        ("perform", &["speed", "latency", "throughput", "faster", "optimized"]),
-        ("improv", &["better", "faster", "fixed", "enhanced", "upgraded"]),
-        ("achiev", &["completed", "accomplished", "reached", "delivered"]),
-        ("key", &["important", "critical", "main", "primary", "essential"]),
-        ("peopl", &["team", "member", "responsible", "leading", "working"]),
-        ("person", &["team", "member", "responsible", "leading", "working"]),
-        ("infrastructur", &["deploy", "server", "cloud", "hosting", "kubernetes"]),
-        ("decis", &["chose", "decided", "selected", "picked", "adopted"]),
-        ("deploy", &["infrastructure", "kubernetes", "server", "hosting", "cloud"]),
+        (
+            "perform",
+            &["speed", "latency", "throughput", "faster", "optimized"],
+        ),
+        (
+            "improv",
+            &["better", "faster", "fixed", "enhanced", "upgraded"],
+        ),
+        (
+            "achiev",
+            &["completed", "accomplished", "reached", "delivered"],
+        ),
+        (
+            "key",
+            &["important", "critical", "main", "primary", "essential"],
+        ),
+        (
+            "peopl",
+            &["team", "member", "responsible", "leading", "working"],
+        ),
+        (
+            "person",
+            &["team", "member", "responsible", "leading", "working"],
+        ),
+        (
+            "infrastructur",
+            &["deploy", "server", "cloud", "hosting", "kubernetes"],
+        ),
+        (
+            "decis",
+            &["chose", "decided", "selected", "picked", "adopted"],
+        ),
+        (
+            "deploy",
+            &["infrastructure", "kubernetes", "server", "hosting", "cloud"],
+        ),
         ("moral", &["team", "mood", "happy", "celebrate", "social"]),
-        ("dynamic", &["interaction", "relationship", "team", "collaboration"]),
+        (
+            "dynamic",
+            &["interaction", "relationship", "team", "collaboration"],
+        ),
     ];
 
     let stemmer = Stemmer::create(Algorithm::English);
@@ -4103,18 +4144,20 @@ fn has_relationship_signal(query: &str) -> bool {
     let query_lower = query.to_lowercase();
 
     let relationship_patterns = [
-        "from ", " to ",   // "switch from X to Y"
-        "between ",        // "between X and Y"
-        "switch",          // "switch from X to Y"
-        "change",          // "changed from X to Y"
-        "compare",         // "compare X and Y"
-        "replace",         // "replaced X with Y"
-        "migrat",          // "migrate/migration from X to Y"
-        "convert",         // "converted from X to Y"
-        "transition",      // "transition from X to Y"
-        "moved from",      // "moved from X to Y"
-        "versus", " vs ",  // "X versus Y"
-        "differ",          // "difference between X and Y"
+        "from ",
+        " to ",       // "switch from X to Y"
+        "between ",   // "between X and Y"
+        "switch",     // "switch from X to Y"
+        "change",     // "changed from X to Y"
+        "compare",    // "compare X and Y"
+        "replace",    // "replaced X with Y"
+        "migrat",     // "migrate/migration from X to Y"
+        "convert",    // "converted from X to Y"
+        "transition", // "transition from X to Y"
+        "moved from", // "moved from X to Y"
+        "versus",
+        " vs ",   // "X versus Y"
+        "differ", // "difference between X and Y"
     ];
 
     // Require at least one relationship pattern
@@ -4414,7 +4457,11 @@ mod tests {
         let query = "Why did we change the database AND what was the impact on the timeline?";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert!(subs.len() >= 3, "Should produce original + 2 parts, got {:?}", subs);
+        assert!(
+            subs.len() >= 3,
+            "Should produce original + 2 parts, got {:?}",
+            subs
+        );
         assert_eq!(subs[0], query); // original always first
     }
 
@@ -4423,7 +4470,11 @@ mod tests {
         let query = "What framework did we pick and also what ORM are we using?";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert!(subs.len() >= 3, "Should split on 'and also', got {:?}", subs);
+        assert!(
+            subs.len() >= 3,
+            "Should split on 'and also', got {:?}",
+            subs
+        );
     }
 
     #[test]
@@ -4432,7 +4483,11 @@ mod tests {
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
         // Should produce original + entity sub-queries
-        assert!(subs.len() >= 2, "Should decompose multi-entity query, got {:?}", subs);
+        assert!(
+            subs.len() >= 2,
+            "Should decompose multi-entity query, got {:?}",
+            subs
+        );
         assert_eq!(subs[0], query);
     }
 
@@ -4441,7 +4496,12 @@ mod tests {
         let query = "What programming language did we choose?";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert_eq!(subs.len(), 1, "Simple query should not decompose: {:?}", subs);
+        assert_eq!(
+            subs.len(),
+            1,
+            "Simple query should not decompose: {:?}",
+            subs
+        );
         assert_eq!(subs[0], query);
     }
 
@@ -4471,6 +4531,10 @@ mod tests {
         let query = "Compare the performance of React versus Vue";
         let analysis = analyze_query(query);
         let subs = decompose_query(query, &analysis);
-        assert!(subs.len() >= 2, "Should decompose comparison query, got {:?}", subs);
+        assert!(
+            subs.len() >= 2,
+            "Should decompose comparison query, got {:?}",
+            subs
+        );
     }
 }

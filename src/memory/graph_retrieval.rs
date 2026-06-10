@@ -38,13 +38,12 @@ use crate::constants::{
     DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
     EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
     IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
-    QUERY_TYPE_ATTRIBUTE_GRAPH, QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC,
-    QUERY_TYPE_EXPLORATORY_GRAPH, QUERY_TYPE_EXPLORATORY_LINGUISTIC,
-    QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH, QUERY_TYPE_TEMPORAL_LINGUISTIC,
-    QUERY_TYPE_TEMPORAL_SEMANTIC,
     MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION,
     MEMORY_TIER_GRAPH_MULT_WORKING, ONTOLOGICAL_DENSITY_THRESHOLD, ONTOLOGICAL_ENTITY_PENALTY,
-    ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, SALIENCE_BOOST_FACTOR,
+    ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, QUERY_TYPE_ATTRIBUTE_GRAPH,
+    QUERY_TYPE_ATTRIBUTE_LINGUISTIC, QUERY_TYPE_ATTRIBUTE_SEMANTIC, QUERY_TYPE_EXPLORATORY_GRAPH,
+    QUERY_TYPE_EXPLORATORY_LINGUISTIC, QUERY_TYPE_EXPLORATORY_SEMANTIC, QUERY_TYPE_TEMPORAL_GRAPH,
+    QUERY_TYPE_TEMPORAL_LINGUISTIC, QUERY_TYPE_TEMPORAL_SEMANTIC, SALIENCE_BOOST_FACTOR,
     SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
     SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
     SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
@@ -329,9 +328,8 @@ fn spread_single_direction(
                     // Uses hierarchical matching: Team matches Organization, Service matches Technology
                     // Cached: each entity is read from RocksDB at most once across all hops.
                     if !intent.expected_labels.is_empty() {
-                        let cached_labels = entity_label_cache
-                            .entry(target_uuid)
-                            .or_insert_with(|| {
+                        let cached_labels =
+                            entity_label_cache.entry(target_uuid).or_insert_with(|| {
                                 graph
                                     .get_entity(&target_uuid)
                                     .ok()
@@ -703,19 +701,23 @@ pub fn spreading_activation_retrieve_with_stats(
                 entity_node.salience,
             ));
             // FIX-09: Track entity resolution success
-            stats.entity_resolution.push(crate::memory::types::EntityResolution {
-                name: entity.text.clone(),
-                status: "found".to_string(),
-                resolved_to: Some(entity_node.uuid.to_string()),
-            });
+            stats
+                .entity_resolution
+                .push(crate::memory::types::EntityResolution {
+                    name: entity.text.clone(),
+                    status: "found".to_string(),
+                    resolved_to: Some(entity_node.uuid.to_string()),
+                });
         } else {
             tracing::debug!("  ✗ Entity '{}' not found in graph", entity.text);
             // FIX-09: Track entity resolution failure
-            stats.entity_resolution.push(crate::memory::types::EntityResolution {
-                name: entity.text.clone(),
-                status: "not_found".to_string(),
-                resolved_to: None,
-            });
+            stats
+                .entity_resolution
+                .push(crate::memory::types::EntityResolution {
+                    name: entity.text.clone(),
+                    status: "not_found".to_string(),
+                    resolved_to: None,
+                });
         }
     }
 
@@ -873,9 +875,8 @@ pub fn spreading_activation_retrieve_with_stats(
                             penalty *= ONTOLOGICAL_RELATION_PENALTY;
                         }
                         if !intent.expected_labels.is_empty() {
-                            let cached_labels = entity_label_cache
-                                .entry(target_uuid)
-                                .or_insert_with(|| {
+                            let cached_labels =
+                                entity_label_cache.entry(target_uuid).or_insert_with(|| {
                                     graph
                                         .get_entity(&target_uuid)
                                         .ok()
@@ -1107,8 +1108,7 @@ pub fn spreading_activation_retrieve_with_stats(
 
         crate::metrics::RETRIEVAL_VARIANCE_SEMANTIC.observe(stats.semantic_variance_pct as f64);
         crate::metrics::RETRIEVAL_VARIANCE_GRAPH.observe(stats.graph_variance_pct as f64);
-        crate::metrics::RETRIEVAL_VARIANCE_LINGUISTIC
-            .observe(stats.linguistic_variance_pct as f64);
+        crate::metrics::RETRIEVAL_VARIANCE_LINGUISTIC.observe(stats.linguistic_variance_pct as f64);
     }
 
     // Step 6: Sort by final score (descending)

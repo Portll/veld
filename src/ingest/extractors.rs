@@ -289,10 +289,7 @@ fn strip_markdown_inline(line: &str, pat: &MarkdownPatterns) -> String {
         .to_string();
 
     // Strikethrough → text
-    s = pat
-        .strikethrough
-        .replace_all(&s, "$1")
-        .to_string();
+    s = pat.strikethrough.replace_all(&s, "$1").to_string();
 
     // Inline code → preserve content
     s = pat.inline_code.replace_all(&s, "$1").to_string();
@@ -305,7 +302,11 @@ fn strip_markdown_inline(line: &str, pat: &MarkdownPatterns) -> String {
 
     // Strip blockquote markers
     if s.trim_start().starts_with('>') {
-        s = s.trim_start().trim_start_matches('>').trim_start().to_string();
+        s = s
+            .trim_start()
+            .trim_start_matches('>')
+            .trim_start()
+            .to_string();
     }
 
     // Strip list markers (unordered: - * +, ordered: 1. 2.)
@@ -479,11 +480,7 @@ fn extract_csv(content: &str) -> Result<ExtractedContent> {
         }
     };
 
-    let delimiter = if first_line.contains('\t') {
-        '\t'
-    } else {
-        ','
-    };
+    let delimiter = if first_line.contains('\t') { '\t' } else { ',' };
 
     let headers: Vec<String> = parse_csv_row(first_line, delimiter);
     let mut output_lines: Vec<String> = Vec::new();
@@ -949,10 +946,7 @@ mod tests {
         assert!(result.text.contains("Name: Alice"));
         assert!(result.text.contains("Age: 30"));
         assert!(result.text.contains("City: LA"));
-        assert!(result
-            .metadata
-            .entities_hint
-            .contains(&"Name".to_string()));
+        assert!(result.metadata.entities_hint.contains(&"Name".to_string()));
     }
 
     #[test]

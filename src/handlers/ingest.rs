@@ -11,10 +11,7 @@ use super::remember::parse_experience_type;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::ingest;
-use crate::memory::{
-    types::NerEntityRecord,
-    Experience, SessionEvent,
-};
+use crate::memory::{types::NerEntityRecord, Experience, SessionEvent};
 use crate::metrics;
 use crate::validation;
 use std::collections::HashSet;

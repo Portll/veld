@@ -18,9 +18,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use chrono::{Duration, Utc};
+use tempfile::TempDir;
 use veld::memory::types::{Experience, ExperienceType, Query};
 use veld::memory::{MemoryConfig, MemoryId, MemorySystem};
-use tempfile::TempDir;
 
 // =============================================================================
 // DATA STRUCTURES
@@ -805,14 +805,14 @@ fn locomo_queries() -> Vec<LocomoQuery> {
         LocomoQuery {
             query: "What programming language did we choose for the backend?",
             query_type: "single_hop",
-            expected_memory_indices: vec![2],     // Rust decision
-            absence_indices: vec![7, 10, 44],     // frontend, competitors, encryption
+            expected_memory_indices: vec![2], // Rust decision
+            absence_indices: vec![7, 10, 44], // frontend, competitors, encryption
         },
         LocomoQuery {
             query: "Who is the project lead?",
             query_type: "single_hop",
-            expected_memory_indices: vec![1],     // Raj Patel is project lead
-            absence_indices: vec![10, 29, 44],    // competitors, search, encryption
+            expected_memory_indices: vec![1], // Raj Patel is project lead
+            absence_indices: vec![10, 29, 44], // competitors, search, encryption
         },
         LocomoQuery {
             query: "What database are we using?",
@@ -823,16 +823,15 @@ fn locomo_queries() -> Vec<LocomoQuery> {
         LocomoQuery {
             query: "What was the first bug we encountered?",
             query_type: "single_hop",
-            expected_memory_indices: vec![30],    // CRDT merge panic
-            absence_indices: vec![0, 5, 14],      // kickoff, timeline, sprints
+            expected_memory_indices: vec![30], // CRDT merge panic
+            absence_indices: vec![0, 5, 14],   // kickoff, timeline, sprints
         },
         LocomoQuery {
             query: "What testing framework did we pick?",
             query_type: "single_hop",
-            expected_memory_indices: vec![4],     // proptest + playwright
-            absence_indices: vec![0, 10, 29],     // kickoff, competitors, search
+            expected_memory_indices: vec![4], // proptest + playwright
+            absence_indices: vec![0, 10, 29], // kickoff, competitors, search
         },
-
         // =====================================================================
         // TEMPORAL: Time-referenced queries
         // =====================================================================
@@ -841,27 +840,27 @@ fn locomo_queries() -> Vec<LocomoQuery> {
             query_type: "temporal",
             // Session 4 decisions (most recent — closest to "last week")
             expected_memory_indices: vec![46, 49, 52],
-            absence_indices: vec![0, 2, 3],       // session 1 items
+            absence_indices: vec![0, 2, 3], // session 1 items
         },
         LocomoQuery {
             query: "What happened during the second meeting?",
             query_type: "temporal",
             // Session 2 = architecture deep-dive
             expected_memory_indices: vec![15, 17, 18],
-            absence_indices: vec![30, 45, 48],    // session 3/4 items
+            absence_indices: vec![30, 45, 48], // session 3/4 items
         },
         LocomoQuery {
             query: "When did we switch from PostgreSQL to MongoDB?",
             query_type: "temporal",
-            expected_memory_indices: vec![18],    // the switch decision
-            absence_indices: vec![0, 5, 30],      // kickoff, timeline, first bug
+            expected_memory_indices: vec![18], // the switch decision
+            absence_indices: vec![0, 5, 30],   // kickoff, timeline, first bug
         },
         LocomoQuery {
             query: "What was the most recent architecture change?",
             query_type: "temporal",
             // Session 4: analytics back to PostgreSQL, microservice revert
             expected_memory_indices: vec![46, 48],
-            absence_indices: vec![6, 12, 3],      // session 1 architecture
+            absence_indices: vec![6, 12, 3], // session 1 architecture
         },
         LocomoQuery {
             query: "What bugs did we find during the debugging phase?",
@@ -872,9 +871,8 @@ fn locomo_queries() -> Vec<LocomoQuery> {
             // 33 (permission perf), 34 (formatting), 36 (Unicode), 37 (merge conflicts),
             // 38 (optimization), 39 (CI flaky), 41 (rate limiting).
             expected_memory_indices: vec![30, 31, 32, 33, 34, 36, 37, 41],
-            absence_indices: vec![0, 5, 14],      // non-bug items
+            absence_indices: vec![0, 5, 14], // non-bug items
         },
-
         // =====================================================================
         // MULTI-HOP: Combining information from multiple memories
         // =====================================================================
@@ -889,30 +887,29 @@ fn locomo_queries() -> Vec<LocomoQuery> {
             query_type: "multi_hop",
             // Raj proposed microservice split (47), which caused bugs (48)
             expected_memory_indices: vec![47, 48],
-            absence_indices: vec![0, 5, 10],       // kickoff, timeline, competitors
+            absence_indices: vec![0, 5, 10], // kickoff, timeline, competitors
         },
         LocomoQuery {
             query: "What decisions were reversed and why?",
             query_type: "multi_hop",
             // MongoDB partial reversal (46), microservice revert (48)
             expected_memory_indices: vec![46, 48],
-            absence_indices: vec![0, 5, 14],       // kickoff basics
+            absence_indices: vec![0, 5, 14], // kickoff basics
         },
         LocomoQuery {
             query: "How did the testing strategy change based on the bugs we found?",
             query_type: "multi_hop",
             // Original testing (4), Sarah's testing value (35), evolution (43)
             expected_memory_indices: vec![35, 43],
-            absence_indices: vec![0, 10, 29],      // non-testing items
+            absence_indices: vec![0, 10, 29], // non-testing items
         },
         LocomoQuery {
             query: "What trade-offs did we discuss about the backend language choice?",
             query_type: "multi_hop",
             // Original Rust decision (2) + revisited trade-offs (21)
             expected_memory_indices: vec![2, 21],
-            absence_indices: vec![7, 10, 44],      // frontend, competitors, encryption
+            absence_indices: vec![7, 10, 44], // frontend, competitors, encryption
         },
-
         // =====================================================================
         // OPEN-DOMAIN: Broad, context-dependent queries
         // =====================================================================
@@ -921,13 +918,13 @@ fn locomo_queries() -> Vec<LocomoQuery> {
             query_type: "open_domain",
             // Should surface high-level status items
             expected_memory_indices: vec![0, 45, 49],
-            absence_indices: vec![39, 42],         // CI flaky tests, rate limiting detail
+            absence_indices: vec![39, 42], // CI flaky tests, rate limiting detail
         },
         LocomoQuery {
             query: "What are the biggest risks?",
             query_type: "open_domain",
-            expected_memory_indices: vec![11],     // risk assessment
-            absence_indices: vec![14, 29],         // sprints, search
+            expected_memory_indices: vec![11], // risk assessment
+            absence_indices: vec![14, 29],     // sprints, search
         },
         LocomoQuery {
             query: "What should we focus on next?",
@@ -946,7 +943,7 @@ fn locomo_queries() -> Vec<LocomoQuery> {
             query_type: "open_domain",
             // Decision reversal pattern, process improvement, lessons learned
             expected_memory_indices: vec![52, 59],
-            absence_indices: vec![3, 9],           // database detail, infra plan
+            absence_indices: vec![3, 9], // database detail, infra plan
         },
     ]
 }
@@ -987,10 +984,7 @@ fn precision_at_k(retrieved: &[usize], relevant: &[usize], k: usize) -> f32 {
 
 /// Count how many absence_indices appear in retrieved results.
 fn count_absence_violations(retrieved: &[usize], absence: &[usize]) -> usize {
-    retrieved
-        .iter()
-        .filter(|r| absence.contains(r))
-        .count()
+    retrieved.iter().filter(|r| absence.contains(r)).count()
 }
 
 /// Map MemoryIds returned by recall back to corpus indices.
@@ -1076,7 +1070,14 @@ fn print_report(
         };
         println!(
             "  [{:<10}] [{}] MRR={:.2}  R@5={:.2}  R@10={:.2}  P@5={:.2}  {}ms{}",
-            r.query_type, hit, r.mrr, r.recall_at_5, r.recall_at_10, r.precision_at_5, r.latency_ms, absence_note
+            r.query_type,
+            hit,
+            r.mrr,
+            r.recall_at_5,
+            r.recall_at_10,
+            r.precision_at_5,
+            r.latency_ms,
+            absence_note
         );
         let display_query = if r.query_text.len() > 72 {
             format!("{}...", &r.query_text[..69])
@@ -1132,8 +1133,11 @@ fn print_report(
     } else {
         1.0
     };
-    let composite =
-        0.30 * overall_mrr + 0.20 * overall_recall + 0.15 * overall_recall_10 + 0.20 * overall_precision + 0.15 * absence_compliance;
+    let composite = 0.30 * overall_mrr
+        + 0.20 * overall_recall
+        + 0.15 * overall_recall_10
+        + 0.20 * overall_precision
+        + 0.15 * absence_compliance;
     println!(
         "Composite Score: {:.1}%  (MRR={:.1}% R@5={:.1}% R@10={:.1}% P@5={:.1}% AbsCompl={:.1}%)",
         composite * 100.0,
@@ -1260,8 +1264,16 @@ fn locomo_benchmark() {
     let n = per_query_results.len() as f32;
     let overall_mrr = per_query_results.iter().map(|r| r.mrr).sum::<f32>() / n;
     let overall_recall = per_query_results.iter().map(|r| r.recall_at_5).sum::<f32>() / n;
-    let overall_recall_10 = per_query_results.iter().map(|r| r.recall_at_10).sum::<f32>() / n;
-    let overall_precision = per_query_results.iter().map(|r| r.precision_at_5).sum::<f32>() / n;
+    let overall_recall_10 = per_query_results
+        .iter()
+        .map(|r| r.recall_at_10)
+        .sum::<f32>()
+        / n;
+    let overall_precision = per_query_results
+        .iter()
+        .map(|r| r.precision_at_5)
+        .sum::<f32>()
+        / n;
     let total_absence_violations: usize =
         per_query_results.iter().map(|r| r.absence_violations).sum();
     let total_absence_checks: usize = queries.iter().map(|q| q.absence_indices.len()).sum();
@@ -1282,8 +1294,11 @@ fn locomo_benchmark() {
     );
 
     // --- JSON artifact for validation and sharing ---
-    let composite =
-        0.30 * overall_mrr + 0.20 * overall_recall + 0.15 * overall_recall_10 + 0.20 * overall_precision + 0.15 * (1.0 - total_absence_violations as f32 / total_absence_checks.max(1) as f32);
+    let composite = 0.30 * overall_mrr
+        + 0.20 * overall_recall
+        + 0.15 * overall_recall_10
+        + 0.20 * overall_precision
+        + 0.15 * (1.0 - total_absence_violations as f32 / total_absence_checks.max(1) as f32);
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -1311,8 +1326,12 @@ fn locomo_benchmark() {
     // Content hash for reproducibility verification
     let hash_input = format!(
         "{}|{}|{}|{}|{}|{}",
-        overall_mrr, overall_recall, overall_recall_10, overall_precision,
-        total_absence_violations, per_query_results.len()
+        overall_mrr,
+        overall_recall,
+        overall_recall_10,
+        overall_precision,
+        total_absence_violations,
+        per_query_results.len()
     );
     let content_hash = format!("{:x}", md5_simple(hash_input.as_bytes()));
 
@@ -1342,15 +1361,26 @@ fn locomo_benchmark() {
 {}
   ]
 }}"#,
-        version, git_hash, chrono::Utc::now().format("%Y-%m-%d"),
-        stored_ids.len(), per_query_results.len(), content_hash,
-        overall_mrr, overall_recall, overall_recall_10, overall_precision,
-        composite, total_absence_violations, total_absence_checks, avg_latency_ms,
-        type_json.join(",\n"), per_query_json.join(",\n")
+        version,
+        git_hash,
+        chrono::Utc::now().format("%Y-%m-%d"),
+        stored_ids.len(),
+        per_query_results.len(),
+        content_hash,
+        overall_mrr,
+        overall_recall,
+        overall_recall_10,
+        overall_precision,
+        composite,
+        total_absence_violations,
+        total_absence_checks,
+        avg_latency_ms,
+        type_json.join(",\n"),
+        per_query_json.join(",\n")
     );
 
-    let json_path = std::path::Path::new("evaluations")
-        .join(format!("locomo_v{}_{}.json", version, git_hash));
+    let json_path =
+        std::path::Path::new("evaluations").join(format!("locomo_v{}_{}.json", version, git_hash));
     if std::path::Path::new("evaluations").exists() {
         std::fs::write(&json_path, &json).expect("Failed to write benchmark JSON");
         println!("\nBenchmark artifact: {}", json_path.display());
@@ -1359,13 +1389,16 @@ fn locomo_benchmark() {
 
     // --- Regression gate ---
     // All categories must stay >= 0.900 MRR for v0.5+ releases
-    let regression_failures: Vec<String> = type_summaries.iter().filter_map(|s| {
-        if s.mrr < 0.850 {
-            Some(format!("{}: MRR {:.3} < 0.850 floor", s.query_type, s.mrr))
-        } else {
-            None
-        }
-    }).collect();
+    let regression_failures: Vec<String> = type_summaries
+        .iter()
+        .filter_map(|s| {
+            if s.mrr < 0.850 {
+                Some(format!("{}: MRR {:.3} < 0.850 floor", s.query_type, s.mrr))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     if !regression_failures.is_empty() {
         println!("\n*** REGRESSION GATE ***");
