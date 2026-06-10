@@ -2446,6 +2446,20 @@ impl MemorySystem {
         self.temporal_fact_store.list(user_id, limit)
     }
 
+    /// Resolve a named-event phrase ("the wedding", "graduation") to a stored
+    /// date via the temporal fact store (B2 helper). Returns `None` for forward
+    /// references / unresolvable phrases. Public wrapper used by the B4
+    /// answer-derivation surface to resolve event-anchor questions.
+    pub fn resolve_event_to_date(
+        &self,
+        user_id: &str,
+        event_phrase: &str,
+    ) -> Option<chrono::NaiveDate> {
+        let mut visited = std::collections::HashSet::new();
+        self.temporal_fact_store
+            .resolve_event_to_date(user_id, event_phrase, &mut visited, 0)
+    }
+
     /// List all temporal facts for a user, optionally including expired facts.
     pub fn list_temporal_facts_filtered(
         &self,
