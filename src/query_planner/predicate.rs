@@ -28,6 +28,13 @@ pub struct Query {
     /// Per-stage candidate caps. Clamps scan estimates so the planner never asks
     /// a backend to materialize more than its budget allows.
     pub stage_caps: StageCaps,
+    /// Optional raw natural-language query text. The planner itself never reads
+    /// this — it exists so the HTTP `/api/query/execute` surface can run B4
+    /// temporal answer-derivation ("when did/is X?") alongside the structured
+    /// plan. Absent in existing/structured-only payloads (`#[serde(default)]`),
+    /// so the wire format and planner behaviour are unchanged when it is `None`.
+    #[serde(default)]
+    pub query_text: Option<String>,
 }
 
 /// Relational filters expressed as column-level predicates.

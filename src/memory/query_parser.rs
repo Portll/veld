@@ -1252,6 +1252,189 @@ pub fn asks_for_temporal_answer(query: &str) -> bool {
 }
 
 // ============================================================================
+// B4: TEMPORAL ANSWER-DERIVATION
+// ============================================================================
+// The answer-side complement to B1/B2. B1/B2 *parse* a derived date out of a
+// query so retrieval can FILTER by it. B4 answers "when did/is X?" questions
+// directly: when the query asks FOR a date and veld can compute it, we surface
+// the computed date plus the supporting facts/source memories that justify it.
+//
+// This is strictly additive: it never touches retrieval or ranking. The HTTP
+// surface (`handlers::query`) calls `derive_temporal_answer` and attaches the
+// result to a NEW optional response field; when no date is derivable the result
+// is `None` and the response is byte-identical to today.
+
+/// How a temporal answer's date was derived. Priority order, highest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivationMethod {
+    /// "the Sunday before 2023-05-25" — anchor is a literal calendar date (B1
+    /// path). The date is computed purely from the query, no store lookup.
+    AnchorRelative,
+    /// "the Monday after the wedding" — anchor is a named event resolved to a
+    /// date via the event resolver / `TemporalFactStore` (B2 path).
+    EventAnchor,
+    /// "when did X do Y" — a stored temporal fact for (entity, event) carries
+    /// the answer in its `resolved_time`.
+    TemporalFact,
+}
+
+impl DerivationMethod {
+    /// Stable wire token. Matches the spec strings exactly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DerivationMethod::AnchorRelative => "anchor_relative",
+            DerivationMethod::EventAnchor => "event_anchor",
+            DerivationMethod::TemporalFact => "temporal_fact",
+        }
+    }
+}
+
+/// A derived answer to a temporal question.
+///
+/// `derived_date` is an ISO `YYYY-MM-DD` string for `AnchorRelative`/`EventAnchor`
+/// (always a `TemporalBound::Point`) or the fact's `ResolvedTime` sortable
+/// representation for `TemporalFact` (which may be coarser, e.g. `2023-06` for a
+/// MonthYear fact). `supporting_facts` and `source_memories` are empty for the
+/// pure query-computed paths (anchor-relative) and populated when a stored fact
+/// justified the answer.
+#[derive(Debug, Clone)]
+pub struct DerivedTemporalAnswer {
+    pub derived_date: String,
+    pub method: DerivationMethod,
+    pub supporting_facts: Vec<crate::memory::temporal_facts::TemporalFact>,
+    pub source_memories: Vec<crate::memory::types::MemoryId>,
+}
+
+/// Re-run the B1/B2 anchor regexes to classify whether the matched anchor is a
+/// literal calendar date (→ `AnchorRelative`) or a named event (→ `EventAnchor`).
+///
+/// Returns `None` when no anchor pattern matched at all. Mirrors the regexes in
+/// `extract_temporal_refs` / `extract_temporal_refs_with_events` so the
+/// classification cannot drift from the resolver that produced the bound.
+fn classify_anchor_relative(query: &str) -> Option<DerivationMethod> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static WEEKDAY_REL_B4: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\bthe\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(?:before|after)\s+(.+)",
+        )
+        .unwrap()
+    });
+    static DAY_REL_B4: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bthe\s+day\s+(?:before|after)\s+(.+)").unwrap());
+    static N_UNIT_REL_B4: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b\d+\s+(?:days?|weeks?)\s+(?:before|after)\s+(.+)").unwrap()
+    });
+
+    fn anchor_is_literal_date(anchor: &str) -> bool {
+        let anchor = anchor.trim();
+        if extract_explicit_dates(anchor).into_iter().next().is_some() {
+            return true;
+        }
+        if let Ok(parsed) = dateparser::parse(anchor) {
+            let d = parsed.date_naive();
+            if (1900..=2100).contains(&d.year()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    let lower = query.to_lowercase();
+    let anchor = WEEKDAY_REL_B4
+        .captures(&lower)
+        .and_then(|c| c.get(1))
+        .or_else(|| DAY_REL_B4.captures(&lower).and_then(|c| c.get(1)))
+        .or_else(|| N_UNIT_REL_B4.captures(&lower).and_then(|c| c.get(1)))
+        .map(|m| m.as_str().to_string())?;
+
+    Some(if anchor_is_literal_date(&anchor) {
+        DerivationMethod::AnchorRelative
+    } else {
+        DerivationMethod::EventAnchor
+    })
+}
+
+/// Derive the answer date for a temporal "when did/is X?" question.
+///
+/// Returns `None` unless [`asks_for_temporal_answer`] is true AND a date can be
+/// computed. Tries, in priority order:
+///
+/// 1. **Anchor-relative / event-anchor** — reuse [`extract_temporal_refs_with_events`].
+///    If it resolves a `TemporalBound::Point`, that Point IS the answer date.
+///    The anchor is classified as literal-date (`AnchorRelative`) or named-event
+///    (`EventAnchor`).
+/// 2. **Matching temporal fact** — `fact_lookup(query)` returns stored facts for
+///    the query's (entity, event). The most recent fact's `resolved_time` is the
+///    answer; the fact is a supporting fact and its `source_memory_id` a source
+///    memory.
+///
+/// Both closures are injected so this function is pure and unit-testable without
+/// a live `TemporalFactStore`. `event_resolver` resolves a named-event anchor
+/// phrase to a date (the same closure `recall.rs` builds over the store).
+/// `fact_lookup` returns candidate facts for the whole query string.
+pub fn derive_temporal_answer(
+    query: &str,
+    event_resolver: Option<&dyn Fn(&str) -> Option<NaiveDate>>,
+    fact_lookup: Option<&dyn Fn(&str) -> Vec<crate::memory::temporal_facts::TemporalFact>>,
+) -> Option<DerivedTemporalAnswer> {
+    // Reversion guard: only fire for "when/what-date" questions.
+    if !asks_for_temporal_answer(query) {
+        return None;
+    }
+
+    // --- Priority 1: anchor-relative / event-anchor → a Point bound. ---
+    let extraction = extract_temporal_refs_with_events(query, event_resolver);
+    let point = extraction.query_bounds.iter().find_map(|b| match b {
+        TemporalBound::Point(p) => Some(*p),
+        _ => None,
+    });
+    if let Some(date) = point {
+        // Classify which sub-path produced the Point. Default to AnchorRelative
+        // when the regex classifier can't see an anchor (e.g. a bare relative
+        // pre-pass like "yesterday") — that date is still query-computed.
+        let method = classify_anchor_relative(query).unwrap_or(DerivationMethod::AnchorRelative);
+        return Some(DerivedTemporalAnswer {
+            derived_date: date.format("%Y-%m-%d").to_string(),
+            method,
+            supporting_facts: Vec::new(),
+            source_memories: Vec::new(),
+        });
+    }
+
+    // --- Priority 2: a stored temporal fact answers the (entity, event). ---
+    if let Some(lookup) = fact_lookup {
+        let facts = lookup(query);
+        // Choose the most recent NON-Unknown-dated fact (by conversation_date);
+        // an Unknown resolved_time carries no answer.
+        let chosen = facts
+            .iter()
+            .filter(|f| {
+                !matches!(
+                    f.resolved_time,
+                    crate::memory::temporal_facts::ResolvedTime::Unknown
+                        | crate::memory::temporal_facts::ResolvedTime::RelativeDescription(_)
+                )
+            })
+            .max_by_key(|f| f.conversation_date)
+            .cloned();
+        if let Some(fact) = chosen {
+            let derived_date = fact.resolved_time.to_sortable_string();
+            let source_memories = vec![fact.source_memory_id.clone()];
+            return Some(DerivedTemporalAnswer {
+                derived_date,
+                method: DerivationMethod::TemporalFact,
+                supporting_facts: vec![fact],
+                source_memories,
+            });
+        }
+    }
+
+    None
+}
+
+// ============================================================================
 // ATTRIBUTE QUERY DETECTION
 // ============================================================================
 // Detect queries asking for specific attributes of entities.
@@ -5546,5 +5729,143 @@ mod tests {
             "Expected TemporalBound::Point(2023-06-12) for '3 days before graduation', got: {:?}",
             extraction.bounds()
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // B4: temporal answer-derivation tests
+    // -------------------------------------------------------------------------
+
+    use crate::memory::temporal_facts::{ResolvedTime, TemporalFact};
+    use crate::memory::types::MemoryId;
+
+    fn b4_fact(
+        entity: &str,
+        event: &str,
+        stems: &[&str],
+        resolved_time: ResolvedTime,
+        conv: chrono::DateTime<chrono::Utc>,
+        mem_uuid: uuid::Uuid,
+    ) -> TemporalFact {
+        TemporalFact {
+            id: format!("{entity}:{event}"),
+            entity: entity.to_string(),
+            event: event.to_string(),
+            event_stems: stems.iter().map(|s| s.to_string()).collect(),
+            event_type: crate::memory::temporal_facts::EventType::Occurred,
+            relative_time: None,
+            resolved_time,
+            source_memory_id: MemoryId(mem_uuid),
+            conversation_date: conv,
+            confidence: 0.9,
+            source_text: format!("{entity} did {event}"),
+            valid_from: None,
+            valid_until: None,
+        }
+    }
+
+    /// (a) Literal-date anchor: "when is the Sunday before 2023-05-25?"
+    ///     → derived_date 2023-05-21, method anchor_relative. No store touched.
+    #[test]
+    fn test_b4_anchor_relative_literal_date() {
+        // Resolver present but must not be needed for a literal-date anchor.
+        let resolver = |_p: &str| -> Option<chrono::NaiveDate> { None };
+        let answer = derive_temporal_answer(
+            "when is the Sunday before 2023-05-25?",
+            Some(&resolver),
+            None,
+        )
+        .expect("literal-date anchor must derive an answer");
+        assert_eq!(
+            answer.derived_date, "2023-05-21",
+            "Sunday before Thu 2023-05-25 must be 2023-05-21"
+        );
+        assert_eq!(answer.method, DerivationMethod::AnchorRelative);
+        assert!(answer.supporting_facts.is_empty());
+        assert!(answer.source_memories.is_empty());
+    }
+
+    /// (b) Event-anchor: "when was the Monday after the wedding?" with a resolver
+    ///     mapping wedding → 2023-05-25 (Thu) → Monday after = 2023-05-29,
+    ///     method event_anchor.
+    #[test]
+    fn test_b4_event_anchor_resolver() {
+        let wedding = chrono::NaiveDate::from_ymd_opt(2023, 5, 25).unwrap();
+        let resolver = |phrase: &str| -> Option<chrono::NaiveDate> {
+            phrase.contains("wedding").then_some(wedding)
+        };
+        let answer =
+            derive_temporal_answer("when was the Monday after the wedding?", Some(&resolver), None)
+                .expect("event-anchor must derive an answer");
+        assert_eq!(
+            answer.derived_date, "2023-05-29",
+            "Monday after Thu 2023-05-25 must be 2023-05-29"
+        );
+        assert_eq!(answer.method, DerivationMethod::EventAnchor);
+    }
+
+    /// (c) Temporal-fact: "when did Melanie go camping?" with a stored fact for
+    ///     (Melanie, camping) resolving to 2023-07-04 → derived_date is the
+    ///     fact's resolved_time, method temporal_fact, supporting fact + source
+    ///     memory surfaced.
+    #[test]
+    fn test_b4_temporal_fact_lookup() {
+        let camp_date = chrono::NaiveDate::from_ymd_opt(2023, 7, 4).unwrap();
+        let conv = chrono::DateTime::parse_from_rfc3339("2023-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mem_uuid = uuid::Uuid::from_u128(0xC0FFEE);
+        let fact = b4_fact(
+            "Melanie",
+            "camping",
+            &["camp"],
+            ResolvedTime::ExactDate(camp_date),
+            conv,
+            mem_uuid,
+        );
+        let lookup = move |_q: &str| -> Vec<TemporalFact> { vec![fact.clone()] };
+        // No anchor pattern in this query, so priority-1 yields nothing and we
+        // fall through to the fact lookup.
+        let answer =
+            derive_temporal_answer("when did Melanie go camping?", None, Some(&lookup))
+                .expect("stored temporal fact must derive an answer");
+        assert_eq!(
+            answer.derived_date, "2023-07-04",
+            "derived_date must equal the fact's resolved_time"
+        );
+        assert_eq!(answer.method, DerivationMethod::TemporalFact);
+        assert_eq!(answer.supporting_facts.len(), 1);
+        assert_eq!(answer.supporting_facts[0].entity, "Melanie");
+        assert_eq!(answer.source_memories.len(), 1);
+        assert_eq!(answer.source_memories[0], MemoryId(mem_uuid));
+    }
+
+    /// (d) Reversion guard: a non-temporal query derives nothing — even with both
+    ///     closures present and a matching fact available.
+    #[test]
+    fn test_b4_non_temporal_query_is_none() {
+        let resolver = |_p: &str| -> Option<chrono::NaiveDate> {
+            Some(chrono::NaiveDate::from_ymd_opt(2023, 5, 25).unwrap())
+        };
+        let conv = chrono::Utc::now();
+        let fact = b4_fact(
+            "Melanie",
+            "camping",
+            &["camp"],
+            ResolvedTime::ExactDate(chrono::NaiveDate::from_ymd_opt(2023, 7, 4).unwrap()),
+            conv,
+            uuid::Uuid::nil(),
+        );
+        let lookup = move |_q: &str| -> Vec<TemporalFact> { vec![fact.clone()] };
+        let answer = derive_temporal_answer(
+            "What did Melanie think about camping?",
+            Some(&resolver),
+            Some(&lookup),
+        );
+        assert!(
+            answer.is_none(),
+            "Non-temporal query must derive no answer (got {answer:?})"
+        );
+        // Sanity: it is genuinely classified as non-temporal-answer.
+        assert!(!asks_for_temporal_answer("What did Melanie think about camping?"));
     }
 }
