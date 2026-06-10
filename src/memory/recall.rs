@@ -1530,8 +1530,14 @@ impl super::MemorySystem {
                     match self.retriever.search_ids_secondary(sec_emb, query.max_results * 8) {
                         Ok(sec_results) if !sec_results.is_empty() => {
                             // Use fraction of semantic weight for secondary — it's a refinement
-                            // signal, not a replacement for primary vector search
-                            let sec_w = semantic_w * SECONDARY_RRF_WEIGHT_RATIO;
+                            // signal, not a replacement for primary vector search.
+                            // Precedence: live dial `secondary_rrf_ratio` → const 0.5.
+                            let sec_ratio = self
+                                .cognitive_dials
+                                .read()
+                                .secondary_rrf_ratio
+                                .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
+                            let sec_w = semantic_w * sec_ratio;
                             for (r, (id, _)) in sec_results.iter().enumerate() {
                                 *fused.entry(id.clone()).or_insert(0.0) +=
                                     sec_w / (k + (r + 1) as f32);
