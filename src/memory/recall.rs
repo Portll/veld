@@ -484,10 +484,9 @@ impl super::MemorySystem {
                 // "planning", "going to" → Planned
                 // "did", "ran", "went" → Occurred
                 // year mentions (2022, 2021) → Historical
-                let event_type = if query_lower_for_temporal.contains("planning")
-                    || query_lower_for_temporal.contains("going to")
-                    || query_lower_for_temporal.contains("will")
-                {
+                let event_type = if temporal_facts::query_signals_planned_intent(
+                    &query_lower_for_temporal,
+                ) {
                     Some(temporal_facts::EventType::Planned)
                 } else if query_lower_for_temporal.contains(" did ")
                     || query_lower_for_temporal.contains("when did")
