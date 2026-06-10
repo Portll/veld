@@ -958,14 +958,29 @@ impl SemanticConsolidator {
 
         // Phase 3: Convert qualifying clusters to facts
         for cluster in clusters {
-            if cluster.members.len() >= self.min_support {
+            // Support must count DISTINCT source memories, not candidate strings:
+            // a single verbose memory can emit several near-but-not-duplicate
+            // candidates and must not self-promote a fact. The fact layer is a
+            // retrieval-speed cache over the (always-retained) episodic store, so
+            // we keep it lean by requiring corroboration across separate memories.
+            let distinct_sources = cluster
+                .members
+                .iter()
+                .map(|(_, id, _)| id)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+
+            if distinct_sources >= self.min_support {
                 let representative = Self::select_representative(&cluster.members);
                 let avg_confidence = cluster.members.iter().map(|(_, _, c)| c).sum::<f32>()
                     / cluster.members.len() as f32;
 
+                // De-duplicate source ids, preserving first-seen order.
+                let mut seen: std::collections::HashSet<&MemoryId> = std::collections::HashSet::new();
                 let source_ids: Vec<MemoryId> = cluster
                     .members
                     .iter()
+                    .filter(|(_, id, _)| seen.insert(id))
                     .map(|(_, id, _)| id.clone())
                     .collect();
                 let entities = self.keyword_extractor.extract(representative);
@@ -975,7 +990,7 @@ impl SemanticConsolidator {
                     id: uuid::Uuid::new_v4().to_string(),
                     fact: representative.to_string(),
                     confidence: avg_confidence.min(1.0),
-                    support_count: cluster.members.len(),
+                    support_count: distinct_sources,
                     source_memories: source_ids,
                     related_entities: entities,
                     created_at: now,
@@ -1140,37 +1155,15 @@ impl SemanticConsolidator {
         // Cap per-memory candidates
         candidates.truncate(CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY);
 
-        // Entity pair relationships (sorted for determinism)
-        // Filter: min 3 chars, no stop words, remove substring-redundant entities
-        if memory.experience.entities.len() >= 2 {
-            let mut sorted_entities: Vec<String> = memory
-                .experience
-                .entities
-                .iter()
-                .map(|e| e.to_lowercase())
-                .filter(|e| e.len() >= 3 && !self.keyword_extractor.is_stop_word(e))
-                .collect();
-            sorted_entities.sort();
-            sorted_entities.dedup();
-
-            // Remove entities that are substrings of another entity in the set
-            // e.g. "chose" is redundant when "chose rust" exists
-            let before_dedup = sorted_entities.clone();
-            sorted_entities.retain(|entity| {
-                !before_dedup
-                    .iter()
-                    .any(|other| other != entity && other.contains(entity.as_str()))
-            });
-
-            let max_entities = sorted_entities.len().min(4);
-            for i in 0..max_entities {
-                for j in (i + 1)..max_entities {
-                    let relationship =
-                        format!("{} relates to {}", sorted_entities[i], sorted_entities[j]);
-                    candidates.push((relationship, importance * 0.8));
-                }
-            }
-        }
+        // Entity co-occurrence is NOT emitted as fact candidates. Two memories
+        // mentioning the same entity pair would each emit the identical sorted
+        // "X relates to Y" string -> instant support=2 -> promotion, flooding the
+        // fact speed-cache with the lowest-signal entries (and previously bypassing
+        // the per-memory cap above by appending after the truncate). Entity
+        // relationships are already captured by the knowledge-graph layer
+        // (`RelationshipEdge` in src/graph_memory.rs), which remains the source of
+        // truth for co-occurrence; forget-nothing holds because nothing is
+        // discarded, it simply isn't duplicated into the fact cache.
 
         candidates
     }
@@ -1949,41 +1942,26 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_relationships_sorted_deterministic() {
+    fn test_entity_pairs_not_emitted_as_fact_candidates() {
+        // Entity co-occurrence is owned by the knowledge-graph layer, not the
+        // fact speed-cache. extract_fact_candidates must not emit synthetic
+        // "X relates to Y" strings: two memories sharing an entity pair would
+        // otherwise self-promote a low-signal fact at support=2.
         let consolidator = SemanticConsolidator::new();
 
-        let m1 = create_typed_memory(
+        let m = create_typed_memory(
             "Testing entity ordering",
             0.7,
             ExperienceType::Observation,
             vec!["JWT".to_string(), "Auth".to_string(), "Token".to_string()],
         );
 
-        let m2 = create_typed_memory(
-            "Testing entity ordering",
-            0.7,
-            ExperienceType::Observation,
-            vec!["Token".to_string(), "Auth".to_string(), "JWT".to_string()],
-        );
+        let candidates = consolidator.extract_fact_candidates(&m);
 
-        let c1 = consolidator.extract_fact_candidates(&m1);
-        let c2 = consolidator.extract_fact_candidates(&m2);
-
-        // Entity relationships should be identical regardless of input order
-        let relations1: Vec<&str> = c1
-            .iter()
-            .filter(|(t, _)| t.contains("relates to"))
-            .map(|(t, _)| t.as_str())
-            .collect();
-        let relations2: Vec<&str> = c2
-            .iter()
-            .filter(|(t, _)| t.contains("relates to"))
-            .map(|(t, _)| t.as_str())
-            .collect();
-
-        assert_eq!(
-            relations1, relations2,
-            "Entity relationships should be deterministic regardless of input order"
+        assert!(
+            !candidates.iter().any(|(t, _)| t.contains("relates to")),
+            "Entity-pair 'relates to' strings must not be emitted as fact candidates; \
+             entity co-occurrence is captured by the graph layer"
         );
     }
 }
