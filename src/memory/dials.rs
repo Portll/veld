@@ -213,7 +213,7 @@ pub const RECALL_SLIDER_SPECS: &[RecallSliderSpec] = &[
     RecallSliderSpec { id: "rrf_k_outer", group: "Fusion", label: "RRF k (graph+hybrid)", default: 20.0, rec_lo: 20.0, rec_hi: 35.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
     RecallSliderSpec { id: "rrf_k_decomp", group: "Fusion", label: "RRF k (sub-query)", default: 20.0, rec_lo: 20.0, rec_hi: 30.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
     RecallSliderSpec { id: "rrf_k_inner", group: "Fusion", label: "RRF k (BM25+vector)", default: 45.0, rec_lo: 30.0, rec_hi: 60.0, abs_lo: 5.0, abs_hi: 100.0, step: 1.0 },
-    RecallSliderSpec { id: "secondary_rrf_ratio", group: "Fusion", label: "Secondary index weight", default: 0.5, rec_lo: 0.3, rec_hi: 0.7, abs_lo: 0.0, abs_hi: 1.0, step: 0.05 },
+    RecallSliderSpec { id: "secondary_rrf_ratio", group: "Fusion", label: "Secondary index weight", default: 0.5, rec_lo: 0.3, rec_hi: 0.7, abs_lo: 0.0, abs_hi: 2.0, step: 0.05 },
     RecallSliderSpec { id: "bm25_min_score", group: "Candidates", label: "BM25 min score", default: 0.1, rec_lo: 0.0, rec_hi: 0.2, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
     RecallSliderSpec { id: "onto_rerank_boost", group: "Rerank", label: "Ontological boost / match", default: 0.15, rec_lo: 0.05, rec_hi: 0.15, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
     RecallSliderSpec { id: "onto_rerank_max", group: "Rerank", label: "Ontological boost cap", default: 0.40, rec_lo: 0.20, rec_hi: 0.40, abs_lo: 0.0, abs_hi: 1.0, step: 0.01 },
@@ -305,7 +305,7 @@ impl CognitiveDials {
         cl(&mut self.rrf_k_outer, 5.0, 100.0);
         cl(&mut self.rrf_k_decomp, 5.0, 100.0);
         cl(&mut self.rrf_k_inner, 5.0, 100.0);
-        cl(&mut self.secondary_rrf_ratio, 0.0, 1.0);
+        cl(&mut self.secondary_rrf_ratio, 0.0, 2.0);
         cl(&mut self.bm25_min_score, 0.0, 1.0);
         cl(&mut self.onto_rerank_boost, 0.0, 1.0);
         cl(&mut self.onto_rerank_max, 0.0, 1.0);
