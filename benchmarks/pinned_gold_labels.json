@@ -1,0 +1,2522 @@
+{
+ "conv-26_q0": {
+  "gold_sessions": [
+   17
+  ],
+  "locatable": true,
+  "question": "When did Caroline go to the LGBTQ support group?",
+  "answer": "7 May 2023"
+ },
+ "conv-26_q1": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie paint a sunrise?",
+  "answer": "2022"
+ },
+ "conv-26_q5": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie run a charity race?",
+  "answer": "The sunday before 25 May 2023"
+ },
+ "conv-26_q6": {
+  "gold_sessions": [
+   3,
+   4
+  ],
+  "locatable": true,
+  "question": "When is Melanie planning on going camping?",
+  "answer": "June 2023"
+ },
+ "conv-26_q8": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline give a speech at a school?",
+  "answer": "The week before 9 June 2023"
+ },
+ "conv-26_q9": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline meet up with her friends, family, and mentors?",
+  "answer": "The week before 9 June 2023"
+ },
+ "conv-26_q10": {
+  "gold_sessions": [
+   3,
+   4
+  ],
+  "locatable": true,
+  "question": "How long has Caroline had her current group of friends for?",
+  "answer": "4 years"
+ },
+ "conv-26_q12": {
+  "gold_sessions": [
+   3,
+   4
+  ],
+  "locatable": true,
+  "question": "How long ago was Caroline's 18th birthday?",
+  "answer": "10 years ago"
+ },
+ "conv-26_q16": {
+  "gold_sessions": [
+   5,
+   6,
+   7,
+   8,
+   9,
+   10
+  ],
+  "locatable": true,
+  "question": "When did Melanie sign up for a pottery class?",
+  "answer": "2 July 2023"
+ },
+ "conv-26_q17": {
+  "gold_sessions": [
+   5,
+   6,
+   7,
+   8,
+   9,
+   10
+  ],
+  "locatable": true,
+  "question": "When is Caroline going to the transgender conference?",
+  "answer": "July 2023"
+ },
+ "conv-26_q20": {
+  "gold_sessions": [
+   5,
+   8,
+   10
+  ],
+  "locatable": true,
+  "question": "When did Melanie go to the museum?",
+  "answer": "5 July 2023"
+ },
+ "conv-26_q21": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline have a picnic?",
+  "answer": "The week before 6 July 2023"
+ },
+ "conv-26_q25": {
+  "gold_sessions": [
+   10
+  ],
+  "locatable": true,
+  "question": "When did Caroline go to the LGBTQ conference?",
+  "answer": "10 July 2023"
+ },
+ "conv-26_q26": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie read the book \"nothing is impossible\"?",
+  "answer": "2022"
+ },
+ "conv-26_q28": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline go to the adoption meeting?",
+  "answer": "The friday before 15 July 2023"
+ },
+ "conv-26_q29": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie go to the pottery workshop?",
+  "answer": "The Friday before 15 July 2023"
+ },
+ "conv-26_q31": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie go camping in June?",
+  "answer": "The week before 27 June 2023"
+ },
+ "conv-26_q33": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline go to a pride parade during the summer?",
+  "answer": "The week before 3 July 2023"
+ },
+ "conv-26_q35": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie go camping in July?",
+  "answer": "two weekends before 17 July 2023"
+ },
+ "conv-26_q36": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline join a mentorship program?",
+  "answer": "The weekend before 17 July 2023"
+ },
+ "conv-26_q41": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline join a new activist group?",
+  "answer": "The Tuesday before 20 July 2023"
+ },
+ "conv-26_q44": {
+  "gold_sessions": [
+   13
+  ],
+  "locatable": true,
+  "question": "When is Melanie's daughter's birthday?",
+  "answer": "13 August"
+ },
+ "conv-26_q45": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline attend a pride parade in August?",
+  "answer": "The Friday before 14 August 2023"
+ },
+ "conv-26_q49": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline and Melanie go to a pride fesetival together?",
+  "answer": "2022"
+ },
+ "conv-26_q53": {
+  "gold_sessions": [
+   13,
+   14
+  ],
+  "locatable": true,
+  "question": "When did Caroline apply to adoption agencies?",
+  "answer": "The week of 23 August 2023"
+ },
+ "conv-26_q54": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline draw a self-portrait?",
+  "answer": "The week before 23 August 2023"
+ },
+ "conv-26_q57": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline encounter people on a hike and have a negative experience?",
+  "answer": "The week before 25 August 2023"
+ },
+ "conv-26_q58": {
+  "gold_sessions": [
+   11
+  ],
+  "locatable": true,
+  "question": "When did Melanie make a plate in pottery class?",
+  "answer": "24 August 2023"
+ },
+ "conv-26_q62": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie go to the park?",
+  "answer": "27 August 2023"
+ },
+ "conv-26_q63": {
+  "gold_sessions": [
+   16
+  ],
+  "locatable": true,
+  "question": "When is Caroline's youth center putting on a talent show?",
+  "answer": "September 2023"
+ },
+ "conv-26_q67": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Caroline go biking with friends?",
+  "answer": "The weekend before 13 September 2023"
+ },
+ "conv-26_q68": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long has Melanie been practicing art?",
+  "answer": "Since 2016"
+ },
+ "conv-26_q72": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie's friend adopt a child?",
+  "answer": "2022"
+ },
+ "conv-26_q73": {
+  "gold_sessions": [
+   16
+  ],
+  "locatable": true,
+  "question": "When did Melanie get hurt?",
+  "answer": "September 2023"
+ },
+ "conv-26_q74": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie's family go on a roadtrip?",
+  "answer": "The weekend before 20 October 2023"
+ },
+ "conv-26_q79": {
+  "gold_sessions": [
+   19
+  ],
+  "locatable": true,
+  "question": "When did Caroline pass the adoption interview?",
+  "answer": "The Friday before 22 October 2023"
+ },
+ "conv-26_q80": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Melanie buy the figurines?",
+  "answer": "21 October 2023"
+ },
+ "conv-30_q0": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When Jon has lost his job as a banker?",
+  "answer": "19 January, 2023"
+ },
+ "conv-30_q1": {
+  "gold_sessions": [
+   1,
+   2
+  ],
+  "locatable": true,
+  "question": "When Gina has lost her job at Door Dash?",
+  "answer": "January, 2023"
+ },
+ "conv-30_q6": {
+  "gold_sessions": [
+   3,
+   4,
+   5
+  ],
+  "locatable": true,
+  "question": "When is Jon's group performing at a festival?",
+  "answer": "February, 2023"
+ },
+ "conv-30_q7": {
+  "gold_sessions": [
+   2
+  ],
+  "locatable": true,
+  "question": "When did Gina launch an ad campaign for her store?",
+  "answer": "29 January, 2023"
+ },
+ "conv-30_q8": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was Jon in Paris?",
+  "answer": "28 January 2023"
+ },
+ "conv-30_q10": {
+  "gold_sessions": [
+   3,
+   4,
+   5
+  ],
+  "locatable": true,
+  "question": "When did Gina team up with a local artist for some cool designs?",
+  "answer": "February, 2023"
+ },
+ "conv-30_q11": {
+  "gold_sessions": [
+   5
+  ],
+  "locatable": true,
+  "question": "When did Gina get her tattoo?",
+  "answer": "A few years ago"
+ },
+ "conv-30_q12": {
+  "gold_sessions": [
+   6,
+   7
+  ],
+  "locatable": true,
+  "question": "When did Jon start to go to the gym?",
+  "answer": "March, 2023"
+ },
+ "conv-30_q13": {
+  "gold_sessions": [
+   6
+  ],
+  "locatable": true,
+  "question": "When did Gina open her online clothing store?",
+  "answer": "16 March, 2023"
+ },
+ "conv-30_q14": {
+  "gold_sessions": [
+   8,
+   9,
+   10
+  ],
+  "locatable": true,
+  "question": "When did Jon start expanding his studio's social media presence?",
+  "answer": "April, 2023"
+ },
+ "conv-30_q15": {
+  "gold_sessions": [
+   2,
+   11,
+   12
+  ],
+  "locatable": true,
+  "question": "When did Jon host a dance competition?",
+  "answer": "May, 2023"
+ },
+ "conv-30_q16": {
+  "gold_sessions": [
+   10
+  ],
+  "locatable": true,
+  "question": "When did Jon go to a fair to get more exposure for his dance studio?",
+  "answer": "24 April, 2023"
+ },
+ "conv-30_q19": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Gina interview for a design internship?",
+  "answer": "10 May, 2023"
+ },
+ "conv-30_q20": {
+  "gold_sessions": [
+   12
+  ],
+  "locatable": true,
+  "question": "When did Gina get accepted for the design internship?",
+  "answer": "27 May, 2023"
+ },
+ "conv-30_q21": {
+  "gold_sessions": [
+   2,
+   11,
+   12
+  ],
+  "locatable": true,
+  "question": "When did Jon start reading \"The Lean Startup\"?",
+  "answer": "May, 2023"
+ },
+ "conv-30_q22": {
+  "gold_sessions": [
+   13,
+   14,
+   15,
+   16
+  ],
+  "locatable": true,
+  "question": "When did Gina develop a video presentation to teach how to style her fashion pieces? ",
+  "answer": "June, 2023"
+ },
+ "conv-30_q26": {
+  "gold_sessions": [
+   15,
+   16
+  ],
+  "locatable": true,
+  "question": "When did Jon receive mentorship to promote his venture?",
+  "answer": "15 June, 2023"
+ },
+ "conv-30_q28": {
+  "gold_sessions": [
+   13,
+   14,
+   15,
+   16
+  ],
+  "locatable": true,
+  "question": "When was Jon in Rome?",
+  "answer": "June 2023"
+ },
+ "conv-30_q30": {
+  "gold_sessions": [
+   13,
+   14,
+   15,
+   16
+  ],
+  "locatable": true,
+  "question": "When Jon is planning to open his dance studio?",
+  "answer": "20 June, 2023"
+ },
+ "conv-30_q32": {
+  "gold_sessions": [
+   13,
+   14,
+   15,
+   16
+  ],
+  "locatable": true,
+  "question": "When did Gina design a limited collection of hoodies?",
+  "answer": "June 2023"
+ },
+ "conv-30_q33": {
+  "gold_sessions": [
+   13,
+   14,
+   15,
+   16
+  ],
+  "locatable": true,
+  "question": "When did Jon visit networking events for his store?",
+  "answer": "20 June, 2023"
+ },
+ "conv-30_q34": {
+  "gold_sessions": [
+   17,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "When did Gina start being recognized by fashion editors?",
+  "answer": "July 2023"
+ },
+ "conv-30_q35": {
+  "gold_sessions": [
+   17,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "When did Jon start learning marketing and analytics tools?",
+  "answer": "July, 2023"
+ },
+ "conv-30_q36": {
+  "gold_sessions": [
+   18
+  ],
+  "locatable": true,
+  "question": "When did Jon and Gina decide to collaborate to create dance content?",
+  "answer": "21 July 2023"
+ },
+ "conv-30_q37": {
+  "gold_sessions": [
+   17,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "When did Gina mention Shia Labeouf?",
+  "answer": " 23 July, 2023"
+ },
+ "conv-30_q38": {
+  "gold_sessions": [
+   18
+  ],
+  "locatable": true,
+  "question": "When did Gina go to a dance class with a group of friends?",
+  "answer": "21 July 2023"
+ },
+ "conv-41_q0": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Who did Maria have dinner with on May 3, 2023?",
+  "answer": "her mother"
+ },
+ "conv-41_q1": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria donate her car?",
+  "answer": "21 December 2022"
+ },
+ "conv-41_q4": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John join the online support group?",
+  "answer": "The week before 1 January 2023"
+ },
+ "conv-41_q5": {
+  "gold_sessions": [
+   1,
+   2
+  ],
+  "locatable": true,
+  "question": "When did Maria go to the beach?",
+  "answer": "December 2022"
+ },
+ "conv-41_q10": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria meet Jean?",
+  "answer": "February 24, 2023"
+ },
+ "conv-41_q13": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria's grandmother pass away?",
+  "answer": "The week before 6 March 2023"
+ },
+ "conv-41_q16": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John get his degree?",
+  "answer": "The week before 2 April 2023"
+ },
+ "conv-41_q20": {
+  "gold_sessions": [
+   1,
+   2
+  ],
+  "locatable": true,
+  "question": "When did John take a road trip to the Pacific Northwest?",
+  "answer": "2022"
+ },
+ "conv-41_q22": {
+  "gold_sessions": [
+   8,
+   21
+  ],
+  "locatable": true,
+  "question": "When did John go to a convention with colleagues?",
+  "answer": "March 2023"
+ },
+ "conv-41_q24": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John start boot camp with his family?",
+  "answer": "April.2023"
+ },
+ "conv-41_q27": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John have a party with veterans?",
+  "answer": "The Friday before 20 May 2023"
+ },
+ "conv-41_q31": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John get his dog Max?",
+  "answer": "In 2013"
+ },
+ "conv-41_q34": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria join a gym?",
+  "answer": "The week before 16 June 2023"
+ },
+ "conv-41_q38": {
+  "gold_sessions": [
+   21,
+   22,
+   23,
+   24,
+   25,
+   26
+  ],
+  "locatable": true,
+  "question": "When did Maria get in a car accident?",
+  "answer": "July 2, 2023"
+ },
+ "conv-41_q43": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was John's old area hit with a flood?",
+  "answer": "The week before 7 July 2023"
+ },
+ "conv-41_q46": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria go hiking with her church friends?",
+  "answer": "The weekend before 22 July 2023"
+ },
+ "conv-41_q48": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John have his first firefighter call-out?",
+  "answer": "The sunday before 3` July 2023"
+ },
+ "conv-41_q51": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria start volunteering at the homeless shelter?",
+  "answer": "Around August 2022"
+ },
+ "conv-41_q53": {
+  "gold_sessions": [
+   1,
+   2
+  ],
+  "locatable": true,
+  "question": "When did John help renovate his hometown community center?",
+  "answer": "2022"
+ },
+ "conv-41_q54": {
+  "gold_sessions": [
+   31
+  ],
+  "locatable": true,
+  "question": "When did Maria take up community work with her church friends?",
+  "answer": "August 4, 2023"
+ },
+ "conv-41_q55": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria receive a medal from the homeless shelter?",
+  "answer": "The week before 9 August 2023"
+ },
+ "conv-41_q56": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John participate in a 5K charity run?",
+  "answer": "first weekend of August 2023"
+ },
+ "conv-41_q58": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria get Coco?",
+  "answer": "Two weeks before 11 August 2023"
+ },
+ "conv-41_q59": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John go on a camping trip with Max?",
+  "answer": "The summer of 2022"
+ },
+ "conv-41_q61": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Maria adopt Shadow?",
+  "answer": "The week before 13 August 2023"
+ },
+ "conv-41_q63": {
+  "gold_sessions": [
+   30
+  ],
+  "locatable": true,
+  "question": "How many weeks passed between Maria adopting Coco and Shadow?",
+  "answer": "two weeks"
+ },
+ "conv-41_q91": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What did John attend with his colleagues in March 2023?",
+  "answer": "a tech-for-good convention"
+ },
+ "conv-42_q2": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna first watch \"Eternal Sunshine of the Spotless Mind?",
+  "answer": "2019"
+ },
+ "conv-42_q3": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate win his first video game tournament?",
+  "answer": "the week before 21Janury, 2022"
+ },
+ "conv-42_q6": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long has Nate had his first two turtles?",
+  "answer": "three years"
+ },
+ "conv-42_q7": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna finish her first screenplay?",
+  "answer": "The Friday before 23January, 2022"
+ },
+ "conv-42_q8": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate get his first two turtles?",
+  "answer": "2019"
+ },
+ "conv-42_q9": {
+  "gold_sessions": [
+   2
+  ],
+  "locatable": true,
+  "question": "What major achievement did Joanna accomplish in January 2022?",
+  "answer": "finished her screenplay and printed it"
+ },
+ "conv-42_q13": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna have an audition for a writing gig?",
+  "answer": "23 March, 2022."
+ },
+ "conv-42_q15": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate get purple hair?",
+  "answer": "The week before 15April, 2022."
+ },
+ "conv-42_q16": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What physical transformation did Nate undergo in April 2022?",
+  "answer": "dyed his hair purple"
+ },
+ "conv-42_q17": {
+  "gold_sessions": [
+   10
+  ],
+  "locatable": true,
+  "question": "What movie did Joanna watch on 1 May, 2022?",
+  "answer": "Lord of the Rings"
+ },
+ "conv-42_q18": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which outdoor spot did Joanna visit in May?",
+  "answer": "Whispering Falls waterfall"
+ },
+ "conv-42_q20": {
+  "gold_sessions": [
+   2,
+   3,
+   5,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   21,
+   26,
+   28
+  ],
+  "locatable": true,
+  "question": "When did Nate adopt Max?",
+  "answer": "May 2022"
+ },
+ "conv-42_q21": {
+  "gold_sessions": [
+   12,
+   13
+  ],
+  "locatable": true,
+  "question": "Who was the new addition to Nate's family in May 2022?",
+  "answer": "Max"
+ },
+ "conv-42_q22": {
+  "gold_sessions": [
+   2,
+   3,
+   5,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   21,
+   26,
+   28
+  ],
+  "locatable": true,
+  "question": "When did Joanna start writing her third screenplay?",
+  "answer": "May 2022"
+ },
+ "conv-42_q24": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When is Nate hosting a gaming party?",
+  "answer": "The weekend after 3June, 2022."
+ },
+ "conv-42_q25": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna hike with her buddies?",
+  "answer": "The weekend after 3June, 2022."
+ },
+ "conv-42_q26": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate win his third tourney?",
+  "answer": "The week before 3June, 2022"
+ },
+ "conv-42_q28": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate make vegan icecream and share it with a vegan diet group?",
+  "answer": "The Friday before 24June, 2022."
+ },
+ "conv-42_q29": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When is Joanna going to make Nate's ice cream for her family?",
+  "answer": "The weekend of 24June, 2022."
+ },
+ "conv-42_q31": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate win his fourth video game tournament?",
+  "answer": "The Friday before 10July, 2022."
+ },
+ "conv-42_q32": {
+  "gold_sessions": [
+   17
+  ],
+  "locatable": true,
+  "question": "Where did Joanna travel to in July 2022?",
+  "answer": "Woodhaven"
+ },
+ "conv-42_q33": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did someone write Joanna a touching letter?",
+  "answer": "The week before 14August, 2022."
+ },
+ "conv-42_q35": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate take time off to chill with his pets?",
+  "answer": "The weekend of 22August, 2022."
+ },
+ "conv-42_q36": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna share her book with her writers group?",
+  "answer": "The week before 22August, 2022."
+ },
+ "conv-42_q37": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate win an international tournament?",
+  "answer": "21 August, 2022"
+ },
+ "conv-42_q38": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna make a desert with almond milk?",
+  "answer": "The Friday before 14September, 2022"
+ },
+ "conv-42_q39": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate attend a cooking show?",
+  "answer": "The Monday before 14September, 2022"
+ },
+ "conv-42_q40": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna's laptop crash?",
+  "answer": "The week before 14September, 2022"
+ },
+ "conv-42_q41": {
+  "gold_sessions": [
+   22,
+   23,
+   25
+  ],
+  "locatable": true,
+  "question": "When did Joanna make a chocolate tart with raspberries?",
+  "answer": "5 October, 2022"
+ },
+ "conv-42_q43": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did it take for Joanna to finish writing her book?",
+  "answer": "four months"
+ },
+ "conv-42_q44": {
+  "gold_sessions": [
+   20,
+   21
+  ],
+  "locatable": true,
+  "question": "When did Nate win a lot of money in a video game tournament?",
+  "answer": "September 2022"
+ },
+ "conv-42_q45": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Joanna finish up the writing for her book?",
+  "answer": "The week before 6October, 2022"
+ },
+ "conv-42_q48": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate go to a convention and meet new people?",
+  "answer": "The Friday before 9October, 2022."
+ },
+ "conv-42_q54": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was Joanna's second movie script shown on the big screens?",
+  "answer": "The Sunday before 25October, 2022."
+ },
+ "conv-42_q57": {
+  "gold_sessions": [
+   26,
+   28
+  ],
+  "locatable": true,
+  "question": "When did Joanna plan to go over to Nate's and share recipes?",
+  "answer": "5 November, 2022."
+ },
+ "conv-42_q64": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Nate win a big Valorant tourney?",
+  "answer": "The Saturday before 7November, 2022"
+ },
+ "conv-42_q65": {
+  "gold_sessions": [
+   27
+  ],
+  "locatable": true,
+  "question": "Which torunament did Nate win in the beginning of November 2022?",
+  "answer": "Valorant"
+ },
+ "conv-42_q72": {
+  "gold_sessions": [
+   26,
+   27
+  ],
+  "locatable": true,
+  "question": "When did Joanna plan on going to Nate's to watch him play with his turtles?",
+  "answer": "10 November, 2022"
+ },
+ "conv-42_q77": {
+  "gold_sessions": [
+   28
+  ],
+  "locatable": true,
+  "question": "When did Nate win his second tournament?",
+  "answer": "The week before 2 May, 2022."
+ },
+ "conv-42_q86": {
+  "gold_sessions": [
+   26,
+   27
+  ],
+  "locatable": true,
+  "question": "When did Nate take his turtles to the beach?",
+  "answer": "10 November, 2022"
+ },
+ "conv-43_q6": {
+  "gold_sessions": [
+   2
+  ],
+  "locatable": true,
+  "question": "In which month's game did John achieve a career-high score in points?",
+  "answer": "June 2023"
+ },
+ "conv-43_q10": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was John in Seattle for a game?",
+  "answer": "early August, 2023"
+ },
+ "conv-43_q12": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What year did John start surfing?",
+  "answer": "2018"
+ },
+ "conv-43_q16": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "After how many weeks did Tim reconnect with the fellow Harry Potter fan from California?",
+  "answer": "three weeks"
+ },
+ "conv-43_q20": {
+  "gold_sessions": [
+   3
+  ],
+  "locatable": true,
+  "question": "Which city was John in before traveling to Chicago?",
+  "answer": "Seattle"
+ },
+ "conv-43_q22": {
+  "gold_sessions": [
+   7
+  ],
+  "locatable": true,
+  "question": "When did John meet with his teammates after returning from Chicago?",
+  "answer": "August 15, 2023"
+ },
+ "conv-43_q23": {
+  "gold_sessions": [
+   11
+  ],
+  "locatable": true,
+  "question": "When is Tim attending a book conference?",
+  "answer": "September 2023"
+ },
+ "conv-43_q24": {
+  "gold_sessions": [
+   6
+  ],
+  "locatable": true,
+  "question": "Where was John between August 11 and August 15 2023?",
+  "answer": "Chicago"
+ },
+ "conv-43_q31": {
+  "gold_sessions": [
+   11
+  ],
+  "locatable": true,
+  "question": "What month did Tim plan on going to Universal Studios?",
+  "answer": "September, 2023"
+ },
+ "conv-43_q33": {
+  "gold_sessions": [
+   12,
+   13,
+   14,
+   15
+  ],
+  "locatable": true,
+  "question": "When does John plan on traveling with his team on a team trip?",
+  "answer": "October, 2023"
+ },
+ "conv-43_q37": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which week did Tim visit the UK for the Harry Potter Conference?",
+  "answer": "The week before October 13th, 2023."
+ },
+ "conv-43_q39": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What year did Tim go to the Smoky Mountains?",
+  "answer": "2022"
+ },
+ "conv-43_q40": {
+  "gold_sessions": [
+   6,
+   10,
+   19
+  ],
+  "locatable": true,
+  "question": "Has Tim been to North Carolina and/or Tennesee states in the US?",
+  "answer": "Yes"
+ },
+ "conv-43_q44": {
+  "gold_sessions": [
+   16,
+   17,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "When did John and his wife go on a European vacation?",
+  "answer": "November, 2023."
+ },
+ "conv-43_q45": {
+  "gold_sessions": [
+   13,
+   15,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "Which country was Tim visiting in the second week of November?",
+  "answer": "UK"
+ },
+ "conv-43_q46": {
+  "gold_sessions": [
+   13,
+   15,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "Where was Tim in the week before 16 November 2023?",
+  "answer": "UK"
+ },
+ "conv-43_q47": {
+  "gold_sessions": [
+   11
+  ],
+  "locatable": true,
+  "question": "When did John get married at a greenhouse?",
+  "answer": "last week of September 2023"
+ },
+ "conv-43_q54": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John take a trip to the Rocky Mountains?",
+  "answer": "2022"
+ },
+ "conv-43_q55": {
+  "gold_sessions": [
+   1,
+   5,
+   11,
+   19,
+   20
+  ],
+  "locatable": true,
+  "question": "When did John start playing professionally?",
+  "answer": "May, 2023"
+ },
+ "conv-43_q56": {
+  "gold_sessions": [
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   22
+  ],
+  "locatable": true,
+  "question": "When did Tim start playing the violin?",
+  "answer": "August 2023"
+ },
+ "conv-43_q58": {
+  "gold_sessions": [
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   22
+  ],
+  "locatable": true,
+  "question": "When did John attend the Harry Potter trivia?",
+  "answer": "August 2023."
+ },
+ "conv-43_q60": {
+  "gold_sessions": [
+   23
+  ],
+  "locatable": true,
+  "question": "When did John achieve a career-high assist performance?",
+  "answer": "December 11, 2023"
+ },
+ "conv-43_q63": {
+  "gold_sessions": [
+   3,
+   10,
+   14,
+   20,
+   26
+  ],
+  "locatable": true,
+  "question": "When did John organize a basketball camp for kids?",
+  "answer": "summer 2023"
+ },
+ "conv-43_q64": {
+  "gold_sessions": [
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26
+  ],
+  "locatable": true,
+  "question": "Which month was John in Italy?",
+  "answer": "December, 2023"
+ },
+ "conv-43_q68": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What day did Tim get into his study abroad program?",
+  "answer": "Januarty 5, 2024"
+ },
+ "conv-43_q69": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When will Tim leave for Ireland?",
+  "answer": "February, 2024"
+ },
+ "conv-44_q0": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which year did Audrey adopt the first three of her dogs?",
+  "answer": "2020"
+ },
+ "conv-44_q1": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Andrew start his new job as a financial analyst?",
+  "answer": "The week before March 27, 2023"
+ },
+ "conv-44_q4": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Audrey make muffins for herself?",
+  "answer": "The week of April 3rd to 9th"
+ },
+ "conv-44_q5": {
+  "gold_sessions": [
+   27
+  ],
+  "locatable": true,
+  "question": "When did Audrey see a hummingbird?",
+  "answer": "first week of May 2023"
+ },
+ "conv-44_q6": {
+  "gold_sessions": [
+   3
+  ],
+  "locatable": true,
+  "question": "When did Audrey adopt Pixie?",
+  "answer": "around April 2, 2023"
+ },
+ "conv-44_q7": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How many years passed between Audrey adopting Pixie and her other three dogs?",
+  "answer": "three years"
+ },
+ "conv-44_q8": {
+  "gold_sessions": [
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27,
+   28
+  ],
+  "locatable": true,
+  "question": "Did Andrew have a pet dog during March 2023?",
+  "answer": "No"
+ },
+ "conv-44_q10": {
+  "gold_sessions": [
+   7,
+   8,
+   9
+  ],
+  "locatable": true,
+  "question": "When did Audrey's positive reinforcement training course for dogs take place?",
+  "answer": "June, 2023"
+ },
+ "conv-44_q11": {
+  "gold_sessions": [
+   7
+  ],
+  "locatable": true,
+  "question": "When did Andrew go rock climbing?",
+  "answer": "June 11, 2023"
+ },
+ "conv-44_q13": {
+  "gold_sessions": [
+   7,
+   8,
+   9
+  ],
+  "locatable": true,
+  "question": "When did Audrey move to a new place?",
+  "answer": "June 2023"
+ },
+ "conv-44_q16": {
+  "gold_sessions": [
+   14,
+   15,
+   16,
+   17
+  ],
+  "locatable": true,
+  "question": "When is Andrew going to go hiking with Audrey?",
+  "answer": "August"
+ },
+ "conv-44_q22": {
+  "gold_sessions": [
+   14
+  ],
+  "locatable": true,
+  "question": "Where did Andrew go during the first weekend of August 2023?",
+  "answer": "camping with girlfriend"
+ },
+ "conv-44_q25": {
+  "gold_sessions": [
+   17
+  ],
+  "locatable": true,
+  "question": "When did Andrew and his girlfriend go fishing?",
+  "answer": "weekend before August 24, 2023"
+ },
+ "conv-44_q30": {
+  "gold_sessions": [
+   27,
+   28
+  ],
+  "locatable": true,
+  "question": "When is Andrew planning to go to the beach with his girlfriend?",
+  "answer": "November 2023"
+ },
+ "conv-44_q34": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How many months passed between Andrew adopting Toby and Buddy?",
+  "answer": "three months"
+ },
+ "conv-44_q37": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Audrey get into an accident in the park?",
+  "answer": "between October 19 and 24, 2023"
+ },
+ "conv-44_q38": {
+  "gold_sessions": [
+   25
+  ],
+  "locatable": true,
+  "question": "When did Andrew and his girlfriend go on a wine tasting trip?",
+  "answer": "the weekend before October 24, 2023"
+ },
+ "conv-44_q45": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How many pets will Andrew have, as of December 2023?",
+  "answer": "three"
+ },
+ "conv-44_q46": {
+  "gold_sessions": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   17,
+   18,
+   19,
+   20,
+   22,
+   23,
+   25,
+   26,
+   27
+  ],
+  "locatable": true,
+  "question": "How many pets did Andrew have, as of September 2023?",
+  "answer": "one"
+ },
+ "conv-44_q47": {
+  "gold_sessions": [
+   5,
+   6,
+   11,
+   12,
+   20
+  ],
+  "locatable": true,
+  "question": "How many months passed between Andrew adopting Buddy and Scout",
+  "answer": "one month"
+ },
+ "conv-44_q55": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Andrew make his dogs a fun indoor area?",
+  "answer": "few days before November 22, 2023"
+ },
+ "conv-44_q57": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Andrew adopt Scout?",
+  "answer": "few days before November 2023"
+ },
+ "conv-44_q58": {
+  "gold_sessions": [
+   25
+  ],
+  "locatable": true,
+  "question": "What did Audrey eat for dinner on October 24, 2023?",
+  "answer": "sushi"
+ },
+ "conv-44_q59": {
+  "gold_sessions": [
+   5
+  ],
+  "locatable": true,
+  "question": "How long has it been since Andrew adopted his first pet, as of November 2023?",
+  "answer": "4 months"
+ },
+ "conv-47_q1": {
+  "gold_sessions": [
+   1
+  ],
+  "locatable": true,
+  "question": "Which recreational activity was James pursuing on March 16, 2022?",
+  "answer": "bowling"
+ },
+ "conv-47_q4": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John resume playing drums in his adulthood?",
+  "answer": "February 2022"
+ },
+ "conv-47_q10": {
+  "gold_sessions": [
+   6
+  ],
+  "locatable": true,
+  "question": "When did James adopt Ned?",
+  "answer": "first week of April 2022"
+ },
+ "conv-47_q11": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How was John feeling on April 10, 2022?",
+  "answer": "seeking solitude"
+ },
+ "conv-47_q13": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did James visit Italy?",
+  "answer": "In 2021"
+ },
+ "conv-47_q14": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did James buy himself a new adventure book?",
+  "answer": "April 26, 2022"
+ },
+ "conv-47_q15": {
+  "gold_sessions": [
+   1,
+   2,
+   3
+  ],
+  "locatable": true,
+  "question": "When did James start playing Civilization VI?",
+  "answer": "March 2022"
+ },
+ "conv-47_q21": {
+  "gold_sessions": [
+   1,
+   7,
+   9,
+   12,
+   28
+  ],
+  "locatable": true,
+  "question": "When did John first organize a charity tournament with his friends?",
+  "answer": "May 7, 2022"
+ },
+ "conv-47_q23": {
+  "gold_sessions": [
+   16,
+   17
+  ],
+  "locatable": true,
+  "question": "When will John start his new job?",
+  "answer": "In July, 2022"
+ },
+ "conv-47_q28": {
+  "gold_sessions": [
+   1,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   16,
+   21,
+   28
+  ],
+  "locatable": true,
+  "question": "When did James volunteer at an organization?",
+  "answer": "May 2022"
+ },
+ "conv-47_q29": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did James depart for his trip to Canada?",
+  "answer": "July 11, 2022"
+ },
+ "conv-47_q31": {
+  "gold_sessions": [
+   15,
+   19
+  ],
+  "locatable": true,
+  "question": "How many days did James plan to spend on his trip in Canada?",
+  "answer": "19 days"
+ },
+ "conv-47_q32": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Where was James at on July 12, 2022?",
+  "answer": "Toronto, Canada"
+ },
+ "conv-47_q37": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John spend time with his sister and dogs?",
+  "answer": "July 21, 2022"
+ },
+ "conv-47_q39": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John start his job in IT?",
+  "answer": "2019"
+ },
+ "conv-47_q41": {
+  "gold_sessions": [
+   19,
+   21
+  ],
+  "locatable": true,
+  "question": "When did James meet Samantha?",
+  "answer": "August 9, 2022"
+ },
+ "conv-47_q42": {
+  "gold_sessions": [
+   19,
+   21
+  ],
+  "locatable": true,
+  "question": "When did James take his 3 dogs to the beach?",
+  "answer": "August 9, 2022"
+ },
+ "conv-47_q43": {
+  "gold_sessions": [
+   22,
+   23,
+   24,
+   25
+  ],
+  "locatable": true,
+  "question": "When did John plan his next meeting with his siblings?",
+  "answer": "In September, 2022"
+ },
+ "conv-47_q46": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John and James meet at McGee's bar?",
+  "answer": "August 27, 2022"
+ },
+ "conv-47_q47": {
+  "gold_sessions": [
+   22,
+   23
+  ],
+  "locatable": true,
+  "question": "When did James ask Samantha to be his girlfriend?",
+  "answer": "September 3, 2022"
+ },
+ "conv-47_q48": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did James, Samantha and John go to the baseball game together?",
+  "answer": "September 11, 2022"
+ },
+ "conv-47_q50": {
+  "gold_sessions": [
+   22,
+   23,
+   24,
+   25
+  ],
+  "locatable": true,
+  "question": "When did James start taking cooking classes?",
+  "answer": "September 2, 2022"
+ },
+ "conv-47_q52": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John start working on his 2D Adventure mobile game?",
+  "answer": "approximately summer of 2022"
+ },
+ "conv-47_q53": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did it take for James to complete his Witcher-inspired game?",
+  "answer": "six months"
+ },
+ "conv-47_q55": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John and his programming friends host an online programming competition?",
+  "answer": "Last week before 13 October 2022."
+ },
+ "conv-47_q57": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did James' mother and her friend visit him?",
+  "answer": "October 19, 2022"
+ },
+ "conv-47_q58": {
+  "gold_sessions": [
+   26,
+   27,
+   28,
+   29
+  ],
+  "locatable": true,
+  "question": "When did James try Cyberpunk 2077 game?",
+  "answer": "October 20, 2022"
+ },
+ "conv-47_q59": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John and his gaming friends organize the charity tournament?",
+  "answer": "On the night of October 30 to 31, 2022"
+ },
+ "conv-47_q61": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What was James' big moment with Samantha in October 2023?",
+  "answer": "They decided to live together and rented an apartment not far from McGee's bar."
+ },
+ "conv-47_q62": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did James and Samantha date for before deciding to move in together?",
+  "answer": "nearly three months"
+ },
+ "conv-47_q63": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did James, his family and his dogs start on a road trip together?",
+  "answer": "November 4, 2022"
+ },
+ "conv-47_q64": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did John practice chess for before winning the chess tournament?",
+  "answer": "nearly four months"
+ },
+ "conv-47_q65": {
+  "gold_sessions": [
+   31
+  ],
+  "locatable": true,
+  "question": "When did James and his family visit Mark and Josh?",
+  "answer": "November 7, 2022"
+ },
+ "conv-47_q66": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did John work with a game developer on a project?",
+  "answer": "November 5-6, 2022"
+ },
+ "conv-48_q0": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What kind of project was Jolene working on in the beginning of January 2023?",
+  "answer": "electricity engineering project"
+ },
+ "conv-48_q2": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah`s mother pass away?",
+  "answer": "a few years before 2023"
+ },
+ "conv-48_q3": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene`s mother pass away?",
+  "answer": "in 2022"
+ },
+ "conv-48_q4": {
+  "gold_sessions": [
+   1
+  ],
+  "locatable": true,
+  "question": "When did Jolene's mom gift her a pendant?",
+  "answer": "in 2010"
+ },
+ "conv-48_q7": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which country were Jolene and her mother visiting in 2010?",
+  "answer": "France"
+ },
+ "conv-48_q9": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah's father pass away?",
+  "answer": "January 25, 2023"
+ },
+ "conv-48_q10": {
+  "gold_sessions": [
+   2
+  ],
+  "locatable": true,
+  "question": "When was Deborah's parents' wedding?",
+  "answer": "in 1993"
+ },
+ "conv-48_q12": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah receive an appreciation letter from her community?",
+  "answer": "January 26, 2023"
+ },
+ "conv-48_q17": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene buy her pet Seraphim?",
+  "answer": "in 2022"
+ },
+ "conv-48_q21": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When do Jolene and her partner plan to complete the game \"Walking Dead\"?",
+  "answer": "Saturday after 27 January, 2023"
+ },
+ "conv-48_q22": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah meet Anna?",
+  "answer": "31 January, 2023"
+ },
+ "conv-48_q26": {
+  "gold_sessions": [
+   4
+  ],
+  "locatable": true,
+  "question": "Which book did Jolene read in January 2023?",
+  "answer": "Avalanche by Neal Stephenson"
+ },
+ "conv-48_q27": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was Jolene in Bogota?",
+  "answer": "in summer 2022"
+ },
+ "conv-48_q29": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene have a mini-retreat to reflect on her career?",
+  "answer": "Wednesday before 9 February, 2023"
+ },
+ "conv-48_q30": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene have a dinner and drinks with her friends?",
+  "answer": "21 February, 2023"
+ },
+ "conv-48_q31": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was the last photo of Deborah and Karlie taken?",
+  "answer": "in summer 2022"
+ },
+ "conv-48_q32": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was Deborah in Bali?",
+  "answer": "in 2022"
+ },
+ "conv-48_q34": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which year did Jolene and her partner start dating?",
+  "answer": "2020"
+ },
+ "conv-48_q35": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah go for her first morning jog in a nearby park?",
+  "answer": "24 February, 2023"
+ },
+ "conv-48_q37": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene take Seraphim to the park?",
+  "answer": "Sunday before 2 March, 2023"
+ },
+ "conv-48_q38": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah start the yoga class in the neighborhood?",
+  "answer": "Friday before 13 March, 2023"
+ },
+ "conv-48_q43": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah go for a bicycle ride with Anna?",
+  "answer": "first week of April, 2023"
+ },
+ "conv-48_q44": {
+  "gold_sessions": [
+   12
+  ],
+  "locatable": true,
+  "question": "When did Deborah go to an art show with Anna?",
+  "answer": "on 9 April, 2023"
+ },
+ "conv-48_q45": {
+  "gold_sessions": [
+   25,
+   26,
+   29
+  ],
+  "locatable": true,
+  "question": "When did Jolene finish her robotics project?",
+  "answer": "May 2023"
+ },
+ "conv-48_q46": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did Jolene work on the robotics project given to her by her Professor?",
+  "answer": "four months"
+ },
+ "conv-48_q47": {
+  "gold_sessions": [
+   13
+  ],
+  "locatable": true,
+  "question": "When did Jolene do yoga at Talkeetna?",
+  "answer": "on 5 June, 2023"
+ },
+ "conv-48_q50": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which year did Jolene start practicing yoga?",
+  "answer": "2020"
+ },
+ "conv-48_q51": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene buy a new aquarium for Seraphim?",
+  "answer": "24 June, 2023"
+ },
+ "conv-48_q52": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene lose a lot of progress in her work?",
+  "answer": "last week of July 2023"
+ },
+ "conv-48_q53": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene adopt her snake Susie?",
+  "answer": "in 2021"
+ },
+ "conv-48_q54": {
+  "gold_sessions": [
+   2,
+   16,
+   28
+  ],
+  "locatable": true,
+  "question": "Which pet did Jolene adopt first - Susie or Seraphim?",
+  "answer": "Susie"
+ },
+ "conv-48_q55": {
+  "gold_sessions": [
+   2,
+   8,
+   14,
+   28
+  ],
+  "locatable": true,
+  "question": "Which pet did Jolene adopt more recently - Susie or Seraphim?",
+  "answer": "Seraphim"
+ },
+ "conv-48_q56": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah lead a meditation session during the sunset?",
+  "answer": "week before 16 August, 2023"
+ },
+ "conv-48_q57": {
+  "gold_sessions": [
+   17,
+   19
+  ],
+  "locatable": true,
+  "question": "When did Jolene gift her partner a new console?",
+  "answer": "17 August, 2023"
+ },
+ "conv-48_q60": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah go to a yoga retreat near her mom's place?",
+  "answer": "a week before 24 August,2023"
+ },
+ "conv-48_q65": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which country was Jolene located in during the last week of August 2023?",
+  "answer": "Brazil"
+ },
+ "conv-48_q66": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene and her partner return home from Rio de Janeiro?",
+  "answer": "29 August, 2023"
+ },
+ "conv-48_q68": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Deborah visit Brazil?",
+  "answer": "2020"
+ },
+ "conv-48_q71": {
+  "gold_sessions": [
+   16,
+   18,
+   20,
+   21
+  ],
+  "locatable": true,
+  "question": "When did Deborah go to a community meetup?",
+  "answer": "last week of August 2023"
+ },
+ "conv-48_q76": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Jolene and her partner try scuba diving lessons?",
+  "answer": "Friday before 17 September, 2023"
+ },
+ "conv-48_q78": {
+  "gold_sessions": [
+   27
+  ],
+  "locatable": true,
+  "question": "Where did Jolene and her partner spend most of September 2023?",
+  "answer": "Phuket"
+ },
+ "conv-48_q81": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did the Deboran and Jolene agree to go surfing?",
+  "answer": "in October 2023"
+ },
+ "conv-49_q4": {
+  "gold_sessions": [
+   1,
+   2,
+   8,
+   10,
+   11,
+   13,
+   20,
+   21
+  ],
+  "locatable": true,
+  "question": "Which hobby did Sam take up in May 2023?",
+  "answer": "painting"
+ },
+ "conv-49_q9": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan go to Jasper with his family?",
+  "answer": "weekend before May 24, 2023"
+ },
+ "conv-49_q12": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Sam first go to the doctor and find out he had a weight problem?",
+  "answer": "A few days before May 24, 2023."
+ },
+ "conv-49_q13": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan have his sudden heart palpitation incident that really shocked him up?",
+  "answer": "first week of June 2023"
+ },
+ "conv-49_q17": {
+  "gold_sessions": [
+   4
+  ],
+  "locatable": true,
+  "question": "When did Sam's friends mock him for being overweight?",
+  "answer": "Friday before 27 July 2023"
+ },
+ "conv-49_q22": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When Evan did meet his future wife?",
+  "answer": "week before August 7, 2023."
+ },
+ "conv-49_q23": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Sam start working out at the gym?",
+  "answer": "July 28, 2023"
+ },
+ "conv-49_q24": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What significant event happened in Sam's life towards the end of summer 2023?",
+  "answer": "He fell in love with a Canadian woman"
+ },
+ "conv-49_q25": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which year did Evan start taking care of his health seriously?",
+  "answer": "2021"
+ },
+ "conv-49_q30": {
+  "gold_sessions": [
+   6
+  ],
+  "locatable": true,
+  "question": "When Evan get back from a vacation with his SO?",
+  "answer": "August 13, 2023"
+ },
+ "conv-49_q35": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was Evan's son injured at soccer?",
+  "answer": "Saturday before August 15, 2023."
+ },
+ "conv-49_q39": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How many months lapsed between Sam's first and second doctor's appointment?",
+  "answer": "three months"
+ },
+ "conv-49_q40": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan start taking painting classes?",
+  "answer": "Few days before 19 August, 2023."
+ },
+ "conv-49_q41": {
+  "gold_sessions": [
+   8
+  ],
+  "locatable": true,
+  "question": "Which classes did Evan join in mid-August 2023?",
+  "answer": "painting classes"
+ },
+ "conv-49_q45": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "Which places in Canada was Evan visiting in July 2023?",
+  "answer": "Banff, Rocky Mountains"
+ },
+ "conv-49_q47": {
+  "gold_sessions": [
+   4
+  ],
+  "locatable": true,
+  "question": "When did Evan go skiing in Banff?",
+  "answer": "July 2023"
+ },
+ "conv-49_q52": {
+  "gold_sessions": [
+   1,
+   2,
+   8,
+   10,
+   11,
+   13,
+   20,
+   21
+  ],
+  "locatable": true,
+  "question": "Which activity do Evan and Sam plan on doing together during September 2023?",
+  "answer": "painting"
+ },
+ "conv-49_q53": {
+  "gold_sessions": [
+   10
+  ],
+  "locatable": true,
+  "question": "When did Evan and Sam decide to paint together?",
+  "answer": "Saturday after 11 September, 2023."
+ },
+ "conv-49_q58": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan start lifting weights?",
+  "answer": "October 2022"
+ },
+ "conv-49_q59": {
+  "gold_sessions": [
+   13,
+   14
+  ],
+  "locatable": true,
+  "question": "When did Sam and his friend decide to try kayaking?",
+  "answer": "October 14, 2023"
+ },
+ "conv-49_q60": {
+  "gold_sessions": [
+   13,
+   25
+  ],
+  "locatable": true,
+  "question": "Which new activity does Sam take up in October 2023?",
+  "answer": "kayaking"
+ },
+ "conv-49_q61": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What kind of stress was Sam dealing with in October 2023?",
+  "answer": "work-related stress"
+ },
+ "conv-49_q63": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When was Sam in the ER?",
+  "answer": "weekend before 17 October, 2023."
+ },
+ "conv-49_q66": {
+  "gold_sessions": [
+   11,
+   14
+  ],
+  "locatable": true,
+  "question": "When did Evan lose his job?",
+  "answer": "end of October 2023"
+ },
+ "conv-49_q67": {
+  "gold_sessions": [
+   18,
+   19,
+   20,
+   21,
+   22
+  ],
+  "locatable": true,
+  "question": "When did Evan and Sam planned a trip to the beach together?",
+  "answer": "December, 2023"
+ },
+ "conv-49_q68": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What was Sam doing on December 4, 2023?",
+  "answer": "Attending a Weight Watchers meeting"
+ },
+ "conv-49_q70": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did Evan and his partner date before getting married?",
+  "answer": "four months"
+ },
+ "conv-49_q73": {
+  "gold_sessions": [
+   25
+  ],
+  "locatable": true,
+  "question": "When is Evan planning a big family reunion?",
+  "answer": "Summer 2024"
+ },
+ "conv-49_q74": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan's son fall off his bike?",
+  "answer": "Thursday before December 17, 2023."
+ },
+ "conv-49_q75": {
+  "gold_sessions": [
+   25
+  ],
+  "locatable": true,
+  "question": "When did Evan announce his marriage to his extended family?",
+  "answer": "January 5, 2024"
+ },
+ "conv-49_q76": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan finish the painting that's hanging in the exhibit?",
+  "answer": "few days before 17 December, 2023."
+ },
+ "conv-49_q79": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When will Evan and his partner have their honeymoon in Canada?",
+  "answer": "February 2024"
+ },
+ "conv-49_q80": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Evan have a drunken night with his friends?",
+  "answer": "January 9, 2023"
+ },
+ "conv-50_q0": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Calvin first travel to Tokyo?",
+  "answer": "between 26 March and 20 April 2023"
+ },
+ "conv-50_q2": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Dave see Aerosmith perform live?",
+  "answer": "on the weekend before March 26, 2023"
+ },
+ "conv-50_q8": {
+  "gold_sessions": [
+   3,
+   4,
+   5,
+   6,
+   7,
+   11,
+   15,
+   18,
+   30
+  ],
+  "locatable": true,
+  "question": "When did Dave start his car maintenance shop?",
+  "answer": "May 1, 2023"
+ },
+ "conv-50_q9": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did a mishap occur with Calvin's musical gear and favorite mic?",
+  "answer": "On a week before 16 May, 2023"
+ },
+ "conv-50_q10": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Calvin's place get flooded in Tokyo?",
+  "answer": "On a week before 16 May, 2023"
+ },
+ "conv-50_q12": {
+  "gold_sessions": [
+   3,
+   6,
+   7,
+   30
+  ],
+  "locatable": true,
+  "question": "When was Calvin's concert in Tokyo?",
+  "answer": "last week of May 2023"
+ },
+ "conv-50_q14": {
+  "gold_sessions": [
+   8
+  ],
+  "locatable": true,
+  "question": "When did Calvin meet with the creative team for his new album?",
+  "answer": "8 June, 2023"
+ },
+ "conv-50_q16": {
+  "gold_sessions": [
+   10,
+   11
+  ],
+  "locatable": true,
+  "question": "When did Dave take a trip to mountainous regions?",
+  "answer": "July 2023"
+ },
+ "conv-50_q17": {
+  "gold_sessions": [
+   9
+  ],
+  "locatable": true,
+  "question": "When did Calvin have a car incident?",
+  "answer": "on the Friday before 21 June, 2023"
+ },
+ "conv-50_q25": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Dave host a card-playing night with his friends?",
+  "answer": "on the Friday before 22 August, 2023"
+ },
+ "conv-50_q26": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Calvin record a podcast with his friends?",
+  "answer": "21 August, 2023"
+ },
+ "conv-50_q27": {
+  "gold_sessions": [
+   16
+  ],
+  "locatable": true,
+  "question": "Which city was Calvin visiting in August 2023?",
+  "answer": "Miami"
+ },
+ "conv-50_q31": {
+  "gold_sessions": [
+   14
+  ],
+  "locatable": true,
+  "question": "Where was Dave in the last two weeks of August 2023?",
+  "answer": "San Francisco"
+ },
+ "conv-50_q34": {
+  "gold_sessions": [
+   17,
+   18,
+   19
+  ],
+  "locatable": true,
+  "question": "When did Dave return from San Francisco?",
+  "answer": "September 1, 2023"
+ },
+ "conv-50_q35": {
+  "gold_sessions": [
+   16
+  ],
+  "locatable": true,
+  "question": "When did Calvin book flight tickets to Boston?",
+  "answer": "last week of August 2023"
+ },
+ "conv-50_q36": {
+  "gold_sessions": [
+   18
+  ],
+  "locatable": true,
+  "question": "When was Calvin's album released?",
+  "answer": "September 11, 2023"
+ },
+ "conv-50_q38": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Dave have a great jam session with his band?",
+  "answer": "September 14, 2023"
+ },
+ "conv-50_q43": {
+  "gold_sessions": [
+   1,
+   2,
+   3,
+   7,
+   8,
+   15,
+   17,
+   18,
+   19,
+   21,
+   24,
+   26,
+   27,
+   29,
+   30
+  ],
+  "locatable": true,
+  "question": "Which city was Calvin at on October 3, 2023?",
+  "answer": "Boston"
+ },
+ "conv-50_q44": {
+  "gold_sessions": [
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27
+  ],
+  "locatable": true,
+  "question": "When did Calvin met with local artists in Boston?",
+  "answer": "October 3, 2023"
+ },
+ "conv-50_q48": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "What was Dave doing in the first weekend of October 2023?",
+  "answer": "attending a car show"
+ },
+ "conv-50_q50": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Calvin buy his second Ferrari?",
+  "answer": "first week of October 2023"
+ },
+ "conv-50_q51": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Calvin and Frank Ocean start collaborating?",
+  "answer": "August 2022"
+ },
+ "conv-50_q52": {
+  "gold_sessions": [
+   28,
+   29,
+   30
+  ],
+  "locatable": true,
+  "question": "When did Calvin plan on travelling to Tokyo the second time?",
+  "answer": "November 2023"
+ },
+ "conv-50_q55": {
+  "gold_sessions": [
+   24
+  ],
+  "locatable": true,
+  "question": "When did Calvin visit some of the sights in Boston with a former high school friend?",
+  "answer": "October 24, 2023"
+ },
+ "conv-50_q57": {
+  "gold_sessions": [
+   27,
+   30
+  ],
+  "locatable": true,
+  "question": "Which hobby did Dave pick up in October 2023?",
+  "answer": "photography"
+ },
+ "conv-50_q61": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long did Dave's work on the Ford Mustang take?",
+  "answer": "nearly two months"
+ },
+ "conv-50_q62": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "How long was the car modification workshop in San Francisco?",
+  "answer": "two weeks"
+ },
+ "conv-50_q65": {
+  "gold_sessions": [
+   17,
+   18,
+   19,
+   20
+  ],
+  "locatable": true,
+  "question": "When did Dave take a photo of a Boston clock tower?",
+  "answer": "September 2023"
+ },
+ "conv-50_q67": {
+  "gold_sessions": [
+   3,
+   6,
+   7,
+   14,
+   15,
+   24
+  ],
+  "locatable": true,
+  "question": "Where was Calvin located in the last week of October 2023?",
+  "answer": "Tokyo"
+ },
+ "conv-50_q68": {
+  "gold_sessions": [
+   23
+  ],
+  "locatable": true,
+  "question": "When did Dave find the car he repaired and started sharing in his blog?",
+  "answer": "last week of October 2023"
+ },
+ "conv-50_q69": {
+  "gold_sessions": [
+   28,
+   29,
+   30
+  ],
+  "locatable": true,
+  "question": "When did Dave buy a vintage camera?",
+  "answer": "November 2023"
+ },
+ "conv-50_q70": {
+  "gold_sessions": [],
+  "locatable": false,
+  "question": "When did Calvin attend a gala in Boston?",
+  "answer": "November 16, 2023"
+ }
+}
