@@ -1525,7 +1525,51 @@ impl super::MemorySystem {
             // don't matter. Weight is split from semantic_w to avoid inflating total.
             let use_dual = query.dual_index.unwrap_or(true);
             if use_dual {
-                if let Some(ref sec_emb) = query_embedding_secondary {
+                // When a learned secondary→primary alignment is installed for the
+                // active (primary, secondary) pair, route the secondary leg through
+                // the *aligned* path: encode the query with the secondary model,
+                // project it into primary space, and search the PRIMARY index. This
+                // lets the 768d secondary contribute in a space the primary index
+                // actually shares, instead of only competing inside the separate
+                // secondary Vamana. Gated on `has_alignment()` so the no-alignment
+                // path below is byte-identical to before.
+                let aligned_results: Option<Vec<(MemoryId, f32)>> = if self
+                    .embedder
+                    .has_alignment()
+                {
+                    match self
+                        .retriever
+                        .search_ids_aligned(query_text, query.max_results * 8)
+                    {
+                        Ok(r) if !r.is_empty() => Some(r),
+                        Ok(_) => Some(Vec::new()),
+                        Err(e) => {
+                            tracing::warn!("Aligned secondary search failed (non-fatal): {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(aligned) = aligned_results {
+                    if !aligned.is_empty() {
+                        let sec_ratio = self
+                            .cognitive_dials
+                            .read()
+                            .secondary_rrf_ratio
+                            .unwrap_or(SECONDARY_RRF_WEIGHT_RATIO);
+                        let sec_w = semantic_w * sec_ratio;
+                        for (r, (id, _)) in aligned.iter().enumerate() {
+                            *fused.entry(id.clone()).or_insert(0.0) += sec_w / (k + (r + 1) as f32);
+                        }
+                        tracing::debug!(
+                            "Layer 4 RRF: aligned secondary (projected→primary) added {} results (w={:.2})",
+                            aligned.len(),
+                            sec_w
+                        );
+                    }
+                } else if let Some(ref sec_emb) = query_embedding_secondary {
                     match self.retriever.search_ids_secondary(sec_emb, query.max_results * 8) {
                         Ok(sec_results) if !sec_results.is_empty() => {
                             // Use fraction of semantic weight for secondary — it's a refinement
