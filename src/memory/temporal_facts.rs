@@ -1218,10 +1218,64 @@ pub fn extract_temporal_facts(
             .iter()
             .find(|e| sentence_lower.contains(&e.to_lowercase()));
 
-        if mentioned_entity.is_none() {
-            continue;
-        }
-        let entity = mentioned_entity.unwrap().clone();
+        // GAP-3: If no NER entity matched, fall back to first-person/second-person
+        // pronoun subjects when a clear time+event signal is present.  The
+        // pronoun check is conservative: we only activate it when the sentence
+        // contains a recognisable temporal expression AND a past/planning verb
+        // form, to avoid creating noisy facts from unrelated pronoun sentences.
+        let entity: String = if let Some(e) = mentioned_entity {
+            e.clone()
+        } else {
+            // Require a time signal in the sentence.
+            let has_time_signal = !extract_time_expression(&sentence_lower).is_empty()
+                || parse_in_n_units(&sentence_lower).is_some()
+                || extract_explicit_date_from_sentence(sentence, conversation_date).is_some();
+
+            if !has_time_signal {
+                continue;
+            }
+
+            // Require a past or planning verb form.
+            let past_verbs = [
+                "went", "ran", "did", "took", "made", "had", "got", "saw", "met",
+                "was", "were", "attended", "visited", "started", "finished",
+                "completed", "joined", "left",
+            ];
+            let planning_verbs = [
+                "planning", "going", "thinking", "want", "hope", "will", "would",
+                "am", "are", "is",
+            ];
+            let has_verb = past_verbs.iter().any(|v| {
+                // word-boundary check: surrounded by non-alpha on both sides
+                let lc = &sentence_lower;
+                lc.split_whitespace()
+                    .any(|w| w.trim_matches(|c: char| !c.is_alphabetic()) == *v)
+            }) || planning_verbs.iter().any(|v| sentence_lower.contains(v));
+
+            if !has_verb {
+                continue;
+            }
+
+            // Map pronoun to generic entity label.
+            if sentence_lower.split_whitespace().any(|w| {
+                let w = w.trim_matches(|c: char| !c.is_alphabetic());
+                w == "i" || w == "i've" || w == "i'm" || w == "i'd" || w == "i'll"
+            }) {
+                "speaker".to_string()
+            } else if sentence_lower.split_whitespace().any(|w| {
+                let w = w.trim_matches(|c: char| !c.is_alphabetic());
+                w == "we" || w == "we've" || w == "we're" || w == "we'll"
+            }) {
+                "group".to_string()
+            } else if sentence_lower.split_whitespace().any(|w| {
+                let w = w.trim_matches(|c: char| !c.is_alphabetic());
+                w == "you" || w == "you've" || w == "you're"
+            }) {
+                "listener".to_string()
+            } else {
+                continue;
+            }
+        };
 
         // Try to extract temporal facts using patterns
         if let Some(fact) =
@@ -1268,7 +1322,10 @@ fn extract_planning_fact(
         "soon",
     ];
 
-    let has_planning = planning_patterns.iter().any(|p| sentence_lower.contains(p));
+    // GAP-2: "in N days/weeks/months" is also a planning/future indicator
+    let has_in_n = parse_in_n_units(&sentence_lower).is_some();
+
+    let has_planning = planning_patterns.iter().any(|p| sentence_lower.contains(p)) || has_in_n;
     if !has_planning {
         return None;
     }
@@ -1402,7 +1459,53 @@ fn extract_historical_fact(
 ) -> Option<TemporalFact> {
     let sentence_lower = sentence.to_lowercase();
 
-    // Look for year references (historical)
+    // GAP-1: Try explicit date patterns first (full/partial dates → ExactDate/MonthYear).
+    // This covers "May 8, 2023", "8 May 2023", "2023-05-08", "May 2023", "May 8" (conv year),
+    // "8 May" (conv year).  Dates in the conversation year are treated as Occurred-class facts
+    // here; dates strictly before the conversation year remain Historical.
+    if let Some((resolved_time, time_text)) =
+        extract_explicit_date_from_sentence(sentence, conversation_date)
+    {
+        // Only proceed if the date is not in the future relative to the conversation.
+        let is_future = match &resolved_time {
+            ResolvedTime::ExactDate(d) => *d > conversation_date.date_naive(),
+            ResolvedTime::MonthYear { month, year } => {
+                let conv_naive = conversation_date.date_naive();
+                (*year > conv_naive.year())
+                    || (*year == conv_naive.year() && *month > conv_naive.month())
+            }
+            _ => false,
+        };
+        if !is_future {
+            let event = extract_event_from_sentence(sentence);
+            if !event.is_empty() {
+                let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
+                let event_stems: Vec<String> = event
+                    .split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .map(|w| stemmer.stem(&w.to_lowercase()).to_string())
+                    .filter(|s| s != &entity_stem)
+                    .collect();
+                return Some(TemporalFact {
+                    id: format!("tf-{}-{}", memory_id.0, uuid::Uuid::new_v4()),
+                    entity: entity.to_string(),
+                    event: event.clone(),
+                    event_stems,
+                    event_type: EventType::Historical,
+                    relative_time: Some(time_text),
+                    resolved_time,
+                    source_memory_id: memory_id.clone(),
+                    conversation_date,
+                    confidence: 0.90,
+                    source_text: sentence.to_string(),
+                    valid_from: Some(conversation_date),
+                    valid_until: None,
+                });
+            }
+        }
+    }
+
+    // Fallback: bare 4-digit year reference (original behaviour — unchanged).
     let year_pattern = regex::Regex::new(r"\b(19|20)\d{2}\b").ok()?;
     let year_match = year_pattern.find(&sentence_lower)?;
     let year: i32 = year_match.as_str().parse().ok()?;
@@ -1460,6 +1563,157 @@ fn extract_event_and_time(sentence: &str, patterns: &[&str]) -> (String, String)
     let event = extract_event_from_sentence(sentence);
 
     (event, relative_time)
+}
+
+/// Parse "in N days/weeks/months" future expressions.
+///
+/// Returns `Some((n, unit_in_days_or_none))` where:
+/// - `unit_in_days_or_none = Some(days)` for day/week expressions,
+/// - `unit_in_days_or_none = None` for month expressions (calendar-correct).
+///
+/// Returns `None` for unrecognised or malformed expressions.
+fn parse_in_n_units(expr: &str) -> Option<(i64, InNUnit)> {
+    // Match "in (a|an|N) (day|days|week|weeks|month|months)"
+    let re = regex::Regex::new(
+        r"(?i)\bin\s+(a|an|one|two|three|four|five|six|seven|eight|nine|ten|[0-9]+)\s+(day|days|week|weeks|month|months)\b",
+    )
+    .ok()?;
+    let cap = re.captures(expr)?;
+
+    let n: i64 = match cap[1].to_lowercase().as_str() {
+        "a" | "an" | "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        s => s.parse().ok()?,
+    };
+
+    let unit = match cap[2].to_lowercase().as_str() {
+        "day" | "days" => InNUnit::DaysOrWeeks(n),
+        "week" | "weeks" => InNUnit::DaysOrWeeks(n * 7),
+        "month" | "months" => InNUnit::Months,
+        _ => return None,
+    };
+
+    Some((n, unit))
+}
+
+/// Unit classification returned by `parse_in_n_units`.
+enum InNUnit {
+    /// Calendar-month addition: resolve to `MonthYear`.
+    Months,
+    /// Day/week: exact day-count, resolve to `ExactDate`.
+    DaysOrWeeks(i64),
+}
+
+/// Parse explicit absolute-date patterns from a sentence.
+///
+/// Handles (all case-insensitive):
+///   - "Month Day, Year"  → ExactDate  ("May 8, 2023")
+///   - "Day Month Year"   → ExactDate  ("8 May 2023")
+///   - "YYYY-MM-DD"       → ExactDate
+///   - "Month Year"       → MonthYear  ("May 2023")
+///   - "Month Day" / "Day Month" (no year) → ExactDate anchored to conv year
+///
+/// Returns the *most precise* match found, or `None`.
+fn extract_explicit_date_from_sentence(
+    sentence: &str,
+    conversation_date: DateTime<Utc>,
+) -> Option<(ResolvedTime, String)> {
+    let months = [
+        ("january", 1u32), ("jan", 1), ("february", 2), ("feb", 2),
+        ("march", 3), ("mar", 3), ("april", 4), ("apr", 4), ("may", 5),
+        ("june", 6), ("jun", 6), ("july", 7), ("jul", 7), ("august", 8),
+        ("aug", 8), ("september", 9), ("sep", 9), ("sept", 9),
+        ("october", 10), ("oct", 10), ("november", 11), ("nov", 11),
+        ("december", 12), ("dec", 12),
+    ];
+
+    let conv_year = conversation_date.year();
+
+    // -- ISO: YYYY-MM-DD --
+    if let Some(cap) = regex::Regex::new(r"\b(\d{4})-(\d{2})-(\d{2})\b").ok()?.captures(sentence) {
+        let year: i32 = cap[1].parse().ok()?;
+        let month: u32 = cap[2].parse().ok()?;
+        let day: u32 = cap[3].parse().ok()?;
+        if (1900..=2100).contains(&year) {
+            if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
+                return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
+            }
+        }
+    }
+
+    let s_lower = sentence.to_lowercase();
+
+    // -- Month Day, Year  OR  Month Day Year  ("May 8, 2023" / "May 8 2023") --
+    for &(month_name, month_num) in &months {
+        // "May 8, 2023" or "May 8 2023"
+        let pat = format!(r"(?i)\b{}\s+(\d{{1,2}}),?\s+(\d{{4}})\b", regex::escape(month_name));
+        if let Ok(re) = regex::Regex::new(&pat) {
+            if let Some(cap) = re.captures(&s_lower) {
+                let day: u32 = cap[1].parse().ok()?;
+                let year: i32 = cap[2].parse().ok()?;
+                if (1900..=2100).contains(&year) {
+                    if let Some(d) = NaiveDate::from_ymd_opt(year, month_num, day) {
+                        return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
+                    }
+                }
+            }
+        }
+        // "8 May 2023" or "8 May, 2023"
+        let pat2 = format!(r"(?i)\b(\d{{1,2}})\s+{},?\s+(\d{{4}})\b", regex::escape(month_name));
+        if let Ok(re) = regex::Regex::new(&pat2) {
+            if let Some(cap) = re.captures(&s_lower) {
+                let day: u32 = cap[1].parse().ok()?;
+                let year: i32 = cap[2].parse().ok()?;
+                if (1900..=2100).contains(&year) {
+                    if let Some(d) = NaiveDate::from_ymd_opt(year, month_num, day) {
+                        return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
+                    }
+                }
+            }
+        }
+        // "May 2023" (month + year, no day)
+        let pat3 = format!(r"(?i)\b{}\s+(\d{{4}})\b", regex::escape(month_name));
+        if let Ok(re) = regex::Regex::new(&pat3) {
+            if let Some(cap) = re.captures(&s_lower) {
+                let year: i32 = cap[1].parse().ok()?;
+                if (1900..=2100).contains(&year) {
+                    return Some((
+                        ResolvedTime::MonthYear { month: month_num, year },
+                        cap[0].to_string(),
+                    ));
+                }
+            }
+        }
+        // "May 8" or "8 May" (no year — anchor to conversation year)
+        let pat4 = format!(r"(?i)\b{}\s+(\d{{1,2}})\b", regex::escape(month_name));
+        if let Ok(re) = regex::Regex::new(&pat4) {
+            if let Some(cap) = re.captures(&s_lower) {
+                let day: u32 = cap[1].parse().ok()?;
+                if let Some(d) = NaiveDate::from_ymd_opt(conv_year, month_num, day) {
+                    return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
+                }
+            }
+        }
+        let pat5 = format!(r"(?i)\b(\d{{1,2}})\s+{}\b", regex::escape(month_name));
+        if let Ok(re) = regex::Regex::new(&pat5) {
+            if let Some(cap) = re.captures(&s_lower) {
+                let day: u32 = cap[1].parse().ok()?;
+                if let Some(d) = NaiveDate::from_ymd_opt(conv_year, month_num, day) {
+                    return Some((ResolvedTime::ExactDate(d), cap[0].to_string()));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Extract time expression from sentence
@@ -1592,6 +1846,16 @@ fn extract_time_expression(sentence: &str) -> String {
             let last_two = words[words.len() - 2..].join(" ");
             return format!("{} ago", last_two);
         }
+    }
+
+    // GAP-2: "in N days/weeks/months" future expressions
+    if let Some(cap) = regex::Regex::new(
+        r"(?i)\bin\s+(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|[0-9]+)\s+(?:day|days|week|weeks|month|months)\b",
+    )
+    .ok()
+    .and_then(|re| re.find(sentence))
+    {
+        return cap.as_str().to_string();
     }
 
     String::new()
@@ -2004,6 +2268,24 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
     if let Ok(year) = relative_lower.trim().parse::<i32>() {
         if (1900..2100).contains(&year) {
             return ResolvedTime::Year(year);
+        }
+    }
+
+    // GAP-2: "in N days/weeks/months" — future offsets from conversation_date
+    if relative_lower.contains("in ") {
+        if let Some((n, unit)) = parse_in_n_units(&relative_lower) {
+            match unit {
+                InNUnit::Months => {
+                    let total_months = conv_date.month() as i64 + n;
+                    let extra_years = (total_months - 1) / 12;
+                    let month = ((total_months - 1) % 12 + 1) as u32;
+                    let year = conv_date.year() + extra_years as i32;
+                    return ResolvedTime::MonthYear { month, year };
+                }
+                InNUnit::DaysOrWeeks(days) => {
+                    return ResolvedTime::ExactDate(conv_date + Duration::days(days));
+                }
+            }
         }
     }
 
@@ -3060,6 +3342,191 @@ mod tests {
                 "R5 behavior must be unchanged: expected After(wedding_date), got {other:?}"
             ),
         }
+    }
+
+    // =========================================================================
+    // GAP-1: Explicit date extraction — ExactDate / MonthYear
+    // =========================================================================
+
+    /// "Caroline attended on 8 May 2023" with conv date 2023-05-25 →
+    /// Historical fact with ExactDate(2023-05-08) (full date) or MonthYear(5,2023).
+    #[test]
+    fn test_gap1_explicit_date_full() {
+        use super::super::types::MemoryId;
+        use rust_stemmers::{Algorithm, Stemmer};
+
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+        let stemmer = Stemmer::create(Algorithm::English);
+        let entity = "Caroline";
+
+        let fact = extract_historical_fact(
+            "Caroline attended on 8 May 2023",
+            entity,
+            &memory_id,
+            conv,
+            &stemmer,
+        )
+        .expect("should extract a fact for '8 May 2023'");
+
+        assert!(
+            matches!(
+                fact.resolved_time,
+                ResolvedTime::ExactDate(d) if d == NaiveDate::from_ymd_opt(2023, 5, 8).unwrap()
+            ),
+            "expected ExactDate(2023-05-08), got {:?}",
+            fact.resolved_time
+        );
+    }
+
+    /// "Caroline attended on May 2023" → MonthYear { month: 5, year: 2023 }.
+    #[test]
+    fn test_gap1_explicit_date_month_year() {
+        use super::super::types::MemoryId;
+        use rust_stemmers::{Algorithm, Stemmer};
+
+        let conv = DateTime::parse_from_rfc3339("2023-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+        let stemmer = Stemmer::create(Algorithm::English);
+        let entity = "Caroline";
+
+        let fact = extract_historical_fact(
+            "Caroline attended the event in May 2023",
+            entity,
+            &memory_id,
+            conv,
+            &stemmer,
+        )
+        .expect("should extract a fact for 'May 2023'");
+
+        assert!(
+            matches!(
+                fact.resolved_time,
+                ResolvedTime::MonthYear { month: 5, year: 2023 }
+            ),
+            "expected MonthYear(5, 2023), got {:?}",
+            fact.resolved_time
+        );
+    }
+
+    // =========================================================================
+    // GAP-2: "in N units" future extraction
+    // =========================================================================
+
+    /// "the conference is in 3 weeks" with conv date 2023-06-01 →
+    /// planning fact with ExactDate(~2023-06-22).
+    #[test]
+    fn test_gap2_in_n_weeks_future() {
+        use super::super::types::MemoryId;
+        use rust_stemmers::{Algorithm, Stemmer};
+
+        let conv = DateTime::parse_from_rfc3339("2023-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let memory_id = MemoryId(uuid::Uuid::new_v4());
+        let stemmer = Stemmer::create(Algorithm::English);
+        let entity = "conference";
+
+        let fact = extract_planning_fact(
+            "the conference is in 3 weeks",
+            entity,
+            &memory_id,
+            conv,
+            &stemmer,
+        )
+        .expect("should extract a planning fact for 'in 3 weeks'");
+
+        let expected = NaiveDate::from_ymd_opt(2023, 6, 22).unwrap();
+        assert!(
+            matches!(fact.resolved_time, ResolvedTime::ExactDate(d) if d == expected),
+            "expected ExactDate(2023-06-22), got {:?}",
+            fact.resolved_time
+        );
+    }
+
+    /// resolve_relative_time: "in a month" from 2023-06-01 → MonthYear { month: 7, year: 2023 }.
+    #[test]
+    fn test_gap2_in_a_month_resolves() {
+        let conv = DateTime::parse_from_rfc3339("2023-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        match resolve_relative_time("in a month", conv) {
+            ResolvedTime::MonthYear { month, year } => {
+                assert_eq!(month, 7, "one month after June is July");
+                assert_eq!(year, 2023);
+            }
+            other => panic!("expected MonthYear(7, 2023), got {other:?}"),
+        }
+    }
+
+    /// resolve_relative_time: "in 2 days" from 2023-06-01 → ExactDate(2023-06-03).
+    #[test]
+    fn test_gap2_in_n_days_resolves() {
+        let conv = DateTime::parse_from_rfc3339("2023-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected = NaiveDate::from_ymd_opt(2023, 6, 3).unwrap();
+        match resolve_relative_time("in 2 days", conv) {
+            ResolvedTime::ExactDate(d) => assert_eq!(d, expected),
+            other => panic!("expected ExactDate(2023-06-03), got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // GAP-3: Pronoun-entity fallback
+    // =========================================================================
+
+    /// "I got my first two turtles three years ago" with NO 'speaker' in entities
+    /// → still creates a fact via pronoun fallback with entity = "speaker",
+    /// resolved to Year(conv_year - 3).
+    #[test]
+    fn test_gap3_pronoun_fallback_no_entity() {
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        // Empty entity list — no NER match possible.
+        let facts = extract_temporal_facts(
+            "I got my first two turtles three years ago",
+            &memory_id,
+            conv,
+            &[],
+        );
+
+        assert!(!facts.is_empty(), "pronoun fallback must produce at least one fact");
+        let fact = &facts[0];
+        assert_eq!(fact.entity, "speaker", "fallback entity must be 'speaker'");
+        assert!(
+            matches!(fact.resolved_time, ResolvedTime::Year(2020)),
+            "3 years before 2023 = Year(2020), got {:?}",
+            fact.resolved_time
+        );
+    }
+
+    /// GAP-3 does not fire on a sentence with NO time signal (no noise).
+    #[test]
+    fn test_gap3_no_spurious_fact_without_time_signal() {
+        let conv = DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let memory_id = super::super::types::MemoryId(uuid::Uuid::new_v4());
+
+        let facts = extract_temporal_facts(
+            "I really enjoy hiking in the mountains",
+            &memory_id,
+            conv,
+            &[],
+        );
+
+        assert!(
+            facts.is_empty(),
+            "no time signal → no pronoun-fallback fact; got {facts:?}"
+        );
     }
 
     /// (c) Cycle: A references "after B event", B references "after A event".
