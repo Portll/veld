@@ -1820,6 +1820,30 @@ impl MemorySystem {
             }
         }
 
+        // DUAL-EMBEDDER: compute the secondary (768d) embedding on the live
+        // deferred-ingest path so the secondary Vamana actually populates.
+        // Mirrors remember_with_id() (the MIF-import path). Without this,
+        // embed_and_index() set only the primary embedding, so
+        // RetrievalEngine::index_memory() skipped the secondary add_vector and
+        // the 768d secondary index stayed empty — dual retrieval contributed
+        // nothing. Reversion guard: when no secondary model is configured
+        // (has_secondary() == false, the common case) this is a byte-identical
+        // no-op. Uses the same enriched searchable text as the primary so the
+        // two indexes stay consistent.
+        if memory.experience.embeddings_secondary.is_none() && self.embedder.has_secondary() {
+            let secondary_text =
+                crate::memory::retrieval::RetrievalEngine::extract_searchable_text(&memory);
+            if let Ok(Some(secondary)) = self.embedder.encode_secondary(&secondary_text) {
+                memory.experience.embeddings_secondary = Some(secondary);
+                // Persist so restarts retain the secondary embedding (parity with
+                // the primary, which is persisted above). No-op for the no-secondary
+                // common case since this branch is skipped entirely.
+                if let Err(e) = self.long_term_memory.update(&memory) {
+                    tracing::warn!("Failed to persist background secondary embedding: {e}");
+                }
+            }
+        }
+
         // Vector index (uses pre-computed embedding for short content, re-embeds chunks)
         let memory_arc = Arc::new(memory);
         if let Err(e) = self.retriever.index_memory(&memory_arc) {
