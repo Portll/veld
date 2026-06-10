@@ -958,7 +958,7 @@ fn test_consolidation_report_after_maintenance() {
     }
 
     // Run maintenance to potentially trigger decay events (0.95 = standard decay factor)
-    system.run_maintenance(0.95, "test-user", false).unwrap();
+    system.run_maintenance(0.95, "test-user", false, false).unwrap();
 
     // Get report
     let report = system.get_consolidation_report(epoch(), None);
@@ -1118,7 +1118,7 @@ fn test_consolidation_report_stats_consistency() {
     }
 
     // Run maintenance with standard decay factor
-    system.run_maintenance(0.95, "test-user", false).unwrap();
+    system.run_maintenance(0.95, "test-user", false, false).unwrap();
 
     // Get report
     let report = system.get_consolidation_report(epoch(), None);
@@ -1344,4 +1344,164 @@ fn test_consolidation_event_count() {
         final_count > initial_count,
         "Event count should increase after operations"
     );
+}
+
+// =============================================================================
+// W4: UNIFIED FACT PATH + SINGLE WATERMARK OWNER
+// =============================================================================
+//
+// These tests pin the W4 invariants at the orchestration level. They are
+// deliberately embedder-independent: the fact-extraction watermark now advances
+// from the HEAVY path whenever it runs over a non-empty window, regardless of
+// whether any fact was actually embedded/extracted. That makes the cursor
+// behavior observable in a test environment without ONNX models.
+
+/// W4 test 6 — Watermark ownership.
+///
+/// `distill_facts` MUST NOT advance the persisted fact-extraction watermark.
+/// `run_maintenance` (heavy) IS the single owner and advances it to
+/// max(created_at) of the processed window.
+#[test]
+fn test_w4_watermark_single_owner() {
+    let (system, _temp) = setup_memory_system();
+
+    for i in 0..6 {
+        system
+            .remember(create_experience(&format!("watermark owner memory {i}")), None)
+            .unwrap();
+    }
+
+    // Before any consolidation cycle: no persisted watermark.
+    assert!(
+        system.persisted_fact_watermark("test-user").is_none(),
+        "watermark should be unset before any heavy cycle"
+    );
+
+    // distill_facts reads the watermark but must NEVER advance it.
+    let _ = system
+        .distill_facts("test-user", 2, 7)
+        .expect("distill_facts should succeed");
+    assert!(
+        system.persisted_fact_watermark("test-user").is_none(),
+        "distill_facts must NOT advance the persisted watermark (single-owner = heavy path)"
+    );
+
+    // run_maintenance (heavy, facts_already_distilled=true) is the single owner:
+    // it advances the watermark to the window high-water mark even though the
+    // handler already distilled.
+    system
+        .run_maintenance(0.95, "test-user", true, true)
+        .expect("heavy maintenance should succeed");
+
+    let wm_after = system.persisted_fact_watermark("test-user");
+    assert!(
+        wm_after.is_some(),
+        "heavy run_maintenance must advance (own) the persisted watermark"
+    );
+    let wm_val = wm_after.unwrap();
+    assert!(
+        wm_val > 0,
+        "advanced watermark should be a real created_at timestamp, got {wm_val}"
+    );
+    // Watermark must not run ahead of 'now' (advances to max(created_at), not a
+    // future sentinel).
+    assert!(
+        wm_val <= chrono::Utc::now().timestamp_millis(),
+        "watermark advanced past now(): {wm_val}"
+    );
+}
+
+/// W4 test 4 — No starvation across the handler order (distill → maintenance).
+///
+/// Replays the exact handler sequence: distill_facts FIRST, then heavy
+/// run_maintenance with facts_already_distilled=true. The heavy path must not
+/// be starved of the watermark advance (W4 relocates the advance OUT of the
+/// fact/dirty-flag branch). A second back-to-back heavy maintenance over the
+/// now-consumed window must not regress the cursor — proving idempotency of the
+/// advance and that the unified path does not re-process the same window.
+#[test]
+fn test_w4_no_starvation_handler_order() {
+    let (system, _temp) = setup_memory_system();
+
+    for i in 0..8 {
+        system
+            .remember(create_experience(&format!("no-starvation memory {i}")), None)
+            .unwrap();
+    }
+
+    // Handler order: distill first (no watermark change), then heavy maintenance
+    // (advances watermark — the heavy path is NOT starved).
+    let _ = system.distill_facts("test-user", 2, 7).unwrap();
+    assert!(
+        system.persisted_fact_watermark("test-user").is_none(),
+        "distill must not advance watermark"
+    );
+
+    system
+        .run_maintenance(0.95, "test-user", true, true)
+        .expect("first heavy maintenance");
+    let wm1 = system
+        .persisted_fact_watermark("test-user")
+        .expect("heavy maintenance must advance watermark");
+
+    // Second back-to-back heavy maintenance: window is now consumed (all
+    // memories are <= watermark), so the cursor must NOT regress.
+    system
+        .run_maintenance(0.95, "test-user", true, true)
+        .expect("second heavy maintenance");
+    let wm2 = system
+        .persisted_fact_watermark("test-user")
+        .expect("watermark still present");
+
+    assert!(
+        wm2 >= wm1,
+        "watermark regressed across back-to-back heavy cycles: {wm1} -> {wm2}"
+    );
+}
+
+/// W3/W4 test 8 — Forget-nothing.
+///
+/// veld forgets NOTHING — episodic memory is the permanent source of truth and
+/// the SemanticFact layer (plus W3 candidate staging) is only a retrieval-speed
+/// cache. After running the full consolidation handler order (distill_facts +
+/// heavy run_maintenance, which exercises staging + promotion + TTL/cap
+/// eviction), EVERY source episodic memory must still be retrievable. No episode
+/// is ever deleted by promotion or eviction.
+#[test]
+fn test_w3w4_forget_nothing_after_consolidation() {
+    let (system, _temp) = setup_memory_system();
+
+    // Record a recurring pattern plus some one-offs.
+    let mut ids: Vec<MemoryId> = Vec::new();
+    for i in 0..6 {
+        let id = system
+            .remember(
+                create_experience(&format!("Always run cargo check before commit ({i})")),
+                None,
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    for i in 0..4 {
+        let id = system
+            .remember(create_experience(&format!("unrelated note {i}")), None)
+            .unwrap();
+        ids.push(id);
+    }
+
+    // Full handler order: distill (stages candidates) then heavy maintenance
+    // (promotes, evicts) — both under the same write path.
+    let _ = system.distill_facts("test-user", 2, 7).unwrap();
+    system
+        .run_maintenance(0.95, "test-user", true, true)
+        .expect("heavy maintenance");
+
+    // Every source episodic memory remains retrievable — forget-nothing holds.
+    for id in &ids {
+        let got = system.get_memory(id);
+        assert!(
+            got.is_ok(),
+            "source episodic memory {id:?} was lost after consolidation/eviction"
+        );
+    }
 }

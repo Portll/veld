@@ -172,7 +172,9 @@ pub async fn consolidate_memories(
             let uid = user_id.clone();
             match tokio::task::spawn_blocking(move || {
                 let memory_guard = memory.read();
-                memory_guard.run_maintenance(decay_factor, &uid, true)
+                // facts_already_distilled = true: distill_facts (Step 1) already
+                // ran over this window under the same CONSOLIDATION_LOCKS guard.
+                memory_guard.run_maintenance(decay_factor, &uid, true, true)
             })
             .await
             {
@@ -573,7 +575,9 @@ pub async fn sleep_phase_consolidation(
             let uid = user_id.clone();
             match tokio::task::spawn_blocking(move || {
                 let memory_guard = memory.read();
-                memory_guard.run_maintenance(decay_factor, &uid, true)
+                // facts_already_distilled = true: Phase 1 distill_facts already
+                // ran over this window under the same CONSOLIDATION_LOCKS guard.
+                memory_guard.run_maintenance(decay_factor, &uid, true, true)
             })
             .await
             {

@@ -33,6 +33,59 @@ pub struct FactStats {
     pub avg_support: f32,
 }
 
+/// W3 cross-window promotion candidate (persisted staging row).
+///
+/// Sub-threshold pattern clusters (distinct-source support < `min_support` in a
+/// single consolidation window) are accumulated here instead of being
+/// discarded. Keyed `fact_candidate:{user_id}:{signature}` where `signature` is
+/// the deterministic hash of the cluster's stemmed token set, so the same
+/// pattern seen once per window across separate windows accrues against ONE row.
+///
+/// `accumulated_support` is the count of DISTINCT source memories seen across
+/// all windows (consistent with the W1/W2 distinct-source promotion rule). When
+/// it reaches `min_support`, the candidate is promoted to a `SemanticFact` via
+/// the unified persist/reinforce path and the staging row is deleted.
+///
+/// This is a pure retrieval-speed-cache accumulator: the source episodic
+/// memories are the permanent record, so dropping a staging row loses nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionCandidate {
+    /// Deterministic hash of the cluster's stemmed token set (the pattern identity).
+    pub signature: String,
+    /// Highest-confidence representative text seen so far (becomes the fact text).
+    pub representative: String,
+    /// Distinct source-memory count across all windows (== `source_memories.len()`
+    /// before the per-row source cap is applied; preserved separately so trimming
+    /// `source_memories` never lowers the promotion count).
+    pub accumulated_support: usize,
+    /// Distinct source-memory ids (deduplicated; capped at `FACT_CANDIDATE_MAX_SOURCES`).
+    pub source_memories: Vec<MemoryId>,
+    /// Union of related entities observed across windows.
+    pub related_entities: Vec<String>,
+    /// Running sum of per-window mean confidences (for the running-mean estimate).
+    pub sum_confidence: f32,
+    /// Number of windows that have contributed (denominator for the running mean).
+    pub count: usize,
+    /// First time this signature was staged.
+    pub first_seen: chrono::DateTime<chrono::Utc>,
+    /// Most recent time this signature was reinforced (drives TTL eviction).
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+    /// On-disk schema version for forward migrations (additive-default).
+    #[serde(default)]
+    pub schema_v: u8,
+}
+
+impl PromotionCandidate {
+    /// Running-mean confidence estimate (`sum_confidence / count`), clamped.
+    pub fn mean_confidence(&self) -> f32 {
+        if self.count == 0 {
+            0.0
+        } else {
+            (self.sum_confidence / self.count as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// Pre-bi-temporal `SemanticFact` shape (the OLDEST on-disk format). Used as
 /// a fallback when decoding records written before `valid_from` / `valid_until`
 /// / `superseded_by` / `supersedes` were appended to the struct.
@@ -910,6 +963,217 @@ impl SemanticFactStore {
         Ok(())
     }
 
+    // =========================================================================
+    // W3: CROSS-WINDOW PROMOTION CANDIDATE STAGING
+    //
+    // Sub-threshold pattern clusters accumulate here across consolidation
+    // windows. Brand-new key prefix `fact_candidate:{user_id}:{signature}` —
+    // empty on existing installs, additive only, no SemanticFact schema change.
+    // All callers hold the per-user CONSOLIDATION_LOCKS, so read-modify-write
+    // upserts are serialized without a new lock.
+    // =========================================================================
+
+    fn candidate_key(user_id: &str, signature: &str) -> String {
+        format!("fact_candidate:{user_id}:{signature}")
+    }
+
+    /// Read a staged promotion candidate by signature.
+    pub fn get_candidate(
+        &self,
+        user_id: &str,
+        signature: &str,
+    ) -> Result<Option<PromotionCandidate>> {
+        let key = Self::candidate_key(user_id, signature);
+        match self.db.get(key.as_bytes())? {
+            Some(data) => {
+                let (cand, _): (PromotionCandidate, _) =
+                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                Ok(Some(cand))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Merge this window's observation of a pattern into its staging row,
+    /// creating the row on first sight. Returns the merged candidate.
+    ///
+    /// Merge semantics:
+    /// - `source_memories`: union, deduplicated by `MemoryId`, capped at
+    ///   `FACT_CANDIDATE_MAX_SOURCES`.
+    /// - `accumulated_support`: distinct source-memory count (== the deduped
+    ///   union size; counts cap-trimmed sources too so the threshold is honest).
+    /// - confidence: running mean — `sum_confidence += window_mean`, `count += 1`.
+    /// - `representative`: keep the higher-confidence text (this window's vs the
+    ///   stored running mean).
+    /// - `related_entities`: union.
+    /// - `last_seen`: bumped to `now`; `first_seen` preserved.
+    ///
+    /// Idempotent w.r.t. a source memory: re-observing the SAME source id does
+    /// not raise `accumulated_support` (dedup union).
+    pub fn upsert_candidate(
+        &self,
+        user_id: &str,
+        window: &super::compression::PendingCandidate,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<PromotionCandidate> {
+        use crate::constants::FACT_CANDIDATE_MAX_SOURCES;
+
+        let signature = window.signature.as_str();
+        let window_mean_confidence = window.avg_confidence;
+
+        let mut cand = match self.get_candidate(user_id, signature)? {
+            Some(existing) => existing,
+            None => PromotionCandidate {
+                signature: signature.to_string(),
+                representative: window.representative.clone(),
+                accumulated_support: 0,
+                source_memories: Vec::new(),
+                related_entities: Vec::new(),
+                sum_confidence: 0.0,
+                count: 0,
+                first_seen: now,
+                last_seen: now,
+                schema_v: 1,
+            },
+        };
+
+        // Union source memories (dedup by id). Track the true distinct count
+        // BEFORE capping, but only retain up to the cap on disk.
+        let mut seen: std::collections::HashSet<MemoryId> =
+            cand.source_memories.iter().cloned().collect();
+        let mut distinct_added = 0usize;
+        for src in &window.source_memories {
+            if seen.insert(src.clone()) {
+                distinct_added += 1;
+                if cand.source_memories.len() < FACT_CANDIDATE_MAX_SOURCES {
+                    cand.source_memories.push(src.clone());
+                }
+            }
+        }
+        // accumulated_support is the honest distinct count across all windows,
+        // even when the retained id list was trimmed by the cap.
+        cand.accumulated_support = cand.accumulated_support.saturating_add(distinct_added);
+
+        // Union entities.
+        for e in &window.related_entities {
+            if !cand.related_entities.contains(e) {
+                cand.related_entities.push(e.clone());
+            }
+        }
+
+        // Keep the higher-confidence representative text. Compare THIS window's
+        // confidence against the running mean BEFORE folding it in, and always
+        // accept on the very first observation.
+        if cand.count == 0 || window_mean_confidence >= cand.mean_confidence() {
+            cand.representative = window.representative.clone();
+        }
+
+        // Running-mean confidence (fold in after the representative decision).
+        cand.sum_confidence += window_mean_confidence.clamp(0.0, 1.0);
+        cand.count += 1;
+
+        cand.last_seen = now;
+
+        let key = Self::candidate_key(user_id, signature);
+        let value = bincode::serde::encode_to_vec(&cand, bincode::config::standard())?;
+        self.db.put(key.as_bytes(), &value)?;
+        Ok(cand)
+    }
+
+    /// Delete a staged candidate (after promotion, or during eviction).
+    pub fn delete_candidate(&self, user_id: &str, signature: &str) -> Result<bool> {
+        let key = Self::candidate_key(user_id, signature);
+        let existed = self.db.get(key.as_bytes())?.is_some();
+        self.db.delete(key.as_bytes())?;
+        Ok(existed)
+    }
+
+    /// List all staged candidates for a user (bounded scan).
+    pub fn list_candidates(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PromotionCandidate>> {
+        let prefix = format!("fact_candidate:{user_id}:");
+        let mut out = Vec::new();
+        let iter = self.db.iterator(IteratorMode::From(
+            prefix.as_bytes(),
+            rocksdb::Direction::Forward,
+        ));
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            if let Ok((cand, _)) = bincode::serde::decode_from_slice::<PromotionCandidate, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                out.push(cand);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Evict stale / over-cap staging candidates. Returns the number evicted.
+    ///
+    /// Two-stage hygiene (W3, Part 2.4):
+    /// 1. TTL: drop candidates whose `last_seen` is older than `ttl_days`.
+    /// 2. Cap: if more than `max_per_user` remain, evict lowest
+    ///    `accumulated_support` first, breaking ties by oldest `last_seen`,
+    ///    until the cap is met.
+    ///
+    /// Eviction loses nothing durable — source episodic memories persist; a
+    /// re-occurring pattern simply re-stages a fresh candidate.
+    pub fn evict_stale_candidates(
+        &self,
+        user_id: &str,
+        ttl_days: i64,
+        max_per_user: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        // Pull all candidates (bounded generously above the cap for the sweep).
+        let scan_limit = max_per_user.saturating_mul(2).max(max_per_user + 1024);
+        let mut candidates = self.list_candidates(user_id, scan_limit)?;
+        let mut evicted = 0usize;
+
+        // Stage 1: TTL.
+        let cutoff = now - chrono::Duration::days(ttl_days);
+        let mut survivors: Vec<PromotionCandidate> = Vec::with_capacity(candidates.len());
+        for cand in candidates.drain(..) {
+            if cand.last_seen < cutoff {
+                if self.delete_candidate(user_id, &cand.signature)? {
+                    evicted += 1;
+                }
+            } else {
+                survivors.push(cand);
+            }
+        }
+
+        // Stage 2: cap. Evict lowest support, oldest last_seen first.
+        if survivors.len() > max_per_user {
+            // Sort so the WEAKEST candidates come first: ascending support, then
+            // ascending last_seen (oldest first).
+            survivors.sort_by(|a, b| {
+                a.accumulated_support
+                    .cmp(&b.accumulated_support)
+                    .then(a.last_seen.cmp(&b.last_seen))
+            });
+            let to_evict = survivors.len() - max_per_user;
+            for cand in survivors.into_iter().take(to_evict) {
+                if self.delete_candidate(user_id, &cand.signature)? {
+                    evicted += 1;
+                }
+            }
+        }
+
+        Ok(evicted)
+    }
+
     /// List all unique user IDs that have facts
     pub fn list_users(&self, limit: usize) -> Result<Vec<String>> {
         let prefix = "facts:";
@@ -1062,6 +1326,229 @@ mod tests {
         let stats = store.stats("user-1").unwrap();
         assert_eq!(stats.total_facts, 2);
         assert!(stats.avg_confidence > 0.0);
+    }
+
+    /// W4 test 5 — Unified merge: a paraphrase of an existing fact (cosine
+    /// >= 0.80, shared entity, same polarity) is matched by `find_similar` and
+    /// REINFORCED in place rather than inserted as a near-duplicate.
+    ///
+    /// This pins the dedup gate that `MemorySystem::persist_or_reinforce_facts`
+    /// relies on: distill_facts (Path A) and run_maintenance (Path B) both route
+    /// through `find_similar`, so an equivalent fact is never duplicated.
+    #[test]
+    fn test_w4_unified_merge_reinforces_paraphrase() {
+        let (store, _dir) = create_test_store();
+
+        // Existing fact with a stored embedding.
+        let mut existing = create_test_fact(
+            "fact-1",
+            "Rust uses ownership for memory safety",
+        );
+        existing.support_count = 1;
+        existing.confidence = 0.6;
+        store.store("user-1", &existing).unwrap();
+        let emb = vec![1.0f32, 0.0, 0.0, 0.0];
+        store.store_embedding("user-1", "fact-1", &emb).unwrap();
+
+        // A paraphrase: near-identical embedding (cosine ~0.998 >= 0.80),
+        // shared entity ("rust"/"memory"), same (positive) polarity, and high
+        // lexical overlap (Jaccard >= 0.30 floor).
+        let paraphrase_text = "Rust uses ownership for safe memory management";
+        let paraphrase_emb = vec![0.98f32, 0.02, 0.0, 0.0];
+        let entities = vec!["rust".to_string(), "memory".to_string()];
+
+        let matched = store
+            .find_similar("user-1", paraphrase_text, &entities, Some(&paraphrase_emb))
+            .unwrap();
+        assert!(
+            matched.is_some(),
+            "paraphrase should match the existing fact via hybrid dedup"
+        );
+        let mut hit = matched.unwrap();
+        assert_eq!(hit.id, "fact-1", "must reinforce the original fact, not a new one");
+
+        // Apply the reinforce update (mirrors persist_or_reinforce_facts).
+        hit.support_count += 1;
+        let boost = 0.1 * (1.0 - hit.confidence);
+        hit.confidence = (hit.confidence + boost).min(1.0);
+        store.update("user-1", &hit).unwrap();
+
+        // Exactly ONE active fact remains; support bumped to 2; no near-dup.
+        let all = store.list("user-1", 100).unwrap();
+        assert_eq!(all.len(), 1, "no near-duplicate fact should be inserted");
+        assert_eq!(all[0].id, "fact-1");
+        assert_eq!(all[0].support_count, 2, "support must increase by exactly 1");
+        assert!(all[0].confidence > 0.6, "confidence must increase on reinforce");
+    }
+
+    // =========================================================================
+    // W3: CROSS-WINDOW CANDIDATE STAGING TESTS
+    // =========================================================================
+
+    use super::super::compression::PendingCandidate;
+
+    fn mem_id() -> MemoryId {
+        MemoryId(uuid::Uuid::new_v4())
+    }
+
+    /// One window's observation of a pattern with the given distinct sources.
+    fn pending(sig: &str, sources: Vec<MemoryId>, conf: f32) -> PendingCandidate {
+        let distinct = sources.len();
+        PendingCandidate {
+            signature: sig.to_string(),
+            representative: format!("pattern {sig}"),
+            source_memories: sources,
+            related_entities: vec!["rust".to_string()],
+            avg_confidence: conf,
+            distinct_sources: distinct,
+        }
+    }
+
+    /// W3 test 1 — Cross-window accumulation.
+    ///
+    /// The same pattern seen once in each of 3 separate windows (3 distinct
+    /// source memories, watermark conceptually advanced between each) must
+    /// accumulate to support 3 against ONE staging row — not 3 rows, not zero.
+    /// Promoting that row yields exactly ONE fact with support_count == 3.
+    #[test]
+    fn test_w3_cross_window_accumulates_to_one_fact() {
+        let (store, _dir) = create_test_store();
+        let now = chrono::Utc::now();
+        let sig = "abc123";
+
+        let m1 = mem_id();
+        let m2 = mem_id();
+        let m3 = mem_id();
+
+        // Three separate windows, each contributing one distinct source.
+        store.upsert_candidate("u", &pending(sig, vec![m1.clone()], 0.5), now).unwrap();
+        store.upsert_candidate("u", &pending(sig, vec![m2.clone()], 0.6), now).unwrap();
+        let merged = store
+            .upsert_candidate("u", &pending(sig, vec![m3.clone()], 0.7), now)
+            .unwrap();
+
+        // ONE staging row, accumulated to 3 distinct sources.
+        assert_eq!(store.list_candidates("u", 100).unwrap().len(), 1);
+        assert_eq!(merged.accumulated_support, 3, "3 distinct sources -> support 3");
+        assert_eq!(merged.source_memories.len(), 3);
+
+        // Simulate promotion (mirrors stage_and_promote_candidates): build one
+        // fact with support == accumulated_support, then drop the staging row.
+        let fact = SemanticFact {
+            support_count: merged.accumulated_support,
+            ..create_test_fact("promoted-1", &merged.representative)
+        };
+        store.store("u", &fact).unwrap();
+        store.delete_candidate("u", sig).unwrap();
+
+        let facts = store.list("u", 100).unwrap();
+        assert_eq!(facts.len(), 1, "exactly one active fact after promotion");
+        assert_eq!(facts[0].support_count, 3);
+        assert!(store.list_candidates("u", 100).unwrap().is_empty(), "staging row deleted");
+    }
+
+    /// W3 test 2 — Staging idempotency.
+    ///
+    /// Re-observing the SAME source memory's candidate across two windows must
+    /// NOT raise accumulated_support (dedup union by MemoryId). Stays at 1; no
+    /// promotion (min_support 2) would fire.
+    #[test]
+    fn test_w3_staging_idempotent_same_source() {
+        let (store, _dir) = create_test_store();
+        let now = chrono::Utc::now();
+        let sig = "dup";
+        let m1 = mem_id();
+
+        store.upsert_candidate("u", &pending(sig, vec![m1.clone()], 0.5), now).unwrap();
+        let merged = store
+            .upsert_candidate("u", &pending(sig, vec![m1.clone()], 0.5), now)
+            .unwrap();
+
+        assert_eq!(merged.accumulated_support, 1, "same source twice -> support stays 1");
+        assert_eq!(merged.source_memories.len(), 1);
+        assert!(
+            merged.accumulated_support < 2,
+            "below min_support -> no fact would be created"
+        );
+    }
+
+    /// W3 test 3 — Below-then-above promotion across windows.
+    ///
+    /// Two windows each contributing one DISTINCT candidate, min_support = 2:
+    /// promotes on the second window; the staging row is deleted on promote.
+    #[test]
+    fn test_w3_below_then_above_promotes_and_deletes_row() {
+        let (store, _dir) = create_test_store();
+        let now = chrono::Utc::now();
+        let sig = "grow";
+        let min_support = 2usize;
+
+        // Window 1: support 1 -> below threshold, no promote.
+        let after1 = store
+            .upsert_candidate("u", &pending(sig, vec![mem_id()], 0.5), now)
+            .unwrap();
+        assert!(after1.accumulated_support < min_support);
+        assert_eq!(store.list_candidates("u", 100).unwrap().len(), 1, "row stays staged");
+
+        // Window 2: a second distinct source -> reaches threshold.
+        let after2 = store
+            .upsert_candidate("u", &pending(sig, vec![mem_id()], 0.6), now)
+            .unwrap();
+        assert!(after2.accumulated_support >= min_support, "now meets min_support");
+
+        // Promote + delete staging row (mirrors the production path).
+        store
+            .store("u", &SemanticFact {
+                support_count: after2.accumulated_support,
+                ..create_test_fact("promoted", &after2.representative)
+            })
+            .unwrap();
+        store.delete_candidate("u", sig).unwrap();
+
+        assert_eq!(store.list("u", 100).unwrap().len(), 1, "promoted to one fact");
+        assert!(store.list_candidates("u", 100).unwrap().is_empty(), "staging row deleted on promote");
+    }
+
+    /// W3 test 7 — Staging TTL + cap hygiene.
+    ///
+    /// (a) A candidate whose last_seen is older than the TTL is evicted, no fact
+    ///     created. (b) Over-cap candidates are evicted preferring HIGH support /
+    ///     RECENT last_seen (i.e. weakest/oldest are dropped first).
+    #[test]
+    fn test_w3_staging_ttl_and_cap_eviction() {
+        let (store, _dir) = create_test_store();
+        let now = chrono::Utc::now();
+
+        // (a) TTL: a single stale candidate (last_seen 200d ago) is evicted at
+        // a 90-day TTL.
+        let stale_now = now - chrono::Duration::days(200);
+        store.upsert_candidate("ttl", &pending("stale", vec![mem_id()], 0.5), stale_now).unwrap();
+        assert_eq!(store.list_candidates("ttl", 100).unwrap().len(), 1);
+        let evicted = store.evict_stale_candidates("ttl", 90, 5000, now).unwrap();
+        assert_eq!(evicted, 1, "stale candidate evicted");
+        assert!(store.list_candidates("ttl", 100).unwrap().is_empty());
+        assert!(store.list("ttl", 100).unwrap().is_empty(), "no fact created by eviction");
+
+        // (b) Cap: 5 fresh candidates with varied support, cap = 3. The 2
+        // WEAKEST (lowest accumulated_support) must be evicted; the 3 highest
+        // retained.
+        for i in 0..5u32 {
+            let sig = format!("cap{i}");
+            // i distinct sources -> accumulated_support == i (0..=4).
+            let sources: Vec<MemoryId> = (0..=i).map(|_| mem_id()).collect();
+            store.upsert_candidate("cap", &pending(&sig, sources, 0.5), now).unwrap();
+        }
+        assert_eq!(store.list_candidates("cap", 100).unwrap().len(), 5);
+        let evicted = store.evict_stale_candidates("cap", 90, 3, now).unwrap();
+        assert_eq!(evicted, 2, "two weakest candidates evicted to meet cap");
+
+        let survivors = store.list_candidates("cap", 100).unwrap();
+        assert_eq!(survivors.len(), 3);
+        let min_support_kept = survivors.iter().map(|c| c.accumulated_support).min().unwrap();
+        assert!(
+            min_support_kept >= 2,
+            "highest-support candidates retained, got min kept support {min_support_kept}"
+        );
     }
 
     // =========================================================================

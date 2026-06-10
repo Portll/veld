@@ -5573,6 +5573,12 @@ impl MemorySystem {
     /// `is_heavy`: when true, runs expensive operations (fact extraction, auto-repair)
     /// that require full RocksDB scans. Light cycles only touch in-memory data.
     ///
+    /// `facts_already_distilled`: when true, the calling handler already ran
+    /// [`Self::distill_facts`] over the same window (both consolidation handlers
+    /// do this), so the heavy fact-extraction block is SKIPPED to avoid
+    /// re-scanning. The watermark is still advanced (heavy path is the single
+    /// owner) and the `fact_extraction_needed` dirty flag is still cleared.
+    ///
     /// Returns the number of memories processed for activation decay.
     /// Also records consolidation events for introspection.
     pub fn run_maintenance(
@@ -5580,6 +5586,7 @@ impl MemorySystem {
         decay_factor: f32,
         user_id: &str,
         is_heavy: bool,
+        facts_already_distilled: bool,
     ) -> Result<MaintenanceResult> {
         let start_time = std::time::Instant::now();
         let now = chrono::Utc::now();
@@ -5744,15 +5751,35 @@ impl MemorySystem {
 
         // 3.8. Fact extraction: consolidate episodic memories into semantic facts
         // HEAVY ONLY: requires ONNX inference for embedding new facts.
+        //
+        // W4 single-watermark-owner invariant: the heavy path is the SOLE owner
+        // of `fact_extraction_watermark`. On any heavy cycle we compute the
+        // window (memories newer than the watermark) and — at the end of this
+        // block — advance the watermark to max(created_at) of that window,
+        // REGARDLESS of whether fact extraction actually ran. This keeps the
+        // cursor owned by exactly one writer so the on-demand path
+        // (`distill_facts`) and this path can never race / double-advance it.
+        //
+        // `facts_already_distilled` is true when the calling handler already ran
+        // `distill_facts` over the same window (both consolidation handlers do).
+        // In that case we SKIP the heavy extraction (it would re-scan an empty
+        // window — distill_facts shares the same watermark read) but still clear
+        // the dirty flag and still advance the watermark below.
+        //
         // The dirty flag (fact_extraction_needed) is only checked on heavy cycles;
         // it stays set across light cycles until the next heavy cycle processes it.
         let mut facts_extracted_count = 0;
         let mut facts_reinforced_count = 0;
-        if is_heavy
-            && self
+        // Captures the processed window (memories newer than the watermark) so
+        // the watermark advance can run after the fact block, single-owner.
+        let mut fact_window_max_created: Option<i64> = None;
+        if is_heavy {
+            // Consume the dirty flag whenever a heavy cycle runs. When the
+            // handler already distilled, the work is done — still clear it.
+            let dirty = self
                 .fact_extraction_needed
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            let should_extract = dirty && !facts_already_distilled;
             let all_memories = &all_memories_for_heavy;
             if !all_memories.is_empty() {
                 // Incremental: only process memories created since last extraction watermark.
@@ -5782,15 +5809,50 @@ impl MemorySystem {
                     .map(|arc_mem| arc_mem.as_ref().clone())
                     .collect();
 
+                // Record the window high-water mark for the watermark advance
+                // (single-owner, happens after this block whether or not we
+                // actually extract facts this cycle).
+                if !memories.is_empty() {
+                    fact_window_max_created = memories
+                        .iter()
+                        .map(|m| m.created_at.timestamp_millis())
+                        .max();
+                }
+
                 tracing::info!(
                     total_memories = all_memories.len(),
                     new_since_watermark = memories.len(),
                     watermark = %watermark_dt.format("%Y-%m-%dT%H:%M:%S"),
+                    should_extract,
                     "Incremental fact extraction"
                 );
 
-                let consolidator = compression::SemanticConsolidator::new();
-                let consolidation_result = consolidator.consolidate(&memories);
+                let mut consolidation_result = if should_extract {
+                    let consolidator = compression::SemanticConsolidator::new();
+                    consolidator.consolidate(&memories)
+                } else {
+                    // Handler already distilled this window — skip extraction,
+                    // but the watermark still advances below.
+                    compression::ConsolidationResult::default()
+                };
+
+                // W3: stage sub-threshold clusters for cross-window accumulation
+                // and promote any that have reached min_support. Drained BEFORE
+                // the immediate-promote block consumes `new_facts`. Held under
+                // the maintenance write path (background heavy cycle / handler).
+                let sub_threshold =
+                    std::mem::take(&mut consolidation_result.sub_threshold_candidates);
+                if !sub_threshold.is_empty() {
+                    let (promoted_extracted, promoted_reinforced) = self
+                        .stage_and_promote_candidates(
+                            user_id,
+                            sub_threshold,
+                            crate::constants::CONSOLIDATION_MIN_SUPPORT,
+                            now,
+                        );
+                    facts_extracted_count += promoted_extracted;
+                    facts_reinforced_count += promoted_reinforced;
+                }
 
                 if !consolidation_result.new_facts.is_empty() {
                     // Batch-encode all new fact texts for hybrid dedup
@@ -5870,102 +5932,14 @@ impl MemorySystem {
                         })
                         .collect();
 
-                    let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
-
-                    for (fact, embedding) in gated.into_iter()
-                    {
-                        // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
-                        match self.fact_store.find_similar(
-                            user_id,
-                            &fact.fact,
-                            &fact.related_entities,
-                            embedding.as_deref(),
-                        ) {
-                            Ok(Some(mut existing)) => {
-                                // Reinforce the existing fact
-                                existing.support_count += 1;
-                                existing.last_reinforced = now;
-                                let confidence_before = existing.confidence;
-                                let boost = 0.1 * (1.0 - existing.confidence);
-                                existing.confidence = (existing.confidence + boost).min(1.0);
-
-                                // Extend source memories and related entities
-                                for src in &fact.source_memories {
-                                    if !existing.source_memories.contains(src) {
-                                        existing.source_memories.push(src.clone());
-                                    }
-                                }
-                                for entity in &fact.related_entities {
-                                    if !existing.related_entities.contains(entity) {
-                                        existing.related_entities.push(entity.clone());
-                                    }
-                                }
-
-                                if let Err(e) = self.fact_store.update(user_id, &existing) {
-                                    tracing::debug!("Failed to reinforce fact: {e}");
-                                } else {
-                                    // Update existing fact's embedding with latest encoding
-                                    if let Some(ref emb) = embedding {
-                                        let _ = self.fact_store.store_embedding(
-                                            user_id,
-                                            &existing.id,
-                                            emb,
-                                        );
-                                    }
-                                    facts_reinforced_count += 1;
-                                    self.record_consolidation_event_for_user(
-                                        user_id,
-                                        ConsolidationEvent::FactReinforced {
-                                            fact_id: existing.id.clone(),
-                                            fact_content: existing.fact.clone(),
-                                            confidence_before,
-                                            confidence_after: existing.confidence,
-                                            new_support_count: existing.support_count,
-                                            timestamp: now,
-                                        },
-                                    );
-                                }
-                            }
-                            _ => {
-                                truly_new.push((fact.clone(), embedding));
-                            }
-                        }
-                    }
-
-                    // Store new facts
-                    if !truly_new.is_empty() {
-                        let facts_only: Vec<SemanticFact> =
-                            truly_new.iter().map(|(f, _)| f.clone()).collect();
-                        match self.fact_store.store_batch(user_id, &facts_only) {
-                            Ok(stored) => {
-                                facts_extracted_count = stored;
-                                // Store embeddings for newly persisted facts
-                                for (fact, embedding) in &truly_new {
-                                    if let Some(emb) = embedding {
-                                        let _ =
-                                            self.fact_store.store_embedding(user_id, &fact.id, emb);
-                                    }
-                                    self.record_consolidation_event_for_user(
-                                        user_id,
-                                        ConsolidationEvent::FactExtracted {
-                                            fact_id: fact.id.clone(),
-                                            fact_content: fact.fact.clone(),
-                                            confidence: fact.confidence,
-                                            fact_type: format!("{:?}", fact.fact_type),
-                                            source_memory_count: fact.source_memories.len(),
-                                            timestamp: now,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to store extracted facts: {e}");
-                            }
-                        }
-
-                        // Connect newly extracted facts to the knowledge graph
-                        self.connect_facts_to_graph(&facts_only);
-                    }
+                    // Route through the unified persist/reinforce path so the
+                    // heavy cycle and the on-demand distill_facts path share a
+                    // single dedup decision and can never insert near-duplicates
+                    // of each other's output.
+                    let (extracted, reinforced) =
+                        self.persist_or_reinforce_facts(user_id, gated, now);
+                    facts_extracted_count += extracted;
+                    facts_reinforced_count += reinforced;
 
                     if facts_extracted_count > 0 || facts_reinforced_count > 0 {
                         tracing::debug!(
@@ -5975,25 +5949,23 @@ impl MemorySystem {
                         );
                     }
                 }
+            }
 
-                // Advance watermark to the LAST memory's created_at timestamp,
-                // NOT to now(). Using now() would skip memories created during the
-                // (potentially slow) fact extraction cycle — they'd have created_at
-                // < now() and never be processed for facts.
-                if !memories.is_empty() {
-                    let new_watermark = memories
-                        .iter()
-                        .map(|m| m.created_at.timestamp_millis())
-                        .max()
-                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-                    self.fact_extraction_watermark
-                        .store(new_watermark, std::sync::atomic::Ordering::Relaxed);
-                    self.long_term_memory
-                        .set_fact_watermark(user_id, new_watermark);
-                }
+            // W4 single-owner watermark advance: relocated OUT of the
+            // fact/dirty-flag branch so heavy maintenance advances the
+            // watermark whenever it runs over a non-empty window — even when
+            // the handler already distilled (facts_already_distilled = true) or
+            // the dirty flag was clear. Advance to the LAST memory's created_at
+            // (NOT now()): using now() would skip memories created during a slow
+            // cycle (created_at < now()) and never process them for facts.
+            if let Some(new_watermark) = fact_window_max_created {
+                self.fact_extraction_watermark
+                    .store(new_watermark, std::sync::atomic::Ordering::Relaxed);
+                self.long_term_memory
+                    .set_fact_watermark(user_id, new_watermark);
             }
         } else {
-            tracing::debug!("Fact extraction skipped: no new memories since last cycle");
+            tracing::debug!("Fact extraction skipped: light cycle (heavy-only)");
         }
 
         // 4. SHO-105 + PIPE-2: Memory replay cycle (consolidation during heavy cycles)
@@ -6605,6 +6577,216 @@ impl MemorySystem {
     // Distilled knowledge extracted from episodic memories
     // =========================================================================
 
+    /// Unified fact persistence path shared by both consolidation entry points
+    /// (the on-demand `distill_facts` / Path A, and the heavy `run_maintenance`
+    /// fact block / Path B).
+    ///
+    /// For each quality-gated `(fact, embedding)` pair:
+    /// 1. `find_similar` (hybrid dedup: cosine + entity gate + polarity + Jaccard)
+    /// 2. If a match exists → reinforce it in place (support_count += 1, confidence
+    ///    boost, source-memory + entity union, refreshed embedding) and emit
+    ///    `FactReinforced`. Reinforcement is idempotent w.r.t. source memories
+    ///    because they are dedup-unioned by id.
+    /// 3. Otherwise → collect as truly-new, `store_batch` + `store_embedding` +
+    ///    `connect_facts_to_graph`, emit `FactExtracted`.
+    ///
+    /// Returns `(extracted, reinforced)` counts. This is the single source of
+    /// truth for "does an equivalent fact already exist?" so the two promotion
+    /// paths can never insert near-duplicates of each other's output.
+    fn persist_or_reinforce_facts(
+        &self,
+        user_id: &str,
+        gated: Vec<(SemanticFact, Option<Vec<f32>>)>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (usize, usize) {
+        let mut facts_extracted_count = 0usize;
+        let mut facts_reinforced_count = 0usize;
+        let mut truly_new: Vec<(SemanticFact, Option<Vec<f32>>)> = Vec::new();
+
+        for (fact, embedding) in gated.into_iter() {
+            // Hybrid dedup: embedding cosine + entity gate + polarity + Jaccard floor
+            match self.fact_store.find_similar(
+                user_id,
+                &fact.fact,
+                &fact.related_entities,
+                embedding.as_deref(),
+            ) {
+                Ok(Some(mut existing)) => {
+                    // Reinforce the existing fact
+                    existing.support_count += 1;
+                    existing.last_reinforced = now;
+                    let confidence_before = existing.confidence;
+                    let boost = 0.1 * (1.0 - existing.confidence);
+                    existing.confidence = (existing.confidence + boost).min(1.0);
+
+                    // Extend source memories and related entities (dedup by id)
+                    for src in &fact.source_memories {
+                        if !existing.source_memories.contains(src) {
+                            existing.source_memories.push(src.clone());
+                        }
+                    }
+                    for entity in &fact.related_entities {
+                        if !existing.related_entities.contains(entity) {
+                            existing.related_entities.push(entity.clone());
+                        }
+                    }
+
+                    if let Err(e) = self.fact_store.update(user_id, &existing) {
+                        tracing::debug!("Failed to reinforce fact: {e}");
+                    } else {
+                        // Update existing fact's embedding with latest encoding
+                        if let Some(ref emb) = embedding {
+                            let _ = self.fact_store.store_embedding(user_id, &existing.id, emb);
+                        }
+                        facts_reinforced_count += 1;
+                        self.record_consolidation_event_for_user(
+                            user_id,
+                            ConsolidationEvent::FactReinforced {
+                                fact_id: existing.id.clone(),
+                                fact_content: existing.fact.clone(),
+                                confidence_before,
+                                confidence_after: existing.confidence,
+                                new_support_count: existing.support_count,
+                                timestamp: now,
+                            },
+                        );
+                    }
+                }
+                _ => {
+                    truly_new.push((fact, embedding));
+                }
+            }
+        }
+
+        // Store truly-new facts
+        if !truly_new.is_empty() {
+            let facts_only: Vec<SemanticFact> =
+                truly_new.iter().map(|(f, _)| f.clone()).collect();
+            match self.fact_store.store_batch(user_id, &facts_only) {
+                Ok(stored) => {
+                    facts_extracted_count = stored;
+                    // Store embeddings for newly persisted facts
+                    for (fact, embedding) in &truly_new {
+                        if let Some(emb) = embedding {
+                            let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
+                        }
+                        self.record_consolidation_event_for_user(
+                            user_id,
+                            ConsolidationEvent::FactExtracted {
+                                fact_id: fact.id.clone(),
+                                fact_content: fact.fact.clone(),
+                                confidence: fact.confidence,
+                                fact_type: format!("{:?}", fact.fact_type),
+                                source_memory_count: fact.source_memories.len(),
+                                timestamp: now,
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to store extracted facts: {e}");
+                }
+            }
+
+            // Connect newly extracted facts to the knowledge graph
+            self.connect_facts_to_graph(&facts_only);
+        }
+
+        (facts_extracted_count, facts_reinforced_count)
+    }
+
+    /// W3 cross-window candidate staging + promotion.
+    ///
+    /// Sub-threshold pattern clusters surfaced by `consolidate()` are no longer
+    /// discarded. For each:
+    /// 1. `upsert_candidate` merges this window's observation into the persistent
+    ///    staging row (`fact_candidate:{user_id}:{signature}`), deduping source
+    ///    memories by id so re-seeing the same source never inflates support.
+    /// 2. If accumulated DISTINCT support now reaches `min_support`, build a
+    ///    `SemanticFact` from the accumulated state and route it through the
+    ///    unified `persist_or_reinforce_facts` path (so an equivalent existing
+    ///    fact is REINFORCED, not duplicated), then delete the staging row.
+    ///
+    /// After processing, runs TTL/cap hygiene on the user's staging table.
+    /// Returns `(extracted, reinforced)` from any promotions this call made.
+    ///
+    /// Invariants: callers hold the per-user CONSOLIDATION_LOCKS (no new lock).
+    /// Eviction loses nothing durable — episodic memory is the permanent record.
+    fn stage_and_promote_candidates(
+        &self,
+        user_id: &str,
+        candidates: Vec<compression::PendingCandidate>,
+        min_support: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (usize, usize) {
+        let mut promoted_extracted = 0usize;
+        let mut promoted_reinforced = 0usize;
+        let consolidator = compression::SemanticConsolidator::new();
+
+        for cand in candidates {
+            let merged = match self.fact_store.upsert_candidate(user_id, &cand, now) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(signature = %cand.signature, "candidate upsert failed: {e}");
+                    continue;
+                }
+            };
+
+            if merged.accumulated_support >= min_support {
+                // Build the fact from the accumulated cross-window state.
+                let fact = consolidator.fact_from_candidate(
+                    &merged.representative,
+                    merged.mean_confidence(),
+                    merged.accumulated_support,
+                    merged.source_memories.clone(),
+                    merged.related_entities.clone(),
+                    now,
+                );
+
+                // Encode for hybrid dedup (best-effort; Jaccard fallback if the
+                // embedder is unavailable).
+                let embedding: Option<Vec<f32>> = match self
+                    .embedder
+                    .encode_batch(&[fact.fact.as_str()])
+                {
+                    Ok(mut embs) if !embs.is_empty() => Some(embs.remove(0)),
+                    _ => None,
+                };
+
+                let (ext, reinf) =
+                    self.persist_or_reinforce_facts(user_id, vec![(fact, embedding)], now);
+                promoted_extracted += ext;
+                promoted_reinforced += reinf;
+
+                // Promotion done (whether as a new fact or a reinforcement of an
+                // equivalent existing fact) — drop the staging row.
+                let _ = self.fact_store.delete_candidate(user_id, &cand.signature);
+
+                tracing::debug!(
+                    signature = %cand.signature,
+                    accumulated_support = merged.accumulated_support,
+                    "W3: promoted cross-window candidate"
+                );
+            }
+        }
+
+        // Hygiene: TTL + cap eviction on the user's staging table.
+        match self.fact_store.evict_stale_candidates(
+            user_id,
+            crate::constants::FACT_CANDIDATE_TTL_DAYS,
+            crate::constants::FACT_CANDIDATE_MAX_PER_USER,
+            now,
+        ) {
+            Ok(n) if n > 0 => {
+                tracing::debug!(user_id = %user_id, evicted = n, "W3: evicted stale candidates");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("candidate eviction failed: {e}"),
+        }
+
+        (promoted_extracted, promoted_reinforced)
+    }
+
     /// Distill semantic facts from episodic memories
     ///
     /// Runs the consolidation process to extract durable knowledge:
@@ -6735,50 +6917,53 @@ impl MemorySystem {
                 .collect();
             let facts_gated = result.facts_extracted.saturating_sub(gated_facts.len());
 
+            // Snapshot the gated facts for the return value BEFORE routing them
+            // through the unified persist path (which moves the vec).
             let gated_fact_refs: Vec<SemanticFact> = gated_facts.iter().map(|(f, _)| f.clone()).collect();
-            let stored = self.fact_store.store_batch(user_id, &gated_fact_refs)?;
+
+            // Route through the unified persist/reinforce path: an equivalent
+            // existing fact (cosine + entity + polarity + Jaccard match) is
+            // REINFORCED in place rather than duplicated. This is the W4 fix —
+            // distill_facts (Path A) and run_maintenance (Path B) now share one
+            // dedup decision, so neither inserts a near-duplicate of the other.
+            let now = chrono::Utc::now();
+            let (stored, reinforced) =
+                self.persist_or_reinforce_facts(user_id, gated_facts, now);
+            result.facts_reinforced = reinforced;
             tracing::info!(
                 user_id = %user_id,
                 facts_extracted = result.facts_extracted,
                 facts_gated,
                 facts_stored = stored,
+                facts_reinforced = reinforced,
                 "Semantic distillation complete"
             );
-
-            // Store embeddings for distilled facts
-            for (fact, emb) in &gated_facts {
-                if let Some(emb) = emb {
-                    let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
-                }
-            }
-
-            // Record consolidation event for each fact (persists significant events)
-            for (fact, _) in &gated_facts {
-                self.record_consolidation_event_for_user(
-                    user_id,
-                    ConsolidationEvent::FactExtracted {
-                        fact_id: fact.id.clone(),
-                        fact_content: fact.fact.clone(),
-                        confidence: fact.confidence,
-                        fact_type: format!("{:?}", fact.fact_type),
-                        source_memory_count: fact.source_memories.len(),
-                        timestamp: chrono::Utc::now(),
-                    },
-                );
-            }
 
             // Update result with gated facts for return value
             result.new_facts = gated_fact_refs;
         }
 
-        // Advance watermark after successful extraction
-        if !memories.is_empty() {
-            let new_watermark = chrono::Utc::now().timestamp_millis();
-            self.fact_extraction_watermark
-                .store(new_watermark, std::sync::atomic::Ordering::Relaxed);
-            self.long_term_memory
-                .set_fact_watermark(user_id, new_watermark);
+        // W3: stage sub-threshold clusters for cross-window accumulation, and
+        // promote any that have now reached min_support. Runs even when this
+        // window extracted zero immediate facts (the whole point is to capture
+        // patterns that are below threshold THIS window). Held under the
+        // handler's CONSOLIDATION_LOCKS.
+        let staging_now = chrono::Utc::now();
+        let sub_threshold = std::mem::take(&mut result.sub_threshold_candidates);
+        if !sub_threshold.is_empty() {
+            let (promoted_extracted, promoted_reinforced) =
+                self.stage_and_promote_candidates(user_id, sub_threshold, min_support, staging_now);
+            result.facts_extracted += promoted_extracted;
+            result.facts_reinforced += promoted_reinforced;
         }
+
+        // NOTE: distill_facts deliberately does NOT advance the fact-extraction
+        // watermark (W4 single-owner invariant). The heavy `run_maintenance`
+        // path is the sole owner of the watermark; it advances to max(created_at)
+        // of the processed window. Both consolidation handlers call distill_facts
+        // first and then run_maintenance (with facts_already_distilled = true),
+        // so the watermark still advances within the same handler invocation —
+        // just from the single owner, never from two writers racing the cursor.
 
         Ok(result)
     }
@@ -6790,6 +6975,16 @@ impl MemorySystem {
     /// * `limit` - Maximum number of facts to return
     pub fn get_facts(&self, user_id: &str, limit: usize) -> Result<Vec<SemanticFact>> {
         self.fact_store.list(user_id, limit)
+    }
+
+    /// Read the persisted fact-extraction watermark (millis since epoch) for a
+    /// user, or `None` if no extraction cycle has advanced it yet.
+    ///
+    /// Single-owner invariant (W4): only the heavy `run_maintenance` path
+    /// advances this cursor; `distill_facts` reads it but never writes it.
+    /// Exposed for introspection and watermark-ownership testing.
+    pub fn persisted_fact_watermark(&self, user_id: &str) -> Option<i64> {
+        self.long_term_memory.get_fact_watermark(user_id)
     }
 
     /// Get facts related to a specific entity
