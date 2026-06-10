@@ -213,6 +213,11 @@ pub struct RecallResponse {
     /// label. Advisory; a terminal readout never fed into learning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metacognition: Option<crate::memory::types::QueryMetacognition>,
+    /// B4 temporal answer-derivation. `None` (and omitted from JSON) when no
+    /// temporal answer is derivable — response is then byte-identical to the
+    /// pre-B4 shape. Never affects `memories`/`count`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_answer: Option<crate::handlers::temporal_derivation::DerivedAnswer>,
 }
 
 impl RecallResponse {
@@ -1064,10 +1069,13 @@ mod tests {
             lineage_count: None,
             tokens_estimated: None,
             metacognition: None,
+            derived_answer: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("memories"));
         assert!(json.contains("count"));
+        // derived_answer is None — field must be absent from JSON (skip_serializing_if)
+        assert!(!json.contains("derived_answer"));
     }
 
     #[test]

@@ -71,6 +71,9 @@ pub mod datasets;
 // Query planner HTTP surface (W6 — explainable multi-source planning)
 pub mod query;
 
+// Shared B4 temporal answer-derivation (used by /api/query/execute + /api/recall)
+pub mod temporal_derivation;
+
 // Sleep-time / observational memory orchestrator (V1)
 pub mod sleep_time;
 
