@@ -62,9 +62,22 @@ struct Args {
     #[arg(long)]
     primary_id: String,
 
-    /// Secondary embedder identifier (e.g. `minilm-l6-v2`).
+    /// Secondary embedder *loading* identifier (e.g. `minilm-l6-v2`, or an
+    /// `http://…/v1` URL for an HTTP-served secondary). This is the key passed
+    /// to `load_secondary_embedder` to construct the embedder.
     #[arg(long)]
     secondary_id: String,
+
+    /// Canonical secondary `model_id` used as `pair_id.secondary` in the fit
+    /// file header. MUST match the runtime `secondary.model_id()` so the
+    /// onboarding loader accepts the file (retrieval builds the runtime pair_id
+    /// from `model_id()`, not the loading key). For HTTP secondaries the loading
+    /// key is a URL but `model_id()` is the served model name (e.g.
+    /// `text-embedding-nomic-embed-text-v1.5`) — pass that here. Defaults to
+    /// `--secondary_id` when omitted (correct for `minilm`/`nomic`, whose
+    /// loading id already equals their `model_id()`).
+    #[arg(long)]
+    secondary_model_id: Option<String>,
 
     /// Which face of asymmetric embedders to use (doc | query).
     #[arg(long, value_enum, default_value_t = Side::Doc)]
@@ -99,12 +112,31 @@ fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt::try_init().ok();
 
-    let pair_id = AlignmentPairId::new(args.primary_id.clone(), args.secondary_id.clone());
-
     let primary: Arc<dyn Embedder> = veld::embeddings::load_primary_embedder(&args.primary_id)
         .context("loading primary embedder")?;
     let secondary: Arc<dyn Embedder> = veld::embeddings::load_secondary_embedder(&args.secondary_id)
         .context("loading secondary embedder")?;
+
+    // pair_id.secondary must equal the runtime `secondary.model_id()` so the
+    // onboarding loader (retrieval.rs builds its pair_id from `model_id()`)
+    // accepts this file. The loading id (`--secondary_id`) may be a URL for an
+    // HTTP secondary; the canonical id is the served model name. Prefer the
+    // explicit override, else the live embedder's `model_id()`, else fall back
+    // to the loading id.
+    let secondary_canonical = args.secondary_model_id.clone().unwrap_or_else(|| {
+        let mid = secondary.model_id();
+        if mid == "unknown" {
+            args.secondary_id.clone()
+        } else {
+            mid.to_string()
+        }
+    });
+    let pair_id = AlignmentPairId::new(args.primary_id.clone(), secondary_canonical.clone());
+    tracing::info!(
+        "pair_id.secondary = {} (loading id = {})",
+        secondary_canonical,
+        args.secondary_id
+    );
 
     let file = File::open(&args.pairs)
         .with_context(|| format!("opening {}", args.pairs.display()))?;
