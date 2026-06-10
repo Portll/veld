@@ -257,7 +257,15 @@ impl RetrievalEngine {
                 engine.embedder.primary_embedder().model_id(),
                 secondary.model_id(),
             );
-            match super::alignment_onboarding::resolve_or_fit(&pair_id) {
+            // Hand the LIVE secondary instance to onboarding so auto-fit aligns
+            // the SAME vectors the secondary produces at ingest, and never tries
+            // to re-load an HTTP/runtime-only secondary by its (non-loadable)
+            // `model_id()` — which is the "unknown embedder id" autofit failure.
+            let live_secondary = secondary.clone();
+            match super::alignment_onboarding::resolve_or_fit_with_secondary(
+                &pair_id,
+                live_secondary,
+            ) {
                 Ok(Some(alignment)) => {
                     if let Err(e) = engine.embedder.install_alignment(alignment) {
                         tracing::warn!("could not install alignment {:?}: {}", pair_id, e);
