@@ -1450,10 +1450,7 @@ pub async fn update_todo(
                 {
                     return Err(AppError::InvalidInput {
                         field: "depends_on".to_string(),
-                        reason: format!(
-                            "Adding dependency on {} would create a cycle",
-                            dep_str
-                        ),
+                        reason: format!("Adding dependency on {} would create a cycle", dep_str),
                     });
                 }
                 todo.add_dependency(dep_todo.id);
@@ -1995,11 +1992,10 @@ pub async fn list_ready_todos(
     let formatted = if ready.is_empty() {
         "No ready todos (all tasks have unresolved dependencies)".to_string()
     } else {
-        let mut output =
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+        let mut output = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
              ┃  READY (all dependencies satisfied)  ┃\n\
              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                .to_string();
+            .to_string();
         output.push_str(&todo_formatter::format_todo_list(&ready, &projects));
         output
     };
@@ -2116,7 +2112,11 @@ pub async fn dependency_chain(
     };
 
     let formatted = if chain_todos.is_empty() {
-        format!("No {} dependencies for {}", query.direction, todo.short_id())
+        format!(
+            "No {} dependencies for {}",
+            query.direction,
+            todo.short_id()
+        )
     } else {
         let mut output = format!(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\

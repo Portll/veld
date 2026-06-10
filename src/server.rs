@@ -16,9 +16,9 @@ use crate::{
     auth,
     config::{env_var_is_set, promote_env_aliases, ServerConfig, StorageBackend},
     embeddings::minilm::pre_init_ort_runtime,
+    metrics, middleware,
     rate_limit_governance::{RateLimitGovernanceLayer, ResetHandle},
     roots::{AppState, RootsRuntime},
-    metrics, middleware,
 };
 
 #[cfg(feature = "telemetry")]
@@ -56,11 +56,10 @@ pub struct ServerRunConfig {
 /// Environment variables are set **before** the tokio runtime is created, so no
 /// threads exist yet. This avoids the `set_var` unsoundness on multi-threaded runtimes.
 pub fn run(config: ServerRunConfig) -> Result<()> {
-    let local_dev_rate_limit_default =
-        !config.production
-            && crate::config::is_local_bind_host(&config.host)
-            && !env_var_is_set("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT")
-            && config.rate_limit == 4000;
+    let local_dev_rate_limit_default = !config.production
+        && crate::config::is_local_bind_host(&config.host)
+        && !env_var_is_set("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT")
+        && config.rate_limit == 4000;
     let effective_rate_limit = if local_dev_rate_limit_default {
         0
     } else {
@@ -149,10 +148,7 @@ async fn async_main() -> Result<()> {
     crate::decay::init_runtime_scales(&server_config.log_periodic_scales);
 
     // Create orchestration runtime
-    let runtime = RootsRuntime::new(
-        server_config.storage_path.clone(),
-        server_config.clone(),
-    )?;
+    let runtime = RootsRuntime::new(server_config.storage_path.clone(), server_config.clone())?;
     let manager: AppState = runtime.state();
 
     // Print storage stats
@@ -260,22 +256,22 @@ async fn async_main() -> Result<()> {
             let requested_storage_backend = requested_storage_backend.clone();
             let effective_storage_backend = effective_storage_backend.clone();
             async move {
-            axum::Json(serde_json::json!({
-                "name": "veld",
-                "version": env!("VELD_VERSION_FULL"),
-                "description": "Adaptive memory runtime for AI agents and robots",
-                "requested_storage_backend": requested_storage_backend,
-                "effective_storage_backend": effective_storage_backend,
-                "health": "/health",
-                "api": {
-                    "remember": "POST /api/remember",
-                    "recall": "POST /api/recall",
-                    "forget": "POST /api/forget",
-                    "todos": "GET /api/todos",
-                    "graph": "GET /api/graph/stats"
-                },
-                "docs": "https://github.com/Portll/veld"
-            }))
+                axum::Json(serde_json::json!({
+                    "name": "veld",
+                    "version": env!("VELD_VERSION_FULL"),
+                    "description": "Adaptive memory runtime for AI agents and robots",
+                    "requested_storage_backend": requested_storage_backend,
+                    "effective_storage_backend": effective_storage_backend,
+                    "health": "/health",
+                    "api": {
+                        "remember": "POST /api/remember",
+                        "recall": "POST /api/recall",
+                        "forget": "POST /api/forget",
+                        "todos": "GET /api/todos",
+                        "graph": "GET /api/graph/stats"
+                    },
+                    "docs": "https://github.com/Portll/veld"
+                }))
             }
         }),
     );
@@ -655,7 +651,11 @@ fn print_config(config: &ServerConfig) {
     }
     eprintln!(
         "     Encryption: {}",
-        if encryption_enabled { "enabled" } else { "disabled" }
+        if encryption_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     if config.cors.deny_all {
         eprintln!("     CORS:    deny-all (set SHODH_CORS_ORIGINS)");
@@ -691,9 +691,7 @@ fn log_production_security_warnings(config: &ServerConfig) {
     }
 
     if config.rate_limit_per_second == 0 {
-        warn!(
-            "PRODUCTION WARNING: rate limiting is disabled (SHODH_RATE_LIMIT=0)."
-        );
+        warn!("PRODUCTION WARNING: rate limiting is disabled (SHODH_RATE_LIMIT=0).");
     }
 }
 
@@ -728,11 +726,9 @@ fn print_ready_message(addr: SocketAddr) {
     eprintln!("     Stream:    ws://{}/api/stream", addr);
     #[cfg(feature = "zenoh")]
     {
-        let zenoh_enabled = crate::config::env_var_truthy(
-            "VELD_ZENOH_ENABLED",
-            "SHODH_ZENOH_ENABLED",
-        )
-        .unwrap_or(false);
+        let zenoh_enabled =
+            crate::config::env_var_truthy("VELD_ZENOH_ENABLED", "SHODH_ZENOH_ENABLED")
+                .unwrap_or(false);
         if zenoh_enabled {
             let prefix = crate::config::env_var("VELD_ZENOH_PREFIX", "SHODH_ZENOH_PREFIX")
                 .unwrap_or_else(|_| "veld".to_string());

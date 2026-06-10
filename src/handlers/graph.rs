@@ -260,9 +260,7 @@ pub async fn rebuild_user_graph(
     }
 
     // Get all memories for this user
-    let memory_sys = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory_sys = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
     let memories: Vec<(MemoryId, Experience)> = {
         let memory_guard = memory_sys.read();
         memory_guard

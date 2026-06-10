@@ -7,8 +7,8 @@
 //! - Mixed entity extraction
 //! - Edge cases and stress tests
 
-use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 use std::path::PathBuf;
+use veld::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 
 /// Create a fallback NER instance for testing
 fn create_test_ner() -> NeuralNer {

@@ -82,8 +82,7 @@ impl SlowStore {
     /// Used by Planet X detection to find where edges converge.
     pub fn load_all_edge_pairs(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare_cached("SELECT from_entity, to_entity FROM edges")?;
+        let mut stmt = conn.prepare_cached("SELECT from_entity, to_entity FROM edges")?;
 
         let results = stmt
             .query_map([], |row| {

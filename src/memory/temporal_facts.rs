@@ -198,9 +198,25 @@ pub fn detect_semantic_opposition(text_a: &str, text_b: &str) -> bool {
     // and they share significant vocabulary (caller already verified similarity > 0.85),
     // that's a strong signal of contradiction.
     let negation_markers = [
-        "not ", "n't ", "no ", "never ", "doesn't ", "don't ", "didn't ",
-        "isn't ", "aren't ", "wasn't ", "weren't ", "won't ", "wouldn't ",
-        "can't ", "cannot ", "couldn't ", "shouldn't ", "hasn't ", "haven't ",
+        "not ",
+        "n't ",
+        "no ",
+        "never ",
+        "doesn't ",
+        "don't ",
+        "didn't ",
+        "isn't ",
+        "aren't ",
+        "wasn't ",
+        "weren't ",
+        "won't ",
+        "wouldn't ",
+        "can't ",
+        "cannot ",
+        "couldn't ",
+        "shouldn't ",
+        "hasn't ",
+        "haven't ",
         "hadn't ",
     ];
 
@@ -495,8 +511,7 @@ impl TemporalFactStore {
         include_expired: bool,
     ) -> Result<Vec<TemporalFact>> {
         // Get facts by entity (already filtered by include_expired)
-        let entity_facts =
-            self.find_by_entity_filtered(user_id, entity, 100, include_expired)?;
+        let entity_facts = self.find_by_entity_filtered(user_id, entity, 100, include_expired)?;
 
         // Filter by event keywords
         let stemmer = Stemmer::create(Algorithm::English);
@@ -860,7 +875,8 @@ fn extract_event_and_time(sentence: &str, patterns: &[&str]) -> (String, String)
     // Find which pattern matched (used to verify a pattern exists)
     let _matched_pattern = patterns
         .iter()
-        .find(|p| sentence_lower.contains(*p)).copied()
+        .find(|p| sentence_lower.contains(*p))
+        .copied()
         .unwrap_or("");
 
     // Extract time expression

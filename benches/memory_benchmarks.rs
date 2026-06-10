@@ -8,10 +8,10 @@
 //! Now includes NER integration for entity extraction benchmarks.
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-use veld::embeddings::ner::{NerConfig, NeuralNer};
-use veld::memory::{Experience, MemoryConfig, MemorySystem, Query};
 use std::fs;
 use tempfile::TempDir;
+use veld::embeddings::ner::{NerConfig, NeuralNer};
+use veld::memory::{Experience, MemoryConfig, MemorySystem, Query};
 
 /// Helper: Create test memory system
 fn setup_memory_system() -> (MemorySystem, TempDir) {

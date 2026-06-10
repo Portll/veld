@@ -193,7 +193,11 @@ impl KeyValueStore for RedbKeyValueStore {
         ))
     }
 
-    fn scan_prefix(&self, _prefix: &[u8], _limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    fn scan_prefix(
+        &self,
+        _prefix: &[u8],
+        _limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Err(not_implemented(
             &format!("key-value prefix scan in namespace '{}'", self.namespace),
             &self.path,

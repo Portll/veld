@@ -98,10 +98,7 @@ impl CompetitiveEmbedder {
             Some(embedder) => match embedder.encode(text) {
                 Ok(emb) => Some(emb),
                 Err(e) => {
-                    tracing::warn!(
-                        "Secondary embedder failed (graceful degradation): {}",
-                        e
-                    );
+                    tracing::warn!("Secondary embedder failed (graceful degradation): {}", e);
                     None
                 }
             },

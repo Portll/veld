@@ -20,7 +20,9 @@ pub fn env_truthy(value: &str) -> bool {
 }
 
 pub fn env_var_truthy(primary: &str, legacy: &str) -> Option<bool> {
-    env_var(primary, legacy).ok().map(|value| env_truthy(&value))
+    env_var(primary, legacy)
+        .ok()
+        .map(|value| env_truthy(&value))
 }
 
 /// Promote VELD_* and SHODH_* aliases so either environment surface works.
@@ -41,7 +43,10 @@ pub unsafe fn promote_env_aliases() {
         ("VELD_USER_ID", "SHODH_USER_ID"),
         ("VELD_MULTI_TENANT", "SHODH_MULTI_TENANT"),
         ("VELD_COLLECTIVE_STORE_DIR", "SHODH_COLLECTIVE_STORE_DIR"),
-        ("VELD_KEY_USER_BINDINGS_PATH", "SHODH_KEY_USER_BINDINGS_PATH"),
+        (
+            "VELD_KEY_USER_BINDINGS_PATH",
+            "SHODH_KEY_USER_BINDINGS_PATH",
+        ),
         ("VELD_ENCRYPTION_KEY", "SHODH_ENCRYPTION_KEY"),
         ("VELD_RATE_LIMIT", "SHODH_RATE_LIMIT"),
         ("VELD_RATE_BURST", "SHODH_RATE_BURST"),
@@ -784,8 +789,7 @@ impl ServerConfig {
         } else {
             info!(
                 "   Backend: requested {}, running {} (compatibility path)",
-                self.requested_storage_backend,
-                self.effective_storage_backend
+                self.requested_storage_backend, self.effective_storage_backend
             );
         }
         info!("   Max users in memory: {}", self.max_users_in_memory);
@@ -838,7 +842,9 @@ pub fn print_env_help() {
     println!("  VELD_MEMORY_PATH       - Storage directory (default: platform data dir, e.g. ~/.local/share/shodh-memory/)");
     println!("  VELD_STORAGE_BACKEND   - Requested backend: redb (target default) or rocksdb (legacy compatibility)");
     println!("  VELD_API_KEYS          - Comma-separated API keys (required in production)");
-    println!("  VELD_DEV_API_KEY       - Development API key (required in dev if VELD_API_KEYS not set)");
+    println!(
+        "  VELD_DEV_API_KEY       - Development API key (required in dev if VELD_API_KEYS not set)"
+    );
     println!("  VELD_ENCRYPTION_KEY    - 32-byte field-encryption key (required for encrypted-at-rest production)");
     println!("  VELD_MAX_USERS         - Max users in memory LRU (default: 1000)");
     println!("  VELD_RATE_LIMIT        - Requests per second (default: 0 on localhost/dev, otherwise 4000)");
@@ -963,7 +969,10 @@ mod tests {
         let cors = CorsConfig::from_env();
         assert!(!cors.deny_all);
         assert!(cors.is_restricted());
-        assert_eq!(cors.allowed_origins, vec!["https://app.example.com".to_string()]);
+        assert_eq!(
+            cors.allowed_origins,
+            vec!["https://app.example.com".to_string()]
+        );
 
         env::remove_var("SHODH_ENV");
         env::remove_var("SHODH_CORS_ORIGINS");

@@ -292,10 +292,7 @@ pub static VECTOR_INDEX_SIZE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Vector search operations
 pub static VECTOR_SEARCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     IntCounterVec::new(
-        Opts::new(
-            "veld_vector_search_total",
-            "Total vector search operations",
-        ),
+        Opts::new("veld_vector_search_total", "Total vector search operations"),
         &["result"],
     )
     .expect("VECTOR_SEARCH_TOTAL metric must be valid at compile time")

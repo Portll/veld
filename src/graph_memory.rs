@@ -518,7 +518,6 @@ pub struct RelationshipEdge {
     // M&I bidirectional memory-identity coupling: direction matters.
     // When memory A triggers recall of B (but not vice versa), the edge
     // should reflect this asymmetry for spreading activation.
-
     /// Forward activation strength (from_entity triggered, to_entity co-retrieved)
     /// Increases when from_entity is the query match and to_entity is co-retrieved.
     #[serde(default)]
@@ -1965,9 +1964,10 @@ impl GraphMemory {
                 for (uuid, existing_emb) in cache.iter() {
                     let sim = crate::similarity::cosine_similarity(new_emb, existing_emb);
                     if sim >= ENTITY_CONCEPT_MERGE_THRESHOLD
-                        && best_match.is_none_or(|(_, best_sim)| sim > best_sim) {
-                            best_match = Some((*uuid, sim));
-                        }
+                        && best_match.is_none_or(|(_, best_sim)| sim > best_sim)
+                    {
+                        best_match = Some((*uuid, sim));
+                    }
                 }
                 if let Some((matched_uuid, sim)) = best_match {
                     tracing::debug!(
@@ -2523,9 +2523,7 @@ impl GraphMemory {
         if let Err(e) = self
             .index_entity_edge(&edge.from_entity, &edge.uuid)
             .and_then(|_| self.index_entity_edge(&edge.to_entity, &edge.uuid))
-            .and_then(|_| {
-                self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid)
-            })
+            .and_then(|_| self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid))
         {
             tracing::warn!(
                 "Rolling back relationship {} due to index failure: {}",
@@ -4074,8 +4072,7 @@ impl GraphMemory {
                 }
 
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) =
-                    bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put_cf(self.relationships_cf(), key, value);
                     edges_updated += 1;
@@ -4109,8 +4106,7 @@ impl GraphMemory {
                 };
 
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) =
-                    bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
                     batch.put_cf(self.relationships_cf(), key, value);
 
@@ -4767,9 +4763,7 @@ impl GraphMemory {
             // Only write back edges whose strength actually changed, LTP status
             // changed, or need pruning. With 300s maintenance intervals, most edges
             // won't have meaningful decay, so this skips unchanged edges.
-            if should_prune
-                || (edge.strength - strength_before).abs() > f32::EPSILON
-                || ltp_changed
+            if should_prune || (edge.strength - strength_before).abs() > f32::EPSILON || ltp_changed
             {
                 let key = edge.uuid.as_bytes();
                 match bincode::serde::encode_to_vec(&*edge, bincode::config::standard()) {
@@ -5078,9 +5072,7 @@ impl GraphMemory {
     ///
     /// Returns L3-tier edges where both endpoints are PII-clean.
     /// Each tuple: (from_name, to_name, strength, relation_type).
-    pub fn export_collective_edges(
-        &self,
-    ) -> Result<Vec<(String, String, f32, String)>> {
+    pub fn export_collective_edges(&self) -> Result<Vec<(String, String, f32, String)>> {
         let mut safe_edges = Vec::new();
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.fill_cache(false);
@@ -7425,7 +7417,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::PersonalIdentity,
+            pii_classification: PiiClassification::PersonalIdentity,
         };
         let entity2 = EntityNode {
             uuid: Uuid::new_v4(),
@@ -7439,7 +7431,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::OrganizationIdentity,
+            pii_classification: PiiClassification::OrganizationIdentity,
         };
 
         let entity1_uuid = graph.add_entity(entity1.clone()).unwrap();
@@ -7489,7 +7481,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::PersonalIdentity,
+            pii_classification: PiiClassification::PersonalIdentity,
         };
         let entity2 = EntityNode {
             uuid: entity2_uuid,
@@ -7503,7 +7495,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::OrganizationIdentity,
+            pii_classification: PiiClassification::OrganizationIdentity,
         };
 
         graph.add_entity(entity1).unwrap();
@@ -7623,7 +7615,11 @@ mod tests {
         // Verify it's in the expected range for L2 promotion gate (>= 0.45) and
         // below LTP readiness bonus threshold (0.75)
         assert!(npmi >= 0.45, "NPMI {} should pass L2 promotion gate", npmi);
-        assert!(npmi < 0.75, "NPMI {} should be below LTP bonus threshold", npmi);
+        assert!(
+            npmi < 0.75,
+            "NPMI {} should be below LTP bonus threshold",
+            npmi
+        );
     }
 
     #[test]
@@ -7708,9 +7704,15 @@ mod tests {
 
     #[test]
     fn test_npmi_prune_thresholds() {
-        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L1Working) - 0.30).abs() < f32::EPSILON);
-        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L2Episodic) - 0.40).abs() < f32::EPSILON);
-        assert!((GraphMemory::npmi_prune_threshold(&EdgeTier::L3Semantic) - 0.50).abs() < f32::EPSILON);
+        assert!(
+            (GraphMemory::npmi_prune_threshold(&EdgeTier::L1Working) - 0.30).abs() < f32::EPSILON
+        );
+        assert!(
+            (GraphMemory::npmi_prune_threshold(&EdgeTier::L2Episodic) - 0.40).abs() < f32::EPSILON
+        );
+        assert!(
+            (GraphMemory::npmi_prune_threshold(&EdgeTier::L3Semantic) - 0.50).abs() < f32::EPSILON
+        );
     }
 
     #[test]
@@ -7739,7 +7741,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::Clean,
+            pii_classification: PiiClassification::Clean,
         };
         let node_b = EntityNode {
             uuid: entity_b,
@@ -7753,7 +7755,7 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
-                pii_classification: PiiClassification::Clean,
+            pii_classification: PiiClassification::Clean,
         };
         graph.add_entity(node_a).unwrap();
         graph.add_entity(node_b).unwrap();
@@ -7774,7 +7776,7 @@ mod tests {
             ltp_status: LtpStatus::None,
             activation_timestamps: None,
             tier: EdgeTier::L2Episodic,
-                created_by: EdgeSource::CoOccurrence,
+            created_by: EdgeSource::CoOccurrence,
             entity_confidence: None,
             forward_strength: 0.5,
             backward_strength: 0.5,

@@ -233,8 +233,8 @@ fn download_file(url: &str, path: &PathBuf) -> Result<()> {
         .with_context(|| format!("HTTP request failed: {url}"))?;
 
     let mut reader = resp.into_body().into_reader();
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("Failed to create file: {path:?}"))?;
+    let mut file =
+        std::fs::File::create(path).with_context(|| format!("Failed to create file: {path:?}"))?;
 
     std::io::copy(&mut reader, &mut file)?;
     Ok(())

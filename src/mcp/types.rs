@@ -83,7 +83,9 @@ pub(crate) struct LineageStatsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GapMapperParams {
-    #[schemars(description = "Filter function: 'centroid_distance' (default), 'density', 'eccentricity', 'neighbor_distance', or 'embedding_pc1'")]
+    #[schemars(
+        description = "Filter function: 'centroid_distance' (default), 'density', 'eccentricity', 'neighbor_distance', or 'embedding_pc1'"
+    )]
     pub filter: Option<String>,
     #[schemars(description = "Number of intervals in the cover (default 10)")]
     pub num_intervals: Option<usize>,

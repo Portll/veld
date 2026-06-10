@@ -78,9 +78,8 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
 
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()> {
         let mapping_key = format!("vmapping:{}", id.0);
-        let mapping_value =
-            bincode::serde::encode_to_vec(mapping, bincode::config::standard())
-                .context("Failed to serialize vector mapping for legacy RocksDB store")?;
+        let mapping_value = bincode::serde::encode_to_vec(mapping, bincode::config::standard())
+            .context("Failed to serialize vector mapping for legacy RocksDB store")?;
 
         self.inner
             .db()
@@ -203,7 +202,8 @@ impl BackupStore for RocksDbBackupStore {
     }
 
     fn restore_backup(&self, user_id: &str, backup_id: u32, target_path: &Path) -> Result<()> {
-        self.inner.restore_backup(user_id, Some(backup_id), target_path)
+        self.inner
+            .restore_backup(user_id, Some(backup_id), target_path)
     }
 }
 
@@ -289,9 +289,12 @@ impl RocksDbAuditStore {
     }
 
     fn cf(&self) -> Result<&ColumnFamily> {
-        self.db
-            .cf_handle(&self.column_family)
-            .with_context(|| format!("Missing RocksDB audit column family '{}'", self.column_family))
+        self.db.cf_handle(&self.column_family).with_context(|| {
+            format!(
+                "Missing RocksDB audit column family '{}'",
+                self.column_family
+            )
+        })
     }
 }
 

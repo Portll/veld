@@ -141,9 +141,7 @@ impl ContextBlockStore {
         let prefix = format!("{user_id}:");
         let mut blocks = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.cf(), prefix.as_bytes());
+        let iter = self.db.prefix_iterator_cf(self.cf(), prefix.as_bytes());
 
         for item in iter {
             let (key, value) = item.context("Failed to iterate context blocks")?;
@@ -207,7 +205,9 @@ mod tests {
         let (db, _tmp) = open_test_db();
         let store = ContextBlockStore::new(db);
 
-        let block = store.set("user1", "persona", "You are a helpful assistant.", None).unwrap();
+        let block = store
+            .set("user1", "persona", "You are a helpful assistant.", None)
+            .unwrap();
         assert_eq!(block.key, "persona");
         assert_eq!(block.version, 1);
         assert_eq!(block.max_tokens, DEFAULT_MAX_TOKENS);

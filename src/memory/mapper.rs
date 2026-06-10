@@ -217,8 +217,8 @@ pub fn compute_mapper(store: &SlowStore, config: &MapperConfig) -> Result<Mapper
         .iter()
         .enumerate()
         .map(|(id, (interval_idx, members))| {
-            let avg_fv = members.iter().map(|&i| filter_values[i]).sum::<f32>()
-                / members.len() as f32;
+            let avg_fv =
+                members.iter().map(|&i| filter_values[i]).sum::<f32>() / members.len() as f32;
             MapperNode {
                 id,
                 member_names: members.iter().map(|&i| names[i].clone()).collect(),
@@ -402,8 +402,7 @@ fn compute_filter_values(embeddings: &[&[f32]], filter: MapperFilter) -> Vec<f32
                     // center
                     let centered: Vec<f32> =
                         emb.iter().zip(mean.iter()).map(|(e, m)| e - m).collect();
-                    let projection: f32 =
-                        centered.iter().zip(pc.iter()).map(|(c, p)| c * p).sum();
+                    let projection: f32 = centered.iter().zip(pc.iter()).map(|(c, p)| c * p).sum();
                     for (np, c) in new_pc.iter_mut().zip(centered.iter()) {
                         *np += projection * c;
                     }
@@ -490,8 +489,7 @@ fn single_linkage_cluster(
     // Merge points within radius
     for i in 0..n {
         for j in (i + 1)..n {
-            let dist =
-                1.0 - cosine_similarity(embeddings[indices[i]], embeddings[indices[j]]);
+            let dist = 1.0 - cosine_similarity(embeddings[indices[i]], embeddings[indices[j]]);
             if dist <= radius {
                 union(&mut parent, i, j);
             }
@@ -586,8 +584,16 @@ mod tests {
     #[test]
     fn test_count_components_connected() {
         let edges = vec![
-            MapperEdge { from: 0, to: 1, weight: 1 },
-            MapperEdge { from: 1, to: 2, weight: 1 },
+            MapperEdge {
+                from: 0,
+                to: 1,
+                weight: 1,
+            },
+            MapperEdge {
+                from: 1,
+                to: 2,
+                weight: 1,
+            },
         ];
         assert_eq!(count_components(3, &edges), 1);
     }

@@ -146,20 +146,23 @@ impl FieldEncryptor {
         }
 
         if &data[..4] != ENCRYPTED_MARKER {
-            return Err(anyhow!("Missing encryption marker — data may not be encrypted"));
+            return Err(anyhow!(
+                "Missing encryption marker — data may not be encrypted"
+            ));
         }
 
         let nonce_bytes = &data[4..4 + NONCE_SIZE];
         let ciphertext = &data[4 + NONCE_SIZE..];
 
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext_bytes = self
-            .cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| anyhow!("AES-256-GCM decryption failed (wrong key or corrupted data): {}", e))?;
+        let plaintext_bytes = self.cipher.decrypt(nonce, ciphertext).map_err(|e| {
+            anyhow!(
+                "AES-256-GCM decryption failed (wrong key or corrupted data): {}",
+                e
+            )
+        })?;
 
-        String::from_utf8(plaintext_bytes)
-            .context("Decrypted content is not valid UTF-8")
+        String::from_utf8(plaintext_bytes).context("Decrypted content is not valid UTF-8")
     }
 
     /// Check whether a byte slice looks like encrypted content (has the marker prefix).
@@ -254,7 +257,8 @@ mod tests {
     #[test]
     fn unicode_roundtrip() {
         let enc = FieldEncryptor::new(&test_key());
-        let plaintext = "Memory: user prefers dark mode \u{1f30d} \u{2014} context: \u{e4}\u{fc}\u{f6}\u{df}";
+        let plaintext =
+            "Memory: user prefers dark mode \u{1f30d} \u{2014} context: \u{e4}\u{fc}\u{f6}\u{df}";
         let encrypted = enc.encrypt_content(plaintext).unwrap();
         let decrypted = enc.decrypt_content(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);

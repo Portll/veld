@@ -17,9 +17,9 @@
 
 use std::time::Instant;
 
+use tempfile::TempDir;
 use veld::memory::types::{Experience, ExperienceType, Query};
 use veld::memory::{MemoryConfig, MemoryId, MemorySystem};
-use tempfile::TempDir;
 
 // =============================================================================
 // DATA STRUCTURES
@@ -510,28 +510,19 @@ fn aggregate_by_type(evaluations: &[QueryEvaluation]) -> Vec<EvaluationResult> {
 fn print_summary_table(type_results: &[EvaluationResult], overall: &EvaluationResult) {
     println!();
     println!("Shodh-Memory Retrieval Benchmark");
-    println!(
-        "{}",
-        "\u{2501}".repeat(73)
-    );
+    println!("{}", "\u{2501}".repeat(73));
     println!(
         "{:<16}| {:<8}| {:<8}| {:<8}| {:<8}| Latency",
         "Query Type", "P@3", "P@5", "R@5", "MRR"
     );
-    println!(
-        "{}",
-        "\u{2500}".repeat(73)
-    );
+    println!("{}", "\u{2500}".repeat(73));
     for r in type_results {
         println!(
             "{:<16}| {:<8.2}| {:<8.2}| {:<8.2}| {:<8.2}| {}ms",
             r.query_type, r.precision_at_3, r.precision_at_5, r.recall_at_5, r.mrr, r.latency_ms
         );
     }
-    println!(
-        "{}",
-        "\u{2501}".repeat(73)
-    );
+    println!("{}", "\u{2501}".repeat(73));
     println!(
         "{:<16}| {:<8.2}| {:<8.2}| {:<8.2}| {:<8.2}| {}ms",
         "OVERALL",
@@ -692,7 +683,10 @@ fn benchmark_retrieval_quality() {
         println!(
             "  Total absence violations: {}/{}",
             absence_violations,
-            queries.iter().map(|q| q.expected_absent.len()).sum::<usize>()
+            queries
+                .iter()
+                .map(|q| q.expected_absent.len())
+                .sum::<usize>()
         );
     }
 

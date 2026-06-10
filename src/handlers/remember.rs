@@ -316,8 +316,7 @@ pub async fn remember(
         let fmt = crate::ingest::detect_format(None, &req.content);
         fmt != crate::ingest::InputFormat::PlainText
     } {
-        let format =
-            crate::ingest::detect_format(req.filename.as_deref(), &req.content);
+        let format = crate::ingest::detect_format(req.filename.as_deref(), &req.content);
         if format != crate::ingest::InputFormat::PlainText {
             match crate::ingest::extract_text(&req.content, format) {
                 Ok(extracted) => {
@@ -425,8 +424,7 @@ pub async fn remember(
         .ok()
         .map(|g| g.read().get_stats().map(|s| s.entity_count).unwrap_or(0))
         .unwrap_or(0);
-    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD
-        && ner_entities.len() < 2
+    if graph_entity_count < crate::constants::ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2
     {
         let cold_entities =
             crate::embeddings::ner::cold_start_extract_entities(&req.content, &merged_entities);
@@ -491,9 +489,7 @@ pub async fn remember(
             let memory_guard = memory.read();
             // Fast path: persist + BM25 only (~10ms), embedding deferred to background
             if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent_deferred(
-                    exp_clone, created_at, agent_id, run_id,
-                )
+                memory_guard.remember_with_agent_deferred(exp_clone, created_at, agent_id, run_id)
             } else {
                 memory_guard.remember_deferred(exp_clone, created_at)
             }
@@ -863,7 +859,8 @@ fn detect_and_resolve_conflicts(
         // Create SupersededBy edge in graph
         let now = chrono::Utc::now();
         // Find entity pairs to link
-        let old_entities: Vec<uuid::Uuid> = candidate.entity_refs.iter().map(|e| e.entity_id).collect();
+        let old_entities: Vec<uuid::Uuid> =
+            candidate.entity_refs.iter().map(|e| e.entity_id).collect();
         if let (Some(&new_ent), Some(&old_ent)) = (focal_entities.first(), old_entities.first()) {
             let edge = crate::graph_memory::RelationshipEdge {
                 uuid: uuid::Uuid::new_v4(),

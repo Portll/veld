@@ -121,11 +121,18 @@ impl super::MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
+                match graph
+                    .read()
+                    .record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..])
+                {
                     Ok(result) => {
                         // BRIDGE-4: Consume edge tier promotions — boost memory importance
                         for promo in &result.promotions {
-                            let boost = if promo.new_tier.contains("L3") { 0.15 } else { 0.10 };
+                            let boost = if promo.new_tier.contains("L3") {
+                                0.15
+                            } else {
+                                0.10
+                            };
                             for mem in &memories {
                                 if mem.id.0 == promo.from_entity || mem.id.0 == promo.to_entity {
                                     mem.boost_importance(boost);
@@ -299,8 +306,8 @@ impl super::MemorySystem {
                 } else {
                     g.entities_average_density(&seed_uuids).ok().flatten()
                 };
-                let use_rerank = !density
-                    .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD);
+                let use_rerank =
+                    !density.is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD);
                 (density, use_rerank)
             } else {
                 (None, false)
@@ -412,9 +419,23 @@ impl super::MemorySystem {
         // "in that session", "what happened recently").
         let query_lower_for_temporal = query_text.to_lowercase();
         let has_temporal_keywords = [
-            "when", "last week", "recently", "during", "before", "after",
-            "yesterday", "meeting", "session", "phase", "earlier", "later",
-            "previous", "following", "happened", "took place", "occurred",
+            "when",
+            "last week",
+            "recently",
+            "during",
+            "before",
+            "after",
+            "yesterday",
+            "meeting",
+            "session",
+            "phase",
+            "earlier",
+            "later",
+            "previous",
+            "following",
+            "happened",
+            "took place",
+            "occurred",
         ]
         .iter()
         .any(|kw| query_lower_for_temporal.contains(kw));
@@ -494,7 +515,10 @@ impl super::MemorySystem {
                             );
                         }
                         Err(e) => {
-                            tracing::debug!("Layer 0.6: Temporal fact lookup (entity+event) failed: {}", e);
+                            tracing::debug!(
+                                "Layer 0.6: Temporal fact lookup (entity+event) failed: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -505,21 +529,23 @@ impl super::MemorySystem {
                 // Fires when entity is known but event keywords are empty or
                 // Strategy 1 returned nothing.
                 if boosted.is_empty() && !entity.is_empty() {
-                    match self.temporal_fact_store.find_by_entity_filtered(
-                        user_id, &entity, 50, false,
-                    ) {
+                    match self
+                        .temporal_fact_store
+                        .find_by_entity_filtered(user_id, &entity, 50, false)
+                    {
                         Ok(facts) if !facts.is_empty() => {
                             // When query has a parsed time window, filter facts by it
-                            let filtered = Self::filter_facts_by_time_window(
-                                &facts, &query_temporal,
-                            );
+                            let filtered =
+                                Self::filter_facts_by_time_window(&facts, &query_temporal);
                             if !filtered.is_empty() {
                                 tracing::info!(
                                     "Layer 0.6: Fallback entity-only found {} facts (time-filtered) for '{}'",
                                     filtered.len(),
                                     entity
                                 );
-                                boosted.extend(filtered.into_iter().map(|f| f.source_memory_id.clone()));
+                                boosted.extend(
+                                    filtered.into_iter().map(|f| f.source_memory_id.clone()),
+                                );
                             } else {
                                 // No time window or no overlap — take all entity facts
                                 tracing::debug!(
@@ -546,13 +572,15 @@ impl super::MemorySystem {
                     for kw in &event_keywords {
                         match self.temporal_fact_store.find_by_event(user_id, kw, 30) {
                             Ok(facts) if !facts.is_empty() => {
-                                let filtered = Self::filter_facts_by_time_window(
-                                    &facts, &query_temporal,
-                                );
+                                let filtered =
+                                    Self::filter_facts_by_time_window(&facts, &query_temporal);
                                 if !filtered.is_empty() {
-                                    boosted.extend(filtered.iter().map(|f| f.source_memory_id.clone()));
+                                    boosted.extend(
+                                        filtered.iter().map(|f| f.source_memory_id.clone()),
+                                    );
                                 } else {
-                                    boosted.extend(facts.iter().map(|f| f.source_memory_id.clone()));
+                                    boosted
+                                        .extend(facts.iter().map(|f| f.source_memory_id.clone()));
                                 }
                             }
                             _ => {}
@@ -575,16 +603,17 @@ impl super::MemorySystem {
                 if boosted.is_empty() && query_temporal.has_temporal_refs() {
                     match self.temporal_fact_store.list_filtered(user_id, 200, false) {
                         Ok(all_facts) if !all_facts.is_empty() => {
-                            let filtered = Self::filter_facts_by_time_window(
-                                &all_facts, &query_temporal,
-                            );
+                            let filtered =
+                                Self::filter_facts_by_time_window(&all_facts, &query_temporal);
                             if !filtered.is_empty() {
                                 tracing::info!(
                                     "Layer 0.6: Time-window scan matched {} facts out of {}",
                                     filtered.len(),
                                     all_facts.len()
                                 );
-                                boosted.extend(filtered.into_iter().map(|f| f.source_memory_id.clone()));
+                                boosted.extend(
+                                    filtered.into_iter().map(|f| f.source_memory_id.clone()),
+                                );
                             }
                         }
                         _ => {}
@@ -682,12 +711,11 @@ impl super::MemorySystem {
             };
 
         // Secondary query embedding for dual-index competition (Nomic 768d)
-        let query_embedding_secondary: Option<Vec<f32>> =
-            if self.embedder.has_secondary() {
-                self.embedder.encode_secondary(query_text).ok().flatten()
-            } else {
-                None
-            };
+        let query_embedding_secondary: Option<Vec<f32>> = if self.embedder.has_secondary() {
+            self.embedder.encode_secondary(query_text).ok().flatten()
+        } else {
+            None
+        };
 
         let t_embedding = recall_start.elapsed();
         tracing::info!(
@@ -868,11 +896,7 @@ impl super::MemorySystem {
                                                     * path_boost;
                                                 // Relevance floor: skip low-activation candidates
                                                 if activation >= 0.1 {
-                                                    ids.push((
-                                                        mid,
-                                                        activation,
-                                                        tr.decay_factor,
-                                                    ));
+                                                    ids.push((mid, activation, tr.decay_factor));
                                                 }
                                             }
                                         }
@@ -910,19 +934,12 @@ impl super::MemorySystem {
                                 eps.truncate(20);
                                 for ep in eps {
                                     let mid = MemoryId(ep.uuid);
-                                    if episode_candidates
-                                        .as_ref()
-                                        .is_none_or(|c| c.contains(&mid))
+                                    if episode_candidates.as_ref().is_none_or(|c| c.contains(&mid))
                                     {
-                                        let activation =
-                                            tr.entity.salience * tr.decay_factor;
+                                        let activation = tr.entity.salience * tr.decay_factor;
                                         // Relevance floor: skip low-activation candidates
                                         if activation >= 0.1 {
-                                            ids.push((
-                                                mid,
-                                                activation,
-                                                tr.decay_factor,
-                                            ));
+                                            ids.push((mid, activation, tr.decay_factor));
                                         }
                                     }
                                 }
@@ -1025,8 +1042,8 @@ impl super::MemorySystem {
         // Detect abstract/thematic decomposition (Rule 4): decomposition fired AND
         // query contains abstract vocabulary. Used to invert RRF weights (sub-queries
         // are more targeted than the vague original) and gate adaptive scoring.
-        let abstract_decomposed = decomposed
-            && query_parser::expand_abstract_terms_for_bm25(query_text).is_some();
+        let abstract_decomposed =
+            decomposed && query_parser::expand_abstract_terms_for_bm25(query_text).is_some();
 
         let mut vector_results: Vec<(MemoryId, f32)> = if decomposed {
             // --- Decomposed path: weighted RRF merge of sub-query vector results ---
@@ -1043,7 +1060,11 @@ impl super::MemorySystem {
                 // contribute more to RRF scoring. For conjunction/entity decomposition,
                 // the original compound query is more informative — keep default weights.
                 let weight = if abstract_decomposed {
-                    if is_original { QUERY_DECOMPOSITION_SUB_WEIGHT } else { 1.0_f32 }
+                    if is_original {
+                        QUERY_DECOMPOSITION_SUB_WEIGHT
+                    } else {
+                        1.0_f32
+                    }
                 } else if is_original {
                     1.0_f32
                 } else {
@@ -1106,19 +1127,18 @@ impl super::MemorySystem {
                     rerank_count: query.rerank_count,
                 };
 
-                let sub_results =
-                    self.retriever
-                        .search_ids(&sub_vector_query, query.max_results * 8)?;
+                let sub_results = self
+                    .retriever
+                    .search_ids(&sub_vector_query, query.max_results * 8)?;
 
-                let filtered: Vec<(MemoryId, f32)> =
-                    if let Some(ref c) = episode_candidates {
-                        sub_results
-                            .into_iter()
-                            .filter(|(id, _)| c.contains(id))
-                            .collect()
-                    } else {
-                        sub_results
-                    };
+                let filtered: Vec<(MemoryId, f32)> = if let Some(ref c) = episode_candidates {
+                    sub_results
+                        .into_iter()
+                        .filter(|(id, _)| c.contains(id))
+                        .collect()
+                } else {
+                    sub_results
+                };
 
                 // Weighted RRF: score = weight / (K + rank)
                 for (rank, (id, _sim)) in filtered.iter().enumerate() {
@@ -1160,7 +1180,8 @@ impl super::MemorySystem {
             cumulative_ms = format!("{:.2}", t_vector.as_secs_f64() * 1000.0),
             vector_results = vector_results.len(),
             decomposed = decomposed,
-            "recall [layer:3] Vamana vector search{}", if decomposed { " (decomposed)" } else { "" }
+            "recall [layer:3] Vamana vector search{}",
+            if decomposed { " (decomposed)" } else { "" }
         );
 
         // ===========================================================================
@@ -1250,10 +1271,8 @@ impl super::MemorySystem {
         // 384-dim vectors, this is <0.1ms — negligible vs Vamana's ~2-5ms.
         {
             let mut tier_hits = 0usize;
-            let vamana_ids: std::collections::HashSet<MemoryId> = vector_results
-                .iter()
-                .map(|(id, _)| id.clone())
-                .collect();
+            let vamana_ids: std::collections::HashSet<MemoryId> =
+                vector_results.iter().map(|(id, _)| id.clone()).collect();
 
             // Helper: compute max similarity across primary + secondary embeddings
             let dual_cosine = |mem: &crate::memory::types::Memory| -> Option<f32> {
@@ -1263,20 +1282,21 @@ impl super::MemorySystem {
                 if let Some(ref emb) = mem.experience.embeddings {
                     if !emb.is_empty() {
                         let sim = crate::memory::hybrid_search::cosine_similarity_pub(
-                            &query_embedding, emb,
+                            &query_embedding,
+                            emb,
                         );
                         best = Some(sim);
                     }
                 }
 
                 // Secondary embedding (Nomic 768d) — take max of both
-                if let (Some(ref q_sec), Some(ref m_sec)) =
-                    (&query_embedding_secondary, &mem.experience.embeddings_secondary)
-                {
+                if let (Some(ref q_sec), Some(ref m_sec)) = (
+                    &query_embedding_secondary,
+                    &mem.experience.embeddings_secondary,
+                ) {
                     if !m_sec.is_empty() {
-                        let sim_sec = crate::memory::hybrid_search::cosine_similarity_pub(
-                            q_sec, m_sec,
-                        );
+                        let sim_sec =
+                            crate::memory::hybrid_search::cosine_similarity_pub(q_sec, m_sec);
                         best = Some(best.map_or(sim_sec, |b| b.max(sim_sec)));
                     }
                 }
@@ -1377,8 +1397,7 @@ impl super::MemorySystem {
             // e.g., "patterns" → also search "decisions choices recurring"
             // Expansion terms use low boost (^0.3) to act as tiebreakers.
             // ---------------------------------------------------------------
-            let bm25_query_text =
-                query_parser::expand_abstract_terms_for_bm25(query_text);
+            let bm25_query_text = query_parser::expand_abstract_terms_for_bm25(query_text);
             let bm25_query_ref: &str = bm25_query_text.as_deref().unwrap_or(query_text);
 
             let hybrid_ids = self
@@ -1468,9 +1487,7 @@ impl super::MemorySystem {
 
                 // Signal attribution: record graph contribution for memories
                 // that came from graph traversal (may not have hybrid search data)
-                attr.entry(id.clone())
-                    .or_default()
-                    .graph_contribution = *activation;
+                attr.entry(id.clone()).or_default().graph_contribution = *activation;
             }
 
             // Hybrid (BM25+vector) results: pure RRF with density weight
@@ -1551,24 +1568,25 @@ impl super::MemorySystem {
                     || (query_lower.contains("what") && query_lower.contains("use"));
 
                 if is_decision_query {
-                    let get_experience_type = |id: &MemoryId| -> Option<crate::memory::types::ExperienceType> {
-                        self.working_memory
-                            .read()
-                            .get(id)
-                            .map(|m| m.experience.experience_type.clone())
-                            .or_else(|| {
-                                self.session_memory
-                                    .read()
-                                    .get(id)
-                                    .map(|m| m.experience.experience_type.clone())
-                            })
-                            .or_else(|| {
-                                self.long_term_memory
-                                    .get(id)
-                                    .ok()
-                                    .map(|m| m.experience.experience_type.clone())
-                            })
-                    };
+                    let get_experience_type =
+                        |id: &MemoryId| -> Option<crate::memory::types::ExperienceType> {
+                            self.working_memory
+                                .read()
+                                .get(id)
+                                .map(|m| m.experience.experience_type.clone())
+                                .or_else(|| {
+                                    self.session_memory
+                                        .read()
+                                        .get(id)
+                                        .map(|m| m.experience.experience_type.clone())
+                                })
+                                .or_else(|| {
+                                    self.long_term_memory
+                                        .get(id)
+                                        .ok()
+                                        .map(|m| m.experience.experience_type.clone())
+                                })
+                        };
 
                     const DECISION_TYPE_BOOST: f32 = 0.15;
                     let mut boosted_count = 0usize;
@@ -1605,14 +1623,13 @@ impl super::MemorySystem {
                 let stemmer = Stemmer::create(Algorithm::English);
 
                 const STOP_WORDS: &[&str] = &[
-                    "the", "and", "for", "are", "but", "not", "you", "all", "can",
-                    "had", "was", "one", "our", "out", "has", "how", "its", "who",
-                    "did", "get", "got", "let", "say", "she", "too", "use", "what",
-                    "when", "where", "which", "with", "will", "would", "could",
-                    "should", "about", "after", "before", "from", "have", "been",
-                    "were", "being", "their", "there", "these", "those", "this",
-                    "that", "than", "into", "some", "such", "them", "then", "very",
-                    "just", "also", "most", "over", "only", "other", "during",
+                    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "was",
+                    "one", "our", "out", "has", "how", "its", "who", "did", "get", "got", "let",
+                    "say", "she", "too", "use", "what", "when", "where", "which", "with", "will",
+                    "would", "could", "should", "about", "after", "before", "from", "have", "been",
+                    "were", "being", "their", "there", "these", "those", "this", "that", "than",
+                    "into", "some", "such", "them", "then", "very", "just", "also", "most", "over",
+                    "only", "other", "during",
                 ];
 
                 let query_stems: std::collections::HashSet<String> = query_text
@@ -1620,8 +1637,7 @@ impl super::MemorySystem {
                     .split_whitespace()
                     .filter(|w| w.len() > 2)
                     .map(|w| {
-                        let cleaned: String =
-                            w.chars().filter(|c| c.is_alphanumeric()).collect();
+                        let cleaned: String = w.chars().filter(|c| c.is_alphanumeric()).collect();
                         stemmer.stem(&cleaned).to_string()
                     })
                     .filter(|s| !s.is_empty() && s.len() > 1 && !STOP_WORDS.contains(&s.as_str()))
@@ -1657,11 +1673,7 @@ impl super::MemorySystem {
                             .collect();
                         let overlap = query_stems
                             .iter()
-                            .filter(|qs| {
-                                entity_stems
-                                    .iter()
-                                    .any(|es| es.contains(qs.as_str()))
-                            })
+                            .filter(|qs| entity_stems.iter().any(|es| es.contains(qs.as_str())))
                             .count();
                         if overlap >= 1 {
                             // Dampen entity overlap for abstract/decomposed queries:
@@ -1746,8 +1758,8 @@ impl super::MemorySystem {
                     }
                 }
                 if lengths.len() >= 5 {
-                    let mean_len: f32 = lengths.iter().map(|(_, l)| *l as f32).sum::<f32>()
-                        / lengths.len() as f32;
+                    let mean_len: f32 =
+                        lengths.iter().map(|(_, l)| *l as f32).sum::<f32>() / lengths.len() as f32;
                     for (id, len) in &lengths {
                         let ratio = *len as f32 / mean_len.max(1.0);
                         // Memories 50%+ longer than mean get penalized (0.85-0.70x)
@@ -1804,9 +1816,22 @@ impl super::MemorySystem {
 
                 if q_stems.len() >= 2 {
                     let get_ents = |id: &MemoryId| -> Vec<String> {
-                        self.working_memory.read().get(id).map(|m| m.experience.entities.clone())
-                            .or_else(|| self.session_memory.read().get(id).map(|m| m.experience.entities.clone()))
-                            .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.experience.entities.clone()))
+                        self.working_memory
+                            .read()
+                            .get(id)
+                            .map(|m| m.experience.entities.clone())
+                            .or_else(|| {
+                                self.session_memory
+                                    .read()
+                                    .get(id)
+                                    .map(|m| m.experience.entities.clone())
+                            })
+                            .or_else(|| {
+                                self.long_term_memory
+                                    .get(id)
+                                    .ok()
+                                    .map(|m| m.experience.entities.clone())
+                            })
                             .unwrap_or_default()
                     };
 
@@ -1845,38 +1870,56 @@ impl super::MemorySystem {
             if has_any_temporal_intent || has_temporal_keywords {
                 let ids: Vec<MemoryId> = fused.keys().cloned().collect();
                 let get_created_at = |id: &MemoryId| -> Option<chrono::DateTime<chrono::Utc>> {
-                    self.working_memory.read().get(id).map(|m| m.created_at)
+                    self.working_memory
+                        .read()
+                        .get(id)
+                        .map(|m| m.created_at)
                         .or_else(|| self.session_memory.read().get(id).map(|m| m.created_at))
                         .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.created_at))
                 };
                 let get_ents = |id: &MemoryId| -> std::collections::HashSet<String> {
-                    self.working_memory.read().get(id).map(|m| m.experience.entities.clone())
-                        .or_else(|| self.session_memory.read().get(id).map(|m| m.experience.entities.clone()))
-                        .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.experience.entities.clone()))
+                    self.working_memory
+                        .read()
+                        .get(id)
+                        .map(|m| m.experience.entities.clone())
+                        .or_else(|| {
+                            self.session_memory
+                                .read()
+                                .get(id)
+                                .map(|m| m.experience.entities.clone())
+                        })
+                        .or_else(|| {
+                            self.long_term_memory
+                                .get(id)
+                                .ok()
+                                .map(|m| m.experience.entities.clone())
+                        })
                         .unwrap_or_default()
                         .into_iter()
                         .map(|e| e.to_lowercase())
                         .collect()
                 };
 
-                let entity_sets: Vec<(MemoryId, std::collections::HashSet<String>)> = ids
-                    .iter()
-                    .map(|id| (id.clone(), get_ents(id)))
-                    .collect();
+                let entity_sets: Vec<(MemoryId, std::collections::HashSet<String>)> =
+                    ids.iter().map(|id| (id.clone(), get_ents(id))).collect();
 
                 let mut demoted = 0usize;
                 for i in 0..entity_sets.len() {
                     for j in (i + 1)..entity_sets.len() {
                         let (id_a, set_a) = &entity_sets[i];
                         let (id_b, set_b) = &entity_sets[j];
-                        if set_a.is_empty() || set_b.is_empty() { continue; }
+                        if set_a.is_empty() || set_b.is_empty() {
+                            continue;
+                        }
 
                         let intersection = set_a.intersection(set_b).count();
                         let union = set_a.union(set_b).count();
                         let jaccard = intersection as f32 / union.max(1) as f32;
 
                         if jaccard > 0.40 {
-                            if let (Some(ts_a), Some(ts_b)) = (get_created_at(id_a), get_created_at(id_b)) {
+                            if let (Some(ts_a), Some(ts_b)) =
+                                (get_created_at(id_a), get_created_at(id_b))
+                            {
                                 let older_id = if ts_a < ts_b { id_a } else { id_b };
                                 if let Some(score) = fused.get_mut(older_id) {
                                     *score *= 0.85;
@@ -1887,7 +1930,10 @@ impl super::MemorySystem {
                     }
                 }
                 if demoted > 0 {
-                    tracing::debug!("Layer 4.54: Temporal dedup demoted {} older same-topic memories", demoted);
+                    tracing::debug!(
+                        "Layer 4.54: Temporal dedup demoted {} older same-topic memories",
+                        demoted
+                    );
                 }
             }
 
@@ -2130,7 +2176,10 @@ impl super::MemorySystem {
                     .map(|(id, _)| get_content(id))
                     .collect();
                 let get_ts = |id: &MemoryId| -> Option<chrono::DateTime<chrono::Utc>> {
-                    self.working_memory.read().get(id).map(|m| m.created_at)
+                    self.working_memory
+                        .read()
+                        .get(id)
+                        .map(|m| m.created_at)
                         .or_else(|| self.session_memory.read().get(id).map(|m| m.created_at))
                         .or_else(|| self.long_term_memory.get(id).ok().map(|m| m.created_at))
                 };
@@ -2201,9 +2250,8 @@ impl super::MemorySystem {
                     .iter()
                     .take(dedup_budget)
                     .map(|(id, _)| {
-                        get_content(id).map(|c| {
-                            c.chars().take(200).collect::<String>().to_lowercase()
-                        })
+                        get_content(id)
+                            .map(|c| c.chars().take(200).collect::<String>().to_lowercase())
                     })
                     .collect();
 
@@ -2249,7 +2297,11 @@ impl super::MemorySystem {
             // so more candidates survive into the cross-encoder.
             let rerank_budget = if decomposed { 50_usize } else { 30_usize }.max(query.max_results);
             res.truncate(rerank_budget);
-            tracing::debug!("Layer 4: {} fused results (rerank budget={})", res.len(), rerank_budget);
+            tracing::debug!(
+                "Layer 4: {} fused results (rerank budget={})",
+                res.len(),
+                rerank_budget
+            );
             (res, heb, attr)
         };
 
@@ -2416,8 +2468,16 @@ impl super::MemorySystem {
                 // BRIDGE-1: access_count (signal 5, proven 14% in proactive)
                 // Query-intent-dependent: exploratory queries reduce access advantage
                 // to surface novel/unfamiliar memories (bifocal novelty evaluation)
-                let access_weight = if matches!(query_type, crate::memory::query_parser::QueryType::Exploratory) { 0.02 } else { 0.07 };
-                let access_boost = ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * access_weight;
+                let access_weight = if matches!(
+                    query_type,
+                    crate::memory::query_parser::QueryType::Exploratory
+                ) {
+                    0.02
+                } else {
+                    0.07
+                };
+                let access_boost =
+                    ((mem.access_count() as f64).ln_1p() / 5.0) as f32 * access_weight;
 
                 // BRIDGE-1: graph_strength (signal 3+, proven 13% in proactive)
                 let graph_boost = hebbian_scores
@@ -2435,7 +2495,11 @@ impl super::MemorySystem {
                     .and_then(|c| c.episode.episode_id.as_ref())
                     .and_then(|mem_ep| {
                         query.episode_id.as_ref().and_then(|q_ep| {
-                            if mem_ep == q_ep { Some(0.08_f32) } else { None }
+                            if mem_ep == q_ep {
+                                Some(0.08_f32)
+                            } else {
+                                None
+                            }
                         })
                     })
                     .unwrap_or(0.0);
@@ -2483,9 +2547,8 @@ impl super::MemorySystem {
                 let activation_boost = mem.activation() * 0.03;
 
                 // Signal 18: Temporal fact density — more temporal refs = more anchored
-                let temporal_density = (mem.experience.temporal_refs.len() as f32 / 5.0)
-                    .min(1.0)
-                    * 0.02;
+                let temporal_density =
+                    (mem.experience.temporal_refs.len() as f32 / 5.0).min(1.0) * 0.02;
 
                 // Signal 19: Entity confidence — memories with more entity refs
                 // are more structurally connected (proxy for graph salience)
@@ -2652,8 +2715,8 @@ impl super::MemorySystem {
             for mem in &memories {
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
                 let recency_val = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale_attr;
-                let has_temporal_match = !mem.experience.temporal_refs.is_empty()
-                    && has_temporal_query;
+                let has_temporal_match =
+                    !mem.experience.temporal_refs.is_empty() && has_temporal_query;
                 let entry = signal_attributions.entry(mem.id.clone()).or_default();
                 entry.recency_contribution = recency_val;
                 if has_temporal_match && !entry.temporal_match {
@@ -2707,9 +2770,8 @@ impl super::MemorySystem {
                 match reranker.rerank(query_text, candidates) {
                     Ok(reranked) => {
                         // Build score lookup from cross-encoder results
-                        let ce_scores: std::collections::HashMap<MemoryId, f32> = reranked
-                            .into_iter()
-                            .collect();
+                        let ce_scores: std::collections::HashMap<MemoryId, f32> =
+                            reranked.into_iter().collect();
 
                         // Adaptive blend: decomposed queries shift weight toward
                         // cross-encoder (55/45) because the CE can reason about abstract
@@ -2737,9 +2799,7 @@ impl super::MemorySystem {
 
                         // Re-sort after blending
                         memories.sort_by(|a, b| {
-                            b.score
-                                .unwrap_or(0.0)
-                                .total_cmp(&a.score.unwrap_or(0.0))
+                            b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
                         });
 
                         tracing::info!(
@@ -2778,11 +2838,7 @@ impl super::MemorySystem {
                 }
             }
             if any_demoted {
-                memories.sort_by(|a, b| {
-                    b.score
-                        .unwrap_or(0.0)
-                        .total_cmp(&a.score.unwrap_or(0.0))
-                });
+                memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
                 tracing::debug!("Layer 5.35: Applied fragment demotion to retrieval scores");
             }
         }
@@ -2817,8 +2873,7 @@ impl super::MemorySystem {
             };
             if let Some(lambda) = mmr_lambda {
                 let before_count = memories.len();
-                memories =
-                    Self::apply_mmr(&memories, lambda, query.max_results);
+                memories = Self::apply_mmr(&memories, lambda, query.max_results);
                 tracing::debug!(
                     lambda = format!("{lambda:.2}"),
                     before = before_count,
@@ -2862,7 +2917,10 @@ impl super::MemorySystem {
                 if keep < memories.len() {
                     tracing::debug!(
                         "Layer 5.7: Confidence pruning {} -> {} results (top={:.3}, cut={:.3})",
-                        memories.len(), keep, top_score, scores.get(keep).copied().unwrap_or(0.0)
+                        memories.len(),
+                        keep,
+                        top_score,
+                        scores.get(keep).copied().unwrap_or(0.0)
                     );
                     memories.truncate(keep);
                 }
@@ -2876,25 +2934,25 @@ impl super::MemorySystem {
         // Soft filter (score penalty), not hard filter.
         {
             let query_lower = query_text.to_lowercase();
-            let preferred: Option<Vec<crate::memory::types::ExperienceType>> =
-                if query_lower.contains("bug")
-                    || query_lower.contains("error")
-                    || query_lower.contains("issue")
-                    || query_lower.contains("problem")
-                    || query_lower.contains("fail")
-                {
-                    Some(vec![
-                        crate::memory::types::ExperienceType::Error,
-                        crate::memory::types::ExperienceType::Discovery,
-                    ])
-                } else if query_lower.contains("risk") || query_lower.contains("concern") {
-                    Some(vec![
-                        crate::memory::types::ExperienceType::Observation,
-                        crate::memory::types::ExperienceType::Discovery,
-                    ])
-                } else {
-                    None
-                };
+            let preferred: Option<Vec<crate::memory::types::ExperienceType>> = if query_lower
+                .contains("bug")
+                || query_lower.contains("error")
+                || query_lower.contains("issue")
+                || query_lower.contains("problem")
+                || query_lower.contains("fail")
+            {
+                Some(vec![
+                    crate::memory::types::ExperienceType::Error,
+                    crate::memory::types::ExperienceType::Discovery,
+                ])
+            } else if query_lower.contains("risk") || query_lower.contains("concern") {
+                Some(vec![
+                    crate::memory::types::ExperienceType::Observation,
+                    crate::memory::types::ExperienceType::Discovery,
+                ])
+            } else {
+                None
+            };
 
             if let Some(ref prefs) = preferred {
                 for mem in memories.iter_mut() {
@@ -2906,11 +2964,7 @@ impl super::MemorySystem {
                         *mem = Arc::new(cloned);
                     }
                 }
-                memories.sort_by(|a, b| {
-                    b.score
-                        .unwrap_or(0.0)
-                        .total_cmp(&a.score.unwrap_or(0.0))
-                });
+                memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
             }
         }
 
@@ -3005,12 +3059,12 @@ impl super::MemorySystem {
                             }
                         }
                     }
-                    TemporalRange::Window { hours: window_hours } => {
+                    TemporalRange::Window {
+                        hours: window_hours,
+                    } => {
                         let in_window = memories
                             .iter()
-                            .filter(|m| {
-                                (now - m.created_at).num_hours() as f64 <= window_hours
-                            })
+                            .filter(|m| (now - m.created_at).num_hours() as f64 <= window_hours)
                             .count();
 
                         if in_window >= 3 {
@@ -3031,13 +3085,9 @@ impl super::MemorySystem {
                 }
 
                 if demoted > 0 {
-                    memories.sort_by(|a, b| {
-                        b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
-                    });
-                    tracing::info!(
-                        demoted,
-                        "recall [layer:5.87] temporal range demotion"
-                    );
+                    memories
+                        .sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+                    tracing::info!(demoted, "recall [layer:5.87] temporal range demotion");
                 }
             }
         }
@@ -3062,9 +3112,8 @@ impl super::MemorySystem {
 
             // Ordinal: "first" → sort ascending by created_at, keep earliest
             let wants_first = ql.contains("first ") || ql.starts_with("first ");
-            let wants_last = ql.contains("most recent")
-                || ql.contains("latest")
-                || ql.contains("last ");
+            let wants_last =
+                ql.contains("most recent") || ql.contains("latest") || ql.contains("last ");
 
             if wants_first && !memories.is_empty() {
                 // Sort by created_at ascending — earliest first
@@ -3072,9 +3121,7 @@ impl super::MemorySystem {
                 // Preserve the score of the earliest memory but put it at rank 1
                 let earliest = memories[0].clone();
                 // Re-sort by score but pin the earliest at position 0
-                memories.sort_by(|a, b| {
-                    b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
-                });
+                memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
                 // Remove the earliest from its current position and insert at front
                 if let Some(pos) = memories.iter().position(|m| m.id == earliest.id) {
                     memories.remove(pos);
@@ -3103,9 +3150,9 @@ impl super::MemorySystem {
                     by_time.iter().find(|m| {
                         let content_lower = m.experience.content.to_lowercase();
                         let tags_lower: String = m.experience.tags.join(" ").to_lowercase();
-                        focal_stems.iter().any(|stem| {
-                            content_lower.contains(stem) || tags_lower.contains(stem)
-                        })
+                        focal_stems
+                            .iter()
+                            .any(|stem| content_lower.contains(stem) || tags_lower.contains(stem))
                     })
                 } else {
                     None
@@ -3124,13 +3171,13 @@ impl super::MemorySystem {
                 } else {
                     // Fallback: p50-gated pin (original strategy)
                     let score_sorted: Vec<f32> = {
-                        let mut s: Vec<f32> = memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
+                        let mut s: Vec<f32> =
+                            memories.iter().map(|m| m.score.unwrap_or(0.0)).collect();
                         s.sort_by(|a, b| b.total_cmp(a));
                         s
                     };
                     let p50 = score_sorted[score_sorted.len() / 2];
-                    let latest_relevant = by_time.iter()
-                        .find(|m| m.score.unwrap_or(0.0) >= p50);
+                    let latest_relevant = by_time.iter().find(|m| m.score.unwrap_or(0.0) >= p50);
                     if let Some(latest) = latest_relevant {
                         let latest_id = latest.id.clone();
                         if let Some(pos) = memories.iter().position(|m| m.id == latest_id) {
@@ -3139,7 +3186,8 @@ impl super::MemorySystem {
                         }
                     }
                     // Graduated boost for top-3 recent relevant
-                    let relevant_recent: Vec<MemoryId> = by_time.iter()
+                    let relevant_recent: Vec<MemoryId> = by_time
+                        .iter()
                         .filter(|m| m.score.unwrap_or(0.0) >= p50)
                         .take(3)
                         .map(|m| m.id.clone())
@@ -3153,7 +3201,8 @@ impl super::MemorySystem {
                             *mem = Arc::new(cloned);
                         }
                     }
-                    memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
+                    memories
+                        .sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
                     tracing::debug!(
                         "Layer 5.9: Gated pin — latest not relevant, boosted {} recent-relevant memories",
                         relevant_recent.len()
@@ -3164,16 +3213,14 @@ impl super::MemorySystem {
             // Category error detection + ordinal session resolution:
             // Try ordinal resolution FIRST. Only apply category error demotion
             // if resolution fails or is unavailable.
-            let ordinal_session_ref = (ql.contains("second ") || ql.contains("third ")
-                || ql.contains("fourth "))
-                && (ql.contains("meeting") || ql.contains("sprint") || ql.contains("session"));
+            let ordinal_session_ref =
+                (ql.contains("second ") || ql.contains("third ") || ql.contains("fourth "))
+                    && (ql.contains("meeting") || ql.contains("sprint") || ql.contains("session"));
 
             let mut ordinal_resolved = false;
 
             if ordinal_session_ref {
-                if let Some((ordinal, _noun)) =
-                    wavelet_sessions::extract_ordinal_session_ref(&ql)
-                {
+                if let Some((ordinal, _noun)) = wavelet_sessions::extract_ordinal_session_ref(&ql) {
                     match self.get_or_compute_session_map() {
                         Ok(session_map) if ordinal <= session_map.sessions.len() => {
                             let target = &session_map.sessions[ordinal - 1];
@@ -3197,16 +3244,13 @@ impl super::MemorySystem {
                                 if session_ids.contains(&mem.id) {
                                     let base = mem.score.unwrap_or(0.0);
                                     let mut cloned: Memory = mem.as_ref().clone();
-                                    cloned.set_score(
-                                        base + crate::constants::ORDINAL_SESSION_BOOST,
-                                    );
+                                    cloned
+                                        .set_score(base + crate::constants::ORDINAL_SESSION_BOOST);
                                     *mem = Arc::new(cloned);
                                 }
                             }
                             memories.sort_by(|a, b| {
-                                b.score
-                                    .unwrap_or(0.0)
-                                    .total_cmp(&a.score.unwrap_or(0.0))
+                                b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
                             });
                             ordinal_resolved = true;
                             tracing::info!(
@@ -3450,9 +3494,7 @@ impl super::MemorySystem {
             }
 
             // Re-sort after sufficiency adjustments
-            memories.sort_by(|a, b| {
-                b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
-            });
+            memories.sort_by(|a, b| b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0)));
 
             // If the top result has low entity coverage, try to supplement from fact store.
             // Facts are distilled knowledge — they're often more complete than thin episodic
@@ -3485,9 +3527,7 @@ impl super::MemorySystem {
                                         continue;
                                     }
                                     // Load and score the fact-source memory
-                                    if let Some(src_mem) =
-                                        self.working_memory.read().get(src_id)
-                                    {
+                                    if let Some(src_mem) = self.working_memory.read().get(src_id) {
                                         memories.push(src_mem);
                                         injected += 1;
                                     } else if let Some(src_mem) =
@@ -3599,7 +3639,10 @@ impl super::MemorySystem {
         if memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
+                match graph
+                    .read()
+                    .record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..])
+                {
                     Ok(ref result) if result.edges_updated > 0 => {
                         // Record consolidation events for coactivation visibility
                         for i in 0..memories.len().min(5) {
@@ -3783,7 +3826,6 @@ impl super::MemorySystem {
         boost
     }
 
-
     /// Retrieve or recompute the wavelet-detected session map.
     ///
     /// The session map is cached and only recomputed when new memories have been
@@ -3817,10 +3859,7 @@ impl super::MemorySystem {
     }
 
     /// Entity-aware retrieval-time competition for the live recall path.
-    fn compete_memories(
-        memories: &mut Vec<SharedMemory>,
-        mode: CompetitionMode,
-    ) -> (usize, usize) {
+    fn compete_memories(memories: &mut Vec<SharedMemory>, mode: CompetitionMode) -> (usize, usize) {
         use crate::constants::{COMPETITION_ENTITY_OVERLAP_MIN, COMPETITION_MAX_PAIRS};
 
         if mode == CompetitionMode::Coexist || memories.len() < 2 {
@@ -3921,10 +3960,10 @@ impl super::MemorySystem {
                         let weaker_score = memories[weaker_idx].score.unwrap_or(0.0);
                         let mut weaker_clone: Memory = memories[weaker_idx].as_ref().clone();
                         weaker_clone.set_score(weaker_score - penalty);
-                        weaker_clone.experience.metadata.insert(
-                            "competition_conflict".to_string(),
-                            "true".to_string(),
-                        );
+                        weaker_clone
+                            .experience
+                            .metadata
+                            .insert("competition_conflict".to_string(), "true".to_string());
                         weaker_clone.experience.metadata.insert(
                             "competition_opponent".to_string(),
                             memories[stronger_idx].id.0.to_string(),
@@ -3932,10 +3971,10 @@ impl super::MemorySystem {
                         memories[weaker_idx] = Arc::new(weaker_clone);
 
                         let mut stronger_clone: Memory = memories[stronger_idx].as_ref().clone();
-                        stronger_clone.experience.metadata.insert(
-                            "competition_conflict".to_string(),
-                            "true".to_string(),
-                        );
+                        stronger_clone
+                            .experience
+                            .metadata
+                            .insert("competition_conflict".to_string(), "true".to_string());
                         stronger_clone.experience.metadata.insert(
                             "competition_opponent".to_string(),
                             memories[weaker_idx].id.0.to_string(),
@@ -3982,7 +4021,6 @@ impl super::MemorySystem {
 
         (competitions_detected, memories_eliminated)
     }
-
 
     /// Calculate temporal relevance based on memory age (ENTERPRISE FEATURE)
     ///
@@ -4055,7 +4093,6 @@ impl super::MemorySystem {
         }
     }
 
-
     // =========================================================================
     // OUTCOME FEEDBACK SYSTEM - Hebbian "Fire Together, Wire Together"
     // =========================================================================
@@ -4118,18 +4155,27 @@ impl super::MemorySystem {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memory_ids.iter().map(|id| id.0).collect();
                 if memory_uuids.len() >= 2 {
-                    match graph.read().record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..]) {
+                    match graph
+                        .read()
+                        .record_memory_coactivation(&memory_uuids[0], &memory_uuids[1..])
+                    {
                         Ok(result) => {
                             stats.associations_strengthened = result.edges_updated;
                             // BRIDGE-4: Boost importance for memories linked by promoted edges
                             for promo in &result.promotions {
-                                let boost = if promo.new_tier.contains("L3") { 0.15 } else { 0.10 };
+                                let boost = if promo.new_tier.contains("L3") {
+                                    0.15
+                                } else {
+                                    0.10
+                                };
                                 for mid in memory_ids {
                                     if mid.0 == promo.from_entity || mid.0 == promo.to_entity {
                                         // Apply boost through all tiers
                                         if let Some(mem) = self.working_memory.read().get(mid) {
                                             mem.boost_importance(boost);
-                                        } else if let Some(mem) = self.session_memory.read().get(mid) {
+                                        } else if let Some(mem) =
+                                            self.session_memory.read().get(mid)
+                                        {
                                             mem.boost_importance(boost);
                                         } else if let Ok(mem) = self.long_term_memory.get(mid) {
                                             mem.boost_importance(boost);
@@ -4304,16 +4350,16 @@ impl super::MemorySystem {
             let mut best_mmr = f32::NEG_INFINITY;
 
             for (ri, &cand_idx) in remaining.iter().enumerate() {
-                let relevance =
-                    (memories[cand_idx].score.unwrap_or(0.0) - min_score) / score_range;
+                let relevance = (memories[cand_idx].score.unwrap_or(0.0) - min_score) / score_range;
 
                 // Max similarity to any already-selected memory
                 let max_sim = if let Some(cand_emb) = embeddings[cand_idx] {
                     selected
                         .iter()
                         .filter_map(|&sel_idx| {
-                            embeddings[sel_idx]
-                                .map(|sel_emb| crate::similarity::cosine_similarity(cand_emb, sel_emb))
+                            embeddings[sel_idx].map(|sel_emb| {
+                                crate::similarity::cosine_similarity(cand_emb, sel_emb)
+                            })
                         })
                         .fold(0.0_f32, f32::max)
                 } else {

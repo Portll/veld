@@ -144,8 +144,16 @@ impl BenchmarkDataset {
         let memory_ids: HashSet<usize> = self.memories.iter().map(|m| m.id).collect();
         let person_ids: HashSet<&str> = self.persons.iter().map(|p| p.id.as_str()).collect();
         let session_ids: HashSet<u8> = self.sessions.iter().map(|s| s.id).collect();
-        let valid_types: HashSet<&str> = self.query_type_vocabulary.iter().map(|s| s.as_str()).collect();
-        let valid_challenges: HashSet<&str> = self.challenge_tag_vocabulary.iter().map(|s| s.as_str()).collect();
+        let valid_types: HashSet<&str> = self
+            .query_type_vocabulary
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let valid_challenges: HashSet<&str> = self
+            .challenge_tag_vocabulary
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
 
         // Validate memories
         for mem in &self.memories {

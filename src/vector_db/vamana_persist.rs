@@ -213,10 +213,7 @@ fn validate_layout(header: &VamanaHeader, file_len: usize) -> Result<(usize, usi
         .map_err(|_| anyhow!("deleted_count does not fit in usize"))?;
 
     if dimension == 0 || dimension > MAX_REASONABLE_DIMENSION {
-        return Err(anyhow!(
-            "Invalid persisted Vamana dimension: {}",
-            dimension
-        ));
+        return Err(anyhow!("Invalid persisted Vamana dimension: {}", dimension));
     }
 
     if deleted_count > num_vectors {
@@ -238,11 +235,7 @@ fn validate_layout(header: &VamanaHeader, file_len: usize) -> Result<(usize, usi
 
     let deleted_section_size = checked_mul(deleted_count, 4, "deleted section size")?;
     let graph_min_section_size = checked_mul(num_vectors, 2, "minimum graph section size")?;
-    let graph_offset = checked_add(
-        HEADER_SIZE,
-        deleted_section_size,
-        "graph section offset",
-    )?;
+    let graph_offset = checked_add(HEADER_SIZE, deleted_section_size, "graph section offset")?;
     let vectors_offset = align_to(
         checked_add(
             graph_offset,
@@ -674,8 +667,15 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let index_path = temp_dir.path().join("invalid-layout.vamana");
 
-        let mut header =
-            VamanaHeader::new(1_000_000, 384, 32, 0, DistanceMetric::NormalizedDotProduct, 0, 0);
+        let mut header = VamanaHeader::new(
+            1_000_000,
+            384,
+            32,
+            0,
+            DistanceMetric::NormalizedDotProduct,
+            0,
+            0,
+        );
         header.checksum = compute_checksum(&[]);
         std::fs::write(&index_path, header.to_bytes()).unwrap();
 

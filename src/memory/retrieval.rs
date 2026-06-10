@@ -1497,7 +1497,10 @@ impl RetrievalEngine {
             return Ok((0, 0));
         }
 
-        tracing::info!("Starting context-prefix re-embedding migration: {} memories", total);
+        tracing::info!(
+            "Starting context-prefix re-embedding migration: {} memories",
+            total
+        );
         let start_time = std::time::Instant::now();
         let mut reembedded = 0;
         let mut failed = 0;
@@ -1544,16 +1547,21 @@ impl RetrievalEngine {
                 };
                 tracing::info!(
                     "Re-embed progress: {}/{} ({:.1}%), {} done, {} failed, {:.0}/sec",
-                    i + 1, total,
+                    i + 1,
+                    total,
                     (i + 1) as f64 / total as f64 * 100.0,
-                    reembedded, failed, rate
+                    reembedded,
+                    failed,
+                    rate
                 );
             }
         }
 
         tracing::info!(
             "Re-embed migration complete: {} re-embedded, {} failed (total: {})",
-            reembedded, failed, total
+            reembedded,
+            failed,
+            total
         );
 
         Ok((reembedded, failed))
@@ -1667,8 +1675,7 @@ pub struct IndexHealth {
 ///
 /// When memories are retrieved and used to complete a task, this feedback
 /// tells the system whether they were helpful, enabling adaptive learning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RetrievalOutcome {
     /// Memory helped complete the task successfully
     /// Triggers: +importance boost, +association strength, +access count
@@ -1780,7 +1787,7 @@ impl RetrievalEngine {
                         // Increment access and apply importance boost
                         memory.record_access();
                         memory.boost_importance(0.05); // +5% importance
-                        // Bayesian confidence calibration
+                                                       // Bayesian confidence calibration
                         memory.update_confidence(true);
 
                         // PERSIST: Write updated memory back to durable storage
@@ -1796,7 +1803,7 @@ impl RetrievalEngine {
                     if let Ok(memory) = self.storage.get(id) {
                         memory.record_access();
                         memory.decay_importance(0.10); // -10% importance
-                        // Bayesian confidence calibration
+                                                       // Bayesian confidence calibration
                         memory.update_confidence(false);
 
                         // PERSIST: Write updated memory back to durable storage
@@ -1876,7 +1883,6 @@ pub struct ReinforcementStats {
     /// How many persistence operations failed (non-zero indicates data loss risk)
     pub persist_failures: usize,
 }
-
 
 // NOTE: MemoryGraph has been consolidated into GraphMemory (src/graph_memory.rs)
 // which provides persistent storage in RocksDB and proper Hebbian learning.

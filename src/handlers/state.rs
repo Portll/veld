@@ -24,8 +24,6 @@ fn issue_regex() -> &'static regex::Regex {
 }
 
 use crate::ab_testing;
-#[cfg(feature = "multi-tenant")]
-use crate::extensions::maintenance;
 use crate::backup;
 use crate::backup::BackupMetadata;
 use crate::config::{ServerConfig, StorageBackend};
@@ -34,6 +32,8 @@ use crate::embeddings::{
     get_ner_models_dir, ner::NerEntityType, neural_ner_enabled, KeywordExtractor, NerConfig,
     NeuralNer,
 };
+#[cfg(feature = "multi-tenant")]
+use crate::extensions::maintenance;
 use crate::graph_memory::{
     EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
     LtpStatus, RelationType, RelationshipEdge,
@@ -107,11 +107,9 @@ impl MultiUserMemoryManagerRotationHelper {
             tracing::warn!("audit cutoff timestamp outside i64 nanos range, using 0");
             0
         });
-        let removed_count = self.audit_store.rotate_events(
-            user_id,
-            self.audit_max_entries,
-            cutoff_time,
-        )?;
+        let removed_count =
+            self.audit_store
+                .rotate_events(user_id, self.audit_max_entries, cutoff_time)?;
 
         // Sync in-memory cache
         if removed_count > 0 {
@@ -422,11 +420,8 @@ impl MultiUserMemoryManager {
             crate::constants::ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
         );
 
-        let shared_stores = Self::bootstrap_shared_stores(
-            &base_path,
-            &server_config,
-            &shared_rocksdb_cache,
-        )?;
+        let shared_stores =
+            Self::bootstrap_shared_stores(&base_path, &server_config, &shared_rocksdb_cache)?;
 
         if let Err(e) = shared_stores.todo_store.load_vector_indices() {
             tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
@@ -523,12 +518,11 @@ impl MultiUserMemoryManager {
 
                 Self::migrate_audit_db(base_path, &shared_db)?;
 
-                let audit_store: Arc<dyn AuditStore> = Arc::new(
-                    crate::storage::legacy_rocksdb::RocksDbAuditStore::new(
+                let audit_store: Arc<dyn AuditStore> =
+                    Arc::new(crate::storage::legacy_rocksdb::RocksDbAuditStore::new(
                         shared_db.clone(),
                         CF_AUDIT,
-                    ),
-                );
+                    ));
 
                 let prospective_store =
                     Arc::new(ProspectiveStore::new(shared_db.clone(), base_path)?);
@@ -546,10 +540,7 @@ impl MultiUserMemoryManager {
                 let feedback_store = Arc::new(parking_lot::RwLock::new(
                     FeedbackStore::with_shared_db(shared_db.clone(), base_path).unwrap_or_else(
                         |e| {
-                            tracing::warn!(
-                                "Failed to load feedback store: {}, using in-memory",
-                                e
-                            );
+                            tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
                             FeedbackStore::new()
                         },
                     ),
@@ -841,7 +832,10 @@ impl MultiUserMemoryManager {
                     Some(&self.shared_rocksdb_cache),
                 )
                 .with_context(|| {
-                    format!("Failed to open primary memory store at {:?}", config.storage_path)
+                    format!(
+                        "Failed to open primary memory store at {:?}",
+                        config.storage_path
+                    )
                 })?;
 
                 Earth::with_storage(config, Arc::new(primary_store.into_inner()))
@@ -858,13 +852,14 @@ impl MultiUserMemoryManager {
 
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
-                let graph_store = RocksDbGraphStore::open(
-                    &graph_path,
-                    Some(&self.shared_rocksdb_cache),
-                )
-                .with_context(|| {
-                    format!("Failed to open graph store for user '{user_id}' at {:?}", graph_path)
-                })?;
+                let graph_store =
+                    RocksDbGraphStore::open(&graph_path, Some(&self.shared_rocksdb_cache))
+                        .with_context(|| {
+                            format!(
+                                "Failed to open graph store for user '{user_id}' at {:?}",
+                                graph_path
+                            )
+                        })?;
 
                 Ok(graph_store.into_inner())
             }
@@ -2091,7 +2086,9 @@ impl MultiUserMemoryManager {
                     if graph_path.exists() {
                         let _ = std::fs::remove_dir_all(&graph_path);
                     }
-                    if let Err(e) = crate::backup::copy_dir_recursive_pub(&graph_checkpoint, &graph_path) {
+                    if let Err(e) =
+                        crate::backup::copy_dir_recursive_pub(&graph_checkpoint, &graph_path)
+                    {
                         tracing::warn!(error = %e, "Failed to restore graph DB from backup");
                     } else {
                         all_restored.push("graph".to_string());
@@ -2140,8 +2137,7 @@ impl MultiUserMemoryManager {
                             );
                             backed_up += 1;
 
-                            if let Err(e) = self.purge_backups_for_user(name, max_backups)
-                            {
+                            if let Err(e) = self.purge_backups_for_user(name, max_backups) {
                                 tracing::warn!(
                                     user_id = name,
                                     error = %e,

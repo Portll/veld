@@ -121,7 +121,6 @@ pub enum StreamMode {
     Event,
 }
 
-
 /// Configuration for automatic memory extraction from streams
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionConfig {

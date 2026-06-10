@@ -56,9 +56,7 @@ pub async fn get_brain_state(
 ) -> Result<Json<BrainStateResponse>, AppError> {
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
 
@@ -150,9 +148,7 @@ pub async fn get_visualization_stats(
 ) -> Result<Json<VisualizationStats>, AppError> {
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
     let stats = memory_guard.get_visualization_stats();
@@ -167,9 +163,7 @@ pub async fn get_visualization_dot(
 ) -> Result<String, AppError> {
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
     let dot = memory_guard.export_visualization_dot();
@@ -260,9 +254,7 @@ pub async fn get_graph_data(
 ) -> Result<Json<GraphDataResponse>, AppError> {
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
-    let memory = state
-        .get_user_earth(&user_id)
-        .map_err(AppError::Internal)?;
+    let memory = state.get_user_earth(&user_id).map_err(AppError::Internal)?;
 
     let memory_guard = memory.read();
     let graph = memory_guard

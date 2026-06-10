@@ -58,10 +58,7 @@ pub fn build_public_routes(state: AppState) -> Router {
         // can never block its own recovery. The endpoint enforces its own
         // separate auth via X-Admin-API-Key + VELD_ADMIN_API_KEY env var.
         // =================================================================
-        .route(
-            "/api/admin/reset-rate-limit",
-            post(admin::reset_rate_limit),
-        )
+        .route("/api/admin/reset-rate-limit", post(admin::reset_rate_limit))
         // =================================================================
         // STATE
         // =================================================================
@@ -121,7 +118,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         .route("/api/memory/{memory_id}", get(crud::get_memory))
         .route("/api/memories/{memory_id}", get(crud::get_memory)) // Cloudflare compat alias
-        .route("/api/memory/{memory_id}/health", get(crud::get_memory_health)) // FIX-02: observability
+        .route(
+            "/api/memory/{memory_id}/health",
+            get(crud::get_memory_health),
+        ) // FIX-02: observability
         .route("/api/memory/{memory_id}", put(crud::update_memory))
         .route("/api/memory/{memory_id}", delete(crud::delete_memory))
         .route("/api/forget/{memory_id}", delete(crud::delete_memory)) // OpenAPI alias
@@ -286,7 +286,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/gap/analyze", post(gap_analysis::analyze_gaps))
         .route("/api/gap/stats", post(gap_analysis::gap_stats))
         .route("/api/gap/voronoi", post(gap_analysis::voronoi_analysis))
-        .route("/api/gap/persistence", post(gap_analysis::persistence_analysis))
+        .route(
+            "/api/gap/persistence",
+            post(gap_analysis::persistence_analysis),
+        )
         .route("/api/gap/mapper", post(gap_analysis::mapper_analysis))
         // =================================================================
         // KNOWLEDGE GRAPH (BASIC)
@@ -330,8 +333,14 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/todos/{todo_id}/complete", post(todos::complete_todo)) // TUI path style
         .route("/api/todos/{todo_id}/reorder", post(todos::reorder_todo)) // TUI path style
         .route("/api/todos/{todo_id}/subtasks", get(todos::list_subtasks))
-        .route("/api/todos/{todo_id}/dependents", get(todos::list_dependents))
-        .route("/api/todos/{todo_id}/dependency_chain", get(todos::dependency_chain))
+        .route(
+            "/api/todos/{todo_id}/dependents",
+            get(todos::list_dependents),
+        )
+        .route(
+            "/api/todos/{todo_id}/dependency_chain",
+            get(todos::dependency_chain),
+        )
         .route("/api/todos/ready", post(todos::list_ready_todos))
         .route(
             "/api/todos/{todo_id}/comments",

@@ -1431,17 +1431,16 @@ mod tests {
 /// - Version numbers (v1.2.3)
 /// - CamelCase tech names (PostgreSQL, FastAPI)
 /// - Uppercase acronyms (API, AWS, CI)
-pub fn cold_start_extract_entities(
-    text: &str,
-    existing_entities: &[String],
-) -> Vec<NerEntity> {
+pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> Vec<NerEntity> {
     let existing_lower: std::collections::HashSet<String> =
         existing_entities.iter().map(|e| e.to_lowercase()).collect();
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     for word in text.split_whitespace() {
-        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '@' && c != '/' && c != '-' && c != '_');
+        let clean = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '.' && c != '@' && c != '/' && c != '-' && c != '_'
+        });
         if clean.is_empty() || clean.len() < 2 {
             continue;
         }
@@ -1466,9 +1465,11 @@ pub fn cold_start_extract_entities(
         {
             // Proper noun heuristic — but skip common English words
             let lower = clean.to_lowercase();
-            let common = ["the", "this", "that", "with", "from", "into", "when", "what",
-                "where", "which", "while", "after", "before", "should", "could", "would",
-                "their", "there", "these", "those", "about", "above", "below", "between"];
+            let common = [
+                "the", "this", "that", "with", "from", "into", "when", "what", "where", "which",
+                "while", "after", "before", "should", "could", "would", "their", "there", "these",
+                "those", "about", "above", "below", "between",
+            ];
             if common.contains(&lower.as_str()) {
                 None
             } else {
@@ -1494,7 +1495,9 @@ pub fn cold_start_extract_entities(
 }
 
 fn is_camel_case(s: &str) -> bool {
-    if s.len() < 4 { return false; }
+    if s.len() < 4 {
+        return false;
+    }
     let has_upper = s.chars().any(|c| c.is_uppercase());
     let has_lower = s.chars().any(|c| c.is_lowercase());
     let starts_upper = s.chars().next().is_some_and(|c| c.is_uppercase());
@@ -1503,15 +1506,18 @@ fn is_camel_case(s: &str) -> bool {
 }
 
 fn is_acronym(s: &str) -> bool {
-    s.len() >= 2 && s.len() <= 6 && s.chars().all(|c| c.is_uppercase() || c.is_numeric())
+    s.len() >= 2
+        && s.len() <= 6
+        && s.chars().all(|c| c.is_uppercase() || c.is_numeric())
         && s.chars().any(|c| c.is_alphabetic())
 }
 
 fn is_version_number(s: &str) -> bool {
     let s = s.strip_prefix('v').unwrap_or(s);
     let parts: Vec<&str> = s.split('.').collect();
-    parts.len() >= 2 && parts.iter().all(|p| {
-        let base = p.split('-').next().unwrap_or(p);
-        !base.is_empty() && base.chars().all(|c| c.is_numeric())
-    })
+    parts.len() >= 2
+        && parts.iter().all(|p| {
+            let base = p.split('-').next().unwrap_or(p);
+            !base.is_empty() && base.chars().all(|c| c.is_numeric())
+        })
 }

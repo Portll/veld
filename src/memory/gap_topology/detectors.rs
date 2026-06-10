@@ -6,11 +6,11 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
-
 use crate::similarity::cosine_similarity;
 
 use super::{
-    GapDetectionConfig, GapEntity, GapRole, GapStore, GapTopology, GapType, MissingLink, ShapeSignature,
+    GapDetectionConfig, GapEntity, GapRole, GapStore, GapTopology, GapType, MissingLink,
+    ShapeSignature,
 };
 
 /// Detect open triads (U-shapes) and score by embedding similarity.
@@ -49,8 +49,8 @@ pub fn detect_open_triads(
         let edge_confidence = (triad.ab_strength + triad.bc_strength) / 2.0;
         let emb_confidence = emb_sim.unwrap_or(0.5);
         let salience_factor = (triad.a_salience + triad.c_salience) / 2.0;
-        let confidence = (edge_confidence * 0.4 + emb_confidence * 0.4 + salience_factor * 0.2)
-            .clamp(0.0, 1.0);
+        let confidence =
+            (edge_confidence * 0.4 + emb_confidence * 0.4 + salience_factor * 0.2).clamp(0.0, 1.0);
 
         let gap_id = format!(
             "triad:{}:{}:{}",
@@ -122,7 +122,10 @@ pub fn detect_diamond_gaps(
 
     let mut gaps = Vec::new();
     for diamond in &raw_diamonds {
-        let emb_sim = match (embeddings.get(&diamond.left), embeddings.get(&diamond.right)) {
+        let emb_sim = match (
+            embeddings.get(&diamond.left),
+            embeddings.get(&diamond.right),
+        ) {
             (Some(l), Some(r)) => Some(cosine_similarity(l, r)),
             _ => None,
         };
@@ -201,8 +204,9 @@ pub fn detect_star_gaps(
 
     let mut gaps = Vec::new();
     for star in &raw_stars {
-        let confidence = (1.0 - (star.possible_edges as f32 - star.missing_edges as f32)
-            / star.possible_edges.max(1) as f32)
+        let confidence = (1.0
+            - (star.possible_edges as f32 - star.missing_edges as f32)
+                / star.possible_edges.max(1) as f32)
             * star.avg_hub_strength;
 
         let gap_id = format!(
@@ -338,11 +342,11 @@ pub fn detect_orbit_gaps(
             }
 
             // If few or no cross-links relative to shared attractors, it's an orbit gap
-            let cross_ratio = cross_links as f32
-                / (members_a.len() * members_b.len()).max(1) as f32;
+            let cross_ratio =
+                cross_links as f32 / (members_a.len() * members_b.len()).max(1) as f32;
             if cross_ratio < 0.1 {
-                let confidence = (shared_attractors.len() as f32 / 5.0).clamp(0.0, 1.0)
-                    * (1.0 - cross_ratio);
+                let confidence =
+                    (shared_attractors.len() as f32 / 5.0).clamp(0.0, 1.0) * (1.0 - cross_ratio);
 
                 let gap_id = format!("orbit:{}:{}", id_a, id_b);
 
@@ -403,7 +407,7 @@ pub fn detect_orbit_gaps(
                         members_b.len(),
                         shared_attractors.len(),
                     ),
-                            entities,
+                    entities,
                     missing_links,
                     confidence,
                     embedding_similarity: None,
@@ -445,8 +449,7 @@ pub fn label_propagation(
                     }
                 }
                 // Adopt most common neighbor label
-                if let Some((&best_label, _)) =
-                    label_counts.iter().max_by_key(|(_, count)| *count)
+                if let Some((&best_label, _)) = label_counts.iter().max_by_key(|(_, count)| *count)
                 {
                     let current = labels.get(node.as_str()).copied().unwrap_or(0);
                     if best_label != current {
@@ -464,10 +467,7 @@ pub fn label_propagation(
     // Group by label
     let mut clusters: HashMap<usize, Vec<String>> = HashMap::new();
     for (node, label) in &labels {
-        clusters
-            .entry(*label)
-            .or_default()
-            .push(node.to_string());
+        clusters.entry(*label).or_default().push(node.to_string());
     }
 
     clusters.into_iter().collect()

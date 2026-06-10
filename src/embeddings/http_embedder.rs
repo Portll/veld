@@ -48,9 +48,9 @@ impl HttpEmbedderConfig {
                 "VELD_EMBEDDING_API_TIMEOUT_MS",
                 "SHODH_EMBEDDING_API_TIMEOUT_MS",
             )
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5000),
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000),
         }
     }
 }
@@ -134,7 +134,9 @@ impl HttpEmbedder {
             builder = builder.header("Authorization", &format!("Bearer {key}"));
         }
 
-        let resp = builder.send_json(&req).context("HTTP embedding request failed")?;
+        let resp = builder
+            .send_json(&req)
+            .context("HTTP embedding request failed")?;
 
         let parsed: EmbeddingResponse = resp
             .into_body()

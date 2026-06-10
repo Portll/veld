@@ -10,9 +10,9 @@
 //! Run with: cargo test temporal_benchmark -- --ignored --nocapture
 
 use chrono::{Duration, Utc};
+use tempfile::TempDir;
 use veld::memory::types::{Experience, ExperienceType, Query, RetrievalMode};
 use veld::memory::{MemoryConfig, MemorySystem};
-use tempfile::TempDir;
 
 // =============================================================================
 // BENCHMARK PARAMETERS
@@ -216,7 +216,10 @@ fn temporal_benchmark_kendalls_tau() {
     let corpus = build_corpus();
 
     // Phase 1: Store events with explicit timestamps
-    println!("\n=== TEMPORAL BENCHMARK: Storing {} events ===\n", corpus.len());
+    println!(
+        "\n=== TEMPORAL BENCHMARK: Storing {} events ===\n",
+        corpus.len()
+    );
     let mut memory_ids = Vec::new();
 
     for event in &corpus {
@@ -242,7 +245,10 @@ fn temporal_benchmark_kendalls_tau() {
     }
 
     // Phase 2: Query and measure temporal ordering
-    println!("=== Running {} temporal queries ===\n", build_queries().len());
+    println!(
+        "=== Running {} temporal queries ===\n",
+        build_queries().len()
+    );
     let queries = build_queries();
     let mut tau_scores: Vec<f64> = Vec::new();
     let mut per_type_taus: std::collections::HashMap<&str, Vec<f64>> =
@@ -266,11 +272,7 @@ fn temporal_benchmark_kendalls_tau() {
         // Map retrieved memory IDs back to corpus indices, preserving retrieval order
         let retrieved_indices: Vec<usize> = results
             .iter()
-            .filter_map(|m| {
-                memory_ids
-                    .iter()
-                    .position(|stored_id| *stored_id == m.id)
-            })
+            .filter_map(|m| memory_ids.iter().position(|stored_id| *stored_id == m.id))
             .collect();
 
         // Extract the subset of expected indices that appear in retrieved results
@@ -290,10 +292,7 @@ fn temporal_benchmark_kendalls_tau() {
         if predicted_in_expected.len() >= 2 && expected_in_results.len() >= 2 {
             let tau = kendalls_tau(&predicted_in_expected, &expected_in_results);
             tau_scores.push(tau);
-            per_type_taus
-                .entry(tq.query_type)
-                .or_default()
-                .push(tau);
+            per_type_taus.entry(tq.query_type).or_default().push(tau);
 
             println!(
                 "  [{:.3}τ] {} — retrieved {}/{} expected items",
@@ -321,7 +320,11 @@ fn temporal_benchmark_kendalls_tau() {
         tau_scores.iter().sum::<f64>() / tau_scores.len() as f64
     };
 
-    println!("Overall Kendall's τ: {:.3} (n={})", avg_tau, tau_scores.len());
+    println!(
+        "Overall Kendall's τ: {:.3} (n={})",
+        avg_tau,
+        tau_scores.len()
+    );
     println!();
 
     for (qtype, taus) in &per_type_taus {

@@ -53,8 +53,8 @@
 use std::sync::OnceLock;
 
 use crate::constants::{
-    ANCHOR_IMPORTANCE_FLOOR, DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION,
-    LOG_PERIODIC_BETA, LOG_PERIODIC_SCALES, POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
+    ANCHOR_IMPORTANCE_FLOOR, DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION, LOG_PERIODIC_BETA,
+    LOG_PERIODIC_SCALES, POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
 };
 
 /// Runtime-configurable log-periodic scales.
@@ -559,12 +559,8 @@ mod tests {
     fn test_log_periodic_with_zero_beta_is_pure_powerlaw() {
         // When β=0, correction is exactly 1.0 everywhere → pure power-law
         for day in [7.0, 30.0, 90.0, 365.0] {
-            let correction = log_periodic_correction(
-                day,
-                DECAY_CROSSOVER_DAYS,
-                0.0,
-                &LOG_PERIODIC_SCALES,
-            );
+            let correction =
+                log_periodic_correction(day, DECAY_CROSSOVER_DAYS, 0.0, &LOG_PERIODIC_SCALES);
             assert!((correction - 1.0).abs() < 1e-15);
         }
     }
