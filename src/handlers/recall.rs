@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::state::MultiUserMemoryManager;
+use super::temporal_derivation::derive_answer_for_user_query;
 use super::types::{
     MemoryEvent, RecallExperience, RecallFact, RecallLineageEdge, RecallMemory, RecallRequest,
     RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
@@ -974,6 +975,20 @@ pub async fn recall(
         meta
     });
 
+    // B4: temporal answer-derivation. Additive — memories/count are already
+    // final. Runs in spawn_blocking because derive_answer_for_user_query acquires
+    // a read lock on the memory substrate.
+    let derived_answer = {
+        let state_for_da = state.clone();
+        let user_id_for_da = req.user_id.clone();
+        let query_for_da = req.query.clone();
+        tokio::task::spawn_blocking(move || {
+            derive_answer_for_user_query(&state_for_da, &user_id_for_da, &query_for_da)
+        })
+        .await
+        .unwrap_or(None)
+    };
+
     let mut resp = RecallResponse {
         memories: recall_memories,
         count,
@@ -988,6 +1003,7 @@ pub async fn recall(
         lineage_count,
         tokens_estimated: None,
         metacognition,
+        derived_answer,
     };
     resp.tokens_estimated = Some(resp.estimate_tokens());
     Ok(Json(resp))
@@ -2832,4 +2848,92 @@ pub async fn recall_by_date(
     });
 
     Ok(Json(RetrieveResponse { memories, count }))
+}
+
+// =============================================================================
+// B4 RECALL SURFACE TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod b4_recall_surface_tests {
+    use crate::handlers::temporal_derivation::DerivedAnswer;
+    use crate::handlers::types::RecallResponse;
+    use crate::memory::query_parser::asks_for_temporal_answer;
+
+    // Helper: build a minimal RecallResponse with a given derived_answer.
+    fn make_response(derived_answer: Option<DerivedAnswer>) -> RecallResponse {
+        RecallResponse {
+            memories: vec![],
+            count: 0,
+            retrieval_stats: None,
+            todos: vec![],
+            todo_count: None,
+            facts: vec![],
+            fact_count: None,
+            triggered_reminders: vec![],
+            reminder_count: None,
+            lineage: vec![],
+            lineage_count: None,
+            tokens_estimated: None,
+            metacognition: None,
+            derived_answer,
+        }
+    }
+
+    /// A temporal "when did X" question must pass the gate so derivation can fire.
+    /// This mirrors what `/api/recall` must do: gate on `asks_for_temporal_answer`
+    /// before calling `derive_answer_for_user_query`.
+    #[test]
+    fn temporal_query_passes_gate_for_recall() {
+        assert!(asks_for_temporal_answer("when did Melanie go camping?"));
+        assert!(asks_for_temporal_answer("When was the project launched?"));
+    }
+
+    /// Non-temporal queries must never reach derivation (gate blocks them),
+    /// so derived_answer is None and absent from the wire.
+    #[test]
+    fn non_temporal_query_gate_blocked() {
+        assert!(!asks_for_temporal_answer(
+            "What did Melanie think about camping?"
+        ));
+        assert!(!asks_for_temporal_answer("Tell me about the project"));
+
+        let resp = make_response(None);
+        let json = serde_json::to_string(&resp).unwrap();
+        // field must be absent — skip_serializing_if = "Option::is_none"
+        assert!(!json.contains("derived_answer"));
+    }
+
+    /// When derived_answer is None, the JSON output must NOT include the field
+    /// at all — confirming the response is byte-identical to the pre-B4 shape.
+    #[test]
+    fn none_derived_answer_omitted_from_json() {
+        let resp = make_response(None);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("derived_answer"),
+            "derived_answer must be absent from JSON when None, got: {json}"
+        );
+    }
+
+    /// When derived_answer is populated (a "when did X" query with a stored
+    /// fact), the field must appear in the JSON with the correct shape.
+    #[test]
+    fn populated_derived_answer_present_in_json() {
+        let da = DerivedAnswer {
+            derived_date: "2024-03-15".to_string(),
+            method: "temporal_fact".to_string(),
+            supporting_facts: vec![],
+            source_memories: vec!["mem-id-123".to_string()],
+        };
+        let resp = make_response(Some(da));
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("derived_answer"),
+            "derived_answer must be present in JSON when Some, got: {json}"
+        );
+        assert!(json.contains("2024-03-15"));
+        assert!(json.contains("temporal_fact"));
+        assert!(json.contains("mem-id-123"));
+    }
 }
