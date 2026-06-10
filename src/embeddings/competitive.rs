@@ -425,4 +425,43 @@ mod tests {
         let result = failing.encode_batch(&["a", "b", "c"]);
         assert!(result.is_err());
     }
+
+    /// Defect 3 routing decision: recall routes the secondary leg through the
+    /// aligned path (`search_ids_aligned` / `encode_aligned`) iff
+    /// `has_alignment()` is true for the active pair. Before install the gate is
+    /// false (recall takes the byte-identical raw-secondary path); after install
+    /// it is true (recall takes the aligned, projected-into-primary path), and
+    /// `encode_aligned` returns a primary-space vector.
+    #[test]
+    fn aligned_branch_gated_on_has_alignment() {
+        use crate::embeddings::{AlignmentPairId, IdentityAlignment};
+
+        // Same dim on both sides so IdentityAlignment installs cleanly.
+        let primary: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(8));
+        let secondary: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(8));
+        let embedder = CompetitiveEmbedder::new(primary, Some(secondary));
+
+        // No alignment yet → recall's gate is false → raw-secondary path.
+        assert!(!embedder.has_alignment());
+        assert!(
+            embedder
+                .encode_aligned("query text", AlignedSide::Query)
+                .unwrap()
+                .is_none(),
+            "encode_aligned must yield None with no alignment (fallback path)"
+        );
+
+        let pair_id = AlignmentPairId::new("stub-primary", "stub-secondary");
+        embedder
+            .install_alignment(Arc::new(IdentityAlignment::new(8, pair_id)))
+            .expect("identity alignment installs (dims match)");
+
+        // Alignment installed → recall's gate is true → aligned path.
+        assert!(embedder.has_alignment());
+        let aligned = embedder
+            .encode_aligned("query text", AlignedSide::Query)
+            .unwrap()
+            .expect("encode_aligned yields a projected vector once aligned");
+        assert_eq!(aligned.len(), 8, "aligned vector lives in primary space");
+    }
 }
