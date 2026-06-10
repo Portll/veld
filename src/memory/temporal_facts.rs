@@ -22,6 +22,7 @@ use std::sync::Arc;
 use super::types::MemoryId;
 
 /// Type of temporal event
+// bincode: append-only — never reorder or insert; new variants go last
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     /// Event was planned/scheduled ("We're planning to go camping next month")
@@ -30,6 +31,11 @@ pub enum EventType {
     Occurred,
     /// Event was mentioned in past tense referring to history ("I painted that in 2022")
     Historical,
+    /// A past intention whose fulfilment is unknown ("I was going to visit her
+    /// last week but couldn't", "I wanted to go camping"). NOT a confident
+    /// future (the intent is past) and NOT a confident occurrence (the act may
+    /// never have happened). Appended LAST — bincode tag 3.
+    PastIntent,
 }
 
 /// A temporal fact extracted from conversation
@@ -1191,6 +1197,234 @@ impl TemporalFactStore {
 }
 
 // ============================================================================
+// WORD-BOUNDARY MATCHING + INTENT INVENTORY  (precision layer)
+// ============================================================================
+//
+// Raw `contains` matching silently misroutes: "ran" hits *orange*, "got" hits
+// *forgot*, "soon" hits *monsoon*, "did" hits *candid*, "met" hits *helmet*.
+// Everything below matches against whole tokens / token-windows so a phrase
+// only fires when its words appear as words, never as substrings.
+
+/// Tokenise a lowercased sentence into alphanumeric word tokens, preserving the
+/// apostrophe so contractions (`don't`, `i'm`, `can't`) survive intact.
+fn sentence_tokens(sentence_lower: &str) -> Vec<&str> {
+    sentence_lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Return the token index at which `phrase` (one or more space-separated words)
+/// appears as a contiguous run of whole tokens, or `None`. Word-boundary safe:
+/// `contains_phrase(tokens("orange juice"), "ran")` is `None`.
+fn contains_phrase(tokens: &[&str], phrase: &str) -> Option<usize> {
+    let needle: Vec<&str> = phrase.split_whitespace().collect();
+    if needle.is_empty() || needle.len() > tokens.len() {
+        return None;
+    }
+    tokens
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+}
+
+/// True if any phrase in `phrases` appears as whole tokens.
+fn any_phrase(tokens: &[&str], phrases: &[&str]) -> bool {
+    phrases.iter().any(|p| contains_phrase(tokens, p).is_some())
+}
+
+/// Tense class of a matched intent construction. Drives bucket routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentTense {
+    /// want(s) to, will, planning to, going to (present aux), about to … → Planned.
+    PresentFuture,
+    /// wanted to, was going to, planned to, hoped to … → PastIntent bucket.
+    PastIntent,
+    /// decided/agreed/promised to … → decision is past, act usually future → Planned (lower conf).
+    DecisionPast,
+}
+
+/// Intent-verb heads whose PAST simple/progressive form routes to PastIntent.
+/// Mapped present→past so we can detect the past form by token match.
+/// (head present form, head past form)
+const PAST_INTENT_FORMS: &[&str] = &[
+    "wanted", "hoped", "planned", "intended", "wished", "expected", "meant",
+];
+
+/// Decision-class heads: the decision is past but the act is usually future.
+/// `decided to adopt a puppy` → a plan, not (yet) an occurrence.
+const DECISION_FORMS: &[&str] = &["decided", "agreed", "promised"];
+
+/// Auxiliaries that, when sitting ≤2 tokens before a `going to`/`gonna`/
+/// `-ing` intent head, force the PAST-INTENT reading.
+const PAST_AUX: &[&str] = &["was", "were", "wasn't", "weren't"];
+
+/// Negators that kill an intent fact when within 3 tokens before the head.
+/// `can't wait to` is whitelisted upstream (positive intent containing `can't`).
+const NEGATORS: &[&str] = &[
+    "not", "n't", "never", "don't", "doesn't", "didn't", "won't", "wouldn't",
+    "couldn't", "cannot", "can't", "refuse", "refused", "no",
+];
+
+/// Subordinators that turn `get to` into the arrival sense
+/// (`when I get to the office`) — skip the intent reading.
+const ARRIVAL_SUBORDINATORS: &[&str] = &["when", "once", "after", "until", "before"];
+
+/// Determiners following a commitment verb signal a noun complement
+/// (`agreed to the terms`), not an event — skip.
+const DETERMINERS: &[&str] =
+    &["the", "a", "an", "my", "his", "her", "their", "our", "this", "that"];
+
+/// Genuine future-intent phrases (multi-word, matched word-boundary). Present /
+/// future tense → Planned. The PAST and DECISION forms are handled separately so
+/// they route to the PastIntent / DecisionPast classes instead of confident-future.
+const INTENT_PHRASES: &[&str] = &[
+    // canonical plan/intent
+    "planning to", "planning on", "plan to", "plans to",
+    "going to", "gonna",
+    "want to", "wants to", "wanting to", "wanna",
+    "hope to", "hopes to", "hoping to",
+    "intend to", "intends to", "intending to",
+    "aim to", "aims to", "aiming to",
+    "wish to", "wishes to", "wishing to",
+    "expect to", "expects to", "expecting to",
+    "thinking about", "thinking of",
+    "looking forward to", "look forward to", "looks forward to",
+    "excited to", "excited about",
+    // polite / strong anticipation
+    "would like to", "'d like to",
+    "would love to", "'d love to",
+    "can't wait to", "cannot wait to",
+    // the requested addition + imminent/scheduled
+    "get to", "gets to", "getting to",
+    "about to",
+    "set to", "scheduled to", "slated to",
+    // deliberation
+    "considering",
+    "decide to", "decides to", "deciding to",
+    "agree to", "agrees to",
+    "promise to", "promises to", "promising to",
+];
+
+/// Future time markers (word-boundary). Presence alone (verb-less) is a weak
+/// future signal kept for back-compat at lowered confidence.
+const FUTURE_TIME_MARKERS: &[&str] = &[
+    "next month", "next week", "next year", "next weekend",
+    "this weekend", "tomorrow", "soon",
+];
+
+/// Phrases that look like intent but must NEVER trigger a Planned fact.
+/// Checked and rejected before any INTENT_PHRASES match is honoured.
+const INTENT_TRAPS: &[&str] = &[
+    "due to",        // causal preposition ("cancelled due to rain")
+    "used to",       // past habitual ("used to run marathons")
+    "have to", "has to", "had to",   // obligation
+    "need to", "needs to", "needed to",
+    "got to", "gotta",               // obligation / past-opportunity
+    "able to",                        // capability
+    "supposed to",                    // expectation (v1: exclude)
+    "in order to", "so as to",       // purpose adjunct
+    "like to", "love to",            // bare habitual preference
+    "try to", "trying to", "tried to",
+    "ought to", "go to",
+    "happy to", "glad to", "willing to", "ready to",
+];
+
+/// Query-side symmetry: does a (lowercased) query phrase signal a *planned*
+/// intent? Reuses the same INTENT_PHRASES inventory as extraction so the two
+/// lists can never drift apart. Used by recall.rs to map queries to
+/// `EventType::Planned`.
+pub fn query_signals_planned_intent(query_lower: &str) -> bool {
+    let tokens = sentence_tokens(query_lower);
+    // Explicit planning words + the full intent inventory.
+    any_phrase(&tokens, &["planning", "will"])
+        || any_phrase(&tokens, INTENT_PHRASES)
+}
+
+/// Classify the tense of an intent match given the sentence tokens.
+/// Looks at past-form heads, decision heads, and a ≤2-token aux lookbehind for
+/// `going to`/`gonna`/`-ing` heads.
+fn classify_intent_tense(tokens: &[&str]) -> IntentTense {
+    // Past-simple intent heads ("wanted to go", "planned to visit").
+    if PAST_INTENT_FORMS
+        .iter()
+        .any(|f| contains_phrase(tokens, f).is_some())
+    {
+        return IntentTense::PastIntent;
+    }
+    // Decision class ("decided to", "agreed to", "promised to").
+    if DECISION_FORMS
+        .iter()
+        .any(|f| contains_phrase(tokens, f).is_some())
+    {
+        return IntentTense::DecisionPast;
+    }
+    // Past progressive: `was/were … going to / gonna / planning / hoping …`.
+    // Find a progressive/periphrastic head and check ≤2 tokens before it.
+    let progressive_heads = ["going", "gonna", "planning", "hoping", "looking", "aiming"];
+    for (idx, tok) in tokens.iter().enumerate() {
+        if progressive_heads.contains(tok) {
+            let lo = idx.saturating_sub(2);
+            if tokens[lo..idx].iter().any(|t| PAST_AUX.contains(t)) {
+                return IntentTense::PastIntent;
+            }
+        }
+    }
+    IntentTense::PresentFuture
+}
+
+/// Guard: is the intent head negated? Scans up to 3 tokens before the *first*
+/// intent-phrase head. `can't wait to` is treated as positive upstream.
+fn intent_is_negated(tokens: &[&str], head_idx: usize) -> bool {
+    let lo = head_idx.saturating_sub(3);
+    tokens[lo..head_idx].iter().any(|t| NEGATORS.contains(t))
+}
+
+/// Guard: arrival-sense `get to` (`when I get to the office`). True ⇒ skip.
+fn is_arrival_get_to(tokens: &[&str]) -> bool {
+    // Only relevant when a get-to family phrase is present.
+    let head = ["get", "gets", "getting"];
+    for (idx, tok) in tokens.iter().enumerate() {
+        if head.contains(tok) && tokens.get(idx + 1) == Some(&"to") {
+            let lo = idx.saturating_sub(2);
+            if tokens[lo..idx].iter().any(|t| ARRIVAL_SUBORDINATORS.contains(t)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Guard: commitment verb followed by a determiner ⇒ noun complement, not an
+/// event (`agreed to the terms`). True ⇒ skip.
+fn is_noun_complement(tokens: &[&str]) -> bool {
+    let commit = ["agree", "agrees", "agreed", "promise", "promises", "promised"];
+    for (idx, tok) in tokens.iter().enumerate() {
+        if commit.contains(tok)
+            && tokens.get(idx + 1) == Some(&"to")
+            && tokens.get(idx + 2).is_some_and(|t| DETERMINERS.contains(t))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Guard: perfect-infinitive complement (`excited to have met you`) references a
+/// PAST event — do not treat as a future plan. True ⇒ skip the Planned reading.
+fn is_perfect_infinitive(tokens: &[&str]) -> bool {
+    tokens
+        .windows(2)
+        .any(|w| w == ["to", "have"])
+}
+
+/// Guard: a second-person question (`Do you want to come hiking?`). The sentence
+/// terminator is needed; passed in separately. True ⇒ skip (a question to the
+/// entity is not a fact about them).
+fn is_second_person_question(tokens: &[&str], terminator: char) -> bool {
+    terminator == '?' && tokens.contains(&"you")
+}
+
+// ============================================================================
 // TEMPORAL FACT EXTRACTION
 // ============================================================================
 
@@ -1204,13 +1438,29 @@ pub fn extract_temporal_facts(
     let mut facts = Vec::new();
     let stemmer = Stemmer::create(Algorithm::English);
 
-    // Split into sentences
-    let sentences: Vec<&str> = content
-        .split(['.', '!', '?'])
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    // Split into sentences, RETAINING the terminator so question detection is
+    // possible downstream (a `?` sentence directed at the entity is not a fact).
+    let mut sentences: Vec<(&str, char)> = Vec::new();
+    {
+        let mut start = 0usize;
+        for (idx, ch) in content.char_indices() {
+            if ch == '.' || ch == '!' || ch == '?' {
+                let seg = &content[start..idx];
+                if !seg.trim().is_empty() {
+                    sentences.push((seg, ch));
+                }
+                start = idx + ch.len_utf8();
+            }
+        }
+        if start < content.len() {
+            let seg = &content[start..];
+            if !seg.trim().is_empty() {
+                sentences.push((seg, '.'));
+            }
+        }
+    }
 
-    for sentence in sentences {
+    for (sentence, terminator) in sentences {
         let sentence_lower = sentence.to_lowercase();
 
         // Find which entity is mentioned in this sentence
@@ -1278,9 +1528,14 @@ pub fn extract_temporal_facts(
         };
 
         // Try to extract temporal facts using patterns
-        if let Some(fact) =
-            extract_planning_fact(sentence, &entity, memory_id, conversation_date, &stemmer)
-        {
+        if let Some(fact) = extract_planning_fact(
+            sentence,
+            terminator,
+            &entity,
+            memory_id,
+            conversation_date,
+            &stemmer,
+        ) {
             facts.push(fact);
         } else if let Some(fact) =
             extract_occurred_fact(sentence, &entity, memory_id, conversation_date, &stemmer)
@@ -1296,48 +1551,151 @@ pub fn extract_temporal_facts(
     facts
 }
 
-/// Extract "planning" facts (future events)
+/// Extract "planning"/intent facts (future events + past-intent).
+///
+/// Precision-first: word-boundary matching, an expanded intent inventory with
+/// explicit trap exclusion, tense routing (past-intent away from confident
+/// future), and a battery of deterministic guards.
 fn extract_planning_fact(
     sentence: &str,
+    terminator: char,
     entity: &str,
     memory_id: &MemoryId,
     conversation_date: DateTime<Utc>,
     stemmer: &Stemmer,
 ) -> Option<TemporalFact> {
     let sentence_lower = sentence.to_lowercase();
+    let tokens = sentence_tokens(&sentence_lower);
 
-    // Planning patterns
-    let planning_patterns = [
-        "planning to",
-        "planning on",
-        "going to",
-        "thinking about",
-        "want to",
-        "hope to",
-        "looking forward to",
-        "excited to",
-        "next month",
-        "next week",
-        "this weekend",
-        "soon",
-    ];
+    // ---- Trap rejection (before any intent match is honoured) ---------------
+    // due to / used to / obligation / capability / purpose / habitual-preference.
+    // Whitelist `can't wait to` and `would like/love to`, which legitimately
+    // contain trapped substrings, by checking traps as whole phrases only.
+    let is_positive_wait = any_phrase(&tokens, &["can't wait to", "cannot wait to"]);
+    if !is_positive_wait && any_phrase(&tokens, INTENT_TRAPS) {
+        // A trap phrase is present. Only bail if NO clean intent phrase also
+        // fires — e.g. "I want to, but I have to leave" should still extract.
+        // For v1 we are conservative: a trap present and no future marker → drop.
+        let clean_intent = any_phrase(&tokens, INTENT_PHRASES);
+        if !clean_intent {
+            return None;
+        }
+    }
 
-    // GAP-2: "in N days/weeks/months" is also a planning/future indicator
+    // ---- Intent / future detection (word-boundary) --------------------------
+    let head_idx = INTENT_PHRASES
+        .iter()
+        .filter_map(|p| contains_phrase(&tokens, p))
+        .min();
+    let has_past_intent_form = PAST_INTENT_FORMS
+        .iter()
+        .any(|f| contains_phrase(&tokens, f).is_some())
+        || DECISION_FORMS
+            .iter()
+            .any(|f| contains_phrase(&tokens, f).is_some());
+    let has_future_marker = any_phrase(&tokens, FUTURE_TIME_MARKERS);
+    // GAP-2: "in N days/weeks/months" is also a future indicator.
     let has_in_n = parse_in_n_units(&sentence_lower).is_some();
 
-    let has_planning = planning_patterns.iter().any(|p| sentence_lower.contains(p)) || has_in_n;
-    if !has_planning {
+    let has_intent_verb = head_idx.is_some() || has_past_intent_form;
+    if !has_intent_verb && !has_future_marker && !has_in_n {
         return None;
     }
 
-    // Extract event and time
-    let (event, relative_time) = extract_event_and_time(sentence, &planning_patterns);
+    // ---- Guards (deterministic, O(n)) ---------------------------------------
+    // Question to the entity is not a fact about them.
+    if is_second_person_question(&tokens, terminator) {
+        return None;
+    }
+    // Arrival-sense `get to` / commitment noun-complement → not an event.
+    if is_arrival_get_to(&tokens) || is_noun_complement(&tokens) {
+        // Only skip when the *only* intent signal was that construction.
+        // If another clean intent phrase exists, fall through.
+        let other = head_idx.is_some()
+            && !any_phrase(&tokens, &["get to", "gets to", "getting to"])
+            && !is_noun_complement(&tokens);
+        if !other {
+            return None;
+        }
+    }
+    // Negation kills the intent (unless positive `can't wait to`).
+    if let Some(idx) = head_idx {
+        if !is_positive_wait && intent_is_negated(&tokens, idx) {
+            return None;
+        }
+    }
+
+    // ---- Tense routing ------------------------------------------------------
+    // Perfect infinitive ("excited to have met you") → past reference: not a
+    // confident future plan. Route to PastIntent so it is not surfaced as a plan.
+    let perfect = is_perfect_infinitive(&tokens) && head_idx.is_some();
+    let tense = if perfect {
+        IntentTense::PastIntent
+    } else {
+        classify_intent_tense(&tokens)
+    };
+
+    // Extract event and time (word boundaries already applied to detection).
+    let (event, relative_time) = extract_event_and_time(sentence, INTENT_PHRASES);
     if event.is_empty() {
         return None;
     }
 
-    // Resolve relative time
-    let resolved_time = resolve_relative_time(&relative_time, conversation_date);
+    // Marker direction: does the resolved marker land in the past?
+    let marker_resolved = if relative_time.is_empty() {
+        ResolvedTime::Unknown
+    } else {
+        resolve_relative_time(&relative_time, conversation_date)
+    };
+    let conv_naive = conversation_date.date_naive();
+    let marker_is_past = matches!(
+        marker_resolved.to_bound(),
+        TemporalBound::Point(d) if d < conv_naive
+    ) || matches!(
+        marker_resolved.to_bound(),
+        TemporalBound::Closed { end, .. } if end < conv_naive
+    ) || matches!(marker_resolved, ResolvedTime::Before(_));
+    let has_marker = !matches!(marker_resolved.to_bound(), TemporalBound::Unknown);
+
+    // Routing matrix (subset of plan §b — the load-bearing rows).
+    let (event_type, resolved_time, confidence) = match tense {
+        IntentTense::PresentFuture => {
+            if has_marker && marker_is_past {
+                // conflict: marker wins → Occurred ("want to mention I went yesterday").
+                (EventType::Occurred, marker_resolved.clone(), 0.6)
+            } else if has_marker {
+                (EventType::Planned, marker_resolved.clone(), 0.85)
+            } else {
+                // Marker-less plan: forward of utterance (replaces junk empty desc).
+                (EventType::Planned, ResolvedTime::After(conv_naive), 0.7)
+            }
+        }
+        IntentTense::DecisionPast => {
+            if has_marker && marker_is_past {
+                (EventType::Occurred, marker_resolved.clone(), 0.65)
+            } else if has_marker {
+                (EventType::Planned, marker_resolved.clone(), 0.65)
+            } else {
+                (EventType::Planned, ResolvedTime::After(conv_naive), 0.65)
+            }
+        }
+        IntentTense::PastIntent => {
+            // Past intention, fulfilment unknown. Never confident-future.
+            let rt = if has_marker {
+                marker_resolved.clone()
+            } else {
+                ResolvedTime::Before(conv_naive)
+            };
+            (EventType::PastIntent, rt, 0.4)
+        }
+    };
+
+    // Verb-less future-marker-only sentences get a lowered confidence.
+    let confidence = if !has_intent_verb {
+        0.6
+    } else {
+        confidence
+    };
 
     let entity_stem = stemmer.stem(&entity.to_lowercase()).to_string();
     let event_stems: Vec<String> = event
@@ -1352,7 +1710,7 @@ fn extract_planning_fact(
         entity: entity.to_string(),
         event: event.clone(),
         event_stems,
-        event_type: EventType::Planned,
+        event_type,
         relative_time: if relative_time.is_empty() {
             None
         } else {
@@ -1361,7 +1719,7 @@ fn extract_planning_fact(
         resolved_time,
         source_memory_id: memory_id.clone(),
         conversation_date,
-        confidence: 0.8,
+        confidence,
         source_text: sentence.to_string(),
         valid_from: Some(conversation_date),
         valid_until: None,
@@ -1400,12 +1758,22 @@ fn extract_occurred_fact(
         "a few days ago",
     ];
 
-    // Check for past tense verbs combined with time patterns
+    // Check for past tense verbs combined with time patterns. Word-boundary
+    // matching: "ran" must not fire on *orange*, "got" not on *forgot*, "did"
+    // not on *candid*, "met" not on *helmet*, "had" not on *shadow*.
+    let tokens = sentence_tokens(&sentence_lower);
     let past_verbs = [
         "ran", "went", "did", "took", "made", "had", "got", "saw", "met",
     ];
-    let has_past_event = occurred_patterns.iter().any(|p| sentence_lower.contains(p))
-        || past_verbs.iter().any(|v| sentence_lower.contains(v));
+    // The occurred time-markers are multi-word/safe phrases except "just" and
+    // "ago" which leak as substrings (adjust/justice, agony) — match those by
+    // whole token too via contains_phrase.
+    let has_past_event = occurred_patterns
+        .iter()
+        .any(|p| contains_phrase(&tokens, p).is_some())
+        || past_verbs
+            .iter()
+            .any(|v| contains_phrase(&tokens, v).is_some());
 
     if !has_past_event {
         return None;
@@ -1830,10 +2198,17 @@ fn extract_time_expression(sentence: &str) -> String {
         "a week ago",
         // bare "recently"
         "recently",
+        // near-future fuzzy marker (resolves to Around conv_date+7d, radius 7)
+        // so a "soon" plan stops producing a junk RelativeDescription("").
+        "soon",
     ];
 
+    // Word-boundary match: every pattern here is whole words, so a boundary
+    // check is strictly safer and stops "soon" matching *monsoon*, "today"
+    // matching *todays*, etc., without changing any genuine phrase match.
+    let pat_tokens = sentence_tokens(sentence);
     for pattern in time_patterns {
-        if sentence.contains(pattern) {
+        if contains_phrase(&pat_tokens, pattern).is_some() {
             return pattern.to_string();
         }
     }
@@ -1960,6 +2335,44 @@ fn extract_event_from_sentence(sentence: &str) -> String {
         "looking",
         "forward",
         "excited",
+        // expanded intent heads (S7) — keep these out of event_stems so the new
+        // inventory does not pollute matching with the verb itself.
+        "wanted",
+        "hoped",
+        "planned",
+        "intend",
+        "intends",
+        "intended",
+        "aim",
+        "aims",
+        "aiming",
+        "wish",
+        "wishes",
+        "wished",
+        "expect",
+        "expects",
+        "expecting",
+        "expected",
+        "decide",
+        "decides",
+        "decided",
+        "agree",
+        "agrees",
+        "agreed",
+        "promise",
+        "promises",
+        "promised",
+        "gonna",
+        "wanna",
+        "considering",
+        "supposed",
+        "scheduled",
+        "slated",
+        "get",
+        "gets",
+        "getting",
+        "set",
+        "meant",
         "last",
         "next",
         "week",
@@ -2099,6 +2512,15 @@ pub fn resolve_relative_time(relative: &str, conversation_date: DateTime<Utc>) -
         return ResolvedTime::Around {
             centre: conv_date,
             radius_days: 14,
+        };
+    }
+
+    // "soon" → fuzzy near-future window centred a week ahead, ±7 days.
+    // Replaces the prior junk RelativeDescription("") for "soon" plans.
+    if relative_lower.trim() == "soon" {
+        return ResolvedTime::Around {
+            centre: conv_date + Duration::days(7),
+            radius_days: 7,
         };
     }
 
@@ -2680,6 +3102,7 @@ mod tests {
 
         let fact = extract_planning_fact(
             "Melanie is planning to go camping next month",
+            '.',
             entity,
             &memory_id,
             conv,
@@ -3433,6 +3856,7 @@ mod tests {
 
         let fact = extract_planning_fact(
             "the conference is in 3 weeks",
+            '.',
             entity,
             &memory_id,
             conv,
@@ -3609,5 +4033,195 @@ mod tests {
             "cycle fact B must remain Unknown, got {:?}",
             resolved_b.resolved_time
         );
+    }
+
+    // ========================================================================
+    // INTENT-VERB EXPANSION + WORD-BOUNDARY PRECISION + TENSE ROUTING
+    // ========================================================================
+
+    fn iv_conv() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2023-05-25T13:14:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn extract(content: &str) -> Vec<TemporalFact> {
+        let mid = super::super::types::MemoryId(uuid::Uuid::new_v4());
+        extract_temporal_facts(content, &mid, iv_conv(), &["Melanie".to_string()])
+    }
+
+    // ---- Word-boundary precision: the load-bearing FP fixes -----------------
+
+    #[test]
+    fn test_wordboundary_orange_creates_no_fact() {
+        // "ran" must NOT match inside "orange". No time signal, no real verb.
+        let facts = extract("Melanie likes orange juice");
+        assert!(
+            facts.is_empty(),
+            "'orange' must not trip the 'ran' past-verb match: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn test_wordboundary_forgot_creates_no_fact() {
+        // "got" must NOT match inside "forgot".
+        let facts = extract("Melanie forgot her keys");
+        assert!(
+            facts.is_empty(),
+            "'forgot' must not trip the 'got' past-verb match: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn test_wordboundary_monsoon_creates_no_fact() {
+        // "soon" must NOT match inside "monsoon" (no intent verb present).
+        let facts = extract("Melanie loves the monsoon");
+        assert!(
+            facts.is_empty(),
+            "'monsoon' must not trip the 'soon' future marker: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn test_wordboundary_keeps_genuine_matches() {
+        // The boundary change must NOT drop real matches.
+        let ran = extract("Melanie ran a marathon yesterday");
+        assert!(!ran.is_empty(), "'ran ... yesterday' must still extract");
+        let soon = extract("Melanie is planning to visit soon");
+        assert!(!soon.is_empty(), "'planning to ... soon' must still extract");
+    }
+
+    // ---- New intent families DO create planned facts ------------------------
+
+    #[test]
+    fn test_get_to_creates_planned_fact() {
+        let facts = extract("Melanie gets to see her sister next week");
+        assert_eq!(facts.len(), 1, "get-to family must extract: {facts:?}");
+        assert_eq!(facts[0].event_type, EventType::Planned);
+    }
+
+    #[test]
+    fn test_decide_to_creates_planned_fact() {
+        let facts = extract("Melanie decided to adopt a puppy");
+        assert_eq!(facts.len(), 1, "decide-to must extract: {facts:?}");
+        assert_eq!(
+            facts[0].event_type,
+            EventType::Planned,
+            "decision-past with no past marker routes Planned"
+        );
+    }
+
+    #[test]
+    fn test_about_to_creates_planned_fact() {
+        let facts = extract("Melanie is about to start a pottery class");
+        assert_eq!(facts.len(), 1, "about-to must extract: {facts:?}");
+        assert_eq!(facts[0].event_type, EventType::Planned);
+    }
+
+    // ---- Traps do NOT create planned facts ----------------------------------
+
+    #[test]
+    fn test_due_to_creates_no_planned_fact() {
+        let facts = extract("Melanie cancelled the picnic due to rain");
+        // No future plan asserted (causal "due to"); may surface nothing.
+        assert!(
+            !facts.iter().any(|f| f.event_type == EventType::Planned),
+            "'due to' is causal, never a plan: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn test_used_to_creates_no_planned_fact() {
+        let facts = extract("Melanie used to run marathons");
+        assert!(
+            !facts.iter().any(|f| f.event_type == EventType::Planned),
+            "'used to' is past-habitual, never a plan: {facts:?}"
+        );
+    }
+
+    // ---- Tense routing: past-intent away from confident-future --------------
+
+    #[test]
+    fn test_was_going_to_last_week_is_past_intent_not_future() {
+        let facts = extract("Melanie was going to visit her last week but couldn't");
+        assert!(!facts.is_empty(), "must extract something: {facts:?}");
+        let f = &facts[0];
+        assert_ne!(
+            f.event_type,
+            EventType::Planned,
+            "past-aux 'was going to' must NOT route confident-future Planned: {f:?}"
+        );
+        assert_eq!(
+            f.event_type,
+            EventType::PastIntent,
+            "unfulfilled past intent → PastIntent bucket: {f:?}"
+        );
+        assert!(
+            f.confidence <= 0.5,
+            "past intent must not be high-confidence, got {}",
+            f.confidence
+        );
+    }
+
+    #[test]
+    fn test_wanted_to_is_past_intent() {
+        let facts = extract("Melanie wanted to go camping last week");
+        assert!(!facts.is_empty());
+        assert_eq!(
+            facts[0].event_type,
+            EventType::PastIntent,
+            "'wanted to' is past-intent: {:?}",
+            facts[0]
+        );
+    }
+
+    // ---- Negation + question guards -----------------------------------------
+
+    #[test]
+    fn test_negated_intent_creates_no_fact() {
+        let facts = extract("Melanie doesn't want to go to the reunion");
+        assert!(
+            !facts.iter().any(|f| f.event_type == EventType::Planned),
+            "negated intent must not assert a plan: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn test_second_person_question_is_not_a_fact() {
+        let facts = extract("Do you want to come hiking next week?");
+        assert!(
+            facts.is_empty(),
+            "a 2nd-person question is not a fact about the entity: {facts:?}"
+        );
+    }
+
+    #[test]
+    fn test_cant_wait_to_is_positive_intent() {
+        // Contains "can't" but is positive anticipation — must survive negation guard.
+        let facts = extract("Melanie can't wait to try the new restaurant");
+        assert_eq!(facts.len(), 1, "can't-wait-to must extract: {facts:?}");
+        assert_eq!(facts[0].event_type, EventType::Planned);
+    }
+
+    // ---- "soon" no longer junk ----------------------------------------------
+
+    #[test]
+    fn test_soon_resolves_to_window_not_junk() {
+        match resolve_relative_time("soon", iv_conv()) {
+            ResolvedTime::Around { radius_days, .. } => {
+                assert_eq!(radius_days, 7, "soon → ±7d window");
+            }
+            other => panic!("'soon' must resolve to an Around window, got {other:?}"),
+        }
+    }
+
+    // ---- Query-side symmetry ------------------------------------------------
+
+    #[test]
+    fn test_query_signals_planned_intent_mirrors_inventory() {
+        assert!(query_signals_planned_intent("when is melanie planning to travel"));
+        assert!(query_signals_planned_intent("what does she want to do next week"));
+        assert!(query_signals_planned_intent("when does he get to visit"));
+        assert!(!query_signals_planned_intent("the orange monsoon forgot nothing"));
     }
 }
