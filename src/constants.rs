@@ -518,6 +518,33 @@ pub const CONSOLIDATION_MIN_SUPPORT: usize = 2;
 /// - Matches weekly work cycles
 pub const CONSOLIDATION_MIN_AGE_DAYS: i64 = 7;
 
+/// W3 candidate-staging TTL (days).
+///
+/// Sub-threshold promotion candidates (`fact_candidate:{user_id}:{signature}`)
+/// that have not been reinforced (no `last_seen` bump) within this window are
+/// evicted during consolidation. Eviction loses nothing durable — the source
+/// episodic memories remain the permanent record; the staging row is only a
+/// cross-window accumulator. 90 days matches the fact-decay grace period so a
+/// pattern that recurs even quarterly still accrues toward promotion.
+pub const FACT_CANDIDATE_TTL_DAYS: i64 = 90;
+
+/// W3 candidate-staging per-user cap.
+///
+/// Hard ceiling on staged (un-promoted) candidates per user. When exceeded,
+/// consolidation evicts the lowest `accumulated_support`, oldest `last_seen`
+/// first. Bounds the staging keyspace so a noisy ingest stream cannot grow the
+/// candidate table without limit. The cache is reconstructable from episodic
+/// memory, so eviction is safe.
+pub const FACT_CANDIDATE_MAX_PER_USER: usize = 5000;
+
+/// W3 candidate-staging per-candidate source-memory retention cap.
+///
+/// A single staging row retains at most this many distinct source-memory ids
+/// (the `accumulated_support` count is preserved separately, so promotion
+/// thresholding is unaffected even after trimming). Bounds per-row growth for
+/// patterns that recur across many windows.
+pub const FACT_CANDIDATE_MAX_SOURCES: usize = 64;
+
 /// Heat-score consolidation trigger (A2: Survey on AI Memory, MemoryOS)
 ///
 /// Memories between HEAT_SCORE_MIN_AGE_DAYS and CONSOLIDATION_MIN_AGE_DAYS

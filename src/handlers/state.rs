@@ -2336,7 +2336,10 @@ impl MultiUserMemoryManager {
                         total_feedback_events += learned.update_count;
                     }
                 }
-                match memory.run_maintenance(decay_factor, &user_id, is_heavy) {
+                // facts_already_distilled = false: the background maintenance
+                // cycle does NOT pre-run distill_facts, so the heavy path remains
+                // the fact-extraction owner here.
+                match memory.run_maintenance(decay_factor, &user_id, is_heavy, false) {
                     Ok(result) => {
                         total_processed += result.decayed_count;
                         total_facts_extracted += result.facts_extracted;

@@ -708,6 +708,32 @@ pub struct CausalFactLink {
     pub relation: String,
 }
 
+/// A sub-threshold pattern cluster surfaced by [`SemanticConsolidator::consolidate`].
+///
+/// W3 candidate staging: clusters whose DISTINCT-source count is below
+/// `min_support` are no longer discarded. They are returned here so the caller
+/// can accumulate them across consolidation windows in the persistent staging
+/// store (`fact_candidate:{user_id}:{signature}`). When accumulated distinct
+/// support reaches `min_support`, the candidate is promoted into a real
+/// `SemanticFact` via the unified persist/reinforce path.
+#[derive(Debug, Clone)]
+pub struct PendingCandidate {
+    /// Stable signature derived from the cluster's stemmed token set. Identical
+    /// patterns across separate windows produce the same signature, so their
+    /// support accumulates against one staging row.
+    pub signature: String,
+    /// Highest-confidence member text — the representative for the eventual fact.
+    pub representative: String,
+    /// Distinct source-memory ids contributing to this cluster THIS window.
+    pub source_memories: Vec<MemoryId>,
+    /// Entities extracted from the representative.
+    pub related_entities: Vec<String>,
+    /// Mean confidence across this window's cluster members.
+    pub avg_confidence: f32,
+    /// Distinct-source count for this window's cluster.
+    pub distinct_sources: usize,
+}
+
 /// Result of consolidation operation
 #[derive(Debug, Clone, Default)]
 pub struct ConsolidationResult {
@@ -721,6 +747,9 @@ pub struct ConsolidationResult {
     pub new_fact_ids: Vec<String>,
     /// Newly extracted semantic facts (ready for storage)
     pub new_facts: Vec<SemanticFact>,
+    /// W3: sub-threshold clusters (distinct-source < min_support) surfaced for
+    /// cross-window candidate staging instead of being discarded.
+    pub sub_threshold_candidates: Vec<PendingCandidate>,
 }
 
 /// Semantic consolidation engine
@@ -970,26 +999,28 @@ impl SemanticConsolidator {
                 .collect::<std::collections::HashSet<_>>()
                 .len();
 
-            if distinct_sources >= self.min_support {
-                let representative = Self::select_representative(&cluster.members);
-                let avg_confidence = cluster.members.iter().map(|(_, _, c)| c).sum::<f32>()
-                    / cluster.members.len() as f32;
+            // Computed for BOTH branches (promote and stage).
+            let representative = Self::select_representative(&cluster.members).to_string();
+            let avg_confidence = (cluster.members.iter().map(|(_, _, c)| c).sum::<f32>()
+                / cluster.members.len() as f32)
+                .min(1.0);
+            // De-duplicate source ids, preserving first-seen order.
+            let mut seen: std::collections::HashSet<&MemoryId> = std::collections::HashSet::new();
+            let source_ids: Vec<MemoryId> = cluster
+                .members
+                .iter()
+                .filter(|(_, id, _)| seen.insert(id))
+                .map(|(_, id, _)| id.clone())
+                .collect();
+            let entities = self.keyword_extractor.extract(&representative);
 
-                // De-duplicate source ids, preserving first-seen order.
-                let mut seen: std::collections::HashSet<&MemoryId> = std::collections::HashSet::new();
-                let source_ids: Vec<MemoryId> = cluster
-                    .members
-                    .iter()
-                    .filter(|(_, id, _)| seen.insert(id))
-                    .map(|(_, id, _)| id.clone())
-                    .collect();
-                let entities = self.keyword_extractor.extract(representative);
-                let fact_type = self.classify_fact(representative);
+            if distinct_sources >= self.min_support {
+                let fact_type = self.classify_fact(&representative);
 
                 let fact = SemanticFact {
                     id: uuid::Uuid::new_v4().to_string(),
-                    fact: representative.to_string(),
-                    confidence: avg_confidence.min(1.0),
+                    fact: representative,
+                    confidence: avg_confidence,
                     support_count: distinct_sources,
                     source_memories: source_ids,
                     related_entities: entities,
@@ -1007,6 +1038,19 @@ impl SemanticConsolidator {
                 result.new_fact_ids.push(fact.id.clone());
                 result.new_facts.push(fact);
                 result.facts_extracted += 1;
+            } else {
+                // W3: sub-threshold cluster — surface as a staging candidate
+                // instead of discarding. The caller accumulates these across
+                // windows in the persistent staging store; when accumulated
+                // distinct support reaches min_support the candidate promotes.
+                result.sub_threshold_candidates.push(PendingCandidate {
+                    signature: Self::cluster_signature(&cluster.stem_set),
+                    representative,
+                    source_memories: source_ids,
+                    related_entities: entities,
+                    avg_confidence,
+                    distinct_sources,
+                });
             }
         }
 
@@ -1094,6 +1138,63 @@ impl SemanticConsolidator {
             .max_by(|a, b| a.2.total_cmp(&b.2))
             .map(|(text, _, _)| text.as_str())
             .unwrap_or("")
+    }
+
+    /// Build a `SemanticFact` from an accumulated promotion candidate.
+    ///
+    /// W3: mirrors the immediate-promote fact construction in `consolidate`, but
+    /// sourced from the cross-window accumulated `representative` /
+    /// `source_memories` / `confidence` / support count. `created_at` /
+    /// `last_reinforced` / `valid_from` are stamped at promotion time (`now`).
+    pub fn fact_from_candidate(
+        &self,
+        representative: &str,
+        confidence: f32,
+        support_count: usize,
+        source_memories: Vec<MemoryId>,
+        related_entities: Vec<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> SemanticFact {
+        SemanticFact {
+            id: uuid::Uuid::new_v4().to_string(),
+            fact: representative.to_string(),
+            confidence: confidence.min(1.0),
+            support_count,
+            source_memories,
+            related_entities,
+            created_at: now,
+            last_reinforced: now,
+            fact_type: self.classify_fact(representative),
+            valid_from: Some(now),
+            valid_until: None,
+            superseded_by: None,
+            supersedes: Vec::new(),
+            purged_at: None,
+            purge_reason: None,
+        }
+    }
+
+    /// Compute a stable signature for a cluster's stemmed token set.
+    ///
+    /// W3: the signature is the identity of a recurring pattern across windows.
+    /// It is the sorted, deduplicated stem tokens joined with `\u{1f}`, then
+    /// FNV-1a hashed to a fixed-width hex string. Deterministic and
+    /// order-independent: the same set of stems always yields the same
+    /// signature, so a pattern seen once per window accumulates support against
+    /// a single staging row.
+    pub(crate) fn cluster_signature(stem_set: &HashSet<String>) -> String {
+        let mut tokens: Vec<&str> = stem_set.iter().map(|s| s.as_str()).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        let joined = tokens.join("\u{1f}");
+
+        // FNV-1a 64-bit — small, dependency-free, deterministic across runs.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in joined.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{hash:016x}")
     }
 
     // ── Multi-Extractor Pipeline ────────────────────────────────────────────
