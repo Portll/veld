@@ -1606,15 +1606,16 @@ impl super::MemorySystem {
             // AND an attribute synonym value. This ensures "Caroline is single" ranks
             // high for "What is Caroline's relationship status?".
             if !attribute_boost_ids.is_empty() {
-                const ATTRIBUTE_BOOST: f32 = 0.5; // Strong boost for attribute matches
+                // Multiplicative (matches shodh): scale the matching item's fused score by
+                // 1.5× rather than adding an absolute +0.5 that dwarfs RRF-scale scores
+                // (~0.05), which let a mid-ranked item leapfrog the top. Only boost items
+                // already in the fused set — inserting un-retrieved matches at an absolute
+                // floor was the prime additive distortion of top-rank ordering.
+                const ATTRIBUTE_BOOST_FACTOR: f32 = 1.5;
                 let mut boosted_count = 0;
                 for id in &attribute_boost_ids {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += ATTRIBUTE_BOOST;
-                        boosted_count += 1;
-                    } else {
-                        // Also add memories that weren't in the fusion but match attribute
-                        fused.insert(id.clone(), ATTRIBUTE_BOOST);
+                        *score *= ATTRIBUTE_BOOST_FACTOR;
                         boosted_count += 1;
                     }
                 }
@@ -1636,13 +1637,12 @@ impl super::MemorySystem {
             // memories by ~2 RRF positions without overriding strong semantic matches.
             if !temporal_fact_boost_ids.is_empty() {
                 let temporal_recall_boost = self.cognitive_dials.read().temporal_recall_boost.unwrap_or(crate::constants::TEMPORAL_RECALL_BOOST);
+                let temporal_boost_factor = 1.0 + temporal_recall_boost;
                 let mut boosted_count = 0;
                 for id in &temporal_fact_boost_ids {
+                    // Multiplicative (matches shodh), no insert — see Layer 4.5.
                     if let Some(score) = fused.get_mut(id) {
-                        *score += temporal_recall_boost;
-                        boosted_count += 1;
-                    } else {
-                        fused.insert(id.clone(), temporal_recall_boost);
+                        *score *= temporal_boost_factor;
                         boosted_count += 1;
                     }
                     // Signal attribution: mark temporal match
