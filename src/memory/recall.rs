@@ -2995,7 +2995,13 @@ impl super::MemorySystem {
             let d = self.cognitive_dials.read();
             (d.use_reranking, d.rerank_count)
         };
-        if memories.len() > 1 && layer53_use_reranking.unwrap_or(true) {
+        // Default OFF (validated 2026-06): the ONNX cross-encoder (mxbai-rerank-xsmall)
+        // is a `Mutex<Session>` serialized with 1 ORT thread on macOS, costing ~395ms ×
+        // ~20 candidates ≈ 7.9s/query — and it *lowered* quality: on the curated recall
+        // suite veld scored recall@10 0.95–0.97 with it OFF vs 0.91 with it ON (shodh,
+        // which has no ONNX cross-encoder, scores 0.98 @ 26ms). Re-enable per-tenant via
+        // the `use_reranking=Some(true)` dial.
+        if memories.len() > 1 && layer53_use_reranking.unwrap_or(false) {
             if let Some(reranker) = self.hybrid_search.reranker() {
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
