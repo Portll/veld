@@ -1,0 +1,166 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #262b36;
+  --text: #e6e9ef;
+  --muted: #8a93a6;
+  --accent: #5b9dff;
+  --ok: #3fb950;
+  --err: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.title {
+  font-weight: 600;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.dot.ok {
+  background: var(--ok);
+}
+
+.dot.err {
+  background: var(--err);
+}
+
+.rail {
+  display: flex;
+  gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rail button {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.rail button:hover {
+  color: var(--text);
+}
+
+.rail button.active {
+  color: var(--text);
+  background: var(--panel);
+  border-color: var(--border);
+}
+
+main {
+  padding: 16px;
+  overflow: auto;
+}
+
+.placeholder {
+  color: var(--muted);
+}
+
+.error {
+  color: var(--err);
+  white-space: pre-wrap;
+}
+
+/* ── Account → Org → Repo tree ── */
+.tree {
+  font-size: 12.5px;
+}
+.acct {
+  margin-bottom: 10px;
+}
+.node {
+  padding: 3px 0;
+}
+.acct-node {
+  font-weight: 600;
+}
+.org {
+  margin-left: 16px;
+}
+.org-node {
+  color: var(--muted);
+}
+.repo {
+  margin-left: 18px;
+}
+.repo-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tag {
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.badge {
+  font-size: 10px;
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.badge.internal {
+  color: #ffcf6b;
+  background: rgba(255, 207, 107, 0.1);
+}
+.badge.external {
+  color: #6bb5ff;
+  background: rgba(107, 181, 255, 0.1);
+}
+.mark {
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.hash {
+  margin-left: auto;
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+.muted {
+  color: var(--muted);
+  margin-top: 12px;
+}
