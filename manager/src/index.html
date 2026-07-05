@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Veld Manager</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <span class="title" id="app-title">Veld Manager</span>
+      <span class="status" id="status"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></span>
+    </header>
+    <nav class="rail" id="rail">
+      <button data-view="tree" class="active">Tree</button>
+      <button data-view="workspaces">Workspaces</button>
+      <button data-view="scope">Scope</button>
+      <button data-view="connections">Connections</button>
+      <button data-view="recall">Recall</button>
+    </nav>
+    <main id="content"><p class="placeholder">Loading…</p></main>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>

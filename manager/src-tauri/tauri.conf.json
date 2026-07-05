@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Veld Manager",
+  "version": "0.1.0",
+  "identifier": "net.portll.veld.manager",
+  "build": {
+    "beforeDevCommand": "cd ../src && npm run dev",
+    "devUrl": "http://localhost:1422",
+    "beforeBuildCommand": "cd ../src && npm run build",
+    "frontendDist": "../src/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Veld Manager",
+        "width": 900,
+        "height": 640,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "visible": true,
+        "center": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "shortDescription": "Veld Manager — workspaces, folders, repos, accounts, tenant scopes",
+    "longDescription": "Veld Manager is the desktop console that unifies GitHub accounts, repositories, worktrees, workspaces, and per-project Veld tenant scopes, and brokers per-project keys for the Veld memory system.",
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon-32.png", "icons/icon-128.png", "icons/icon.ico"],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}
