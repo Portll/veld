@@ -42,6 +42,7 @@ use crate::memory::{
     query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
     ProspectiveStore, SessionStore, TodoStore,
 };
+use crate::registry::RegistryStore;
 use crate::relevance::RelevanceEngine;
 use crate::storage::legacy_rocksdb::{RocksDbGraphStore, RocksDbPrimaryMemoryStore};
 use crate::storage::{AuditLogEntry, AuditStore, StorageCapabilities};
@@ -57,6 +58,7 @@ struct SharedStoreBootstrap {
     audit_store: Arc<dyn AuditStore>,
     prospective_store: Arc<ProspectiveStore>,
     todo_store: Arc<TodoStore>,
+    registry_store: Arc<RegistryStore>,
     context_block_store: Arc<crate::memory::ContextBlockStore>,
     file_store: Arc<FileMemoryStore>,
     feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
@@ -182,6 +184,9 @@ pub struct MultiUserMemoryManager {
 
     /// GTD-style todo store
     pub todo_store: Arc<TodoStore>,
+
+    /// Registry: account/org/workspace/project/folder graph
+    pub registry_store: Arc<RegistryStore>,
 
     /// Agent context block store (Letta-style mutable key-value blocks)
     pub context_block_store: Arc<crate::memory::ContextBlockStore>,
@@ -596,6 +601,7 @@ impl MultiUserMemoryManager {
             streaming_extractor,
             prospective_store: shared_stores.prospective_store,
             todo_store: shared_stores.todo_store,
+            registry_store: shared_stores.registry_store,
             context_block_store: shared_stores.context_block_store,
             file_store: shared_stores.file_store,
             feedback_store: shared_stores.feedback_store,
@@ -688,6 +694,8 @@ impl MultiUserMemoryManager {
 
                 let todo_store = Arc::new(TodoStore::new(shared_db.clone(), base_path)?);
 
+                let registry_store = Arc::new(RegistryStore::new(shared_db.clone()));
+
                 let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), base_path)?);
                 info!("File memory store initialized");
 
@@ -713,6 +721,7 @@ impl MultiUserMemoryManager {
                     audit_store,
                     prospective_store,
                     todo_store,
+                    registry_store,
                     context_block_store,
                     file_store,
                     feedback_store,
@@ -752,6 +761,7 @@ impl MultiUserMemoryManager {
             o
         })];
         cfs.extend(TodoStore::cf_descriptors());
+        cfs.extend(crate::registry::RegistryStore::cf_descriptors());
         cfs.extend(ProspectiveStore::column_family_descriptors());
         cfs.extend(FileMemoryStore::cf_descriptors());
         cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
@@ -2704,6 +2714,11 @@ impl MultiUserMemoryManager {
     /// Get the todo store
     pub fn todo_store(&self) -> &Arc<TodoStore> {
         &self.todo_store
+    }
+
+    /// Get the registry store
+    pub fn registry_store(&self) -> &Arc<RegistryStore> {
+        &self.registry_store
     }
 
     /// Get the prospective store
