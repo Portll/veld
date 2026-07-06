@@ -14,8 +14,8 @@ use super::state::MultiUserMemoryManager;
 use super::{
     ab_testing, admin, compression, consolidation, context_blocks, crud, datasets, dials, docs,
     external_dimensions, facts, files, gap_analysis, graph, health, ingest, integrations, lineage,
-    memory_ops, mif, prompt_gen, query, recall, remember, search, seed, sessions, sleep_time,
-    todos, user_auth,
+    memory_ops, mif, prompt_gen, query, recall, registry, remember, search, seed, sessions,
+    sleep_time, todos, user_auth,
     users, visualization, webhooks,
 };
 
@@ -683,6 +683,34 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/export/mif", post(mif::export_mif))
         .route("/api/import/mif", post(mif::import_mif))
         .route("/api/mif/adapters", get(mif::list_adapters))
+        // =================================================================
+        // REGISTRY ADMIN CRUD + ACL (account → org → workspace → project →
+        // folder graph). Each handler self-enforces veld's admin-key gate
+        // (X-Admin-API-Key vs VELD_ADMIN_API_KEY, constant-time) via
+        // registry::…/handlers::admin::check_admin_key. Mounted on the
+        // protected router so the regular API-key layer is an additional
+        // outer guard (defense in depth).
+        // =================================================================
+        .route("/api/admin/registry/accounts", post(registry::create_account))
+        .route("/api/admin/registry/accounts", get(registry::list_accounts))
+        .route("/api/admin/registry/orgs", post(registry::create_org))
+        .route("/api/admin/registry/orgs", get(registry::list_orgs))
+        .route("/api/admin/registry/workspaces", post(registry::create_workspace))
+        .route("/api/admin/registry/workspaces", get(registry::list_workspaces))
+        .route("/api/admin/registry/projects", post(registry::create_project))
+        .route("/api/admin/registry/projects", get(registry::list_projects))
+        .route("/api/admin/registry/folders", post(registry::create_folder))
+        .route("/api/admin/registry/folders", get(registry::list_folders))
+        .route(
+            "/api/admin/registry/links/ws-project",
+            post(registry::link_ws_project),
+        )
+        .route("/api/admin/registry/acl/grant", post(registry::acl_grant))
+        .route("/api/admin/registry/acl/revoke", post(registry::acl_revoke))
+        .route(
+            "/api/admin/registry/{kind}/{id}",
+            delete(registry::delete_entity),
+        )
         // =================================================================
         // STATE
         // =================================================================
