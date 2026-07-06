@@ -30,6 +30,61 @@ pub const ADMIN_API_KEY_HEADER: &str = "X-Admin-API-Key";
 /// `VELD_DEV_API_KEY` — admin actions are NOT authorized by regular API keys.
 pub const ADMIN_API_KEY_ENV: &str = "VELD_ADMIN_API_KEY";
 
+/// Shared admin-key gate for every admin surface (rate-limit reset, registry
+/// CRUD, …). Returns `Ok(())` when the caller presented the configured key, or
+/// `Err(response)` carrying the exact rejection to return verbatim:
+///
+/// - `VELD_ADMIN_API_KEY` unset/blank → 503 `{"error":"admin_key_not_configured"}`
+/// - `X-Admin-API-Key` header missing/empty/wrong → 401 `{"error":"unauthorized"}`
+///
+/// The comparison is constant-time: both the configured and provided keys are
+/// hashed to 32-byte SHA-256 digests and compared with `subtle::ConstantTimeEq`,
+/// which removes the timing-length oracle a naive `==` would leak.
+///
+/// The `Err` payload is a fully-formed `axum::response::Response` (the
+/// mandated shared-gate signature) so callers return it verbatim; that makes
+/// the `Result` `Err` variant large, which is intentional here.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_admin_key(headers: &HeaderMap) -> Result<(), Response> {
+    // 1) Configured?
+    let configured_key = match std::env::var(ADMIN_API_KEY_ENV) {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "admin_key_not_configured"})),
+            )
+                .into_response());
+        }
+    };
+
+    // 2) Header present?
+    let provided = match headers.get(ADMIN_API_KEY_HEADER).and_then(|v| v.to_str().ok()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            )
+                .into_response());
+        }
+    };
+
+    // 3) Fixed-buffer constant-time compare (see module docs for the rationale
+    //    behind hashing both sides before `ct_eq`).
+    let configured_hash: [u8; 32] = Sha256::digest(configured_key.as_bytes()).into();
+    let provided_hash: [u8; 32] = Sha256::digest(provided.as_bytes()).into();
+    if bool::from(configured_hash.ct_eq(&provided_hash)) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response())
+    }
+}
+
 /// `POST /api/admin/reset-rate-limit`
 ///
 /// Recovers from a stuck rate-limiter bucket by atomically swapping the
@@ -65,47 +120,11 @@ pub async fn reset_rate_limit(
             .into_response();
     };
 
-    // 1) Configured?
-    let configured_key = match std::env::var(ADMIN_API_KEY_ENV) {
-        Ok(k) if !k.trim().is_empty() => k,
-        _ => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "admin_key_not_configured"})),
-            )
-                .into_response();
-        }
-    };
-
-    // 2) Header present?
-    let provided = match headers.get(ADMIN_API_KEY_HEADER).and_then(|v| v.to_str().ok()) {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "unauthorized"})),
-            )
-                .into_response();
-        }
-    };
-
-    // 3) Fixed-buffer constant-time compare. Hash both keys to 32-byte
-    //    SHA-256 digests and `ct_eq` those. The earlier length-equal-then-
-    //    `ct_eq` dance still leaked whether a guessed key length matched
-    //    the configured length via the dummy compare's size; hashing
-    //    eliminates the timing-length oracle entirely. The only attack
-    //    surface that remains is brute-force on the configured key itself,
-    //    which `VELD_ADMIN_API_KEY` length / entropy controls.
-    let configured_hash: [u8; 32] = Sha256::digest(configured_key.as_bytes()).into();
-    let provided_hash: [u8; 32] = Sha256::digest(provided.as_bytes()).into();
-    let bytes_eq = bool::from(configured_hash.ct_eq(&provided_hash));
-
-    if !bytes_eq {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "unauthorized"})),
-        )
-            .into_response();
+    // 1–3) Configured? Header present? Constant-time key match? All three
+    //       checks (and their exact 503/401 responses) live in the shared
+    //       `check_admin_key` gate so every admin surface behaves identically.
+    if let Err(resp) = check_admin_key(&headers) {
+        return resp;
     }
 
     // 4) Authenticated — perform the reset and audit-log.
