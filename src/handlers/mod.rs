@@ -62,6 +62,11 @@ pub mod consolidation;
 // Admin operational endpoints (rate-limit reset, etc.)
 pub mod admin;
 
+// Registry admin CRUD + ACL + boundary-invariant endpoints (account → org →
+// workspace → project → folder graph). Admin-key gated, mounted on the
+// protected router.
+pub mod registry;
+
 // Context blocks (Letta-style mutable agent state)
 pub mod context_blocks;
 
