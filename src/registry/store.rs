@@ -20,7 +20,7 @@ pub const CF_ENTITIES: &str = "registry_entities";
 pub const CF_LINKS: &str = "registry_links";
 /// Secondary lookup indexes: `scope2proj:` / `remote2scope:` / `org_proj:` / `wsname:`.
 pub const CF_INDEX: &str = "registry_index";
-/// Principal (`key_hash`) → authorized scope grants: `grant:` / `scopegrant:`.
+/// Principal (tenant `user_id`) → authorized scope grants: `grant:` / `scopegrant:`.
 pub const CF_ACL: &str = "registry_acl";
 /// Schema version + counters.
 pub const CF_META: &str = "registry_meta";

@@ -98,10 +98,18 @@ pub struct Folder {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// An ACL grant: which `key_hash` may see which `scope`, with what role.
+/// An ACL grant: which `principal` may see which `scope`, with what role.
+///
+/// The `principal` is the tenant's authoritative veld `user_id` — the identity
+/// veld's auth layer resolves for a caller (see
+/// [`crate::handlers::utils::resolve_request_user_id`]). It is NOT a `key_hash`:
+/// veld never exposes an API-key hash to a handler, so keying grants by
+/// `key_hash` (as R3 originally did) could never be matched against a live
+/// caller. Grants are keyed by `user_id` throughout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grant {
-    pub key_hash: String,
+    /// The authorized tenant `user_id`.
+    pub principal: String,
     pub scope: String,
     pub role: String,
     pub granted_at: chrono::DateTime<chrono::Utc>,
