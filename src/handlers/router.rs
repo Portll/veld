@@ -712,6 +712,15 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             delete(registry::delete_entity),
         )
         // =================================================================
+        // REGISTRY TENANT READS (R4). NOT admin-gated: each handler resolves
+        // the caller's authoritative user_id via resolve_request_user_id and
+        // ACL-filters the result to that tenant's authorized_scopes. Protection
+        // is the tenant auth layer + ACL filter, so these deliberately do NOT
+        // self-gate with check_admin_key.
+        // =================================================================
+        .route("/api/registry/tree", post(registry::registry_tree))
+        .route("/api/registry/resolve", post(registry::registry_resolve))
+        // =================================================================
         // STATE
         // =================================================================
         .with_state(state)
