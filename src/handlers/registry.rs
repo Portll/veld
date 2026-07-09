@@ -47,12 +47,17 @@ use serde_json::json;
 
 use crate::auth::AuthenticatedUser;
 use crate::handlers::admin::check_admin_key;
+use crate::handlers::recall::recall;
 use crate::handlers::router::AppState;
+use crate::handlers::types::{
+    default_recall_limit, default_recall_mode, RecallMemory, RecallRequest,
+};
 use crate::handlers::utils::resolve_request_user_id;
 use crate::registry::{
     derive_scope, Account, Boundary, Folder, Grant, Org, Project, RegistryStore, Workspace, CF_ACL,
     CF_ENTITIES, CF_INDEX, CF_LINKS, REGISTRY_LOCK,
 };
+use futures::future::join_all;
 
 // ===========================================================================
 // Error plumbing
@@ -200,6 +205,33 @@ struct ResolveRequest {
     git_remote: String,
     #[serde(default)]
     user_id: Option<String>,
+}
+
+/// Body for the tenant `scoped_recall` endpoint. Recalls `query` across every
+/// project scope linked to `workspace_id` that the caller is ACL-authorized for
+/// AND that shares the workspace's boundary. `limit`/`mode` mirror the single
+/// `RecallRequest` fields (same defaults); `user_id` is only consulted when the
+/// API key is not tenant-bound (single-tenant / dev mode).
+#[derive(Debug, Deserialize)]
+struct ScopedRecallRequest {
+    workspace_id: String,
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+/// One recalled memory tagged with the project scope it came from. The inner
+/// [`RecallMemory`] is flattened so the wire shape is the ordinary recall memory
+/// plus a `source_scope` discriminator.
+#[derive(Serialize)]
+struct ScopedMemory {
+    source_scope: String,
+    #[serde(flatten)]
+    memory: RecallMemory,
 }
 
 // ===========================================================================
@@ -886,6 +918,70 @@ fn registry_resolve_logic(
 }
 
 // ===========================================================================
+// R5 — cross-scope recall resolution (ACL ∩ authorized, boundary-safe)
+// ===========================================================================
+
+/// Resolve the set of project scopes a `scoped_recall` over `workspace_id` may
+/// query on behalf of `caller_user_id`, and the set it defensively refuses to.
+///
+/// Returns `(scopes_to_query, dropped_cross_boundary)` where a linked project's
+/// scope is:
+/// - **queried** iff it is BOTH in [`authorized_scopes`]`(caller)` AND its
+///   leading boundary tag equals the workspace's own boundary tag;
+/// - **dropped** (into `dropped_cross_boundary`) iff it is authorized but its
+///   boundary tag differs from the workspace's — defense-in-depth so a bad
+///   cross-boundary `ws_proj` edge can never leak memories across the boundary,
+///   even though [`link_ws_project_logic`] (invariant I1) rejects such links at
+///   write time;
+/// - **excluded entirely** (in neither list) iff the caller is not authorized
+///   for it — the anti-leak allow-list is never widened by workspace membership.
+///
+/// An unknown `workspace_id` is `404 not_found`. Both returned vectors are
+/// sorted and de-duplicated.
+fn resolve_recall_scopes(
+    store: &RegistryStore,
+    workspace_id: &str,
+    caller_user_id: &str,
+) -> ApiResult<(Vec<String>, Vec<String>)> {
+    // The workspace must exist; its boundary is the ceiling for every scope.
+    let ws: Workspace = load_entity(store, CF_ENTITIES, &k_ws(workspace_id))?
+        .ok_or_else(ApiError::not_found)?;
+    let boundary_tag = ws.boundary.tag();
+
+    let authorized = authorized_scopes(store, caller_user_id);
+
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    let mut dropped: BTreeSet<String> = BTreeSet::new();
+
+    // Walk the workspace's linked projects via the `ws_proj:{ws}:{proj}` edges.
+    for (edge_key, _) in store.scan_prefix(CF_LINKS, &format!("ws_proj:{workspace_id}:")) {
+        let Some(proj_id) = edge_key.rsplit(':').next() else {
+            continue;
+        };
+        let Some(project) = load_entity::<Project>(store, CF_ENTITIES, &k_proj(proj_id))? else {
+            continue;
+        };
+        let scope = project.scope;
+
+        // ACL gate: the caller must be authorized for the scope. Workspace
+        // membership alone never grants read access.
+        if !authorized.contains(&scope) {
+            continue;
+        }
+
+        // Boundary gate: same-boundary scopes are queryable; cross-boundary
+        // ones are recorded as dropped and never queried.
+        if scope_tag(&scope) == boundary_tag {
+            kept.insert(scope);
+        } else {
+            dropped.insert(scope);
+        }
+    }
+
+    Ok((kept.into_iter().collect(), dropped.into_iter().collect()))
+}
+
+// ===========================================================================
 // HTTP handlers (admin-gated thin wrappers over the logic functions)
 // ===========================================================================
 
@@ -1153,6 +1249,105 @@ pub async fn registry_resolve(
         Ok(value) => ok_json(value),
         Err(e) => e.into_response(),
     }
+}
+
+/// `POST /api/registry/recall` — recall `query` across a workspace's project
+/// scopes, ACL-filtered and boundary-safe. Body
+/// `{ workspace_id, query, limit?, mode? }`. NOT admin-gated: the caller's
+/// authoritative `user_id` is resolved via [`resolve_request_user_id`] and the
+/// scope set is the ACL ∩ same-boundary intersection from
+/// [`resolve_recall_scopes`].
+///
+/// Fans the resolved scopes out to veld's existing [`recall`] handler
+/// concurrently, merges the successful results (each tagged with its
+/// `source_scope`), sorts by score descending and truncates to the effective
+/// limit. A per-scope recall error is reported in `failed_scopes` and never
+/// fails the whole request. Response:
+/// `{ results, scopes_queried, dropped_cross_boundary, failed_scopes, count }`.
+pub async fn scoped_recall(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    body: Bytes,
+) -> Response {
+    let req: ScopedRecallRequest = match parse_body(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let caller = match resolve_request_user_id(
+        req.user_id.as_deref(),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    ) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    let (scopes_queried, dropped_cross_boundary) =
+        match resolve_recall_scopes(state.registry_store(), &req.workspace_id, &caller) {
+            Ok(pair) => pair,
+            Err(e) => return e.into_response(),
+        };
+
+    // Effective per-scope limit AND final truncation bound (recall defaults).
+    let limit = req.limit.unwrap_or_else(default_recall_limit);
+    let mode = req.mode.clone().unwrap_or_else(default_recall_mode);
+
+    // No authorized same-boundary scope → nothing to recall. Still surface the
+    // dropped set so the caller can see a bad cross-boundary link was refused.
+    if scopes_queried.is_empty() {
+        return ok_json(json!({
+            "results": Vec::<ScopedMemory>::new(),
+            "scopes_queried": Vec::<String>::new(),
+            "dropped_cross_boundary": dropped_cross_boundary,
+            "failed_scopes": Vec::<String>::new(),
+            "count": 0,
+        }));
+    }
+
+    // Fan out to the EXISTING recall handler per scope, concurrently. Each
+    // RecallRequest sets user_id = scope so recall reads that scope's memories.
+    let recalls = scopes_queried.iter().map(|scope| {
+        let request = RecallRequest {
+            user_id: scope.clone(),
+            query: req.query.clone(),
+            limit,
+            mode: mode.clone(),
+            rrf_k: None,
+            rerank_count: None,
+            competition_mode: None,
+            as_of: None,
+        };
+        recall(State(state.clone()), Json(request))
+    });
+    let outcomes = join_all(recalls).await;
+
+    // Merge: successful scopes contribute their memories (source-tagged); a
+    // failing scope is reported in failed_scopes, never silently dropped.
+    let mut merged: Vec<ScopedMemory> = Vec::new();
+    let mut failed_scopes: Vec<String> = Vec::new();
+    for (scope, outcome) in scopes_queried.iter().zip(outcomes.into_iter()) {
+        match outcome {
+            Ok(Json(response)) => {
+                for memory in response.memories {
+                    merged.push(ScopedMemory { source_scope: scope.clone(), memory });
+                }
+            }
+            Err(_) => failed_scopes.push(scope.clone()),
+        }
+    }
+
+    // Global rank across scopes by score, then truncate to the effective limit.
+    merged.sort_by(|a, b| b.memory.score.total_cmp(&a.memory.score));
+    merged.truncate(limit);
+    let count = merged.len();
+
+    ok_json(json!({
+        "results": merged,
+        "scopes_queried": scopes_queried,
+        "dropped_cross_boundary": dropped_cross_boundary,
+        "failed_scopes": failed_scopes,
+        "count": count,
+    }))
 }
 
 // ===========================================================================
@@ -1569,5 +1764,83 @@ mod tests {
         let (store, _dir) = temp_store();
         let err = create_account_logic(&store, "   ").unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── R5: resolve_recall_scopes = ACL ∩ authorized, boundary-safe ──
+
+    #[test]
+    fn resolve_recall_scopes_enforces_acl_and_boundary() {
+        let (store, _dir) = temp_store();
+
+        // External workspace with a same-boundary project the caller is granted.
+        let (ext_org, ws, ext_proj) = seed_external(&store);
+        link_ws_project_logic(&store, &ws.id, &ext_proj.id).unwrap();
+
+        // A second external project linked to the workspace but NOT granted to
+        // the caller → must be excluded from BOTH lists.
+        let ungranted = create_project_logic(&store, &ext_org.id, "fond-blanc").unwrap();
+        link_ws_project_logic(&store, &ws.id, &ungranted.id).unwrap();
+
+        // An INTERNAL project manually linked to the EXTERNAL workspace, bypassing
+        // the I1 link-time guard to model a bad cross-boundary edge on disk.
+        let acct = create_account_logic(&store, "portll-owner").unwrap();
+        let int_org = create_org_logic(&store, &acct.id, "Portll").unwrap();
+        let int_proj = create_project_logic(&store, &int_org.id, "veld").unwrap();
+        assert_eq!(int_proj.boundary, Boundary::Internal);
+        store
+            .write_batch(
+                &[
+                    (
+                        CF_LINKS,
+                        k_ws_proj(&ws.id, &int_proj.id),
+                        int_proj.id.clone().into_bytes(),
+                    ),
+                    (
+                        CF_LINKS,
+                        k_proj_ws(&int_proj.id, &ws.id),
+                        ws.id.clone().into_bytes(),
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        // Authorize the caller for the ext project AND the int project. Grants
+        // are written directly to bypass the I6 mixed-boundary guard, modelling a
+        // corrupt ACL state the boundary drop must still defend against.
+        let caller = "ext.acme.client";
+        for scope in [&ext_proj.scope, &int_proj.scope] {
+            let grant = Grant {
+                principal: caller.to_string(),
+                scope: scope.clone(),
+                role: "reader".to_string(),
+                granted_at: now(),
+            };
+            let value = to_bytes(&grant).unwrap();
+            store
+                .write_batch(
+                    &[
+                        (CF_ACL, k_grant(caller, scope), value.clone()),
+                        (CF_ACL, k_scopegrant(scope, caller), value),
+                    ],
+                    &[],
+                )
+                .unwrap();
+        }
+
+        let (scopes, dropped) = resolve_recall_scopes(&store, &ws.id, caller).unwrap();
+
+        // ext project: authorized + same boundary → queried.
+        assert_eq!(scopes, vec![ext_proj.scope.clone()]);
+        // ungranted project: linked but not ACL-authorized → excluded entirely.
+        assert!(!scopes.contains(&ungranted.scope));
+        assert!(!dropped.contains(&ungranted.scope));
+        // int project: authorized but cross-boundary → dropped, never queried.
+        assert_eq!(dropped, vec![int_proj.scope.clone()]);
+        assert!(!scopes.contains(&int_proj.scope));
+
+        // Unknown workspace → not_found.
+        let err = resolve_recall_scopes(&store, "no-such-ws", caller).unwrap_err();
+        assert_eq!(err.code, "not_found");
     }
 }

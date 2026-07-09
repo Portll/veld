@@ -720,6 +720,7 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         // =================================================================
         .route("/api/registry/tree", post(registry::registry_tree))
         .route("/api/registry/resolve", post(registry::registry_resolve))
+        .route("/api/registry/recall", post(registry::scoped_recall))
         // =================================================================
         // STATE
         // =================================================================
