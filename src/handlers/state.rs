@@ -1108,21 +1108,22 @@ impl MultiUserMemoryManager {
                         break;
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("lock") || err_str.contains("LOCK") {
-                            let delay = std::time::Duration::from_millis(50 * 2u64.pow(attempt));
-                            tracing::warn!(
-                                "RocksDB lock contention for user '{}' (attempt {}/4), retrying in {:?}",
-                                user_id, attempt + 1, delay
-                            );
-                            std::thread::sleep(delay);
-                            last_err = Some(e);
-                        } else {
-                            // Non-lock error, fail immediately
-                            return Err(e).with_context(|| {
-                                format!("Failed to initialize UserMemory for user '{user_id}'")
-                            });
-                        }
+                        // Retry EVERY error, not just ones whose Display
+                        // mentions "lock". The observed post-eviction 500s
+                        // (2026-07-31..08-03, always the tenant being lazily
+                        // idle-evicted by its own request) failed immediately
+                        // through the old non-lock branch — the transient
+                        // races here are not limited to the RocksDB LOCK
+                        // file, and a genuinely-broken tenant only pays
+                        // ~750ms extra before the same error surfaces.
+                        let delay = std::time::Duration::from_millis(50 * 2u64.pow(attempt));
+                        tracing::warn!(
+                            error = format!("{:#}", e),
+                            "UserMemory open failed for user '{}' (attempt {}/4), retrying in {:?} (post-eviction races are expected to clear)",
+                            user_id, attempt + 1, delay
+                        );
+                        std::thread::sleep(delay);
+                        last_err = Some(e);
                     }
                 }
             }
@@ -1131,7 +1132,7 @@ impl MultiUserMemoryManager {
                 None => {
                     return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
                         format!(
-                            "Failed to initialize UserMemory for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
+                            "Failed to initialize UserMemory for user '{}' after 4 attempts",
                             user_id
                         )
                     });
@@ -1624,20 +1625,18 @@ impl MultiUserMemoryManager {
                         break;
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("lock") || err_str.contains("LOCK") {
-                            let delay = std::time::Duration::from_millis(50 * 2u64.pow(attempt));
-                            tracing::warn!(
-                                "RocksDB lock contention on graph for user '{}' (attempt {}/4), retrying in {:?}",
-                                user_id, attempt + 1, delay
-                            );
-                            std::thread::sleep(delay);
-                            last_err = Some(e);
-                        } else {
-                            return Err(e).with_context(|| {
-                                format!("Failed to initialize graph memory for user '{user_id}'")
-                            });
-                        }
+                        // Retry every error — same reasoning as the
+                        // UserMemory open loop above: the post-eviction
+                        // races that produced the 2026-07/08 500s bypassed
+                        // the old "lock"-string gate.
+                        let delay = std::time::Duration::from_millis(50 * 2u64.pow(attempt));
+                        tracing::warn!(
+                            error = format!("{:#}", e),
+                            "graph memory open failed for user '{}' (attempt {}/4), retrying in {:?}",
+                            user_id, attempt + 1, delay
+                        );
+                        std::thread::sleep(delay);
+                        last_err = Some(e);
                     }
                 }
             }
@@ -1646,7 +1645,7 @@ impl MultiUserMemoryManager {
                 None => {
                     return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all retry attempts failed"))).with_context(|| {
                         format!(
-                            "Failed to initialize graph memory for user '{}' after 4 attempts (RocksDB lock contention)",
+                            "Failed to initialize graph memory for user '{}' after 4 attempts",
                             user_id
                         )
                     });
@@ -2189,10 +2188,16 @@ impl MultiUserMemoryManager {
     /// scan the log, find store records the log never recorded, and
     /// backfill a `Remember` frame for each.
     ///
-    /// Direction is store→log only: the canonical RocksDB store is the
-    /// source of truth; this never deletes from the store based on the
-    /// log. Returns the number of frames backfilled. Non-fatal — the
-    /// caller logs and continues on error.
+    /// The store is canonical in BOTH directions — this never mutates the
+    /// store, only the log:
+    /// - store-ahead-of-log (crashed before a `Remember`/`Update` frame
+    ///   landed): backfill a `Remember` frame from the store snapshot.
+    /// - log-ahead-of-store (crashed after a RocksDB delete but before its
+    ///   `Forget` frame landed): backfill a `Forget` frame. Without this,
+    ///   any replay — including restore-from-backup — resurrects the
+    ///   deleted memory into every projection.
+    /// Returns the number of frames backfilled. Non-fatal — the caller
+    /// logs and continues on error.
     fn reconcile_store_with_intent_log(
         &self,
         user_id: &str,
@@ -2214,8 +2219,11 @@ impl MultiUserMemoryManager {
             guard.all_memory_ids()?
         };
 
+        let store_id_strings: std::collections::HashSet<String> =
+            store_ids.iter().map(|id| id.0.to_string()).collect();
+
         let mut backfilled = 0usize;
-        for id in store_ids {
+        for id in &store_ids {
             let id_str = id.0.to_string();
             if covered.contains(&id_str) {
                 continue;
@@ -2224,7 +2232,7 @@ impl MultiUserMemoryManager {
             // `Remember` frame so the log is a complete record of the store.
             let snapshot = {
                 let guard = user_mem.read();
-                match guard.get_memory(&id) {
+                match guard.get_memory(id) {
                     Ok(mem) => {
                         match bincode::serde::encode_to_vec(&mem, bincode::config::standard()) {
                             Ok(bytes) => Some(bytes),
@@ -2268,14 +2276,41 @@ impl MultiUserMemoryManager {
                 backfilled += 1;
             }
         }
-        if backfilled > 0 {
+        // log-ahead-of-store: the log says live, the store has no such
+        // memory — a crash landed between the RocksDB delete and its
+        // `Forget` frame. Backfill the `Forget` so replay (including
+        // restore-from-backup) cannot resurrect it into projections.
+        let mut forget_backfilled = 0usize;
+        for id_str in &covered {
+            if store_id_strings.contains(id_str) {
+                continue;
+            }
+            let payload = crate::intent_log::IntentPayload::Forget {
+                user_id: user_id.to_string(),
+                memory_id: id_str.clone(),
+                schema_version: Some(crate::intent_log::payload::CURRENT_PAYLOAD_SCHEMA_VERSION),
+            };
+            if let Err(e) = self.journal_and_apply(user_id, &payload) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    memory_id = %id_str,
+                    error = %e,
+                    "C2 reconcile: Forget backfill journal_and_apply failed",
+                );
+            } else {
+                forget_backfilled += 1;
+            }
+        }
+
+        if backfilled > 0 || forget_backfilled > 0 {
             tracing::warn!(
                 user_id = %user_id,
                 backfilled,
-                "C2 store↔log reconcile backfilled store-ahead-of-log memories into the intent log",
+                forget_backfilled,
+                "C2 store↔log reconcile backfilled the intent log (Remember frames for store-ahead, Forget frames for log-ahead)",
             );
         }
-        Ok(backfilled)
+        Ok(backfilled + forget_backfilled)
     }
 
     /// Get graph statistics for a user
@@ -2861,18 +2896,58 @@ impl MultiUserMemoryManager {
         vec![("shared".to_string(), std::sync::Arc::clone(&self.shared_db))]
     }
 
-    /// Default location of the W5 intent log directory for this server
-    /// instance: `<base_path>/intent_log/`. The path is conventional —
-    /// callers that need a different layout can call the lower-level
-    /// `VeldBackupEngine` methods directly.
-    fn intent_log_default_dir(&self) -> std::path::PathBuf {
-        self.base_path.join("intent_log")
+    /// Directory holding `user_id`'s W5 intent log: the journal lives at
+    /// `{base_path}/{user_id}/intent.log` next to the tenant's stores
+    /// (see `get_user_journaled_writer`). The old `<base_path>/intent_log/`
+    /// convention predates the per-user layout — backups pointed at it
+    /// captured nothing (`intent_log_files: []` on every archive).
+    fn intent_log_user_dir(&self, user_id: &str) -> std::path::PathBuf {
+        self.base_path.join(user_id)
     }
 
     pub fn create_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
-                let memory_sys = self.get_user_memory(user_id)?;
+                // Always attempt to include the intent log; the backup
+                // engine no-ops cleanly when the dir doesn't exist (W5
+                // not yet active for this install).
+                let intent_log_spec =
+                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id));
+
+                // Stage the journal under the tenant's writer mutex so the
+                // cut is clean (no mid-frame copy, exact cut LSN), and
+                // BEFORE the primary checkpoint so the snapshot is a
+                // superset of the journal — the direction C2 reconcile can
+                // heal on restore. This runs before any user-memory or
+                // graph lock is taken (get_user_journaled_writer may touch
+                // user memory on first open, and holding the writer mutex
+                // here only blocks journal appends for the duration of a
+                // file copy). If the writer can't be opened, fall back to
+                // an unquiesced copy rather than failing the backup.
+                let staged = match self.get_user_journaled_writer(user_id) {
+                    Ok(writer) => {
+                        let _writer_guard = writer.lock();
+                        Some(self.backup_engine.stage_intent_log(&intent_log_spec, user_id)?)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            error = %e,
+                            "backup: journaled writer unavailable; staging intent log without quiesce",
+                        );
+                        Some(self.backup_engine.stage_intent_log(&intent_log_spec, user_id)?)
+                    }
+                };
+
+                let memory_sys = match self.get_user_memory(user_id) {
+                    Ok(memory_sys) => memory_sys,
+                    Err(e) => {
+                        if let Some(staged) = &staged {
+                            let _ = std::fs::remove_dir_all(&staged.staging_dir);
+                        }
+                        return Err(e);
+                    }
+                };
                 let memory_guard = memory_sys.read();
                 let db = memory_guard.get_db();
 
@@ -2886,19 +2961,12 @@ impl MultiUserMemoryManager {
                 let graph_guard = graph_lock.as_ref().map(|graph| graph.read());
                 let graph_db_ref = graph_guard.as_ref().map(|graph| graph.get_db());
 
-                // Always attempt to include the intent log; the backup
-                // engine no-ops cleanly when the dir doesn't exist (W5
-                // not yet active for this install).
-                let intent_log_dir = self.intent_log_default_dir();
-                let intent_log_spec =
-                    crate::backup::IntentLogBackupSpec::with_default_log_name(intent_log_dir);
-
-                self.backup_engine.create_comprehensive_backup_with_intent_log(
+                self.backup_engine.create_comprehensive_backup_with_staged_intent_log(
                     &db,
                     user_id,
                     &store_refs,
                     graph_db_ref,
-                    Some(&intent_log_spec),
+                    staged,
                 )
             }
             StorageBackend::Redb => Err(anyhow::anyhow!(
@@ -2961,13 +3029,12 @@ impl MultiUserMemoryManager {
             StorageBackend::RocksDb => {
                 let memory_db_path = self.base_path.join(user_id).join("storage");
                 let graph_path = self.base_path.join(user_id).join("graph").join("graph");
-                let intent_log_dir = self.intent_log_default_dir();
 
                 self.evict_user(user_id);
 
                 let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
                 let intent_log_spec =
-                    crate::backup::IntentLogBackupSpec::with_default_log_name(intent_log_dir);
+                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id));
                 let restore_opts = crate::backup::RestoreOptions { max_lsn };
                 let restored_stores = self
                     .backup_engine

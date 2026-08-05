@@ -1,0 +1,10 @@
+# Probe evidence — /api/backup/create portll — 2026-08-05 18:20 local
+# Claim: 500 for portll consistently; reads fine. Result: NOT REPRODUCED.
+== backup/create user_id=portll ==
+{"success":true,"backup":{"backup_id":5,"created_at":"2026-08-05T10:50:10.268741Z","user_id":"portll","backup_type":"Incremental","size_bytes":9491401,"checksum":"c330431a0b0a35796273ae7884b8be63f4f27bdb810c0a930ee815b74098acbd","memory_count":1305,"sequence_number":72050,"secondary_stores":["shared","graph"],"secondary_size_bytes":142308,"intent_log_files":[],"column_families":["default","memory_index"]},"message":"Backup created successfully"}
+HTTP 200
+== backup/create user_id=sleight ==
+{"success":true,"backup":{"backup_id":3,"created_at":"2026-08-05T10:50:10.419374Z","user_id":"sleight","backup_type":"Incremental","size_bytes":761175,"checksum":"9240ade8a77cfc62a54c75af9a639691557fa07d5e70969f11e10a95fc1c1b42","memory_count":3283,"sequence_number":695755,"secondary_stores":["shared","graph"],"secondary_size_bytes":143904,"intent_log_files":[],"column_families":["default","memory_index"]},"message":"Backup created successfully"}
+HTTP 200
+== control read: backup/list portll ==
+{"success":true,"backups":[{"backup_id":1,"created_at":"2026-08-05T08:47:16.924988Z","user_id":"portll","backup_type":"Full","size_bytes":9345873,"checksum":"9530ef9a0d097b32aa066294f39bd73738987c17f2b00bf5c4f4c4844ae55a83","memory_count":1279,"sequence_number":70957,"secondary_stores":["shared","graph"],"secondary_size_bytes":140987,"intent_log_files":[],"column_families":["default","memory_index"]},{"backup_id":2,"created_at":"2026-08-05T10:43:26.932696Z","user_id":"portll","backup_type":"Incremental","size_bytes":9491401,"checksum":"9ebe5f43c111b8ce106a62d3a209df8f5e9bd45960c5b822f00c851889
