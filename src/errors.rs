@@ -231,7 +231,11 @@ impl AppError {
             }
             Self::ServiceUnavailable(msg) => format!("Service unavailable: {msg}"),
             Self::Internal(err) => {
-                tracing::error!(error = %err, "Internal error");
+                // `{:#}` prints the whole anyhow context chain; `%err` alone
+                // prints only the outermost context, which is how the
+                // 2026-07/08 tenant-reopen 500s stayed undiagnosable — every
+                // incident logged the context string and swallowed the cause.
+                tracing::error!(error = format!("{:#}", err), "Internal error");
                 "Internal server error".to_string()
             }
         }
