@@ -599,10 +599,13 @@ pub async fn remember(
     // RocksDB is the source of truth and has already been written above.
     // The journal is a *derived* record so the SQLite slow store (and
     // future projections — Vamana, BM25, Postgres) can stay in sync via
-    // replay. This call runs synchronously because the journal-then-apply
-    // primitive is fast (~ one fsync + one SQLite upsert) and because we
-    // need the LSN ordering to be deterministic with respect to the
-    // RocksDB write.
+    // replay. The spawn_blocking is AWAITED before responding — a
+    // detached task left a crash window as wide as the task queue (memory
+    // durable in RocksDB, no journal frame until C2 reconcile on next
+    // open) and made LSN order nondeterministic with respect to request
+    // completion. The journal-then-apply primitive is fast (~ one fsync +
+    // projection applies; embeddings are not present yet, so the vector
+    // applies are no-ops at this point).
     //
     // Per-projection apply errors are swallowed inside `journal_and_apply`
     // — the intent log frame is durable regardless, so a future restart's
@@ -615,7 +618,7 @@ pub async fn remember(
         let user_id = req.user_id.clone();
         let memory_for_journal = memory.clone();
         let mid = memory_id.clone();
-        tokio::task::spawn_blocking(move || {
+        let journal_join = tokio::task::spawn_blocking(move || {
             let bincode = {
                 let guard = memory_for_journal.read();
                 match guard.get_memory(&mid) {
@@ -660,6 +663,12 @@ pub async fn remember(
                 );
             }
         });
+        if let Err(e) = journal_join.await {
+            tracing::warn!(
+                error = %e,
+                "intent-log journal task panicked (RocksDB write already durable; C2 reconcile will backfill)",
+            );
+        }
     }
 
     // Record metrics + session + broadcast BEFORE returning response (fast, <1ms)
@@ -1699,7 +1708,7 @@ pub async fn upsert_memory(
         let memory_system_for_journal = memory_system.clone();
         let mid = memory_id.clone();
         let is_update = was_update;
-        tokio::task::spawn_blocking(move || {
+        let journal_join = tokio::task::spawn_blocking(move || {
             let bincode = {
                 let guard = memory_system_for_journal.read();
                 match guard.get_memory(&mid) {
@@ -1755,6 +1764,15 @@ pub async fn upsert_memory(
                 );
             }
         });
+        // Awaited before responding — see the matching comment in
+        // `remember`: a detached journal task leaves a store-ahead-of-log
+        // crash window and nondeterministic LSN order.
+        if let Err(e) = journal_join.await {
+            tracing::warn!(
+                error = %e,
+                "intent-log journal task (upsert) panicked (RocksDB write already durable; C2 reconcile will backfill)",
+            );
+        }
     }
 
     // Build episodic graph for multi-hop retrieval

@@ -84,6 +84,16 @@ pub struct BackupMetadata {
     /// found in the configured `intent_log/` source directory.
     #[serde(default)]
     pub intent_log_files: Vec<IntentLogFileMeta>,
+    /// Highest LSN in the main journal at the moment the intent log was
+    /// captured — the backup's consistency cut. The journal is captured
+    /// *before* the primary DB is checkpointed, and every primary write
+    /// precedes its journal frame, so the primary snapshot always
+    /// contains at least everything up to this LSN; anything the primary
+    /// holds beyond it is re-journalled by the C2 reconcile on first
+    /// access after restore. `None` for backups taken before this field
+    /// existed, or when no journal file was present.
+    #[serde(default)]
+    pub journal_cut_lsn: Option<u64>,
     /// Column families that the main memories DB actually contained at
     /// backup time. `cf_user_auth` appears here when Phase C has been
     /// initialised; otherwise it is omitted. Older backups written before
@@ -129,16 +139,40 @@ pub struct IntentLogBackupSpec {
     /// file to verify-CRC on restore. Other files in `source_dir` are
     /// copied without CRC scanning.
     pub log_filename: String,
+    /// When `Some`, only files with these exact names are copied from
+    /// `source_dir`; when `None`, every plain file in the directory is
+    /// copied. The per-user layout keeps the journal next to unrelated
+    /// tenant files (RocksDB dirs, projections), so per-user specs
+    /// enumerate exactly what belongs in the archive.
+    pub only_files: Option<Vec<String>>,
 }
 
 impl IntentLogBackupSpec {
     /// Build a spec from `source_dir` with the conventional log filename
-    /// (`intent.log`). For tests and call sites that want full control,
-    /// construct the struct directly.
+    /// (`intent.log`), copying every plain file in the directory. For
+    /// tests and call sites that want full control, construct the struct
+    /// directly.
     pub fn with_default_log_name(source_dir: PathBuf) -> Self {
         Self {
             source_dir,
             log_filename: "intent.log".to_string(),
+            only_files: None,
+        }
+    }
+
+    /// Spec for the per-user W5 layout: `{base}/{user_id}/intent.log` +
+    /// `projection_checkpoints.bin` live alongside the tenant's stores.
+    /// Copies exactly those two files (when present) and nothing else —
+    /// projections (SQLite slow store, Vamana, BM25) are rebuildable by
+    /// replay and deliberately excluded.
+    pub fn per_user(user_dir: PathBuf) -> Self {
+        Self {
+            source_dir: user_dir,
+            log_filename: "intent.log".to_string(),
+            only_files: Some(vec![
+                "intent.log".to_string(),
+                "projection_checkpoints.bin".to_string(),
+            ]),
         }
     }
 }
@@ -156,6 +190,22 @@ pub struct RestoreOptions {
 pub struct SecondaryStoreRef<'a> {
     pub name: &'a str,
     pub db: &'a Arc<DB>,
+}
+
+/// An intent-log tree copied into a staging directory ahead of the
+/// primary checkpoint, plus what was learned while copying it. Produced
+/// by [`VeldBackupEngine::stage_intent_log`], consumed by
+/// [`VeldBackupEngine::create_comprehensive_backup_with_staged_intent_log`],
+/// which renames the tree into its final `intent_log_<backup_id>/` home.
+#[derive(Debug)]
+pub struct StagedIntentLog {
+    /// Temporary directory holding the copied files.
+    pub staging_dir: PathBuf,
+    /// Per-file metadata (hashes, sizes, journal LSN range).
+    pub files: Vec<IntentLogFileMeta>,
+    /// Highest LSN in the main journal at copy time — the consistency cut.
+    /// `None` when the source dir had no journal file (W5 inactive).
+    pub journal_cut_lsn: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -247,6 +297,7 @@ impl VeldBackupEngine {
             secondary_stores: Vec::new(),
             secondary_size_bytes: 0,
             intent_log_files: Vec::new(),
+            journal_cut_lsn: None,
             column_families,
         };
 
@@ -397,17 +448,108 @@ impl VeldBackupEngine {
         graph_db: Option<&DB>,
         intent_log_spec: Option<&IntentLogBackupSpec>,
     ) -> Result<BackupMetadata> {
-        let mut metadata =
-            self.create_comprehensive_backup_with_graph(db, user_id, secondary_stores, graph_db)?;
+        let staged = intent_log_spec
+            .map(|spec| self.stage_intent_log(spec, user_id))
+            .transpose()?;
+        self.create_comprehensive_backup_with_staged_intent_log(
+            db,
+            user_id,
+            secondary_stores,
+            graph_db,
+            staged,
+        )
+    }
 
-        if let Some(spec) = intent_log_spec {
+    /// Copy the intent-log directory into a staging area under the user's
+    /// backup dir, ahead of the primary checkpoint. Callers that can
+    /// quiesce the journal (hold the tenant's `JournaledWriter` mutex)
+    /// should do so around this call — the copy is the backup's
+    /// consistency cut, and staging is deliberately the *cheap* step so
+    /// the lock is held for a file copy, not a DB checkpoint.
+    pub fn stage_intent_log(
+        &self,
+        spec: &IntentLogBackupSpec,
+        user_id: &str,
+    ) -> Result<StagedIntentLog> {
+        let backup_dir = self.backup_path.join(user_id);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let staging_dir =
+            backup_dir.join(format!("intent_log_staging_{}_{}", std::process::id(), stamp));
+        fs::create_dir_all(&staging_dir)?;
+
+        let files = match self.copy_intent_log_into_archive(spec, &staging_dir) {
+            Ok(files) => files,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&staging_dir);
+                return Err(e);
+            }
+        };
+        let journal_cut_lsn = files
+            .iter()
+            .find(|f| f.name == spec.log_filename)
+            .and_then(|f| f.lsn_range)
+            .map(|(_, hi)| hi);
+
+        Ok(StagedIntentLog {
+            staging_dir,
+            files,
+            journal_cut_lsn,
+        })
+    }
+
+    /// Comprehensive backup around an intent log that was already staged
+    /// via [`stage_intent_log`]. The staged tree is renamed into place as
+    /// `<backup_dir>/intent_log_<backup_id>/` once the backup id is known.
+    ///
+    /// Capture order matters: the journal is staged BEFORE the primary DB
+    /// is checkpointed. Every primary write precedes its journal frame, so
+    /// this order guarantees the primary snapshot is a superset of the
+    /// staged journal — the direction the C2 reconcile can heal. The old
+    /// order (journal copied after the checkpoint) allowed frames for
+    /// memories the primary snapshot never saw, which replay would
+    /// resurrect into projections.
+    pub fn create_comprehensive_backup_with_staged_intent_log(
+        &self,
+        db: &DB,
+        user_id: &str,
+        secondary_stores: &[SecondaryStoreRef<'_>],
+        graph_db: Option<&DB>,
+        staged: Option<StagedIntentLog>,
+    ) -> Result<BackupMetadata> {
+        let mut metadata = match self.create_comprehensive_backup_with_graph(
+            db,
+            user_id,
+            secondary_stores,
+            graph_db,
+        ) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                if let Some(staged) = &staged {
+                    let _ = fs::remove_dir_all(&staged.staging_dir);
+                }
+                return Err(e);
+            }
+        };
+
+        if let Some(staged) = staged {
             let backup_dir = self.backup_path.join(user_id);
             let intent_log_dir =
                 backup_dir.join(format!("intent_log_{}", metadata.backup_id));
-            fs::create_dir_all(&intent_log_dir)?;
+            if intent_log_dir.exists() {
+                fs::remove_dir_all(&intent_log_dir)?;
+            }
+            fs::rename(&staged.staging_dir, &intent_log_dir).with_context(|| {
+                format!(
+                    "failed to move staged intent log {:?} into {:?}",
+                    staged.staging_dir, intent_log_dir
+                )
+            })?;
 
-            metadata.intent_log_files =
-                self.copy_intent_log_into_archive(spec, &intent_log_dir)?;
+            metadata.intent_log_files = staged.files;
+            metadata.journal_cut_lsn = staged.journal_cut_lsn;
 
             // Recompute checksum now that the intent-log tree is in place.
             metadata.checksum =
@@ -418,7 +560,8 @@ impl VeldBackupEngine {
                 backup_id = metadata.backup_id,
                 user_id = user_id,
                 files = metadata.intent_log_files.len(),
-                "Intent log copied into backup archive"
+                journal_cut_lsn = metadata.journal_cut_lsn,
+                "Intent log captured in backup archive (staged pre-checkpoint)"
             );
         }
 
@@ -457,6 +600,11 @@ impl VeldBackupEngine {
                 continue;
             }
             let file_name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(only) = &spec.only_files {
+                if !only.iter().any(|n| n == &file_name) {
+                    continue;
+                }
+            }
             let dst = target_dir.join(&file_name);
 
             // Stream-copy + hash + size so a huge log doesn't load fully
@@ -1225,6 +1373,7 @@ mod tests {
                 size_bytes: 512,
                 lsn_range: Some((0, 9)),
             }],
+            journal_cut_lsn: Some(9),
             column_families: vec![
                 "default".to_string(),
                 "memory_index".to_string(),
@@ -1586,6 +1735,72 @@ mod tests {
         let cf = restored_db.cf_handle(CF_USER_AUTH).unwrap();
         let val = restored_db.get_cf(cf, b"user-row-key").unwrap();
         assert_eq!(val.unwrap(), b"argon2id-hash-bytes");
+    }
+
+    #[test]
+    fn staged_intent_log_records_cut_lsn_and_filters_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_root = temp_dir.path().join("backups");
+        let db_path = temp_dir.path().join("db");
+        let user_dir = temp_dir.path().join("tenant");
+        let user_id = "staged";
+
+        // Journal with 3 frames, plus the per-user checkpoint store, plus
+        // a tenant file that must NOT be captured by the per_user spec.
+        let (_, lsns) = build_intent_log_dir(&user_dir, &[b"a", b"b", b"c"]);
+        assert_eq!(lsns, vec![0, 1, 2]);
+        fs::rename(
+            user_dir.join("checkpoints.bin"),
+            user_dir.join("projection_checkpoints.bin"),
+        )
+        .unwrap();
+        fs::write(user_dir.join("slow_store.db"), b"projection-bytes").unwrap();
+
+        let spec = IntentLogBackupSpec::per_user(user_dir.clone());
+        let engine = VeldBackupEngine::new(backup_root.clone()).unwrap();
+
+        // Stage first (what create_user_backup does under the writer mutex).
+        let staged = engine.stage_intent_log(&spec, user_id).unwrap();
+        assert_eq!(staged.journal_cut_lsn, Some(2));
+        assert_eq!(staged.files.len(), 2, "only allow-listed files staged");
+        assert!(staged.files.iter().any(|f| f.name == "intent.log"));
+        assert!(staged
+            .files
+            .iter()
+            .any(|f| f.name == "projection_checkpoints.bin"));
+        assert!(staged.staging_dir.exists());
+
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = rocksdb::DB::open(&opts, &db_path).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        let metadata = engine
+            .create_comprehensive_backup_with_staged_intent_log(
+                &db,
+                user_id,
+                &[],
+                None,
+                Some(staged),
+            )
+            .unwrap();
+
+        // Cut LSN lands in the manifest; staging dir was renamed away.
+        assert_eq!(metadata.journal_cut_lsn, Some(2));
+        assert_eq!(metadata.intent_log_files.len(), 2);
+        let final_dir = backup_root
+            .join(user_id)
+            .join(format!("intent_log_{}", metadata.backup_id));
+        assert!(final_dir.join("intent.log").exists());
+        assert!(!final_dir.join("slow_store.db").exists());
+        let leftover_staging = fs::read_dir(backup_root.join(user_id))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("intent_log_staging"));
+        assert!(!leftover_staging, "staging dir must not survive the backup");
+
+        // Checksum covers the moved-into-place intent log tree.
+        assert!(engine.verify_backup(user_id, metadata.backup_id).unwrap());
     }
 
     #[test]
