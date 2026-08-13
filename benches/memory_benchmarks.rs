@@ -725,7 +725,7 @@ fn print_performance_summary() {
     println!("║                     {CYAN}Detailed results:{RESET}  target/criterion/report/index.html                      ║");
     println!("║                     {CYAN}Run benchmarks:{RESET}   cargo bench --bench memory_benchmarks                  ║");
     println!("║                                                                                               ║");
-    println!("║                     {MAGENTA}Learn more:{RESET}       https://veld-rag.com                                    ║");
+    println!("║                     {MAGENTA}Learn more:{RESET}       https://github.com/Portll/veld                                    ║");
     println!("║                     {MAGENTA}GitHub:{RESET}           https://github.com/roshera/veld                ║");
     println!("║                                                                                               ║");
     println!("╚═══════════════════════════════════════════════════════════════════════════════════════════════╝");

@@ -8,7 +8,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/veld.svg)](https://pypi.org/project/veld/)
 [![Downloads](https://static.pepy.tech/badge/veld)](https://pepy.tech/project/veld)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
 ---
 
@@ -268,10 +268,14 @@ Working Memory ──overflow──> Session Memory ──importance──> Long
 ## Links
 
 - [GitHub](https://github.com/Portll/veld)
-- [Documentation](https://www.veld-rag.com/memory)
+- [Documentation](https://github.com/Portll/veld)
 - [npm (MCP Server)](https://www.npmjs.com/package/@veld/memory-mcp)
 - [crates.io (Rust)](https://crates.io/crates/veld)
 
 ## License
 
-Apache 2.0
+veld is dual-licensed: **AGPL-3.0-or-later** (see [LICENSE](LICENSE)) **or** a commercial
+licence from Portll. See [LICENSING.md](LICENSING.md).
+
+A derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory)
+(Apache-2.0); upstream portions remain under Apache-2.0 — see [NOTICE](NOTICE).

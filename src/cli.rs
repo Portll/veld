@@ -541,7 +541,7 @@ fn handle_init() -> Result<()> {
     eprintln!();
     eprintln!("    claude mcp add veld -- npx -y @veld/memory-mcp");
     eprintln!();
-    eprintln!("  Documentation: https://www.veld.com/docs");
+    eprintln!("  Documentation: https://github.com/Portll/veld");
     eprintln!();
 
     Ok(())
@@ -828,7 +828,7 @@ fn handle_version() {
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
     eprintln!("  Target backend: {}", veld::config::default_requested_storage_backend());
     eprintln!("  Runtime backend: {}", veld::config::effective_storage_backend_for_current_build(veld::config::default_requested_storage_backend()));
-    eprintln!("  License:  BUSL-1.1");
+    eprintln!("  License:  AGPL-3.0-or-later (or commercial — see LICENSING.md)");
     eprintln!("  Repo:     https://github.com/Portll/veld");
 }
 

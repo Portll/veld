@@ -94,5 +94,5 @@ The memory block automatically infers types from content:
 
 ## Documentation
 
-- [Veld Documentation](https://www.veld-rag.com/memory)
+- [Veld Documentation](https://github.com/Portll/veld)
 - [LlamaIndex Memory Guide](https://docs.llamaindex.ai/en/stable/module_guides/deploying/agents/memory/)

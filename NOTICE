@@ -1,11 +1,89 @@
-veld (Portll fork)
-Copyright 2025-2026 Portll
+veld
+Copyright (c) 2025-2026 Portll
 
-This product includes software originally developed by veld-rag
-(https://github.com/Portll/veld) under the Apache License 2.0.
+═══════════════════════════════════════════════════════════════════════════════
+THIS IS A MODIFIED DERIVATIVE WORK.  (Apache-2.0 section 4(b))
+═══════════════════════════════════════════════════════════════════════════════
 
-Portions (c) 2025 veld-rag, licensed under Apache License 2.0.
-Derivative work (c) 2025-2026 Portll, licensed under BUSL-1.1.
+veld is a fork of shodh-memory and has been EXTENSIVELY MODIFIED by Portll.
+Files throughout this repository have been changed, added and removed relative to
+the original. Treat every file as changed unless you have diffed it against
+upstream yourself.
 
-The upstream author's original contributions remain available under
-Apache License 2.0 at the upstream repository.
+The fork point was imported as a single squashed commit (3e4d7ca, "veld v0.7.7"),
+so this repository's git history does NOT show the upstream authorship it is built
+on. That history is at the upstream repository below. Do not read `git log` here as
+a record of who wrote what before the fork point.
+
+═══════════════════════════════════════════════════════════════════════════════
+UPSTREAM  (Apache-2.0 sections 4(a) and 4(c))
+═══════════════════════════════════════════════════════════════════════════════
+
+  Work:       shodh-memory
+  Copyright:  Copyright (c) 2025 Varun Sharma and contributors
+  Licence:    Apache License, Version 2.0
+  Upstream:   https://github.com/varun29ankuS/shodh-memory
+  Mirror:     https://github.com/Portll/shodh-memory-upstream
+
+  The upstream LICENSE file states the notice in brand form, as:
+
+      Copyright 2025 shodh-rag
+
+  reproduced here verbatim to satisfy section 4(c), which requires retaining the
+  notices as they appear in the source form of the Work.
+
+  "shodh-rag" and "Shodh Team" are project styling, not a separate legal person:
+  shodh-rag.com is the upstream documentation domain, and Cargo.toml and
+  pyproject.toml both give the author as "Shodh Team <29.varuns@gmail.com>".
+  Upstream's own CITATION.cff names Varun Sharma as author, and 1,200 of ~1,225
+  commits on upstream's main are his (as VS / Varun Sharma / varun29ankuS).
+  Copyright is therefore Varun Sharma's, jointly with the smaller set of upstream
+  contributors — Antidote Dev, GTanger, phreakocious, Alex Yanchenko, Portll and
+  others — none of whom appear to have assigned it.
+
+  A WARNING FOR ANYONE EDITING THIS FILE: earlier versions named the upstream as
+  "veld-rag (https://github.com/Portll/veld)" — a circular citation pointing at
+  this repository. That was not a typo. The fork search-replaced "shodh" with
+  "veld" across the tree, which turned shodh-rag.com into veld-rag.com and the
+  upstream copyright line into "veld-rag". Attribution strings must be copied from
+  upstream, never derived from this tree's own text.
+
+A complete copy of the Apache License 2.0, as required by section 4(a), is
+distributed with this work as LICENSE-APACHE-2.0. It is byte-identical to the
+copy shipped by upstream. You may also obtain it at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Upstream had no NOTICE file of its own, so the section 4(d) obligation to
+reproduce upstream NOTICE contents does not arise. This file exists to satisfy
+4(b) and 4(c), and as attribution.
+
+═══════════════════════════════════════════════════════════════════════════════
+LICENSING OF THIS WORK
+═══════════════════════════════════════════════════════════════════════════════
+
+Portions remain (c) 2025 shodh-rag under the Apache License 2.0, and continue to
+be available under Apache-2.0 from the upstream repository. Nothing in this
+distribution restricts, or purports to restrict, that grant. Anyone may obtain
+those portions from upstream under Apache-2.0 regardless of the terms below.
+
+The derivative work as a whole is (c) 2025-2026 Portll, distributed under the GNU
+Affero General Public License version 3 or later, or under a separate commercial
+licence from Portll. See LICENSE and LICENSING.md.
+
+Apache-2.0 section 2 grants an irrevocable right to prepare derivative works and
+to sublicense, and section 4 expressly permits different licence terms for a
+derivative work as a whole, provided the section 4 conditions are met for the
+Apache-licensed material. That is the basis on which this work is offered under
+the terms above. Apache-2.0 is also one-way compatible with GPLv3 and AGPLv3, so
+the upstream portions may be conveyed as part of an AGPL-3.0-or-later work.
+
+Apache-2.0 section 6 grants no trademark rights. Nothing here claims any right in
+the "shodh-memory" or "shodh-rag" names; they appear solely to identify the origin
+of this work, which is the customary use section 6 permits.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the Apache License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+OR CONDITIONS OF ANY KIND, either express or implied.
