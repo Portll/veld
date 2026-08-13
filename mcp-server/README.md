@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.veld-rag.com/memory">Documentation</a> |
+  <a href="https://github.com/Portll/veld">Documentation</a> |
   <a href="https://github.com/Portll/veld">GitHub</a> |
   <a href="https://pypi.org/project/veld/">Python SDK</a> |
   <a href="https://crates.io/crates/veld">Rust Crate</a>
@@ -282,10 +282,11 @@ The backend server runs locally and stores all data on your machine. No cloud de
 
 ## Links
 
-- [Documentation](https://www.veld-rag.com/memory)
+- [Documentation](https://github.com/Portll/veld)
 - [GitHub Repository](https://github.com/Portll/veld)
 - [Issue Tracker](https://github.com/Portll/veld/issues)
 
 ## License
 
-BUSL-1.1
+AGPL-3.0-or-later, or a commercial licence from Portll.
+See [LICENSING.md](../LICENSING.md).

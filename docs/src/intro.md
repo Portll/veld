@@ -33,7 +33,9 @@ Veld exposes an HTTP API and two MCP transports:
 
 ## Licence and distribution
 
-Veld is licensed under the **Business Source License 1.1 (BUSL-1.1)**. The production-use restrictions convert to Apache-2.0 on the change date specified in the licence file.
+Veld is dual-licensed: **AGPL-3.0-or-later** or a commercial licence from Portll. Running an unmodified Veld carries no source obligation; modifying it and exposing the modified version as a network service triggers AGPL section 13. See LICENSING.md.
+
+Veld is a derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory) (Apache-2.0); upstream portions remain under Apache-2.0 per NOTICE.
 
 | Surface | Identifier |
 |---|---|
