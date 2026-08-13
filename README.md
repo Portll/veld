@@ -14,7 +14,7 @@
   <a href="https://www.npmjs.com/package/@veld/memory-mcp"><img src="https://img.shields.io/npm/v/@veld/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/veld/"><img src="https://img.shields.io/pypi/v/veld.svg" alt="PyPI"></a>
   <a href="https://hub.docker.com/r/varunveld/veld"><img src="https://img.shields.io/docker/pulls/varunveld/veld.svg?logo=docker" alt="Docker"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg" alt="License"></a>
   <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
 
@@ -273,7 +273,7 @@ documented and auto-generated in the [docs site](https://portll.github.io/veld/r
 
 160+ endpoints on `http://localhost:3030`. All `/api/*` endpoints require `X-API-Key` header.
 
-[Full API reference →](https://www.veld.com/docs/api)
+[Full API reference →](https://github.com/Portll/veld#api)
 
 <details>
 <summary>Quick examples</summary>
@@ -470,10 +470,14 @@ memory.example.com {
 
 ## License
 
-Business Source License 1.1 (BUSL-1.1)
+veld is dual-licensed: **AGPL-3.0-or-later** (see [LICENSE](LICENSE)) **or** a commercial
+licence from Portll. See [LICENSING.md](LICENSING.md).
+
+A derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory)
+(Apache-2.0); upstream portions remain under Apache-2.0 — see [NOTICE](NOTICE).
 
 ---
 
 <p align="center">
-  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=veld">MCP Registry</a> · <a href="https://hub.docker.com/r/varunveld/veld">Docker Hub</a> · <a href="https://pypi.org/project/veld/">PyPI</a> · <a href="https://www.npmjs.com/package/@veld/memory-mcp">npm</a> · <a href="https://crates.io/crates/veld">crates.io</a> · <a href="https://www.veld.com">Docs</a>
+  <a href="https://registry.modelcontextprotocol.io/v0/servers?search=veld">MCP Registry</a> · <a href="https://hub.docker.com/r/varunveld/veld">Docker Hub</a> · <a href="https://pypi.org/project/veld/">PyPI</a> · <a href="https://www.npmjs.com/package/@veld/memory-mcp">npm</a> · <a href="https://crates.io/crates/veld">crates.io</a> · <a href="https://github.com/Portll/veld">Docs</a>
 </p>

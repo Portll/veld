@@ -4,7 +4,7 @@ version = "0.1.91"
 edition = "2021"
 description = "Terminal UI for Veld - real-time visualization"
 authors = ["Veld"]
-license = "BUSL-1.1"
+license = "AGPL-3.0-or-later"
 
 [[bin]]
 name = "veld-tui"

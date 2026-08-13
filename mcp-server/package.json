@@ -46,7 +46,7 @@
     "veld"
   ],
   "author": "Veld Team <john@portll.net>",
-  "license": "BUSL-1.1",
+  "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Portll/veld.git"

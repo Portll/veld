@@ -8,7 +8,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/veld.svg)](https://crates.io/crates/veld)
 [![Downloads](https://img.shields.io/crates/d/veld.svg)](https://crates.io/crates/veld)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
 ---
 
@@ -317,10 +317,14 @@ Content-hash dedup (SHA-256) ensures identical content is never stored twice.
 ## Links
 
 - [GitHub](https://github.com/Portll/veld)
-- [Documentation](https://www.veld-rag.com/memory)
+- [Documentation](https://github.com/Portll/veld)
 - [PyPI (Python)](https://pypi.org/project/veld/)
 - [npm (MCP Server)](https://www.npmjs.com/package/@veld/memory-mcp)
 
 ## License
 
-Apache 2.0
+veld is dual-licensed: **AGPL-3.0-or-later** (see [LICENSE](LICENSE)) **or** a commercial
+licence from Portll. See [LICENSING.md](LICENSING.md).
+
+A derivative work of [shodh-memory](https://github.com/varun29ankuS/shodh-memory)
+(Apache-2.0); upstream portions remain under Apache-2.0 — see [NOTICE](NOTICE).

@@ -51,5 +51,5 @@ See `veld_langchain.py` for complete examples including:
 
 ## Documentation
 
-- [Veld Documentation](https://www.veld-rag.com/memory)
+- [Veld Documentation](https://github.com/Portll/veld)
 - [LangChain MCP Adapters](https://github.com/langchain-ai/langchain-mcp-adapters)
