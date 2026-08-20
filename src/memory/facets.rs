@@ -1123,7 +1123,11 @@ mod tests {
                 "/c/Repositories/Portll/veld/.claude/worktrees/agent-abc",
             )),
             branch: Some("feat/agent-session-facet".into()),
-            agent_id: Some("claude-code".into()),
+            // A BRAND, not a launcher slug. agent_id is whitelisted at deserialize
+            // time against KNOWN_AGENT_BRANDS, so "claude-code" round-tripped to None
+            // and this assertion failed from 2026-05-27 (ddc6e2d, which added the
+            // whitelist one commit after 8b82fda added this fixture) until 2026-08-20.
+            agent_id: Some("Claude".into()),
             vscode_window_id: Some("window-42".into()),
             started_at: Some(started_at),
             parent_repo: Some(PathBuf::from("/c/Repositories/Portll/veld")),
@@ -1144,14 +1148,15 @@ mod tests {
         let session = AgentSession {
             worktree_path: Some(PathBuf::from("/repo/wt")),
             branch: Some("main".into()),
-            agent_id: Some("vscode-copilot".into()),
+            // A BRAND, not a launcher slug — see the bincode test above.
+            agent_id: Some("Copilot".into()),
             vscode_window_id: Some("vscode-1".into()),
             started_at: Some(started_at),
             parent_repo: Some(PathBuf::from("/repo")),
         };
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"branch\":\"main\""));
-        assert!(json.contains("\"agent_id\":\"vscode-copilot\""));
+        assert!(json.contains("\"agent_id\":\"Copilot\""));
         assert!(json.contains("\"vscode_window_id\":\"vscode-1\""));
         let back: AgentSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, session);
