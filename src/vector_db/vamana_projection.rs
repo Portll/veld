@@ -1151,9 +1151,15 @@ mod tests {
             log.sync().unwrap();
         }
 
-        // First boot: apply only LSN 0..=2 via the static Projection arm.
-        // Note: this run does NOT call persist_checkpoint via the dyn
-        // arm, so no id_map side data is persisted — only the LSN.
+        // First boot: apply only LSN 0..=2 via the static Projection arm, then
+        // persist. THIS WRITES THE id_map SIDE DATA AS WELL AS THE LSN —
+        // `Projection::persist_checkpoint` calls `persist()`, which snapshots
+        // `self.memories` under SIDE_DATA_KEY_ID_MAP precisely "so a later open
+        // can restore it without replaying the log". A previous comment here
+        // claimed the opposite ("no id_map side data is persisted — only the
+        // LSN"); that was true only before a7bb7c4 added the side-data path on
+        // 2026-05-28, the same day this test landed in b398301, and it is what
+        // made the final assertion below wrong for three months.
         {
             let log = IntentLog::open(&log_path).unwrap();
             let config = VamanaConfig {
@@ -1211,17 +1217,108 @@ mod tests {
                 "missing mapping for {mid} after restart-replay"
             );
         }
-        // And the first three (already applied on the previous boot)
-        // are NOT in the new projection's map — they live only in the
-        // SQLite projection / RocksDB. This matches the intent: the
-        // Vamana projection is rebuildable from the log starting at any
-        // checkpoint, and the operator is expected to wipe-and-replay
-        // from `Lsn::ZERO` if they want full reconstruction.
+        // THE MAP COMES BACK; THE INDEX DOES NOT. This is the distinction the
+        // test exists to pin, and it is the one an operator has to understand.
+        //
+        // The first three were applied on the previous boot and are NOT replayed
+        // (see `applied == 3` above — the checkpoint did its job). Their
+        // memory_id → vector_id mappings still resolve, because `persist()`
+        // snapshotted them into CheckpointStore side data and the second boot
+        // restored them; `id_map_survives_reopen_via_side_data` pins that path
+        // directly. What is NOT restored is their VECTORS: the Vamana index
+        // starts empty and only replay writes to it, which is why
+        // `index.len() == 3` above rather than 6.
+        //
+        // So the projection can NAME a pre-checkpoint memory but cannot SEARCH
+        // it. That asymmetry is the real operational fact: the operator must
+        // wipe-and-replay from `Lsn::ZERO` for full reconstruction, and a
+        // restored id map is not evidence that the index is whole.
+        // The map DOES come back — pinned here because the original assertion
+        // claimed the opposite and was wrong from the day it landed.
         for mid in memory_ids.iter().take(3) {
             assert!(
-                proj.vector_id_for(mid).is_none(),
-                "checkpointed lsn should not be re-applied: {mid}"
+                proj.vector_id_for(mid).is_some(),
+                "pre-checkpoint id map should survive via side data: {mid}"
             );
+        }
+        // What that map POINTS AT is a separate, unresolved question — see
+        // `restored_id_map_collides_with_replayed_vector_ids` below.
+    }
+
+    /// PINS A REAL DEFECT. `#[ignore]`d so it does not gate the suite, NOT
+    /// because it is uncertain — it fails deterministically and the mechanism
+    /// is understood. Run it with `cargo test -- --ignored`.
+    ///
+    /// THE COLLISION: `VamanaIndex::add_vector` allocates ids from that index's
+    /// own `num_vectors` counter, starting at 0. On a restart-from-checkpoint
+    /// the id map is restored from CheckpointStore side data while the index is
+    /// rebuilt EMPTY, so replay hands out 0, 1, 2 again — to different memories.
+    /// Six memory_ids then share three vector_ids, and every pre-checkpoint
+    /// lookup resolves to a vector belonging to some other memory.
+    ///
+    /// This is worse than the "can name but cannot search" asymmetry the sibling
+    /// test documents: the projection does not fail to answer, it answers
+    /// WRONGLY, and `memory_id_for()` walks the forward map so its inverse is
+    /// ambiguous too. For a memory store that is returning the wrong memory.
+    ///
+    /// Not repaired here because the fix is a design choice in someone else's
+    /// subsystem — persist the index alongside the map, or make vector_id
+    /// allocation survive a restart (a monotonic counter in side data), or
+    /// discard the restored map when the index is empty. Discarding is the
+    /// smallest and matches the module's stated "wipe-and-replay from Lsn::ZERO"
+    /// posture, but it silently drops the side-data feature's whole benefit, so
+    /// it is a call for the owner rather than a cleanup.
+    #[tokio::test]
+    #[ignore = "known defect: restored id map collides with replayed vector ids — see doc comment"]
+    async fn restored_id_map_collides_with_replayed_vector_ids() {
+        let (log_path, ckpt_path) = tmp_paths("idmap_collision");
+        let mut memory_ids = Vec::new();
+        {
+            let mut log = IntentLog::open(&log_path).unwrap();
+            for i in 0..6 {
+                let (mid, bytes) = mk_memory_with_embedding(axis_vec(i));
+                memory_ids.push(mid.0.to_string());
+                crate::intent_log::payload::append(
+                    &mut log,
+                    &mk_remember(&mid.0.to_string(), bytes),
+                )
+                .unwrap();
+            }
+            log.sync().unwrap();
+        }
+        {
+            let log = IntentLog::open(&log_path).unwrap();
+            let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+            let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+            let mut proj =
+                VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index, ckpt);
+            let records: Vec<_> =
+                log.iter().unwrap().take(3).collect::<Result<_, _>>().unwrap();
+            for r in &records {
+                Projection::apply(&mut proj, r).unwrap();
+            }
+            Projection::persist_checkpoint(&mut proj).unwrap();
+        }
+        let log = IntentLog::open(&log_path).unwrap();
+        let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        let ckpt = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let mut proj =
+            VamanaProjection::new(VamanaEmbeddingKind::TextPrimary, index.clone(), ckpt);
+        replay(&log, &mut proj, None).unwrap();
+
+        // Every live memory_id must own a DISTINCT vector_id. It does not.
+        let mut seen: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        for mid in &memory_ids {
+            if let Some(vid) = proj.vector_id_for(mid) {
+                if let Some(prev) = seen.insert(vid, mid.clone()) {
+                    panic!(
+                        "vector_id {vid} is claimed by BOTH {prev} and {mid} — a restored \
+                         pre-checkpoint mapping now points at a vector replay wrote for a \
+                         different memory"
+                    );
+                }
+            }
         }
     }
 
