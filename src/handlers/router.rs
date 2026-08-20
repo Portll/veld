@@ -763,15 +763,62 @@ mod public_router_structural_guard {
         }
         let body = &after[body_start..=body_end];
 
+        // THE FIRST ARGUMENT IS NOT ALWAYS A STRING LITERAL, and assuming it was
+        // is what broke this guard. `build_public_routes` contains
+        // `r.route(METRICS_PATH_IF_PUBLIC, …)` — an identifier. The original loop
+        // ran `rest.find('"')` unbounded from the `.route(`, so on that call it
+        // reached PAST the const into a later call's literal. Two outcomes, both
+        // bad: with a literal further down it SILENTLY recorded the wrong path
+        // for this route and dropped a real one; with none left it panicked
+        // ("opening quote in .route call"), which is how this test has been
+        // failing. A guard that can quietly report the wrong route table is worse
+        // than one that dies, so the search is now BOUNDED to a single call and
+        // identifiers are resolved rather than skipped.
+        //
+        // Resolution is deliberate, not clever: the only non-literal permitted is
+        // a `const … : &str = "…";` declared in this same file, which is exactly
+        // what the const-drift rule is about. Anything else fails loudly, because
+        // silently omitting a route is the failure mode this whole module exists
+        // to prevent.
+        let resolve_const = |ident: &str| -> String {
+            let decl = format!("const {}: &str = \"", ident);
+            let at = source.get(..).and_then(|s| s.find(&decl)).unwrap_or_else(|| {
+                panic!(
+                    "`.route({ident}, …)` in `{fn_name}` is neither a string literal nor a \
+                     `const {ident}: &str` declared in router.rs — the structural guard cannot \
+                     resolve it, and skipping it would let a public route go unchecked"
+                )
+            });
+            let after_decl = &source[at + decl.len()..];
+            let end = after_decl.find('"').expect("closing quote on const decl");
+            after_decl[..end].to_string()
+        };
+
         let mut paths = Vec::new();
         let mut rest = body;
         while let Some(idx) = rest.find(".route(") {
             rest = &rest[idx + ".route(".len()..];
-            let q1 = rest.find('"').expect("opening quote in .route call");
-            let after_q1 = &rest[q1 + 1..];
-            let q2 = after_q1.find('"').expect("closing quote in .route call");
-            paths.push(after_q1[..q2].to_string());
-            rest = &after_q1[q2 + 1..];
+            // Bound the argument to THIS call: everything up to the next `.route(`.
+            let window_end = rest.find(".route(").unwrap_or(rest.len());
+            let window = &rest[..window_end];
+            let arg = window.trim_start();
+            if let Some(stripped) = arg.strip_prefix('"') {
+                let q2 = stripped.find('"').expect("closing quote in .route call");
+                paths.push(stripped[..q2].to_string());
+            } else {
+                // An identifier: read up to the argument separator.
+                let ident: String = arg
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                assert!(
+                    !ident.is_empty(),
+                    "unparseable first argument to `.route(` in `{fn_name}`: {:?}",
+                    &arg[..arg.len().min(40)]
+                );
+                paths.push(resolve_const(&ident));
+            }
+            rest = &rest[window_end..];
         }
         paths.sort();
         paths.dedup();
@@ -795,8 +842,25 @@ mod public_router_structural_guard {
         // the conditional `/metrics` branch, so check both shapes by parsing
         // the function once and treating `METRICS_PATH_IF_PUBLIC` as the only
         // permitted extra path.
+        // NOT EVERY PUBLIC PATH IS MOUNTED BY THIS BUILDER, and assuming so was the
+        // guard's second wrong assumption. `/docs` is public — it belongs in
+        // PUBLIC_PATHS — but it is mounted by `handlers::docs` via
+        // `nest_service("/docs", …)` / `.route("/docs", …)`, added by 0dfa490
+        // (2026-05-29) after this guard was written. Subtracting it here keeps the
+        // drift check meaningful for everything `build_public_routes` DOES own,
+        // instead of failing permanently on a path it was never responsible for.
+        //
+        // Anything added to this list must be a path that is genuinely public AND
+        // genuinely mounted elsewhere — it is an exemption from THIS builder's
+        // check, not from the public-path contract.
+        const MOUNTED_BY_ANOTHER_BUILDER: &[&str] = &["/docs"];
+
         let routed = extract_routed_paths(&router_source(), "build_public_routes");
-        let mut declared: Vec<String> = PUBLIC_PATHS.iter().map(|s| s.to_string()).collect();
+        let mut declared: Vec<String> = PUBLIC_PATHS
+            .iter()
+            .filter(|p| !MOUNTED_BY_ANOTHER_BUILDER.contains(p))
+            .map(|s| s.to_string())
+            .collect();
         declared.push(METRICS_PATH_IF_PUBLIC.to_string());
         declared.sort();
         assert_eq!(
