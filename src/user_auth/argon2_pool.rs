@@ -115,8 +115,30 @@ mod tests {
         assert_eq!(n, expected);
     }
 
+    /// ONE TEST, DELIBERATELY, AND IT MUST STAY ONE.
+    ///
+    /// These were two `#[tokio::test]`s and the pair was flaky — measured
+    /// 2026-08-20, `assert_eq!(available_permits(), before)` failing with
+    /// `left: 0, right: 18`. Neither test was wrong about the code; they were
+    /// wrong about each other. `ARGON2_SEMAPHORE` is PROCESS-GLOBAL (see the
+    /// `OnceLock` above), the harness runs tests in parallel threads within one
+    /// process, and the first half below SATURATES that semaphore on purpose to
+    /// prove the cap binds. The second half sampled `available_permits()` and
+    /// asserted it had returned to its starting value — which is only true when
+    /// no other test is contending. `right: 18` is `available_parallelism()` on
+    /// that machine, i.e. the full idle pool; `left: 0` is the first half
+    /// holding every permit.
+    ///
+    /// The old code carried a `yield_now()` "to allow a small async wiggle for
+    /// the spawn_blocking join" — a real timing fix aimed at the wrong race. It
+    /// settles this test's own join and can do nothing about a sibling's permits.
+    ///
+    /// Worse than the flake: the equality assertion could not tell "my permit
+    /// leaked" — the bug it exists to catch — from "someone else is busy", so it
+    /// could also PASS while a permit genuinely leaked. Splitting these again
+    /// restores both faults.
     #[tokio::test]
-    async fn semaphore_caps_in_flight_argon2_critical_sections() {
+    async fn semaphore_caps_concurrency_and_releases_permits_on_error() {
         // Spawn N tasks where N is well above the permit count. Each task
         // counts itself in/out of the critical section with an AtomicUsize
         // and asserts the peak never exceeds the cap. The test mirrors the
@@ -159,19 +181,35 @@ mod tests {
             peak.load(Ordering::SeqCst) >= 1,
             "peak should be at least 1 — no work observed"
         );
-    }
 
-    #[tokio::test]
-    async fn run_blocking_propagates_argon2_errors_and_releases_permit() {
-        let before = available_permits();
-        let err = run_blocking(|| Err::<(), _>(AuthError::internal("boom")))
+        // ── second half: an erroring closure must still return its permit ──
+        //
+        // ASSERTED BY PROGRESS, NOT BY COUNTING, and that distinction is the
+        // whole point. Any `assert_eq!` on `available_permits()` is an exact
+        // comparison against a PROCESS-GLOBAL counter that every other test in
+        // this binary can move — which is what made the original flaky, and
+        // which I reproduced once while fixing it by asserting the pool was
+        // idle here. Counting cannot work; a leak has to be observed as a
+        // failure to make progress.
+        //
+        // So: run `cap + 1` erroring calls in sequence. Each must acquire a
+        // permit, error, and RELEASE. If the error path leaked even one, the
+        // pool drains and a later call blocks forever — surfacing as the
+        // timeout below rather than as a number that happened to differ.
+        // Contention from other tests can only slow this down, never break it.
+        for i in 0..=cap {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                run_blocking(|| Err::<(), _>(AuthError::internal("boom"))),
+            )
             .await
-            .unwrap_err();
-        assert!(matches!(err, AuthError::Internal(_)));
-        // The permit must come back even when the closure errored.
-        // (Allow a small async wiggle for the spawn_blocking join to
-        // resolve before sampling.)
-        tokio::task::yield_now().await;
-        assert_eq!(available_permits(), before);
+            .unwrap_or_else(|_| {
+                panic!(
+                    "call {i} of {cap} blocked for 10s — the error path is not releasing \
+                     its permit, so the pool has drained"
+                )
+            });
+            assert!(matches!(outcome.unwrap_err(), AuthError::Internal(_)));
+        }
     }
 }
