@@ -8,7 +8,12 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/portll/veld"
 homepage = "https://github.com/portll/veld"
 readme = "README-rust.md"
-keywords = ["memory", "ai", "robotics", "zenoh", "cognitive"]
+# crates.io allows five. Chosen for what someone would actually TYPE to find this,
+# not for what it is called internally. Dropped: "ai" (thousands of crates carry it,
+# so it discriminates nothing), "cognitive" (nobody searches it), "zenoh" (the
+# transport, not the ecosystem — "robotics" reaches the same people and more).
+# The fuller set lives in pyproject.toml, which has no five-keyword limit.
+keywords = ["memory", "agents", "vector-database", "rag", "robotics"]
 categories = ["science", "database", "embedded"]
 exclude = [
     "mcp-server/",
