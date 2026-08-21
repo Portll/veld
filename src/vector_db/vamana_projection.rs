@@ -313,6 +313,7 @@ impl VamanaProjection {
         checkpoint_store: Arc<Mutex<CheckpointStore>>,
     ) -> Self {
         let (checkpoint, memories) = load_checkpoint_and_map(kind, &checkpoint_store);
+        let memories = reconcile_map_with_index(kind, memories, &index);
         Self {
             kind,
             state: IndexState::Ready(index),
@@ -626,6 +627,57 @@ fn load_checkpoint_and_map(
         _ => HashMap::new(),
     };
     (checkpoint, map)
+}
+
+/// A RESTORED ID MAP IS ONLY VALID FOR THE INDEX IT WAS BUILT AGAINST.
+///
+/// `load_checkpoint_and_map` validates the side data's stamp against the projection's
+/// checkpoint LSN, which proves the map is not STALE. It cannot prove the map still
+/// DESCRIBES anything, because the index is a separate artifact with its own lifetime.
+///
+/// The gap that leaves is not a missing lookup, it is a WRONG one.
+/// `VamanaIndex::add_vector` allocates ids from that index's own counter starting at 0.
+/// Restore a map naming vector ids 0,1,2 alongside a freshly-built empty index and replay
+/// hands 0,1,2 straight back out — to different memories. Measured 2026-08-20: six
+/// memory_ids sharing three vector_ids, so `vector_id_for()` on a pre-checkpoint memory
+/// returned a vector belonging to someone else, and `memory_id_for()` — which walks this
+/// same forward map — was ambiguous in the other direction. For a memory store that is
+/// returning the wrong memory's content.
+///
+/// So: every id the map names must exist in the index. Ids are dense from 0, so the test
+/// is `max(vector_id) < index.len()`. On failure the whole map is DISCARDED and replay
+/// rebuilds it, which is the treatment the stale-stamp arm already applies one function
+/// up — this extends an existing defence rather than inventing one.
+///
+/// Discarding is not a loss of the side-data feature. That feature buys "restore without
+/// replaying the log", and it still does — whenever the index was persisted too, which is
+/// the only case where the map meant anything. What it stops doing is answering confidently
+/// from a map whose index is gone.
+fn reconcile_map_with_index(
+    kind: VamanaEmbeddingKind,
+    memories: HashMap<String, MemoryEntry>,
+    index: &Arc<RwLock<VamanaIndex>>,
+) -> HashMap<String, MemoryEntry> {
+    if memories.is_empty() {
+        return memories;
+    }
+    let index_len = index.read().len();
+    let highest = memories.values().map(|e| e.vector_id as usize).max();
+    match highest {
+        Some(max_vid) if max_vid >= index_len => {
+            tracing::warn!(
+                projection = kind.projection_name(),
+                mapped_entries = memories.len(),
+                highest_vector_id = max_vid,
+                index_len,
+                "vamana projection: restored id_map names vector ids the index does not have \
+                 (index rebuilt without its vectors); DISCARDING the map and replaying. Keeping \
+                 it would alias pre-checkpoint memories onto vectors replay is about to write.",
+            );
+            HashMap::new()
+        }
+        _ => memories,
+    }
 }
 
 /// Decode a bincoded `Memory` snapshot off the wire. Mirrors the
@@ -1233,16 +1285,27 @@ mod tests {
         // it. That asymmetry is the real operational fact: the operator must
         // wipe-and-replay from `Lsn::ZERO` for full reconstruction, and a
         // restored id map is not evidence that the index is whole.
-        // The map DOES come back — pinned here because the original assertion
-        // claimed the opposite and was wrong from the day it landed.
+        // Pre-checkpoint ids do NOT resolve — and the REASON matters, because this
+        // assertion has now been right, wrong, and right again for three different
+        // reasons in three months.
+        //
+        //   originally: "no id_map side data is persisted" — simply FALSE;
+        //               persist_checkpoint() has snapshotted the map since a7bb7c4.
+        //   2026-08-20: changed to is_some(), which was true and was the BUG —
+        //               the map came back naming vectors this fresh index lacks.
+        //   now:        the map is DISCARDED at open because the index cannot back
+        //               it, so replay rebuilds from the checkpoint and only the
+        //               post-checkpoint memories are mapped.
+        //
+        // Same assertion as the original, opposite justification. If it ever fails
+        // again, read reconcile_map_with_index before touching this line.
         for mid in memory_ids.iter().take(3) {
             assert!(
-                proj.vector_id_for(mid).is_some(),
-                "pre-checkpoint id map should survive via side data: {mid}"
+                proj.vector_id_for(mid).is_none(),
+                "pre-checkpoint {mid} must not resolve: its map entry named a vector the \
+                 rebuilt index never had, so the map was discarded"
             );
         }
-        // What that map POINTS AT is a separate, unresolved question — see
-        // `restored_id_map_collides_with_replayed_vector_ids` below.
     }
 
     /// PINS A REAL DEFECT. `#[ignore]`d so it does not gate the suite, NOT
@@ -1269,8 +1332,7 @@ mod tests {
     /// posture, but it silently drops the side-data feature's whole benefit, so
     /// it is a call for the owner rather than a cleanup.
     #[tokio::test]
-    #[ignore = "known defect: restored id map collides with replayed vector ids — see doc comment"]
-    async fn restored_id_map_collides_with_replayed_vector_ids() {
+    async fn restored_id_map_is_discarded_when_the_index_cannot_back_it() {
         let (log_path, ckpt_path) = tmp_paths("idmap_collision");
         let mut memory_ids = Vec::new();
         {
@@ -1623,11 +1685,14 @@ mod tests {
         let (id_b, b_b) = mk_memory_with_embedding(axis_vec(2));
         let (id_c, b_c) = mk_memory_with_embedding(axis_vec(5));
 
+        // The index is hoisted OUT of the block below so it outlives the first
+        // projection. That is the whole point of the rewrite: the map is only
+        // restorable when the index it describes survived too.
+        let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let saved_ids = {
-            let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
             let mut proj = VamanaProjection::new(
                 VamanaEmbeddingKind::TextPrimary,
-                index,
+                Arc::clone(&index),
                 ckpt.clone(),
             );
             TypedProjection::apply(
@@ -1665,23 +1730,58 @@ mod tests {
             ]
         };
 
-        // Re-open. Brand-new index + projection, same checkpoint store.
-        // No replay runs here — the side data must carry the map back.
-        let index2 = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        // Re-open with a NEW projection but the SURVIVING index, same checkpoint
+        // store. No replay runs — the side data alone must carry the map back.
         let ckpt2 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
         let proj2 = VamanaProjection::new(
             VamanaEmbeddingKind::TextPrimary,
-            index2,
+            Arc::clone(&index),
             ckpt2,
         );
         assert_eq!(proj2.checkpoint(), Some(Lsn(2)));
         assert_eq!(proj2.tracked_memory_count(), 3);
-        for (mid, expected_vid) in saved_ids {
+        for (mid, expected_vid) in &saved_ids {
             assert_eq!(
-                proj2.vector_id_for(&mid),
-                Some(expected_vid),
+                proj2.vector_id_for(mid),
+                Some(*expected_vid),
                 "id_map side data must round-trip vector ids exactly"
             );
+        }
+
+        // AND THE OTHER HALF, WHICH IS NEW AND IS THE POINT.
+        //
+        // This test used to re-open against a BRAND-NEW EMPTY index and assert the
+        // ids came back anyway. They did — and that was the bug, not the feature.
+        // Every VamanaProjection construction site in this crate builds
+        // `VamanaIndex::new(...)`; nothing on the projection path calls
+        // `VamanaIndex::load`. So "restored map + empty index" is not a test
+        // convenience, it is the PRODUCTION shape, and it aliases pre-checkpoint
+        // memories onto vectors replay is about to write (see
+        // `restored_id_map_is_discarded_when_the_index_cannot_back_it`).
+        //
+        // The map is now discarded when the index cannot back it. That NARROWS the
+        // side-data feature to the case where the index survived, which is the only
+        // case where a vector_id meant anything.
+        let empty_index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        let ckpt3 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
+        let proj3 = VamanaProjection::new(
+            VamanaEmbeddingKind::TextPrimary,
+            empty_index,
+            ckpt3,
+        );
+        assert_eq!(
+            proj3.checkpoint(),
+            Some(Lsn(2)),
+            "the CHECKPOINT is still restored — only the id map is refused"
+        );
+        assert_eq!(
+            proj3.tracked_memory_count(),
+            0,
+            "an id map naming vectors an empty index does not have must be discarded, \
+             not handed to a caller that will resolve it to the wrong memory"
+        );
+        for (mid, _) in &saved_ids {
+            assert!(proj3.vector_id_for(mid).is_none());
         }
     }
 
@@ -1823,11 +1923,13 @@ mod tests {
         let (id_b, b_b) = mk_memory_with_embedding(axis_vec(2));
         let (id_c, b_c) = mk_memory_with_embedding(axis_vec(5));
 
+        // Hoisted so the index OUTLIVES the first projection — the restored map is
+        // only honoured when the index it names still holds those vectors.
+        let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
         let saved = {
-            let index = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
             let mut proj = VamanaProjection::new(
                 VamanaEmbeddingKind::TextPrimary,
-                index,
+                Arc::clone(&index),
                 ckpt.clone(),
             );
             TypedProjection::apply(
@@ -1864,15 +1966,19 @@ mod tests {
             ]
         };
 
-        // Re-open: brand-new index + projection, same checkpoint store.
+        // Re-open: new projection over the SURVIVING index, same checkpoint store.
         // The forward map is restored from side data (covered by
-        // `id_map_survives_reopen_via_side_data`). The reverse
-        // accessor must work over that restored map.
-        let index2 = Arc::new(RwLock::new(VamanaIndex::new(test_config()).unwrap()));
+        // `id_map_survives_reopen_via_side_data`). The reverse accessor must work
+        // over that restored map.
+        //
+        // This previously re-opened against a brand-new EMPTY index. That passed only
+        // because the map was restored regardless of whether the index could back it —
+        // so the reverse lookup was resolving vector ids the index did not have. See
+        // `restored_id_map_is_discarded_when_the_index_cannot_back_it`.
         let ckpt2 = Arc::new(Mutex::new(CheckpointStore::open(&ckpt_path).unwrap()));
         let proj2 = VamanaProjection::new(
             VamanaEmbeddingKind::TextPrimary,
-            index2,
+            Arc::clone(&index),
             ckpt2,
         );
         assert_eq!(proj2.tracked_memory_count(), 3);
