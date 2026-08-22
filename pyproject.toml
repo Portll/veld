@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 keywords = [
-    "memory", "ai", "edge-computing", "robotics", "drones", "rag",
+    "memory", "ai", "edge-computing", "robotics", "drones", "rag", "knowledge-graph",
     "vector-database", "offline", "ros2", "autonomous", "navigation",
     "gps", "spatial", "mission-tracking", "sensor-data"
 ]
