@@ -54,8 +54,11 @@ impl std::str::FromStr for StorageBackend {
     }
 }
 
+// fix: request rocksdb, because redb is unfinished and every request for it is served rocksdb
+// anyway. Requesting redb made /health report requested:redb / effective:rocksdb beside
+// status:healthy — a request the service did not honour, published as compliance.
 pub const fn default_requested_storage_backend() -> StorageBackend {
-    StorageBackend::Redb
+    StorageBackend::RocksDb
 }
 
 pub const fn effective_storage_backend_for_current_build(
@@ -1076,7 +1079,9 @@ mod tests {
         assert_eq!(config.port, 3030);
         assert_eq!(config.max_users_in_memory, 1000);
         assert!(!config.is_production);
-        assert_eq!(config.requested_storage_backend, StorageBackend::Redb);
+        // requested must EQUAL effective by default — a default that asks for a backend the build
+        // cannot serve publishes an unhonoured request beside status:healthy.
+        assert_eq!(config.requested_storage_backend, StorageBackend::RocksDb);
         assert_eq!(config.effective_storage_backend, StorageBackend::RocksDb);
     }
 
