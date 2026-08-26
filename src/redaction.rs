@@ -1,8 +1,11 @@
 //! Entity redaction — classify credential-shaped strings before they enter the graph.
 //!
-//! WHY ON THE WAY IN. `delete_entity()` exists in `graph_memory` but is not exposed as a route,
-//! and the forget path never touches the graph, so removing a memory does not remove the entities
-//! it minted. An entity is a one-way door; this is the only place the decision can be made.
+//! WHY ON THE WAY IN. The forget path does not touch the graph, so removing a memory does not
+//! remove the entities it minted. `DELETE /api/graph/entity/delete` now exists and is the exit,
+//! but it is a remediation tool, not a control: it acts on one known id at a time, after the fact,
+//! and only if somebody notices. Entry is still the only place the decision is made by default.
+//! (Until 2026-08-26 there was no exit at all — `graph_memory::delete_entity` was implemented and
+//! routed from nothing.)
 //!
 //! WHY A LABEL AND NOT A DROP. A redacted entity is replaced with `redacted:<class>`, never
 //! removed. Dropping it would make "there was a credential here" indistinguishable from "there was
@@ -149,8 +152,10 @@ pub fn classify(entity: &str) -> Option<Redacted> {
 /// the same session may have nothing to do with each other, and spreading activation cannot tell
 /// the difference.
 ///
-/// Exposed as a predicate rather than wired to an automatic drop, because removing them changes
-/// graph topology and that is an operator's decision, not a library's.
+/// OPERATOR RULING 2026-08-26: **UUID entities are ALLOWED.** They stay in the graph. This
+/// predicate is informational only — for reporting and for anyone wanting to filter at read
+/// time — and must NOT be wired to a drop at write time without a new ruling. The hub effect
+/// described above is a known and accepted property, not an open defect.
 static BARE_UUID: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").expect("literal")
 });

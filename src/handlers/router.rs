@@ -435,6 +435,10 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
             post(graph::rebuild_user_graph),
         )
         .route("/api/graph/entity/find", post(graph::find_entity))
+        // The graph had five ways to add an entity and none to remove one, so anything
+        // that reached the entity namespace was permanent. Protected router: API key
+        // required, and the handler binds user_id to the authenticated tenant.
+        .route("/api/graph/entity/delete", delete(graph::delete_entity))
         .route("/api/graph/entities/all", post(graph::get_all_entities))
         .route(
             "/api/graph/relationship/invalidate",
