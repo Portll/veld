@@ -59,25 +59,33 @@ pub struct ChunkConfig {
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            // ~200 tokens * 4 chars/token = 800 chars.
+            // DERIVED FROM MEASUREMENT, not from an assumed characters-per-token ratio.
             //
-            // MEASURED 2026-08-27 (`src/bin/chunk_audit.rs`, 300 memories, 1,278 chunks, real
-            // tokenizer): this corpus is paths, JSON, SHAs and slugs, and the densest chunks run
-            // 2.5-3.0 chars/token, not 4. Chunk lengths came out median 195 / p90 240 / p99 280 /
-            // max 412 tokens, so 4.5% of chunks exceeded 256 — the "headroom for tokenizer
-            // differences" is headroom in the wrong direction, because the assumption fails toward
-            // chunks that are too BIG.
+            // This was 800, commented "~200 tokens * 4 chars/token ... leave headroom for tokenizer
+            // differences". The headroom ran the wrong way: the assumption fails toward chunks that
+            // are too BIG, because dense text has FEWER chars per token, not more. This corpus is
+            // paths, JSON, SHAs and slugs, and its densest chunks run under 2 chars/token.
             //
-            // It is no longer a correctness bug: windowed pooling in `minilm.rs` embeds an
-            // over-length chunk whole instead of truncating it. It is still a granularity cost, and
-            // it is left at 800 deliberately — changing it moves every chunk boundary in the store
-            // and invalidates the vector index, which is an operator's call and not a side effect
-            // of a comment being wrong.
-            chunk_size: 800,
-            // ~50 tokens overlap for context continuity
-            overlap: 200,
-            // Don't create chunks smaller than ~50 tokens
-            min_chunk_size: 200,
+            // `chunk-audit --sweep` over 300 real memories against the real tokenizer, counting how
+            // many chunks exceed the 256-token window:
+            //
+            //     chunk_size   chunks   over   max tokens
+            //            400     2431      0          248
+            //            480     2046      2          269
+            //            640     1564     10          322
+            //            800     1278     58          412   <- the old value
+            //
+            // 400 is the only value with zero overflow, at 1.9x the vectors. 480 costs 1.6x and
+            // leaves 2 chunks in 2,046 (0.1%) spanning two windows. Since `minilm.rs` now pools
+            // across windows rather than truncating, an over-length chunk is blurred and not lost,
+            // so 0.1% buys a third of the index back. That trade is why this is 480 and not 400,
+            // and the table is here so the next person can pick differently with the same numbers
+            // instead of re-deriving them.
+            chunk_size: 480,
+            // Held at a quarter of chunk_size, the ratio the 800/200 pair used.
+            overlap: 120,
+            // Don't create chunks smaller than ~30 tokens
+            min_chunk_size: 120,
         }
     }
 }
