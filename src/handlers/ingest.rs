@@ -207,6 +207,9 @@ pub async fn ingest(
         }
     }
 
+    // Redact before the cap — same reasoning as handlers/remember.rs. This is a separate entry
+    // path to the same graph, and a control on one door is not a control.
+    crate::redaction::redact_entities(&mut merged_entities);
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
     }
