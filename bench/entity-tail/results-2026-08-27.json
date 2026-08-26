@@ -1,0 +1,95 @@
+{
+  "corpus_total": 4929,
+  "pool": 397,
+  "listed": 400,
+  "hit_at": 20,
+  "buckets": {
+    "head": {
+      "index_range": [
+        0,
+        7
+      ],
+      "probed": 60,
+      "tag_lookup_hits": 16,
+      "semantic_hits": 3,
+      "tag_lookup_rate": 0.2667,
+      "semantic_rate": 0.05,
+      "example_misses": [
+        "hook",
+        "scope:claude-code",
+        "hook",
+        "scope:claude-code",
+        "scope:claude-code",
+        "hook",
+        "hook",
+        "scope:claude-code"
+      ],
+      "selectivity": {
+        "tags": 2779,
+        "no_entity_record": 454,
+        "median_mentions": 1977,
+        "mean_mentions": 1985.2,
+        "share_on_100_plus": 0.7308,
+        "share_near_unique": 0.0219
+      }
+    },
+    "mid": {
+      "index_range": [
+        7,
+        25
+      ],
+      "probed": 60,
+      "tag_lookup_hits": 28,
+      "semantic_hits": 1,
+      "tag_lookup_rate": 0.4667,
+      "semantic_rate": 0.0167,
+      "example_misses": [
+        "memory",
+        "Claude",
+        "says",
+        "Claude",
+        "says",
+        "Claude",
+        "name",
+        "check"
+      ],
+      "selectivity": {
+        "tags": 7146,
+        "no_entity_record": 1828,
+        "median_mentions": 115.0,
+        "mean_mentions": 588.3,
+        "share_on_100_plus": 0.5196,
+        "share_near_unique": 0.0604
+      }
+    },
+    "tail": {
+      "index_range": [
+        25,
+        null
+      ],
+      "probed": 60,
+      "tag_lookup_hits": 17,
+      "semantic_hits": 2,
+      "tag_lookup_rate": 0.2833,
+      "semantic_rate": 0.0333,
+      "example_misses": [
+        "repositories",
+        "right",
+        "commitwork's",
+        "cite",
+        "2026-08-26",
+        "a21ab2c3-9534-41e8-aeaf-4ab2e39eff00",
+        "a21ab2c3-9534-41e8-aeaf-4ab2e39eff00",
+        "2026-08-26"
+      ],
+      "selectivity": {
+        "tags": 8459,
+        "no_entity_record": 1998,
+        "median_mentions": 106,
+        "mean_mentions": 644.7,
+        "share_on_100_plus": 0.5095,
+        "share_near_unique": 0.0337
+      }
+    }
+  }
+}
