@@ -1021,9 +1021,63 @@ fn print_ready_message(addr: SocketAddr) {
         }
     }
     eprintln!();
+    eprintln!("     Tenants:   {}", tenant_isolation_posture());
+    eprintln!();
     eprintln!("  Press Ctrl+C to stop");
     eprintln!();
     let _ = std::io::stderr().flush();
+}
+
+/// What tenant isolation is ACTUALLY doing in this binary, said out loud at every start.
+///
+/// Handlers call `resolve_request_user_id`, and a dozen doc comments say it "rejects a `user_id`
+/// that does not match the API key's tenant binding". That is true of the source and says nothing
+/// about the build: the binding is populated only by `attach_bound_user_to_request`, which is
+/// `#[cfg(feature = "multi-tenant")]`, and `multi-tenant` is **not** in `default`. Without it
+/// `authenticated_user` is always `None`, `resolve_request_user_id` returns whatever user_id the
+/// caller asked for, and the `cross_tenant_rejected` audit warning is unreachable code.
+///
+/// Found 2026-08-27 by reading the deployed binary rather than the source: `strings` on it has
+/// `cross_tenant_rejected` and neither `BOUND_USER_MISMATCH` nor `KeyUserBindings`. A check that is
+/// compiled, tested, and fed by nothing reads exactly like a check that works, which is why this
+/// line exists instead of another comment.
+///
+/// Single-tenant is a legitimate deployment and this is not a warning about it. It is a refusal to
+/// let the two regimes look identical from outside.
+fn tenant_isolation_posture() -> &'static str {
+    if cfg!(feature = "multi-tenant") {
+        "multi-tenant — API keys are bound to a user_id and a mismatch is refused"
+    } else {
+        "SINGLE-TENANT BUILD — any valid API key may name any user_id; per-handler \
+         tenant binding is compiled but never fed (build with --features multi-tenant to enforce)"
+    }
+}
+
+#[cfg(test)]
+mod tenant_posture_tests {
+    use super::tenant_isolation_posture;
+
+    #[test]
+    fn the_posture_line_tracks_the_feature_rather_than_asserting_one() {
+        let posture = tenant_isolation_posture();
+
+        if cfg!(feature = "multi-tenant") {
+            assert!(
+                posture.starts_with("multi-tenant"),
+                "multi-tenant build must say so, got: {posture}"
+            );
+        } else {
+            // The only failure that matters: a stock build claiming enforcement it does not have.
+            assert!(
+                posture.contains("SINGLE-TENANT"),
+                "a build without the feature must name itself single-tenant, got: {posture}"
+            );
+            assert!(
+                posture.contains("any valid API key may name any user_id"),
+                "the consequence must be stated, not implied, got: {posture}"
+            );
+        }
+    }
 }
 
 // =============================================================================
