@@ -4,12 +4,14 @@ Answers the operator's question of 2026-08-26. Grounded in veld at 0.7.39+15, re
 
 ## Why this has to happen on the way IN
 
-`delete_entity()` exists at `veld/src/graph_memory.rs:2267` and **is not exposed as a route**. The
-entity API is alias, attribute, merge, resolve, add, find, traverse, stats. There is no delete. And
-the forget path does not touch the graph, so removing a memory does not remove the entities it
-minted.
+When this was written, `delete_entity()` existed at `veld/src/graph_memory.rs:2267` and **was not
+exposed as a route** — the entity API was alias, attribute, merge, resolve, add, find, traverse,
+stats, with no delete at all. An entity was a one-way door, and that fact drove the whole design.
 
-**An entity is a one-way door.** Every other control is a preference; this one is the constraint.
+**That has since been fixed** (`DELETE /api/graph/entity/delete`, see Status). The reasoning still
+holds, for a narrower reason: the forget path still does not touch the graph, and the delete route
+is a REMEDIATION tool — one known id at a time, after the fact, and only if somebody notices. Entry
+remains the only place the decision is made by default.
 
 ## Where a secret can become an entity
 
@@ -61,9 +63,9 @@ which are identifying and were the only real hits in the corpus (7).
 filter with no output is indistinguishable from a filter nobody wired, which is this repo's most
 frequent defect. Never log the dropped string.
 
-**5. Expose `delete_entity` as a route.** Filtering only helps writes after the change. There are 20
-users of a live store whose graphs already contain whatever was minted before it. Without an exit
-there is no remediation path for anything already in there, and no way to act on a report.
+**5. Expose `delete_entity` as a route.** DONE — see Status. Filtering only helps writes after the
+change, and the store's graphs already contained whatever was minted before it. Without an exit
+there was no remediation path for any of it, and no way to act on a report.
 
 ## What this does NOT do, stated because a partial control presented as complete is the defect
 
@@ -75,8 +77,9 @@ there is no remediation path for anything already in there, and no way to act on
   output never does**, because it is the one payload that quotes credentials by design.
 - **`redactionCheck` is a caller-side refusal, not a server-side filter.** It matches `field:` and
   `field=` shapes, so a bare token in prose passes it. It is the first gate, not the only one.
-- **Nothing here cleans the existing graph.** That needs the delete route plus a sweep, and the
-  sweep needs a way to find candidates, which is the same two filters pointed at stored entities.
+- **Nothing here cleans the existing graph.** The delete route now makes cleaning POSSIBLE, but
+  nothing has been swept: that needs the classifiers pointed at stored entities, and a route is a
+  capability rather than a remediation.
 
 ## The cap is not the knob, and this is why
 
@@ -110,14 +113,29 @@ fail by name.
 UUIDs are exposed as `is_non_semantic_id()` and are **not** labelled `redacted:`, because nothing
 about a session id is confidential and saying so would put a false claim in the data.
 
-**NOT DONE, and both need an operator decision:**
+**DONE — the exit exists.** `DELETE /api/graph/entity/delete`, on the protected router so an API
+key is required, with `resolve_request_user_id` binding the request to the authenticated tenant and
+auditing a cross-tenant attempt. Deletion is by UUID, never by name: a name is user-controlled and
+can collide across tenants. A missing entity returns `deleted: false` rather than an error or a
+success, because "it is gone now" and "it was never here" are different facts. Every attempt is
+audited even when it removes nothing, since an attempt that finds nothing is the shape a probe
+makes. The entity NAME is deliberately not echoed into the event stream — this route's first use is
+removing a credential-shaped entity, and previewing it would move the disclosure rather than end it.
 
-1. **Expose `delete_entity` as a route.** Still the highest-value item. Redaction only protects
-   writes from now on; the existing graph holds whatever was minted before `0ab568a`, and there is
-   no API path to remove any of it.
-2. **Sweep the existing graph.** Needs the delete route plus the same classifiers pointed at stored
-   entities. The corpus scan says the yield would be small — zero live secrets, 7 home paths — but
-   "small" is a measurement of what these rules can see, not of what is there.
-3. **Decide on the UUID entities.** 216 of them, 4 acting as hubs that manufacture adjacency from a
-   scheduling coincidence. Dropping them changes graph topology, which is why the predicate ships
-   unwired.
+Three tests, and the load-bearing two read the router source: the route must be MOUNTED (a unit test
+on the handler would have passed for the entire time it was unreachable) and it must be mounted on
+the protected builder, not the public or probe one. Verified by unmounting it and watching both
+fail.
+
+**RULED — UUID entities are ALLOWED** (operator, 2026-08-26). They stay. `is_non_semantic_id()`
+remains informational, for reporting or read-time filtering, and must not be wired to a write-time
+drop without a new ruling. The hub effect is a known and accepted property, not an open defect.
+
+**NOT DONE:**
+
+1. **Sweep the existing graph.** Now unblocked by the delete route. Needs the classifiers pointed at
+   stored entities. The corpus scan says the yield would be small — zero live secrets, 7 home paths
+   — but "small" measures what these rules can see, not what is there.
+2. **Instrument recall against the entity tail.** The open question from the cap section: if graph
+   traversal never matches on a tail entity, the tail is pure cost and should be cut rather than
+   filtered. Needs measurement, not argument.

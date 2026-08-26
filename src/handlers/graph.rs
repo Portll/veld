@@ -191,6 +191,94 @@ pub async fn get_memory_universe(
     Ok(Json(universe))
 }
 
+/// Request body for `DELETE /api/graph/entity`.
+#[derive(Debug, Deserialize)]
+pub struct DeleteEntityRequest {
+    /// Owning tenant. Checked against the authenticated binding by
+    /// `resolve_request_user_id`, which rejects and audits a mismatch.
+    pub user_id: String,
+    /// The entity's UUID. Deletion is by id, never by name: a name can collide
+    /// across tenants and is user-controlled, an id cannot be guessed into.
+    pub entity_id: String,
+}
+
+/// Delete one entity from a tenant's graph.
+///
+/// WHY THIS ROUTE EXISTS. `graph_memory::delete_entity` has been implemented since the graph was
+/// built and was reachable from nothing. Every path that WRITES an entity was routed; the one that
+/// removes one was not. That made the entity namespace a one-way door: the forget path does not
+/// touch the graph either, so nothing that reached it could be removed through the API at all.
+/// Redaction (`crate::redaction`) stops new credential-shaped entities entering, but it cannot act
+/// on anything already stored, and without this route there was no remediation path for a report.
+///
+/// AUTH. Mounted on the protected router, so an API key is required before the handler is entered.
+/// Inside it, `resolve_request_user_id` binds the request to the authenticated tenant and refuses a
+/// cross-tenant `user_id` with an audited warning. The graph is resolved per user, so a caller
+/// cannot reach another tenant's entity even with a valid id.
+///
+/// HONEST RETURN. `delete_entity` returns false when the entity did not exist. That is reported as
+/// `deleted: false`, never as an error and never as a success: "it is gone now" and "it was never
+/// here" are different facts, and collapsing them is how a delete that silently did nothing gets
+/// read as a delete that worked.
+pub async fn delete_entity(
+    State(state): State<AppState>,
+    authenticated_user: Option<Extension<AuthenticatedUser>>,
+    Json(req): Json<DeleteEntityRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = resolve_request_user_id(
+        Some(&req.user_id),
+        authenticated_user.as_ref().map(|extension| &extension.0),
+    )?;
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+
+    let uuid = uuid::Uuid::parse_str(req.entity_id.trim()).map_err(|_| AppError::InvalidInput {
+        field: "entity_id".to_string(),
+        reason: "must be a UUID".to_string(),
+    })?;
+
+    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+    let graph_guard = graph.write();
+
+    let deleted = graph_guard
+        .delete_entity(&uuid)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
+    // Audited whether or not it removed anything. A deletion attempt is a security-relevant act
+    // even when it is a no-op, and an attempt that found nothing is the shape a probe makes.
+    info!(
+        audit = "entity_deleted",
+        user_id = %user_id,
+        entity_id = %uuid,
+        deleted,
+        "entity delete requested"
+    );
+
+    if deleted {
+        state.emit_event(MemoryEvent {
+            event_type: "ENTITY_DELETE".to_string(),
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.clone(),
+            memory_id: Some(uuid.to_string()),
+            // The entity NAME is deliberately not previewed. This route's first use is removing a
+            // credential-shaped entity, and echoing the name into the event stream would move the
+            // disclosure rather than end it.
+            content_preview: None,
+            memory_type: Some("graph".to_string()),
+            importance: None,
+            count: Some(1),
+            entities: None,
+            results: None,
+        });
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "deleted": deleted,
+        "entity_id": uuid.to_string(),
+        "user_id": user_id,
+    })))
+}
+
 /// DELETE /api/graph/{user_id}/clear - Clear all graph data for a user
 pub async fn clear_user_graph(
     State(state): State<AppState>,
@@ -369,4 +457,97 @@ pub async fn invalidate_relationship(
         "success": true,
         "message": "Relationship invalidated"
     })))
+}
+
+#[cfg(test)]
+mod delete_entity_route_tests {
+    use std::fs;
+    use std::path::Path;
+
+    fn router_src() -> String {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/router.rs");
+        fs::read_to_string(p).expect("router.rs must be readable")
+    }
+
+    const ROUTE: &str = "/api/graph/entity/delete";
+
+    /// The defect this route fixes is a function nobody could reach: `delete_entity` existed in
+    /// `graph_memory` since the graph was built and was routed from nothing. A unit test on the
+    /// handler would have passed the whole time it was unreachable, so the assertion that matters
+    /// is that it is MOUNTED.
+    #[test]
+    fn the_delete_route_is_mounted() {
+        let src = router_src();
+        assert!(
+            src.contains(ROUTE),
+            "{ROUTE} is not mounted — the handler is unreachable, which is the defect it exists \
+             to fix"
+        );
+        assert!(
+            src.contains(&format!("\"{ROUTE}\", delete(graph::delete_entity)")),
+            "{ROUTE} must be mounted as DELETE on graph::delete_entity"
+        );
+    }
+
+    /// AUTH, asserted structurally rather than trusted. The protected builder is where API-key
+    /// middleware is applied by the caller; the public and probe builders are not. A delete route
+    /// on either of those would be unauthenticated entity removal.
+    #[test]
+    fn the_delete_route_is_behind_auth_not_on_a_public_router() {
+        let src = router_src();
+        let protected_at = src
+            .find("pub fn build_protected_routes")
+            .expect("build_protected_routes must exist");
+        let route_at = src.find(ROUTE).expect("route must be mounted");
+        assert!(
+            route_at > protected_at,
+            "{ROUTE} is declared before build_protected_routes, so it sits on a public or probe \
+             router and entity deletion would be unauthenticated"
+        );
+
+        // And it must not appear in either unauthenticated builder's body.
+        let public_body = {
+            let a = src
+                .find("pub fn build_public_routes")
+                .expect("build_public_routes must exist");
+            &src[a..protected_at]
+        };
+        assert!(
+            !public_body.contains(ROUTE),
+            "{ROUTE} appears inside build_public_routes"
+        );
+        let probe_body = {
+            let a = src
+                .find("pub fn build_probe_routes")
+                .expect("build_probe_routes must exist");
+            let b = src
+                .find("pub fn build_public_routes")
+                .expect("build_public_routes must exist");
+            &src[a..b]
+        };
+        assert!(
+            !probe_body.contains(ROUTE),
+            "{ROUTE} appears inside build_probe_routes"
+        );
+    }
+
+    /// The handler must bind the request to the authenticated tenant. Without this, a valid API key
+    /// for tenant A could delete tenant B's entity by supplying B's user_id.
+    #[test]
+    fn the_handler_resolves_the_user_against_the_authenticated_binding() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers/graph.rs");
+        let src = fs::read_to_string(p).expect("graph.rs must be readable");
+        let at = src
+            .find("pub async fn delete_entity")
+            .expect("handler must exist");
+        let body = &src[at..at + 1200.min(src.len() - at)];
+        assert!(
+            body.contains("resolve_request_user_id"),
+            "delete_entity does not bind user_id to the authenticated tenant"
+        );
+        assert!(
+            body.contains("authenticated_user"),
+            "delete_entity does not take the authenticated user extension"
+        );
+    }
 }
