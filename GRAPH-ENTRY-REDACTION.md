@@ -169,9 +169,22 @@ property of the build — which is why the fix is not another test of the same k
 **NOT DONE:**
 
 1. ~~Sweep the existing graph.~~ **DONE — see "What the sweep found" below.**
-2. **Instrument recall against the entity tail.** The open question from the cap section: if graph
-   traversal never matches on a tail entity, the tail is pure cost and should be cut rather than
-   filtered. Needs measurement, not argument.
+2. ~~Instrument recall against the entity tail.~~ **MEASURED 2026-08-27 —
+   `docs/ENTITY-TAIL-FINDINGS-2026-08-27.md`. It refutes the guess in the cap section
+   below**, which is left standing above this line so the correction has something to correct.
+   The tail is **nineteen times more selective than the head** on median mention count (106 vs
+   1,977; 73.1% of head tags sit on 100+ of 4,929 memories). "Cut the tail hard" is wrong.
+   Position was the wrong axis: `truncate(50)` cuts by arrival order, which is uncorrelated with
+   worth, so on the 67.2% of records that hit the cap it keeps near-zero-information scope markers
+   and discards material likelier to be distinctive. **Ordering by `mention_count` before
+   truncating strictly dominates ordering by arrival, at the same cap and the same disclosure
+   surface.** That is the change the cap section was looking for, and the signal it needs already
+   exists on every entity.
+
+   Still open, and honestly so: whether a REAL query ever matches a tail entity cannot be observed,
+   because recall returns a score and no attribution of which tag matched. The probe measures
+   reachability, which is the upper bound on usefulness — a low number would have settled it, and
+   these are not low.
 
 ## What the sweep found
 
