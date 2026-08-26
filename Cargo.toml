@@ -139,6 +139,10 @@ name = "chunk-audit"
 path = "src/bin/chunk_audit.rs"
 
 [[bin]]
+name = "model-fetch"
+path = "src/bin/model_fetch.rs"
+
+[[bin]]
 name = "llm-eval"
 path = "src/bin/llm_eval.rs"
 

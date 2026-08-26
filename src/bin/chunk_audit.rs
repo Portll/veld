@@ -43,9 +43,18 @@ struct Args {
     #[arg(long)]
     tokenizer: PathBuf,
 
-    /// `MiniLMConfig::max_length`, the width past which `encode` silently drops tokens.
+    /// `MiniLMConfig::max_length`, the width past which a chunk needs more than one window.
     #[arg(long, default_value_t = 256)]
     max_length: usize,
+
+    /// Override `ChunkConfig::chunk_size` to test a candidate value. The shipped 800 is an
+    /// assumption (4 chars/token); this is how you find out what the corpus supports.
+    #[arg(long)]
+    chunk_size: Option<usize>,
+
+    /// Sweep chunk sizes and report the largest that fits every chunk in one window.
+    #[arg(long)]
+    sweep: bool,
 }
 
 fn main() -> Result<()> {
@@ -80,7 +89,46 @@ fn main() -> Result<()> {
     let records: Vec<&str> = raw.split('\u{1e}').map(str::trim).filter(|s| !s.is_empty()).collect();
     anyhow::ensure!(!records.is_empty(), "corpus parsed to 0 records — that is a failed read");
 
-    let config = ChunkConfig::default();
+    let mut config = ChunkConfig::default();
+    if let Some(size) = args.chunk_size {
+        // Keep overlap proportional to the shipped 800/200 ratio so the sweep varies one thing.
+        config.overlap = size / 4;
+        config.min_chunk_size = size / 4;
+        config.chunk_size = size;
+    }
+
+    if args.sweep {
+        println!("sweep: largest chunk_size whose every chunk fits {} tokens\n", args.max_length);
+        println!("  {:>10}  {:>8}  {:>8}  {:>9}", "chunk_size", "chunks", "over", "max tokens");
+        let mut best = None;
+        for size in [400usize, 480, 560, 640, 720, 800, 900, 1000] {
+            let cfg = ChunkConfig { chunk_size: size, overlap: size / 4, min_chunk_size: size / 4 };
+            let (mut n, mut over, mut worst) = (0usize, 0usize, 0usize);
+            for record in &records {
+                for chunk in chunk_text(record, &cfg).chunks {
+                    let len = tokenizer
+                        .encode(chunk.as_str(), true)
+                        .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+                        .get_ids()
+                        .len();
+                    n += 1;
+                    worst = worst.max(len);
+                    if len > args.max_length {
+                        over += 1;
+                    }
+                }
+            }
+            println!("  {size:>10}  {n:>8}  {over:>8}  {worst:>9}");
+            if over == 0 {
+                best = Some(size);
+            }
+        }
+        match best {
+            Some(size) => println!("\n  largest value with ZERO overflow: {size}"),
+            None => println!("\n  no swept value fits every chunk; the densest text needs a smaller chunk or more windows"),
+        }
+        return Ok(());
+    }
     let (mut chunks_total, mut over, mut records_affected, mut tokens_lost) = (0usize, 0usize, 0usize, 0usize);
     let mut lengths: Vec<usize> = Vec::new();
     let mut worst: Vec<(usize, f64, String)> = Vec::new();
@@ -138,7 +186,10 @@ fn main() -> Result<()> {
         100.0 * over as f64 / chunks_total as f64,
         100.0 * records_affected as f64 / records.len() as f64
     );
-    println!("  tokens dropped     {tokens_lost} — silently, with coverage_ratio() still reporting 1.0");
+    // Says "spilled", not "dropped". Since `minilm.rs` pools across windows these tokens are
+    // embedded, just in a second window that blurs into the chunk's mean. Leaving the old wording
+    // would have this tool reporting a loss that the fix it verifies has already removed.
+    println!("  tokens spilled     {tokens_lost} into a second window (embedded, not lost — pooled)");
 
     if !worst.is_empty() {
         println!("\n  densest offenders (tokens, chars/token, opening):");

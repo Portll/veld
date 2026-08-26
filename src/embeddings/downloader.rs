@@ -682,15 +682,43 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         let lib_name = "libonnxruntime.dylib";
 
+        // Match the REAL library, not the unversioned symlink that points at it.
+        //
+        // The macOS and Linux release tarballs ship both: `libonnxruntime.dylib` is a symlink to
+        // `libonnxruntime.1.23.2.dylib` (and `libonnxruntime.so` to `libonnxruntime.so.1.23.2`).
+        // The previous predicate — `ends_with(lib_name) || contains(lib_name)` — matched ONLY the
+        // symlink, because the versioned filename contains neither string. `entry.unpack()` then
+        // faithfully recreated a symlink whose relative target had not been extracted, and returned
+        // early, so the real library was never reached.
+        //
+        // The result was a broken link at exactly the path `get_onnx_runtime_path()` probes, so
+        // `is_onnx_runtime_downloaded()` reported false, `download_onnx_runtime` bailed with
+        // "Failed to extract ONNX Runtime", and the archive was deleted on the way out — making
+        // every retry re-download and re-fail identically. On this machine that had left the
+        // runtime, and therefore every model, permanently uninstalled, with the server silently
+        // serving hash-bigram vectors instead of embeddings.
+        //
+        // So: require a regular file, and match on the library STEM so a versioned name qualifies.
+        let lib_stem = lib_name.split('.').next().unwrap_or(lib_name);
+        let mut found = false;
         for entry in archive.entries()? {
             let mut entry = entry?;
+            let is_regular_file = entry.header().entry_type().is_file();
             let path = entry.path()?;
-            let name = path.to_string_lossy();
+            let file_name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
-            if name.ends_with(lib_name) || name.contains(lib_name) {
+            // e.g. libonnxruntime.dylib, libonnxruntime.1.23.2.dylib, libonnxruntime.so.1.23.2
+            let is_the_library = file_name.starts_with(lib_stem)
+                && (file_name.ends_with(".dylib") || file_name.contains(".so"));
+
+            if is_regular_file && is_the_library {
+                found = true;
                 let dest_path = dest_dir.join(lib_name);
                 entry.unpack(&dest_path)?;
-                tracing::info!("Extracted {}", lib_name);
+                tracing::info!("Extracted {} from {}", lib_name, file_name);
 
                 // macOS Gatekeeper blocks unsigned dylibs downloaded from the internet.
                 // Remove the quarantine xattr and ad-hoc sign so dlopen succeeds.
@@ -731,7 +759,17 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
             }
         }
 
-        anyhow::bail!("{} not found in archive", lib_name);
+        // Distinguish the two failures rather than reporting one. "Nothing matched" and "the only
+        // things that matched were symlinks" have different causes and different fixes, and the
+        // second is what actually happened here.
+        anyhow::ensure!(
+            !found,
+            "{lib_name}: matched entries in the archive but unpacking did not complete"
+        );
+        anyhow::bail!(
+            "no regular file named {lib_stem}*.dylib/.so in the archive — if the tarball layout \
+             changed, the symlink-only match this replaced would have reported success"
+        );
     }
 }
 
