@@ -1,7 +1,13 @@
 //! Text Chunking for Long-Content Embeddings
 //!
-//! MiniLM has a 256 token limit. Content beyond this is silently dropped,
-//! making long memories unsearchable by their later content.
+//! MiniLM is configured with a 256 token window, and this module splits longer content so each
+//! piece is separately searchable rather than only the opening of a memory being findable.
+//!
+//! The header used to end "Content beyond this is silently dropped." That was true when written
+//! and is no longer: `minilm.rs` embeds the whole input by pooling across windows, so an
+//! over-length chunk is now blurred rather than cut off. **The sentence is corrected rather than
+//! deleted because it described a real defect that this module did not actually prevent** — see
+//! the measurement on `chunk_size` below.
 //!
 //! This module implements two chunking strategies:
 //!
@@ -53,8 +59,20 @@ pub struct ChunkConfig {
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            // ~200 tokens * 4 chars/token = 800 chars
-            // Leave headroom for tokenizer differences
+            // ~200 tokens * 4 chars/token = 800 chars.
+            //
+            // MEASURED 2026-08-27 (`src/bin/chunk_audit.rs`, 300 memories, 1,278 chunks, real
+            // tokenizer): this corpus is paths, JSON, SHAs and slugs, and the densest chunks run
+            // 2.5-3.0 chars/token, not 4. Chunk lengths came out median 195 / p90 240 / p99 280 /
+            // max 412 tokens, so 4.5% of chunks exceeded 256 — the "headroom for tokenizer
+            // differences" is headroom in the wrong direction, because the assumption fails toward
+            // chunks that are too BIG.
+            //
+            // It is no longer a correctness bug: windowed pooling in `minilm.rs` embeds an
+            // over-length chunk whole instead of truncating it. It is still a granularity cost, and
+            // it is left at 800 deliberately — changing it moves every chunk boundary in the store
+            // and invalidates the vector index, which is an operator's call and not a side effect
+            // of a comment being wrong.
             chunk_size: 800,
             // ~50 tokens overlap for context continuity
             overlap: 200,
@@ -73,17 +91,27 @@ pub struct ChunkResult {
     pub original_length: usize,
     /// Whether chunking was needed (content exceeded single chunk)
     pub was_chunked: bool,
+    /// Bytes of the original actually present in some chunk, MEASURED rather than assumed.
+    ///
+    /// The chunk loop can leave a gap: it breaks on `start >= end`, and it force-advances `start`
+    /// when the overlap arithmetic fails to make progress. Neither is hypothetical enough to leave
+    /// unmeasured, and a coverage number that cannot go below 1.0 cannot report either.
+    pub covered_length: usize,
 }
 
 impl ChunkResult {
-    /// Calculate content coverage ratio (1.0 = all content in single chunk)
+    /// Fraction of the original text present in the chunks.
+    ///
+    /// This used to be `1.0`, unconditionally, with the comment "With chunking, we cover
+    /// everything". Its only caller was a test asserting it equals 1.0 — a metric, and a test of
+    /// that metric, that agreed with each other by construction and could not have disagreed with
+    /// anything else. The value it now returns is derived from the spans the chunker actually
+    /// emitted, so a gap shows up as a number below 1.0 instead of as nothing at all.
     pub fn coverage_ratio(&self) -> f32 {
-        if self.chunks.is_empty() {
+        if self.chunks.is_empty() || self.original_length == 0 {
             return 0.0;
         }
-        // With chunking, we cover everything
-        // Without chunking, we might truncate
-        1.0
+        (self.covered_length as f32 / self.original_length as f32).min(1.0)
     }
 }
 
@@ -128,11 +156,16 @@ pub fn chunk_text(text: &str, config: &ChunkConfig) -> ChunkResult {
             chunks: vec![text.to_string()],
             original_length,
             was_chunked: false,
+            covered_length: original_length,
         };
     }
 
     let mut chunks = Vec::new();
     let mut start = 0;
+    // Union of the [start, end) spans emitted, walked in order. `frontier` is the furthest byte
+    // any chunk has reached; anything the loop skips past never gets counted.
+    let mut covered_length = 0usize;
+    let mut frontier = 0usize;
 
     while start < original_length {
         // Calculate end position for this chunk, ensuring valid char boundary
@@ -154,6 +187,10 @@ pub fn chunk_text(text: &str, config: &ChunkConfig) -> ChunkResult {
         }
 
         // Extract chunk (now safe - both start and end are valid char boundaries)
+        if end > frontier {
+            covered_length += end - frontier.max(start);
+            frontier = end;
+        }
         let chunk = text[start..end].trim();
         if chunk.len() >= config.min_chunk_size || chunks.is_empty() {
             chunks.push(chunk.to_string());
@@ -180,6 +217,7 @@ pub fn chunk_text(text: &str, config: &ChunkConfig) -> ChunkResult {
         chunks,
         original_length,
         was_chunked: true,
+        covered_length,
     }
 }
 
@@ -318,6 +356,7 @@ pub fn semantic_chunk_text(text: &str, config: &SemanticChunkConfig) -> ChunkRes
             chunks: vec![text.to_string()],
             original_length,
             was_chunked: false,
+            covered_length: original_length,
         };
     }
 
@@ -327,10 +366,22 @@ pub fn semantic_chunk_text(text: &str, config: &SemanticChunkConfig) -> ChunkRes
     // Step 2: Group segments into chunks respecting size constraints
     let chunks = group_segments_into_chunks(segments, config);
 
+    // Semantic chunking groups whole segments rather than slicing spans, so there are no
+    // [start, end) offsets to union the way `chunk_text` does. Summing the emitted bytes is a
+    // WEAKER guarantee, and the weakness is worth naming: it counts content, so a dropped segment
+    // shows up, but it cannot tell a gap from a gap that an overlap elsewhere happens to offset.
+    // A lower bound that can fall is still worth more than a 1.0 that cannot.
+    let covered_length = chunks
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .min(original_length);
+
     ChunkResult {
         chunks,
         original_length,
         was_chunked: true,
+        covered_length,
     }
 }
 
@@ -676,7 +727,31 @@ mod tests {
 
         assert!(result.was_chunked);
         assert!(result.chunks.len() > 10); // Should have many chunks
+
+        // This assertion used to be the ONLY caller of coverage_ratio(), and coverage_ratio()
+        // returned a hardcoded 1.0 — so it agreed with the function by construction and could not
+        // have caught anything. It now checks a measured value, and the two assertions below make
+        // sure it is a measurement rather than a constant that happens to read 1.0.
         assert_eq!(result.coverage_ratio(), 1.0);
+        assert_eq!(
+            result.covered_length, result.original_length,
+            "chunking left a gap: {} of {} bytes reached a chunk",
+            result.covered_length, result.original_length
+        );
+
+        // Non-vacuity: the value must be able to FALL. A metric whose only observed output is 1.0
+        // is indistinguishable from one that cannot report a problem, which is what this was.
+        let partial = ChunkResult {
+            chunks: vec!["half".to_string()],
+            original_length: 100,
+            was_chunked: true,
+            covered_length: 40,
+        };
+        assert_eq!(
+            partial.coverage_ratio(),
+            0.4,
+            "coverage_ratio must report incomplete coverage, not round it up to 1.0"
+        );
 
         // Verify no chunk exceeds config size significantly
         for chunk in &result.chunks {

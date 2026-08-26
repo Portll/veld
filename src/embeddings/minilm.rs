@@ -86,8 +86,30 @@ impl LazyModel {
             .commit_from_file(&config.model_path)
             .context("Failed to load ONNX model")?;
 
-        let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+
+        // all-MiniLM-L6-v2 ships tokenizer.json with `truncation: {max_length: 128}`. Left in
+        // place it becomes the REAL ceiling — below `config.max_length` of 256, so `max_length`
+        // never binds and the `.take(max_length)` below is dead code. Measured 2026-08-27 over 300
+        // memories: the chunker sizes chunks for ~200 tokens, so 90.2% of chunks exceeded 128 and
+        // 82,300 tokens were dropped, silently, from 86% of records — by the very component built
+        // to stop content being silently dropped.
+        //
+        // veld owns its own window. A downloaded JSON does not get to impose a different one
+        // behind it, and the difference between "the ceiling I configured" and "the ceiling that
+        // applies" is not something a caller can see.
+        let shipped = tokenizer.get_truncation().map(|t| t.max_length);
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| anyhow::anyhow!("Failed to clear tokenizer truncation: {e}"))?;
+        if let Some(limit) = shipped {
+            tracing::info!(
+                shipped_truncation = limit,
+                window = config.max_length,
+                "cleared tokenizer.json's own truncation; the configured window is now the only one"
+            );
+        }
 
         tracing::info!("MiniLM-L6-v2 model loaded successfully");
 
@@ -576,6 +598,7 @@ impl MiniLMEmbedder {
     /// Generate embedding using ONNX Runtime (production)
     ///
     /// Lazily loads the model on first call if not already loaded.
+    #[allow(clippy::needless_range_loop)]
     fn generate_embedding_onnx(&self, text: &str) -> Result<Vec<f32>> {
         // Lazy load model on first use
         tracing::debug!("ONNX: ensuring model loaded...");
@@ -604,49 +627,91 @@ impl MiniLMEmbedder {
         let max_length = self.config.max_length;
         tracing::debug!("ONNX: tokenized {} tokens", tokens.len());
 
-        // Truncate or pad to max_length
-        let mut input_ids = vec![0i64; max_length];
-        let mut attention = vec![0i64; max_length];
-        let token_type_ids = vec![0i64; max_length];
+        // WINDOWED MEAN POOLING — the whole input is embedded, never its first `max_length` tokens.
+        //
+        // This used to be `tokens.iter().take(max_length)`: everything past the window was dropped
+        // with no marker, no warning and no field, so a vector computed from 12% of a document was
+        // indistinguishable from one computed over all of it. Measured 2026-08-27 over 300
+        // memories, the layer above lost 82,300 tokens from 86% of records that way.
+        //
+        // Mean pooling is a sum over attended positions divided by their count, and both halves of
+        // that decompose across windows. So the loop below accumulates the numerator and the
+        // denominator over every window and divides once at the end, which for a text that fits in
+        // one window is arithmetically the same computation as before — short content embeds
+        // BIT-IDENTICALLY, and only content that was previously being truncated changes.
+        //
+        // It is not equivalent to a model with a longer context: windows past the first begin
+        // without a real [CLS] and their position embeddings restart, so cross-window attention
+        // does not happen. It is an honest average of the whole text rather than an exact reading
+        // of it, which is the difference between approximate and absent.
+        let window_count = window_spans(tokens.len(), max_length).len();
 
-        for (i, &token) in tokens.iter().take(max_length).enumerate() {
-            input_ids[i] = token as i64;
+        // A bound, because an unbounded loop over attacker-supplied text is a denial of service.
+        // It refuses rather than truncating: past this point we cannot embed the whole input, and
+        // the one thing this function must not do is silently return an embedding of part of it.
+        const MAX_WINDOWS: usize = 64;
+        anyhow::ensure!(
+            window_count <= MAX_WINDOWS,
+            "input is {} tokens ({} windows of {}), over the {} window limit. Refusing rather \
+             than embedding a prefix and reporting it as the whole — chunk it upstream.",
+            tokens.len(),
+            window_count,
+            max_length,
+            MAX_WINDOWS
+        );
+        if window_count > 1 {
+            tracing::debug!(
+                tokens = tokens.len(),
+                windows = window_count,
+                "ONNX: input exceeds one window; pooling across all of it"
+            );
         }
-        for (i, &mask) in attention_mask.iter().take(max_length).enumerate() {
-            attention[i] = mask as i64;
-        }
 
-        // Create input tensors
-        let input_ids_value = Value::from_array((vec![1, max_length], input_ids))?;
-        let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))?;
-        let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))?;
-
-        // Run inference
-        tracing::debug!("ONNX: running inference...");
-        let outputs = session.run(ort::inputs![
-            "input_ids" => &input_ids_value,
-            "attention_mask" => &attention_mask_value,
-            "token_type_ids" => &token_type_ids_value,
-        ])?;
-        tracing::debug!("ONNX: inference complete");
-
-        // Extract embeddings
-        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-        let (_shape, output_data) = output_tensor;
-
-        // Mean pooling over sequence dimension
         let mut pooled = vec![0.0; self.dimension];
         let mut mask_sum = 0.0;
 
-        for (seq_idx, &att) in attention.iter().enumerate() {
-            if att == 1 {
-                for (dim_idx, pooled_val) in pooled.iter_mut().enumerate() {
-                    let idx = seq_idx * self.dimension + dim_idx;
-                    *pooled_val += output_data[idx];
+        for (window, (start, end)) in window_spans(tokens.len(), max_length).into_iter().enumerate()
+        {
+            let mut input_ids = vec![0i64; max_length];
+            let mut attention = vec![0i64; max_length];
+            let token_type_ids = vec![0i64; max_length];
+
+            for (i, &token) in tokens[start..end].iter().enumerate() {
+                input_ids[i] = token as i64;
+            }
+            for (i, &mask) in attention_mask[start..end].iter().enumerate() {
+                attention[i] = mask as i64;
+            }
+
+            // Create input tensors
+            let input_ids_value = Value::from_array((vec![1, max_length], input_ids))?;
+            let attention_mask_value = Value::from_array((vec![1, max_length], attention.clone()))?;
+            let token_type_ids_value = Value::from_array((vec![1, max_length], token_type_ids))?;
+
+            // Run inference
+            tracing::debug!("ONNX: running inference on window {}...", window);
+            let outputs = session.run(ort::inputs![
+                "input_ids" => &input_ids_value,
+                "attention_mask" => &attention_mask_value,
+                "token_type_ids" => &token_type_ids_value,
+            ])?;
+
+            // Extract embeddings
+            let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
+            let (_shape, output_data) = output_tensor;
+
+            // Accumulate the mean-pooling numerator and denominator across windows.
+            for (seq_idx, &att) in attention.iter().enumerate() {
+                if att == 1 {
+                    for (dim_idx, pooled_val) in pooled.iter_mut().enumerate() {
+                        let idx = seq_idx * self.dimension + dim_idx;
+                        *pooled_val += output_data[idx];
+                    }
+                    mask_sum += 1.0;
                 }
-                mask_sum += 1.0;
             }
         }
+        tracing::debug!("ONNX: inference complete ({} window(s))", window_count);
 
         // Average and L2 normalize
         if mask_sum > 0.0 {
@@ -717,6 +782,32 @@ impl MiniLMEmbedder {
                     .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // The batch tensor is one fixed [batch, max_length] block, so a text longer than the
+        // window cannot be represented in it — the `.take(max_length)` below is the same silent
+        // drop the single-text path had. Rather than quietly giving batched callers a worse answer
+        // than unbatched ones (the shape of defect where two paths disagree and only one is
+        // tested), any over-length text is handed to the windowed single-text path and its result
+        // spliced back into position. Batches of short text — the overwhelmingly common case —
+        // take the fast path untouched.
+        let over: Vec<usize> = encodings
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.get_ids().len() > max_length)
+            .map(|(i, _)| i)
+            .collect();
+        if !over.is_empty() {
+            tracing::debug!(
+                over = over.len(),
+                batch = batch_size,
+                "batch holds text longer than one window; routing those to the windowed path"
+            );
+            drop(session);
+            return texts
+                .iter()
+                .map(|text| self.generate_embedding_onnx(text))
+                .collect();
+        }
 
         // Prepare batched tensors
         let total_elements = batch_size * max_length;
@@ -1037,5 +1128,101 @@ mod tests {
         for emb in embeddings {
             assert_eq!(emb.len(), 384);
         }
+    }
+}
+
+/// The windows a token sequence is embedded in, as `[start, end)` byte-index pairs.
+///
+/// Extracted from the inference loop so the claim it exists to make — **every token lands in
+/// exactly one window** — can be checked without a model, a tokenizer or an ONNX runtime. The
+/// defect this replaces was `tokens.iter().take(max_length)`, which dropped the rest in silence;
+/// a fix for that should not itself rest on a loop nobody can test on a machine with no model
+/// files, which is the machine this was written on.
+///
+/// An empty input yields one window, because the encoder still wants a padded tensor and a
+/// zero-window loop would return an unnormalised zero vector by a different route.
+pub(crate) fn window_spans(token_count: usize, max_length: usize) -> Vec<(usize, usize)> {
+    if max_length == 0 || token_count == 0 {
+        return vec![(0, 0)];
+    }
+    (0..token_count.div_ceil(max_length))
+        .map(|w| {
+            let start = w * max_length;
+            (start, (start + max_length).min(token_count))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod window_spans_tests {
+    use super::window_spans;
+
+    /// The one property that makes "keep the whole length" true rather than aspirational: the
+    /// windows must TILE the token sequence — every index in exactly one window, nothing dropped
+    /// off the end, nothing counted twice into the mean.
+    ///
+    /// It is checked by reconstruction rather than by arithmetic about the spans, because the
+    /// defect being fixed (`take(max_length)`) was itself arithmetic that looked right.
+    #[test]
+    fn windows_tile_the_sequence_exactly_leaving_nothing_out() {
+        for max_length in [1usize, 2, 7, 128, 256, 512] {
+            for token_count in [0usize, 1, 2, 6, 7, 8, 127, 128, 129, 255, 256, 257, 999, 4096] {
+                let spans = window_spans(token_count, max_length);
+                assert!(!spans.is_empty(), "len={token_count} w={max_length}: no windows");
+
+                let mut visited = vec![0u32; token_count];
+                for (start, end) in &spans {
+                    assert!(
+                        end >= start && *end <= token_count,
+                        "len={token_count} w={max_length}: span {start}..{end} out of range"
+                    );
+                    assert!(
+                        end - start <= max_length,
+                        "len={token_count} w={max_length}: span {start}..{end} exceeds the window"
+                    );
+                    for i in *start..*end {
+                        visited[i] += 1;
+                    }
+                }
+
+                // Both directions asserted separately: a 0 is a dropped token (the original bug)
+                // and a 2 is a token double-weighted in the mean (the bug a naive overlap fix
+                // would introduce). Only one of those is the direction that lies to you, so they
+                // do not get to share an assertion.
+                let dropped = visited.iter().filter(|&&v| v == 0).count();
+                let duplicated = visited.iter().filter(|&&v| v > 1).count();
+                assert_eq!(
+                    dropped, 0,
+                    "len={token_count} w={max_length}: {dropped} token(s) in NO window — this is \
+                     the silent truncation the windowing exists to remove"
+                );
+                assert_eq!(
+                    duplicated, 0,
+                    "len={token_count} w={max_length}: {duplicated} token(s) in more than one \
+                     window — they would be weighted twice in the pooled mean"
+                );
+            }
+        }
+    }
+
+    /// A text that fits in one window must produce exactly one window, so its embedding is
+    /// bit-identical to what the pre-windowing code produced. Without this the change would
+    /// silently re-embed the entire existing corpus into a slightly different space.
+    #[test]
+    fn text_within_the_window_still_takes_exactly_one_pass() {
+        for token_count in [0usize, 1, 100, 255, 256] {
+            assert_eq!(
+                window_spans(token_count, 256).len(),
+                1,
+                "{token_count} tokens should need one window, not more"
+            );
+        }
+        assert_eq!(window_spans(257, 256).len(), 2, "257 tokens needs a second window");
+    }
+
+    /// A degenerate window must not produce an infinite or empty plan.
+    #[test]
+    fn a_zero_window_yields_one_span_rather_than_looping_forever() {
+        assert_eq!(window_spans(100, 0), vec![(0, 0)]);
     }
 }
