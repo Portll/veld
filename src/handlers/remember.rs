@@ -521,6 +521,25 @@ pub async fn remember(
         }
     }
 
+    // Redact BEFORE the cap. An entity is a one-way door — delete_entity() is not routed and the
+    // forget path does not touch the graph — so this is the only point the decision can be made.
+    // Order matters twice over: filtering after truncate would mean a credential had already
+    // displaced a legitimate entity, and the cap cuts by arrival order rather than by relevance.
+    let redaction = crate::redaction::redact_entities(&mut merged_entities);
+    if redaction.total() > 0 {
+        // Counts and classes only. The value is never logged — that would move the disclosure from
+        // the graph into the log, which is not a fix.
+        tracing::info!(
+            key = redaction.key,
+            private_key = redaction.private_key,
+            token = redaction.token,
+            login = redaction.login,
+            secret = redaction.secret,
+            path = redaction.path,
+            "Redacted credential-shaped entities before graph entry"
+        );
+    }
+
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         tracing::debug!(
             count = merged_entities.len(),
@@ -1182,6 +1201,7 @@ pub async fn batch_remember(
                     merged.push(keyword);
                 }
             }
+            crate::redaction::redact_entities(&mut merged);
             if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
                 tracing::debug!(
                     batch_index = index,
@@ -1193,7 +1213,12 @@ pub async fn batch_remember(
             }
             (merged, ner_records)
         } else {
-            (item.tags.clone(), Vec::new())
+            // The extraction branch is skipped here, so this path would otherwise reach the graph
+            // with no redaction at all — a bypass that exists precisely when the cheap path is
+            // taken. Submitted tags are still tags, and a caller can put a key in one.
+            let mut plain = item.tags.clone();
+            crate::redaction::redact_entities(&mut plain);
+            (plain, Vec::new())
         };
 
         let context = build_rich_context(
@@ -1638,6 +1663,7 @@ pub async fn upsert_memory(
             merged_entities.push(keyword);
         }
     }
+    crate::redaction::redact_entities(&mut merged_entities);
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         tracing::debug!(
             count = merged_entities.len(),
