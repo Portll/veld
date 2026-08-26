@@ -131,6 +131,10 @@ name = "veld-keyctl"
 path = "src/bin/veld_keyctl.rs"
 
 [[bin]]
+name = "graph-sweep"
+path = "src/bin/graph_sweep.rs"
+
+[[bin]]
 name = "llm-eval"
 path = "src/bin/llm_eval.rs"
 

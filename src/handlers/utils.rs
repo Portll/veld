@@ -374,6 +374,29 @@ mod resolve_request_user_id_tests {
 
         assert_eq!(error.code(), "INVALID_INPUT");
     }
+
+    /// The branch that actually runs, which had no test.
+    ///
+    /// The three tests above pass `Some(&authenticated_user)` or `(None, None)`. An
+    /// `AuthenticatedUser` extension is inserted only by `attach_bound_user_to_request`, which is
+    /// `#[cfg(feature = "multi-tenant")]`, and `multi-tenant` is not in `default` — so on a stock
+    /// build the argument is ALWAYS `None` and every request takes this path. The suite was green
+    /// over the one branch the shipped binary can reach, and silent about it.
+    ///
+    /// This asserts the behaviour rather than approving of it: a caller-supplied user_id passes
+    /// through unchallenged, so "the handler binds user_id to the authenticated tenant" describes
+    /// the source and not a stock deployment. If someone makes the fallthrough refuse, this test
+    /// fails and the several doc comments that assume isolation get revisited with it.
+    #[test]
+    fn without_a_binding_the_callers_user_id_passes_through_unchallenged() {
+        let resolved = resolve_request_user_id(Some("someone-elses-tenant"), None)
+            .expect("a stock build accepts any user_id");
+
+        assert_eq!(
+            resolved, "someone-elses-tenant",
+            "the caller's user_id is used verbatim when no tenant binding is compiled in"
+        );
+    }
 }
 
 /// Check if content is a bare question (not worth storing as memory).
