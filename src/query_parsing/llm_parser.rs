@@ -1,6 +1,7 @@
 //! LLM-Based Query Parser
 //!
-//! Uses a local LLM server (Ollama, LM Studio, etc.) via HTTP API for query parsing.
+//! Uses a local LLM server via the OpenAI HTTP API. Which servers, and their default ports, are
+//! declared once in `manifests/llm-hosts.json` — see `crate::llm_hosts`.
 //! Provides better temporal reasoning and entity extraction than rule-based.
 
 use super::parser_trait::*;
@@ -10,34 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// LLM-based query parser using a local HTTP API (Ollama, LM Studio, etc.)
+/// LLM-based query parser speaking the OpenAI HTTP API to any declared host.
 pub struct LlmParser {
     client: reqwest::blocking::Client,
     endpoint: String,
     model: String,
-    api_type: ApiType,
     generation_lock: Mutex<()>,
-}
-
-/// Request format for Ollama API
-#[derive(Debug, Serialize)]
-struct OllamaRequest {
-    model: String,
-    prompt: String,
-    stream: bool,
-    options: OllamaOptions,
-}
-
-#[derive(Debug, Serialize)]
-struct OllamaOptions {
-    temperature: f32,
-    num_predict: i32,
-}
-
-/// Response format from Ollama API
-#[derive(Debug, Deserialize)]
-struct OllamaResponse {
-    response: String,
 }
 
 /// Request format for OpenAI-compatible APIs (LM Studio, vLLM, etc.)
@@ -107,28 +86,19 @@ struct LlmRelativeRef {
     direction: String,
 }
 
-/// API type for the LLM server
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ApiType {
-    /// Ollama API (default)
-    #[default]
-    Ollama,
-    /// OpenAI-compatible API (LM Studio, vLLM, text-generation-webui, etc.)
-    OpenAI,
-}
+// `ApiType` is gone. It had two variants and ollama was `#[default]`, so `LlmParser::new()`
+// constructed an ollama client while `from_env()` defaulted to openai — two different defaults for
+// the same thing, in the same file. Every host in `manifests/llm-hosts.json` speaks the OpenAI HTTP
+// API, which is what makes a host a row in a declaration rather than a branch here. Removed
+// 2026-08-27 on operator instruction; the removal is recorded in that declaration with its reason.
 
 impl LlmParser {
-    /// Create a new LLM parser with Ollama backend
+    /// Create a new LLM parser against any OpenAI-compatible host.
     ///
     /// # Arguments
-    /// * `endpoint` - Base URL (e.g., "http://localhost:11434" for Ollama)
-    /// * `model` - Model name (e.g., "qwen2.5:1.5b", "llama3.2:1b")
+    /// * `endpoint` - Base URL, e.g. `http://127.0.0.1:8080` (llama.cpp) or `:1234` (LM Studio)
+    /// * `model` - Model identifier as the server names it
     pub fn new(endpoint: &str, model: &str) -> Self {
-        Self::with_api_type(endpoint, model, ApiType::Ollama)
-    }
-
-    /// Create a new LLM parser with specified API type
-    pub fn with_api_type(endpoint: &str, model: &str, api_type: ApiType) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -138,31 +108,43 @@ impl LlmParser {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model: model.to_string(),
-            api_type,
             generation_lock: Mutex::new(()),
         }
     }
 
-    /// Create an LLM parser from environment variables.
+    /// Create an LLM parser from environment.
     ///
     /// Reads:
-    /// - `VELD_LLM_URL`      — base URL (default: `http://localhost:1234` for LM Studio)
-    /// - `VELD_LLM_MODEL`    — model identifier (default: `qwq-32b-preview`)
-    /// - `VELD_LLM_API_TYPE` — `openai` or `ollama` (default: `openai`)
+    /// - `VELD_LLM_URL`   — base URL. Defaults to the declared default host's URL
+    ///   (`manifests/llm-hosts.json`), NOT to a literal written here. A port hardcoded in source
+    ///   is how eight copies of `127.0.0.1:1234` ended up across three repositories.
+    /// - `VELD_LLM_HOST`  — a declared host id (`llama.cpp`, `lmstudio`, …) instead of a URL.
+    ///   Its own `VELD_LLM_URL_<ID>` override still applies.
+    /// - `VELD_LLM_MODEL` — model identifier as the server names it.
+    ///
+    /// `VELD_LLM_API_TYPE` is gone with ollama: every declared host speaks the OpenAI API.
     pub fn from_env() -> Self {
-        let endpoint = std::env::var("VELD_LLM_URL")
-            .unwrap_or_else(|_| "http://localhost:1234".to_string());
+        let decl = crate::llm_hosts::declaration();
+        let endpoint = std::env::var("VELD_LLM_URL").unwrap_or_else(|_| {
+            let id = std::env::var("VELD_LLM_HOST").unwrap_or_else(|_| decl.default.clone());
+            match crate::llm_hosts::host(&id) {
+                Some(h) => h.base_url(),
+                None => {
+                    // Fail loudly-ish: an unknown id is a config error, and falling through to the
+                    // default silently would make a typo look like a working configuration.
+                    tracing::warn!(
+                        requested = %id,
+                        "VELD_LLM_HOST names no declared host; using the declared default"
+                    );
+                    crate::llm_hosts::host(&decl.default)
+                        .expect("the declaration's own default must exist")
+                        .base_url()
+                }
+            }
+        });
         let model = std::env::var("VELD_LLM_MODEL")
             .unwrap_or_else(|_| "qwq-32b-preview".to_string());
-        let api_type = match std::env::var("VELD_LLM_API_TYPE")
-            .unwrap_or_else(|_| "openai".to_string())
-            .to_lowercase()
-            .as_str()
-        {
-            "ollama" => ApiType::Ollama,
-            _ => ApiType::OpenAI,
-        };
-        Self::with_api_type(&endpoint, &model, api_type)
+        Self::new(&endpoint, &model)
     }
 
     /// Build the prompt for query parsing
@@ -182,38 +164,6 @@ Parse this query: "{query}"
 Output this exact JSON structure:
 {{"entities":[{{"text":"name","type":"person|place|thing|event|time","negated":false}}],"events":["verb"],"modifiers":["adjective"],"temporal":{{"has_temporal_intent":true,"intent":"when_question|specific_time|ordering|duration|none","relative_refs":[{{"text":"last year","resolved_date":"2024-01-01","direction":"past"}}],"resolved_dates":["2024-01-01"]}},"is_attribute_query":false,"attribute_entity":null,"attribute_name":null,"confidence":0.9}}"#
         )
-    }
-
-    /// Generate using Ollama API
-    fn generate_ollama(&self, prompt: &str) -> Result<String, String> {
-        let request = OllamaRequest {
-            model: self.model.clone(),
-            prompt: prompt.to_string(),
-            stream: false,
-            options: OllamaOptions {
-                temperature: 0.1,
-                num_predict: 512,
-            },
-        };
-
-        let url = format!("{}/api/generate", self.endpoint);
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("API returned status: {}", response.status()));
-        }
-
-        let ollama_response: OllamaResponse = response
-            .json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        Ok(ollama_response.response)
     }
 
     /// Generate using OpenAI-compatible API
@@ -252,24 +202,14 @@ Output this exact JSON structure:
             .ok_or_else(|| "No response from API".to_string())
     }
 
-    /// Generate using the configured API type, with fallback to the other on error.
+    /// Generate against the configured host.
+    ///
+    /// There is no longer a second API to fall back to, and the old fallback was worse than
+    /// nothing: it tried the OTHER protocol against the SAME endpoint, so a real failure from the
+    /// configured server was followed by a request that could only fail differently, and the error
+    /// the caller saw came from the protocol it had not asked for.
     fn generate(&self, prompt: &str) -> Result<String, String> {
-        match self.api_type {
-            ApiType::OpenAI => {
-                // Try OpenAI-compatible first (LM Studio / vLLM), fall back to Ollama
-                if let Ok(response) = self.generate_openai(prompt) {
-                    return Ok(response);
-                }
-                self.generate_ollama(prompt)
-            }
-            ApiType::Ollama => {
-                // Try Ollama first, fall back to OpenAI-compatible
-                if let Ok(response) = self.generate_ollama(prompt) {
-                    return Ok(response);
-                }
-                self.generate_openai(prompt)
-            }
-        }
+        self.generate_openai(prompt)
     }
 
     /// Parse the LLM output JSON into ParsedQuery
@@ -369,20 +309,16 @@ Output this exact JSON structure:
         }
     }
 
-    /// Check if the LLM server is reachable
+    /// Is a server reachable at the configured endpoint?
+    ///
+    /// One probe, not two. The ollama `/api/tags` attempt is gone, and with it the case where a
+    /// server that answers `/api/tags` but not `/v1/models` was reported AVAILABLE and then failed
+    /// every actual generation — the probe and the thing it predicted disagreed.
+    ///
+    /// A success here says an OpenAI-compatible server is listening. It does NOT say which one:
+    /// llama.cpp, llamafile, LocalAI and mlx-lm all default to :8080 and answer identically. See
+    /// `llm_hosts::identify_by_port`, which returns `None` for a shared port rather than guessing.
     pub fn is_server_available(&self) -> bool {
-        // Try Ollama health check
-        if self
-            .client
-            .get(format!("{}/api/tags", self.endpoint))
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-
-        // Try OpenAI-compatible models endpoint
         self.client
             .get(format!("{}/v1/models", self.endpoint))
             .send()
