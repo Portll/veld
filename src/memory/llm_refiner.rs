@@ -33,7 +33,7 @@
 //!
 //! Targets the OpenAI-compatible chat-completions API surface (the same
 //! contract used by `HttpLlmConsolidator`). Compatible hosts: OpenAI,
-//! Anthropic via proxy, Ollama, vLLM, LM Studio.
+//! Anthropic via proxy, and any host declared in `manifests/llm-hosts.json`.
 
 use std::collections::HashMap;
 use std::time::Duration;

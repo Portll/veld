@@ -23,7 +23,7 @@ mod llm_parser;
 mod parser_trait;
 mod rule_based;
 
-pub use llm_parser::{ApiType, LlmParser};
+pub use llm_parser::LlmParser;
 pub use parser_trait::*;
 pub use rule_based::RuleBasedParser;
 
@@ -48,8 +48,6 @@ pub struct ParserConfig {
     pub llm_endpoint: Option<String>,
     /// Model identifier (only used if parser_type is Llm)
     pub llm_model: Option<String>,
-    /// API type for the LLM server (only used if parser_type is Llm)
-    pub llm_api_type: ApiType,
 }
 
 impl Default for ParserConfig {
@@ -58,7 +56,6 @@ impl Default for ParserConfig {
             parser_type: ParserType::RuleBased,
             llm_endpoint: None,
             llm_model: None,
-            llm_api_type: ApiType::OpenAI,
         }
     }
 }
@@ -70,12 +67,11 @@ impl ParserConfig {
     }
 
     /// Create config for LLM parser with explicit endpoint and model
-    pub fn llm(endpoint: impl Into<String>, model: impl Into<String>, api_type: ApiType) -> Self {
+    pub fn llm(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             parser_type: ParserType::Llm,
             llm_endpoint: Some(endpoint.into()),
             llm_model: Some(model.into()),
-            llm_api_type: api_type,
         }
     }
 
@@ -85,7 +81,6 @@ impl ParserConfig {
             parser_type: ParserType::Llm,
             llm_endpoint: None,
             llm_model: None,
-            llm_api_type: ApiType::OpenAI, // from_env() on LlmParser will read VELD_LLM_API_TYPE
         }
     }
 }
@@ -97,7 +92,7 @@ pub fn create_parser(config: ParserConfig) -> Arc<dyn QueryParser> {
         ParserType::Llm => {
             let parser = match (config.llm_endpoint, config.llm_model) {
                 (Some(endpoint), Some(model)) => {
-                    LlmParser::with_api_type(&endpoint, &model, config.llm_api_type)
+                    LlmParser::new(&endpoint, &model)
                 }
                 _ => LlmParser::from_env(),
             };

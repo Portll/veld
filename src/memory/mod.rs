@@ -653,7 +653,7 @@ impl MemorySystem {
         // competitive retrieval. The local Nomic ONNX model is the PRIMARY now,
         // so it is not re-used here — the secondary slot is for HTTP / Zenoh peers.
         let secondary: Option<Arc<dyn crate::embeddings::Embedder>> = {
-            // HTTP-backed embedder via LM Studio / Ollama / vLLM
+            // HTTP-backed embedder via any declared host (see crate::llm_hosts)
             let http_config = crate::embeddings::http_embedder::HttpEmbedderConfig::from_env();
             let http_embedder = crate::embeddings::http_embedder::HttpEmbedder::new(http_config);
             if http_embedder.is_available() {
