@@ -1,6 +1,6 @@
 //! HTTP-backed embedding client for OpenAI-compatible embedding APIs.
 //!
-//! Supports LM Studio, Ollama, vLLM, or any server implementing the
+//! Supports any host declared in `manifests/llm-hosts.json` implementing the
 //! `/v1/embeddings` endpoint. Used as an alternative backend for Nomic
 //! when local ONNX model isn't available but a server is running.
 //!
@@ -97,7 +97,7 @@ struct BatchEmbeddingRequest<'a> {
 
 /// HTTP-backed embedder using OpenAI-compatible /v1/embeddings endpoint.
 ///
-/// Connects to LM Studio, Ollama, vLLM, or any compatible server.
+/// Connects to any declared OpenAI-compatible server — see `crate::llm_hosts`.
 /// Falls back gracefully if server is unreachable.
 pub struct HttpEmbedder {
     config: HttpEmbedderConfig,

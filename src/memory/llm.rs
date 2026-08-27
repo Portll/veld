@@ -17,7 +17,8 @@
 //! # Protocol
 //!
 //! The HTTP impl targets the OpenAI-compatible chat-completions API surface,
-//! which is supported by OpenAI, Anthropic (via proxy), local Ollama,
+//! which is supported by OpenAI, Anthropic (via proxy), and every local host in
+//! `manifests/llm-hosts.json`,
 //! vLLM, and most other hosts. Callers swap the endpoint URL to point at
 //! whichever provider they trust.
 

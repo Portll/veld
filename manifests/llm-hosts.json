@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "note": "The local LLM hosts this fleet will talk to, declared ONCE. veld, commitwork/admin and substrate all resolve a host from this file rather than each carrying its own hardcoded base URL. Before it existed, `http://127.0.0.1:1234` and `http://127.0.0.1:11434` were written into eight files across three repositories, so adding or removing a host meant finding all of them and removing one meant finding all of them again.",
+  "principle": "Every host here speaks the OpenAI HTTP API. That is the whole reason this is a DECLARATION and not a set of adapters: `llama.cpp`, `vLLM`, `SGLang`, `LocalAI`, `llamafile`, `mlx-lm` and LM Studio all serve `/v1/models`, `/v1/chat/completions` and `/v1/embeddings`, so a new host is a row here, not a struct. A host that needs its own request shape does NOT belong in this file — that was ollama's `/api/generate`, and carrying it meant every consumer branched on engine type forever.",
+  "detection": "A probe of `/v1/models` proves an OpenAI-compatible server is listening. It does NOT prove WHICH one: llama.cpp, llamafile, LocalAI and mlx-lm all default to port 8080, so the port cannot identify the host and neither can the protocol. A consumer that probes 8080 and reports `llama.cpp` is asserting something it did not measure. Report the port and the model ids the server names; call the host `unidentified` unless the operator declared it.",
+  "default": "llama.cpp",
+  "defaultRationale": "llama.cpp is MIT, self-hostable, has no account and no default telemetry, so it is the one that can be named in published work without qualification. LM Studio remains first in `probeOrder` because it is what is actually running on the operator's machine and it is measurably more reliable here than ollama was under contention — but being the pragmatic detection choice is different from being the documented default, and the two were conflated before this file existed.",
+  "probeOrder": ["lmstudio", "llama.cpp", "llamafile", "mlx-lm", "localai", "vllm", "sglang"],
+  "probeOrderRationale": "Cheapest-to-be-right first, not preference. LM Studio has a port nobody else claims, so a hit on 1234 is unambiguous. The 8080 group is probed after, and a hit there is reported as `unidentified` per `detection`.",
+  "removed": [
+    {
+      "id": "ollama",
+      "removedOn": "2026-08-27",
+      "reason": "Operator instruction, and it was the only host requiring a non-OpenAI request shape (`/api/generate` with its own request/response structs). Every consumer therefore carried an engine branch that existed for one host. Measured cost before removal: veld's `query_parsing/llm_parser.rs` held `OllamaRequest`/`OllamaResponse` and a second code path, and commitwork's `admin/routes/remediation.mjs` exported `OLLAMA_URL` consumed by `issue-detail.mjs`. Operationally it also OOMed on this hardware under contention where LM Studio did not.",
+      "note": "Recorded rather than deleted so that a future 'why is ollama not supported' has an answer with a date on it."
+    }
+  ],
+  "hosts": [
+    {
+      "id": "llama.cpp",
+      "label": "llama.cpp (llama-server)",
+      "baseUrl": "http://127.0.0.1:8080",
+      "api": "openai",
+      "licence": "MIT",
+      "openSource": true,
+      "portIsShared": true,
+      "capabilities": ["chat", "embeddings"],
+      "note": "The reference bare-metal target. `llama-server --embedding` is required for /v1/embeddings; a server started without it answers chat and 501s embeddings, which is why capabilities are declared per host but must still be probed."
+    },
+    {
+      "id": "lmstudio",
+      "label": "LM Studio",
+      "baseUrl": "http://127.0.0.1:1234",
+      "api": "openai",
+      "licence": "proprietary",
+      "openSource": false,
+      "portIsShared": false,
+      "capabilities": ["chat", "embeddings"],
+      "note": "Closed source and single-vendor, and the only entry here that is. Kept and probed first because it is what runs on the operator's machine and because the alternative previously in that slot (ollama) OOMed here. Stated plainly so that 'this fleet uses only open tooling' is never claimed without qualification."
+    },
+    {
+      "id": "llamafile",
+      "label": "llamafile",
+      "baseUrl": "http://127.0.0.1:8080",
+      "api": "openai",
+      "licence": "Apache-2.0",
+      "openSource": true,
+      "portIsShared": true,
+      "capabilities": ["chat", "embeddings"],
+      "note": "Mozilla. Single self-contained executable, no install step, which makes it the easiest host to reproduce an evaluation on."
+    },
+    {
+      "id": "mlx-lm",
+      "label": "mlx-lm (mlx_lm.server)",
+      "baseUrl": "http://127.0.0.1:8080",
+      "api": "openai",
+      "licence": "MIT",
+      "openSource": true,
+      "portIsShared": true,
+      "capabilities": ["chat"],
+      "note": "Apple Silicon native, so it is the fastest option on this hardware. Embeddings are NOT declared: mlx_lm.server is a chat server, and a consumer that assumes /v1/embeddings here gets a 404. Declared narrow on purpose."
+    },
+    {
+      "id": "localai",
+      "label": "LocalAI",
+      "baseUrl": "http://127.0.0.1:8080",
+      "api": "openai",
+      "licence": "MIT",
+      "openSource": true,
+      "portIsShared": true,
+      "capabilities": ["chat", "embeddings"],
+      "note": "Explicit OpenAI drop-in; the broadest backend coverage of anything here."
+    },
+    {
+      "id": "vllm",
+      "label": "vLLM",
+      "baseUrl": "http://127.0.0.1:8000",
+      "api": "openai",
+      "licence": "Apache-2.0",
+      "openSource": true,
+      "portIsShared": false,
+      "capabilities": ["chat", "embeddings"],
+      "note": "Server-grade, GPU-oriented. Right for a fleet box, heavy for a laptop."
+    },
+    {
+      "id": "sglang",
+      "label": "SGLang",
+      "baseUrl": "http://127.0.0.1:30000",
+      "api": "openai",
+      "licence": "Apache-2.0",
+      "openSource": true,
+      "portIsShared": false,
+      "capabilities": ["chat", "embeddings"],
+      "note": "Same tier as vLLM."
+    }
+  ],
+  "licenceNote": "The `licence` field is what the project states upstream and is recorded so an open-source claim about this fleet can be checked rather than asserted. Licences change: Hugging Face's TGI went Apache-2.0, then HFOIL, then back, which is why TGI is deliberately absent here rather than listed from memory. Re-read the upstream LICENSE before citing any row of this table in published work.",
+  "portDefaultsNote": "Ports are each project's documented default and every consumer must allow an override. A wrong default costs one config line; it is not a correctness property, and nothing in this fleet may treat a port as identifying."
+}
