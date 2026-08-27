@@ -698,27 +698,66 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
         // runtime, and therefore every model, permanently uninstalled, with the server silently
         // serving hash-bigram vectors instead of embeddings.
         //
-        // So: require a regular file, and match on the library STEM so a versioned name qualifies.
-        let lib_stem = lib_name.split('.').next().unwrap_or(lib_name);
-        let mut found = false;
+        // So: skip link entries outright, and select by a predicate that cannot pick up a stub.
+        //
+        // The shape of this fix is taken from shodh-memory, which hit the same defect first and
+        // fixed it in its issues #223 and #250. Checking there rather than only here caught a
+        // second bug in the first version of this code: matching `starts_with("libonnxruntime")`
+        // also matches `libonnxruntime_providers_shared.so`, a ~14KB stub that is a REGULAR FILE
+        // and would therefore have been extracted and installed as the runtime if it happened to
+        // come first in the archive. macOS survives that by luck — the osx-arm64 tarball ships no
+        // provider stub, only the real dylib, the symlink, and a 330-byte `libonnxruntime.pc` —
+        // but Linux ships the stubs and would have swapped a 14KB file in for a 35MB library.
+        //
+        // The discriminator is the DOT after `libonnxruntime`: the real library is
+        // `libonnxruntime.dylib` / `libonnxruntime.1.23.2.dylib` / `libonnxruntime.so.1.23.2`,
+        // and every stub is `libonnxruntime_something`. Then take the LARGEST match rather than
+        // the first, so the result does not depend on archive ordering at all.
+        let mut candidates: Vec<(String, u64)> = Vec::new();
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let is_regular_file = entry.header().entry_type().is_file();
+            let entry_type = entry.header().entry_type();
             let path = entry.path()?;
             let file_name = path
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
 
-            // e.g. libonnxruntime.dylib, libonnxruntime.1.23.2.dylib, libonnxruntime.so.1.23.2
-            let is_the_library = file_name.starts_with(lib_stem)
-                && (file_name.ends_with(".dylib") || file_name.contains(".so"));
+            // A link entry points at a versioned file that may not be extracted yet. Unpacking one
+            // produces a dangling symlink at the very path `get_onnx_runtime_path()` probes, which
+            // is exactly how this went unnoticed: it fails `exists()`, so the runtime reported
+            // itself absent forever rather than broken.
+            if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+                continue;
+            }
+            if !entry_type.is_file() || !is_runtime_library(&file_name, lib_name) {
+                continue;
+            }
 
-            if is_regular_file && is_the_library {
-                found = true;
-                let dest_path = dest_dir.join(lib_name);
-                entry.unpack(&dest_path)?;
-                tracing::info!("Extracted {} from {}", lib_name, file_name);
+            let size = entry.header().size().unwrap_or(0);
+            let staged = dest_dir.join(&file_name);
+            entry.unpack(&staged)?;
+            candidates.push((file_name, size));
+        }
+
+        // Largest wins; ordering in the archive is not load-bearing.
+        candidates.sort_by_key(|(_, size)| *size);
+        let found = !candidates.is_empty();
+        if let Some((file_name, size)) = candidates.last().cloned() {
+            let dest_path = dest_dir.join(lib_name);
+            let staged = dest_dir.join(&file_name);
+            if staged != dest_path {
+                fs::rename(&staged, &dest_path)?;
+            }
+            // Anything else extracted alongside is a stub or an older copy; leave no ambiguity
+            // about which file is the runtime.
+            for (other, _) in &candidates {
+                let path = dest_dir.join(other);
+                if path != dest_path {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            tracing::info!("Extracted {} from {} ({} bytes)", lib_name, file_name, size);
 
                 // macOS Gatekeeper blocks unsigned dylibs downloaded from the internet.
                 // Remove the quarantine xattr and ad-hoc sign so dlopen succeeds.
@@ -755,21 +794,95 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
                     }
                 }
 
-                return Ok(());
-            }
+            return Ok(());
         }
 
-        // Distinguish the two failures rather than reporting one. "Nothing matched" and "the only
-        // things that matched were symlinks" have different causes and different fixes, and the
-        // second is what actually happened here.
-        anyhow::ensure!(
-            !found,
-            "{lib_name}: matched entries in the archive but unpacking did not complete"
-        );
+        // `found` is false here by construction, but the message is the point: distinguish "the
+        // archive held nothing that looked like the library" from the old failure, where the only
+        // matching entry WAS a symlink and unpacking it reported success while installing nothing.
+        debug_assert!(!found);
         anyhow::bail!(
-            "no regular file named {lib_stem}*.dylib/.so in the archive — if the tarball layout \
-             changed, the symlink-only match this replaced would have reported success"
+            "no regular file matching {lib_name} in the archive (link entries are skipped by \
+             design, and stubs like libonnxruntime_providers_shared are excluded). If the tarball \
+             layout changed, this is where to look — the predicate this replaced would have \
+             silently installed a dangling symlink instead of reporting anything."
         );
+    }
+}
+
+/// Is this archive entry the ONNX Runtime shared library itself?
+///
+/// Split out so the predicate is testable without a 10MB download, because it is where two
+/// separate bugs lived and neither was visible from the call site.
+///
+/// The rule is the DOT immediately after `libonnxruntime`. Everything the runtime ships alongside
+/// the real library is `libonnxruntime_<something>` — `libonnxruntime_providers_shared.so` is a
+/// ~14KB stub, and it is a regular file, so a size- or type-based filter alone does not exclude it.
+/// The real library is `libonnxruntime.dylib`, `libonnxruntime.1.23.2.dylib` or
+/// `libonnxruntime.so.1.23.2`.
+///
+/// `libonnxruntime.pc` (330 bytes, pkgconfig) also carries the dot, so the extension check is not
+/// redundant with it.
+fn is_runtime_library(file_name: &str, lib_name: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix("libonnxruntime.") else {
+        return false;
+    };
+    // `rest` is e.g. "dylib", "1.23.2.dylib", "so", "so.1.23.2", "pc"
+    let _ = lib_name;
+    rest.ends_with(".dylib") || rest == "dylib" || rest == "so" || rest.starts_with("so.")
+}
+
+#[cfg(test)]
+mod runtime_library_predicate_tests {
+    use super::is_runtime_library;
+
+    /// Exact entry names from `onnxruntime-osx-arm64-1.23.2.tgz` and the Linux equivalent,
+    /// including the two that broke this: the symlink's name (identical to the real library's, so
+    /// the NAME cannot distinguish them — only the tar entry type can) and the provider stub.
+    #[test]
+    fn the_predicate_takes_the_library_and_leaves_the_stubs() {
+        for (name, want, why) in [
+            ("libonnxruntime.1.23.2.dylib", true, "the real macOS library"),
+            ("libonnxruntime.dylib", true, "unversioned name — real file on some layouts"),
+            ("libonnxruntime.so.1.23.2", true, "the real Linux library"),
+            ("libonnxruntime.so", true, "unversioned Linux name"),
+            // The one that made the first fix wrong: a REGULAR FILE, ~14KB, which
+            // starts_with("libonnxruntime") and contains(".so").
+            ("libonnxruntime_providers_shared.so", false, "provider stub, would clobber a 35MB lib"),
+            ("libonnxruntime_providers_cuda.so", false, "provider stub"),
+            ("libonnxruntime.pc", false, "330-byte pkgconfig, carries the dot but is not a library"),
+            ("libonnxruntime_test.dylib", false, "underscore, not the library"),
+            ("onnxruntime.dylib", false, "missing the lib prefix"),
+            ("README.md", false, "unrelated"),
+        ] {
+            assert_eq!(
+                is_runtime_library(name, "libonnxruntime.dylib"),
+                want,
+                "{name}: {why}"
+            );
+        }
+    }
+
+    /// Selection is by size, so ordering in the archive must not matter. Asserted in BOTH orders
+    /// because the original defect was precisely an order-dependent first-match-wins.
+    #[test]
+    fn the_largest_match_wins_regardless_of_order() {
+        let stub = ("libonnxruntime_providers_shared.so".to_string(), 14_000u64);
+        let real = ("libonnxruntime.so.1.23.2".to_string(), 35_138_784u64);
+
+        for candidates in [vec![stub.clone(), real.clone()], vec![real.clone(), stub.clone()]] {
+            let mut kept: Vec<_> = candidates
+                .into_iter()
+                .filter(|(n, _)| is_runtime_library(n, "libonnxruntime.so"))
+                .collect();
+            kept.sort_by_key(|(_, size)| *size);
+            assert_eq!(
+                kept.last().map(|(n, _)| n.as_str()),
+                Some("libonnxruntime.so.1.23.2"),
+                "the real library must win in either archive order"
+            );
+            assert_eq!(kept.len(), 1, "the stub should not even be a candidate");
+        }
     }
 }
 
