@@ -5,7 +5,15 @@
   "detection": "A probe of `/v1/models` proves an OpenAI-compatible server is listening. It does NOT prove WHICH one: llama.cpp, llamafile, LocalAI and mlx-lm all default to port 8080, so the port cannot identify the host and neither can the protocol. A consumer that probes 8080 and reports `llama.cpp` is asserting something it did not measure. Report the port and the model ids the server names; call the host `unidentified` unless the operator declared it.",
   "default": "llama.cpp",
   "defaultRationale": "llama.cpp is MIT, self-hostable, has no account and no default telemetry, so it is the one that can be named in published work without qualification. LM Studio remains first in `probeOrder` because it is what is actually running on the operator's machine and it is measurably more reliable here than ollama was under contention — but being the pragmatic detection choice is different from being the documented default, and the two were conflated before this file existed.",
-  "probeOrder": ["lmstudio", "llama.cpp", "llamafile", "mlx-lm", "localai", "vllm", "sglang"],
+  "probeOrder": [
+    "lmstudio",
+    "llama.cpp",
+    "llamafile",
+    "mlx-lm",
+    "localai",
+    "vllm",
+    "sglang"
+  ],
   "probeOrderRationale": "Cheapest-to-be-right first, not preference. LM Studio has a port nobody else claims, so a hit on 1234 is unambiguous. The 8080 group is probed after, and a hit there is reported as `unidentified` per `detection`.",
   "removed": [
     {
@@ -24,8 +32,14 @@
       "licence": "MIT",
       "openSource": true,
       "portIsShared": true,
-      "capabilities": ["chat", "embeddings"],
-      "note": "The reference bare-metal target. `llama-server --embedding` is required for /v1/embeddings; a server started without it answers chat and 501s embeddings, which is why capabilities are declared per host but must still be probed."
+      "capabilities": [
+        "chat",
+        "embeddings"
+      ],
+      "note": "The reference bare-metal target. `llama-server --embedding` is required for /v1/embeddings; a server started without it answers chat and 501s embeddings, which is why capabilities are declared per host but must still be probed.",
+      "bindsAllInterfacesByDefault": false,
+      "fetchesModelsOnDemand": false,
+      "exposureNote": "Binds 127.0.0.1 unless --host is given, and serves only models already on disk. `--host 0.0.0.0` is one flag away and there is no auth in the box, so an exposed instance is an open generation endpoint."
     },
     {
       "id": "lmstudio",
@@ -35,8 +49,14 @@
       "licence": "proprietary",
       "openSource": false,
       "portIsShared": false,
-      "capabilities": ["chat", "embeddings"],
-      "note": "Closed source and single-vendor, and the only entry here that is. Kept and probed first because it is what runs on the operator's machine and because the alternative previously in that slot (ollama) OOMed here. Stated plainly so that 'this fleet uses only open tooling' is never claimed without qualification."
+      "capabilities": [
+        "chat",
+        "embeddings"
+      ],
+      "note": "Closed source and single-vendor, and the only entry here that is. Kept and probed first because it is what runs on the operator's machine and because the alternative previously in that slot (ollama) OOMed here. Stated plainly so that 'this fleet uses only open tooling' is never claimed without qualification.",
+      "bindsAllInterfacesByDefault": false,
+      "fetchesModelsOnDemand": false,
+      "exposureNote": "Loopback by default with a UI toggle for network serving, and no auth. Closed source, so unlike every other row here the exposure surface cannot be read — only observed."
     },
     {
       "id": "llamafile",
@@ -46,8 +66,14 @@
       "licence": "Apache-2.0",
       "openSource": true,
       "portIsShared": true,
-      "capabilities": ["chat", "embeddings"],
-      "note": "Mozilla. Single self-contained executable, no install step, which makes it the easiest host to reproduce an evaluation on."
+      "capabilities": [
+        "chat",
+        "embeddings"
+      ],
+      "note": "Mozilla. Single self-contained executable, no install step, which makes it the easiest host to reproduce an evaluation on.",
+      "bindsAllInterfacesByDefault": false,
+      "fetchesModelsOnDemand": false,
+      "exposureNote": "Loopback by default. The distinctive risk is not the port: it is an EXECUTABLE that carries its own weights, so the supply chain is the binary and checksums matter more here than anywhere else in this file."
     },
     {
       "id": "mlx-lm",
@@ -57,8 +83,13 @@
       "licence": "MIT",
       "openSource": true,
       "portIsShared": true,
-      "capabilities": ["chat"],
-      "note": "Apple Silicon native, so it is the fastest option on this hardware. Embeddings are NOT declared: mlx_lm.server is a chat server, and a consumer that assumes /v1/embeddings here gets a 404. Declared narrow on purpose."
+      "capabilities": [
+        "chat"
+      ],
+      "note": "Apple Silicon native, so it is the fastest option on this hardware. Embeddings are NOT declared: mlx_lm.server is a chat server, and a consumer that assumes /v1/embeddings here gets a 404. Declared narrow on purpose.",
+      "bindsAllInterfacesByDefault": false,
+      "fetchesModelsOnDemand": true,
+      "exposureNote": "Loopback by default. Resolves model ids through the Hugging Face cache, so an unknown id can trigger a download — a request naming a model is a request that may reach the network."
     },
     {
       "id": "localai",
@@ -68,8 +99,14 @@
       "licence": "MIT",
       "openSource": true,
       "portIsShared": true,
-      "capabilities": ["chat", "embeddings"],
-      "note": "Explicit OpenAI drop-in; the broadest backend coverage of anything here."
+      "capabilities": [
+        "chat",
+        "embeddings"
+      ],
+      "note": "Explicit OpenAI drop-in; the broadest backend coverage of anything here.",
+      "bindsAllInterfacesByDefault": true,
+      "fetchesModelsOnDemand": true,
+      "exposureNote": "THE OUTLIER, and the strongest single argument for defaulting every runner off: it binds 0.0.0.0 by default, so starting it publishes a generation endpoint to the LAN, and its gallery can install a model on request. Remote-triggered fetch plus default-exposed is a different risk class from the rest of this list."
     },
     {
       "id": "vllm",
@@ -79,8 +116,14 @@
       "licence": "Apache-2.0",
       "openSource": true,
       "portIsShared": false,
-      "capabilities": ["chat", "embeddings"],
-      "note": "Server-grade, GPU-oriented. Right for a fleet box, heavy for a laptop."
+      "capabilities": [
+        "chat",
+        "embeddings"
+      ],
+      "note": "Server-grade, GPU-oriented. Right for a fleet box, heavy for a laptop.",
+      "bindsAllInterfacesByDefault": true,
+      "fetchesModelsOnDemand": true,
+      "exposureNote": "Binds 0.0.0.0 by default and downloads weights by model id. --api-key exists and is off unless set. Assume LAN-reachable the moment it starts."
     },
     {
       "id": "sglang",
@@ -90,11 +133,19 @@
       "licence": "Apache-2.0",
       "openSource": true,
       "portIsShared": false,
-      "capabilities": ["chat", "embeddings"],
-      "note": "Same tier as vLLM."
+      "capabilities": [
+        "chat",
+        "embeddings"
+      ],
+      "note": "Same tier as vLLM.",
+      "bindsAllInterfacesByDefault": true,
+      "fetchesModelsOnDemand": true,
+      "exposureNote": "Same posture as vLLM: 0.0.0.0 by default, weights by id, optional key."
     }
   ],
   "licenceNote": "The `licence` field is what the project states upstream and is recorded so an open-source claim about this fleet can be checked rather than asserted. Licences change: Hugging Face's TGI went Apache-2.0, then HFOIL, then back, which is why TGI is deliberately absent here rather than listed from memory. Re-read the upstream LICENSE before citing any row of this table in published work.",
   "contextNote": "A protection was lost when ollama went, and it is written down rather than forgotten: ollama accepted per-request `options.num_ctx` and `keep_alive`, so commitwork pinned the KV cache to 16384 on every run (a GGUF-declared context can size one that pages the machine) and bounded how long a loaded model squatted. The OpenAI API has neither field. Context is now set when the SERVER starts — llama.cpp `-c`, vLLM `--max-model-len`, LM Studio in its UI — so it is the operator's launch flag and not something this fleet can enforce or assert. Nothing here checks it, and no test pretends to.",
-  "portDefaultsNote": "Ports are each project's documented default and every consumer must allow an override. A wrong default costs one config line; it is not a correctness property, and nothing in this fleet may treat a port as identifying."
+  "portDefaultsNote": "Ports are each project's documented default and every consumer must allow an override. A wrong default costs one config line; it is not a correctness property, and nothing in this fleet may treat a port as identifying.",
+  "enabledByDefault": false,
+  "enabledByDefaultRationale": "Every local runner is OFF until the operator turns it on, host by host, in the panel. Operator ruling 2026-08-27: security-first user experience. The argument is in the per-host `exposureNote` fields rather than in caution — localai, vllm and sglang bind 0.0.0.0 by DEFAULT, so merely starting one publishes an unauthenticated generation endpoint to the LAN, and four of the seven will fetch a model when asked for an id they do not have. A tool that probes and auto-selects whatever it finds turns 'I started a server to try something' into 'the panel is now talking to it'. The corollary is a display rule, not a preference: DISABLED is its own state and must never render as 'no local LLM detected', which is the same absence-vs-negative confusion this repo refuses everywhere else."
 }
