@@ -95,5 +95,6 @@
     }
   ],
   "licenceNote": "The `licence` field is what the project states upstream and is recorded so an open-source claim about this fleet can be checked rather than asserted. Licences change: Hugging Face's TGI went Apache-2.0, then HFOIL, then back, which is why TGI is deliberately absent here rather than listed from memory. Re-read the upstream LICENSE before citing any row of this table in published work.",
+  "contextNote": "A protection was lost when ollama went, and it is written down rather than forgotten: ollama accepted per-request `options.num_ctx` and `keep_alive`, so commitwork pinned the KV cache to 16384 on every run (a GGUF-declared context can size one that pages the machine) and bounded how long a loaded model squatted. The OpenAI API has neither field. Context is now set when the SERVER starts — llama.cpp `-c`, vLLM `--max-model-len`, LM Studio in its UI — so it is the operator's launch flag and not something this fleet can enforce or assert. Nothing here checks it, and no test pretends to.",
   "portDefaultsNote": "Ports are each project's documented default and every consumer must allow an override. A wrong default costs one config line; it is not a correctness property, and nothing in this fleet may treat a port as identifying."
 }
