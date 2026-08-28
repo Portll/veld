@@ -1,10 +1,43 @@
 # LoCoMo-MC10 Benchmark Dependencies
-datasets>=2.14.0
-tqdm>=4.65.0
-veld>=0.1.5
+#
+# PINNED 2026-08-28. These were `>=` floors, which meant the benchmark's dependency surface was
+# whatever PyPI happened to resolve on the day somebody ran it — not reproducible, and not
+# auditable. It also made every CVE reported against this file a statement about a version the
+# repository never declared: osv-scanner resolves unpinned floors itself and reported
+# `pillow@9.5.0` and `aiohttp@3.9.5`, neither of which is named here, as 54 of veld's 135
+# dependency findings including both criticals and the only CISA-KEV row.
+#
+# Pin, and the scanner reports what this file actually says.
 
-# LLM Providers (install the one you need)
-openai>=1.0.0         # For OpenAI and OpenAI-compatible APIs (Baseten, Groq, Together)
-# anthropic>=0.18.0   # For Anthropic Claude (optional)
-# ollama>=0.1.0       # For Ollama local models (optional)
-# requests>=2.28.0    # For Baseten native API (optional)
+datasets==5.0.1
+tqdm==4.70.0
+
+# ── veld itself ────────────────────────────────────────────────────────────────────────────────
+#
+# NOT INSTALLED FROM PyPI, and this is a security boundary rather than a preference.
+#
+# `pip install veld` DOES NOT INSTALL THIS PROJECT. The PyPI name `veld` is owned by someone else —
+# "A suite of tools for command line analytics", github.com/GjjvdBurg/veld, latest 0.1.5, six
+# releases, unrelated to this repository. Verified against the PyPI JSON API on 2026-08-28.
+#
+# This line previously read `veld>=0.1.5`, which that stranger's package SATISFIES. Anyone running
+# `pip install -r benchmarks/requirements.txt` was installing it. (The sibling file
+# examples/spot/requirements.txt asks for `veld>=0.1.90`, which is above every version that package
+# has ever published — so it fails to resolve instead of silently installing, and that accident is
+# the only reason the exposure was not wider. It is also the "resolution impossible" line sitting
+# unread in every osv.log this repo has produced.)
+#
+# The rename from shodh-memory to veld took a PyPI name that was already taken. pyproject.toml still
+# declares `name = "veld"` at 0.7.20 and therefore cannot publish under it either. Until that is
+# resolved — a different distribution name, or acquiring the existing one — the only correct
+# instruction is to install from this checkout:
+#
+#     pip install -e .          # from the repository root
+#
+# Do NOT restore a bare `veld` requirement here.
+
+# ── LLM providers (install the one you need) ───────────────────────────────────────────────────
+openai==3.5.0
+# anthropic==1.2.0    # for Anthropic Claude (optional)
+# ollama==0.6.2       # for Ollama local models (optional)
+# requests==2.34.2    # for Baseten native API (optional)
