@@ -234,6 +234,16 @@ impl VeldBackupEngine {
         &self.backup_path
     }
 
+    /// The per-user backup directory, with the identifier validated as a single path component
+    /// BEFORE it is joined — `user_id` arrives from outside the process, and `../` or an absolute
+    /// path in it would escape `backup_path` at every join below. Every user-scoped path in this
+    /// engine goes through here.
+    fn user_backup_dir(&self, user_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .backup_path
+            .join(crate::path_guard::sanitize_component(user_id, "backup user id")?))
+    }
+
     /// Create a full backup of a RocksDB database
     ///
     /// # Arguments
@@ -243,7 +253,7 @@ impl VeldBackupEngine {
     /// # Returns
     /// BackupMetadata with backup details
     pub fn create_backup(&self, db: &DB, user_id: &str) -> Result<BackupMetadata> {
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
         fs::create_dir_all(&backup_dir)?;
 
         // Create RocksDB backup engine
@@ -341,8 +351,7 @@ impl VeldBackupEngine {
 
         // Step 2: Checkpoint each secondary store alongside the backup
         let secondary_dir = self
-            .backup_path
-            .join(user_id)
+            .user_backup_dir(user_id)?
             .join(format!("secondary_{}", metadata.backup_id));
         fs::create_dir_all(&secondary_dir)?;
 
@@ -416,7 +425,7 @@ impl VeldBackupEngine {
 
         // Recompute checksum now that secondary stores are included.
         // The initial checksum from create_backup() only covered the main DB.
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
         metadata.checksum = self.calculate_backup_checksum(&backup_dir, metadata.backup_id)?;
         self.save_metadata(&metadata)?;
 
@@ -471,7 +480,7 @@ impl VeldBackupEngine {
         spec: &IntentLogBackupSpec,
         user_id: &str,
     ) -> Result<StagedIntentLog> {
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -535,7 +544,7 @@ impl VeldBackupEngine {
         };
 
         if let Some(staged) = staged {
-            let backup_dir = self.backup_path.join(user_id);
+            let backup_dir = self.user_backup_dir(user_id)?;
             let intent_log_dir =
                 backup_dir.join(format!("intent_log_{}", metadata.backup_id));
             if intent_log_dir.exists() {
@@ -648,7 +657,7 @@ impl VeldBackupEngine {
         backup_id: Option<u32>,
         restore_path: &Path,
     ) -> Result<()> {
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
 
         if !backup_dir.exists() {
             return Err(anyhow!("No backups found for user: {user_id}"));
@@ -690,7 +699,7 @@ impl VeldBackupEngine {
 
     /// List all available backups for a user
     pub fn list_backups(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
 
         if !backup_dir.exists() {
             return Ok(Vec::new());
@@ -730,7 +739,7 @@ impl VeldBackupEngine {
         let resolved_backup_id = match backup_id {
             Some(id) => id,
             None => {
-                let backup_dir = self.backup_path.join(user_id);
+                let backup_dir = self.user_backup_dir(user_id)?;
                 let backup_opts = BackupEngineOptions::new(&backup_dir)?;
                 let env = Env::new()?;
                 let backup_engine = BackupEngine::open(&backup_opts, &env)?;
@@ -743,8 +752,7 @@ impl VeldBackupEngine {
 
         // Step 3: Restore secondary stores from checkpoints
         let secondary_dir = self
-            .backup_path
-            .join(user_id)
+            .user_backup_dir(user_id)?
             .join(format!("secondary_{resolved_backup_id}"));
 
         let mut restored_stores = Vec::new();
@@ -879,7 +887,7 @@ impl VeldBackupEngine {
         let resolved_id = match backup_id {
             Some(id) => id,
             None => {
-                let backup_dir = self.backup_path.join(user_id);
+                let backup_dir = self.user_backup_dir(user_id)?;
                 let backup_opts = BackupEngineOptions::new(&backup_dir)?;
                 let env = Env::new()?;
                 let engine = BackupEngine::open(&backup_opts, &env)?;
@@ -892,8 +900,7 @@ impl VeldBackupEngine {
         };
 
         let archive_intent_dir = self
-            .backup_path
-            .join(user_id)
+            .user_backup_dir(user_id)?
             .join(format!("intent_log_{resolved_id}"));
         if !archive_intent_dir.exists() {
             // No intent log was captured for this backup. Not an error —
@@ -1035,7 +1042,7 @@ impl VeldBackupEngine {
             ));
         }
 
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
 
         if !backup_dir.exists() {
             return Ok(0);
@@ -1108,7 +1115,7 @@ impl VeldBackupEngine {
     /// Verify backup integrity using checksum
     pub fn verify_backup(&self, user_id: &str, backup_id: u32) -> Result<bool> {
         let metadata = self.load_metadata(user_id, backup_id)?;
-        let backup_dir = self.backup_path.join(user_id);
+        let backup_dir = self.user_backup_dir(user_id)?;
 
         let current_checksum = self.calculate_backup_checksum(&backup_dir, backup_id)?;
 
@@ -1133,8 +1140,7 @@ impl VeldBackupEngine {
 
     fn load_metadata(&self, user_id: &str, backup_id: u32) -> Result<BackupMetadata> {
         let metadata_path = self
-            .backup_path
-            .join(user_id)
+            .user_backup_dir(user_id)?
             .join(format!("backup_{backup_id}.json"));
 
         let json = fs::read_to_string(metadata_path)?;
