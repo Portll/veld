@@ -12,6 +12,13 @@
 datasets==5.0.1
 tqdm==4.70.0
 
+# aiohttp is not used by any benchmark directly — it arrives through datasets → fsspec[http] —
+# but a transitive cannot be retired without dropping datasets, so it is pinned FORWARD instead:
+# 3.14.3 is the lowest version past every fixed-event in the 33 advisories osv reported against
+# the 3.9.5 the old unpinned floor resolved (CVE-2024-52304, CVE-2025-53643, the CVE-2025-6922x
+# family, ...). Derived from the advisories' own ranges on 2026-08-28, not picked by vibes.
+aiohttp==3.14.3
+
 # ── veld itself ────────────────────────────────────────────────────────────────────────────────
 #
 # NOT INSTALLED FROM PyPI, and this is a security boundary rather than a preference.
