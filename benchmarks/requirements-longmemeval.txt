@@ -1,6 +1,7 @@
-huggingface_hub>=0.20.0
-numpy>=1.24.0
-tqdm>=4.65.0
-openai>=1.0.0
-backoff>=2.2.0
-requests>=2.28.0
+# LongMemEval harness dependencies. PINNED 2026-08-28 — see benchmarks/requirements.txt for why.
+huggingface_hub==1.29.0
+numpy==2.5.2
+tqdm==4.70.0
+openai==3.5.0
+backoff==2.2.1
+requests==2.34.2

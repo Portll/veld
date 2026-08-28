@@ -1,1 +1,2 @@
-requests>=2.28.0
+# Runtime dependency of the Python client. PINNED 2026-08-28 — see benchmarks/requirements.txt.
+requests==2.34.2

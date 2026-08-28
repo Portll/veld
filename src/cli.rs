@@ -107,8 +107,7 @@ enum Commands {
         /// API key for authentication
         #[arg(
             long,
-            env = "VELD_API_KEY",
-            default_value = "sk-veld-dev-local-testing-key"
+            env = "VELD_API_KEY"
         )]
         api_key: String,
     },
@@ -122,8 +121,7 @@ enum Commands {
         /// API key for authentication
         #[arg(
             long,
-            env = "VELD_API_KEY",
-            default_value = "sk-veld-dev-local-testing-key"
+            env = "VELD_API_KEY"
         )]
         api_key: String,
 
@@ -154,8 +152,7 @@ enum Commands {
         /// API key for authentication
         #[arg(
             long,
-            env = "VELD_API_KEY",
-            default_value = "sk-veld-dev-local-testing-key"
+            env = "VELD_API_KEY"
         )]
         api_key: String,
     },
@@ -202,8 +199,7 @@ enum HookType {
         /// API key for authentication
         #[arg(
             long,
-            env = "VELD_API_KEY",
-            default_value = "sk-veld-dev-local-testing-key"
+            env = "VELD_API_KEY"
         )]
         api_key: String,
 
@@ -228,8 +224,7 @@ enum HookType {
         /// API key for authentication
         #[arg(
             long,
-            env = "VELD_API_KEY",
-            default_value = "sk-veld-dev-local-testing-key"
+            env = "VELD_API_KEY"
         )]
         api_key: String,
 
@@ -247,8 +242,7 @@ enum HookType {
         /// API key for authentication
         #[arg(
             long,
-            env = "VELD_API_KEY",
-            default_value = "sk-veld-dev-local-testing-key"
+            env = "VELD_API_KEY"
         )]
         api_key: String,
 
@@ -272,6 +266,31 @@ async fn main() -> Result<()> {
     veld::config::load_config_file_into_env();
 
     let cli = Cli::parse();
+
+    // TRANSPORT GUARD, at the one place every invocation passes through.
+    //
+    // Placed here rather than in the client constructors, which is where it went first: `veld
+    // status` reached neither AsyncApiClient::new nor BlockingApiClient::with_timeout, so the
+    // guard was absent from exactly the commands an operator runs from a shell. Found by RUNNING
+    // the binary against a remote http:// URL and watching it not refuse — not by reading the call
+    // graph, which is what said the constructors were the choke point.
+    //
+    // Resolved the way clap resolves it: an explicit --api-url wins, else VELD_API_URL, else the
+    // loopback default every subcommand declares (which passes the check anyway).
+    {
+        let explicit = std::env::args()
+            .skip_while(|a| a != "--api-url")
+            .nth(1);
+        let url = explicit
+            .or_else(|| std::env::var("VELD_API_URL").ok())
+            .or_else(|| std::env::var("VELD_SERVER_URL").ok());
+        if let Some(u) = url {
+            if let Err(msg) = veld::endpoint_guard::check_api_url(&u, std::env::var("VELD_ALLOW_HTTP").ok().as_deref()) {
+                eprintln!("veld: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     match cli.command {
         // =====================================================================
@@ -892,6 +911,13 @@ struct AsyncApiClient {
 
 impl AsyncApiClient {
     fn new(base_url: String, api_key: String, user_id: String) -> Self {
+        // Refuse to carry the key in cleartext to a remote host. Checked HERE rather than at each
+        // subcommand because every command reaches a client, and a guard on the argument parser
+        // would have to be repeated at each of the six places `--api-url` is declared.
+        if let Err(msg) = veld::endpoint_guard::check_api_url(&base_url, std::env::var("VELD_ALLOW_HTTP").ok().as_deref()) {
+            eprintln!("veld: {msg}");
+            std::process::exit(2);
+        }
         Self {
             client: reqwest::Client::new(),
             base_url,
@@ -945,6 +971,14 @@ impl BlockingApiClient {
         api_key: String,
         timeout: Option<std::time::Duration>,
     ) -> Self {
+        // Same refusal as AsyncApiClient::new. BOTH constructors need it: `veld status` and the
+        // hook commands take the BLOCKING client, so guarding only the async one would have left
+        // the commands an operator actually runs from a shell unguarded — which is what the first
+        // attempt did, found by running the binary rather than by reading it.
+        if let Err(msg) = veld::endpoint_guard::check_api_url(&base_url, std::env::var("VELD_ALLOW_HTTP").ok().as_deref()) {
+            eprintln!("veld: {msg}");
+            std::process::exit(2);
+        }
         let mut builder = reqwest::blocking::Client::builder();
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);

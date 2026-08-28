@@ -18,6 +18,7 @@
 pub mod ab_testing;
 pub mod auth;
 pub mod path_guard;
+pub mod endpoint_guard;
 pub mod backup;
 pub mod config;
 pub mod constants;

@@ -1,2 +1,14 @@
-veld>=0.1.90
-# bosdyn-client>=4.0.0  # Optional — only needed for real Spot hardware
+# Spot example dependencies. PINNED 2026-08-28 — see benchmarks/requirements.txt for the reasoning.
+#
+# THE PREVIOUS `veld>=0.1.90` LINE IS REMOVED, not pinned. The PyPI name `veld` belongs to an
+# unrelated project (github.com/GjjvdBurg/veld, "a suite of tools for command line analytics",
+# latest 0.1.5). `>=0.1.90` is above every version that project has published, so this file has
+# never resolved — that is the `failed resolution for src/examples/spot/requirements.txt:
+# resolution impossible / no candidates at all for: veld ">=0.1.90"` line in every osv.log this
+# repository has produced, recorded in the log and surfaced by nothing.
+#
+# Install veld itself from this checkout:
+#
+#     pip install -e .          # from the repository root
+#
+bosdyn-client==5.1.9   # only needed for real Spot hardware
