@@ -27,8 +27,8 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
-use veld::config::StorageBackend;
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use veld::config::StorageBackend;
 
 // =============================================================================
 // CLI STRUCTURE
@@ -97,18 +97,11 @@ enum Commands {
     /// Launch the TUI dashboard
     Tui {
         /// API URL for the Veld server
-        #[arg(
-            long,
-            env = "VELD_SERVER_URL",
-            default_value = "http://127.0.0.1:3030"
-        )]
+        #[arg(long, env = "VELD_SERVER_URL", default_value = "http://127.0.0.1:3030")]
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "VELD_API_KEY"
-        )]
+        #[arg(long, env = "VELD_API_KEY")]
         api_key: String,
     },
 
@@ -119,10 +112,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "VELD_API_KEY"
-        )]
+        #[arg(long, env = "VELD_API_KEY")]
         api_key: String,
 
         /// User ID for Veld operations
@@ -150,10 +140,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "VELD_API_KEY"
-        )]
+        #[arg(long, env = "VELD_API_KEY")]
         api_key: String,
     },
 
@@ -197,10 +184,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "VELD_API_KEY"
-        )]
+        #[arg(long, env = "VELD_API_KEY")]
         api_key: String,
 
         /// User ID for Veld operations
@@ -222,10 +206,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "VELD_API_KEY"
-        )]
+        #[arg(long, env = "VELD_API_KEY")]
         api_key: String,
 
         /// User ID for Veld operations
@@ -240,10 +221,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "VELD_API_KEY"
-        )]
+        #[arg(long, env = "VELD_API_KEY")]
         api_key: String,
 
         /// User ID for Veld operations
@@ -278,14 +256,15 @@ async fn main() -> Result<()> {
     // Resolved the way clap resolves it: an explicit --api-url wins, else VELD_API_URL, else the
     // loopback default every subcommand declares (which passes the check anyway).
     {
-        let explicit = std::env::args()
-            .skip_while(|a| a != "--api-url")
-            .nth(1);
+        let explicit = std::env::args().skip_while(|a| a != "--api-url").nth(1);
         let url = explicit
             .or_else(|| std::env::var("VELD_API_URL").ok())
             .or_else(|| std::env::var("VELD_SERVER_URL").ok());
         if let Some(u) = url {
-            if let Err(msg) = veld::endpoint_guard::check_api_url(&u, std::env::var("VELD_ALLOW_HTTP").ok().as_deref()) {
+            if let Err(msg) = veld::endpoint_guard::check_api_url(
+                &u,
+                std::env::var("VELD_ALLOW_HTTP").ok().as_deref(),
+            ) {
                 eprintln!("veld: {msg}");
                 std::process::exit(2);
             }
@@ -342,9 +321,7 @@ async fn main() -> Result<()> {
         } => {
             if !mcp_enabled {
                 eprintln!("Veld MCP component is disabled — not starting `veld serve`.");
-                eprintln!(
-                    "  Enable it with `mcp = true` in config.toml or VELD_MCP_ENABLED=true."
-                );
+                eprintln!("  Enable it with `mcp = true` in config.toml or VELD_MCP_ENABLED=true.");
                 return Ok(());
             }
 
@@ -708,7 +685,9 @@ fn handle_stop(port: u16) -> Result<()> {
         println!("✓ stopped veld on port {port} (pid {pid})");
         Ok(())
     } else {
-        anyhow::bail!("failed to terminate pid {pid} (port {port}) — it may need elevated permissions")
+        anyhow::bail!(
+            "failed to terminate pid {pid} (port {port}) — it may need elevated permissions"
+        )
     }
 }
 
@@ -743,7 +722,9 @@ fn pid_listening_on_port(port: u16) -> Option<u32> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().next().and_then(|l| l.trim().parse::<u32>().ok())
+    text.lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
 }
 
 fn handle_doctor() -> Result<()> {
@@ -852,8 +833,16 @@ fn handle_version() {
     eprintln!("veld {}", env!("VELD_VERSION_FULL"));
     eprintln!("  Platform: {}", std::env::consts::OS);
     eprintln!("  Arch:     {}", std::env::consts::ARCH);
-    eprintln!("  Target backend: {}", veld::config::default_requested_storage_backend());
-    eprintln!("  Runtime backend: {}", veld::config::effective_storage_backend_for_current_build(veld::config::default_requested_storage_backend()));
+    eprintln!(
+        "  Target backend: {}",
+        veld::config::default_requested_storage_backend()
+    );
+    eprintln!(
+        "  Runtime backend: {}",
+        veld::config::effective_storage_backend_for_current_build(
+            veld::config::default_requested_storage_backend()
+        )
+    );
     eprintln!("  License:  AGPL-3.0-or-later (or commercial — see LICENSING.md)");
     eprintln!("  Repo:     https://github.com/Portll/veld");
 }
@@ -914,7 +903,10 @@ impl AsyncApiClient {
         // Refuse to carry the key in cleartext to a remote host. Checked HERE rather than at each
         // subcommand because every command reaches a client, and a guard on the argument parser
         // would have to be repeated at each of the six places `--api-url` is declared.
-        if let Err(msg) = veld::endpoint_guard::check_api_url(&base_url, std::env::var("VELD_ALLOW_HTTP").ok().as_deref()) {
+        if let Err(msg) = veld::endpoint_guard::check_api_url(
+            &base_url,
+            std::env::var("VELD_ALLOW_HTTP").ok().as_deref(),
+        ) {
             eprintln!("veld: {msg}");
             std::process::exit(2);
         }
@@ -975,7 +967,10 @@ impl BlockingApiClient {
         // hook commands take the BLOCKING client, so guarding only the async one would have left
         // the commands an operator actually runs from a shell unguarded — which is what the first
         // attempt did, found by running the binary rather than by reading it.
-        if let Err(msg) = veld::endpoint_guard::check_api_url(&base_url, std::env::var("VELD_ALLOW_HTTP").ok().as_deref()) {
+        if let Err(msg) = veld::endpoint_guard::check_api_url(
+            &base_url,
+            std::env::var("VELD_ALLOW_HTTP").ok().as_deref(),
+        ) {
             eprintln!("veld: {msg}");
             std::process::exit(2);
         }
@@ -1327,12 +1322,7 @@ fn handle_commit(api_url: &str, api_key: &str, user_id: &str) {
     };
     let content = format!(
         "Git commit {} on branch {} of {} by {}\n\n{}{}",
-        commit.short_hash,
-        commit.branch,
-        commit.repo,
-        commit.author,
-        commit.message,
-        files_section
+        commit.short_hash, commit.branch, commit.repo, commit.author, commit.message, files_section
     );
 
     let client = BlockingApiClient::with_timeout(

@@ -53,10 +53,7 @@ pub fn check_api_url(url: &str, allow_http: Option<&str>) -> Result<(), String> 
     };
 
     // host[:port] up to the first `/`, `?` or `#`; userinfo stripped if present.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = if let Some(end) = authority.rfind(']') {
         &authority[..=end] // IPv6 literal, port (if any) follows the bracket
@@ -105,7 +102,10 @@ mod tests {
     #[test]
     fn remote_http_is_refused_and_the_message_names_the_host() {
         let e = check_api_url("http://veld.example.com:3030/api", None).unwrap_err();
-        assert!(e.contains("veld.example.com"), "the error must name the host: {e}");
+        assert!(
+            e.contains("veld.example.com"),
+            "the error must name the host: {e}"
+        );
         assert!(e.contains("VELD_ALLOW_HTTP"), "and the escape hatch: {e}");
     }
 
