@@ -1,0 +1,134 @@
+version: 2
+
+# Grouped, weekly, and capped. Ungrouped daily updates across fifteen manifests produce more PRs
+# than a merge train under branch protection can absorb — every merge re-stales the rest — so each
+# ecosystem opens at most a couple of PRs a week and patch/minor bumps travel together.
+#
+# Security advisories bypass `open-pull-requests-limit` and are raised individually and immediately;
+# that is the behaviour we actually want on.
+#
+# Ported from the shodh-memory twin, which has carried this since 2026-08-27 while veld carried NO
+# dependabot configuration at all — so veld has never had an automated dependency PR, security
+# advisory or otherwise. The layouts differ and the config is not a copy: veld's root Cargo.toml is
+# a STANDALONE WORKSPACE WITH NO MEMBERS, so its six sub-crates each carry their own Cargo.lock and
+# each needs its own entry. `directories:` (plural) is used where several share one policy.
+
+updates:
+  # ── Rust ────────────────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      cargo-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+        # `ort` is a release candidate (2.0.0-rc.x), and veld is on rc.11 — the same version the
+        # twin is on, with the same exposure. Cargo classifies rc-to-rc as a PATCH bump, but a
+        # release candidate makes no API-stability promise, so it does not belong in a group whose
+        # whole premise is "safe to merge on green". Measured on the twin: rc.11 -> rc.13 made
+        # `ort::Error` generic and broke every `anyhow::Context` call on a session builder, taking
+        # the entire embedding and NER stack down. Excluded so it arrives as its own reviewable PR
+        # with the migration attached.
+        exclude-patterns:
+          - "ort"
+    commit-message:
+      prefix: "deps"
+
+  # The six sub-crates. Each has its own Cargo.lock because the root workspace declares no members,
+  # so `directory: /` above does not reach them — a fact worth stating, because the obvious reading
+  # of a Rust repo is that one entry covers the tree.
+  - package-ecosystem: cargo
+    directories:
+      - /tui
+      - /status-core
+      - /status-tui
+      - /status-widget
+      - /monitor/src-tauri
+      - /docs/generators
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      cargo-subcrates-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(crates)"
+
+  # ── CI ──────────────────────────────────────────────────────────────────────────────────────
+  # zizmor reports 38 unpinned `uses:` across veld's four workflows. This does not pin them — that
+  # is a separate change — but it does keep the tags moving rather than rotting.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+
+  # ── npm ─────────────────────────────────────────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: /mcp-server
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      npm-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(mcp-server)"
+
+  # The three chat integrations share one policy: they are thin clients, none is published, and a
+  # separate cap for each would triple the PR count for no reviewing benefit.
+  - package-ecosystem: npm
+    directories:
+      - /veld-telegram
+      - /veld-todoist
+      - /veld-whatsapp
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      npm-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(integrations)"
+
+  # ── Python ──────────────────────────────────────────────────────────────────────────────────
+  # These were `>=` floors until 2026-08-28 and are now pinned with `==`, which is what makes them
+  # worth watching: dependabot can only raise a PR against a version the manifest actually states.
+  # An unpinned floor gives it nothing to bump, which is why veld's Python surface had been
+  # invisible to it twice over — no config, and nothing to act on if there had been.
+  - package-ecosystem: pip
+    directories:
+      - /benchmarks
+      - /python
+      - /examples/spot
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      pip-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(python)"
