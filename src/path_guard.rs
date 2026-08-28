@@ -1,26 +1,23 @@
-//! Single-component path guards for identifiers that come from callers.
+//! The filesystem chokepoint for caller-supplied identifiers.
 //!
-//! Every per-user directory in this codebase is `base.join(user_id)` where `user_id` originates
-//! outside the process (HTTP request, CLI argument, MCP call). A value like `../other-user` or an
-//! absolute path escapes the base directory at every one of those joins. This module is the one
-//! chokepoint: validate the identifier as a SINGLE, plain path component before it ever reaches a
-//! `join`, and reject rather than normalize — silently rewriting `../x` into something safe would
-//! hide the attempt and change behavior invisibly.
+//! `validation::validate_user_id` already states this codebase's identifier contract — and its
+//! rules are exactly what a path component needs (no separators in the charset, `..` rejected,
+//! no leading/trailing dot, bounded length). What was missing is ENFORCEMENT AT THE JOIN: the
+//! validator is called in some HTTP handlers and skipped in others, while every per-user
+//! directory is `base.join(user_id)` regardless. This module re-exports the same contract as the
+//! guard the state manager's and backup engine's join helpers route through, so an unvalidated
+//! id cannot reach a filesystem path whichever handler it arrived by.
+//!
+//! Deliberately a delegation, not a second vocabulary: two validators drift, and an id accepted
+//! at the API layer must never fail at the filesystem layer.
 
-/// Accepts a non-empty string of at most 128 bytes drawn from `[A-Za-z0-9._@-]`, that is not `.`
-/// or `..` and does not START with a dot (a leading dot names hidden files and the special
-/// entries). Returns the same slice on success so call sites stay borrow-friendly.
+/// Validate `value` as a safe single path component, under the SAME rules as
+/// `validation::validate_user_id`. Returns the same slice on success so call sites stay
+/// borrow-friendly; rejects rather than normalizes, since silently rewriting `../x` would hide
+/// the attempt.
 pub fn sanitize_component<'a>(value: &'a str, what: &str) -> anyhow::Result<&'a str> {
-    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-');
-    if value.is_empty()
-        || value.len() > 128
-        || value.starts_with('.')
-        || !value.chars().all(ok_char)
-    {
-        anyhow::bail!(
-            "invalid {what}: must be a single plain path component ([A-Za-z0-9._@-], not starting with '.', <=128 bytes)"
-        );
-    }
+    crate::validation::validate_user_id(value)
+        .map_err(|e| anyhow::anyhow!("invalid {what}: {e}"))?;
     Ok(value)
 }
 
@@ -29,8 +26,10 @@ mod tests {
     use super::sanitize_component;
 
     #[test]
-    fn accepts_ordinary_identifiers() {
-        for ok in ["all", "user-1", "a.b", "X_9", "someone@example.com"] {
+    fn accepts_everything_the_api_layer_accepts() {
+        // Parity with validate_user_id is the point — an id accepted at the API boundary must
+        // never fail at the filesystem boundary. Unicode-alphanumeric ids are valid upstream.
+        for ok in ["all", "user-1", "a.b", "X_9", "someone@example.com", "名前", "müller"] {
             assert!(sanitize_component(ok, "user id").is_ok(), "{ok}");
         }
     }
@@ -38,8 +37,8 @@ mod tests {
     #[test]
     fn rejects_everything_that_could_leave_the_directory() {
         for bad in [
-            "", ".", "..", "../x", "a/b", "a\\b", "/etc", "a\0b", ".hidden",
-            "..%2f", "a b", "名前", &"x".repeat(129),
+            "", ".", "..", "../x", "a/b", "a\\b", "/etc", "a\0b", ".hidden", "a..b",
+            "trailing.", "a b", &"x".repeat(129),
         ] {
             assert!(sanitize_component(bad, "user id").is_err(), "{bad:?}");
         }

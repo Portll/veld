@@ -519,7 +519,7 @@ fn handle_init() -> Result<()> {
         // transcript and CI log this command runs under, so only a recognisable prefix is shown.
         eprintln!(
             "  ✓ API key generated: {}… (full key stored in {})",
-            &api_key[..api_key.len().min(8)],
+            api_key.get(..12).unwrap_or("sk-veld"),
             config_path.display()
         );
     }
