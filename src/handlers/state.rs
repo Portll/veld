@@ -999,6 +999,16 @@ impl MultiUserMemoryManager {
         }
     }
 
+    /// The per-user state directory, with the identifier validated as a single path component
+    /// BEFORE it is joined — `user_id` arrives from HTTP/MCP/CLI callers, and `../` or an
+    /// absolute path in it would escape `base_path` at every join below. Every user-scoped path
+    /// in this manager goes through here.
+    fn user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
+        Ok(self
+            .base_path
+            .join(crate::path_guard::sanitize_component(user_id, "user id")?))
+    }
+
     fn open_user_memory(&self, user_id: &str, config: MemoryConfig) -> Result<UserMemory> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
@@ -1033,7 +1043,7 @@ impl MultiUserMemoryManager {
     }
 
     fn open_user_graph_memory(&self, user_id: &str) -> Result<GraphMemory> {
-        let graph_path = self.base_path.join(user_id).join("graph");
+        let graph_path = self.user_dir(user_id)?.join("graph");
 
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
@@ -1078,7 +1088,7 @@ impl MultiUserMemoryManager {
             return Ok(memory);
         }
 
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         let config = MemoryConfig {
             storage_path: user_path,
             collective_store_dir: if self.server_config.multi_tenant_mode {
@@ -1221,7 +1231,7 @@ impl MultiUserMemoryManager {
         }
 
         // Delete per-user filesystem (memories DB, graph DB, vector index files)
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         if user_path.exists() {
             let mut attempts = 0;
             let max_attempts = 10;
@@ -1504,7 +1514,7 @@ impl MultiUserMemoryManager {
         let mut saved = 0;
         for (user_id, memory_system) in user_entries {
             if let Some(guard) = memory_system.try_read() {
-                let index_path = self.base_path.join(&user_id).join("vector_index");
+                let index_path = self.user_dir(&user_id)?.join("vector_index");
                 if let Err(e) = guard.save_vector_index(&index_path) {
                     tracing::warn!("  Failed to save vector index for user {}: {}", user_id, e);
                 } else {
@@ -1674,7 +1684,7 @@ impl MultiUserMemoryManager {
             return Ok(store.clone());
         }
 
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         std::fs::create_dir_all(&user_path)?;
         let db_path = user_path.join("slow_store.db");
         let store = std::sync::Arc::new(crate::memory::slow_store::SlowStore::open(&db_path)?);
@@ -1706,7 +1716,7 @@ impl MultiUserMemoryManager {
         if let Some(index) = self.bm25_indices.get(user_id) {
             return Ok(index.clone());
         }
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         let bm25_path = user_path.join(crate::memory::BM25_INDEX_DIR);
         std::fs::create_dir_all(&bm25_path)?;
         let index =
@@ -1766,7 +1776,7 @@ impl MultiUserMemoryManager {
             return Ok(w.clone());
         }
 
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         std::fs::create_dir_all(&user_path)?;
         let log_path = user_path.join("intent.log");
         let checkpoint_path = user_path.join("projection_checkpoints.bin");
@@ -2030,7 +2040,7 @@ impl MultiUserMemoryManager {
         // Fold in user edits first — each edit journals an Update that
         // re-renders its page and syncs the other projections.
         let edits = self.scan_wiki_edits(user_id)?;
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
         let pages = std::fs::read_dir(&dir)
             .map(|rd| {
@@ -2056,7 +2066,12 @@ impl MultiUserMemoryManager {
         if self.wiki_watchers.contains_key(user_id) {
             return;
         }
-        let user_path = self.base_path.join(user_id);
+        // An id that fails the guard has never had a directory created for it, so there is
+        // nothing to watch — refuse quietly rather than joining an unvalidated component.
+        let Ok(user_path) = self.user_dir(user_id) else {
+            tracing::warn!(user_id = %user_id, "wiki watcher: refusing invalid user id");
+            return;
+        };
         let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(user_id = %user_id, error = %e, "wiki watcher: could not create wiki dir");
@@ -2095,7 +2110,7 @@ impl MultiUserMemoryManager {
         if !crate::wiki::wiki_render_enabled() {
             return Ok(0);
         }
-        let user_path = self.base_path.join(user_id);
+        let user_path = self.user_dir(user_id)?;
         let dir = crate::wiki::wiki_target_dir(&user_path, user_id);
         let read = match std::fs::read_dir(&dir) {
             Ok(r) => r,
@@ -2901,8 +2916,8 @@ impl MultiUserMemoryManager {
     /// (see `get_user_journaled_writer`). The old `<base_path>/intent_log/`
     /// convention predates the per-user layout — backups pointed at it
     /// captured nothing (`intent_log_files: []` on every archive).
-    fn intent_log_user_dir(&self, user_id: &str) -> std::path::PathBuf {
-        self.base_path.join(user_id)
+    fn intent_log_user_dir(&self, user_id: &str) -> Result<std::path::PathBuf> {
+        self.user_dir(user_id)
     }
 
     pub fn create_user_backup(&self, user_id: &str) -> Result<BackupMetadata> {
@@ -2912,7 +2927,7 @@ impl MultiUserMemoryManager {
                 // engine no-ops cleanly when the dir doesn't exist (W5
                 // not yet active for this install).
                 let intent_log_spec =
-                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id));
+                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id)?);
 
                 // Stage the journal under the tenant's writer mutex so the
                 // cut is clean (no mid-frame copy, exact cut LSN), and
@@ -3027,14 +3042,14 @@ impl MultiUserMemoryManager {
     ) -> Result<Vec<String>> {
         match self.server_config.effective_storage_backend {
             StorageBackend::RocksDb => {
-                let memory_db_path = self.base_path.join(user_id).join("storage");
-                let graph_path = self.base_path.join(user_id).join("graph").join("graph");
+                let memory_db_path = self.user_dir(user_id)?.join("storage");
+                let graph_path = self.user_dir(user_id)?.join("graph").join("graph");
 
                 self.evict_user(user_id);
 
                 let secondary_restore_paths: Vec<(&str, &std::path::Path)> = vec![];
                 let intent_log_spec =
-                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id));
+                    crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id)?);
                 let restore_opts = crate::backup::RestoreOptions { max_lsn };
                 let restored_stores = self
                     .backup_engine
