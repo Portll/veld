@@ -17,7 +17,6 @@
 
 pub mod ab_testing;
 pub mod auth;
-pub mod path_guard;
 pub mod backup;
 pub mod config;
 pub mod constants;
@@ -41,6 +40,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod mif;
 pub mod oblivious;
+pub mod path_guard;
 pub mod pir;
 pub mod query_parsing;
 pub mod query_planner;
