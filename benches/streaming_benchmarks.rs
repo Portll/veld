@@ -12,7 +12,7 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use veld::embeddings::ner::{NerConfig, NeuralNer};
-use veld::earth::Earth;
+use veld::user_memory::UserMemory;
 use veld::memory::MemoryConfig;
 use veld::parking_lot;
 use veld::streaming::{
@@ -99,7 +99,7 @@ const LONG_CONTENT: &str = "During the quarterly planning session at Microsoft h
 // Helper Functions
 // ==============================================================================
 
-fn setup_memory_system() -> (Earth, TempDir) {
+fn setup_memory_system() -> (UserMemory, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = MemoryConfig {
         storage_path: temp_dir.path().to_path_buf(),
@@ -112,7 +112,7 @@ fn setup_memory_system() -> (Earth, TempDir) {
         importance_threshold: 0.3,
     };
 
-    let memory_system = Earth::new(config, None).expect("Failed to create memory system");
+    let memory_system = UserMemory::new(config, None).expect("Failed to create memory system");
     (memory_system, temp_dir)
 }
 
