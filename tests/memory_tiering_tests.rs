@@ -450,11 +450,23 @@ fn test_forget_low_importance() {
         .forget(veld::memory::ForgetCriteria::LowImportance(0.5))
         .expect("Failed to forget");
 
-    // Some memories should be forgotten
-    // Note: actual count depends on importance calculation
-    assert!(
-        forgotten >= 0,
-        "Forget operation should complete successfully"
+    // `forgotten` is a usize, so the assertion that stood here — `forgotten >= 0` — was true for
+    // every possible value including zero. It asserted nothing, and clippy::correctness denies it
+    // (absurd_extreme_comparisons). `stats_before` was captured two lines up and never read, which
+    // is the other half of the same tell.
+    //
+    // What the test can honestly assert is CONSERVATION: however many the importance calculation
+    // decides to drop, the store must shrink by exactly that many. That holds whatever the
+    // threshold does, which is why the original comment ("actual count depends on importance
+    // calculation") was a reason to assert this rather than a reason to assert nothing.
+    let stats_after = memory_system.stats();
+    assert_eq!(
+        stats_after.total_memories,
+        stats_before.total_memories - forgotten,
+        "forget() reported {} removed, but the store went from {} to {}",
+        forgotten,
+        stats_before.total_memories,
+        stats_after.total_memories
     );
 }
 
