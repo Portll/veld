@@ -833,6 +833,15 @@ impl StreamingMemoryExtractor {
                 severity,
                 data,
             } => {
+                // Release the guard taken at the top of this function before doing
+                // anything that locks again. `tokio::sync::RwLock` is NOT reentrant,
+                // so the read below — and the write further down, and
+                // `extract_memories`, which locks internally — would each block
+                // forever on a guard this same task is holding. Every re-acquire
+                // below already handles the session being gone, so dropping here is
+                // safe as well as necessary.
+                drop(sessions);
+
                 // Check if this event type triggers immediate extraction
                 let is_trigger = {
                     let sessions = self.sessions.read().await;
@@ -888,6 +897,11 @@ impl StreamingMemoryExtractor {
                 timestamp,
                 units,
             } => {
+                // Same reason as the Event arm: the write below and
+                // `extract_memories` both lock, and this task still holds the guard
+                // from the top of the function. Non-reentrant lock, so drop first.
+                drop(sessions);
+
                 // Format sensor reading as content
                 let mut parts: Vec<String> = Vec::new();
                 for (key, value) in &values {
