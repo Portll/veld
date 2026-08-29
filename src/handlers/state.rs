@@ -1606,6 +1606,44 @@ impl MultiUserMemoryManager {
             return Ok(graph);
         }
 
+        // ── the self-lock fix ──────────────────────────────────────────────
+        //
+        // `user_memories` and `graph_memories` are separate moka caches with
+        // separate time_to_idle, but a cached UserMemory HOLDS an Arc to its
+        // GraphMemory (set at creation). So the graph cache can expire an entry
+        // whose GraphMemory is still very much alive, still owning the RocksDB
+        // handle. Opening again then failed against ourselves:
+        //
+        //   IO error: lock hold by current process … /graph/LOCK: No locks available
+        //
+        // Retrying could never clear that — the holder is a live cache entry,
+        // not a dying thread. So before opening, ask whether anyone already has
+        // it, and re-adopt that Arc instead of racing our own handle.
+        //
+        // try_read, never read: a caller may already hold a read guard on this
+        // same UserMemory while calling us (the backup path does), and
+        // parking_lot's RwLock is write-preferring, so a recursive read can
+        // deadlock if a writer queues between the two. Failing to look is safe —
+        // we simply fall through to the open below, which is today's behaviour.
+        // `.get()` on the cache never creates, so this cannot recurse into
+        // get_user_memory().
+        if let Some(user_mem) = self.user_memories.get(user_id) {
+            if let Some(guard) = user_mem.try_read() {
+                if let Some(existing) = guard.graph_memory() {
+                    let adopted = Arc::clone(existing);
+                    drop(guard);
+                    self.graph_memories
+                        .insert(user_id.to_string(), Arc::clone(&adopted));
+                    tracing::debug!(
+                        user_id = %user_id,
+                        "graph cache miss re-adopted the live handle held by user memory \
+                         (avoided a self-lock on reopen)",
+                    );
+                    return Ok(adopted);
+                }
+            }
+        }
+
         // Retry with backoff for RocksDB lock contention (same pattern as get_user_memory).
         // Graph eviction drops synchronously so contention is rare, but possible on Windows
         // where file handle release can lag.
@@ -3099,8 +3137,20 @@ impl MultiUserMemoryManager {
                     continue;
                 }
 
-                let db_path = path.join("memory.db");
+                // `storage`, not `memory.db`. The RocksDB store is a DIRECTORY and
+                // that file has never existed, so this gate skipped every user on
+                // every scheduled run — silently, because the loop just counts what
+                // it did back up and nothing asserts that number is plausible. The
+                // manual endpoint takes an explicit user_id and bypasses this scan,
+                // which is why it kept working and hid the fault. The same path is
+                // spelled correctly in restore_user_backup_with_options.
+                let db_path = path.join("storage");
                 if !db_path.exists() {
+                    tracing::debug!(
+                        user_id = name,
+                        path = ?db_path,
+                        "scheduled backup: skipping, no storage directory",
+                    );
                     continue;
                 }
 
