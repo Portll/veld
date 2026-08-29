@@ -140,6 +140,22 @@ pub(crate) fn neural_ner_enabled() -> bool {
     env_flag("VELD_NEURAL_NER", false)
 }
 
+/// Opt-in to running with NON-SEMANTIC hash embeddings.
+///
+/// Simplified mode makes `encode()` return hash-derived vectors. Nothing errors,
+/// so recall still "works", benchmarks still report numbers, and every one of
+/// those numbers is computed against noise. shodh-memory traced an entire voided
+/// A/B to exactly this: CI runners failed the model download, vamana recall was
+/// all-zero, and the conclusion recorded was "success".
+///
+/// So the fallback is refused unless it is asked for. It remains genuinely
+/// useful for tests and offline smoke runs where nobody is measuring quality —
+/// the point is that choosing it is now a decision someone made, not something
+/// that happened.
+pub(crate) fn allow_simplified_embeddings() -> bool {
+    env_flag("VELD_ALLOW_SIMPLIFIED_EMBEDDINGS", false)
+}
+
 /// Trait for embedding generation
 pub trait Embedder: Send + Sync {
     /// Generate embedding for text.
