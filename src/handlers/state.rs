@@ -2995,9 +2995,29 @@ impl MultiUserMemoryManager {
                     .map(|(name, db)| crate::backup::SecondaryStoreRef { name, db })
                     .collect();
 
-                let graph_lock = self.get_user_graph(user_id).ok();
-                let graph_guard = graph_lock.as_ref().map(|graph| graph.read());
-                let graph_db_ref = graph_guard.as_ref().map(|graph| graph.get_db());
+                // REFUSE, do not degrade. This was `.ok()`, which turned a failure
+                // to open the graph into `None` — and `None` means "no graph to
+                // capture", so the archive was written without it, `secondary_stores`
+                // simply lacked "graph", and the response still said success: true.
+                // A backup missing a store while reporting success is worse than no
+                // backup, because it is the thing a restore is trusted to rely on.
+                //
+                // Absence is not a case here: GraphMemory::new opens with
+                // create_if_missing(true), so a user who has never had a graph gets
+                // an empty one rather than an error. An Err is therefore a real
+                // failure to read something that exists — exactly what a caller
+                // needs to hear about before trusting this archive.
+                let graph_lock = self.get_user_graph(user_id).map_err(|e| {
+                    if let Some(staged) = &staged {
+                        let _ = std::fs::remove_dir_all(&staged.staging_dir);
+                    }
+                    anyhow::anyhow!(
+                        "refusing to write a backup for '{user_id}' without its graph store: {e}. \
+                         The archive would have been silently incomplete."
+                    )
+                })?;
+                let graph_guard = graph_lock.read();
+                let graph_db_ref = Some(graph_guard.get_db());
 
                 self.backup_engine.create_comprehensive_backup_with_staged_intent_log(
                     &db,
