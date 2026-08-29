@@ -178,6 +178,53 @@ pub enum EntityLabel {
     Other(String),
 }
 
+/// Whether an entity of this kind denotes the same referent regardless of
+/// which project band observed it.
+///
+/// A band is a project. Agents working in one band see one tree, so names
+/// inside it co-refer — `config.toml` is one file to everyone looking at it.
+/// Across bands they do not: `staging` in one project is not `staging` in
+/// another.
+///
+/// This is a property of the TYPE, not of the name, which is why it lives on
+/// `EntityLabel`. The label space is closed and additive-only, so the match
+/// below is total and a new variant cannot silently inherit a policy. A list
+/// of privileged names could not give that guarantee, and its failures would
+/// be silent false negatives — names that should have merged and quietly did
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeClass {
+    /// One referent per owner — may merge across bands.
+    Global,
+    /// Referent is relative to its band — never merge across bands.
+    BandRelative,
+}
+
+impl MergeClass {
+    /// Merge class for an entity carrying several labels.
+    ///
+    /// Entities accumulate labels — `add_entity` unions them when folding a
+    /// new observation into an existing node — so the question is asked of a
+    /// set. Any band-relative member makes the whole entity band-relative:
+    /// that direction fails toward NOT merging, and a missed merge is
+    /// recoverable where a wrong one is not.
+    pub fn of(labels: &[EntityLabel]) -> MergeClass {
+        // No labels is no evidence of referential scope, which gets the same
+        // treatment as an unrecognised type.
+        if labels.is_empty() {
+            return MergeClass::BandRelative;
+        }
+        if labels
+            .iter()
+            .any(|l| l.merge_class() == MergeClass::BandRelative)
+        {
+            MergeClass::BandRelative
+        } else {
+            MergeClass::Global
+        }
+    }
+}
+
 impl EntityLabel {
     /// Get string representation of the entity label
     #[allow(unused)] // Public API for serialization/display
@@ -255,6 +302,45 @@ impl EntityLabel {
             return true;
         }
         self.parent_labels().contains(expected)
+    }
+
+    /// Whether entities of this type may merge across project bands.
+    ///
+    /// Exhaustive on purpose — no wildcard arm. Adding a variant to
+    /// `EntityLabel` must be a compile error here, not an inherited default,
+    /// because the choice it forces cannot be undone once entities have
+    /// merged on it.
+    pub fn merge_class(&self) -> MergeClass {
+        use MergeClass::{BandRelative, Global};
+        match self {
+            // The referent is the same thing whichever project observed it.
+            Self::Person | Self::Organization | Self::Location => Global,
+            Self::Technology | Self::Product | Self::Date => Global,
+            Self::Concept | Self::Skill | Self::Role | Self::Team => Global,
+            // Within one owner an Event is usually one occurrence referenced
+            // from several projects — an outage spanning three services is one
+            // outage. Least certain member of this set.
+            Self::Event => Global,
+            // Project and Repository NAME bands. They have to resolve globally
+            // or one band could never refer to another, which is the mechanism
+            // cross-band edges are built on.
+            Self::Project | Self::Repository => Global,
+
+            // Documented as "not a named entity" — a YAKE keyword's sense is
+            // whatever the surrounding band made it.
+            Self::Keyword => BandRelative,
+            Self::Task | Self::Document => BandRelative,
+            // Both variants are documented as INSTANCES ("PostgreSQL, Redis …
+            // instances", "microservices, APIs, daemons"): every band runs its
+            // own.
+            Self::Service | Self::Database => BandRelative,
+            Self::Metric | Self::Configuration => BandRelative,
+            Self::Environment | Self::Pipeline => BandRelative,
+            Self::Module => BandRelative,
+            // Unrecognised type, unknown referential scope. Fail toward not
+            // merging.
+            Self::Other(_) => BandRelative,
+        }
     }
 }
 
@@ -8258,5 +8344,93 @@ mod tests {
             edge.strength,
             L2_PRUNE_THRESHOLD
         );
+    }
+
+    // ── merge class ────────────────────────────────────────────────────────
+
+    /// Every variant must have a stated class. This is the test that fails
+    /// when someone adds a label and forgets what it means across bands —
+    /// the compiler catches the match, and this catches the vocabulary
+    /// drifting away from the list the decision was made against.
+    #[test]
+    fn every_entity_label_declares_a_merge_class() {
+        let all = [
+            EntityLabel::Person,
+            EntityLabel::Organization,
+            EntityLabel::Location,
+            EntityLabel::Technology,
+            EntityLabel::Concept,
+            EntityLabel::Event,
+            EntityLabel::Date,
+            EntityLabel::Product,
+            EntityLabel::Skill,
+            EntityLabel::Keyword,
+            EntityLabel::Project,
+            EntityLabel::Task,
+            EntityLabel::Document,
+            EntityLabel::Repository,
+            EntityLabel::Service,
+            EntityLabel::Database,
+            EntityLabel::Metric,
+            EntityLabel::Configuration,
+            EntityLabel::Environment,
+            EntityLabel::Pipeline,
+            EntityLabel::Team,
+            EntityLabel::Role,
+            EntityLabel::Module,
+            EntityLabel::Other("unrecognised".into()),
+        ];
+        assert_eq!(all.len(), 24, "vocabulary changed — revisit merge classes");
+
+        let global = all
+            .iter()
+            .filter(|l| l.merge_class() == MergeClass::Global)
+            .count();
+        assert_eq!(global, 13, "expected 13 global labels");
+        assert_eq!(all.len() - global, 11, "expected 11 band-relative labels");
+    }
+
+    #[test]
+    fn environment_never_merges_across_bands() {
+        // The clincher for the whole rule: `staging` in one project is not
+        // `staging` in another.
+        assert_eq!(
+            EntityLabel::Environment.merge_class(),
+            MergeClass::BandRelative
+        );
+        assert_eq!(
+            EntityLabel::Configuration.merge_class(),
+            MergeClass::BandRelative
+        );
+    }
+
+    #[test]
+    fn band_naming_labels_are_global_so_bands_can_reference_each_other() {
+        assert_eq!(EntityLabel::Project.merge_class(), MergeClass::Global);
+        assert_eq!(EntityLabel::Repository.merge_class(), MergeClass::Global);
+    }
+
+    #[test]
+    fn unrecognised_label_fails_toward_not_merging() {
+        assert_eq!(
+            EntityLabel::Other("whatever".into()).merge_class(),
+            MergeClass::BandRelative
+        );
+    }
+
+    #[test]
+    fn a_single_band_relative_label_makes_the_whole_entity_band_relative() {
+        // Person is global, Configuration is not; the set is not.
+        let mixed = [EntityLabel::Person, EntityLabel::Configuration];
+        assert_eq!(MergeClass::of(&mixed), MergeClass::BandRelative);
+
+        let all_global = [EntityLabel::Person, EntityLabel::Organization];
+        assert_eq!(MergeClass::of(&all_global), MergeClass::Global);
+    }
+
+    #[test]
+    fn an_unlabelled_entity_is_band_relative() {
+        // No labels is no evidence of scope, not evidence of global scope.
+        assert_eq!(MergeClass::of(&[]), MergeClass::BandRelative);
     }
 }
