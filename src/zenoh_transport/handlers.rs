@@ -364,6 +364,8 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
 
     // Merge entities with dedup (same as HTTP handler)
     let mut merged_entities: Vec<String> = req.tags.clone();
+    // Derived from here on — see crate::entity_cap.
+    let authored_entity_count = merged_entities.len();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     for record in &ner_entities {
         if seen.insert(record.text.to_lowercase()) {
@@ -379,7 +381,23 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     // path to the same graph, and a control on one door is not a control.
     crate::redaction::redact_entities(&mut merged_entities);
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
+        // Selectivity-ordered, same as the HTTP paths. `manager` IS the AppState type, so the same
+        // helper serves — a fourth door to one graph gets the same rule as the other three.
+        let mentions = crate::handlers::remember::mention_counts_for(
+            &manager, &req.user_id, &merged_entities);
+        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+            std::mem::take(&mut merged_entities),
+            authored_entity_count,
+            validation::MAX_ENTITIES_PER_MEMORY,
+            &mentions,
+        );
+        merged_entities = kept;
+        tracing::debug!(
+            considered = report.considered,
+            dropped = report.dropped,
+            rescued_by_ordering = report.rescued_by_ordering,
+            "Capped zenoh entities by selectivity"
+        );
     }
 
     let context = build_rich_context(

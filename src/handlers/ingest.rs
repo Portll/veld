@@ -176,6 +176,8 @@ pub async fn ingest(
 
     // ── Merge all entity sources ────────────────────────────────────────
     let mut merged_entities: Vec<String> = req.tags.clone();
+    // Everything after this point is derived — see crate::entity_cap.
+    let authored_entity_count = merged_entities.len();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
 
     // Add format tag
@@ -211,7 +213,23 @@ pub async fn ingest(
     // path to the same graph, and a control on one door is not a control.
     crate::redaction::redact_entities(&mut merged_entities);
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
+        // Ordered by selectivity, same as handlers/remember.rs. A separate door to the same graph
+        // gets the same rule, for the same reason the redaction above is duplicated here.
+        let mentions = crate::handlers::remember::mention_counts_for(
+            &state, &req.user_id, &merged_entities);
+        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+            std::mem::take(&mut merged_entities),
+            authored_entity_count,
+            validation::MAX_ENTITIES_PER_MEMORY,
+            &mentions,
+        );
+        merged_entities = kept;
+        tracing::debug!(
+            considered = report.considered,
+            dropped = report.dropped,
+            rescued_by_ordering = report.rescued_by_ordering,
+            "Capped ingest entities by selectivity"
+        );
     }
 
     // ── Build and store experience ──────────────────────────────────────
