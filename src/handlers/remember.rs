@@ -377,6 +377,36 @@ pub async fn file_answer(
 }
 
 /// Remember a single memory
+/// How many memories already carry each candidate entity.
+///
+/// ONE read lock for the whole list, not one per candidate: this runs on the write path, and a
+/// hundred sequential lock acquisitions there is a different kind of defect from the one being
+/// fixed.
+///
+/// A failure to read the graph returns an EMPTY map, and that is deliberate and safe: every
+/// candidate then scores 0, the sort is a stable no-op, and the cap falls back to arrival order —
+/// exactly the behaviour that shipped before this. A degraded lookup must not reorder entities by
+/// accident, and it must not fail the write either; losing selectivity ordering is a worse outcome
+/// than nothing only if you cannot tell it happened, which is what the warn is for.
+pub(crate) fn mention_counts_for(
+    state: &AppState,
+    user_id: &str,
+    candidates: &[String],
+) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(graph_arc) = state.get_user_graph(user_id) else {
+        tracing::warn!("entity cap: graph unavailable; falling back to arrival order");
+        return out;
+    };
+    let graph = graph_arc.read();
+    for name in candidates {
+        if let Ok(Some(entity)) = graph.find_entity_by_name(name) {
+            out.insert(name.clone(), entity.mention_count);
+        }
+    }
+    out
+}
+
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn remember(
     State(state): State<AppState>,
@@ -477,6 +507,10 @@ pub async fn remember(
     for tag in &req.intent_tags {
         merged_entities.push(format!("intent:{tag}"));
     }
+    // Everything appended from here on is DERIVED — nobody chose it. The split is what lets the cap
+    // protect the writer's own tags while ranking the rest, and it has to be taken here because
+    // after this point the list is one flat Vec with no record of where authorship ended.
+    let authored_entity_count = merged_entities.len();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     // Merge ingest-derived entity hints (JSON keys, CSV columns, code symbols)
     for tag in &ingest_tags {
@@ -541,12 +575,26 @@ pub async fn remember(
     }
 
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        tracing::debug!(
-            count = merged_entities.len(),
-            max = validation::MAX_ENTITIES_PER_MEMORY,
-            "Capping entities to maximum allowed"
+        // Ordered by SELECTIVITY before the cut, not by arrival. Measured 2026-08-27: the tail this
+        // used to discard was 19x more selective than the head it kept, because arrival order is
+        // uncorrelated with worth. See crate::entity_cap.
+        let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
+        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+            std::mem::take(&mut merged_entities),
+            authored_entity_count,
+            validation::MAX_ENTITIES_PER_MEMORY,
+            &mentions,
         );
-        merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
+        merged_entities = kept;
+        tracing::debug!(
+            considered = report.considered,
+            authored = report.authored,
+            dropped = report.dropped,
+            // A persistent zero here means the ordering is inert and should be questioned rather
+            // than trusted — which is why it is logged rather than assumed.
+            rescued_by_ordering = report.rescued_by_ordering,
+            "Capped entities by selectivity"
+        );
     }
 
     let experience_type_str = format!("{:?}", experience_type);
@@ -1190,6 +1238,8 @@ pub async fn batch_remember(
             let extracted_keywords: Vec<String> = keyword_extractor.extract_texts(&item.content);
 
             let mut merged: Vec<String> = item.tags.clone();
+            // Derived from here on — see crate::entity_cap.
+            let authored_batch_count = merged.len();
             let mut seen: HashSet<String> = merged.iter().map(|t| t.to_lowercase()).collect();
             for record in &ner_records {
                 if seen.insert(record.text.to_lowercase()) {
@@ -1209,7 +1259,20 @@ pub async fn batch_remember(
                     max = validation::MAX_ENTITIES_PER_MEMORY,
                     "Capping entities to maximum allowed in batch item"
                 );
-                merged.truncate(validation::MAX_ENTITIES_PER_MEMORY);
+                let mentions = mention_counts_for(&state, &req.user_id, &merged);
+                let (kept, report) = crate::entity_cap::cap_by_selectivity(
+                    std::mem::take(&mut merged),
+                    authored_batch_count,
+                    validation::MAX_ENTITIES_PER_MEMORY,
+                    &mentions,
+                );
+                merged = kept;
+                tracing::debug!(
+                    considered = report.considered,
+                    dropped = report.dropped,
+                    rescued_by_ordering = report.rescued_by_ordering,
+                    "Capped batch entities by selectivity"
+                );
             }
             (merged, ner_records)
         } else {
@@ -1652,6 +1715,8 @@ pub async fn upsert_memory(
     let extracted_keywords: Vec<String> = state.get_keyword_extractor().extract_texts(&req.content);
 
     let mut merged_entities: Vec<String> = req.tags.clone();
+    // Derived from here on — see crate::entity_cap.
+    let authored_entity_count = merged_entities.len();
     let mut seen: HashSet<String> = merged_entities.iter().map(|t| t.to_lowercase()).collect();
     for record in &ner_entities {
         if seen.insert(record.text.to_lowercase()) {
@@ -1665,12 +1730,21 @@ pub async fn upsert_memory(
     }
     crate::redaction::redact_entities(&mut merged_entities);
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
-        tracing::debug!(
-            count = merged_entities.len(),
-            max = validation::MAX_ENTITIES_PER_MEMORY,
-            "Capping entities to maximum allowed in upsert"
+        // Selectivity-ordered, same as the store path. See crate::entity_cap.
+        let mentions = mention_counts_for(&state, &req.user_id, &merged_entities);
+        let (kept, report) = crate::entity_cap::cap_by_selectivity(
+            std::mem::take(&mut merged_entities),
+            authored_entity_count,
+            validation::MAX_ENTITIES_PER_MEMORY,
+            &mentions,
         );
-        merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
+        merged_entities = kept;
+        tracing::debug!(
+            considered = report.considered,
+            dropped = report.dropped,
+            rescued_by_ordering = report.rescued_by_ordering,
+            "Capped entities by selectivity in upsert"
+        );
     }
 
     // Stamp the upsert with the active agent / worktree / branch — the

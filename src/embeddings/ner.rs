@@ -485,6 +485,18 @@ impl NeuralNer {
             all_encodings.push(encoding);
         }
 
+        // The batch tensor is one fixed [batch, max_length] block, so a text longer than the window
+        // cannot be represented in it — the `.take(max_length)` below is the same silent drop the
+        // single-text path had. Rather than give batched callers a worse answer than unbatched ones
+        // (two paths disagreeing, only one of them tested), any over-length text sends the whole
+        // batch through the windowed path.
+        if all_encodings.iter().any(|e| e.get_ids().len() > max_length) {
+            // No session lock is held yet at this point, so nothing to release before the
+            // per-text path takes its own.
+            tracing::debug!("NER batch holds text longer than one window; routing to the windowed path");
+            return texts.iter().map(|t| self.extract_neural(t)).collect();
+        }
+
         // Prepare batched input tensors
         let mut input_ids = vec![0i64; batch_size * max_length];
         let mut attention_mask = vec![0i64; batch_size * max_length];
@@ -655,14 +667,50 @@ impl NeuralNer {
         let offsets = encoding.get_offsets();
         let max_length = self.config.max_length;
 
-        // Prepare input tensors
+        // WINDOWED EXTRACTION — every token is looked at, not the first `max_length` of them.
+        //
+        // This was `tokens.iter().take(max_length)`, and for NER that truncation is worse than the
+        // one it mirrors in `minilm.rs`. A truncated embedding is a blurred vector; a truncated NER
+        // pass means entities past token ~128 are NEVER EXTRACTED AT ALL, on a corpus where 54% of
+        // memories exceed 800 characters. There is no pooling analogue either: you cannot average
+        // spans, so the windows are run and their entity lists concatenated.
+        //
+        // Two details make the concatenation correct rather than approximately correct:
+        //
+        //   * `build_entity` indexes the FULL encoding's `offsets`, so windows pass GLOBAL token
+        //     indices and character spans come out right without any offset arithmetic.
+        //   * index 0 is `[CLS]` in the FIRST window only. The old loop skipped `i == 0`
+        //     unconditionally; carried into a windowed loop that would silently drop the first real
+        //     token of every window after the first — a truncation fix that quietly truncates.
+        //
+        // The honest limitation, stated because it is not fixed: an entity straddling a window
+        // boundary is split into two. Entities are short and the window is 128 tokens, so this is
+        // rare, but it is a real difference from a single pass over the whole text.
+        let window_count = crate::embeddings::minilm::window_spans(tokens.len(), max_length).len();
+        const MAX_WINDOWS: usize = 64;
+        anyhow::ensure!(
+            window_count <= MAX_WINDOWS,
+            "NER input is {} tokens ({} windows of {}), over the {} window limit — refusing rather \
+             than extracting from a prefix and reporting it as the whole text",
+            tokens.len(),
+            window_count,
+            max_length,
+            MAX_WINDOWS
+        );
+
+        let mut entities = Vec::new();
+        for (window, (win_start, win_end)) in
+            crate::embeddings::minilm::window_spans(tokens.len(), max_length)
+                .into_iter()
+                .enumerate()
+        {
         let mut input_ids = vec![0i64; max_length];
         let mut attention = vec![0i64; max_length];
 
-        for (i, &token) in tokens.iter().take(max_length).enumerate() {
+        for (i, &token) in tokens[win_start..win_end].iter().enumerate() {
             input_ids[i] = token as i64;
         }
-        for (i, &mask) in attention_mask.iter().take(max_length).enumerate() {
+        for (i, &mask) in attention_mask[win_start..win_end].iter().enumerate() {
             attention[i] = mask as i64;
         }
 
@@ -694,15 +742,18 @@ impl NeuralNer {
 
         // Decode BIO tags to entities
         let num_labels = 9; // O, B-MISC, I-MISC, B-PER, I-PER, B-ORG, I-ORG, B-LOC, I-LOC
-        let seq_len = tokens.len().min(max_length);
+        let seq_len = win_end - win_start;
 
-        let mut entities = Vec::new();
         let mut current_entity: Option<(NerTag, Vec<usize>, f32)> = None;
 
         #[allow(clippy::needless_range_loop)] // Index used for both array access and arithmetic
         for i in 0..seq_len {
-            // Skip [CLS] and [SEP] tokens
-            if i == 0 || attention[i] == 0 {
+            // `i` indexes THIS WINDOW's logits; `gi` is the token's place in the whole text and is
+            // what `build_entity` needs, because it reads the full encoding's offsets.
+            let gi = win_start + i;
+            // [CLS] is only at index 0 of the FIRST window. Skipping `i == 0` in every window would
+            // drop the first real token of each one — a truncation fix that truncates.
+            if (window == 0 && i == 0) || attention[i] == 0 {
                 continue;
             }
 
@@ -721,13 +772,13 @@ impl NeuralNer {
             match (&current_entity, tag.is_begin(), tag.is_inside()) {
                 // Begin new entity
                 (None, true, _) => {
-                    current_entity = Some((tag, vec![i], best_prob));
+                    current_entity = Some((tag, vec![gi], best_prob));
                 }
                 // Continue current entity
                 (Some((prev_tag, _indices, _acc_prob)), _, true) if tag.matches_type(prev_tag) => {
                     // Take ownership to extend indices in-place (avoids clone)
                     if let Some((prev_tag, mut indices, acc_prob)) = current_entity.take() {
-                        indices.push(i);
+                        indices.push(gi);
                         current_entity = Some((prev_tag, indices, acc_prob + best_prob));
                     }
                 }
@@ -746,7 +797,7 @@ impl NeuralNer {
 
                     // Start new entity if this is a B- tag
                     if tag.is_begin() {
-                        current_entity = Some((tag, vec![i], best_prob));
+                        current_entity = Some((tag, vec![gi], best_prob));
                     } else {
                         current_entity = None;
                     }
@@ -755,7 +806,7 @@ impl NeuralNer {
             }
         }
 
-        // Don't forget the last entity
+        // Don't forget the last entity IN THIS WINDOW
         if let Some((tag, indices, acc_prob)) = current_entity {
             if let Some(entity) = self.build_entity(text, &tag, &indices, acc_prob, offsets) {
                 if entity.confidence >= self.config.confidence_threshold {
@@ -763,8 +814,11 @@ impl NeuralNer {
                 }
             }
         }
+        } // end window loop
 
-        // Deduplicate and merge overlapping entities
+        // Deduplicate and merge overlapping entities. This already existed and now earns its keep
+        // twice over: it is what collapses an entity that a window boundary reported from both
+        // sides into one.
         let entities = self.deduplicate_entities(entities);
 
         Ok(entities)

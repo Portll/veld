@@ -365,8 +365,19 @@ mod tests {
         use std::fs;
         use std::path::{Path, PathBuf};
 
-        const CAP: &str = "truncate(validation::MAX_ENTITIES_PER_MEMORY)";
+        // The cap call, not a raw truncate. It changed on 2026-08-28 when the cap became
+        // selectivity-ordered, and this test FAILED rather than passing vacuously when it did —
+        // the `capping_files >= 3` floor below is what caught it. That is the floor earning its
+        // keep: a marker-based gate whose marker is renamed asserts nothing, silently.
+        // The QUALIFIED call, not the bare name: `entity_cap.rs` DEFINES `cap_by_selectivity` and
+        // would otherwise match its own marker and be reported as an unredacted entry path. Keying
+        // on the qualified path distinguishes a call site from a definition without an exclusion
+        // list, which is the thing that quietly shrinks a gate's population over time.
+        const CAP: &str = "entity_cap::cap_by_selectivity(";
         const REDACT: &str = "redact_entities(";
+        // Nothing may cap by position any more. A blind truncate would cut by ARRIVAL order, which
+        // was measured to discard material 19x more selective than what it kept.
+        const BLIND: &str = "truncate(validation::MAX_ENTITIES_PER_MEMORY)";
 
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             for e in fs::read_dir(dir).expect("src/ must be readable") {
@@ -391,6 +402,18 @@ mod tests {
         let mut capping_files = 0;
         for f in &files {
             let text = fs::read_to_string(f).expect("source must be readable");
+            let name_early = f.strip_prefix(&src).unwrap_or(f).display().to_string();
+
+            // This file states BLIND as a literal to test for it; everything else that contains it
+            // is a path that caps by position.
+            if name_early != "redaction.rs" && text.contains(BLIND) {
+                panic!(
+                    "{name_early} truncates the entity list by ARRIVAL order. Measured 2026-08-27, \
+                     the tail that discards is 19x more selective than the head it keeps — use \
+                     crate::entity_cap::cap_by_selectivity"
+                );
+            }
+
             let caps: Vec<usize> = text.match_indices(CAP).map(|(i, _)| i).collect();
             if caps.is_empty() {
                 continue;
@@ -426,7 +449,8 @@ mod tests {
         assert!(
             capping_files >= 3,
             "found only {capping_files} file(s) that cap entities — expected the remember, ingest \
-             and zenoh paths at least. Has MAX_ENTITIES_PER_MEMORY been renamed?"
+             and zenoh paths at least. Has the cap call been renamed? This floor is what caught the \
+             2026-08-28 rename instead of letting this test pass asserting nothing."
         );
     }
 
