@@ -314,7 +314,17 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
         (0i64, 0i64, 0i64, 0i64);
     let mut total_vectors = 0i64;
 
-    for user_id in state.list_users().iter().take(100) {
+    // CACHED users only. `list_users()` is a FILESYSTEM listing, so pairing it with
+    // `get_user_memory()` opened a RocksDB instance for every user not currently
+    // resident — meaning a Prometheus scrape monotonically grew memory and FD usage
+    // AND mutated the user cache. That churn drives eviction, which is the condition
+    // the graph/user-memory reopen race needs, so scraping made an unrelated 500
+    // more likely. Metrics now describe what is resident, which is also the honest
+    // reading of a gauge that is set from resident state.
+    //
+    // The take(100) cap is retained from the original: it truncates the aggregate
+    // silently, but max_users_in_memory bounds the cache well below it in practice.
+    for user_id in state.list_cached_users().iter().take(100) {
         if let Ok(memory_sys) = state.get_user_memory(user_id) {
             if let Some(guard) = memory_sys.try_read() {
                 let stats = guard.stats();

@@ -1188,12 +1188,39 @@ impl VeldBackupEngine {
         Ok(())
     }
 
+    /// Upper bound on the memory records in `db`.
+    ///
+    /// This used to count EVERY key in the column family — counters, `stats:`
+    /// rows and index entries included — and the result is published in the
+    /// manifest as `memory_count` and rendered to operators as "Memories". It
+    /// therefore reported a number that was not a count of memories, and read
+    /// as authoritative because nothing downstream could tell.
+    ///
+    /// It now applies the same structural discriminator the real stats path
+    /// uses (`MemoryStorage::get_stats`): a memory key is exactly the 16 UUID
+    /// bytes, and `stats:`-prefixed keys are not memories.
+    ///
+    /// It is an UPPER BOUND, not the figure `get_stats` returns. That path also
+    /// drops soft-deleted records via `memory.is_forgotten()`, which requires
+    /// decoding each record — and decoding needs the storage layer's cipher and
+    /// key context, which a backup engine holding a bare `&DB` does not have.
+    /// Forgotten-but-not-compacted records are therefore still counted. Named
+    /// and returned as a bound rather than quietly reported as exact.
     fn estimate_memory_count(&self, db: &DB) -> Result<usize> {
-        // Estimate by counting keys (this is a rough estimate)
-        let mut count = 0;
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        const STATS_PREFIX: &[u8] = b"stats:";
+        const MEMORY_KEY_LEN: usize = 16; // UUID bytes
 
-        for _ in iter {
+        let mut count = 0;
+        for item in db.iterator(rocksdb::IteratorMode::Start) {
+            let (key, _value) = match item {
+                Ok(kv) => kv,
+                // A read error here must not silently shrink the count: surface
+                // it rather than reporting a smaller number as if it were whole.
+                Err(e) => return Err(anyhow!("counting memory records: {e}")),
+            };
+            if key.starts_with(STATS_PREFIX) || key.len() != MEMORY_KEY_LEN {
+                continue;
+            }
             count += 1;
         }
 
