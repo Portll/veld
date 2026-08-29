@@ -3120,16 +3120,61 @@ impl MultiUserMemoryManager {
                     .join("graph");
 
                 let mut all_restored = restored_stores;
+
+                // The main memories DB is what the caller actually came for, and it
+                // was never named in this list — so a successful restore reported
+                // stores that sound peripheral and stayed silent about the memories,
+                // which reads as "my memories did not come back".
+                all_restored.insert(0, "memories".to_string());
+
                 if graph_checkpoint.exists() {
+                    // STAGE THEN SWAP. This used to delete the live graph first and
+                    // then copy — so a failed copy left the user with NO graph at
+                    // all, and the failure was a warn!, so the function still
+                    // returned Ok and the endpoint still answered success: true.
+                    // Destroying data and reporting success is the worst available
+                    // outcome; the original is now never removed until its
+                    // replacement is on disk beside it.
+                    let staging = graph_path.with_extension("restoring");
+                    if staging.exists() {
+                        std::fs::remove_dir_all(&staging).with_context(|| {
+                            format!("clearing stale graph staging dir {staging:?}")
+                        })?;
+                    }
+                    crate::backup::copy_dir_recursive_pub(&graph_checkpoint, &staging).map_err(
+                        |e| {
+                            let _ = std::fs::remove_dir_all(&staging);
+                            anyhow::anyhow!(
+                                "restoring the graph for '{user_id}' failed while staging: {e}. \
+                                 The existing graph was left untouched."
+                            )
+                        },
+                    )?;
+
+                    // Only now is it safe to move the original aside.
+                    let previous = graph_path.with_extension("superseded");
                     if graph_path.exists() {
-                        let _ = std::fs::remove_dir_all(&graph_path);
+                        let _ = std::fs::remove_dir_all(&previous);
+                        std::fs::rename(&graph_path, &previous).with_context(|| {
+                            format!("moving the previous graph aside at {graph_path:?}")
+                        })?;
                     }
-                    if let Err(e) = crate::backup::copy_dir_recursive_pub(&graph_checkpoint, &graph_path) {
-                        tracing::warn!(error = %e, "Failed to restore graph DB from backup");
-                    } else {
-                        all_restored.push("graph".to_string());
-                        tracing::info!("Graph DB restored from backup");
+                    if let Err(e) = std::fs::rename(&staging, &graph_path) {
+                        // Put the original back rather than leaving the user with
+                        // neither.
+                        if previous.exists() {
+                            let _ = std::fs::rename(&previous, &graph_path);
+                        }
+                        let _ = std::fs::remove_dir_all(&staging);
+                        return Err(anyhow::anyhow!(
+                            "restoring the graph for '{user_id}' failed on swap: {e}. \
+                             The previous graph was put back."
+                        ));
                     }
+                    let _ = std::fs::remove_dir_all(&previous);
+
+                    all_restored.push("graph".to_string());
+                    tracing::info!("Graph DB restored from backup");
                 }
 
                 Ok(all_restored)
