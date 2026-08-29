@@ -381,11 +381,7 @@ impl MiniLMEmbedder {
         // CRITICAL: Ensure ORT_DYLIB_PATH is set BEFORE any ort code runs
         // This prevents ort from picking up system DLLs with wrong versions
         if let Err(e) = Self::ensure_onnx_runtime_available(offline_mode) {
-            tracing::warn!(
-                "Failed to set up ONNX Runtime: {}. Using simplified embeddings.",
-                e
-            );
-            return Self::new_simplified(config);
+            return Self::simplified_or_fail(config, &format!("ONNX Runtime setup failed: {e}"));
         }
 
         // Check if model files exist
@@ -393,17 +389,17 @@ impl MiniLMEmbedder {
 
         if !model_available {
             if offline_mode {
-                tracing::warn!(
-                    "Model files not found and VELD_OFFLINE=true. Using simplified embeddings.",
+                return Self::simplified_or_fail(
+                    config,
+                    "model files not found and VELD_OFFLINE=true",
                 );
-                return Self::new_simplified(config);
             }
 
             if !super::auto_download_models_enabled() {
-                tracing::warn!(
-                    "Model files not found locally and VELD_AUTO_DOWNLOAD_MODELS is not enabled. Using simplified embeddings.",
+                return Self::simplified_or_fail(
+                    config,
+                    "model files not found locally and VELD_AUTO_DOWNLOAD_MODELS is not enabled",
                 );
-                return Self::new_simplified(config);
             }
 
             // Try to auto-download model files
@@ -446,11 +442,10 @@ impl MiniLMEmbedder {
                     return Self::new(updated_config);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to download models: {}. Using simplified embeddings.",
-                        e
+                    return Self::simplified_or_fail(
+                        config,
+                        &format!("model download failed: {e}"),
                     );
-                    return Self::new_simplified(config);
                 }
             }
         }
@@ -492,10 +487,44 @@ impl MiniLMEmbedder {
         self.lazy_model.get().is_some()
     }
 
+    /// Degrade to hash embeddings, but only if someone asked for that.
+    ///
+    /// Every caller of this used to be a silent `return Self::new_simplified(..)`
+    /// on a failure path. The result is an embedder whose `encode()` returns
+    /// non-semantic vectors while nothing reports an error — so recall still
+    /// answers, benchmarks still produce numbers, and all of it is measured
+    /// against noise. That is not a degraded search, it is an invalidated
+    /// measurement that looks like a working one.
+    ///
+    /// Refuse by default. `VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1` opts in, for
+    /// tests and offline smoke runs where nobody is reading the quality numbers.
+    fn simplified_or_fail(config: EmbeddingConfig, why: &str) -> Result<Self> {
+        if super::allow_simplified_embeddings() {
+            tracing::warn!(
+                reason = why,
+                "DEGRADED: using non-semantic hash embeddings because \
+                 VELD_ALLOW_SIMPLIFIED_EMBEDDINGS is set. Any recall quality or \
+                 benchmark figure from this process is meaningless.",
+            );
+            return Self::new_simplified(config);
+        }
+        anyhow::bail!(
+            "refusing to run on non-semantic hash embeddings: {why}. Every recall \
+             and benchmark number would be computed against noise while still \
+             reporting success. Fix the model setup, or set \
+             VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1 to accept a degraded embedder \
+             deliberately."
+        )
+    }
+
     /// Create simplified embedder as fallback when model files are missing
     ///
     /// Uses hash-based embeddings that are fast but less semantic.
     /// Suitable for edge devices without enough RAM for ONNX.
+    ///
+    /// Prefer [`Self::simplified_or_fail`] on failure paths — calling this
+    /// directly is how the degrade became silent in the first place. Tests that
+    /// deliberately want hash mode are the legitimate direct callers.
     pub fn new_simplified(config: EmbeddingConfig) -> Result<Self> {
         tracing::warn!(
             "Using SIMPLIFIED embeddings (hash-based). Semantic search will be limited."

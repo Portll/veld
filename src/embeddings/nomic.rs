@@ -423,11 +423,7 @@ impl NomicEmbedder {
 
         // Ensure ORT_DYLIB_PATH is set before any ort code runs
         if let Err(e) = Self::ensure_onnx_runtime_available(offline_mode) {
-            tracing::warn!(
-                "Failed to set up ONNX Runtime: {}. Using simplified Nomic embeddings.",
-                e
-            );
-            return Self::new_simplified(config);
+            return Self::simplified_or_fail(config, &format!("ONNX Runtime setup failed: {e}"));
         }
 
         // Check if model files exist
@@ -435,17 +431,17 @@ impl NomicEmbedder {
 
         if !model_available {
             if offline_mode {
-                tracing::warn!(
-                    "Nomic model files not found and VELD_OFFLINE=true. Using simplified embeddings.",
+                return Self::simplified_or_fail(
+                    config,
+                    "Nomic model files not found and VELD_OFFLINE=true",
                 );
-                return Self::new_simplified(config);
             }
 
             if !super::auto_download_models_enabled() {
-                tracing::warn!(
-                    "Nomic model files not found locally and VELD_AUTO_DOWNLOAD_MODELS is not enabled. Using simplified embeddings.",
+                return Self::simplified_or_fail(
+                    config,
+                    "Nomic model files not found locally and VELD_AUTO_DOWNLOAD_MODELS is not enabled",
                 );
-                return Self::new_simplified(config);
             }
 
             // Try to auto-download model files
@@ -486,11 +482,10 @@ impl NomicEmbedder {
                     return Self::new(updated_config);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to download Nomic models: {}. Using simplified embeddings.",
-                        e
+                    return Self::simplified_or_fail(
+                        config,
+                        &format!("Nomic model download failed: {e}"),
                     );
-                    return Self::new_simplified(config);
                 }
             }
         }
@@ -531,10 +526,40 @@ impl NomicEmbedder {
         self.lazy_model.get().is_some()
     }
 
+    /// Degrade to hash embeddings, but only if someone asked for that.
+    ///
+    /// See the MiniLM twin for the full reasoning. In short: simplified mode
+    /// returns non-semantic vectors while nothing errors, so every recall and
+    /// benchmark figure is measured against noise and still reports success.
+    /// Refuse unless `VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1`.
+    ///
+    /// Returning `Err` here is safe for the primary-embedder selection in
+    /// `memory::mod`: it already treats `Err(_)` and `Ok(simplified)` the same
+    /// way — warn, and fall back to MiniLM as primary.
+    fn simplified_or_fail(config: NomicConfig, why: &str) -> Result<Self> {
+        if super::allow_simplified_embeddings() {
+            tracing::warn!(
+                reason = why,
+                "DEGRADED: using non-semantic hash embeddings for Nomic because \
+                 VELD_ALLOW_SIMPLIFIED_EMBEDDINGS is set. Any recall quality or \
+                 benchmark figure from this process is meaningless.",
+            );
+            return Self::new_simplified(config);
+        }
+        anyhow::bail!(
+            "refusing to run Nomic on non-semantic hash embeddings: {why}. Fix the \
+             model setup, or set VELD_ALLOW_SIMPLIFIED_EMBEDDINGS=1 to accept a \
+             degraded embedder deliberately."
+        )
+    }
+
     /// Create simplified embedder as fallback when model files are missing
     ///
     /// Uses hash-based embeddings that are fast but less semantic.
     /// Suitable for edge devices without enough RAM for ONNX.
+    ///
+    /// Prefer [`Self::simplified_or_fail`] on failure paths. Tests that
+    /// deliberately want hash mode are the legitimate direct callers.
     pub fn new_simplified(config: NomicConfig) -> Result<Self> {
         tracing::warn!(
             "Using SIMPLIFIED Nomic embeddings (hash-based). Semantic search will be limited."

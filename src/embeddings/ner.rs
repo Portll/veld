@@ -965,7 +965,14 @@ impl NeuralNer {
                             .is_some_and(|slice| slice.eq_ignore_ascii_case(&e.name))
                     })
                     .map(|(pos, _)| (pos, pos + name_len))
-                    .unwrap_or((0, name_len.min(text.len())));
+                    // NOT FOUND means the extractor normalised the surface form, so
+                    // the span is genuinely unknown. This used to return
+                    // (0, name_len) — a span asserting that the first name_len bytes
+                    // of the text ARE this entity, which is a confident wrong answer
+                    // that any offset-based consumer (highlighting, linking) would
+                    // act on. A zero-width span says "position unknown" instead, and
+                    // that is checkable.
+                    .unwrap_or((0, 0));
 
                 NerEntity {
                     text: e.name,
@@ -976,6 +983,14 @@ impl NeuralNer {
                 }
             })
             .collect();
+
+        // The neural and batch paths both dedup (see the two other call sites);
+        // this one did not, so the heuristic extractor alone could emit overlapping
+        // duplicates for the same span. Note the overlap test treats zero-width
+        // "position unknown" spans as non-overlapping, which is correct — two
+        // entities whose positions are both unknown are not evidence of one
+        // entity, and collapsing them would invent a fact.
+        let entities = self.deduplicate_entities(entities);
 
         Ok(entities)
     }
