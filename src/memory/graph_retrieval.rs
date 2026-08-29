@@ -847,8 +847,24 @@ pub fn spreading_activation_retrieve_with_stats(
                     .get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
 
                 for edge in edges {
-                    // Spread activation to connected entity
-                    let target_uuid = edge.to_entity;
+                    // Resolve the real neighbour, as the bidirectional path does.
+                    //
+                    // This was `edge.to_entity` unconditionally. Edges are indexed
+                    // under BOTH endpoints (index_entity_edge writes two keys), so
+                    // get_entity_relationships_limited returns edges where
+                    // entity_uuid is sometimes the `to` side — and on those, taking
+                    // `to_entity` spread activation from a node back onto ITSELF
+                    // instead of to its neighbour. A self-loop that inflates the
+                    // source's own score and never reaches the entity the edge was
+                    // recording a relationship to.
+                    //
+                    // Still divergent from the bidirectional path, deliberately and
+                    // not silently: that path also blends directional_strength
+                    // (effective*0.6 + directional*0.4), so learned edge direction
+                    // affects scoring there and not here. That is a scoring change
+                    // rather than a correctness fix, so it is left for a change that
+                    // can be measured on its own.
+                    let target_uuid = edge.neighbor_of(&entity_uuid);
 
                     // Edge-tier trust weight (SHO-D1, PIPE-4)
                     let tier_trust = if edge.is_potentiated() {
