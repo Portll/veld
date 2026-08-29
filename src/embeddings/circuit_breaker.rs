@@ -316,6 +316,17 @@ impl Embedder for ResilientEmbedder {
         self.inner.dimension()
     }
 
+    /// Delegate, rather than inheriting the trait default of `"unknown"`.
+    ///
+    /// A wrapper must not change the identity of the model it wraps. This one
+    /// did, silently: `AlignmentPairId` is built from `model_id()` and exists so
+    /// an alignment fitted on one model pair cannot be loaded against another,
+    /// and an embedder reporting `"unknown"` collapses every pair into the same
+    /// bucket — defeating the guard by agreeing with everything.
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
     fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         // For batch operations, check circuit once and apply consistently
         if !self.should_allow_request() {
