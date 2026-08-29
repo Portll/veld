@@ -455,7 +455,17 @@ impl VamanaProjection {
                         // no image, and an image projection should
                         // happily skip it. Advance the checkpoint so
                         // replay doesn't loop on this frame forever.
-                        tracing::warn!(
+                        // DEBUG, not WARN. Image/Audio/Video embeddings are never
+                        // written anywhere in the tree — those three fields only
+                        // ever get `None` — so their projections emit this for
+                        // EVERY memory, forever. Measured 2026-08-25: 35,015 of
+                        // 131,912 lines, 26.5% of everything veld had ever logged,
+                        // were this one message. A warning that fires on every
+                        // normal operation is not a warning; it buries the ones
+                        // that mean something. The skip itself is correct and the
+                        // checkpoint must still advance, so the behaviour is
+                        // unchanged — only the volume.
+                        tracing::debug!(
                             projection = self.kind.projection_name(),
                             memory_id = %memory_id,
                             lsn = lsn.0,
