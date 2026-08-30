@@ -525,12 +525,18 @@ pub async fn recall(
                 ..Default::default()
             };
 
-            let memories = memory_guard.recall(&query).unwrap_or_default();
+            // A recall failure is NOT an empty result. unwrap_or_default() here
+            // returned HTTP 200 with zero memories, which the caller cannot
+            // distinguish from "you have no matching memories" — so a broken index,
+            // an unreadable store or a decode error all presented as a confident
+            // negative answer. Propagate; an error is the honest response.
+            let memories = memory_guard.recall(&query)?;
 
-            (memories, reminders, prospective_signals, query_embedding_opt)
+            Ok::<_, anyhow::Error>((memories, reminders, prospective_signals, query_embedding_opt))
         })
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?;
 
     let triggered_reminder_count = triggered_reminders.len();
     if triggered_reminder_count > 0 {
@@ -1600,7 +1606,9 @@ pub async fn proactive_context(
                 competition_mode: req.competition_mode,
                 ..Default::default()
             };
-            let results = memory_guard.recall(&query).unwrap_or_default();
+            // See the note at the first recall site: a failure must not present as
+            // an empty result set.
+            let results = memory_guard.recall(&query)?;
 
             let candidates: Vec<(SharedMemory, f32)> = results
                 .into_iter()
@@ -1717,7 +1725,7 @@ pub async fn proactive_context(
             }
 
             // Return top results with entity overlap annotation
-            enriched
+            let out = enriched
                 .into_iter()
                 .take(max_results)
                 .map(|(m, score, matched)| {
@@ -1779,10 +1787,12 @@ pub async fn proactive_context(
                             .cloned(),
                     }
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            Ok::<_, anyhow::Error>(out)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
     };
 
     let t_recall = op_start.elapsed();
@@ -2521,10 +2531,13 @@ pub async fn recall_tracked(
                 competition_mode: req.competition_mode,
                 ..Default::default()
             };
-            memory_guard.recall(&query).unwrap_or_default()
+            // See the note at the first recall site: a failure must not present as
+            // an empty result set, which is indistinguishable from "no matches".
+            memory_guard.recall(&query)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
     };
 
     // Extract memory IDs for tracking
