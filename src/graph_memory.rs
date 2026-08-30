@@ -2344,7 +2344,51 @@ impl GraphMemory {
             self.db.delete_cf(self.entity_pair_index_cf(), key)?;
         }
 
-        // 7. Decrement counter
+        // 7. Remove entity_episodes entries (prefix scan)
+        //
+        // This step did not exist. The inverted index is keyed
+        // `{entity_uuid}:{episode_uuid}` (index_entity_episode) and was only ever
+        // cleaned per-EPISODE, so deleting an entity that episodes still referenced
+        // left its rows behind forever. Orphan cleanup runs repeatedly, so the
+        // residue accumulates: a slow leak in index space that nothing reports and
+        // that get_episodes_by_entity would happily prefix-scan into, resolving
+        // episode ids for an entity that no longer exists.
+        //
+        // Only the forward direction exists for this index — unlike
+        // entity_pair_index above, which needs the reverse sweep because it is
+        // written in both orientations.
+        let episode_prefix = format!("{}:", uuid);
+        let mut episode_keys_to_delete = Vec::new();
+        let iter = self.db.prefix_iterator_cf(
+            self.entity_episodes_cf(),
+            episode_prefix.as_bytes(),
+        );
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    let key_str = String::from_utf8_lossy(&key);
+                    if key_str.starts_with(&episode_prefix) {
+                        episode_keys_to_delete.push(key.to_vec());
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let leaked = episode_keys_to_delete.len();
+        for key in &episode_keys_to_delete {
+            self.db.delete_cf(self.entity_episodes_cf(), key)?;
+        }
+        if leaked > 0 {
+            tracing::debug!(
+                entity = %uuid,
+                entries = leaked,
+                "delete_entity: scrubbed entity_episodes index entries",
+            );
+        }
+
+        // 8. Decrement counter
         self.entity_count.fetch_sub(1, Ordering::Relaxed);
 
         tracing::debug!("Deleted orphaned entity '{}' (uuid={})", entity.name, uuid);
