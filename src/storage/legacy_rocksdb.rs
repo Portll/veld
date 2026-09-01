@@ -9,14 +9,90 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{
-    AuditLogEntry, AuditStore, BackupStore, GraphStore, KeyValueStore, MigrationStore,
-    PrimaryMemoryStore, StorageFactory,
+    AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, GraphStore, KeyValueStore,
+    MigrationStore, PrimaryMemoryStore, StorageFactory, WriteBatch as StorageWriteBatch,
 };
 use crate::backup::{BackupMetadata, VeldBackupEngine};
 use crate::config::StorageBackend;
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphMemory, GraphStats, RelationshipEdge};
 use crate::memory::storage::{MemoryStorage, SearchCriteria, VectorMappingEntry};
 use crate::memory::{Memory, MemoryConfig, MemoryId};
+
+/// DB-scoped atomic batch writer — see [`super::WriteBatch`] for why it hangs
+/// off the database rather than off a single store.
+pub struct RocksDbBatchWriter {
+    db: Arc<DB>,
+}
+
+impl RocksDbBatchWriter {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+}
+
+impl BatchWriter for RocksDbBatchWriter {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::RocksDb
+    }
+
+    fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // RESOLVE EVERY COLUMN FAMILY FIRST. Resolving inside the translation
+        // loop would build a rocksdb batch containing the ops before an unknown
+        // name and then bail — and because nothing has been written yet that
+        // would still look atomic here, while silently changing what the caller
+        // asked for the moment anyone reorders the loop or writes early. The
+        // failure is made to happen before any op is translated, not before any
+        // op is applied, so the two cannot drift apart.
+        let mut handles: Vec<(&str, &ColumnFamily)> = Vec::new();
+        for name in batch.column_families() {
+            let cf = self.db.cf_handle(name).ok_or_else(|| {
+                anyhow!(
+                    "write_batch names column family '{}', which this database does not have — \
+                     nothing was written",
+                    name
+                )
+            })?;
+            handles.push((name, cf));
+        }
+        let resolved = |name: &str| -> &ColumnFamily {
+            handles
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, h)| *h)
+                .expect("column_families() is the set the ops draw from")
+        };
+
+        let mut wb = WriteBatch::default();
+        for op in batch.ops() {
+            match op {
+                BatchOp::Put {
+                    cf: Some(name),
+                    key,
+                    value,
+                } => wb.put_cf(resolved(name), key, value),
+                BatchOp::Put {
+                    cf: None,
+                    key,
+                    value,
+                } => wb.put(key, value),
+                BatchOp::Delete {
+                    cf: Some(name),
+                    key,
+                } => wb.delete_cf(resolved(name), key),
+                BatchOp::Delete { cf: None, key } => wb.delete(key),
+            }
+        }
+
+        self.db
+            .write(wb)
+            .context("write_batch: rocksdb refused the batch")?;
+        Ok(())
+    }
+}
 
 /// Trait adapter for the current RocksDB-backed primary memory store.
 pub struct RocksDbPrimaryMemoryStore {

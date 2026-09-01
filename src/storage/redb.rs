@@ -20,14 +20,96 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    AuditLogEntry, AuditStore, BackupStore, GraphStore, KeyValueStore, MigrationStore,
-    PrimaryMemoryStore, StorageFactory,
+    AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, GraphStore, KeyValueStore,
+    MigrationStore, PrimaryMemoryStore, StorageFactory, WriteBatch as StorageWriteBatch,
 };
 use crate::backup::BackupMetadata;
 use crate::config::StorageBackend;
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, RelationshipEdge};
 use crate::memory::storage::{SearchCriteria, VectorMappingEntry};
 use crate::memory::{Memory, MemoryConfig, MemoryId};
+
+/// The table an op with `cf: None` addresses. Deliberately the SAME table
+/// `RedbKeyValueStore` binds (`KV_TABLE` below is defined from this name, so
+/// the two cannot drift): a default-keyspace batch op and a `KeyValueStore`
+/// put must reach the same rows, or a batch would appear to write nothing.
+pub(crate) const DEFAULT_TABLE_NAME: &str = "kv";
+
+/// DB-scoped atomic batch writer. See [`super::WriteBatch`] for why the handle
+/// is the database rather than one store.
+pub struct RedbBatchWriter {
+    database: Arc<redb::Database>,
+}
+
+impl RedbBatchWriter {
+    pub fn new(database: Arc<redb::Database>) -> Self {
+        Self { database }
+    }
+}
+
+impl BatchWriter for RedbBatchWriter {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::Redb
+    }
+
+    fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // EXISTENCE IS CHECKED, NOT ASSUMED, and the reason is a real
+        // divergence between the backends rather than caution. RocksDB column
+        // families are created when the database is opened, so naming an
+        // unknown one is an error. redb tables are created LAZILY on first
+        // write — `init_table` above exists solely to paper over that — so the
+        // same batch would silently CREATE the table here and succeed. One
+        // backend rejecting what the other quietly invents is precisely the
+        // divergence that makes a shared trait a lie, so a read transaction
+        // resolves every name first and an unknown one fails before the write
+        // transaction is ever opened.
+        {
+            let read = self.database.begin_read()?;
+            for name in batch.column_families() {
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                    redb::TableDefinition::new(name);
+                read.open_table(def).map_err(|e| {
+                    anyhow!(
+                        "write_batch names table '{}', which this database does not have \
+                         ({e}) — nothing was written",
+                        name
+                    )
+                })?;
+            }
+        }
+
+        let txn = self.database.begin_write()?;
+        {
+            for op in batch.ops() {
+                match op {
+                    BatchOp::Put { cf, key, value } => {
+                        let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                            redb::TableDefinition::new(cf.as_deref().unwrap_or(DEFAULT_TABLE_NAME));
+                        let mut handle = txn.open_table(def)?;
+                        handle.insert(key.as_slice(), value.as_slice())?;
+                    }
+                    BatchOp::Delete { cf, key } => {
+                        let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                            redb::TableDefinition::new(cf.as_deref().unwrap_or(DEFAULT_TABLE_NAME));
+                        let mut handle = txn.open_table(def)?;
+                        // Deleting an absent key is not an error: rocksdb's
+                        // delete_cf is equally indifferent, and a batch that
+                        // failed on a missing row would diverge from it.
+                        let _ = handle.remove(key.as_slice())?;
+                    }
+                }
+            }
+        }
+        // Atomic here: one redb write transaction. Dropping it without commit
+        // — which is what `?` above does on any failure — applies nothing.
+        txn.commit()?;
+        Ok(())
+    }
+}
 
 fn not_implemented(operation: &str, path: &Path) -> anyhow::Error {
     anyhow!(
@@ -446,7 +528,7 @@ impl GraphStore for RedbGraphStore {
 /// Single table backing each namespace's key-value `.redb` file. Keys and values
 /// are opaque byte strings (the trait's contract); callers serialize above this.
 const KV_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> =
-    redb::TableDefinition::new("kv");
+    redb::TableDefinition::new(DEFAULT_TABLE_NAME);
 
 /// redb-backed [`KeyValueStore`]. Each namespace is its own `<namespace>.redb` file
 /// holding a single `kv` table. Operations are one transaction each (redb commits are
@@ -1037,5 +1119,103 @@ impl StorageFactory for RedbStorageFactory {
 
     fn open_migration_store(&self, path: &Path) -> Result<Arc<dyn MigrationStore>> {
         Ok(Arc::new(RedbMigrationStore::open(path)?))
+    }
+}
+#[cfg(test)]
+mod redb_batch_tests {
+    use super::*;
+    use crate::storage::WriteBatch as StorageWriteBatch;
+
+    fn db(tmp: &tempfile::TempDir) -> Arc<redb::Database> {
+        let path = tmp.path().join("batch.redb");
+        create_redb_database(&path).expect("create db")
+    }
+
+    #[test]
+    fn a_batch_spanning_two_tables_commits_both() {
+        // This is the property `supports_transactional_batch: true` actually
+        // claims — atomic ACROSS families, not merely within one. It is the
+        // property src/memory/prospective.rs:298 and :382 depend on.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let database = db(&tmp);
+        init_table(&database, MEMORIES_TABLE).expect("init memories");
+        init_table(&database, AUDIT_TABLE).expect("init audit");
+
+        let writer = RedbBatchWriter::new(database.clone());
+        let mut batch = StorageWriteBatch::new();
+        batch.put_cf("memories", b"m1".to_vec(), b"mv".to_vec());
+        batch.put_cf("audit", b"a1".to_vec(), b"av".to_vec());
+        writer.write_batch(&batch).expect("write_batch");
+
+        assert_eq!(
+            table_get(&database, MEMORIES_TABLE, b"m1").expect("get"),
+            Some(b"mv".to_vec())
+        );
+        assert_eq!(
+            table_get(&database, AUDIT_TABLE, b"a1").expect("get"),
+            Some(b"av".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_batch_whose_second_op_cannot_apply_leaves_the_first_unapplied() {
+        // THE test that stops the capability flag being a declaration with
+        // nothing behind it. Without it, `supports_transactional_batch: true`
+        // is indistinguishable from a loop of point writes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let database = db(&tmp);
+        init_table(&database, MEMORIES_TABLE).expect("init memories");
+
+        let writer = RedbBatchWriter::new(database.clone());
+        let mut batch = StorageWriteBatch::new();
+        batch.put_cf("memories", b"first".to_vec(), b"v".to_vec());
+        batch.put_cf("no_such_table", b"second".to_vec(), b"v".to_vec());
+
+        let err = writer.write_batch(&batch).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("no_such_table"),
+            "the error must name the table it could not resolve, got: {err}"
+        );
+        assert_eq!(
+            table_get(&database, MEMORIES_TABLE, b"first").expect("get"),
+            None,
+            "the FIRST op was applied despite the batch failing — this is the \
+             partial write the capability flag says cannot happen"
+        );
+    }
+
+    #[test]
+    fn an_unknown_table_is_refused_rather_than_created() {
+        // redb opens-or-CREATES a table in a write transaction, so without an
+        // explicit existence check this batch would silently succeed and invent
+        // a table — while rocksdb, whose column families are fixed at open,
+        // would reject the same batch. Asserted so the two backends cannot
+        // quietly disagree about what the same WriteBatch means.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let database = db(&tmp);
+        let writer = RedbBatchWriter::new(database.clone());
+
+        let mut batch = StorageWriteBatch::new();
+        batch.put_cf("invented", b"k".to_vec(), b"v".to_vec());
+        assert!(writer.write_batch(&batch).is_err());
+
+        let read = database.begin_read().expect("read txn");
+        let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new("invented");
+        assert!(
+            read.open_table(def).is_err(),
+            "the refused batch created the table anyway"
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_writes_nothing_and_succeeds() {
+        // 7 call sites in src/ branch on is_empty() to skip the write. This
+        // makes the skip unnecessary rather than merely conventional.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let database = db(&tmp);
+        let writer = RedbBatchWriter::new(database.clone());
+        writer
+            .write_batch(&StorageWriteBatch::new())
+            .expect("an empty batch is a no-op, not an error");
     }
 }

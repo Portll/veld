@@ -155,16 +155,22 @@ Measured after the handoff was first written, before implementing anything.
 
 **What the batch API has to carry.** Every `rocksdb::WriteBatch` operation in `src/`:
 
-    71  batch.put_cf(...)     column-family scoped
-    53  batch.delete_cf(...)  column-family scoped
+    54  batch.put_cf(...)     column-family scoped
+    52  batch.delete_cf(...)  column-family scoped
     15  batch.put(...)
     12  batch.delete(...)
      7  batch.is_empty()
-     1  batch.iter()
-    42  db.write(batch)   +  8  db.write_opt(...)
+     0  batch.iter()          -- see below; the earlier count of 1 was a name collision
+    34  db.write(batch)   +  8  db.write_opt(...)
 
-**82% of batch operations are column-family scoped.** Batch and column-family are therefore not two
+**80% of batch operations are column-family scoped.** Batch and column-family are therefore not two
 independent extensions that can be done in either order — batch requires CF.
+
+> **Corrected on implementation, 2026-09-01.** The first pass of this section reported 71/53 and 42
+> writes. Re-measured with anchored patterns: 54/52 and 34. The ratio, which is the load-bearing
+> part, is unchanged (82% → 80%) and so is the conclusion. But the raw counts were the numbers a
+> reviewer would check, and they were wrong — the original grep matched `put_cf` on receivers other
+> than a `batch`.
 
 **The obvious API is wrong, and here is the measurement that says so.** Both `KeyValueStore`
 implementations are ALREADY scoped to a single column family: `RocksDbColumnFamilyStore` holds one
@@ -172,17 +178,26 @@ implementations are ALREADY scoped to a single column family: `RocksDbColumnFami
 `RedbKeyValueStore` binds one `KV_TABLE` (`redb.rs:481-493`). So hanging `write_batch` off
 `KeyValueStore` looks natural — the store already knows its CF, and no per-op CF field is needed.
 
-That shape cannot express what 4 call sites already do:
+That shape cannot express what 2 call sites already do:
 
-    src/memory/prospective.rs:298         index_cf + tasks_cf in one batch
-    src/memory/prospective.rs:382         index_cf + tasks_cf in one batch
-    src/memory/sleep_time/supersession.rs:204
-    src/memory/todos.rs:274
+    src/memory/prospective.rs:298-362     index_cf + tasks_cf in one batch
+    src/memory/prospective.rs:382-408     index_cf + tasks_cf in one batch
 
-31 batch blocks were examined: 27 single-CF, **4 multi-CF**. Those four write across column families
-atomically. A store-scoped batch would force them into two separate batches — which is not the same
-program. It would turn an atomic cross-CF update into two updates with a window between them, and
-nothing at the call site would look different.
+Those two write across column families atomically. A store-scoped batch would force them into two
+separate batches — which is not the same program. It would turn an atomic cross-CF update into two
+updates with a window between them, and nothing at the call site would look different.
+
+> **Corrected on implementation, 2026-09-01.** This said **4**, naming
+> `supersession.rs:204` and `todos.rs:274` as well. Both are **single-CF**: `supersession.rs:204-206`
+> is `delete_cf(self.cf(), f)` then `delete_cf(self.cf(), r)` — the same family twice — and
+> `todos.rs:274-289` is two `put_cf(index_cf, …)`. The original count treated "two CF-scoped ops in
+> one block" as "two column families" without comparing the family arguments.
+>
+> **The design does not change, and that is the point worth keeping.** One multi-CF site is
+> sufficient to force a DB-scoped handle; the argument never depended on how many there were. But
+> the count was offered as the evidence, and halving it does not weaken a conclusion that was never
+> resting on it — which is worth knowing before someone re-derives 2 and assumes the design was
+> wrong too.
 
 **So the batch handle must be DB-scoped, not store-scoped**, and `StorageCapabilities::
 supports_transactional_batch` must mean "atomic ACROSS column families", because that is the
@@ -202,8 +217,22 @@ The one test that makes the capability flag mean something: a batch whose second
 the FIRST op unapplied. Assert it per backend. Without that, `supports_transactional_batch: true`
 stays what it is today — a declaration with nothing behind it, which is the habit named below.
 
-`batch.iter()` (1 call site) is the only operation this shape does not cover. Find it before
-committing to the design.
+~~`batch.iter()` (1 call site) is the only operation this shape does not cover. Find it before
+committing to the design.~~
+
+**Resolved 2026-09-01: there is no such call site.** `src/embeddings/alignment.rs:69` is
+
+    fn project_batch(&self, batch: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        batch.iter().map(|v| self.project(v)).collect()
+    }
+
+— a slice of embedding vectors, not a `rocksdb::WriteBatch`. The measurement matched on the
+variable NAME. So the shape above covers every real operation and the design has no gap.
+
+Worth keeping rather than deleting, because the instruction "find it before committing to the
+design" is what made it look already checked. A named open question reads as diligence whether or
+not anyone answers it, and this one was load-bearing enough to have blocked the design if taken on
+trust in either direction.
 
 ## The pattern worth naming
 
