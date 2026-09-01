@@ -450,6 +450,28 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         unimplemented!("redb gc_merge_tombstones is not built; returning 0 would be indistinguishable from a sweep that found no tombstones")
     }
 
+    fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        // Ordered range scan over the memories table, stopping at the first key
+        // that leaves the prefix. redb ranges are ordered, so this terminates
+        // early rather than reading the table.
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(MEMORIES_TABLE)?;
+        let mut keys = Vec::new();
+        for row in table.range(prefix..)? {
+            let (k, _) = row?;
+            let key = k.value().to_vec();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
+    fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
+        RedbBatchWriter::new(self.database.clone()).write_batch(batch)
+    }
+
     fn backend(&self) -> StorageBackend {
         StorageBackend::Redb
     }
