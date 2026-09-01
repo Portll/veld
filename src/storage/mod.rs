@@ -470,3 +470,113 @@ mod tests {
         assert!(factory.capabilities().default_target);
     }
 }
+
+#[cfg(test)]
+mod backend_coverage_matrix {
+    //! Executable coverage: every PrimaryMemoryStore method CALLED on both backends.
+    //!
+    //! A static count of `unbuilt(` in the source is one witness and a weak one — it
+    //! cannot see a method that compiles, is reached, and fails for another reason,
+    //! and it counts a refusal in a comment. This calls all of them and records what
+    //! actually happens, which is a different predicate over the same question.
+    use super::*;
+    use crate::memory::types::{Experience, ExperienceType, MemoryTier};
+    use crate::storage::PrimaryMemoryStore;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Outcome { Works, Refuses, Panics }
+
+    fn probe<T>(f: impl FnOnce() -> Result<T>) -> Outcome {
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Err(_) => Outcome::Panics,
+            Ok(Ok(_)) => Outcome::Works,
+            Ok(Err(_)) => Outcome::Refuses,
+        }
+    }
+    fn probe_usize(f: impl FnOnce() -> usize) -> Outcome {
+        match catch_unwind(AssertUnwindSafe(f)) { Err(_) => Outcome::Panics, Ok(_) => Outcome::Works }
+    }
+
+    fn a_memory() -> Memory {
+        let now = chrono::Utc::now();
+        Memory::from_legacy(
+            MemoryId(uuid::Uuid::new_v4()),
+            Experience { experience_type: ExperienceType::Observation, content: "probe".into(), ..Default::default() },
+            0.5, 0, now, now, false, MemoryTier::LongTerm, Vec::new(), 1.0,
+            None, None, None, None, 0.0, None, None, 1, Vec::new(), Vec::new(),
+        )
+    }
+
+    /// Calls all 33 trait methods and returns (name, outcome), sorted.
+    fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
+        let m = a_memory();
+        let id = m.id.clone();
+        let cutoff = chrono::Utc::now();
+        let mut out = vec![
+            ("backend",                       probe(|| Ok::<_, anyhow::Error>(s.backend()))),
+            ("put_memory",                    probe(|| s.put_memory(&m))),
+            ("get_memory",                    probe(|| s.get_memory(&id))),
+            ("update_memory",                 probe(|| s.update_memory(&m))),
+            ("search",                        probe(|| s.search(crate::memory::storage::SearchCriteria::ByTags(vec!["x".into()])))),
+            ("get_vector_mapping",            probe(|| s.get_vector_mapping(&id))),
+            ("put_vector_mapping",            probe(|| s.put_vector_mapping(&id, &Default::default()))),
+            ("delete_vector_mapping",         probe(|| s.delete_vector_mapping(&id))),
+            ("flush",                         probe(|| s.flush())),
+            ("get",                           probe(|| s.get(&id))),
+            ("store",                         probe(|| s.store(&m))),
+            ("update",                        probe(|| s.update(&m))),
+            ("get_all",                       probe(|| s.get_all())),
+            ("get_all_ids",                   probe(|| s.get_all_ids())),
+            ("increment_retrieval_count",     probe(|| s.increment_retrieval_count())),
+            ("get_stats",                     probe(|| s.get_stats())),
+            ("find_by_external_id",           probe(|| s.find_by_external_id("nope"))),
+            ("get_children",                  probe(|| s.get_children(&id))),
+            ("get_ancestors",                 probe(|| s.get_ancestors(&id))),
+            ("get_hierarchy_context",         probe(|| s.get_hierarchy_context(&id))),
+            ("get_uncompressed_older_than",   probe(|| s.get_uncompressed_older_than(cutoff))),
+            ("mark_forgotten_by_age",         probe(|| s.mark_forgotten_by_age(cutoff))),
+            ("save_interference_records",     probe(|| s.save_interference_records("m", &[]))),
+            ("delete_interference_records",   probe(|| s.delete_interference_records("m"))),
+            ("clear_all_interference_records",probe(|| s.clear_all_interference_records())),
+            ("cleanup_corrupted",             probe(|| s.cleanup_corrupted())),
+            ("migrate_legacy",                probe(|| s.migrate_legacy())),
+            ("scan_prefix_keys",              probe(|| s.scan_prefix_keys(b"x"))),
+            ("write_batch",                   probe(|| s.write_batch(&crate::storage::WriteBatch::new()))),
+            ("run_merge_pass",                probe_usize(|| s.run_merge_pass("u", 1))),
+            ("gc_merge_tombstones",           probe_usize(|| s.gc_merge_tombstones("u"))),
+            ("delete_memory",                 probe(|| s.delete_memory(&id))),
+            ("delete",                        probe(|| s.delete(&id))),
+        ];
+        out.sort_by_key(|(n, _)| *n);
+        out
+    }
+
+    #[test]
+    fn every_trait_method_is_called_on_both_backends_and_the_gap_is_exact() {
+        let td = tempfile::tempdir().unwrap();
+        let rocks = crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::open(
+            &td.path().join("rocks"), None).expect("rocks open");
+        let redb = crate::storage::redb::RedbPrimaryMemoryStore::open(
+            &td.path().join("redb")).expect("redb open");
+
+        let r = matrix(&rocks);
+        let b = matrix(&redb);
+        assert_eq!(r.len(), 33, "the matrix must cover every trait method");
+        assert_eq!(r.len(), b.len());
+
+        let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
+        let redb_ok  = b.iter().filter(|(_, o)| *o == Outcome::Works).count();
+        let gap: Vec<&str> = r.iter().zip(&b)
+            .filter(|((_, ro), (_, bo))| *ro == Outcome::Works && *bo != Outcome::Works)
+            .map(|((n, _), _)| *n).collect();
+
+        eprintln!("COVERAGE  rocksdb {rocks_ok}/33   redb {redb_ok}/33   gap {}", gap.len());
+        for name in &gap { eprintln!("  redb missing: {name}"); }
+
+        // The direction that matters: redb must never be ahead in a way that hides a
+        // rocksdb regression, and the gap list must be exactly what is claimed.
+        assert!(rocks_ok >= redb_ok, "redb reports more working methods than rocksdb — check the probe, not the backends");
+        assert_eq!(gap.len(), 33 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
+    }
+}
