@@ -9,12 +9,59 @@ The storage abstraction was **designed correctly and stalled at the `MemorySyste
 traits, the rocksdb adapters and a 1,040-line redb implementation all exist, and the engine selector
 is a `const fn` that returns RocksDb from both arms, so nothing has ever been able to select redb.
 
+## Where redb actually is — MEASURED TWICE, 2026-09-02
+
+Do not re-derive this by reading the source; there is an executable check.
+`cargo test --lib storage::backend_coverage_matrix -- --nocapture` CALLS every
+`PrimaryMemoryStore` method on a live store of each backend and prints the gap.
+
+    trait                    rocksdb      redb
+    PrimaryMemoryStore         33/33     29/33
+    GraphStore                 10/10     10/10
+    AuditStore                   5/5       5/5
+    KeyValueStore                6/6       6/6
+    BackupStore                  4/4       1/4
+    MigrationStore               4/4       2/4
+    StorageFactory               7/7       7/7
+    TOTAL                      69/69     57/69   (at dc8351d)
+
+Two witnesses, agreeing on the count AND the membership: the runtime matrix above,
+and an independent parse of the impl blocks counting `unbuilt(`. A static count
+alone is weak — it cannot see a method that compiles, is reached, and fails for
+another reason, and it counts a refusal written in a comment.
+
+The matrix asserts `rocks_ok >= redb_ok`, because redb reporting MORE working
+methods than rocksdb means the probe is wrong rather than the backends; and that the
+gap list length equals `33 - redb_ok`, so a method failing on BOTH cannot hide inside
+a gap attributed to redb alone. It fails if a method silently stops working and
+equally if one silently starts.
+
+**The remaining gap is not evenly distributed, and only one part of it is hard.**
+The `BackupStore` three are the whole difficulty: rocksdb's is
+`rocksdb::backup::BackupEngine`, a native facility with no redb analogue, so they
+have to be rebuilt on portable export/import — which now exists. Everything else is
+either mechanical or already answered by design.
+
 ## What landed
 
 **`6fc3eee` — R-1.** Corrects the `Cargo.toml` note that said "138 source refs to cfg-gate". Measured
 198, of which 191 are outside `src/storage/`. It also claimed rocksdb was unconditional only on
 non-Windows; there is a second, equally ungated block at `Cargo.toml:511`, so it is unconditional
-everywhere. Nothing else has landed.
+everywhere.
+
+**`8d93d55` / `73d1af1` / `bfa9782` — B, two of three escapes.** The trait gained the 21 methods
+`MemorySystem` calls; the GDPR erasure path and the ACL store came off `.db()`. The third escape,
+`get_db()`, is the backup path — see the R-6a/b section below for why that reorders the plan.
+
+**`3cbcf0f` / `ad835ab` / `2e8a969` — R-6a/b/c.** Portable export (rocksdb), import (redb, refusing a
+non-empty target), and a re-runnable both-directions verify. The dump format carries a record count
+AND a digest, because a digest agrees with itself over however few frames survive a truncation.
+
+**`73cbed4` — the corpus marker records WHICH embedder, not just its dimension.** Two models at 384
+left `recorded == target` true, so the migration short-circuited over a corpus embedded by something
+else, and the per-memory length check was blind for the same reason.
+
+**`dc8351d` / `466a1f0` — redb 22/33 → 29/33** on `PrimaryMemoryStore`.
 
 ## The order is A THEN B, not B then A
 
@@ -49,21 +96,33 @@ because those 191 are the *gating* problem (R-3), not the *boundary* problem.
 
 `.db()` returns `Arc<rocksdb::DB>` (`src/memory/storage.rs:3477`) and is called three times:
 
-1. **`mod.rs:4157`** — GDPR semantic-fact deletion, using `rocksdb::WriteBatch` across key prefixes.
-   **Needs A's batch API.** This is the escape that inverts the order.
-2. **`mod.rs:4248`** — `pub fn get_db() -> Arc<rocksdb::DB>`, documented "primarily intended for
-   backup/restore". A **public** accessor leaking the engine type out of the crate. Should be
-   absorbed by `BackupStore`; check for external callers before removing.
-3. **`mod.rs:4441`** — `acl::MemoryAclStore::new(self.long_term_memory.db())`; `acl.rs:66` takes
-   `Arc<DB>`. Needs porting to a trait (probably `KeyValueStore`, see the model below).
+1. ~~**`mod.rs:4157`** — GDPR semantic-fact deletion.~~ **CLOSED, `73d1af1`.** Went through
+   `scan_prefix_keys` + A's batch API. Two defects went with it: the prefix bound was hand-written in
+   each of two loops (rocksdb's iterator runs PAST the prefix, and a missing break deletes keys
+   nobody asked about — in an erasure path), and `.flatten()` was dropping enumeration errors, so a
+   prefix that could not be read left its facts in place and the step still logged success.
+2. **`mod.rs:4248`** — `pub fn get_db() -> Arc<rocksdb::DB>`. **STILL OPEN and it is the last one.**
+   The handoff said "check for external callers before removing"; measured 2026-09-02, it has
+   **three**: `handlers/state.rs:2990`, `:3020`, and `legacy_rocksdb.rs:330`. All three are the
+   backup path, which is why this escape does not fall to a refactor — see the R-6a/b section.
+3. ~~**`mod.rs:4441`** — `acl::MemoryAclStore::new(self.long_term_memory.db())`.~~ **CLOSED,
+   `bfa9782`.** It used four operations and never needed a database handle.
+
+   **The obvious port was wrong and would not have failed.** This document said to move it onto
+   `MemoryStorage::key_value_store()`. That handle binds the `kv` column family, and ACL records are
+   written with bare `db.put` — the DEFAULT keyspace. Routing them through it reads and writes a
+   different keyspace: every existing grant comes back absent, every new one lands where nothing
+   looks, and no error is raised at any point. A migration wearing a refactor's clothes. Hence
+   `RocksDbDefaultKeyValueStore` and `MemoryStorage::default_key_value_store()`.
 
 ### Follow the model that already exists
 
 `MemoryStorage::key_value_store()` (`src/memory/storage.rs:3489`) already returns
 `Arc<dyn crate::storage::KeyValueStore>`, and its doc comment says callers use it so they "stay
-portable across the redb cutover". **That is exactly the right pattern and it is already in the
-tree** — the ACL store (escape 3) should be moved onto it, and new trait methods should follow its
-shape rather than inventing another.
+portable across the redb cutover". **The SHAPE is right and it is already in the
+tree** — new trait methods should follow it rather than inventing another. But note which keyspace a
+given handle binds before routing anything onto it: `key_value_store()` is bound to `kv`, and escape
+3 above is what happens when that is assumed rather than checked.
 
 ## A, measured
 
