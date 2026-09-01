@@ -120,6 +120,67 @@ impl RocksDbPrimaryMemoryStore {
 }
 
 impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
+    // ── The 21 methods MemorySystem calls, delegated verbatim. Pure forwarding on
+    //    purpose: this adapter's whole job is to preserve current runtime behaviour
+    //    while call sites move off the concrete type, so anything cleverer here
+    //    would change behaviour in the commit whose point is that nothing changes.
+    fn get(&self, id: &MemoryId) -> Result<Memory> { self.inner.get(id) }
+    fn store(&self, memory: &Memory) -> Result<()> { self.inner.store(memory) }
+    fn update(&self, memory: &Memory) -> Result<()> { self.inner.update(memory) }
+    fn delete(&self, id: &MemoryId) -> Result<()> { self.inner.delete(id) }
+    fn get_all(&self) -> Result<Vec<Memory>> { self.inner.get_all() }
+    fn get_all_ids(&self) -> Result<Vec<MemoryId>> { self.inner.get_all_ids() }
+    fn increment_retrieval_count(&self) -> Result<usize> { self.inner.increment_retrieval_count() }
+    fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> { self.inner.get_stats() }
+    fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
+        self.inner.find_by_external_id(external_id)
+    }
+    fn get_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
+        self.inner.get_children(parent_id)
+    }
+    fn get_ancestors(&self, memory_id: &MemoryId) -> Result<Vec<Memory>> {
+        self.inner.get_ancestors(memory_id)
+    }
+    fn get_hierarchy_context(
+        &self,
+        memory_id: &MemoryId,
+    ) -> Result<(Vec<Memory>, Memory, Vec<Memory>)> {
+        self.inner.get_hierarchy_context(memory_id)
+    }
+    fn get_uncompressed_older_than(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Memory>> {
+        self.inner.get_uncompressed_older_than(cutoff)
+    }
+    fn mark_forgotten_by_age(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MemoryId>> {
+        self.inner.mark_forgotten_by_age(cutoff)
+    }
+    fn save_interference_records(
+        &self,
+        memory_id: &str,
+        records: &[crate::memory::replay::InterferenceRecord],
+    ) -> Result<()> {
+        self.inner.save_interference_records(memory_id, records)
+    }
+    fn delete_interference_records(&self, memory_id: &str) -> Result<()> {
+        self.inner.delete_interference_records(memory_id)
+    }
+    fn clear_all_interference_records(&self) -> Result<usize> {
+        self.inner.clear_all_interference_records()
+    }
+    fn cleanup_corrupted(&self) -> Result<usize> { self.inner.cleanup_corrupted() }
+    fn migrate_legacy(&self) -> Result<(usize, usize, usize)> { self.inner.migrate_legacy() }
+    fn run_merge_pass(&self, user_id: &str, limit: usize) -> usize {
+        self.inner.run_merge_pass(user_id, limit)
+    }
+    fn gc_merge_tombstones(&self, user_id: &str) -> usize {
+        self.inner.gc_merge_tombstones(user_id)
+    }
+
     fn backend(&self) -> StorageBackend {
         StorageBackend::RocksDb
     }
