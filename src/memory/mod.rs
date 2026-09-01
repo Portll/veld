@@ -4459,7 +4459,7 @@ impl MemorySystem {
     /// callers grant / revoke / inspect ACLs without holding a long-lived
     /// MemoryAclStore.
     pub fn acl_store(&self) -> acl::MemoryAclStore {
-        acl::MemoryAclStore::new(self.long_term_memory.db())
+        acl::MemoryAclStore::new(self.long_term_memory.default_key_value_store())
     }
 
     /// Check whether `viewer_user_id` is allowed to read a memory owned by
