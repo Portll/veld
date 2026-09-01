@@ -24,7 +24,6 @@
 //! so single-user scans don't fan out.
 
 use anyhow::Result;
-use rocksdb::{IteratorMode, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -59,12 +58,16 @@ impl MemoryAcl {
 
 /// Persistence layer for memory ACLs.
 pub struct MemoryAclStore {
-    db: Arc<DB>,
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl MemoryAclStore {
-    pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+    /// Takes a key-value handle, not a database. It MUST be over the default
+    /// keyspace: these records are written with bare `db.put`, so a handle bound
+    /// to a named column family would read and write a different keyspace and
+    /// every existing grant would come back absent.
+    pub fn new(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     fn key(owner: &str, memory_id: &MemoryId) -> String {
@@ -75,7 +78,7 @@ impl MemoryAclStore {
     /// record exists, which means "owner-only".
     pub fn get(&self, owner: &str, memory_id: &MemoryId) -> Result<MemoryAcl> {
         let key = Self::key(owner, memory_id);
-        match self.db.get(key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(bytes) => {
                 let (acl, _): (MemoryAcl, _) =
                     bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
@@ -88,7 +91,7 @@ impl MemoryAclStore {
     fn put(&self, owner: &str, memory_id: &MemoryId, acl: &MemoryAcl) -> Result<()> {
         let key = Self::key(owner, memory_id);
         let bytes = bincode::serde::encode_to_vec(acl, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &bytes)?;
+        self.store.put_bytes(key.as_bytes(), &bytes)?;
         Ok(())
     }
 
@@ -137,7 +140,7 @@ impl MemoryAclStore {
     /// Delete the ACL record entirely (back to owner-only).
     pub fn clear(&self, owner: &str, memory_id: &MemoryId) -> Result<()> {
         let key = Self::key(owner, memory_id);
-        self.db.delete(key.as_bytes())?;
+        self.store.delete_bytes(key.as_bytes())?;
         Ok(())
     }
 
@@ -166,16 +169,12 @@ impl MemoryAclStore {
     pub fn list_shared(&self, owner: &str) -> Result<Vec<(MemoryId, MemoryAcl)>> {
         let prefix = format!("acl:{}:", owner);
         let mut out = Vec::new();
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-        for item in iter {
-            let (key, value) = item?;
+        // scan_prefix enforces the bound. The raw iterator ran past the prefix,
+        // so this carried its own `starts_with` break — the third copy of that
+        // guard found in this codebase today, and the only kind whose absence is
+        // silent.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
             let id_str = &key_str[prefix.len()..];
             let Ok(uuid) = uuid::Uuid::parse_str(id_str) else {
                 continue;
@@ -191,13 +190,15 @@ impl MemoryAclStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocksdb::DB;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     fn store() -> (MemoryAclStore, TempDir) {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(DB::open_default(dir.path()).unwrap());
-        (MemoryAclStore::new(db), dir)
+        let kv = Arc::new(crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db));
+        (MemoryAclStore::new(kv), dir)
     }
 
     #[test]

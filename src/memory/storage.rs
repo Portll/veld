@@ -3514,6 +3514,17 @@ impl MemoryStorage {
     /// cutover — the concrete rocksdb CF lives behind the trait here, and the redb
     /// path (`RedbKeyValueStore`) implements the same trait. The store is per-user
     /// (this `MemoryStorage` opens the user's own database), so callers use bare keys.
+    /// Backend-agnostic handle over the DEFAULT keyspace.
+    ///
+    /// Not the same store as [`Self::key_value_store`], which binds the `kv`
+    /// column family. Data written before the column families exists here, and
+    /// moving it is a migration, not a refactor — see the type's own note.
+    pub fn default_key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
+        Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(self.db.clone()),
+        )
+    }
+
     pub fn key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
         Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
             self.db.clone(),

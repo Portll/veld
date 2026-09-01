@@ -373,6 +373,74 @@ impl RocksDbColumnFamilyStore {
     }
 }
 
+/// A `KeyValueStore` over the DEFAULT keyspace.
+///
+/// Exists because `RocksDbColumnFamilyStore` is bound to a named column family,
+/// and some data predates the column families entirely — the memory ACLs are
+/// written with `db.put(key, …)`, which is the default CF. Routing those through
+/// the `kv`-bound `MemoryStorage::key_value_store()` would not fail: it would
+/// read and write a DIFFERENT keyspace, so every existing grant would come back
+/// absent and every new one would land where nothing looks. A migration wearing
+/// a refactor's clothes.
+pub struct RocksDbDefaultKeyValueStore {
+    db: Arc<DB>,
+}
+
+impl RocksDbDefaultKeyValueStore {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+}
+
+impl KeyValueStore for RocksDbDefaultKeyValueStore {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::RocksDb
+    }
+
+    fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.get(key)?)
+    }
+
+    fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.put(key, value)?;
+        Ok(())
+    }
+
+    fn delete_bytes(&self, key: &[u8]) -> Result<()> {
+        self.db.delete(key)?;
+        Ok(())
+    }
+
+    fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // The prefix bound is enforced here rather than by each caller. Every
+        // caller ported onto this so far carried its own `starts_with` break, and
+        // rocksdb's iterator genuinely does run past the prefix, so the guard was
+        // load-bearing in all of them.
+        let mut rows = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, Direction::Forward))
+        {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            rows.push((key.to_vec(), value.to_vec()));
+            if let Some(n) = limit {
+                if rows.len() >= n {
+                    break;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.db.flush()?;
+        Ok(())
+    }
+}
+
 impl KeyValueStore for RocksDbColumnFamilyStore {
     fn backend(&self) -> StorageBackend {
         StorageBackend::RocksDb
