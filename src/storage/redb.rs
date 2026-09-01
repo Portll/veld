@@ -404,20 +404,75 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
     fn store(&self, memory: &Memory) -> Result<()> { self.put_memory(memory) }
     fn update(&self, memory: &Memory) -> Result<()> { self.update_memory(memory) }
     fn delete(&self, id: &MemoryId) -> Result<()> { self.delete_memory(id) }
-    fn get_all(&self) -> Result<Vec<Memory>> { Err(unbuilt("get_all")) }
-    fn get_all_ids(&self) -> Result<Vec<MemoryId>> { Err(unbuilt("get_all_ids")) }
+    fn get_all(&self) -> Result<Vec<Memory>> {
+        self.scan_all_memories()
+    }
+    fn get_all_ids(&self) -> Result<Vec<MemoryId>> {
+        // rocksdb filters its default-CF scan to 16-byte keys, because that keyspace
+        // also holds non-memory rows. The redb memories table holds only memories, so
+        // the filter is not needed to be CORRECT here — it is kept because a stray
+        // key of another length would otherwise become a garbage UUID rather than an
+        // omission, and a wrong id is worse than a missing one.
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(MEMORIES_TABLE)?;
+        let mut ids = Vec::new();
+        for row in table.iter()? {
+            let (k, _) = row?;
+            let key = k.value();
+            if key.len() == 16 {
+                let bytes: [u8; 16] = key.try_into().expect("checked len");
+                ids.push(MemoryId(uuid::Uuid::from_bytes(bytes)));
+            }
+        }
+        Ok(ids)
+    }
     fn increment_retrieval_count(&self) -> Result<usize> { Err(unbuilt("increment_retrieval_count")) }
     fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> { Err(unbuilt("get_stats")) }
-    fn find_by_external_id(&self, _external_id: &str) -> Result<Option<Memory>> {
-        Err(unbuilt("find_by_external_id"))
+    fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
+        // rocksdb answers this from a blinded index (`external:{blind_term}:{id}`).
+        // redb has no such index, so this is a scan — same ANSWER, different cost.
+        // Recorded rather than silently accepted: on a large store this is O(n) where
+        // the rocksdb path is a seek, and it is a post-cutover index to build.
+        Ok(self
+            .scan_all_memories()?
+            .into_iter()
+            .find(|m| m.external_id.as_deref() == Some(external_id)))
     }
-    fn get_children(&self, _parent_id: &MemoryId) -> Result<Vec<Memory>> { Err(unbuilt("get_children")) }
-    fn get_ancestors(&self, _memory_id: &MemoryId) -> Result<Vec<Memory>> { Err(unbuilt("get_ancestors")) }
+    fn get_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>> {
+        Ok(self
+            .scan_all_memories()?
+            .into_iter()
+            .filter(|m| m.parent_id.as_ref() == Some(parent_id))
+            .collect())
+    }
+    fn get_ancestors(&self, memory_id: &MemoryId) -> Result<Vec<Memory>> {
+        // The 100-iteration bound is rocksdb's and is carried over deliberately: a
+        // parent_id cycle is representable in the data, and without a bound this walk
+        // does not terminate. Dropping a guard because the loop "obviously" ends at a
+        // root is how the cycle case becomes a hang instead of a wrong answer.
+        let mut ancestors = Vec::new();
+        let mut current = memory_id.clone();
+        for _ in 0..100 {
+            let memory = self.get(&current)?;
+            match &memory.parent_id {
+                Some(parent_id) => {
+                    let parent = self.get(parent_id)?;
+                    ancestors.push(parent.clone());
+                    current = parent_id.clone();
+                }
+                None => break,
+            }
+        }
+        Ok(ancestors)
+    }
     fn get_hierarchy_context(
         &self,
-        _memory_id: &MemoryId,
+        memory_id: &MemoryId,
     ) -> Result<(Vec<Memory>, Memory, Vec<Memory>)> {
-        Err(unbuilt("get_hierarchy_context"))
+        let memory = self.get(memory_id)?;
+        let ancestors = self.get_ancestors(memory_id)?;
+        let children = self.get_children(memory_id)?;
+        Ok((ancestors, memory, children))
     }
     fn get_uncompressed_older_than(
         &self,
@@ -1755,5 +1810,124 @@ mod verify_portable_tests {
         store.verify_portable(&src).unwrap();
         store.verify_portable(&src).unwrap();
         store.verify_portable(&src).expect("verify must be idempotent");
+    }
+}
+
+#[cfg(test)]
+mod redb_hierarchy_tests {
+    use super::*;
+    use crate::memory::types::{Experience, ExperienceType, MemoryTier};
+
+    fn mem(parent: Option<MemoryId>, external: Option<&str>) -> Memory {
+        let now = chrono::Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: "x".into(),
+            ..Default::default()
+        };
+        let mut m = Memory::from_legacy(
+            MemoryId(uuid::Uuid::new_v4()), experience, 0.5, 0, now, now, false,
+            MemoryTier::LongTerm, Vec::new(), 1.0, None, None, None, None, 0.0, None, None, 1,
+            Vec::new(), Vec::new(),
+        );
+        m.parent_id = parent;
+        m.external_id = external.map(|s| s.to_string());
+        m
+    }
+
+    fn store(tmp: &tempfile::TempDir) -> RedbPrimaryMemoryStore {
+        RedbPrimaryMemoryStore::open(tmp.path()).expect("open")
+    }
+
+    #[test]
+    fn get_all_and_get_all_ids_agree_on_the_same_population() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let ids: Vec<_> = (0..5).map(|_| { let m = mem(None, None); s.put_memory(&m).unwrap(); m.id }).collect();
+        assert_eq!(s.get_all().unwrap().len(), 5);
+        let mut got = s.get_all_ids().unwrap();
+        let mut want = ids;
+        got.sort_by_key(|i| i.0); want.sort_by_key(|i| i.0);
+        assert_eq!(got, want, "get_all_ids must be the same set get_all returns, not a subset");
+    }
+
+    #[test]
+    fn children_are_the_ones_naming_this_parent_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let parent = mem(None, None);
+        s.put_memory(&parent).unwrap();
+        let a = mem(Some(parent.id.clone()), None);
+        let b = mem(Some(parent.id.clone()), None);
+        let unrelated = mem(None, None);
+        for m in [&a, &b, &unrelated] { s.put_memory(m).unwrap(); }
+
+        let kids = s.get_children(&parent.id).unwrap();
+        assert_eq!(kids.len(), 2);
+        // Both directions: the two are present AND the unrelated one is not.
+        assert!(kids.iter().any(|m| m.id == a.id) && kids.iter().any(|m| m.id == b.id));
+        assert!(!kids.iter().any(|m| m.id == unrelated.id), "an unparented memory was returned as a child");
+    }
+
+    #[test]
+    fn ancestors_walk_to_the_root_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let root = mem(None, None);
+        let mid = mem(Some(root.id.clone()), None);
+        let leaf = mem(Some(mid.id.clone()), None);
+        for m in [&root, &mid, &leaf] { s.put_memory(m).unwrap(); }
+
+        let anc = s.get_ancestors(&leaf.id).unwrap();
+        assert_eq!(anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![mid.id.clone(), root.id.clone()],
+            "ancestors must be nearest-first, matching the rocksdb walk");
+        assert!(s.get_ancestors(&root.id).unwrap().is_empty(), "a root has no ancestors");
+    }
+
+    #[test]
+    fn a_parent_cycle_terminates_instead_of_hanging() {
+        // THE test the bound exists for. A cycle is representable in the data, and
+        // without the 100-iteration guard this walk never returns — the failure is a
+        // hung request, not a wrong answer, so no assertion downstream would catch it.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let mut a = mem(None, None);
+        let mut b = mem(None, None);
+        a.parent_id = Some(b.id.clone());
+        b.parent_id = Some(a.id.clone());
+        s.put_memory(&a).unwrap();
+        s.put_memory(&b).unwrap();
+
+        let anc = s.get_ancestors(&a.id).unwrap();
+        assert_eq!(anc.len(), 100, "the walk must stop at the rocksdb bound, not run forever");
+    }
+
+    #[test]
+    fn external_id_lookup_finds_the_one_and_only_that_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let tagged = mem(None, Some("ext-42"));
+        let other = mem(None, Some("ext-99"));
+        let untagged = mem(None, None);
+        for m in [&tagged, &other, &untagged] { s.put_memory(m).unwrap(); }
+
+        assert_eq!(s.find_by_external_id("ext-42").unwrap().map(|m| m.id), Some(tagged.id));
+        assert!(s.find_by_external_id("ext-nothing").unwrap().is_none(),
+            "an unknown external id must be None, never the first memory scanned");
+    }
+
+    #[test]
+    fn hierarchy_context_is_its_three_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let root = mem(None, None);
+        let target = mem(Some(root.id.clone()), None);
+        let kid = mem(Some(target.id.clone()), None);
+        for m in [&root, &target, &kid] { s.put_memory(m).unwrap(); }
+
+        let (anc, me, kids) = s.get_hierarchy_context(&target.id).unwrap();
+        assert_eq!(me.id, target.id);
+        assert_eq!(anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![root.id]);
+        assert_eq!(kids.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![kid.id]);
     }
 }
