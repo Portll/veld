@@ -1178,6 +1178,76 @@ impl RedbMigrationStore {
     }
 }
 
+impl RedbMigrationStore {
+    /// Prove an imported target matches the dump it came from — R-6c's verify step.
+    ///
+    /// Separate from `import_portable` and re-runnable on purpose: the point of
+    /// export -> import -> VERIFY -> switch is that the verify can be repeated by
+    /// someone who did not run the import, before anything is pointed at the new
+    /// store. A check that only ever runs inside the write it is checking is a
+    /// check the operator has to take on trust.
+    ///
+    /// BOTH DIRECTIONS. "every dump row is present in the target" passes over a
+    /// target that also holds a thousand rows from somewhere else, and "the counts
+    /// match" passes over a target with the right number of wrong rows. Neither
+    /// alone is worth running.
+    ///
+    /// Reports counts only. The values are memory contents and must not reach a
+    /// log line to prove they were copied.
+    pub fn verify_portable(&self, source: &Path) -> Result<()> {
+        use crate::storage::portable::read_all;
+
+        let file = std::fs::File::open(source)
+            .with_context(|| format!("opening {}", source.display()))?;
+        let records = read_all(file)?;
+        let database = create_redb_database(&self.path.join("storage.redb"))?;
+        let read = database.begin_read()?;
+
+        // Direction 1: everything the dump holds is in the target, byte-for-byte.
+        let mut missing = 0u64;
+        let mut differing = 0u64;
+        for rec in &records {
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                redb::TableDefinition::new(rec.cf.as_str());
+            match read.open_table(def) {
+                Err(_) => missing += 1,
+                Ok(table) => match table.get(rec.key.as_slice())? {
+                    None => missing += 1,
+                    Some(v) if v.value() != rec.value.as_slice() => differing += 1,
+                    Some(_) => {}
+                },
+            }
+        }
+
+        // Direction 2: the target holds nothing the dump does not. This is the half
+        // that catches an import into a store that was not empty.
+        let mut in_target = 0u64;
+        for handle in read.list_tables()? {
+            let name = handle.name().to_string();
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(&name);
+            if let Ok(t) = read.open_table(def) {
+                in_target += t.len()?;
+            }
+        }
+        let extra = in_target.saturating_sub(records.len() as u64);
+
+        if missing > 0 || differing > 0 || in_target != records.len() as u64 {
+            bail!(
+                "verify_portable: {} does not match {} — {missing} missing, {differing} differing, \
+                 {extra} unaccounted for in the target ({} in the dump, {in_target} in the store). \
+                 Do NOT switch the configured backend.",
+                self.path.display(),
+                source.display(),
+                records.len()
+            );
+        }
+
+        tracing::info!(records = records.len(), target = %self.path.display(),
+            "portable import verified against its dump, both directions");
+        Ok(())
+    }
+}
+
 impl MigrationStore for RedbMigrationStore {
     fn backend(&self) -> StorageBackend {
         StorageBackend::Redb
@@ -1570,5 +1640,120 @@ mod import_portable_tests {
         let target = tmp.path().join("target");
         RedbMigrationStore::open(&target).unwrap().import_portable("a", &src).expect("import");
         assert_eq!(row_count(&target), 0);
+    }
+}
+
+#[cfg(test)]
+mod verify_portable_tests {
+    use super::*;
+    use crate::storage::portable::{PortableRecord, PortableWriter};
+
+    fn rec(cf: &str, k: &[u8], v: &[u8]) -> PortableRecord {
+        PortableRecord { cf: cf.into(), key: k.to_vec(), value: v.to_vec() }
+    }
+
+    fn dump_at(dir: &Path, records: &[PortableRecord]) -> PathBuf {
+        let mut buf = Vec::new();
+        let mut w = PortableWriter::new(&mut buf).unwrap();
+        for r in records { w.write_record(r).unwrap(); }
+        w.finish().unwrap();
+        let p = dir.join("d.veldport");
+        std::fs::write(&p, &buf).unwrap();
+        p
+    }
+
+    fn imported(dir: &Path, records: &[PortableRecord]) -> (PathBuf, PathBuf) {
+        let src = dump_at(dir, records);
+        let target = dir.join("t");
+        RedbMigrationStore::open(&target).unwrap().import_portable("u", &src).unwrap();
+        (src, target)
+    }
+
+    #[test]
+    fn a_faithful_import_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, target) = imported(tmp.path(), &[
+            rec("default", b"a", b"1"),
+            rec("kv", b"b", b"2"),
+        ]);
+        RedbMigrationStore::open(&target).unwrap().verify_portable(&src).expect("verify");
+    }
+
+    #[test]
+    fn a_changed_value_is_caught() {
+        // Counts alone would pass this: the right number of rows, one of them wrong.
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, target) = imported(tmp.path(), &[rec("kv", b"b", b"2")]);
+        {
+            let db = create_redb_database(&target.join("storage.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new("kv");
+                let mut t = txn.open_table(def).unwrap();
+                t.insert(b"b".as_slice(), b"tampered".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let err = RedbMigrationStore::open(&target)
+            .unwrap()
+            .verify_portable(&src)
+            .expect_err("a differing value must fail verification");
+        assert!(err.to_string().contains("1 differing"), "got: {err}");
+    }
+
+    #[test]
+    fn a_row_the_dump_does_not_have_is_caught() {
+        // The direction that catches an import into a store that was not empty.
+        // "every dump row is present" passes here; only the reverse check fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, target) = imported(tmp.path(), &[rec("kv", b"b", b"2")]);
+        {
+            let db = create_redb_database(&target.join("storage.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new("kv");
+                let mut t = txn.open_table(def).unwrap();
+                t.insert(b"stowaway".as_slice(), b"x".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let err = RedbMigrationStore::open(&target)
+            .unwrap()
+            .verify_portable(&src)
+            .expect_err("an extra row must fail verification");
+        assert!(err.to_string().contains("unaccounted for"), "got: {err}");
+    }
+
+    #[test]
+    fn a_missing_row_is_caught() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, target) = imported(tmp.path(), &[rec("kv", b"b", b"2"), rec("kv", b"c", b"3")]);
+        {
+            let db = create_redb_database(&target.join("storage.redb")).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new("kv");
+                let mut t = txn.open_table(def).unwrap();
+                let _ = t.remove(b"c".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let err = RedbMigrationStore::open(&target)
+            .unwrap()
+            .verify_portable(&src)
+            .expect_err("a missing row must fail verification");
+        assert!(err.to_string().contains("1 missing"), "got: {err}");
+    }
+
+    #[test]
+    fn verification_is_re_runnable_and_does_not_mutate_the_target() {
+        // R-6c's whole shape depends on this: the operator runs verify BEFORE
+        // switching, possibly without having run the import.
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, target) = imported(tmp.path(), &[rec("kv", b"b", b"2")]);
+        let store = RedbMigrationStore::open(&target).unwrap();
+        store.verify_portable(&src).unwrap();
+        store.verify_portable(&src).unwrap();
+        store.verify_portable(&src).expect("verify must be idempotent");
     }
 }
