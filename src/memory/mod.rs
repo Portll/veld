@@ -4154,40 +4154,61 @@ impl MemorySystem {
 
         // Step 6: Clear semantic facts (GDPR — knowledge derived from memories)
         {
-            let db = self.long_term_memory.db();
-            let mut batch = rocksdb::WriteBatch::default();
+            // Through the trait, not through db(). The raw version enumerated with
+            // rocksdb's prefix_iterator, which may run PAST the prefix, and guarded
+            // that with a hand-written `break` in each of two loops — a guard whose
+            // absence deletes keys nobody asked about, in an erasure path. The bound
+            // is now the implementation's, asserted once.
+            let mut batch = crate::storage::WriteBatch::new();
             let mut facts_deleted = 0usize;
+            let mut unenumerated: Vec<&str> = Vec::new();
             for prefix in &[
                 "facts:",
                 "facts_by_entity:",
                 "facts_by_type:",
                 "facts_embedding:",
+                "temporal_facts:",
             ] {
-                let iter = db.prefix_iterator(prefix.as_bytes());
-                for (key, _) in iter.flatten() {
-                    if !key.starts_with(prefix.as_bytes()) {
-                        break;
+                match self.long_term_memory.scan_prefix_keys(prefix.as_bytes()) {
+                    Ok(keys) => {
+                        if *prefix == "facts:" {
+                            facts_deleted += keys.len();
+                        }
+                        for key in keys {
+                            batch.delete(key);
+                        }
                     }
-                    batch.delete(&key);
-                    if *prefix == "facts:" {
-                        facts_deleted += 1;
+                    // `.flatten()` used to drop these silently, so a prefix that
+                    // could not be read left its facts in place and the step still
+                    // logged success. An erasure that cannot enumerate must not
+                    // report as one.
+                    Err(e) => {
+                        tracing::error!(prefix = %prefix, error = %e,
+                            "could not enumerate keys for erasure");
+                        unenumerated.push(prefix);
                     }
                 }
             }
-            // Clear temporal facts
-            let iter = db.prefix_iterator(b"temporal_facts:");
-            for (key, _) in iter.flatten() {
-                if !key.starts_with(b"temporal_facts:") {
-                    break;
+            if !batch.is_empty() {
+                match self.long_term_memory.write_batch(&batch) {
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to clear facts during forget_all");
+                    }
+                    // Deliberately still partial-erases when a prefix failed: leaving
+                    // the readable facts in place as well helps nobody. What it must
+                    // never do is call that outcome complete.
+                    Ok(()) if !unenumerated.is_empty() => {
+                        tracing::error!(facts_deleted, skipped = ?unenumerated,
+                            "forget_all erasure INCOMPLETE — these prefixes were not enumerated \
+                             and their facts remain");
+                    }
+                    Ok(()) => {
+                        tracing::info!(facts_deleted, "Semantic facts cleared during forget_all");
+                    }
                 }
-                batch.delete(&key);
-            }
-            if facts_deleted > 0 || !batch.is_empty() {
-                if let Err(e) = db.write(batch) {
-                    tracing::warn!(error = %e, "Failed to clear facts during forget_all");
-                } else {
-                    tracing::info!(facts_deleted, "Semantic facts cleared during forget_all");
-                }
+            } else if !unenumerated.is_empty() {
+                tracing::error!(skipped = ?unenumerated,
+                    "forget_all erased NOTHING — no prefix could be enumerated");
             }
         }
 

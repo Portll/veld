@@ -181,6 +181,14 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
         self.inner.gc_merge_tombstones(user_id)
     }
 
+    fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.inner.scan_prefix_keys(prefix)
+    }
+
+    fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
+        self.inner.write_batch(batch)
+    }
+
     fn backend(&self) -> StorageBackend {
         StorageBackend::RocksDb
     }

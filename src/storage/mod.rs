@@ -285,6 +285,23 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn migrate_legacy(&self) -> Result<(usize, usize, usize)>;
     fn run_merge_pass(&self, user_id: &str, limit: usize) -> usize;
     fn gc_merge_tombstones(&self, user_id: &str) -> usize;
+
+    /// Every key under `prefix`, values not loaded.
+    ///
+    /// Replaces `db().prefix_iterator(p)` at the one call site that reached past
+    /// this trait for it. Two differences from the raw iterator, both of which the
+    /// call site was compensating for by hand: rocksdb's prefix iterator may run
+    /// PAST the prefix, so that code carried `if !key.starts_with(prefix) { break }`
+    /// and a missing break would have deleted unrelated keys; and it yields values
+    /// nobody there wanted. Implementations MUST return only matching keys.
+    fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>>;
+
+    /// Apply `batch` atomically against this store's database.
+    ///
+    /// Present on the store rather than reached through a separate handle because
+    /// the batch has to be atomic with respect to THIS store's writes — see
+    /// [`BatchWriter`], which explains why a writer cannot be opened by path.
+    fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
 }
 
 /// Domain interface for graph persistence.
