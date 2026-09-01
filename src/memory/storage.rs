@@ -2959,6 +2959,34 @@ impl MemoryStorage {
     ///
     /// Returns only 16-byte UUID keys (lightweight). Use with `get()` to load
     /// individual memories in batches to avoid OOM on large datasets.
+    /// Every key under `prefix`, values not loaded.
+    ///
+    /// The prefix bound is enforced HERE. rocksdb's `prefix_iterator` may run past
+    /// the prefix, so callers were carrying `if !key.starts_with(p) { break }` by
+    /// hand — a guard whose absence deletes keys nobody asked about, and one of the
+    /// call sites is a GDPR erasure path. `PrimaryMemoryStore::scan_prefix_keys`
+    /// delegates here, so the concrete and trait paths cannot diverge.
+    pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut keys = Vec::new();
+        for item in self.db.prefix_iterator(prefix) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            keys.push(key.to_vec());
+        }
+        Ok(keys)
+    }
+
+    /// Apply a backend-agnostic batch atomically against this store's database.
+    pub fn write_batch(&self, batch: &crate::storage::WriteBatch) -> Result<()> {
+        // Scoped import: this module already has a `WriteBatch` from rocksdb in
+        // flight, and a file-level `use` of the trait would put two same-named
+        // things one glance apart in a 4000-line file.
+        use crate::storage::BatchWriter as _;
+        crate::storage::RocksDbBatchWriter::new(self.db()).write_batch(batch)
+    }
+
     pub fn get_all_ids(&self) -> Result<Vec<MemoryId>> {
         let mut ids = Vec::new();
         let mut read_opts = rocksdb::ReadOptions::default();
