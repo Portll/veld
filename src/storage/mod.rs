@@ -5,6 +5,7 @@
 //! types in recall, graph traversal, or server orchestration.
 
 pub mod legacy_rocksdb;
+pub mod portable;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
 pub mod relational;
