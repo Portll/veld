@@ -13,8 +13,8 @@
 //! through these traits — with entity-dedup/index parity and at-rest encryption
 //! parity — is the remaining v0.9 cutover.
 
-use anyhow::{anyhow, Result};
-use redb::{ReadableTable, ReadableTableMetadata};
+use anyhow::{anyhow, bail, Context, Result};
+use redb::{ReadableTable, ReadableTableMetadata, TableHandle};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,11 +29,21 @@ use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, RelationshipEdge
 use crate::memory::storage::{SearchCriteria, VectorMappingEntry};
 use crate::memory::{Memory, MemoryConfig, MemoryId};
 
-/// The table an op with `cf: None` addresses. Deliberately the SAME table
-/// `RedbKeyValueStore` binds (`KV_TABLE` below is defined from this name, so
-/// the two cannot drift): a default-keyspace batch op and a `KeyValueStore`
-/// put must reach the same rows, or a batch would appear to write nothing.
-pub(crate) const DEFAULT_TABLE_NAME: &str = "kv";
+/// The table an op with `cf: None` addresses.
+///
+/// **"default", not "kv", and the difference is a correctness bug this once had.**
+/// It was defined as "kv" so that `KV_TABLE` could be derived from it, on the
+/// reasoning that a default-keyspace batch op and a `KeyValueStore` put should
+/// reach the same rows. That is true of `KeyValueStore`, which is bound to the
+/// `kv` family — and false of a batch, because on rocksdb `cf: None` becomes
+/// `db.put(...)`, which is the DEFAULT column family, a different keyspace from
+/// `kv` entirely. The same `WriteBatch` therefore landed in two different places
+/// depending on which backend applied it, which is precisely the divergence
+/// `RedbBatchWriter::write_batch` carries a comment about refusing.
+///
+/// The exporter's family list is the arbiter: rocksdb has `default`,
+/// `memory_index` and `kv`, and they are three distinct keyspaces.
+pub(crate) const DEFAULT_TABLE_NAME: &str = "default";
 
 /// DB-scoped atomic batch writer. See [`super::WriteBatch`] for why the handle
 /// is the database rather than one store.
@@ -632,8 +642,9 @@ impl GraphStore for RedbGraphStore {
 
 /// Single table backing each namespace's key-value `.redb` file. Keys and values
 /// are opaque byte strings (the trait's contract); callers serialize above this.
+/// The `kv` family. NOT derived from `DEFAULT_TABLE_NAME` — see that constant.
 const KV_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> =
-    redb::TableDefinition::new(DEFAULT_TABLE_NAME);
+    redb::TableDefinition::new("kv");
 
 /// redb-backed [`KeyValueStore`]. Each namespace is its own `<namespace>.redb` file
 /// holding a single `kv` table. Operations are one transaction each (redb commits are
@@ -1176,8 +1187,83 @@ impl MigrationStore for RedbMigrationStore {
         Err(not_implemented("portable export", &self.path))
     }
 
-    fn import_portable(&self, _user_id: &str, _source: &Path) -> Result<()> {
-        Err(not_implemented("portable import", &self.path))
+    fn import_portable(&self, user_id: &str, source: &Path) -> Result<()> {
+        use crate::storage::portable::read_all;
+
+        let file = std::fs::File::open(source)
+            .with_context(|| format!("opening {}", source.display()))?;
+        // Verified in full before a single row is applied. read_all checks the
+        // trailer, the digest and the count, so a truncated or corrupt dump fails
+        // here rather than half-way through writing.
+        let records = read_all(file)?;
+
+        let database = create_redb_database(&self.path.join("storage.redb"))?;
+
+        // REFUSE A TARGET THAT IS NOT EMPTY. An import that merges into live data
+        // is unrecoverable by config revert, which is the property the whole
+        // export -> import -> verify -> switch route exists to keep. A mis-aimed
+        // path is the likely mistake here, and it is silent: the rows land, the
+        // count is right, and the store now holds two users' data.
+        {
+            let read = database.begin_read()?;
+            for table in read.list_tables()? {
+                let name = table.name().to_string();
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                    redb::TableDefinition::new(&name);
+                if let Ok(t) = read.open_table(def) {
+                    if t.len()? > 0 {
+                        bail!(
+                            "import_portable: {} already holds rows in table '{}' — refusing. \
+                             Import into a scratch target, verify it, then switch the configured \
+                             backend; merging into a populated store cannot be undone by reverting \
+                             a config value.",
+                            self.path.display(),
+                            name
+                        );
+                    }
+                }
+            }
+        }
+
+        // One transaction for the whole dump: a partially-applied import is a
+        // store that looks like a smaller one.
+        let txn = database.begin_write()?;
+        {
+            for rec in &records {
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                    redb::TableDefinition::new(rec.cf.as_str());
+                let mut table = txn.open_table(def)?;
+                table.insert(rec.key.as_slice(), rec.value.as_slice())?;
+            }
+        }
+        txn.commit()?;
+
+        // Count what landed and compare. The dump's own count was checked against
+        // the dump; this checks the STORE against the dump, which is a different
+        // claim and the one a cutover actually rests on.
+        let mut landed = 0u64;
+        {
+            let read = database.begin_read()?;
+            for table in read.list_tables()? {
+                let name = table.name().to_string();
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                    redb::TableDefinition::new(&name);
+                if let Ok(t) = read.open_table(def) {
+                    landed += t.len()?;
+                }
+            }
+        }
+        if landed != records.len() as u64 {
+            bail!(
+                "import_portable: dump held {} records and the store now holds {landed} — \
+                 refusing to report a completed import",
+                records.len()
+            );
+        }
+
+        tracing::info!(user_id, records = landed, target = %self.path.display(),
+            "portable import verified");
+        Ok(())
     }
 
     fn migrate_in_place(
@@ -1322,5 +1408,167 @@ mod redb_batch_tests {
         writer
             .write_batch(&StorageWriteBatch::new())
             .expect("an empty batch is a no-op, not an error");
+    }
+}
+
+#[cfg(test)]
+mod keyspace_agreement_tests {
+    use super::*;
+    use crate::storage::WriteBatch as StorageWriteBatch;
+
+    #[test]
+    fn cf_none_and_cf_default_address_the_same_rows() {
+        // The two backends have to agree on what an unlabelled op means, and the
+        // only way to state that here is that `None` and `Some("default")` are the
+        // same keyspace — which is what rocksdb does, where `cf: None` is db.put
+        // into the default column family. When this was "kv" the same batch landed
+        // in two different places depending on the backend, and nothing said so.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let database = create_redb_database(&tmp.path().join("agree.redb")).expect("db");
+        init_table(&database, redb::TableDefinition::<&[u8], &[u8]>::new(DEFAULT_TABLE_NAME))
+            .expect("init default");
+
+        let writer = RedbBatchWriter::new(database.clone());
+        let mut unlabelled = StorageWriteBatch::new();
+        unlabelled.put(b"k".to_vec(), b"v".to_vec());
+        writer.write_batch(&unlabelled).expect("unlabelled write");
+
+        // Read it back through the EXPLICIT name. If the two disagreed, this is
+        // where a batch would appear to have written nothing.
+        let read = database.begin_read().expect("read");
+        let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+            redb::TableDefinition::new(DEFAULT_TABLE_NAME);
+        let table = read.open_table(def).expect("open default");
+        assert_eq!(
+            table.get(b"k".as_slice()).unwrap().map(|v| v.value().to_vec()),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_default_keyspace_is_not_the_kv_family() {
+        // Asserted separately and in the opposite direction: if someone re-derives
+        // one constant from the other, the test above still passes while this one
+        // fails, which is the signal they have been conflated again.
+        assert_ne!(DEFAULT_TABLE_NAME, "kv");
+        assert_eq!(DEFAULT_TABLE_NAME, "default");
+    }
+}
+
+#[cfg(test)]
+mod import_portable_tests {
+    use super::*;
+    use crate::storage::portable::{PortableRecord, PortableWriter};
+
+    /// Dumps are built HERE, from records, not by calling the rocksdb exporter.
+    /// An importer tested against its own exporter's output proves the pair agree
+    /// and says nothing about whether either matches the format.
+    fn dump_of(records: &[PortableRecord]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut w = PortableWriter::new(&mut buf).unwrap();
+        for r in records {
+            w.write_record(r).unwrap();
+        }
+        w.finish().unwrap();
+        buf
+    }
+
+    fn rec(cf: &str, k: &[u8], v: &[u8]) -> PortableRecord {
+        PortableRecord { cf: cf.into(), key: k.to_vec(), value: v.to_vec() }
+    }
+
+    fn write_dump(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let p = dir.join("in.veldport");
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn row_count(target: &Path) -> u64 {
+        let db = create_redb_database(&target.join("storage.redb")).unwrap();
+        let read = db.begin_read().unwrap();
+        let mut n = 0;
+        for t in read.list_tables().unwrap() {
+            let name = t.name().to_string();
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(&name);
+            if let Ok(tbl) = read.open_table(def) {
+                n += tbl.len().unwrap();
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn every_keyspace_in_the_dump_lands_in_its_own_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = write_dump(
+            tmp.path(),
+            &dump_of(&[
+                rec("default", b"acl:alice:1", b"a"),
+                rec("memory_index", b"i", b"b"),
+                rec("kv", b"dials", b"c"),
+            ]),
+        );
+        let target = tmp.path().join("target");
+        RedbMigrationStore::open(&target)
+            .unwrap()
+            .import_portable("alice", &src)
+            .expect("import");
+
+        let db = create_redb_database(&target.join("storage.redb")).unwrap();
+        let read = db.begin_read().unwrap();
+        for (cf, key, want) in [
+            ("default", &b"acl:alice:1"[..], &b"a"[..]),
+            ("memory_index", b"i", b"b"),
+            ("kv", b"dials", b"c"),
+        ] {
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+            let t = read.open_table(def).unwrap_or_else(|e| panic!("table {cf} missing: {e}"));
+            assert_eq!(t.get(key).unwrap().map(|v| v.value().to_vec()), Some(want.to_vec()));
+        }
+    }
+
+    #[test]
+    fn a_populated_target_is_refused_and_left_alone() {
+        // The likely mistake is a mis-aimed path, and it is silent: the rows land,
+        // the count is right, and the store now holds two users' data.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let first = write_dump(tmp.path(), &dump_of(&[rec("kv", b"already", b"here")]));
+        RedbMigrationStore::open(&target).unwrap().import_portable("a", &first).unwrap();
+        assert_eq!(row_count(&target), 1);
+
+        let second = tmp.path().join("second.veldport");
+        std::fs::write(&second, dump_of(&[rec("kv", b"new", b"row")])).unwrap();
+        let err = RedbMigrationStore::open(&target)
+            .unwrap()
+            .import_portable("b", &second)
+            .expect_err("a populated target must refuse");
+        assert!(err.to_string().contains("already holds rows"), "got: {err}");
+        assert_eq!(row_count(&target), 1, "the refused import still wrote");
+    }
+
+    #[test]
+    fn a_truncated_dump_applies_nothing() {
+        // Verification precedes application, so the target is untouched — not
+        // partially filled with whatever preceded the cut.
+        let tmp = tempfile::tempdir().unwrap();
+        let full = dump_of(&[rec("kv", b"a", b"1"), rec("kv", b"b", b"2")]);
+        let src = write_dump(tmp.path(), &full[..full.len() - 12]);
+        let target = tmp.path().join("target");
+        let err = RedbMigrationStore::open(&target)
+            .unwrap()
+            .import_portable("a", &src)
+            .expect_err("a truncated dump must refuse");
+        assert!(err.to_string().contains("trailer"), "got: {err}");
+        assert_eq!(row_count(&target), 0, "a refused import left rows behind");
+    }
+
+    #[test]
+    fn an_empty_dump_imports_as_an_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = write_dump(tmp.path(), &dump_of(&[]));
+        let target = tmp.path().join("target");
+        RedbMigrationStore::open(&target).unwrap().import_portable("a", &src).expect("import");
+        assert_eq!(row_count(&target), 0);
     }
 }
