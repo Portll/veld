@@ -107,6 +107,37 @@ the child 5×/min, trips its crash-loop breaker and stops. **The operator sees a
 is never opened — but total loss of service. Land R-4 and R-5 as one commit, or gate R-4 so redb
 cannot be selected while any refusal arm remains.
 
+## R-6a/b IS A PREREQUISITE FOR R-3, NOT A FOLLOW-ON — corrected 2026-09-02
+
+This document ordered R-6 last, after R-3. That is backwards, and B is where it shows.
+
+Two of the three `.db()` escapes closed cleanly (`73d1af1` GDPR erasure, `bfa9782` ACL store).
+The third is `get_db()`, whose three callers are all the backup path, and **`src/backup.rs` is built
+on `rocksdb::backup::BackupEngine`** — rocksdb's own incremental backup facility:
+`restore_from_latest_backup(…, &rocksdb::backup::RestoreOptions::default(), …)` at `backup.rs:668,677`.
+16 `rocksdb::` refs in that file: 6 × `DB`, 4 × `Options`, 2 × `rocksdb::backup`, 1 × `IteratorMode`.
+
+redb has no equivalent. So porting the backup path is not a refactor that moves a call site behind a
+trait — it is **reimplementing backup as export/import**, which is exactly R-6a and R-6b.
+
+The consequence that matters for sequencing: **finishing B does not unlock R-3.** A trait carrying
+`Option<Arc<rocksdb::DB>>` for the backup path pins rocksdb into the default build just as firmly as
+the call sites did, so cfg-gating it out remains impossible. 158 `rocksdb::` refs still stand outside
+`src/storage/`.
+
+Real order:
+
+    R-6a  export_portable (rocksdb side)      additive, non-destructive
+    R-6b  import_portable (redb side)         into a SCRATCH target
+    ...   backup/restore re-expressed on top of those, replacing rocksdb::backup
+    B     get_db() removable only then; field flip becomes mechanical
+    R-3   cfg-gate rocksdb — reachable only after the above
+
+**Do not port the backup engine under time pressure.** It took two correctness fixes inside 48 hours
+(`4d1ec01` a backup that omitted a store said success; `6f01987` restore deleted the graph before
+knowing the replacement copied), and it has never been exercised at 2.0 GB across 22 tenants. Two
+fixes landing is evidence it is improving, not that it is proven.
+
 ## R-6 is refuted and replaced
 
 Do not attempt `migrate_in_place`. The replacement, in order:
