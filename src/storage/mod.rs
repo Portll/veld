@@ -284,8 +284,13 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn clear_all_interference_records(&self) -> Result<usize>;
     fn cleanup_corrupted(&self) -> Result<usize>;
     fn migrate_legacy(&self) -> Result<(usize, usize, usize)>;
-    fn run_merge_pass(&self, user_id: &str, limit: usize) -> usize;
-    fn gc_merge_tombstones(&self, user_id: &str) -> usize;
+    // `-> Result<usize>`, not `-> usize`. The bare count could not express failure,
+    // so an unbuilt backend could only return 0 — making "merged nothing" and
+    // "cannot merge" the same answer, which is the absence-as-success this codebase
+    // refuses everywhere else. The redb side panicked to keep them distinguishable;
+    // with an error channel it can simply say so.
+    fn run_merge_pass(&self, user_id: &str, limit: usize) -> Result<usize>;
+    fn gc_merge_tombstones(&self, user_id: &str) -> Result<usize>;
 
     /// Every key under `prefix`, values not loaded.
     ///
@@ -494,9 +499,6 @@ mod backend_coverage_matrix {
             Ok(Err(_)) => Outcome::Refuses,
         }
     }
-    fn probe_usize(f: impl FnOnce() -> usize) -> Outcome {
-        match catch_unwind(AssertUnwindSafe(f)) { Err(_) => Outcome::Panics, Ok(_) => Outcome::Works }
-    }
 
     fn a_memory() -> Memory {
         let now = chrono::Utc::now();
@@ -543,8 +545,8 @@ mod backend_coverage_matrix {
             ("migrate_legacy",                probe(|| s.migrate_legacy())),
             ("scan_prefix_keys",              probe(|| s.scan_prefix_keys(b"x"))),
             ("write_batch",                   probe(|| s.write_batch(&crate::storage::WriteBatch::new()))),
-            ("run_merge_pass",                probe_usize(|| s.run_merge_pass("u", 1))),
-            ("gc_merge_tombstones",           probe_usize(|| s.gc_merge_tombstones("u"))),
+            ("run_merge_pass",                probe(|| s.run_merge_pass("u", 1))),
+            ("gc_merge_tombstones",           probe(|| s.gc_merge_tombstones("u"))),
             ("delete_memory",                 probe(|| s.delete_memory(&id))),
             ("delete",                        probe(|| s.delete(&id))),
         ];

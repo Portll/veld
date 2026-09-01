@@ -351,7 +351,6 @@ impl RetrievalEngine {
         // something else entirely. The length check below cannot see it either:
         // every vector is the right SHAPE and the wrong CONTENT.
         let action = corpus_action(recorded, recorded_id.as_deref(), target, &target_id);
-        let dim_changed = recorded != Some(target);
         if action == CorpusAction::UpToDate {
             return Ok(()); // corpus is at the active dimension AND the active embedder
         }
