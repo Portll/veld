@@ -154,6 +154,14 @@ fn create_redb_database(path: &Path) -> Result<Arc<redb::Database>> {
 // `flush` is a no-op.
 // =============================================================================
 
+/// The default keyspace. rocksdb writes several small records with bare `db.put`
+/// — interference records, the retrieval counter — and those keys must land in the
+/// SAME logical space on both backends or a portable dump round-trips them into a
+/// table nothing reads. Named from DEFAULT_TABLE_NAME so it cannot drift from what
+/// a `cf: None` batch op addresses.
+const DEFAULT_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> =
+    redb::TableDefinition::new(DEFAULT_TABLE_NAME);
+
 /// Memories keyed by `MemoryId` bytes -> `bincode(Memory)`.
 const MEMORIES_TABLE: redb::TableDefinition<'static, &[u8], &[u8]> =
     redb::TableDefinition::new("memories");
@@ -366,6 +374,7 @@ impl RedbPrimaryMemoryStore {
         let database = create_redb_database(&database_path)?;
         init_table(&database, MEMORIES_TABLE)?;
         init_table(&database, VMAPPINGS_TABLE)?;
+        init_table(&database, DEFAULT_TABLE)?;
         Ok(Self { database })
     }
 
@@ -426,8 +435,59 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         }
         Ok(ids)
     }
-    fn increment_retrieval_count(&self) -> Result<usize> { Err(unbuilt("increment_retrieval_count")) }
-    fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> { Err(unbuilt("get_stats")) }
+    fn increment_retrieval_count(&self) -> Result<usize> {
+        // Same key and same encoding as rocksdb: `stats:total_retrievals` -> u64 LE.
+        // Read-modify-write, which is NOT atomic under concurrent readers and loses
+        // increments — rocksdb has the identical race. Matched rather than fixed:
+        // diverging silently is worse than sharing a defect that can be repaired in
+        // both places at once.
+        const RETRIEVAL_KEY: &[u8] = b"stats:total_retrievals";
+        let current = table_get(&self.database, DEFAULT_TABLE, RETRIEVAL_KEY)?
+            .and_then(|b| b.try_into().ok().map(usize::from_le_bytes))
+            .unwrap_or(0);
+        let next = current + 1;
+        table_put(&self.database, DEFAULT_TABLE, RETRIEVAL_KEY, &next.to_le_bytes())?;
+        Ok(next)
+    }
+    fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> {
+        // Forgotten memories are EXCLUDED from every figure, matching rocksdb —
+        // total_count, size, compressed and importance all skip them, so a corpus
+        // that has been forgotten down reports smaller rather than unchanged.
+        let mut stats = crate::memory::storage::StorageStats::default();
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(MEMORIES_TABLE)?;
+        for row in table.iter()? {
+            let (k, v) = row?;
+            if k.value().len() != 16 {
+                continue;
+            }
+            match decode::<Memory>(v.value()) {
+                Ok(memory) => {
+                    if memory.is_forgotten() {
+                        continue;
+                    }
+                    stats.total_count += 1;
+                    stats.total_size_bytes += v.value().len();
+                    if memory.compressed {
+                        stats.compressed_count += 1;
+                    }
+                    stats.importance_sum += memory.importance();
+                }
+                // A record that will not decode is COUNTED as corrupt and skipped,
+                // never silently dropped from the denominator as if it were absent.
+                Err(e) => tracing::warn!(error = %e, "corrupted memory entry during get_stats"),
+            }
+        }
+        if stats.total_count > 0 {
+            stats.average_importance = stats.importance_sum / stats.total_count as f32;
+        }
+        const RETRIEVAL_KEY: &[u8] = b"stats:total_retrievals";
+        stats.total_retrievals = table_get(&self.database, DEFAULT_TABLE, RETRIEVAL_KEY)?
+            .filter(|b| b.len() >= 8)
+            .and_then(|b| b[..8].try_into().ok().map(usize::from_le_bytes))
+            .unwrap_or(0);
+        Ok(stats)
+    }
     fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>> {
         // rocksdb answers this from a blinded index (`external:{blind_term}:{id}`).
         // redb has no such index, so this is a scan — same ANSWER, different cost.
@@ -476,28 +536,99 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
     }
     fn get_uncompressed_older_than(
         &self,
-        _cutoff: chrono::DateTime<chrono::Utc>,
+        cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Memory>> {
-        Err(unbuilt("get_uncompressed_older_than"))
+        // All three conditions, in rocksdb's order: not compressed, not forgotten,
+        // older than the cutoff. Dropping the forgotten check would hand already-
+        // discarded memories back to a compaction pass to compress.
+        Ok(self
+            .scan_all_memories()?
+            .into_iter()
+            .filter(|m| !m.compressed && !m.is_forgotten() && m.created_at < cutoff)
+            .collect())
     }
     fn mark_forgotten_by_age(
         &self,
-        _cutoff: chrono::DateTime<chrono::Utc>,
+        cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<MemoryId>> {
-        Err(unbuilt("mark_forgotten_by_age"))
+        // Soft delete: the record stays and gains two metadata keys. Both are
+        // rocksdb's exact names — a reader looking for "forgotten" would not see a
+        // memory marked under any other spelling, and is_forgotten() is what every
+        // other method filters on.
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut flagged = Vec::new();
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(MEMORIES_TABLE)?;
+            let candidates: Vec<(Vec<u8>, Vec<u8>)> = table
+                .iter()?
+                .filter_map(|r| r.ok())
+                .filter(|(k, _)| k.value().len() == 16)
+                .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
+                .collect();
+            for (key, value) in candidates {
+                let mut memory = match decode::<Memory>(&value) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e,
+                            "skipping a record that failed to deserialize during forget-by-age");
+                        continue;
+                    }
+                };
+                if memory.is_forgotten() || memory.created_at >= cutoff {
+                    continue;
+                }
+                flagged.push(memory.id.clone());
+                memory.experience.metadata.insert("forgotten".into(), "true".into());
+                memory.experience.metadata.insert("forgotten_at".into(), now.clone());
+                table.insert(key.as_slice(), encode(&memory)?.as_slice())?;
+            }
+        }
+        // One transaction: rocksdb writes its whole batch or none of it, so a
+        // partial forget-by-age is not a state either backend can produce.
+        txn.commit()?;
+        Ok(flagged)
     }
     fn save_interference_records(
         &self,
-        _memory_id: &str,
-        _records: &[crate::memory::replay::InterferenceRecord],
+        memory_id: &str,
+        records: &[crate::memory::replay::InterferenceRecord],
     ) -> Result<()> {
-        Err(unbuilt("save_interference_records"))
+        // serde_json, not bincode — matching rocksdb, because these bytes have to be
+        // readable by whichever backend is live after a cutover.
+        let key = format!("interference:{memory_id}");
+        let value = serde_json::to_vec(records)
+            .context("Failed to serialize interference records")?;
+        table_put(&self.database, DEFAULT_TABLE, key.as_bytes(), &value)
     }
-    fn delete_interference_records(&self, _memory_id: &str) -> Result<()> {
-        Err(unbuilt("delete_interference_records"))
+    fn delete_interference_records(&self, memory_id: &str) -> Result<()> {
+        let key = format!("interference:{memory_id}");
+        table_remove(&self.database, DEFAULT_TABLE, key.as_bytes())?;
+        Ok(())
     }
     fn clear_all_interference_records(&self) -> Result<usize> {
-        Err(unbuilt("clear_all_interference_records"))
+        // The prefix is `interference` with NO colon, which is rocksdb's, and it
+        // therefore also removes `interference_meta:total` — the event counter — not
+        // just the per-memory records. Replicated deliberately: whether that is
+        // intended or a slip, the two backends must agree, and a divergence here
+        // would show up as a counter that survives a clear on one engine only.
+        let txn = self.database.begin_write()?;
+        let mut count = 0usize;
+        {
+            let mut table = txn.open_table(DEFAULT_TABLE)?;
+            let doomed: Vec<Vec<u8>> = table
+                .iter()?
+                .filter_map(|row| row.ok())
+                .map(|(k, _)| k.value().to_vec())
+                .filter(|k| k.starts_with(b"interference"))
+                .collect();
+            for key in doomed {
+                let _ = table.remove(key.as_slice())?;
+                count += 1;
+            }
+        }
+        txn.commit()?;
+        Ok(count)
     }
     fn cleanup_corrupted(&self) -> Result<usize> { Err(unbuilt("cleanup_corrupted")) }
     fn migrate_legacy(&self) -> Result<(usize, usize, usize)> { Err(unbuilt("migrate_legacy")) }
