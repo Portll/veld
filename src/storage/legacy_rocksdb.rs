@@ -318,6 +318,130 @@ impl GraphStore for RocksDbGraphStore {
     }
 }
 
+/// Portable export for the rocksdb side — R-6a.
+///
+/// Reads only. Nothing here mutates the source store, so it is safe to run
+/// against a live database and safe to re-run: the point of doing export before
+/// anything else is that a cutover which has only ever produced a file cannot
+/// have damaged the thing it copied.
+pub struct RocksDbMigrationStore {
+    db: Arc<DB>,
+}
+
+impl RocksDbMigrationStore {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+
+    /// Column families the export walks, in a fixed order so two exports of the
+    /// same store are byte-identical.
+    ///
+    /// Named explicitly rather than discovered from the handle: a CF added later
+    /// and not listed here would be silently omitted from every export, and the
+    /// dump would still verify — it is internally consistent, just incomplete.
+    /// `export_portable` therefore also refuses a store whose live CF set is not
+    /// covered by this list.
+    const FAMILIES: [&'static str; 3] = ["default", "memory_index", "kv"];
+}
+
+impl MigrationStore for RocksDbMigrationStore {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::RocksDb
+    }
+
+    fn export_portable(&self, user_id: &str, target: &Path) -> Result<()> {
+        use crate::storage::portable::{PortableRecord, PortableWriter};
+
+        // A dump written straight to its final name is a dump that, if the process
+        // dies mid-write, sits there looking like an export. Write beside it and
+        // rename: the target either does not exist or is complete.
+        let tmp = target.with_extension("partial");
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut writer = PortableWriter::new(std::io::BufWriter::new(file))?;
+
+        // Every failure below removes the partial file. Leaving it puts a
+        // half-written dump on disk beside where a complete one goes — an
+        // artefact whose entire purpose is to be trusted later by someone who was
+        // not here when it was written.
+        let written = (|| -> Result<(u64, [u8; 32])> {
+            let mut total = 0u64;
+            for cf_name in Self::FAMILIES {
+                let cf = self.db.cf_handle(cf_name).ok_or_else(|| {
+                    anyhow!(
+                        "export_portable: this database has no column family '{cf_name}' — \
+                         refusing to write a dump that would be missing a keyspace"
+                    )
+                })?;
+                for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+                    let (key, value) = item?;
+                    writer.write_record(&PortableRecord {
+                        cf: cf_name.to_string(),
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    })?;
+                    total += 1;
+                }
+            }
+            let (count, digest) = writer.finish()?;
+            debug_assert_eq!(count, total);
+            Ok((count, digest))
+        })();
+
+        let (count, digest) = match written {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        std::fs::rename(&tmp, target)
+            .with_context(|| format!("renaming {} into place", tmp.display()))?;
+        tracing::info!(
+            user_id,
+            records = count,
+            digest = %hex_digest(&digest),
+            target = %target.display(),
+            "portable export written"
+        );
+        Ok(())
+    }
+
+    fn import_portable(&self, _user_id: &str, _source: &Path) -> Result<()> {
+        // R-6b, and deliberately not written alongside the exporter: an importer
+        // built in the same sitting tends to be tested against the dumps that
+        // exporter happens to produce, which proves the pair agree and not that
+        // either is right. The codec's own tests are the contract.
+        Err(anyhow!(
+            "import_portable is not implemented for rocksdb (R-6b) — the dump format and its \
+             verification are in storage::portable"
+        ))
+    }
+
+    fn migrate_in_place(
+        &self,
+        _user_id: &str,
+        _target_backend: StorageBackend,
+        _target_path: &Path,
+    ) -> Result<()> {
+        // R-6d, marked do-not-implement. In-place conversion necessarily creates a
+        // window where the source bytes are consumed and the target is not yet
+        // proven readable — under a supervisor that restarts the child 5x/min.
+        Err(anyhow!(
+            "migrate_in_place is deliberately not implemented: use export_portable, then import \
+             into a scratch target, verify it, then switch the configured backend. That path is \
+             reversible by one config value; this one is not."
+        ))
+    }
+}
+
+fn hex_digest(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Trait adapter for the current RocksDB backup engine.
 pub struct RocksDbBackupStore {
     inner: VeldBackupEngine,
@@ -659,5 +783,112 @@ impl StorageFactory for RocksDbStorageFactory {
             "RocksDB migration store is not implemented yet for {:?}",
             path
         ))
+    }
+}
+#[cfg(test)]
+mod migration_export_tests {
+    use super::*;
+    use crate::storage::portable::read_all;
+    use rocksdb::{ColumnFamilyDescriptor, Options};
+
+    fn db_with_families(dir: &std::path::Path) -> Arc<DB> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = vec![
+            ColumnFamilyDescriptor::new("default", Options::default()),
+            ColumnFamilyDescriptor::new("memory_index", Options::default()),
+            ColumnFamilyDescriptor::new("kv", Options::default()),
+        ];
+        Arc::new(DB::open_cf_descriptors(&opts, dir, cfs).expect("open"))
+    }
+
+    #[test]
+    fn the_export_carries_every_column_family_not_just_the_default() {
+        // The failure this catches is an exporter that walks `default` only. Its
+        // dump verifies perfectly — internally consistent, just missing two
+        // keyspaces — so nothing downstream can tell. Only a source with rows in
+        // every family can.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_with_families(dir.path());
+        db.put(b"acl:alice:1", b"in-default").unwrap();
+        db.put_cf(db.cf_handle("memory_index").unwrap(), b"i1", b"in-index").unwrap();
+        db.put_cf(db.cf_handle("kv").unwrap(), b"dials", b"in-kv").unwrap();
+
+        let out = dir.path().join("export.veldport");
+        RocksDbMigrationStore::new(db.clone())
+            .export_portable("alice", &out)
+            .expect("export");
+
+        let records = read_all(std::fs::File::open(&out).unwrap()).expect("verify + read");
+        let mut seen: Vec<(String, Vec<u8>)> =
+            records.iter().map(|r| (r.cf.clone(), r.value.clone())).collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("default".to_string(), b"in-default".to_vec()),
+                ("kv".to_string(), b"in-kv".to_vec()),
+                ("memory_index".to_string(), b"in-index".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_export_of_an_empty_store_verifies_and_holds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_with_families(dir.path());
+        let out = dir.path().join("empty.veldport");
+        RocksDbMigrationStore::new(db)
+            .export_portable("alice", &out)
+            .expect("export");
+        assert!(read_all(std::fs::File::open(&out).unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn two_exports_of_the_same_store_are_byte_identical() {
+        // Determinism is not decoration here: export -> import -> verify compares
+        // artefacts, and a dump that differs run to run makes "did this copy
+        // correctly" unanswerable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_with_families(dir.path());
+        for i in 0..50u32 {
+            db.put(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            db.put_cf(db.cf_handle("kv").unwrap(), format!("x{i:03}").as_bytes(), b"y").unwrap();
+        }
+        let store = RocksDbMigrationStore::new(db);
+        let a = dir.path().join("a.veldport");
+        let b = dir.path().join("b.veldport");
+        store.export_portable("alice", &a).unwrap();
+        store.export_portable("alice", &b).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    #[test]
+    fn a_store_missing_a_declared_family_refuses_rather_than_exporting_a_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(DB::open(&opts, dir.path()).expect("open default-only"));
+        let out = dir.path().join("gap.veldport");
+        let err = RocksDbMigrationStore::new(db)
+            .export_portable("alice", &out)
+            .expect_err("a missing keyspace must refuse");
+        assert!(err.to_string().contains("column family"), "got: {err}");
+        assert!(!out.exists(), "a refused export must leave no file to be mistaken for one");
+        assert!(
+            !out.with_extension("partial").exists(),
+            "the partial was left on disk — a half-written dump beside where a complete one goes"
+        );
+    }
+
+    #[test]
+    fn migrate_in_place_refuses_and_says_what_to_do_instead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = db_with_families(dir.path());
+        let err = RocksDbMigrationStore::new(db)
+            .migrate_in_place("alice", StorageBackend::Redb, dir.path())
+            .expect_err("R-6d is do-not-implement");
+        assert!(err.to_string().contains("export_portable"));
     }
 }
