@@ -2220,6 +2220,7 @@ mod tests {
 
         struct StubEmb;
         impl crate::embeddings::Embedder for StubEmb {
+            fn id(&self) -> &str { "stub-hybrid" }
             fn encode(&self, _: &str) -> anyhow::Result<Vec<f32>> {
                 Ok(vec![0.0; 4])
             }

@@ -156,6 +156,44 @@ impl IdMapping {
     }
 }
 
+/// What a corpus needs, decided from the two markers alone.
+///
+/// Pure, and separated from the migration for one reason: the defect this replaced
+/// was a decision, not a loop. `recorded_dim == target_dim` returned early over a
+/// corpus embedded by a DIFFERENT model at the same dimension, and the per-memory
+/// length check downstream was blind for the same reason — every vector the right
+/// shape, the wrong content. Two guards, one blind spot. A decision that can be
+/// enumerated in a test is one that cannot quietly regain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorpusAction {
+    /// Dimension and embedder both match what is configured.
+    UpToDate,
+    /// Dimension matches and nothing recorded WHICH model wrote the corpus. Not
+    /// knowable after the fact, so it is neither claimed current nor re-embedded.
+    RecordUnverified,
+    /// Dimension changed: the per-memory length check identifies what to redo.
+    MigrateChangedLength,
+    /// Embedder changed at the SAME dimension: length identifies nothing, so
+    /// everything must be redone.
+    MigrateAll,
+}
+
+pub(crate) fn corpus_action(
+    recorded_dim: Option<usize>,
+    recorded_id: Option<&str>,
+    target_dim: usize,
+    target_id: &str,
+) -> CorpusAction {
+    if recorded_dim != Some(target_dim) {
+        return CorpusAction::MigrateChangedLength;
+    }
+    match recorded_id {
+        Some(id) if id == target_id => CorpusAction::UpToDate,
+        Some(_) => CorpusAction::MigrateAll,
+        None => CorpusAction::RecordUnverified,
+    }
+}
+
 impl RetrievalEngine {
     /// Create new retrieval engine with shared embedder (CRITICAL: embedder loaded only once)
     ///
@@ -295,21 +333,60 @@ impl RetrievalEngine {
     ///   target length is promoted in place instead of re-running ONNX.
     fn migrate_embeddings_if_dimension_changed(&self) -> Result<()> {
         let target = self.embedder.primary_dimension();
+        let target_id = self.embedder.primary_id().to_string();
         let marker = self.storage_path.join(".veld_embedding_dim");
+        let id_marker = self.storage_path.join(".veld_embedder");
 
         let recorded: Option<usize> = std::fs::read_to_string(&marker)
             .ok()
             .and_then(|s| s.trim().parse().ok());
-        if recorded == Some(target) {
-            return Ok(()); // corpus already at the active dimension
+        let recorded_id: Option<String> = std::fs::read_to_string(&id_marker)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // DIMENSION IS NOT IDENTITY. Two different models at the same dimension —
+        // the hash-bigram fallback and MiniLM are both 384 — leave `recorded ==
+        // Some(target)` true, so this returned early over a corpus embedded by
+        // something else entirely. The length check below cannot see it either:
+        // every vector is the right SHAPE and the wrong CONTENT.
+        let action = corpus_action(recorded, recorded_id.as_deref(), target, &target_id);
+        let dim_changed = recorded != Some(target);
+        if action == CorpusAction::UpToDate {
+            return Ok(()); // corpus is at the active dimension AND the active embedder
         }
 
         let ids = self.storage.get_all_ids()?;
         if ids.is_empty() {
-            // Fresh / empty store — just record the dimension.
+            // Fresh / empty store — record both; nothing to migrate.
             let _ = std::fs::write(&marker, target.to_string());
+            let _ = std::fs::write(&id_marker, &target_id);
             return Ok(());
         }
+
+        // A corpus written before this marker existed. We CANNOT tell what embedded
+        // it, and neither answer is safe to assume: re-embedding thousands of vectors
+        // unasked is expensive, and writing the current id claims a provenance nobody
+        // established. So the unknown gets its own value — `unverified:<id>` — which
+        // is not equal to `<id>`, so it never satisfies the early return above, and
+        // says in the file itself that this was believed rather than checked.
+        if action == CorpusAction::RecordUnverified {
+            warn!(
+                embedder = %target_id,
+                memories = ids.len(),
+                "embedding provenance UNKNOWN for this corpus: the dimension matches the active \
+                 embedder but nothing recorded which model wrote it, and two models at one \
+                 dimension are indistinguishable in the store. Not re-embedding unasked. POST \
+                 /api/index/reembed to make the corpus current, after which this resolves."
+            );
+            let _ = std::fs::write(&id_marker, format!("unverified:{target_id}"));
+            return Ok(());
+        }
+
+        // An embedder swap at the SAME dimension invalidates every vector while
+        // leaving all their lengths correct, so the per-memory length check below is
+        // blind to it and everything must be re-embedded.
+        let force_all = action == CorpusAction::MigrateAll;
 
         info!(
             "Embedding dimension change detected (was {:?}, now {}d) — checking {} memories",
@@ -341,8 +418,10 @@ impl RetrievalEngine {
             };
 
             // Already the correct length — nothing to do (keeps retries cheap).
-            let needs_migration =
-                matches!(&memory.experience.embeddings, Some(e) if e.len() != target);
+            // Unless the EMBEDDER changed at the same dimension, in which case length
+            // is exactly the property that stayed correct while the content did not.
+            let needs_migration = force_all
+                || matches!(&memory.experience.embeddings, Some(e) if e.len() != target);
             if !needs_migration {
                 unchanged += 1;
                 continue;
@@ -389,6 +468,10 @@ impl RetrievalEngine {
         // it stale so the next startup resumes the remaining memories.
         if failed == 0 {
             let _ = std::fs::write(&marker, target.to_string());
+            // Both markers advance together, or neither does. Advancing the
+            // dimension alone would leave the corpus recorded as unverified
+            // forever and re-run the whole pass on every startup.
+            let _ = std::fs::write(&id_marker, &target_id);
         } else {
             warn!(
                 "Embedding migration finished with {} failures — marker not advanced, will retry next startup",
@@ -3137,5 +3220,73 @@ mod tests {
             2,
             "vector_to_memory should not grow on re-insert"
         );
+    }
+}
+
+#[cfg(test)]
+mod corpus_action_tests {
+    use super::{corpus_action, CorpusAction};
+
+    #[test]
+    fn the_case_that_was_broken_same_dimension_different_model() {
+        // THE defect. Both are 384, so the old check saw `recorded == target` and
+        // returned — over a corpus embedded by something else entirely. The length
+        // check downstream could not see it either: right shape, wrong content.
+        assert_eq!(
+            corpus_action(Some(384), Some("hash-bigram"), 384, "minilm"),
+            CorpusAction::MigrateAll,
+            "an embedder swap at one dimension must redo everything — length identifies nothing"
+        );
+    }
+
+    #[test]
+    fn a_matching_pair_is_up_to_date_and_costs_nothing() {
+        assert_eq!(corpus_action(Some(384), Some("minilm"), 384, "minilm"), CorpusAction::UpToDate);
+    }
+
+    #[test]
+    fn a_dimension_change_uses_the_length_check() {
+        // Still the cheap path: a 768 corpus against a 384 embedder is identifiable
+        // per memory, so there is no reason to redo the ones already correct.
+        assert_eq!(
+            corpus_action(Some(768), Some("nomic"), 384, "minilm"),
+            CorpusAction::MigrateChangedLength
+        );
+        // And it wins even when the id also changed — length is the sharper signal.
+        assert_eq!(
+            corpus_action(Some(768), Some("hash-bigram"), 384, "minilm"),
+            CorpusAction::MigrateChangedLength
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_embedder_is_neither_current_nor_wrong() {
+        // The corpus that exists today: dimension matches, nothing says what wrote it.
+        // Claiming UpToDate asserts a provenance nobody established; MigrateAll
+        // re-embeds thousands of vectors on a suspicion. It gets its own answer.
+        assert_eq!(
+            corpus_action(Some(384), None, 384, "minilm"),
+            CorpusAction::RecordUnverified
+        );
+    }
+
+    #[test]
+    fn unverified_does_not_read_as_current_on_the_next_startup() {
+        // The sentinel has to be a value that never equals a real id, or the next
+        // run reads it as a match and the unknown silently becomes a claim.
+        assert_eq!(
+            corpus_action(Some(384), Some("unverified:minilm"), 384, "minilm"),
+            CorpusAction::MigrateAll,
+            "an unverified marker must resolve, not persist as a permanent maybe"
+        );
+    }
+
+    #[test]
+    fn a_fresh_store_takes_the_migrate_path_and_the_caller_short_circuits_on_empty() {
+        // No markers at all. The decision is MigrateChangedLength; the caller then
+        // finds zero memories and records both markers without work. Asserted so a
+        // later reader does not "fix" this into UpToDate, which would record the
+        // markers for a corpus nobody looked at.
+        assert_eq!(corpus_action(None, None, 384, "minilm"), CorpusAction::MigrateChangedLength);
     }
 }

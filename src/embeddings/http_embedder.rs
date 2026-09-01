@@ -170,6 +170,10 @@ impl HttpEmbedder {
 }
 
 impl Embedder for HttpEmbedder {
+    // The URL IS the canonical id — `load_embedder_by_id` dispatches on the
+    // `http://`/`https://` prefix and uses the whole string as base_url.
+    fn id(&self) -> &str { &self.config.base_url }
+
     fn model_id(&self) -> &str {
         &self.config.model
     }

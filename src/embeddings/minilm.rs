@@ -926,6 +926,8 @@ impl MiniLMEmbedder {
 }
 
 impl Embedder for MiniLMEmbedder {
+    fn id(&self) -> &str { "minilm" }
+
     fn model_id(&self) -> &str {
         "minilm-l6-v2"
     }
