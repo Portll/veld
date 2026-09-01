@@ -1169,6 +1169,8 @@ impl NomicEmbedder {
 }
 
 impl Embedder for NomicEmbedder {
+    fn id(&self) -> &str { "nomic" }
+
     fn model_id(&self) -> &str {
         "nomic-embed-text-v1.5"
     }

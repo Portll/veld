@@ -170,6 +170,11 @@ impl CompetitiveEmbedder {
         self.secondary_dim
     }
 
+    /// The primary embedder's canonical id — what the corpus was embedded BY.
+    pub fn primary_id(&self) -> &str {
+        self.primary.id()
+    }
+
     /// Get a reference to the primary embedder.
     pub fn primary_embedder(&self) -> &Arc<dyn Embedder> {
         &self.primary
@@ -277,6 +282,11 @@ impl CompetitiveEmbedder {
 /// modification. Callers that want dual embeddings should use the
 /// `encode_dual` / `encode_dual_batch` methods directly.
 impl Embedder for CompetitiveEmbedder {
+    // The PRIMARY names the pair. A corpus is embedded by the primary, so that is
+    // the identity the stored vectors have; the secondary is a parallel opinion and
+    // swapping it does not invalidate anything already written.
+    fn id(&self) -> &str { self.primary.id() }
+
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         self.encode_primary(text)
     }
@@ -321,6 +331,7 @@ mod tests {
     }
 
     impl Embedder for StubEmbedder {
+        fn id(&self) -> &str { "stub" }
         fn encode(&self, text: &str) -> Result<Vec<f32>> {
             let seed = text.len() as f32;
             let mut v = vec![0.0f32; self.dim];
@@ -345,6 +356,7 @@ mod tests {
     struct FailingEmbedder;
 
     impl Embedder for FailingEmbedder {
+        fn id(&self) -> &str { "stub-failing" }
         fn encode(&self, _text: &str) -> Result<Vec<f32>> {
             anyhow::bail!("secondary model unavailable")
         }
