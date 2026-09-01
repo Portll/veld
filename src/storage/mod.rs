@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::backup::BackupMetadata;
 use crate::config::StorageBackend;
 use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, RelationshipEdge};
-use crate::memory::storage::{SearchCriteria, VectorMappingEntry};
+use crate::memory::storage::{SearchCriteria, StorageStats, VectorMappingEntry};
 use crate::memory::{Memory, MemoryConfig, MemoryId};
 
 /// Capabilities that differ across storage backends and should be modeled
@@ -228,6 +228,20 @@ pub trait KeyValueStore: Send + Sync {
 }
 
 /// Domain interface for the primary memory store.
+///
+/// The surface below the first block is what `MemorySystem` actually calls on its
+/// `long_term_memory` field: 24 distinct methods across 94 call sites in exactly
+/// two files (`memory/mod.rs`, `memory/recall.rs`), measured 2026-09-01. They are
+/// declared here so the field can become `Arc<dyn PrimaryMemoryStore>` — the
+/// boundary the storage abstraction was designed for and stalled at.
+///
+/// **`get` is NOT expressible in terms of `get_memory`, and that is why both are
+/// here.** `RocksDbPrimaryMemoryStore::get_memory` classifies not-found by
+/// `err.to_string().contains("Memory not found")`, so routing `get` through it
+/// would send every genuine failure through a string match and return `Ok(None)`
+/// for any error whose message someone later rewords — a decode failure, a
+/// corrupt value or a permission error rendered as "this memory does not exist".
+/// `get` therefore delegates straight to the backend and keeps its own error.
 pub trait PrimaryMemoryStore: Send + Sync {
     fn backend(&self) -> StorageBackend;
     fn get_memory(&self, id: &MemoryId) -> Result<Option<Memory>>;
@@ -239,6 +253,38 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()>;
     fn delete_vector_mapping(&self, id: &MemoryId) -> Result<()>;
     fn flush(&self) -> Result<()>;
+
+    // ── What MemorySystem calls, by frequency. Signatures are MemoryStorage's
+    //    exactly: an alias that "tidies" one of these changes behaviour at a call
+    //    site that will not look any different.
+    fn get(&self, id: &MemoryId) -> Result<Memory>;
+    fn store(&self, memory: &Memory) -> Result<()>;
+    fn update(&self, memory: &Memory) -> Result<()>;
+    fn delete(&self, id: &MemoryId) -> Result<()>;
+    fn get_all(&self) -> Result<Vec<Memory>>;
+    fn get_all_ids(&self) -> Result<Vec<MemoryId>>;
+    fn increment_retrieval_count(&self) -> Result<usize>;
+    fn get_stats(&self) -> Result<StorageStats>;
+    fn find_by_external_id(&self, external_id: &str) -> Result<Option<Memory>>;
+    fn get_children(&self, parent_id: &MemoryId) -> Result<Vec<Memory>>;
+    fn get_ancestors(&self, memory_id: &MemoryId) -> Result<Vec<Memory>>;
+    fn get_hierarchy_context(
+        &self,
+        memory_id: &MemoryId,
+    ) -> Result<(Vec<Memory>, Memory, Vec<Memory>)>;
+    fn get_uncompressed_older_than(&self, cutoff: DateTime<Utc>) -> Result<Vec<Memory>>;
+    fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<Vec<MemoryId>>;
+    fn save_interference_records(
+        &self,
+        memory_id: &str,
+        records: &[crate::memory::replay::InterferenceRecord],
+    ) -> Result<()>;
+    fn delete_interference_records(&self, memory_id: &str) -> Result<()>;
+    fn clear_all_interference_records(&self) -> Result<usize>;
+    fn cleanup_corrupted(&self) -> Result<usize>;
+    fn migrate_legacy(&self) -> Result<(usize, usize, usize)>;
+    fn run_merge_pass(&self, user_id: &str, limit: usize) -> usize;
+    fn gc_merge_tombstones(&self, user_id: &str) -> usize;
 }
 
 /// Domain interface for graph persistence.

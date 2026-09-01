@@ -111,6 +111,13 @@ impl BatchWriter for RedbBatchWriter {
     }
 }
 
+/// An operation the redb backend declares but has not built. Distinct from
+/// `not_implemented`, which names a path; these are store-level and the store
+/// holds only a database handle.
+fn unbuilt(operation: &str) -> anyhow::Error {
+    anyhow!("redb {operation} is declared on PrimaryMemoryStore but not implemented — refusing rather than returning an empty result")
+}
+
 fn not_implemented(operation: &str, path: &Path) -> anyhow::Error {
     anyhow!(
         "redb {} is not implemented yet for {}",
@@ -367,6 +374,82 @@ impl RedbPrimaryMemoryStore {
 }
 
 impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
+    // ── Declared but not built, and each one SAYS so rather than returning an
+    //    empty success. redb is unreachable today (config::effective_storage_backend_
+    //    for_current_build returns RocksDb from both arms), so nothing here can be hit
+    //    in production; the value of the stubs is that a future implementer sees the
+    //    list, and that wiring redb before filling them fails loudly instead of
+    //    reporting a store with no memories in it.
+    // These four are NOT unbuilt: redb's primary store is operational, and each of
+    // them is the same operation this trait already carries under another name. On
+    // redb `get_memory` is a plain table lookup returning Option, so composing `get`
+    // from it is exact — unlike the rocksdb adapter, where `get_memory` recovers
+    // not-found by matching an error STRING and composing the other way round would
+    // launder real failures into `Ok(None)`. Same two names, opposite safe direction,
+    // per backend.
+    fn get(&self, id: &MemoryId) -> Result<Memory> {
+        self.get_memory(id)?
+            .ok_or_else(|| anyhow!("Memory not found: {}", id.0))
+    }
+    fn store(&self, memory: &Memory) -> Result<()> { self.put_memory(memory) }
+    fn update(&self, memory: &Memory) -> Result<()> { self.update_memory(memory) }
+    fn delete(&self, id: &MemoryId) -> Result<()> { self.delete_memory(id) }
+    fn get_all(&self) -> Result<Vec<Memory>> { Err(unbuilt("get_all")) }
+    fn get_all_ids(&self) -> Result<Vec<MemoryId>> { Err(unbuilt("get_all_ids")) }
+    fn increment_retrieval_count(&self) -> Result<usize> { Err(unbuilt("increment_retrieval_count")) }
+    fn get_stats(&self) -> Result<crate::memory::storage::StorageStats> { Err(unbuilt("get_stats")) }
+    fn find_by_external_id(&self, _external_id: &str) -> Result<Option<Memory>> {
+        Err(unbuilt("find_by_external_id"))
+    }
+    fn get_children(&self, _parent_id: &MemoryId) -> Result<Vec<Memory>> { Err(unbuilt("get_children")) }
+    fn get_ancestors(&self, _memory_id: &MemoryId) -> Result<Vec<Memory>> { Err(unbuilt("get_ancestors")) }
+    fn get_hierarchy_context(
+        &self,
+        _memory_id: &MemoryId,
+    ) -> Result<(Vec<Memory>, Memory, Vec<Memory>)> {
+        Err(unbuilt("get_hierarchy_context"))
+    }
+    fn get_uncompressed_older_than(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Memory>> {
+        Err(unbuilt("get_uncompressed_older_than"))
+    }
+    fn mark_forgotten_by_age(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MemoryId>> {
+        Err(unbuilt("mark_forgotten_by_age"))
+    }
+    fn save_interference_records(
+        &self,
+        _memory_id: &str,
+        _records: &[crate::memory::replay::InterferenceRecord],
+    ) -> Result<()> {
+        Err(unbuilt("save_interference_records"))
+    }
+    fn delete_interference_records(&self, _memory_id: &str) -> Result<()> {
+        Err(unbuilt("delete_interference_records"))
+    }
+    fn clear_all_interference_records(&self) -> Result<usize> {
+        Err(unbuilt("clear_all_interference_records"))
+    }
+    fn cleanup_corrupted(&self) -> Result<usize> { Err(unbuilt("cleanup_corrupted")) }
+    fn migrate_legacy(&self) -> Result<(usize, usize, usize)> { Err(unbuilt("migrate_legacy")) }
+
+    // THESE TWO CANNOT FAIL CLOSED, and that is a property of the signature rather
+    // than a choice made here: `-> usize` has no error channel, so an unbuilt
+    // implementation can only return a number. 0 is the honest count and the
+    // dangerous one — "merged nothing" and "cannot merge" are the same value, which
+    // is the absence-as-success this repo refuses everywhere else. Panicking is the
+    // only way to keep them distinguishable until the signature carries a Result.
+    fn run_merge_pass(&self, _user_id: &str, _limit: usize) -> usize {
+        unimplemented!("redb run_merge_pass is not built; returning 0 would be indistinguishable from a pass that merged nothing")
+    }
+    fn gc_merge_tombstones(&self, _user_id: &str) -> usize {
+        unimplemented!("redb gc_merge_tombstones is not built; returning 0 would be indistinguishable from a sweep that found no tombstones")
+    }
+
     fn backend(&self) -> StorageBackend {
         StorageBackend::Redb
     }
