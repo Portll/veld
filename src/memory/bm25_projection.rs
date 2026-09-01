@@ -685,6 +685,8 @@ mod tests {
     struct NoopEmbedder;
 
     impl crate::embeddings::Embedder for NoopEmbedder {
+        fn id(&self) -> &str { "stub-noop" }
+
         fn encode(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             // Reranking is disabled in these tests, so this is never invoked.
             // Returning a fixed zero vector keeps the implementation total

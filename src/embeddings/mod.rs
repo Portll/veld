@@ -168,6 +168,16 @@ pub trait Embedder: Send + Sync {
     /// Get embedding dimension
     fn dimension(&self) -> usize;
 
+    /// Which embedder this IS, as the canonical id `load_embedder_by_id` accepts.
+    ///
+    /// Required, not defaulted. The trait could report an embedder's SHAPE and not
+    /// its identity, which is why the corpus migration below could only key on
+    /// dimension — and two different models at the same dimension are the case that
+    /// matters, because that is when the marker matches and the migration
+    /// short-circuits over a corpus embedded by something else. A default here
+    /// would let the next embedder be anonymous and reopen exactly that hole.
+    fn id(&self) -> &str;
+
     /// Encode text as a *query* embedding (retrieval side).
     ///
     /// Asymmetric models (e.g. Nomic, which prepends `search_query: `) override

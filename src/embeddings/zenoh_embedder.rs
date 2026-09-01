@@ -332,6 +332,8 @@ impl ZenohEmbedder {
 
 #[cfg(feature = "zenoh")]
 impl Embedder for ZenohEmbedder {
+    fn id(&self) -> &str { "zenoh" }
+
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.query_peer(&[text])?;
         embeddings

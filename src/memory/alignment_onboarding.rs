@@ -233,6 +233,7 @@ mod tests {
     }
 
     impl Embedder for StubEmbedder {
+        fn id(&self) -> &str { "stub-onboarding" }
         fn encode(&self, text: &str) -> Result<Vec<f32>> {
             let seed = text.len() as f32 + 1.0;
             let mut v = vec![0.0f32; self.dim];

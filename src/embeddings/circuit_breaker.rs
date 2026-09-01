@@ -308,6 +308,10 @@ impl ResilientEmbedder {
 }
 
 impl Embedder for ResilientEmbedder {
+    // Delegates: a breaker around minilm is still minilm, and reporting the
+    // wrapper would make the corpus marker change when only resilience did.
+    fn id(&self) -> &str { self.inner.id() }
+
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
         self.encode_with_status(text).map(|(embedding, _)| embedding)
     }
