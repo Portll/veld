@@ -71,6 +71,152 @@ pub struct AuditLogEntry {
     pub details: String,
 }
 
+/// A column family by NAME rather than by handle. The handle types are
+/// backend-specific (`rocksdb::ColumnFamily` has no redb counterpart), so a
+/// batch that has to survive the cutover can only carry names.
+pub type CfName = String;
+
+/// One deferred write. `cf: None` means the backend's default keyspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOp {
+    Put {
+        cf: Option<CfName>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        cf: Option<CfName>,
+        key: Vec<u8>,
+    },
+}
+
+/// A backend-agnostic atomic write set.
+///
+/// **DB-scoped, not store-scoped, and that was not the obvious answer.** Both
+/// `KeyValueStore` implementations are already bound to a single column family
+/// — `RocksDbColumnFamilyStore` routes every operation through its own `cf()`
+/// and `RedbKeyValueStore` binds one table — so hanging `write_batch` off
+/// `KeyValueStore` looks natural and needs no per-op `cf` field at all.
+///
+/// It cannot express what `src/memory/prospective.rs:298` and `:382` already
+/// do: both write `index_cf` and `tasks_cf` in ONE batch. A store-scoped batch
+/// would force those into two batches, turning an atomic cross-family update
+/// into two updates with a window between them — and nothing at the call site
+/// would look any different. So the handle is DB-scoped, and
+/// `StorageCapabilities::supports_transactional_batch` means "atomic ACROSS
+/// column families", because that is the property those sites depend on. A
+/// version quietly meaning "atomic within one family" would be true, useless,
+/// and indistinguishable from the real thing where it matters.
+///
+/// Measured 2026-09-01 over `src/`: 54 `put_cf` + 52 `delete_cf` against 15
+/// `put` + 12 `delete`, so 80% of batch operations are column-family scoped.
+/// Batch and column-family are not independent extensions that could be done in
+/// either order — batch requires CF.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteBatch {
+    ops: Vec<BatchOp>,
+}
+
+impl WriteBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.ops.push(BatchOp::Put {
+            cf: None,
+            key: key.into(),
+            value: value.into(),
+        });
+    }
+
+    pub fn put_cf(
+        &mut self,
+        cf: impl Into<CfName>,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+    ) {
+        self.ops.push(BatchOp::Put {
+            cf: Some(cf.into()),
+            key: key.into(),
+            value: value.into(),
+        });
+    }
+
+    pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
+        self.ops.push(BatchOp::Delete {
+            cf: None,
+            key: key.into(),
+        });
+    }
+
+    pub fn delete_cf(&mut self, cf: impl Into<CfName>, key: impl Into<Vec<u8>>) {
+        self.ops.push(BatchOp::Delete {
+            cf: Some(cf.into()),
+            key: key.into(),
+        });
+    }
+
+    /// Covers the 7 `batch.is_empty()` call sites in `src/`.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn ops(&self) -> &[BatchOp] {
+        &self.ops
+    }
+
+    /// Every distinct column family this batch touches, `None` excluded.
+    /// Backends resolve these BEFORE applying anything — see `write_batch`.
+    pub fn column_families(&self) -> Vec<&str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for op in &self.ops {
+            let cf = match op {
+                BatchOp::Put { cf, .. } | BatchOp::Delete { cf, .. } => cf.as_deref(),
+            };
+            if let Some(name) = cf {
+                if !seen.contains(&name) {
+                    seen.push(name);
+                }
+            }
+        }
+        seen
+    }
+}
+
+/// Applies a [`WriteBatch`] atomically across column families.
+///
+/// Separate from the per-store traits on purpose: the atomicity that call sites
+/// depend on is a property of the DATABASE, and a trait hung off a single store
+/// cannot promise it.
+///
+/// Implementors MUST resolve every column family named by the batch before
+/// applying any operation. Resolving as they go would apply a prefix and then
+/// fail on an unknown name, which is exactly the partial write the capability
+/// flag says cannot happen.
+///
+/// **Deliberately absent from [`StorageFactory`], and this is a constraint
+/// rather than an omission.** Every other store here is opened by path, and the
+/// obvious next step is `open_batch_writer(&self, path: &Path)`. It would be
+/// wrong: a batch has to be atomic *with respect to the stores it writes
+/// through*, so it must share their already-open database handle, and opening
+/// the path a second time does not merely duplicate a handle — it fails on the
+/// store lock. Observed on this tree: a second opener dies on
+/// `IO error: While lock file: …/shared/LOCK`. Construct a writer FROM a live
+/// handle (`RocksDbBatchWriter::new(db)`, `RedbBatchWriter::new(database)`),
+/// never from a path.
+pub trait BatchWriter: Send + Sync {
+    fn backend(&self) -> StorageBackend;
+
+    /// Apply all ops or none. An unknown column family is an error and writes
+    /// nothing.
+    fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
+}
+
 /// Generic key-value operations for shared secondary stores.
 pub trait KeyValueStore: Send + Sync {
     fn backend(&self) -> StorageBackend;
@@ -165,10 +311,11 @@ pub trait StorageFactory: Send + Sync {
 }
 
 pub use legacy_rocksdb::{
-    RocksDbBackupStore, RocksDbGraphStore, RocksDbPrimaryMemoryStore, RocksDbStorageFactory,
+    RocksDbBackupStore, RocksDbBatchWriter, RocksDbGraphStore, RocksDbPrimaryMemoryStore,
+    RocksDbStorageFactory,
 };
 #[cfg(feature = "storage-redb")]
-pub use redb::RedbStorageFactory;
+pub use redb::{RedbBatchWriter, RedbStorageFactory};
 
 #[cfg(test)]
 mod tests {
@@ -188,6 +335,60 @@ mod tests {
         assert!(!capabilities.default_target);
         assert!(capabilities.legacy_compatibility);
         assert!(capabilities.supports_prefix_scan);
+    }
+
+    #[test]
+    fn a_batch_carries_the_column_family_each_op_named() {
+        let mut b = WriteBatch::new();
+        b.put_cf("index", b"k1".to_vec(), b"v1".to_vec());
+        b.delete_cf("tasks", b"k2".to_vec());
+        b.put(b"k3".to_vec(), b"v3".to_vec());
+
+        assert_eq!(b.len(), 3);
+        assert!(!b.is_empty());
+        // The default keyspace is not a column family and must not appear here,
+        // or a backend would try to resolve a handle for it.
+        assert_eq!(b.column_families(), vec!["index", "tasks"]);
+    }
+
+    #[test]
+    fn an_empty_batch_is_empty_and_names_nothing() {
+        let b = WriteBatch::new();
+        assert!(b.is_empty());
+        assert_eq!(b.len(), 0);
+        assert!(b.column_families().is_empty());
+        // Asserted because 7 call sites branch on is_empty() to skip the write
+        // entirely; a batch that reported non-empty here would turn those into
+        // writes of nothing.
+    }
+
+    #[test]
+    fn the_multi_family_case_the_api_shape_exists_for() {
+        // src/memory/prospective.rs:298 and :382 write index_cf and tasks_cf in
+        // ONE batch. A store-scoped batch cannot express this, which is the
+        // whole reason BatchWriter hangs off the database. Measured 2026-09-01:
+        // 2 such blocks in src/, both in prospective.rs.
+        let mut b = WriteBatch::new();
+        b.put_cf("index", b"i".to_vec(), b"1".to_vec());
+        b.put_cf("tasks", b"t".to_vec(), b"1".to_vec());
+        assert_eq!(
+            b.column_families().len(),
+            2,
+            "if this is ever 1, the batch has been collapsed onto a single \
+             family and the atomic cross-family update has become two writes"
+        );
+    }
+
+    #[test]
+    fn column_families_deduplicates_but_keeps_first_appearance_order() {
+        let mut b = WriteBatch::new();
+        b.put_cf("b", b"1".to_vec(), b"x".to_vec());
+        b.put_cf("a", b"2".to_vec(), b"x".to_vec());
+        b.delete_cf("b", b"3".to_vec());
+        // Deterministic: same input, same order out. Backends resolve handles
+        // from this list, and a set with unstable iteration order would make a
+        // resolution FAILURE report a different family run to run.
+        assert_eq!(b.column_families(), vec!["b", "a"]);
     }
 
     #[test]
