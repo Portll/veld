@@ -149,6 +149,62 @@ bindgen. Use `./scripts/cargo-dev.sh` (it sources `scripts/setup-libclang-env.sh
 ~9m10s, dominated by rocksdb. **Removing that toolchain from the default build is the actual payoff
 of this whole migration**, and it only arrives at R-3 — after A and B.
 
+## A's shape is decided, and not by the obvious answer
+
+Measured after the handoff was first written, before implementing anything.
+
+**What the batch API has to carry.** Every `rocksdb::WriteBatch` operation in `src/`:
+
+    71  batch.put_cf(...)     column-family scoped
+    53  batch.delete_cf(...)  column-family scoped
+    15  batch.put(...)
+    12  batch.delete(...)
+     7  batch.is_empty()
+     1  batch.iter()
+    42  db.write(batch)   +  8  db.write_opt(...)
+
+**82% of batch operations are column-family scoped.** Batch and column-family are therefore not two
+independent extensions that can be done in either order — batch requires CF.
+
+**The obvious API is wrong, and here is the measurement that says so.** Both `KeyValueStore`
+implementations are ALREADY scoped to a single column family: `RocksDbColumnFamilyStore` holds one
+`cf` and routes every operation through `self.cf()?` (`legacy_rocksdb.rs:231-247`), and
+`RedbKeyValueStore` binds one `KV_TABLE` (`redb.rs:481-493`). So hanging `write_batch` off
+`KeyValueStore` looks natural — the store already knows its CF, and no per-op CF field is needed.
+
+That shape cannot express what 4 call sites already do:
+
+    src/memory/prospective.rs:298         index_cf + tasks_cf in one batch
+    src/memory/prospective.rs:382         index_cf + tasks_cf in one batch
+    src/memory/sleep_time/supersession.rs:204
+    src/memory/todos.rs:274
+
+31 batch blocks were examined: 27 single-CF, **4 multi-CF**. Those four write across column families
+atomically. A store-scoped batch would force them into two separate batches — which is not the same
+program. It would turn an atomic cross-CF update into two updates with a window between them, and
+nothing at the call site would look different.
+
+**So the batch handle must be DB-scoped, not store-scoped**, and `StorageCapabilities::
+supports_transactional_batch` must mean "atomic ACROSS column families", because that is the
+property those four sites depend on. A version that quietly means "atomic within one CF" would be
+true, useless, and indistinguishable from the real thing at the call site.
+
+Suggested shape, for whoever implements A:
+
+    pub enum BatchOp { Put { cf: Option<CfName>, key: Vec<u8>, value: Vec<u8> },
+                       Delete { cf: Option<CfName>, key: Vec<u8> } }
+    pub struct WriteBatch { ops: Vec<BatchOp> }   // is_empty()/len() cover the 7 is_empty() calls
+
+    // on a DB-scoped handle, NOT on KeyValueStore:
+    fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
+
+The one test that makes the capability flag mean something: a batch whose second op must fail leaves
+the FIRST op unapplied. Assert it per backend. Without that, `supports_transactional_batch: true`
+stays what it is today — a declaration with nothing behind it, which is the habit named below.
+
+`batch.iter()` (1 call site) is the only operation this shape does not cover. Find it before
+committing to the design.
+
 ## The pattern worth naming
 
 Three independent instances found in one sweep of a declaration written before its wiring:
