@@ -630,20 +630,84 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         txn.commit()?;
         Ok(count)
     }
-    fn cleanup_corrupted(&self) -> Result<usize> { Err(unbuilt("cleanup_corrupted")) }
-    fn migrate_legacy(&self) -> Result<(usize, usize, usize)> { Err(unbuilt("migrate_legacy")) }
-
-    // THESE TWO CANNOT FAIL CLOSED, and that is a property of the signature rather
-    // than a choice made here: `-> usize` has no error channel, so an unbuilt
-    // implementation can only return a number. 0 is the honest count and the
-    // dangerous one — "merged nothing" and "cannot merge" are the same value, which
-    // is the absence-as-success this repo refuses everywhere else. Panicking is the
-    // only way to keep them distinguishable until the signature carries a Result.
-    fn run_merge_pass(&self, _user_id: &str, _limit: usize) -> usize {
-        unimplemented!("redb run_merge_pass is not built; returning 0 would be indistinguishable from a pass that merged nothing")
+    fn cleanup_corrupted(&self) -> Result<usize> {
+        // NO SKIP-PREFIX ALLOWLIST HERE, and that is a structural difference rather
+        // than an omission. rocksdb walks the default column family, which fifteen
+        // other subsystems share — facts, temporal facts, lineage, learning, geo,
+        // vector mappings, interference — so it carries a 15-entry allowlist to
+        // avoid deleting legitimate non-memory rows it cannot decode as a Memory.
+        // redb keeps those in DEFAULT_TABLE and memories in MEMORIES_TABLE, so this
+        // scan cannot reach them and an allowlist would protect nothing.
+        //
+        // The condition that makes it safe is therefore "MEMORIES_TABLE holds only
+        // memories", not "this list is complete" — so it is asserted rather than
+        // assumed: a key that is not a 16-byte UUID is left ALONE and reported,
+        // because it is evidence the invariant has broken and deleting it would
+        // destroy whatever put it there.
+        let txn = self.database.begin_write()?;
+        let mut deleted = 0usize;
+        let mut foreign = 0usize;
+        {
+            let mut table = txn.open_table(MEMORIES_TABLE)?;
+            let doomed: Vec<Vec<u8>> = table
+                .iter()?
+                .filter_map(|r| r.ok())
+                .filter_map(|(k, v)| {
+                    let key = k.value().to_vec();
+                    if key.len() != 16 {
+                        foreign += 1;
+                        return None;
+                    }
+                    decode::<Memory>(v.value()).err().map(|_| key)
+                })
+                .collect();
+            for key in doomed {
+                let _ = table.remove(key.as_slice())?;
+                deleted += 1;
+            }
+        }
+        txn.commit()?;
+        if foreign > 0 {
+            tracing::error!(foreign,
+                "MEMORIES_TABLE holds keys that are not 16-byte memory ids — left in place. \
+                 Something is writing non-memory rows into the memories table, which is the \
+                 invariant this cleanup relies on to be safe without an allowlist.");
+        }
+        Ok(deleted)
     }
-    fn gc_merge_tombstones(&self, _user_id: &str) -> usize {
-        unimplemented!("redb gc_merge_tombstones is not built; returning 0 would be indistinguishable from a sweep that found no tombstones")
+    fn migrate_legacy(&self) -> Result<(usize, usize, usize)> {
+        // redb has no legacy envelope: this backend was written against the current
+        // format, so nothing here can be a v1 record needing re-encoding. Returning
+        // (0, 0, 0) would be the easy answer and a false one — it reads as "no
+        // records" rather than "no records needing migration". So it COUNTS, and
+        // reports what it found: everything decodable is already current, and
+        // anything that will not decode is reported as failed rather than ignored,
+        // which is what cleanup_corrupted exists to act on.
+        let mut already_current = 0usize;
+        let mut failed = 0usize;
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(MEMORIES_TABLE)?;
+        for row in table.iter()? {
+            let (k, v) = row?;
+            if k.value().len() != 16 {
+                continue;
+            }
+            match decode::<Memory>(v.value()) {
+                Ok(_) => already_current += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        Ok((0, already_current, failed))
+    }
+
+    // These carried `-> usize` and had to PANIC to stay honest, because 0 would have
+    // made "merged nothing" and "cannot merge" the same answer. The trait now returns
+    // Result, so they refuse like everything else and a caller can handle it.
+    fn run_merge_pass(&self, _user_id: &str, _limit: usize) -> Result<usize> {
+        Err(unbuilt("run_merge_pass"))
+    }
+    fn gc_merge_tombstones(&self, _user_id: &str) -> Result<usize> {
+        Err(unbuilt("gc_merge_tombstones"))
     }
 
     fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
