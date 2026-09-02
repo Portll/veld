@@ -134,6 +134,12 @@ impl ColumnStore for RocksDbColumnStore {
         Ok(())
     }
 
+    fn ensure_cf(&self, cf: &str) -> Result<()> {
+        // Verification, not creation: rocksdb families come from the open-time
+        // descriptors, so a missing one here is a wiring error to fail on now.
+        self.cf(cf).map(|_| ())
+    }
+
     fn scan_cf(
         &self,
         cf: &str,

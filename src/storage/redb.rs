@@ -162,6 +162,19 @@ impl ColumnStore for RedbColumnStore {
         Ok(())
     }
 
+    fn ensure_cf(&self, cf: &str) -> Result<()> {
+        // Materialization, not verification: redb tables are lazy, and a family
+        // whose first touch is a read or a batched write would otherwise hit
+        // TableDoesNotExist. Same move RedbKeyValueStore::open makes for `kv`.
+        let txn = self.database.begin_write()?;
+        {
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+            txn.open_table(def)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()> {
         let txn = self.database.begin_write()?;
         {

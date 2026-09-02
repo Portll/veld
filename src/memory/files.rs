@@ -31,10 +31,11 @@ pub struct FileMemoryStore {
     /// Two families — CF_FILES and CF_FILE_INDEX — so this takes the multi-family
     /// handle rather than a KeyValueStore bound to one.
     store: Arc<dyn crate::storage::ColumnStore>,
-    /// Kept ONLY for the one-time migration below, which opens a second read-only
-    /// rocksdb and copies rows across. That is a rocksdb-to-rocksdb import, not a
-    /// store operation, and it has no meaning on another backend.
-    db: Arc<DB>,
+    /// Present ONLY when rocksdb-backed: the one-time migration below opens a
+    /// second read-only rocksdb and copies rows across (a rocksdb-to-rocksdb
+    /// import), and the backup accessor hands the engine DB out. A store built
+    /// over another backend has no engine DB to hold.
+    db: Option<Arc<DB>>,
     /// Default configuration
     config: CodebaseConfig,
 }
@@ -69,7 +70,22 @@ impl FileMemoryStore {
             store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(
                 Arc::clone(&db),
             )),
-            db,
+            db: Some(db),
+            config: CodebaseConfig::default(),
+        })
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    /// Skips migrate_from_separate_dbs, a rocksdb-to-rocksdb import with no
+    /// meaning on another backend.
+    pub fn with_store(store: Arc<dyn crate::storage::ColumnStore>) -> Result<Self> {
+        for cf in [CF_FILES, CF_FILE_INDEX] {
+            store.ensure_cf(cf)?;
+        }
+        tracing::info!("File memory store initialized");
+        Ok(Self {
+            store,
+            db: None,
             config: CodebaseConfig::default(),
         })
     }
@@ -145,9 +161,16 @@ impl FileMemoryStore {
         Ok(())
     }
 
-    /// Get references to all RocksDB databases for backup
+    /// Get references to all RocksDB databases for backup.
+    ///
+    /// Empty when not rocksdb-backed: there is no engine DB to hand a rocksdb
+    /// backup engine, and pretending otherwise is how a backup omits a store
+    /// while reporting success.
     pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![("files_shared", &self.db)]
+        match &self.db {
+            Some(db) => vec![("files_shared", db)],
+            None => Vec::new(),
+        }
     }
 
     // =========================================================================
@@ -1222,6 +1245,49 @@ mod tests {
         let db = Arc::new(DB::open_cf_descriptors(&opts, &db_path, cfs).unwrap());
         let store = FileMemoryStore::new(db, temp_dir.path()).unwrap();
         (store, temp_dir)
+    }
+
+    #[test]
+    fn test_with_store_redb_round_trip() {
+        // The point of with_store: the same store logic over the other backend.
+        let temp_dir = TempDir::new().unwrap();
+        let redb_db = crate::storage::redb::create_redb_database_for_test(
+            &temp_dir.path().join("files.redb"),
+        )
+        .unwrap();
+        let store = FileMemoryStore::with_store(Arc::new(
+            crate::storage::redb::RedbColumnStore::new(redb_db),
+        ))
+        .unwrap();
+
+        let project_id = ProjectId::new();
+        let file = FileMemory::new(
+            project_id.clone(),
+            "test-user".to_string(),
+            "src/main.rs".to_string(),
+            "/home/user/project/src/main.rs".to_string(),
+            "abc123".to_string(),
+            FileType::Rust,
+            100,
+            5000,
+        );
+
+        store.store(&file).unwrap();
+        assert_eq!(
+            store.get("test-user", &file.id).unwrap().unwrap().path,
+            "src/main.rs"
+        );
+        // get_by_path exercises the index family; list exercises the scan path.
+        assert!(store
+            .get_by_path("test-user", &project_id, "src/main.rs")
+            .unwrap()
+            .is_some());
+        assert_eq!(store.list_by_user("test-user", None).unwrap().len(), 1);
+        assert!(store.delete("test-user", &file.id).unwrap());
+        assert!(store.get("test-user", &file.id).unwrap().is_none());
+        assert!(store.list_by_user("test-user", None).unwrap().is_empty());
+        // No engine DB behind this store — the backup accessor must say so.
+        assert!(store.databases().is_empty());
     }
 
     #[test]
