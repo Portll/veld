@@ -42,6 +42,47 @@ The `BackupStore` three are the whole difficulty: rocksdb's is
 have to be rebuilt on portable export/import — which now exists. Everything else is
 either mechanical or already answered by design.
 
+## THE TRAITS WERE NEVER THE BOTTLENECK — measured 2026-09-02
+
+redb reached 66/69 on the storage traits tonight. That is not the distance to live,
+and treating it as the headline is the mistake this section exists to prevent.
+
+**What the shared-store bootstrap actually needs.** `handlers/state.rs:721` builds a
+bundle for a user, and five of its members are not in the trait set at all:
+
+    ContextBlockStore    src/memory/context_blocks.rs    holds a db field
+    FileMemoryStore      src/memory/files.rs             holds a db field
+    ProspectiveStore     src/memory/prospective.rs       holds a db field
+    TodoStore            src/memory/todos.rs             holds a db field
+    FeedbackStore        src/memory/feedback.rs          (shared-db variant)
+
+None has a redb implementation, and none is reachable through `StorageFactory`.
+`redb.rs` defines eight store types; not one of these is among them. So the 69-method
+trait surface is complete-ish while the bootstrap still cannot be satisfied.
+
+**The other three arms, and why one of them is B.**
+
+- `state.rs:1028` calls `UserMemory::with_storage_and_bm25_index(config,
+  Arc::new(primary_store.into_inner()), …)` — the concrete type, via `into_inner()`.
+  redb literally cannot be passed. **This arm IS B**, and it cannot be wired before
+  the field flip.
+- `state.rs:3030` / `:3182` are backup create and restore, calling
+  `create_comprehensive_backup_with_staged_intent_log`. redb now has a working
+  `BackupStore` (4/4), but it is NOT comprehensive — no secondary stores, no intent
+  log. Wiring the simple one into the comprehensive call site would be `4d1ec01`
+  again: a backup that omitted a store reporting success.
+
+**The dependency chain, in the only order that works:**
+
+    secondary stores get traits + redb impls   ─┐
+    backup path expressed without get_db()     ─┤
+                                                ├→ B (field flip, state.rs:1028)
+                                                └→ R-5 (the 9 arms) → R-4 → selectable
+
+**`rocksdb::` refs outside `src/storage/`: 191 at the start of this work, 150 now.**
+That figure is the R-3 headline and it moves slowly on purpose — every one of the 41
+removed came with a behaviour check, not a type substitution.
+
 ## What landed
 
 **`6fc3eee` — R-1.** Corrects the `Cargo.toml` note that said "138 source refs to cfg-gate". Measured
