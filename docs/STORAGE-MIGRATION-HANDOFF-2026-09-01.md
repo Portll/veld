@@ -273,27 +273,32 @@ redb's 5 tests (`src/storage/redb.rs:541-887`) all run against **fresh temp data
 rocksdb-written data, none tests concurrency or crash recovery, none approaches this scale. Anything
 that wires redb into production is trusting unit round-trips on empty stores.
 
-## The test suite segfaults on exit, intermittently, and it PREDATES this work
+## The exit segfault: FIXED, and my first diagnosis was wrong
 
-`cargo test --lib memory::` runs all 700 tests green and then the process dies with
-`signal: 11, SIGSEGV` — after `test result: ok`, so it is a teardown crash, not a
-failing test.
+`cargo test --lib memory::` ran 700 green then died with SIGSEGV on ~half of parallel
+runs. Fixed 2026-09-02; five consecutive runs clean.
 
-**Flaky, and not caused by the storage work.** Measured 2026-09-02: two runs at HEAD
-gave exit 0 and exit 101; two runs in a detached worktree at `85dbc52` — the commit
-before the first change in this programme — gave exit 101 and exit 0. Same behaviour
-on both sides, so it is pre-existing.
+**It was never rocksdb.** This section previously read "consistent with many rocksdb
+instances being dropped at process exit" — an inference from "many DBs, dies at exit",
+written before anyone looked. The macOS crash report names the actual thread:
 
-Each module alone is clean (`memory::storage`, `memory::mod`, `memory::merge`,
-`memory::files`, `memory::todos`, `memory::prospective` all exit 0), so it needs the
-whole set — consistent with many rocksdb instances being dropped at process exit.
+    cross-encoder-prewarm-mxbai-rerank-xsmall-v1
+    EXC_BAD_ACCESS, KERN_INVALID_ADDRESS at 0x17
+    libonnxruntime: OrtApis::CreateSession → InferenceSession::Initialize
 
-**Why it is written down rather than shrugged at.** A flaky segfault after a green
-run is the ideal shape for a wrong attribution: the next person to touch storage will
-see `CARGO_EXIT=101` on their change and assume they broke something, and a filtered
-run of their own module will pass, which looks like they fixed it. Both readings are
-wrong. Check the summary line before the exit code — `test result: ok` with a
-non-zero exit is this, not a failure — and re-run before believing it.
+`CrossEncoder::prewarm` spawns a DETACHED thread — `.spawn(…).ok()` drops the
+JoinHandle, nothing joins it. A server runs for hours and the pre-warm finishes; a
+test binary exits seconds after start and tears down mid-CreateSession.
+
+`prewarm` now returns early under `cfg!(test)`. Skipped rather than joined: a
+pre-warm you wait for is not a pre-warm, and `ensure_loaded()` is there for a caller
+that genuinely needs the model.
+
+**Worth keeping as a method note.** Three cheap steps, in order: single-threaded runs
+were 3/3 clean (a race, not a deterministic bug); a base worktree at `85dbc52`
+reproduced it (not this programme's work); the crash report named the frame (not the
+subsystem I had assumed). The third step is the one that mattered, and it was
+available from the start — `~/Library/Logs/DiagnosticReports/`.
 
 ## Build note
 
