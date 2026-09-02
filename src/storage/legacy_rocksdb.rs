@@ -182,26 +182,36 @@ impl ColumnStore for RocksDbColumnStore {
 }
 
 /// Trait adapter for the current RocksDB-backed primary memory store.
+///
+/// Holds the storage by Arc: MemorySystem's constructor receives a SHARED
+/// Arc<MemoryStorage> (the BM25 projection and retrieval engine hold the same
+/// one), so an owned inner would force a second store over the same files.
 pub struct RocksDbPrimaryMemoryStore {
-    inner: MemoryStorage,
+    inner: Arc<MemoryStorage>,
 }
 
 impl RocksDbPrimaryMemoryStore {
     pub fn open(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
         Ok(Self {
-            inner: MemoryStorage::new(path, shared_cache)?,
+            inner: Arc::new(MemoryStorage::new(path, shared_cache)?),
         })
     }
 
-    pub fn from_inner(inner: MemoryStorage) -> Self {
+    pub fn from_arc(inner: Arc<MemoryStorage>) -> Self {
         Self { inner }
+    }
+
+    pub fn from_inner(inner: MemoryStorage) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     pub fn inner(&self) -> &MemoryStorage {
         &self.inner
     }
 
-    pub fn into_inner(self) -> MemoryStorage {
+    pub fn into_inner(self) -> Arc<MemoryStorage> {
         self.inner
     }
 }
@@ -328,6 +338,32 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
 
     fn flush(&self) -> Result<()> {
         self.inner.flush()
+    }
+
+    // ── The eight the long_term_memory flip surfaced — same pure forwarding.
+    fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
+        self.inner.get_by_content_hash(content)
+    }
+    fn update_access(&self, id: &MemoryId) -> Result<()> {
+        self.inner.update_access(id)
+    }
+    fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<Vec<MemoryId>> {
+        self.inner.mark_forgotten_by_importance(threshold)
+    }
+    fn save_interference_event_count(&self, count: usize) -> Result<()> {
+        self.inner.save_interference_event_count(count)
+    }
+    fn get_fact_watermark(&self, user_id: &str) -> Option<i64> {
+        self.inner.get_fact_watermark(user_id)
+    }
+    fn set_fact_watermark(&self, user_id: &str, timestamp_millis: i64) {
+        self.inner.set_fact_watermark(user_id, timestamp_millis)
+    }
+    fn key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
+        self.inner.key_value_store()
+    }
+    fn default_key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
+        self.inner.default_key_value_store()
     }
 }
 

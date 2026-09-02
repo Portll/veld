@@ -1031,7 +1031,7 @@ impl MultiUserMemoryManager {
 
                 UserMemory::with_storage_and_bm25_index(
                     config,
-                    Arc::new(primary_store.into_inner()),
+                    primary_store.into_inner(),
                     bm25_index,
                 )
             }
