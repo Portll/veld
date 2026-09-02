@@ -930,6 +930,32 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
     //    in their signatures, so an unbuilt() stub could not even fail loudly —
     //    it would BE the absence-as-success this file refuses everywhere else.
 
+    fn get_all_vector_mappings(&self) -> Result<Vec<(MemoryId, VectorMappingEntry)>> {
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(VMAPPINGS_TABLE)?;
+        let mut mappings = Vec::new();
+        for row in table.iter()? {
+            let (k, v) = row?;
+            let key = k.value();
+            if key.len() == 16 {
+                let bytes: [u8; 16] = key.try_into().expect("checked len");
+                mappings.push((
+                    MemoryId(uuid::Uuid::from_bytes(bytes)),
+                    decode::<VectorMappingEntry>(v.value())?,
+                ));
+            }
+        }
+        Ok(mappings)
+    }
+
+    fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()> {
+        // Mirror of MemoryStorage::update_modality_vectors for Text: load the
+        // existing entry so other modalities survive, then write it back.
+        let mut entry = self.get_vector_mapping(memory_id)?.unwrap_or_default();
+        entry.add_modality(crate::memory::storage::Modality::Text, vector_ids);
+        self.put_vector_mapping(memory_id, &entry)
+    }
+
     fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         // rocksdb answers from a content-hash index; redb has no such index yet,
         // so this scans and compares. Correct-if-slow, and the same answer:

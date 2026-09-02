@@ -356,6 +356,12 @@ pub trait PrimaryMemoryStore: Send + Sync {
     fn delete_memory(&self, id: &MemoryId) -> Result<()>;
     fn search(&self, criteria: SearchCriteria) -> Result<Vec<Memory>>;
     fn get_vector_mapping(&self, id: &MemoryId) -> Result<Option<VectorMappingEntry>>;
+    /// Every mapping at once — the retrieval engine's index rebuild reads the
+    /// whole set, and this was its last reason to hold the concrete store.
+    fn get_all_vector_mappings(&self) -> Result<Vec<(MemoryId, VectorMappingEntry)>>;
+    /// Replace the TEXT-modality vectors for one memory, preserving other
+    /// modalities — the write half of the retrieval engine's index maintenance.
+    fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()>;
     fn put_vector_mapping(&self, id: &MemoryId, mapping: &VectorMappingEntry) -> Result<()>;
     fn delete_vector_mapping(&self, id: &MemoryId) -> Result<()>;
     fn flush(&self) -> Result<()>;
@@ -641,7 +647,7 @@ mod backend_coverage_matrix {
         )
     }
 
-    /// Calls all 41 trait methods and returns (name, outcome), sorted.
+    /// Calls all 43 trait methods and returns (name, outcome), sorted.
     fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
         let m = a_memory();
         let id = m.id.clone();
@@ -681,6 +687,8 @@ mod backend_coverage_matrix {
             // The eight surfaced by the long_term_memory flip. The KV probes
             // exercise the handle they get back, not just its construction —
             // a handle over the wrong keyspace constructs fine.
+            ("get_all_vector_mappings",       probe(|| s.get_all_vector_mappings())),
+            ("update_vector_mapping",         probe(|| s.update_vector_mapping(&id, vec![1]))),
             ("get_by_content_hash",           probe(|| Ok::<_, anyhow::Error>(s.get_by_content_hash("probe")))),
             ("update_access",                 probe(|| s.update_access(&id))),
             ("mark_forgotten_by_importance",  probe(|| s.mark_forgotten_by_importance(0.0))),
@@ -714,7 +722,7 @@ mod backend_coverage_matrix {
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
-        assert_eq!(r.len(), 41, "the matrix must cover every trait method");
+        assert_eq!(r.len(), 43, "the matrix must cover every trait method");
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
@@ -723,13 +731,13 @@ mod backend_coverage_matrix {
             .filter(|((_, ro), (_, bo))| *ro == Outcome::Works && *bo != Outcome::Works)
             .map(|((n, _), _)| *n).collect();
 
-        eprintln!("COVERAGE  rocksdb {rocks_ok}/41   redb {redb_ok}/41   gap {}", gap.len());
+        eprintln!("COVERAGE  rocksdb {rocks_ok}/43   redb {redb_ok}/43   gap {}", gap.len());
         for name in &gap { eprintln!("  redb missing: {name}"); }
 
         // The direction that matters: redb must never be ahead in a way that hides a
         // rocksdb regression, and the gap list must be exactly what is claimed.
         assert!(rocks_ok >= redb_ok, "redb reports more working methods than rocksdb — check the probe, not the backends");
-        assert_eq!(gap.len(), 41 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
+        assert_eq!(gap.len(), 43 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
     }
 }
 

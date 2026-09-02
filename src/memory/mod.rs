@@ -768,8 +768,14 @@ impl MemorySystem {
 
         // Pass shared embedder and event buffer to retrieval engine (no duplicate model load)
         // Event buffer allows retriever to record Hebbian edge events for introspection
+        // ONE trait object shared by the retriever and long_term_memory below —
+        // the same store, seen through the same adapter.
+        let primary: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::from_arc(storage.clone()),
+        );
         let retriever = RetrievalEngine::with_event_buffer(
-            storage.clone(),
+            primary.clone(),
+            &config.storage_path,
             embedder.clone(),
             Some(consolidation_events.clone()),
         )
@@ -995,11 +1001,7 @@ impl MemorySystem {
             session_memory: Arc::new(RwLock::new(SessionMemory::new(
                 config.session_memory_size_mb,
             ))),
-            long_term_memory: Arc::new(
-                crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::from_arc(
-                    storage.clone(),
-                ),
-            ),
+            long_term_memory: primary,
             rocksdb_backup_db: Some(storage.db()),
             compressor: CompressionPipeline::new(),
             retriever,

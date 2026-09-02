@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::introspection::ConsolidationEventBuffer;
-use super::storage::{MemoryStorage, SearchCriteria};
+use super::storage::SearchCriteria;
 use super::types::*;
 use crate::constants::{
     PREFETCH_RECENCY_FULL_BOOST, PREFETCH_RECENCY_FULL_HOURS, PREFETCH_RECENCY_PARTIAL_BOOST,
@@ -53,7 +53,7 @@ const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
 /// **Note:** Memory graph (Hebbian learning) has been consolidated into GraphMemory
 /// which is managed at the API layer (MultiUserMemoryManager.graph_memories)
 pub struct RetrievalEngine {
-    storage: Arc<MemoryStorage>,
+    storage: Arc<dyn crate::storage::PrimaryMemoryStore>,
     embedder: Arc<CompetitiveEmbedder>,
     /// Lock order: 1 - Acquire first
     vector_index: Arc<RwLock<VamanaIndex>>,
@@ -201,8 +201,12 @@ impl RetrievalEngine {
     /// - Vector mappings are stored atomically with memories in RocksDB
     /// - Vamana index is rebuilt from RocksDB on startup (pure in-memory cache)
     /// - No more file-based IdMapping = no more orphaned memories
-    pub fn new(storage: Arc<MemoryStorage>, embedder: Arc<CompetitiveEmbedder>) -> Result<Self> {
-        Self::with_event_buffer(storage, embedder, None)
+    pub fn new(
+        storage: Arc<dyn crate::storage::PrimaryMemoryStore>,
+        storage_path: &std::path::Path,
+        embedder: Arc<CompetitiveEmbedder>,
+    ) -> Result<Self> {
+        Self::with_event_buffer(storage, storage_path, embedder, None)
     }
 
     /// Create retrieval engine with event buffer for consolidation introspection
@@ -215,11 +219,14 @@ impl RetrievalEngine {
     ///
     /// ATOMIC STARTUP: Rebuilds Vamana from RocksDB mappings for crash safety.
     pub fn with_event_buffer(
-        storage: Arc<MemoryStorage>,
+        storage: Arc<dyn crate::storage::PrimaryMemoryStore>,
+        storage_path: &std::path::Path,
         embedder: Arc<CompetitiveEmbedder>,
         consolidation_events: Option<Arc<RwLock<ConsolidationEventBuffer>>>,
     ) -> Result<Self> {
-        let storage_path = storage.path().to_path_buf();
+        // The path is a PARAMETER, not a store method: where files live is an
+        // engine detail the trait deliberately does not carry.
+        let storage_path = storage_path.to_path_buf();
 
         // Initialize primary Vamana index optimized for 10M+ memories per user.
         // Dimension follows the active primary embedder (Nomic 768d / Matryoshka,
