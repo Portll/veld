@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -69,7 +69,14 @@ pub enum OccOutcome {
 
 /// Storage for agent context blocks, backed by a shared RocksDB instance.
 pub struct ContextBlockStore {
-    db: Arc<DB>,
+    /// A handle bound to CF_CONTEXT_BLOCKS, not a database.
+    ///
+    /// This store addresses ONE column family, so `KeyValueStore` is the right
+    /// surface — `ColumnStore` exists for the three that address several and would
+    /// be a wider grant than this needs. The distinction is worth keeping: a store
+    /// holding a multi-family handle can reach keyspaces it has no business in, and
+    /// nothing at a call site would show it.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl ContextBlockStore {
@@ -83,14 +90,17 @@ impl ContextBlockStore {
     }
 
     /// Create a new context block store backed by the given shared DB.
-    pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
-    fn cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_CONTEXT_BLOCKS)
-            .expect("context_blocks CF must exist in shared DB")
+    pub fn new(db: Arc<DB>) -> Self {
+        Self {
+            store: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_CONTEXT_BLOCKS),
+            ),
+        }
     }
 
     /// Build the RocksDB key for a given user + block key.
@@ -101,7 +111,7 @@ impl ContextBlockStore {
     /// Retrieve a single context block by key.
     pub fn get(&self, user_id: &str, block_key: &str) -> Result<Option<ContextBlock>> {
         let key = Self::db_key(user_id, block_key);
-        match self.db.get_cf(self.cf(), key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(data) => {
                 let (block, _): (ContextBlock, _) =
                     bincode::serde::decode_from_slice(&data, bincode::config::standard())
@@ -153,8 +163,8 @@ impl ContextBlockStore {
 
         let value = bincode::serde::encode_to_vec(&block, bincode::config::standard())
             .context("Failed to serialize context block")?;
-        self.db
-            .put_cf(self.cf(), key.as_bytes(), &value)
+        self.store
+            .put_bytes(key.as_bytes(), &value)
             .context("Failed to write context block to RocksDB")?;
 
         tracing::debug!(
@@ -216,8 +226,8 @@ impl ContextBlockStore {
 
         let value = bincode::serde::encode_to_vec(&block, bincode::config::standard())
             .context("Failed to serialize context block (OCC)")?;
-        self.db
-            .put_cf(self.cf(), key.as_bytes(), &value)
+        self.store
+            .put_bytes(key.as_bytes(), &value)
             .context("Failed to write context block to RocksDB (OCC)")?;
 
         tracing::debug!(
@@ -245,8 +255,8 @@ impl ContextBlockStore {
         let key = Self::db_key(user_id, block_key);
         let value = bincode::serde::encode_to_vec(&prev, bincode::config::standard())
             .context("Failed to serialize context block lock toggle")?;
-        self.db
-            .put_cf(self.cf(), key.as_bytes(), &value)
+        self.store
+            .put_bytes(key.as_bytes(), &value)
             .context("Failed to write context block lock toggle")?;
         tracing::info!(
             user_id = user_id,
@@ -262,17 +272,10 @@ impl ContextBlockStore {
         let prefix = format!("{user_id}:");
         let mut blocks = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.cf(), prefix.as_bytes());
-
-        for item in iter {
-            let (key, value) = item.context("Failed to iterate context blocks")?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written `starts_with` break that
+        // was here is the fourth copy of that guard removed from this codebase.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
+            let _ = &key;
 
             if let Ok((block, _)) = bincode::serde::decode_from_slice::<ContextBlock, _>(
                 &value,
@@ -290,11 +293,11 @@ impl ContextBlockStore {
     /// Delete a context block. Returns `true` if the block existed.
     pub fn delete(&self, user_id: &str, block_key: &str) -> Result<bool> {
         let key = Self::db_key(user_id, block_key);
-        let existed = self.db.get_cf(self.cf(), key.as_bytes())?.is_some();
+        let existed = self.store.get_bytes(key.as_bytes())?.is_some();
 
         if existed {
-            self.db
-                .delete_cf(self.cf(), key.as_bytes())
+            self.store
+                .delete_bytes(key.as_bytes())
                 .context("Failed to delete context block from RocksDB")?;
             tracing::debug!(
                 user_id = user_id,

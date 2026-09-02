@@ -308,7 +308,7 @@ mod trailer_tests {
     }
 
     #[test]
-    fn a_truncated_dump_is_refused_at_LIST_time_not_only_at_restore() {
+    fn a_truncated_dump_is_refused_at_list_time_not_only_at_restore() {
         // The whole reason the cheap reader still validates: finding out a backup is
         // unusable when you come to restore it is finding out too late.
         let dir = tempfile::tempdir().unwrap();
