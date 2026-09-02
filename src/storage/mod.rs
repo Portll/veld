@@ -364,6 +364,27 @@ pub trait PrimaryMemoryStore: Send + Sync {
     /// the batch has to be atomic with respect to THIS store's writes — see
     /// [`BatchWriter`], which explains why a writer cannot be opened by path.
     fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
+
+    // ── The eight methods the long_term_memory flip surfaced (2026-09-02). The
+    //    handoff said the trait already carried every method the 94 call sites
+    //    use; the compiler said otherwise — these existed only on concrete
+    //    MemoryStorage. Signatures are MemoryStorage's exactly, per the
+    //    discipline above: set_fact_watermark returns () and logs,
+    //    get_by_content_hash returns Option with no error channel, because that
+    //    is what the call sites already absorb — a stub there could not even
+    //    fail loudly, so both backends must answer for real.
+    fn get_by_content_hash(&self, content: &str) -> Option<MemoryId>;
+    fn update_access(&self, id: &MemoryId) -> Result<()>;
+    fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<Vec<MemoryId>>;
+    fn save_interference_event_count(&self, count: usize) -> Result<()>;
+    fn get_fact_watermark(&self, user_id: &str) -> Option<i64>;
+    fn set_fact_watermark(&self, user_id: &str, timestamp_millis: i64);
+    /// Backend-agnostic KV handle over the general-purpose `kv` keyspace.
+    fn key_value_store(&self) -> std::sync::Arc<dyn KeyValueStore>;
+    /// KV handle over the DEFAULT keyspace — a DIFFERENT keyspace from `kv`;
+    /// routing a default-keyspace consumer onto `kv` orphans every row it
+    /// thought it wrote (the ACL store found this the hard way).
+    fn default_key_value_store(&self) -> std::sync::Arc<dyn KeyValueStore>;
 }
 
 /// Domain interface for graph persistence.
@@ -566,7 +587,7 @@ mod backend_coverage_matrix {
         )
     }
 
-    /// Calls all 33 trait methods and returns (name, outcome), sorted.
+    /// Calls all 41 trait methods and returns (name, outcome), sorted.
     fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
         let m = a_memory();
         let id = m.id.clone();
@@ -603,6 +624,25 @@ mod backend_coverage_matrix {
             ("write_batch",                   probe(|| s.write_batch(&crate::storage::WriteBatch::new()))),
             ("run_merge_pass",                probe(|| s.run_merge_pass("u", 1))),
             ("gc_merge_tombstones",           probe(|| s.gc_merge_tombstones("u"))),
+            // The eight surfaced by the long_term_memory flip. The KV probes
+            // exercise the handle they get back, not just its construction —
+            // a handle over the wrong keyspace constructs fine.
+            ("get_by_content_hash",           probe(|| Ok::<_, anyhow::Error>(s.get_by_content_hash("probe")))),
+            ("update_access",                 probe(|| s.update_access(&id))),
+            ("mark_forgotten_by_importance",  probe(|| s.mark_forgotten_by_importance(0.0))),
+            ("save_interference_event_count", probe(|| s.save_interference_event_count(1))),
+            ("get_fact_watermark",            probe(|| Ok::<_, anyhow::Error>(s.get_fact_watermark("u")))),
+            ("set_fact_watermark",            probe(|| Ok::<_, anyhow::Error>(s.set_fact_watermark("u", 1)))),
+            ("key_value_store",               probe(|| {
+                let kv = s.key_value_store();
+                kv.put_bytes(b"matrix-probe", b"1")?;
+                kv.get_bytes(b"matrix-probe")
+            })),
+            ("default_key_value_store",       probe(|| {
+                let kv = s.default_key_value_store();
+                kv.put_bytes(b"matrix-probe-default", b"1")?;
+                kv.get_bytes(b"matrix-probe-default")
+            })),
             ("delete_memory",                 probe(|| s.delete_memory(&id))),
             ("delete",                        probe(|| s.delete(&id))),
         ];
@@ -620,7 +660,7 @@ mod backend_coverage_matrix {
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
-        assert_eq!(r.len(), 33, "the matrix must cover every trait method");
+        assert_eq!(r.len(), 41, "the matrix must cover every trait method");
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
@@ -629,13 +669,13 @@ mod backend_coverage_matrix {
             .filter(|((_, ro), (_, bo))| *ro == Outcome::Works && *bo != Outcome::Works)
             .map(|((n, _), _)| *n).collect();
 
-        eprintln!("COVERAGE  rocksdb {rocks_ok}/33   redb {redb_ok}/33   gap {}", gap.len());
+        eprintln!("COVERAGE  rocksdb {rocks_ok}/41   redb {redb_ok}/41   gap {}", gap.len());
         for name in &gap { eprintln!("  redb missing: {name}"); }
 
         // The direction that matters: redb must never be ahead in a way that hides a
         // rocksdb regression, and the gap list must be exactly what is claimed.
         assert!(rocks_ok >= redb_ok, "redb reports more working methods than rocksdb — check the probe, not the backends");
-        assert_eq!(gap.len(), 33 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
+        assert_eq!(gap.len(), 41 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
     }
 }
 
