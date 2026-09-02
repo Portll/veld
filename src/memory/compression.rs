@@ -75,6 +75,14 @@ impl CompressionPipeline {
 
     /// Select compression strategy based on memory characteristics
     fn select_strategy(&self, memory: &Memory) -> CompressionStrategy {
+        // Persistence is checked FIRST and outranks every heuristic below. Importance, age and
+        // access count are all PROXIES for "is this worth keeping"; `persistent` is the caller
+        // saying so directly, and a proxy must never overrule a statement. Default is true, so
+        // the lossy path is now opt-out rather than the fate of anything nobody scored highly.
+        if memory.persistent {
+            return CompressionStrategy::Lz4;
+        }
+
         // High importance memories get lighter compression (lossless LZ4)
         if memory.importance() > COMPRESSION_IMPORTANCE_HIGH {
             return CompressionStrategy::Lz4;
@@ -92,8 +100,12 @@ impl CompressionPipeline {
             return CompressionStrategy::Summarization;
         }
 
-        // Default to hybrid approach
-        CompressionStrategy::Hybrid
+        // Default to LOSSLESS. Hybrid runs compress_semantic first, so defaulting to it made
+        // content destruction the fate of every ordinary memory — including ones that fell
+        // through the age/importance test directly above precisely because they were NOT old
+        // and low-importance. Lossy compression is the documented exception; it must be reached
+        // by the branch that states its conditions, never by the fallthrough.
+        CompressionStrategy::Lz4
     }
 
     /// LZ4 compression - preserves all data
@@ -157,7 +169,19 @@ impl CompressionPipeline {
         let semantic = self.compress_semantic(memory)?;
 
         // Then apply LZ4 on the result
-        self.compress_lz4(&semantic)
+        let mut hybrid = self.compress_lz4(&semantic)?;
+
+        // Re-tag. compress_lz4 writes "lz4" unconditionally, which left every hybrid record —
+        // whose original was ALREADY destroyed by the semantic pass — advertising the lossless
+        // strategy. The consequences were not cosmetic: is_lossless() returned true, decompress()
+        // took the "lz4" branch and returned the 50-word summary AS the restored original, and the
+        // honest "hybrid" error below could never fire. The label has to survive the last writer.
+        hybrid
+            .experience
+            .metadata
+            .insert("compression_strategy".to_string(), "hybrid".to_string());
+
+        Ok(hybrid)
     }
 
     /// Decompress a memory
@@ -1599,6 +1623,125 @@ mod tests {
         let result = pipeline.decompress(&compressed);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("lossy"));
+    }
+
+    /// A hybrid record is LOSSY — compress_semantic destroys the original before lz4 ever runs.
+    /// It used to be tagged "lz4" because compress_lz4 writes that tag last, so it advertised the
+    /// lossless strategy while its content was already gone.
+    #[test]
+    fn test_hybrid_is_labelled_hybrid_not_lz4() {
+        let pipeline = CompressionPipeline::new();
+        let memory = create_test_memory(
+            "A long-form document whose whole value is that every word of it survives storage",
+            0.3,
+        );
+
+        let hybrid = pipeline.compress_hybrid(&memory).unwrap();
+        assert_eq!(pipeline.get_strategy(&hybrid), Some("hybrid"));
+        assert!(
+            !pipeline.is_lossless(&hybrid),
+            "a hybrid record is lossy; reporting it lossless is how a destroyed document passes for an intact one"
+        );
+    }
+
+    /// The "hybrid" arm of decompress() was unreachable while the tag said "lz4": decompress took
+    /// the lz4 branch, succeeded, and handed back the 50-word summary as the restored original.
+    #[test]
+    fn test_hybrid_decompress_refuses_instead_of_returning_the_summary() {
+        let pipeline = CompressionPipeline::new();
+        let original = "The quick brown fox jumps over the lazy dog and then keeps running \
+                        for a great many more words so the summary cannot possibly cover it";
+        let memory = create_test_memory(original, 0.3);
+
+        let hybrid = pipeline.compress_hybrid(&memory).unwrap();
+        let result = pipeline.decompress(&hybrid);
+
+        assert!(result.is_err(), "a lossy record must not decompress to a confident wrong answer");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("not recoverable"), "got: {msg}");
+    }
+
+    /// The fallthrough default decided the fate of every ordinary memory. Hybrid meant lossy.
+    #[test]
+    fn test_default_strategy_is_lossless() {
+        let pipeline = CompressionPipeline::new();
+        // Recent and mid-importance: misses the lz4 branch, the access branch and the
+        // old-AND-low-importance branch, so it lands on the default.
+        let memory = create_test_memory(
+            "Content that must survive: not old, not unimportant, not frequently accessed",
+            0.6,
+        );
+
+        assert!(matches!(
+            pipeline.select_strategy(&memory),
+            CompressionStrategy::Lz4
+        ));
+
+        let compressed = pipeline.compress(&memory).unwrap();
+        assert!(pipeline.is_lossless(&compressed));
+
+        let restored = pipeline.decompress(&compressed).unwrap();
+        assert_eq!(
+            restored.experience.content, memory.experience.content,
+            "a default-path round trip must return every byte it was given"
+        );
+    }
+
+    /// The exception still has to work — but ONLY once persistence is waived.
+    #[test]
+    fn test_old_low_importance_selects_lossy_only_when_persistence_is_waived() {
+        let pipeline = CompressionPipeline::new();
+        let mut memory = create_test_memory("Old and unimportant content here", 0.1);
+        memory.created_at = chrono::Utc::now() - chrono::Duration::days(100);
+
+        // Default: persistent, so even old + unimportant stays lossless.
+        assert!(memory.persistent, "persistence defaults ON");
+        assert!(matches!(
+            pipeline.select_strategy(&memory),
+            CompressionStrategy::Lz4
+        ));
+
+        memory.persistent = false;
+        assert!(matches!(
+            pipeline.select_strategy(&memory),
+            CompressionStrategy::Summarization
+        ));
+    }
+
+    /// Persistence outranks the heuristics. Importance/age/access are proxies for "worth keeping";
+    /// the flag is the caller saying it outright, and a proxy must not overrule a statement.
+    #[test]
+    fn test_persistent_outranks_every_lossy_heuristic() {
+        let pipeline = CompressionPipeline::new();
+        let original = "A document whose entire value is that every word of it survives storage \
+                        long past the point where any heuristic would still rate it interesting";
+        let mut memory = create_test_memory(original, 0.0);
+        memory.created_at = chrono::Utc::now() - chrono::Duration::days(3650);
+
+        assert!(matches!(
+            pipeline.select_strategy(&memory),
+            CompressionStrategy::Lz4
+        ));
+
+        let compressed = pipeline.compress(&memory).unwrap();
+        assert!(pipeline.is_lossless(&compressed));
+        let restored = pipeline.decompress(&compressed).unwrap();
+        assert_eq!(restored.experience.content, original);
+    }
+
+    /// A record serialized before the flag existed must come back PERSISTENT, not lossy-eligible.
+    #[test]
+    fn test_absent_persistent_flag_deserializes_as_true() {
+        let memory = create_test_memory("Written before the flag existed", 0.1);
+        let mut json: serde_json::Value = serde_json::to_value(&memory).unwrap();
+        json.as_object_mut().unwrap().remove("persistent");
+        assert!(json.get("persistent").is_none(), "field removed for the test");
+
+        let restored: Memory = serde_json::from_value(json).unwrap();
+        assert!(
+            restored.persistent,
+            "absent must mean persistent — false-by-omission would make every legacy record lossy-eligible"
+        );
     }
 
     #[test]
