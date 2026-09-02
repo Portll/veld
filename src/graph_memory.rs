@@ -1578,8 +1578,11 @@ pub struct GraphMemory {
 }
 
 impl GraphMemory {
-    /// Get a reference to the underlying RocksDB instance (for backup/checkpoint).
-    pub fn get_db(&self) -> &DB {
+    /// The rocksdb engine handle for backup/checkpoint. Engine-typed by design
+    /// and named for it: GraphMemory is a rocksdb-backed type, and this handle
+    /// feeds the rocksdb BackupEngine's comprehensive archive. Nothing else
+    /// should reach through it.
+    pub fn rocksdb_for_backup(&self) -> &DB {
         &self.db
     }
 

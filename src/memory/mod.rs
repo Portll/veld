@@ -221,6 +221,16 @@ pub struct MemorySystem {
     session_memory: Arc<RwLock<SessionMemory>>,
     long_term_memory: Arc<MemoryStorage>,
 
+    /// Engine handle for the COMPREHENSIVE backup path, captured at
+    /// construction where the concrete store type is known. Engine-typed BY
+    /// DESIGN: create_comprehensive_backup_* is a rocksdb BackupEngine
+    /// facility with no redb analogue — the redb route is export/import
+    /// (R-6a/b). None means "not rocksdb-backed", and the backup path must
+    /// refuse rather than degrade. Deliberately NOT on PrimaryMemoryStore:
+    /// a trait carrying Option<Arc<rocksdb::DB>> would pin rocksdb into the
+    /// default build exactly as the get_db() call sites did.
+    rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
+
     /// Compression pipeline
     compressor: CompressionPipeline,
 
@@ -986,6 +996,7 @@ impl MemorySystem {
                 config.session_memory_size_mb,
             ))),
             long_term_memory: storage.clone(),
+            rocksdb_backup_db: Some(storage.db()),
             compressor: CompressionPipeline::new(),
             retriever,
             embedder,
@@ -4260,13 +4271,17 @@ impl MemorySystem {
         Ok(())
     }
 
-    /// Get the underlying RocksDB database handle for backup operations
+    /// The rocksdb engine handle for the comprehensive backup path, or None
+    /// when this system is not rocksdb-backed.
     ///
-    /// # Warning
-    /// This provides direct access to the database. Use with caution.
-    /// Primarily intended for backup/restore operations.
-    pub fn get_db(&self) -> std::sync::Arc<rocksdb::DB> {
-        self.long_term_memory.db()
+    /// Named for its ONE consumer: create_comprehensive_backup_with_staged_intent_log
+    /// is a rocksdb BackupEngine facility with no redb analogue — the redb route
+    /// is export/import. Do not reach through this for anything else; every
+    /// other access goes through the storage traits. Reads the field captured
+    /// at construction rather than the store, so it survives long_term_memory
+    /// becoming a trait object.
+    pub fn rocksdb_for_comprehensive_backup(&self) -> Option<std::sync::Arc<rocksdb::DB>> {
+        self.rocksdb_backup_db.clone()
     }
 
     /// Advanced search using storage criteria
