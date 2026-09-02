@@ -770,6 +770,18 @@ impl AuditStore for RocksDbAuditStore {
         Ok(())
     }
 
+    fn list_user_ids(&self) -> Result<Vec<String>> {
+        let mut ids = std::collections::HashSet::new();
+        for (key, _) in self.db.iterator_cf(self.cf()?, rocksdb::IteratorMode::Start).flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if let Some(user_id) = key_str.split(':').next() {
+                    ids.insert(user_id.to_string());
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     fn list_events(&self, user_id: &str, limit: usize) -> Result<Vec<AuditLogEntry>> {
         let prefix = format!("{user_id}:");
         let mut events = Vec::new();

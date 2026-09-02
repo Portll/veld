@@ -63,6 +63,55 @@ impl StorageCapabilities {
     }
 }
 
+/// The one shared engine database behind the global stores, carried by ENGINE
+/// rather than erased. The consumers that remain engine-typed — user-auth, the
+/// GDPR purge's raw column scans, sleep-time, the comprehensive backup — must
+/// SAY which engine they need and refuse on the other, instead of discovering
+/// the mismatch at their first raw call.
+#[derive(Clone)]
+pub enum SharedEngineDb {
+    RocksDb(Arc<rocksdb::DB>),
+    #[cfg(feature = "storage-redb")]
+    Redb(Arc<::redb::Database>),
+}
+
+impl SharedEngineDb {
+    pub fn backend(&self) -> StorageBackend {
+        match self {
+            SharedEngineDb::RocksDb(_) => StorageBackend::RocksDb,
+            #[cfg(feature = "storage-redb")]
+            SharedEngineDb::Redb(_) => StorageBackend::Redb,
+        }
+    }
+
+    pub fn rocksdb(&self) -> Option<&Arc<rocksdb::DB>> {
+        match self {
+            SharedEngineDb::RocksDb(db) => Some(db),
+            #[cfg(feature = "storage-redb")]
+            SharedEngineDb::Redb(_) => None,
+        }
+    }
+
+    /// `what` names the CAPABILITY, so the refusal reads as a statement about
+    /// the caller's requirement, not about the database.
+    pub fn require_rocksdb(&self, what: &str) -> Result<&Arc<rocksdb::DB>> {
+        self.rocksdb().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} requires the rocksdb engine; this deployment runs {:?}",
+                self.backend()
+            )
+        })
+    }
+
+    #[cfg(feature = "storage-redb")]
+    pub fn redb(&self) -> Option<&Arc<::redb::Database>> {
+        match self {
+            SharedEngineDb::Redb(db) => Some(db),
+            SharedEngineDb::RocksDb(_) => None,
+        }
+    }
+}
+
 /// Lightweight audit entry shape for storage-level interfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditLogEntry {
@@ -413,6 +462,11 @@ pub trait AuditStore: Send + Sync {
         retention_before: DateTime<Utc>,
     ) -> Result<usize>;
     fn flush(&self) -> Result<()>;
+    /// Every user id with at least one audit row — the enumeration audit
+    /// rotation needs. On the trait because the raw form (scanning the engine's
+    /// keyspace for `{user}:` prefixes) was the last reason rotation reached
+    /// past this abstraction to a concrete database handle.
+    fn list_user_ids(&self) -> Result<Vec<String>>;
 }
 
 /// Backup surface that higher-level orchestration can use without embedding

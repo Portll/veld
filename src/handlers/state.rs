@@ -53,7 +53,7 @@ use super::types::{AuditEvent, ContextStatus, MemoryEvent};
 pub type ContextSessions = DashMap<String, ContextStatus>;
 
 struct SharedStoreBootstrap {
-    shared_db: Arc<rocksdb::DB>,
+    shared_db: crate::storage::SharedEngineDb,
     audit_store: Arc<dyn AuditStore>,
     prospective_store: Arc<ProspectiveStore>,
     todo_store: Arc<TodoStore>,
@@ -141,8 +141,11 @@ pub struct MultiUserMemoryManager {
     /// Per-user audit logs (in-memory cache)
     pub audit_logs: Arc<DashMap<String, Arc<parking_lot::RwLock<VecDeque<AuditEvent>>>>>,
 
-    /// Shared DB for all global stores (todos, reminders, files, feedback, audit)
-    pub shared_db: Arc<rocksdb::DB>,
+    /// Shared engine database for all global stores (todos, reminders, files,
+    /// feedback, audit), carried by ENGINE. Engine-typed consumers (user-auth,
+    /// GDPR purge, sleep-time, comprehensive backup) go through
+    /// `require_rocksdb(..)` and refuse on the other engine by name.
+    pub shared_db: crate::storage::SharedEngineDb,
 
     /// Audit log storage routed through the backend abstraction layer.
     audit_store: Arc<dyn AuditStore>,
@@ -193,7 +196,11 @@ pub struct MultiUserMemoryManager {
     pub feedback_store: Arc<parking_lot::RwLock<FeedbackStore>>,
 
     /// Backup engine for automated and manual backups
-    pub backup_engine: Arc<backup::VeldBackupEngine>,
+    /// None when the backend is not rocksdb: the BackupEngine is a rocksdb
+    /// facility, and every consumer goes through `require_backup_engine(..)`
+    /// so an absent engine refuses by operation name instead of existing in a
+    /// state where any call would be wrong.
+    pub backup_engine: Option<Arc<backup::VeldBackupEngine>>,
 
     /// Context status from Claude Code sessions
     pub context_sessions: Arc<ContextSessions>,
@@ -539,7 +546,11 @@ impl MultiUserMemoryManager {
         // user_auth CF in `open_legacy_shared_db` under the same flag, so
         // construction here just wraps the existing handle.
         let user_auth_runtime = if crate::user_auth::feature_enabled() {
-            match crate::user_auth::store::UserAuthStore::new(shared_stores.shared_db.clone()) {
+            let user_auth_db = shared_stores
+                .shared_db
+                .require_rocksdb("user_auth (enabled by feature flag)")?
+                .clone();
+            match crate::user_auth::store::UserAuthStore::new(user_auth_db) {
                 Ok(store) => {
                     let totp_encryptor = match crate::keystore::SecretCryptor::from_env("totp") {
                         Ok(encryptor) => encryptor,
@@ -709,7 +720,7 @@ impl MultiUserMemoryManager {
                 info!("Feedback store initialized");
 
                 Ok(SharedStoreBootstrap {
-                    shared_db,
+                    shared_db: crate::storage::SharedEngineDb::RocksDb(shared_db),
                     audit_store,
                     prospective_store,
                     todo_store,
@@ -718,8 +729,70 @@ impl MultiUserMemoryManager {
                     feedback_store,
                 })
             }
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => {
+                let database = crate::storage::redb::open_shared_database(base_path)?;
+
+                // Audit is its own audit.redb, mirroring the rocksdb layout where
+                // audit rows live apart from user data.
+                let audit_store: Arc<dyn AuditStore> =
+                    Arc::new(crate::storage::redb::RedbAuditStore::open(base_path)?);
+
+                // ONE ColumnStore over ONE database handle — every multi-family
+                // store shares it (redb permits one opener per file), and each
+                // with_store declares its families via ensure_cf.
+                let column: Arc<dyn crate::storage::ColumnStore> = Arc::new(
+                    crate::storage::redb::RedbColumnStore::new(Arc::clone(&database)),
+                );
+
+                let prospective_store =
+                    Arc::new(ProspectiveStore::with_store(Arc::clone(&column))?);
+                info!("Prospective memory store initialized (redb)");
+
+                let todo_store = Arc::new(TodoStore::with_store(Arc::clone(&column), base_path)?);
+
+                let file_store = Arc::new(FileMemoryStore::with_store(Arc::clone(&column))?);
+                info!("File memory store initialized (redb)");
+
+                let context_block_store = Arc::new(crate::memory::ContextBlockStore::with_store(
+                    Arc::new(crate::storage::redb::RedbTableKeyValueStore::new(
+                        Arc::clone(&database),
+                        "context_blocks",
+                    )),
+                ));
+                info!("Context block store initialized (redb)");
+
+                // Same degrade-to-in-memory shape as the rocksdb arm: feedback is
+                // advisory state, and the rocksdb arm already treats a load
+                // failure as warn-and-continue rather than boot failure.
+                let feedback_store = Arc::new(parking_lot::RwLock::new(
+                    FeedbackStore::with_store(
+                        Arc::new(crate::storage::redb::RedbTableKeyValueStore::new(
+                            Arc::clone(&database),
+                            "feedback",
+                        )),
+                        base_path,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Failed to load feedback store: {}, using in-memory", e);
+                        FeedbackStore::new()
+                    }),
+                ));
+                info!("Feedback store initialized (redb)");
+
+                Ok(SharedStoreBootstrap {
+                    shared_db: crate::storage::SharedEngineDb::Redb(database),
+                    audit_store,
+                    prospective_store,
+                    todo_store,
+                    context_block_store,
+                    file_store,
+                    feedback_store,
+                })
+            }
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for shared-store bootstrap yet",
+                "storage backend '{}' requires this build to enable the storage-redb feature",
                 server_config.effective_storage_backend
             )),
         }
@@ -794,23 +867,29 @@ impl MultiUserMemoryManager {
     fn open_backup_engine(
         base_path: &std::path::Path,
         server_config: &ServerConfig,
-    ) -> Result<Arc<backup::VeldBackupEngine>> {
+    ) -> Result<Option<Arc<backup::VeldBackupEngine>>> {
         let backup_path = base_path.join("backups");
 
         match server_config.effective_storage_backend {
-            StorageBackend::RocksDb => Ok(Arc::new(backup::VeldBackupEngine::new(backup_path)?)),
-            StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for backup engine bootstrap yet",
-                server_config.effective_storage_backend
-            )),
+            StorageBackend::RocksDb => {
+                Ok(Some(Arc::new(backup::VeldBackupEngine::new(backup_path)?)))
+            }
+            // None, not an engine that errors on use: the rocksdb BackupEngine
+            // has no redb analogue, and the redb backup story is export/import.
+            // Every backup operation refuses by name until that lands.
+            StorageBackend::Redb => Ok(None),
         }
     }
 
-    /// Get the audit column family handle from the shared DB
-    fn audit_cf(&self) -> &rocksdb::ColumnFamily {
-        self.shared_db
-            .cf_handle(CF_AUDIT)
-            .expect("audit CF must exist in shared DB")
+    /// The rocksdb backup engine, or a refusal that names the operation.
+    fn require_backup_engine(&self, what: &str) -> Result<&Arc<backup::VeldBackupEngine>> {
+        self.backup_engine.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} requires the rocksdb backup engine; this deployment's backend is '{}' \
+                 and its backup route is export/import",
+                self.server_config.effective_storage_backend
+            )
+        })
     }
 
     /// Migrate old standalone audit_logs DB into the shared DB's audit CF.
@@ -1284,14 +1363,19 @@ impl MultiUserMemoryManager {
 
     /// Purge all user data from shared RocksDB (todos, reminders, files, feedback, audit)
     fn purge_user_from_shared_db(&self, user_id: &str) -> Result<()> {
+        // REFUSE rather than no-op: a GDPR purge that silently touched nothing
+        // while returning Ok would be deletion reported and not performed.
+        let shared_db = self
+            .shared_db
+            .require_rocksdb("GDPR purge of the shared stores")?;
         let prefix = format!("{user_id}:");
         let prefix_bytes = prefix.as_bytes();
 
         // Shared CF names that use `{user_id}:` as key prefix
         let cf_names = ["todos", "projects", "prospective", "context_blocks"];
         for name in &cf_names {
-            if let Some(cf) = self.shared_db.cf_handle(name) {
-                let n = Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);
+            if let Some(cf) = shared_db.cf_handle(name) {
+                let n = Self::delete_by_prefix(&shared_db, cf, prefix_bytes);
                 if n > 0 {
                     tracing::debug!("GDPR: purged {n} entries from {name} CF for {user_id}");
                 }
@@ -1299,7 +1383,7 @@ impl MultiUserMemoryManager {
         }
 
         // Index CFs use varied key prefixes — scan all relevant patterns
-        if let Some(cf) = self.shared_db.cf_handle("todo_index") {
+        if let Some(cf) = shared_db.cf_handle("todo_index") {
             let prefixes = [
                 format!("user:{user_id}:"),
                 format!("status:Backlog:{user_id}:"),
@@ -1312,12 +1396,12 @@ impl MultiUserMemoryManager {
                 format!("todo_vector:{user_id}:"),
             ];
             for p in &prefixes {
-                Self::delete_by_prefix(&self.shared_db, cf, p.as_bytes());
+                Self::delete_by_prefix(&shared_db, cf, p.as_bytes());
             }
             // Priority and due/context keys also contain user_id but at varying positions.
             // Full scan of index CF to catch them all.
             let mut batch = rocksdb::WriteBatch::default();
-            let iter = self.shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             for item in iter.flatten() {
                 let (key, _) = item;
                 if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -1326,10 +1410,10 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
-            let _ = self.shared_db.write(batch);
+            let _ = shared_db.write(batch);
         }
 
-        if let Some(cf) = self.shared_db.cf_handle("prospective_index") {
+        if let Some(cf) = shared_db.cf_handle("prospective_index") {
             let prefixes = [
                 format!("user:{user_id}:"),
                 format!("status:Pending:{user_id}:"),
@@ -1337,11 +1421,11 @@ impl MultiUserMemoryManager {
                 format!("status:Dismissed:{user_id}:"),
             ];
             for p in &prefixes {
-                Self::delete_by_prefix(&self.shared_db, cf, p.as_bytes());
+                Self::delete_by_prefix(&shared_db, cf, p.as_bytes());
             }
             // Context keyword indices: `context:{keyword}:{user_id}:{id}`
             let mut batch = rocksdb::WriteBatch::default();
-            let iter = self.shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             for item in iter.flatten() {
                 let (key, _) = item;
                 if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -1350,19 +1434,19 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
-            let _ = self.shared_db.write(batch);
+            let _ = shared_db.write(batch);
         }
 
         // Files
-        if let Some(cf) = self.shared_db.cf_handle("files") {
-            Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);
+        if let Some(cf) = shared_db.cf_handle("files") {
+            Self::delete_by_prefix(&shared_db, cf, prefix_bytes);
         }
-        if let Some(cf) = self.shared_db.cf_handle("file_index") {
+        if let Some(cf) = shared_db.cf_handle("file_index") {
             let idx_prefix = format!("file_idx:{user_id}:");
-            Self::delete_by_prefix(&self.shared_db, cf, idx_prefix.as_bytes());
+            Self::delete_by_prefix(&shared_db, cf, idx_prefix.as_bytes());
             // Also catch other patterns
             let mut batch = rocksdb::WriteBatch::default();
-            let iter = self.shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let iter = shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             for item in iter.flatten() {
                 let (key, _) = item;
                 if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -1371,18 +1455,18 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
-            let _ = self.shared_db.write(batch);
+            let _ = shared_db.write(batch);
         }
 
         // Feedback: `pending:{user_id}`
-        if let Some(cf) = self.shared_db.cf_handle("feedback") {
+        if let Some(cf) = shared_db.cf_handle("feedback") {
             let pending_key = format!("pending:{user_id}");
-            let _ = self.shared_db.delete_cf(cf, pending_key.as_bytes());
+            let _ = shared_db.delete_cf(cf, pending_key.as_bytes());
         }
 
         // Audit logs
-        if let Some(cf) = self.shared_db.cf_handle("audit") {
-            Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);
+        if let Some(cf) = shared_db.cf_handle("audit") {
+            Self::delete_by_prefix(&shared_db, cf, prefix_bytes);
         }
 
         // Clear in-memory audit log cache
@@ -1469,10 +1553,18 @@ impl MultiUserMemoryManager {
         info!("Flushing all databases to disk...");
 
         // Single flush covers all shared stores (todos, prospective, files, feedback, audit)
-        self.shared_db
-            .flush()
-            .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
-        info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
+        match &self.shared_db {
+            crate::storage::SharedEngineDb::RocksDb(db) => {
+                db.flush()
+                    .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
+                info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
+            }
+            #[cfg(feature = "storage-redb")]
+            crate::storage::SharedEngineDb::Redb(_) => {
+                // redb commits are durable per transaction — nothing buffered.
+                info!("  Shared redb database: durable per transaction, nothing to flush");
+            }
+        }
 
         let user_entries: Vec<(String, SharedUserMemory)> = self
             .user_memories
@@ -1534,19 +1626,10 @@ impl MultiUserMemoryManager {
     fn rotate_all_audit_logs(&self) -> Result<()> {
         let mut total_removed = 0;
 
-        let mut user_ids = std::collections::HashSet::new();
-        let audit = self.audit_cf();
-        let iter = self
-            .shared_db
-            .iterator_cf(audit, rocksdb::IteratorMode::Start);
-
-        for (key, _) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(user_id) = key_str.split(':').next() {
-                    user_ids.insert(user_id.to_string());
-                }
-            }
-        }
+        // Enumeration through the trait — the raw keyspace scan this replaces was
+        // the last reason rotation reached past the audit abstraction.
+        let user_ids: std::collections::HashSet<String> =
+            self.audit_store.list_user_ids()?.into_iter().collect();
 
         let helper = MultiUserMemoryManagerRotationHelper {
             audit_store: self.audit_store.clone(),
@@ -2780,8 +2863,8 @@ impl MultiUserMemoryManager {
     }
 
     /// Get the backup engine
-    pub fn backup_engine(&self) -> &Arc<backup::VeldBackupEngine> {
-        &self.backup_engine
+    pub fn backup_engine(&self) -> Option<&Arc<backup::VeldBackupEngine>> {
+        self.backup_engine.as_ref()
     }
 
     /// Get the A/B test manager
@@ -2876,9 +2959,19 @@ impl MultiUserMemoryManager {
             "feedback",
         ];
 
-        REQUIRED_CFS
-            .iter()
-            .all(|cf| self.shared_db.cf_handle(cf).is_some())
+        match &self.shared_db {
+            crate::storage::SharedEngineDb::RocksDb(db) => REQUIRED_CFS
+                .iter()
+                .all(|cf| db.cf_handle(cf).is_some()),
+            #[cfg(feature = "storage-redb")]
+            crate::storage::SharedEngineDb::Redb(_) => {
+                // Families are materialized at construction by each store's
+                // ensure_cf, or bootstrap already failed. The rocksdb check
+                // exists because ITS families come from open-time descriptors
+                // that config drift could omit; redb has no equivalent drift.
+                true
+            }
+        }
     }
 
     /// Active reminder check: scan all users for due reminders, mark them triggered,
@@ -2946,7 +3039,12 @@ impl MultiUserMemoryManager {
     }
 
     fn collect_legacy_secondary_store_refs(&self) -> Vec<(String, std::sync::Arc<rocksdb::DB>)> {
-        vec![("shared".to_string(), std::sync::Arc::clone(&self.shared_db))]
+        // Empty when not rocksdb-backed: these refs feed the rocksdb
+        // BackupEngine, which require_backup_engine has already refused by then.
+        match self.shared_db.rocksdb() {
+            Some(db) => vec![("shared".to_string(), std::sync::Arc::clone(db))],
+            None => Vec::new(),
+        }
     }
 
     /// Directory holding `user_id`'s W5 intent log: the journal lives at
@@ -2980,7 +3078,7 @@ impl MultiUserMemoryManager {
                 let staged = match self.get_user_journaled_writer(user_id) {
                     Ok(writer) => {
                         let _writer_guard = writer.lock();
-                        Some(self.backup_engine.stage_intent_log(&intent_log_spec, user_id)?)
+                        Some(self.require_backup_engine("backup intent-log staging")?.stage_intent_log(&intent_log_spec, user_id)?)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2988,7 +3086,7 @@ impl MultiUserMemoryManager {
                             error = %e,
                             "backup: journaled writer unavailable; staging intent log without quiesce",
                         );
-                        Some(self.backup_engine.stage_intent_log(&intent_log_spec, user_id)?)
+                        Some(self.require_backup_engine("backup intent-log staging")?.stage_intent_log(&intent_log_spec, user_id)?)
                     }
                 };
 
@@ -3050,7 +3148,7 @@ impl MultiUserMemoryManager {
                 let graph_guard = graph_lock.read();
                 let graph_db_ref = Some(graph_guard.rocksdb_for_backup());
 
-                self.backup_engine.create_comprehensive_backup_with_staged_intent_log(
+                self.require_backup_engine("comprehensive backup creation")?.create_comprehensive_backup_with_staged_intent_log(
                     &db,
                     user_id,
                     &store_refs,
@@ -3067,7 +3165,7 @@ impl MultiUserMemoryManager {
 
     pub fn list_backups_for_user(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
         match self.server_config.effective_storage_backend {
-            StorageBackend::RocksDb => self.backup_engine.list_backups(user_id),
+            StorageBackend::RocksDb => self.require_backup_engine("backup listing")?.list_backups(user_id),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup listing yet",
                 self.server_config.effective_storage_backend
@@ -3077,7 +3175,7 @@ impl MultiUserMemoryManager {
 
     pub fn verify_backup_for_user(&self, user_id: &str, backup_id: u32) -> Result<bool> {
         match self.server_config.effective_storage_backend {
-            StorageBackend::RocksDb => self.backup_engine.verify_backup(user_id, backup_id),
+            StorageBackend::RocksDb => self.require_backup_engine("backup verification")?.verify_backup(user_id, backup_id),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup verification yet",
                 self.server_config.effective_storage_backend
@@ -3087,7 +3185,7 @@ impl MultiUserMemoryManager {
 
     pub fn purge_backups_for_user(&self, user_id: &str, keep_count: usize) -> Result<usize> {
         match self.server_config.effective_storage_backend {
-            StorageBackend::RocksDb => self.backup_engine.purge_old_backups(user_id, keep_count),
+            StorageBackend::RocksDb => self.require_backup_engine("backup purging")?.purge_old_backups(user_id, keep_count),
             StorageBackend::Redb => Err(anyhow::anyhow!(
                 "storage backend '{}' is not wired for backup purging yet",
                 self.server_config.effective_storage_backend
@@ -3125,8 +3223,8 @@ impl MultiUserMemoryManager {
                 let intent_log_spec =
                     crate::backup::IntentLogBackupSpec::per_user(self.intent_log_user_dir(user_id)?);
                 let restore_opts = crate::backup::RestoreOptions { max_lsn };
-                let restored_stores = self
-                    .backup_engine
+                let backup_engine = self.require_backup_engine("backup restore")?;
+                let restored_stores = backup_engine
                     .restore_comprehensive_backup_with_intent_log(
                         user_id,
                         backup_id,
@@ -3137,14 +3235,13 @@ impl MultiUserMemoryManager {
                     )?;
 
                 let resolved_backup_id = backup_id.unwrap_or_else(|| {
-                    self.backup_engine
+                    backup_engine
                         .list_backups(user_id)
                         .ok()
                         .and_then(|backups| backups.last().map(|metadata| metadata.backup_id))
                         .unwrap_or(0)
                 });
-                let graph_checkpoint = self
-                    .backup_engine
+                let graph_checkpoint = backup_engine
                     .backup_path()
                     .join(user_id)
                     .join(format!("secondary_{resolved_backup_id}"))
@@ -3807,5 +3904,65 @@ impl crate::query_planner::adapters::GraphProvider for MultiUserMemoryManager {
             })
             .map(|m| m.id.0.to_string())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod shared_store_bootstrap_tests {
+    use super::*;
+
+    /// The redb arm of bootstrap_shared_stores BOOTS and its stores WORK.
+    /// The compile-only version of this claim is form satisfied, nothing fed:
+    /// the arm could construct stores over the wrong tables and nothing would
+    /// look different until a live cutover.
+    #[cfg(feature = "storage-redb")]
+    #[test]
+    fn redb_shared_store_bootstrap_boots_and_stores_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.effective_storage_backend = crate::config::StorageBackend::Redb;
+        let cache = rocksdb::Cache::new_lru_cache(1024);
+
+        let bundle =
+            MultiUserMemoryManager::bootstrap_shared_stores(tmp.path(), &config, &cache)
+                .expect("redb shared-store bootstrap");
+
+        // The engine is the one asked for.
+        assert!(bundle.shared_db.rocksdb().is_none());
+
+        // A todo round-trips through the bundle's store (crosses all three
+        // todo families via seq_num allocation and indices).
+        let todo = crate::memory::types::Todo::new("boot-user".into(), "works".into());
+        let stored = bundle.todo_store.store_todo(&todo).unwrap();
+        assert!(bundle
+            .todo_store
+            .get_todo("boot-user", &stored.id)
+            .unwrap()
+            .is_some());
+
+        // Audit appends and enumerates through the trait.
+        bundle
+            .audit_store
+            .append_event(
+                "boot-user",
+                &crate::storage::AuditLogEntry {
+                    timestamp: chrono::Utc::now(),
+                    event_type: "test".into(),
+                    memory_id: "m".into(),
+                    details: "d".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            bundle.audit_store.list_user_ids().unwrap(),
+            vec!["boot-user".to_string()]
+        );
+
+        // Context blocks and feedback stores answer over their tables.
+        assert!(bundle
+            .context_block_store
+            .get("boot-user", "nope")
+            .unwrap()
+            .is_none());
     }
 }
