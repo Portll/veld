@@ -341,6 +341,14 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
     }
 
     // ── The eight the long_term_memory flip surfaced — same pure forwarding.
+    fn get_all_vector_mappings(&self) -> Result<Vec<(MemoryId, VectorMappingEntry)>> {
+        self.inner.get_all_vector_mappings()
+    }
+
+    fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()> {
+        self.inner.update_vector_mapping(memory_id, vector_ids)
+    }
+
     fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
         self.inner.get_by_content_hash(content)
     }
