@@ -255,6 +255,14 @@ pub fn create_redb_database_for_test(path: &Path) -> Result<Arc<redb::Database>>
     create_redb_database(path)
 }
 
+/// Open (or create) the SHARED redb database holding the global stores'
+/// tables — the redb counterpart of `open_legacy_shared_db`. One file, one
+/// opener: every store over it must be built FROM THIS HANDLE (`with_store`
+/// constructors), never by path, or the second opener dies on the store lock.
+pub fn open_shared_database(base_path: &Path) -> Result<Arc<redb::Database>> {
+    create_redb_database(&base_path.join("shared.redb"))
+}
+
 fn create_redb_database(path: &Path) -> Result<Arc<redb::Database>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1351,6 +1359,21 @@ impl AuditStore for RedbAuditStore {
         let key = format!("{user_id}:{timestamp_nanos:020}");
         let value = encode(event)?;
         table_put(&self.database, AUDIT_TABLE, key.as_bytes(), &value)
+    }
+
+    fn list_user_ids(&self) -> Result<Vec<String>> {
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(AUDIT_TABLE)?;
+        let mut ids = std::collections::HashSet::new();
+        for row in table.iter()? {
+            let (k, _) = row?;
+            if let Ok(key_str) = std::str::from_utf8(k.value()) {
+                if let Some(user_id) = key_str.split(':').next() {
+                    ids.insert(user_id.to_string());
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
     }
 
     fn list_events(&self, user_id: &str, limit: usize) -> Result<Vec<AuditLogEntry>> {
