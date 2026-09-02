@@ -1756,6 +1756,13 @@ pub struct Memory {
     pub created_at: DateTime<Utc>,
     pub compressed: bool,
 
+    /// Forbids LOSSY compression of this record. Default TRUE: content survives unless a caller
+    /// deliberately opts out. The inverse default is what destroyed a 19KB handoff — it fell
+    /// through select_strategy to Hybrid, whose semantic pass replaces content with 50 words.
+    /// Absent on an older serialized record means true (`default_true`), so the fail-safe
+    /// direction applies to everything already in the store.
+    pub persistent: bool,
+
     // ==========================================================================
     // COGNITIVE EXTENSIONS - Unified memory with graph awareness
     // ==========================================================================
@@ -1833,6 +1840,7 @@ impl Clone for Memory {
             metadata: Arc::new(parking_lot::Mutex::new(self.metadata.lock().clone())),
             created_at: self.created_at,
             compressed: self.compressed,
+            persistent: self.persistent,
             tier: self.tier,
             entity_refs: self.entity_refs.clone(),
             last_retrieval_id: self.last_retrieval_id,
@@ -1892,6 +1900,7 @@ impl Memory {
             })),
             created_at: now,
             compressed: false,
+            persistent: true,
             // Cognitive extensions - initialize to defaults
             tier: MemoryTier::Working,
             entity_refs: Vec::new(),
@@ -1977,6 +1986,7 @@ impl Memory {
             })),
             created_at,
             compressed,
+            persistent: true,
             tier,
             entity_refs,
             last_retrieval_id,
@@ -2589,6 +2599,9 @@ struct MemoryFlat {
     created_at: DateTime<Utc>,
     last_accessed: DateTime<Utc>,
     compressed: bool,
+    /// Absent on records written before the flag existed => true. Never false-by-omission.
+    #[serde(default = "default_true")]
+    persistent: bool,
     // Cognitive extensions
     tier: MemoryTier,
     entity_refs: Vec<EntityRef>,
@@ -2658,6 +2671,7 @@ impl Serialize for Memory {
             created_at: self.created_at,
             last_accessed: meta.last_accessed,
             compressed: self.compressed,
+            persistent: self.persistent,
             // Cognitive extensions
             tier: self.tier,
             entity_refs: self.entity_refs.clone(),
@@ -2741,6 +2755,7 @@ impl<'de> Deserialize<'de> for Memory {
             })),
             created_at: flat.created_at,
             compressed: flat.compressed,
+            persistent: flat.persistent,
             // Cognitive extensions
             tier: flat.tier,
             entity_refs: flat.entity_refs,
