@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use super::{
     AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, GraphStore, KeyValueStore,
-    MigrationStore, PrimaryMemoryStore, StorageFactory, WriteBatch as StorageWriteBatch,
+    ColumnStore, MigrationStore, PrimaryMemoryStore, StorageFactory,
+    WriteBatch as StorageWriteBatch,
 };
 use crate::backup::BackupMetadata;
 use crate::config::StorageBackend;
@@ -121,6 +122,105 @@ impl BatchWriter for RedbBatchWriter {
     }
 }
 
+/// Multi-column-family access over a live redb handle. A rocksdb column family is
+/// a redb table, one for one — the same mapping the portable dump already uses.
+pub struct RedbColumnStore {
+    database: Arc<redb::Database>,
+}
+
+impl RedbColumnStore {
+    pub fn new(database: Arc<redb::Database>) -> Self {
+        Self { database }
+    }
+}
+
+impl ColumnStore for RedbColumnStore {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::Redb
+    }
+
+    fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let txn = self.database.begin_read()?;
+        let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+        // A table that does not exist holds no rows — None, not an error. Reading is
+        // the one direction where absence is a legitimate answer; every WRITE below
+        // names its family and a redb write transaction creates it.
+        match txn.open_table(def) {
+            Ok(t) => Ok(t.get(key)?.map(|v| v.value().to_vec())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+            let mut table = txn.open_table(def)?;
+            table.insert(key, value)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+            let mut table = txn.open_table(def)?;
+            let _ = table.remove(key)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn scan_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let txn = self.database.begin_read()?;
+        let def: redb::TableDefinition<'_, &[u8], &[u8]> = redb::TableDefinition::new(cf);
+        let table = match txn.open_table(def) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut rows = Vec::new();
+        // redb ranges are ordered, so a prefix scan stops at the first key that
+        // leaves it rather than reading the table.
+        let iter: Box<dyn Iterator<Item = _>> = match prefix {
+            Some(p) => Box::new(table.range(p..)?),
+            None => Box::new(table.iter()?),
+        };
+        for row in iter {
+            let (k, v) = row?;
+            let key = k.value().to_vec();
+            if let Some(p) = prefix {
+                if !key.starts_with(p) {
+                    break;
+                }
+            }
+            rows.push((key, v.value().to_vec()));
+            if let Some(n) = limit {
+                if rows.len() >= n {
+                    break;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn flush_cf(&self, _cf: &str) -> Result<()> {
+        // redb commits are durable, so there is nothing buffered to flush. Ok(())
+        // is the honest answer rather than a no-op standing in for one.
+        Ok(())
+    }
+
+    fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
+        RedbBatchWriter::new(Arc::clone(&self.database)).write_batch(batch)
+    }
+}
+
 /// An operation the redb backend declares but has not built. Distinct from
 /// `not_implemented`, which names a path; these are store-level and the store
 /// holds only a database handle.
@@ -134,6 +234,12 @@ fn not_implemented(operation: &str, path: &Path) -> anyhow::Error {
         operation,
         path.display()
     )
+}
+
+/// Test-only constructor so conformance tests can build a bare handle.
+#[cfg(test)]
+pub fn create_redb_database_for_test(path: &Path) -> Result<Arc<redb::Database>> {
+    create_redb_database(path)
 }
 
 fn create_redb_database(path: &Path) -> Result<Arc<redb::Database>> {

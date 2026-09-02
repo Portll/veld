@@ -218,6 +218,47 @@ pub trait BatchWriter: Send + Sync {
     fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
 }
 
+/// Multi-column-family access — the shape five secondary stores actually need.
+///
+/// `KeyValueStore` is bound to ONE family, which fits the stores that have one.
+/// `ContextBlockStore`, `FileMemoryStore`, `ProspectiveStore`, `TodoStore` and
+/// `FeedbackStore` each address several: measured 2026-09-02, 7 / 21 / 35 / 63 / 22
+/// column-family operations respectively, plus `prefix_iterator_cf` and batch
+/// `write`. None of them is expressible through a single-family handle, which is why
+/// all five still hold an `Arc<DB>` and none is reachable through `StorageFactory` —
+/// and why the storage traits reaching 66/69 did not make the bootstrap wireable.
+///
+/// This is [`BatchWriter`] one step further: that gave DB-scoped WRITES because two
+/// call sites batch across families; this gives DB-scoped reads and scans for the
+/// same reason. Same argument, same scope.
+pub trait ColumnStore: Send + Sync {
+    fn backend(&self) -> StorageBackend;
+
+    fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()>;
+    fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()>;
+
+    /// One scan for both uses a caller has. `prefix: None` walks the family.
+    ///
+    /// `limit` is explicit and NOT defaulted, so an unbounded scan of a family that
+    /// may hold hundreds of thousands of rows is a visible choice at the call site
+    /// rather than the shape of the API. The prefix bound is the implementation's:
+    /// rocksdb's iterator runs past a prefix, and every caller ported so far carried
+    /// its own `starts_with` break — three of which were removed tonight, all silent
+    /// if dropped.
+    fn scan_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    fn flush_cf(&self, cf: &str) -> Result<()>;
+
+    /// Atomic across families — see [`WriteBatch`].
+    fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
+}
+
 /// Generic key-value operations for shared secondary stores.
 pub trait KeyValueStore: Send + Sync {
     fn backend(&self) -> StorageBackend;
@@ -580,5 +621,117 @@ mod backend_coverage_matrix {
         // rocksdb regression, and the gap list must be exactly what is claimed.
         assert!(rocks_ok >= redb_ok, "redb reports more working methods than rocksdb — check the probe, not the backends");
         assert_eq!(gap.len(), 33 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
+    }
+}
+
+#[cfg(test)]
+mod column_store_conformance {
+    //! The same script against both backends, compared.
+    //!
+    //! Two separate test suites prove each implementation works on its own terms,
+    //! which is exactly what a divergence looks like from the inside — the `cf: None`
+    //! bug in the batch API passed both sides' tests while landing in two different
+    //! keyspaces. This runs ONE sequence and asserts the answers are equal, so a
+    //! disagreement fails rather than being invisible until a cutover.
+    use super::*;
+    use crate::storage::legacy_rocksdb::RocksDbColumnStore;
+    use crate::storage::redb::RedbColumnStore;
+
+    const FAMILIES: [&str; 3] = ["default", "alpha", "beta"];
+
+    /// Every observable answer the script produces, as comparable values.
+    fn script(s: &dyn ColumnStore) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut note = |k: &str, v: String| out.push((k.to_string(), v));
+
+        note("backend-differs-on-purpose", format!("{:?}", s.backend()));
+
+        s.put_cf("alpha", b"k1", b"v1").unwrap();
+        s.put_cf("alpha", b"k2", b"v2").unwrap();
+        s.put_cf("beta", b"k1", b"OTHER").unwrap();
+
+        note("get alpha/k1", format!("{:?}", s.get_cf("alpha", b"k1").unwrap()));
+        // Isolation: the same key in another family must not be visible here.
+        note("get beta/k1", format!("{:?}", s.get_cf("beta", b"k1").unwrap()));
+        note("get alpha/missing", format!("{:?}", s.get_cf("alpha", b"nope").unwrap()));
+
+        s.put_cf("alpha", b"pre:a", b"1").unwrap();
+        s.put_cf("alpha", b"pre:b", b"2").unwrap();
+        s.put_cf("alpha", b"qqq", b"3").unwrap();
+
+        // The prefix bound: `qqq` sorts after `pre:` and must NOT be returned.
+        let pre = s.scan_cf("alpha", Some(b"pre:"), None).unwrap();
+        note("scan prefix", format!("{:?}", pre.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()));
+        note("scan prefix limit 1", format!("{}", s.scan_cf("alpha", Some(b"pre:"), Some(1)).unwrap().len()));
+        note("scan whole family", format!("{}", s.scan_cf("alpha", None, None).unwrap().len()));
+
+        let mut b = WriteBatch::new();
+        b.put_cf("alpha", b"batched".to_vec(), b"A".to_vec());
+        b.put_cf("beta", b"batched".to_vec(), b"B".to_vec());
+        b.delete_cf("alpha", b"k2".to_vec());
+        s.write_batch(&b).unwrap();
+
+        note("after batch alpha/batched", format!("{:?}", s.get_cf("alpha", b"batched").unwrap()));
+        note("after batch beta/batched", format!("{:?}", s.get_cf("beta", b"batched").unwrap()));
+        note("after batch alpha/k2 deleted", format!("{:?}", s.get_cf("alpha", b"k2").unwrap()));
+
+        s.delete_cf("alpha", b"k1").unwrap();
+        note("after delete alpha/k1", format!("{:?}", s.get_cf("alpha", b"k1").unwrap()));
+        // Deleting an absent key is not an error on either backend.
+        note("delete absent is ok", format!("{:?}", s.delete_cf("alpha", b"never").is_ok()));
+        note("flush", format!("{:?}", s.flush_cf("alpha").is_ok()));
+        out
+    }
+
+    #[test]
+    fn both_backends_answer_the_same_script_identically() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let rocks_db = {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let cfs: Vec<_> = FAMILIES
+                .iter()
+                .map(|n| rocksdb::ColumnFamilyDescriptor::new(*n, rocksdb::Options::default()))
+                .collect();
+            std::sync::Arc::new(rocksdb::DB::open_cf_descriptors(&opts, tmp.path().join("rocks"), cfs).unwrap())
+        };
+        let redb_db = crate::storage::redb::create_redb_database_for_test(&tmp.path().join("redb.redb")).unwrap();
+
+        let r = script(&RocksDbColumnStore::new(rocks_db));
+        let b = script(&RedbColumnStore::new(redb_db));
+
+        assert_eq!(r.len(), b.len());
+        let mut diffs = Vec::new();
+        for ((rk, rv), (_, bv)) in r.iter().zip(&b) {
+            // The backend name is the one answer that SHOULD differ.
+            if rk == "backend-differs-on-purpose" {
+                assert_ne!(rv, bv, "the two stores reported the same backend — the test built one twice");
+                continue;
+            }
+            if rv != bv {
+                diffs.push(format!("  {rk}:  rocksdb={rv}  redb={bv}"));
+            }
+        }
+        assert!(diffs.is_empty(), "the backends disagree:\n{}", diffs.join("\n"));
+
+        // NOT VACUOUS. Two backends that both returned None to everything would agree
+        // perfectly, so the comparison above is only worth running if the script
+        // actually observed something. These pin the answers that carry the meaning.
+        let find = |k: &str| r.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(find("get alpha/k1"), "Some([118, 49])", "the round trip returned nothing to compare");
+        assert_eq!(find("get beta/k1"), "Some([79, 84, 72, 69, 82])",
+            "families are not isolated — the same key read back the other family's value");
+        assert_eq!(find("get alpha/missing"), "None");
+        assert_eq!(find("scan prefix"), "[[112, 114, 101, 58, 97], [112, 114, 101, 58, 98]]",
+            "the prefix scan did not return exactly the two pre: keys — `qqq` sorts after them and \
+             must not be included");
+        assert_eq!(find("scan prefix limit 1"), "1");
+        assert_eq!(find("after batch alpha/batched"), "Some([65])");
+        assert_eq!(find("after batch beta/batched"), "Some([66])",
+            "the cross-family batch did not reach the second family");
+        assert_eq!(find("after batch alpha/k2 deleted"), "None");
+        assert_eq!(find("after delete alpha/k1"), "None");
     }
 }

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use super::{
     AuditLogEntry, AuditStore, BackupStore, BatchOp, BatchWriter, GraphStore, KeyValueStore,
-    MigrationStore, PrimaryMemoryStore, StorageFactory, WriteBatch as StorageWriteBatch,
+    ColumnStore, MigrationStore, PrimaryMemoryStore, StorageFactory,
+    WriteBatch as StorageWriteBatch,
 };
 use crate::backup::{BackupMetadata, VeldBackupEngine};
 use crate::config::StorageBackend;
@@ -91,6 +92,86 @@ impl BatchWriter for RocksDbBatchWriter {
             .write(wb)
             .context("write_batch: rocksdb refused the batch")?;
         Ok(())
+    }
+}
+
+/// Multi-column-family access over a live rocksdb handle.
+pub struct RocksDbColumnStore {
+    db: Arc<DB>,
+}
+
+impl RocksDbColumnStore {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+
+    /// A named family, or an error naming it. Never a silent default: resolving a
+    /// missing family to the default keyspace would put a store's rows somewhere
+    /// nothing reads, and every write would report success.
+    fn cf(&self, name: &str) -> Result<&ColumnFamily> {
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| anyhow!("this database has no column family '{name}'"))
+    }
+}
+
+impl ColumnStore for RocksDbColumnStore {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::RocksDb
+    }
+
+    fn get_cf(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.get_cf(self.cf(cf)?, key)?)
+    }
+
+    fn put_cf(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.put_cf(self.cf(cf)?, key, value)?;
+        Ok(())
+    }
+
+    fn delete_cf(&self, cf: &str, key: &[u8]) -> Result<()> {
+        self.db.delete_cf(self.cf(cf)?, key)?;
+        Ok(())
+    }
+
+    fn scan_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let handle = self.cf(cf)?;
+        let mode = match prefix {
+            Some(p) => IteratorMode::From(p, Direction::Forward),
+            None => IteratorMode::Start,
+        };
+        let mut rows = Vec::new();
+        for item in self.db.iterator_cf(handle, mode) {
+            let (key, value) = item?;
+            // The bound is enforced HERE. rocksdb's iterator continues past the
+            // prefix, so every caller was carrying this break by hand.
+            if let Some(p) = prefix {
+                if !key.starts_with(p) {
+                    break;
+                }
+            }
+            rows.push((key.to_vec(), value.to_vec()));
+            if let Some(n) = limit {
+                if rows.len() >= n {
+                    break;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn flush_cf(&self, cf: &str) -> Result<()> {
+        self.db.flush_cf(self.cf(cf)?)?;
+        Ok(())
+    }
+
+    fn write_batch(&self, batch: &StorageWriteBatch) -> Result<()> {
+        RocksDbBatchWriter::new(Arc::clone(&self.db)).write_batch(batch)
     }
 }
 
