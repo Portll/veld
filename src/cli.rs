@@ -514,7 +514,14 @@ fn handle_init() -> Result<()> {
         std::fs::write(&config_path, config_content)?;
         restrict_config_permissions(&config_path);
         eprintln!("  ✓ Config created: {}", config_path.display());
-        eprintln!("  ✓ API key generated: {}", api_key);
+        // The full key was just written to the config file with restricted permissions — that is
+        // where the user retrieves it. Printing it here lands it in every captured stderr, shell
+        // transcript and CI log this command runs under, so only a recognisable prefix is shown.
+        eprintln!(
+            "  ✓ API key generated: {}… (full key stored in {})",
+            &api_key[..api_key.len().min(8)],
+            config_path.display()
+        );
     }
 
     // 3. Pre-download ONNX runtime + embedding model
