@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use parking_lot::RwLock;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -38,12 +38,13 @@ const CF_TODO_INDEX: &str = "todo_index";
 /// Prior versions wrote bare timestamps (e.g. `due:1739404800:user:uuid`), which break
 /// lexicographic ordering (`"9" > "10"`). Zero-padding to 20 digits ensures
 /// lex order = chronological order, enabling ordered range scans.
-fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
-    let mut batch = WriteBatch::default();
+fn migrate_due_key_padding(store: &dyn crate::storage::ColumnStore) -> Result<usize> {
+    // A logical key rewrite, not a rocksdb-to-rocksdb import — so it runs on the
+    // trait and applies to whichever backend holds the rows.
+    let mut batch = crate::storage::WriteBatch::new();
     let mut count = 0;
 
-    for item in db.prefix_iterator_cf(index_cf, b"due:") {
-        let (key, value) = item.context("Failed to read due index during migration")?;
+    for (key, value) in store.scan_cf(CF_TODO_INDEX, Some(b"due:"), None)? {
         let key_str = std::str::from_utf8(&key).context("Non-UTF8 key in todo due index")?;
 
         // Key format: due:{timestamp}:{user_id}:{todo_id}
@@ -59,14 +60,15 @@ fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
 
         if let Ok(ts) = parts[1].parse::<i64>() {
             let new_key = format!("due:{:020}:{}:{}", ts, parts[2], parts[3]);
-            batch.delete_cf(index_cf, &*key);
-            batch.put_cf(index_cf, new_key.as_bytes(), &*value);
+            batch.delete_cf(CF_TODO_INDEX, key);
+            batch.put_cf(CF_TODO_INDEX, new_key.as_bytes(), value);
             count += 1;
         }
     }
 
     if count > 0 {
-        db.write(batch)
+        store
+            .write_batch(&batch)
             .context("Failed to write migrated todo due keys")?;
         tracing::info!(count, "Migrated todo due keys to zero-padded format");
     }
@@ -76,7 +78,11 @@ fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
 
 /// Storage and query engine for todos and projects
 pub struct TodoStore {
-    /// Shared RocksDB instance with column families for todos, projects, and indices
+    /// Three families — CF_TODOS, CF_PROJECTS, CF_TODO_INDEX — so this takes the
+    /// multi-family handle rather than a KeyValueStore bound to one.
+    store: Arc<dyn crate::storage::ColumnStore>,
+    /// Kept ONLY for migrate_from_separate_dbs (a one-time rocksdb-to-rocksdb
+    /// import from superseded directories) and the backup accessor below.
     db: Arc<DB>,
     /// Vector index for semantic search (per-user indices)
     vector_indices: RwLock<HashMap<String, VamanaIndex>>,
@@ -100,20 +106,6 @@ impl TodoStore {
         ]
     }
 
-    fn todos_cf(&self) -> &ColumnFamily {
-        self.db.cf_handle(CF_TODOS).expect("todos CF must exist")
-    }
-    fn projects_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_PROJECTS)
-            .expect("projects CF must exist")
-    }
-    fn todo_index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_TODO_INDEX)
-            .expect("todo_index CF must exist")
-    }
-
     /// Create a new todo store backed by the given shared DB
     pub fn new(db: Arc<DB>, storage_path: &Path) -> Result<Self> {
         let todos_path = storage_path.join("todos");
@@ -122,15 +114,17 @@ impl TodoStore {
         // Migrate from old separate-DB layout if needed
         Self::migrate_from_separate_dbs(&todos_path, &db)?;
 
+        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
+        );
+
         // Migrate any unpadded due keys from prior versions
-        let index_cf = db
-            .cf_handle(CF_TODO_INDEX)
-            .expect("todo_index CF must exist");
-        migrate_due_key_padding(&db, index_cf)?;
+        migrate_due_key_padding(store.as_ref())?;
 
         tracing::info!("Todo store initialized");
 
         Ok(Self {
+            store,
             db,
             vector_indices: RwLock::new(HashMap::new()),
             storage_path: todos_path,
@@ -255,7 +249,7 @@ impl TodoStore {
     /// Get a todo by its vector index ID (stored in todo_index CF)
     fn get_todo_by_vector_id(&self, user_id: &str, vector_id: u32) -> Result<Option<Todo>> {
         let key = format!("vector_id:{}:{}", user_id, vector_id);
-        if let Some(data) = self.db.get_cf(self.todo_index_cf(), key.as_bytes())? {
+        if let Some(data) = self.store.get_cf(CF_TODO_INDEX, key.as_bytes())? {
             let todo_id_str = String::from_utf8_lossy(&data);
             if let Ok(uuid) = Uuid::parse_str(&todo_id_str) {
                 return self.get_todo(user_id, &TodoId(uuid));
@@ -271,22 +265,27 @@ impl TodoStore {
         vector_id: u32,
         todo_id: &TodoId,
     ) -> Result<()> {
-        let mut batch = WriteBatch::default();
-        let index_cf = self.todo_index_cf();
+        // Two ops on the SAME family — kept one batch for the same commit
+        // semantics the rocksdb version had.
+        let mut batch = crate::storage::WriteBatch::new();
 
         // Forward: vector_id → todo_id (for search result resolution)
         let fwd_key = format!("vector_id:{}:{}", user_id, vector_id);
         batch.put_cf(
-            index_cf,
+            CF_TODO_INDEX,
             fwd_key.as_bytes(),
             todo_id.0.to_string().as_bytes(),
         );
 
         // Reverse: todo_id → vector_id (for cleanup on delete)
         let rev_key = format!("todo_vector:{}:{}", user_id, todo_id.0);
-        batch.put_cf(index_cf, rev_key.as_bytes(), vector_id.to_le_bytes());
+        batch.put_cf(
+            CF_TODO_INDEX,
+            rev_key.as_bytes(),
+            &vector_id.to_le_bytes()[..],
+        );
 
-        self.db.write(batch)?;
+        self.store.write_batch(&batch)?;
         Ok(())
     }
 
@@ -343,7 +342,7 @@ impl TodoStore {
             Some(pid) => format!("seq:{}:{}", user_id, pid.0),
             None => format!("seq:{}:_standalone_", user_id),
         };
-        let current = match self.db.get_cf(self.todo_index_cf(), key.as_bytes())? {
+        let current = match self.store.get_cf(CF_TODO_INDEX, key.as_bytes())? {
             Some(data) => {
                 if data.len() >= 4 {
                     let bytes: [u8; 4] = [data[0], data[1], data[2], data[3]];
@@ -355,8 +354,8 @@ impl TodoStore {
             None => 0,
         };
         let next = current + 1;
-        self.db
-            .put_cf(self.todo_index_cf(), key.as_bytes(), next.to_le_bytes())?;
+        self.store
+            .put_cf(CF_TODO_INDEX, key.as_bytes(), &next.to_le_bytes())?;
         Ok(next)
     }
 
@@ -400,8 +399,8 @@ impl TodoStore {
         let key = format!("{}:{}", todo_to_store.user_id, todo_to_store.id.0);
         let value = serde_json::to_vec(&todo_to_store).context("Failed to serialize todo")?;
 
-        self.db
-            .put_cf(self.todos_cf(), key.as_bytes(), &value)
+        self.store
+            .put_cf(CF_TODOS, key.as_bytes(), &value)
             .context("Failed to store todo")?;
 
         self.update_todo_indices(&todo_to_store)?;
@@ -419,17 +418,16 @@ impl TodoStore {
 
     /// Update todo indices
     fn update_todo_indices(&self, todo: &Todo) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let id_str = todo.id.0.to_string();
-        let index_cf = self.todo_index_cf();
 
         // Index by user (for listing)
         let user_key = format!("user:{}:{}", todo.user_id, id_str);
-        batch.put_cf(index_cf, user_key.as_bytes(), b"1");
+        batch.put_cf(CF_TODO_INDEX,user_key.as_bytes(), b"1");
 
         // Index by status
         let status_key = format!("status:{:?}:{}:{}", todo.status, todo.user_id, id_str);
-        batch.put_cf(index_cf, status_key.as_bytes(), b"1");
+        batch.put_cf(CF_TODO_INDEX,status_key.as_bytes(), b"1");
 
         // Index by priority
         let priority_key = format!(
@@ -438,40 +436,40 @@ impl TodoStore {
             todo.user_id,
             id_str
         );
-        batch.put_cf(index_cf, priority_key.as_bytes(), b"1");
+        batch.put_cf(CF_TODO_INDEX,priority_key.as_bytes(), b"1");
 
         // Index by project
         if let Some(ref project_id) = todo.project_id {
             let project_key = format!("project:{}:{}:{}", project_id.0, todo.user_id, id_str);
-            batch.put_cf(index_cf, project_key.as_bytes(), b"1");
+            batch.put_cf(CF_TODO_INDEX,project_key.as_bytes(), b"1");
         }
 
         // Index by due date (zero-padded for correct lexicographic ordering)
         if let Some(ref due) = todo.due_date {
             let due_key = format!("due:{:020}:{}:{}", due.timestamp(), todo.user_id, id_str);
-            batch.put_cf(index_cf, due_key.as_bytes(), b"1");
+            batch.put_cf(CF_TODO_INDEX,due_key.as_bytes(), b"1");
         }
 
         // Index by context
         for ctx in &todo.contexts {
             let ctx_key = format!("context:{}:{}:{}", ctx.to_lowercase(), todo.user_id, id_str);
-            batch.put_cf(index_cf, ctx_key.as_bytes(), b"1");
+            batch.put_cf(CF_TODO_INDEX,ctx_key.as_bytes(), b"1");
         }
 
         // Index by parent (for subtasks)
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
-            batch.put_cf(index_cf, parent_key.as_bytes(), todo.user_id.as_bytes());
+            batch.put_cf(CF_TODO_INDEX,parent_key.as_bytes(), todo.user_id.as_bytes());
         }
 
         // Index dependencies: forward (dep:{dep_id}:{this_id}) for "who depends on dep_id?"
         for dep_id in &todo.depends_on {
             let dep_key = format!("dep:{}:{}", dep_id.0, id_str);
-            batch.put_cf(index_cf, dep_key.as_bytes(), todo.user_id.as_bytes());
+            batch.put_cf(CF_TODO_INDEX,dep_key.as_bytes(), todo.user_id.as_bytes());
         }
 
-        self.db
-            .write(batch)
+        self.store
+            .write_batch(&batch)
             .context("Failed to update todo indices")?;
 
         Ok(())
@@ -479,15 +477,14 @@ impl TodoStore {
 
     /// Remove todo indices and clean up vector embeddings
     fn remove_todo_indices(&self, todo: &Todo) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let id_str = todo.id.0.to_string();
-        let index_cf = self.todo_index_cf();
 
         let user_key = format!("user:{}:{}", todo.user_id, id_str);
-        batch.delete_cf(index_cf, user_key.as_bytes());
+        batch.delete_cf(CF_TODO_INDEX,user_key.as_bytes());
 
         let status_key = format!("status:{:?}:{}:{}", todo.status, todo.user_id, id_str);
-        batch.delete_cf(index_cf, status_key.as_bytes());
+        batch.delete_cf(CF_TODO_INDEX,status_key.as_bytes());
 
         let priority_key = format!(
             "priority:{}:{}:{}",
@@ -495,37 +492,37 @@ impl TodoStore {
             todo.user_id,
             id_str
         );
-        batch.delete_cf(index_cf, priority_key.as_bytes());
+        batch.delete_cf(CF_TODO_INDEX,priority_key.as_bytes());
 
         if let Some(ref project_id) = todo.project_id {
             let project_key = format!("project:{}:{}:{}", project_id.0, todo.user_id, id_str);
-            batch.delete_cf(index_cf, project_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX,project_key.as_bytes());
         }
 
         if let Some(ref due) = todo.due_date {
             let due_key = format!("due:{:020}:{}:{}", due.timestamp(), todo.user_id, id_str);
-            batch.delete_cf(index_cf, due_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX,due_key.as_bytes());
         }
 
         for ctx in &todo.contexts {
             let ctx_key = format!("context:{}:{}:{}", ctx.to_lowercase(), todo.user_id, id_str);
-            batch.delete_cf(index_cf, ctx_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX,ctx_key.as_bytes());
         }
 
         if let Some(ref parent_id) = todo.parent_id {
             let parent_key = format!("parent:{}:{}", parent_id.0, id_str);
-            batch.delete_cf(index_cf, parent_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX,parent_key.as_bytes());
         }
 
         // Remove dependency index entries
         for dep_id in &todo.depends_on {
             let dep_key = format!("dep:{}:{}", dep_id.0, id_str);
-            batch.delete_cf(index_cf, dep_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX,dep_key.as_bytes());
         }
 
         // Clean up vector index mapping: look up vector_id from reverse mapping
         let rev_key = format!("todo_vector:{}:{}", todo.user_id, id_str);
-        if let Some(vid_bytes) = self.db.get_cf(index_cf, rev_key.as_bytes())? {
+        if let Some(vid_bytes) = self.store.get_cf(CF_TODO_INDEX, rev_key.as_bytes())? {
             if vid_bytes.len() >= 4 {
                 let vector_id =
                     u32::from_le_bytes([vid_bytes[0], vid_bytes[1], vid_bytes[2], vid_bytes[3]]);
@@ -538,13 +535,13 @@ impl TodoStore {
 
                 // Remove forward mapping
                 let fwd_key = format!("vector_id:{}:{}", todo.user_id, vector_id);
-                batch.delete_cf(index_cf, fwd_key.as_bytes());
+                batch.delete_cf(CF_TODO_INDEX,fwd_key.as_bytes());
             }
             // Remove reverse mapping
-            batch.delete_cf(index_cf, rev_key.as_bytes());
+            batch.delete_cf(CF_TODO_INDEX,rev_key.as_bytes());
         }
 
-        self.db.write(batch)?;
+        self.store.write_batch(&batch)?;
         Ok(())
     }
 
@@ -552,7 +549,7 @@ impl TodoStore {
     pub fn get_todo(&self, user_id: &str, todo_id: &TodoId) -> Result<Option<Todo>> {
         let key = format!("{}:{}", user_id, todo_id.0);
 
-        match self.db.get_cf(self.todos_cf(), key.as_bytes())? {
+        match self.store.get_cf(CF_TODOS, key.as_bytes())? {
             Some(value) => {
                 let mut todo: Todo =
                     serde_json::from_slice(&value).context("Failed to deserialize todo")?;
@@ -651,7 +648,7 @@ impl TodoStore {
             for subtask in &subtasks {
                 self.remove_todo_indices(subtask)?;
                 let subtask_key = format!("{}:{}", subtask.user_id, subtask.id.0);
-                self.db.delete_cf(self.todos_cf(), subtask_key.as_bytes())?;
+                self.store.delete_cf(CF_TODOS, subtask_key.as_bytes())?;
                 tracing::debug!(
                     todo_id = %subtask.id,
                     parent_id = %todo_id,
@@ -660,7 +657,7 @@ impl TodoStore {
             }
 
             self.remove_todo_indices(&todo)?;
-            self.db.delete_cf(self.todos_cf(), key.as_bytes())?;
+            self.store.delete_cf(CF_TODOS, key.as_bytes())?;
             tracing::debug!(
                 todo_id = %todo_id,
                 subtasks_deleted = subtasks.len(),
@@ -872,17 +869,12 @@ impl TodoStore {
         let prefix = format!("user:{}:", user_id);
         let mut todos = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
-
-        for item in iter {
-            let (key, _) = item?;
+        // scan_cf enforces the prefix bound.
+        for (key, _) in self
+            .store
+            .scan_cf(CF_TODO_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             // Extract todo_id from key "user:{user_id}:{todo_id}"
             let todo_id_str = key_str.strip_prefix(&prefix).unwrap_or("");
@@ -934,17 +926,12 @@ impl TodoStore {
         let prefix = format!("project:{}:{}:", project_id.0, user_id);
         let mut todos = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
-
-        for item in iter {
-            let (key, _) = item?;
+        // scan_cf enforces the prefix bound.
+        for (key, _) in self
+            .store
+            .scan_cf(CF_TODO_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             let todo_id_str = key_str.strip_prefix(&prefix).unwrap_or("");
             if let Ok(uuid) = Uuid::parse_str(todo_id_str) {
@@ -963,17 +950,12 @@ impl TodoStore {
         let prefix = format!("context:{}:{}:", ctx_lower, user_id);
         let mut todos = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
-
-        for item in iter {
-            let (key, _) = item?;
+        // scan_cf enforces the prefix bound.
+        for (key, _) in self
+            .store
+            .scan_cf(CF_TODO_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             let todo_id_str = key_str.strip_prefix(&prefix).unwrap_or("");
             if let Ok(uuid) = Uuid::parse_str(todo_id_str) {
@@ -1022,17 +1004,12 @@ impl TodoStore {
         let prefix = format!("parent:{}:", parent_id.0);
         let mut todos = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
-
-        for item in iter {
-            let (key, value) = item?;
+        // scan_cf enforces the prefix bound.
+        for (key, value) in self
+            .store
+            .scan_cf(CF_TODO_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             let todo_id_str = key_str.strip_prefix(&prefix).unwrap_or("");
             let user_id = String::from_utf8_lossy(&value);
@@ -1081,15 +1058,12 @@ impl TodoStore {
         let prefix = format!("dep:{}:", todo_id.0);
         let mut dependents = Vec::new();
 
-        for item in self
-            .db
-            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes())
+        // scan_cf enforces the prefix bound.
+        for (key, value) in self
+            .store
+            .scan_cf(CF_TODO_INDEX, Some(prefix.as_bytes()), None)?
         {
-            let (key, value) = item?;
             let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
             let dependent_id_str = key_str.strip_prefix(&prefix).unwrap_or("");
             let user_id = String::from_utf8_lossy(&value);
             if let Ok(uuid) = uuid::Uuid::parse_str(dependent_id_str) {
@@ -1208,12 +1182,12 @@ impl TodoStore {
         let key = format!("{}:{}", project.user_id, project.id.0);
         let value = serde_json::to_vec(project).context("Failed to serialize project")?;
 
-        self.db.put_cf(self.projects_cf(), key.as_bytes(), &value)?;
+        self.store.put_cf(CF_PROJECTS, key.as_bytes(), &value)?;
 
         // Index by user
         let user_key = format!("user:{}:{}", project.user_id, project.id.0);
-        self.db
-            .put_cf(self.todo_index_cf(), user_key.as_bytes(), b"p")?; // 'p' for project
+        self.store
+            .put_cf(CF_TODO_INDEX, user_key.as_bytes(), b"p")?; // 'p' for project
 
         // Index by name (for lookup) - store as string for easy parsing
         let name_key = format!(
@@ -1221,8 +1195,8 @@ impl TodoStore {
             project.name.to_lowercase(),
             project.user_id
         );
-        self.db.put_cf(
-            self.todo_index_cf(),
+        self.store.put_cf(
+            CF_TODO_INDEX,
             name_key.as_bytes(),
             project.id.0.to_string().as_bytes(),
         )?;
@@ -1233,8 +1207,8 @@ impl TodoStore {
                 "project_parent:{}:{}:{}",
                 project.user_id, parent_id.0, project.id.0
             );
-            self.db
-                .put_cf(self.todo_index_cf(), parent_key.as_bytes(), b"1")?;
+            self.store
+                .put_cf(CF_TODO_INDEX, parent_key.as_bytes(), b"1")?;
         }
 
         tracing::debug!(project_id = %project.id.0, name = %project.name, parent = ?project.parent_id, "Stored project");
@@ -1246,7 +1220,7 @@ impl TodoStore {
     pub fn get_project(&self, user_id: &str, project_id: &ProjectId) -> Result<Option<Project>> {
         let key = format!("{}:{}", user_id, project_id.0);
 
-        match self.db.get_cf(self.projects_cf(), key.as_bytes())? {
+        match self.store.get_cf(CF_PROJECTS, key.as_bytes())? {
             Some(value) => {
                 let project: Project =
                     serde_json::from_slice(&value).context("Failed to deserialize project")?;
@@ -1260,7 +1234,7 @@ impl TodoStore {
     pub fn find_project_by_name(&self, user_id: &str, name: &str) -> Result<Option<Project>> {
         let name_key = format!("project_name:{}:{}", name.to_lowercase(), user_id);
 
-        if let Some(value) = self.db.get_cf(self.todo_index_cf(), name_key.as_bytes())? {
+        if let Some(value) = self.store.get_cf(CF_TODO_INDEX, name_key.as_bytes())? {
             if let Ok(uuid) = Uuid::parse_str(&String::from_utf8_lossy(&value)) {
                 return self.get_project(user_id, &ProjectId(uuid));
             }
@@ -1284,18 +1258,12 @@ impl TodoStore {
     pub fn list_projects(&self, user_id: &str) -> Result<Vec<Project>> {
         let mut projects = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.projects_cf(), format!("{}:", user_id).as_bytes());
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&format!("{}:", user_id)) {
-                break;
-            }
-
+        let prefix = format!("{}:", user_id);
+        // scan_cf enforces the prefix bound.
+        for (_key, value) in self
+            .store
+            .scan_cf(CF_PROJECTS, Some(prefix.as_bytes()), None)?
+        {
             let project: Project = serde_json::from_slice(&value)?;
             projects.push(project);
         }
@@ -1311,17 +1279,12 @@ impl TodoStore {
         let mut subprojects = Vec::new();
 
         let prefix = format!("project_parent:{}:{}:", user_id, parent_id.0);
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.todo_index_cf(), prefix.as_bytes());
-
-        for item in iter {
-            let (key, _) = item?;
+        // scan_cf enforces the prefix bound.
+        for (key, _) in self
+            .store
+            .scan_cf(CF_TODO_INDEX, Some(prefix.as_bytes()), None)?
+        {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             // Extract project ID from key
             let parts: Vec<&str> = key_str.split(':').collect();
@@ -1422,8 +1385,8 @@ impl TodoStore {
                 if project.name != old_name {
                     let old_name_key =
                         format!("project_name:{}:{}", old_name.to_lowercase(), user_id);
-                    self.db
-                        .delete_cf(self.todo_index_cf(), old_name_key.as_bytes())?;
+                    self.store
+                        .delete_cf(CF_TODO_INDEX, old_name_key.as_bytes())?;
                 }
 
                 self.store_project(&project)?;
@@ -1459,16 +1422,16 @@ impl TodoStore {
 
             // Delete project
             let key = format!("{}:{}", user_id, project_id.0);
-            self.db.delete_cf(self.projects_cf(), key.as_bytes())?;
+            self.store.delete_cf(CF_PROJECTS, key.as_bytes())?;
 
             // Delete indices
             let user_key = format!("user:{}:{}", user_id, project_id.0);
-            self.db
-                .delete_cf(self.todo_index_cf(), user_key.as_bytes())?;
+            self.store
+                .delete_cf(CF_TODO_INDEX, user_key.as_bytes())?;
 
             let name_key = format!("project_name:{}:{}", project.name.to_lowercase(), user_id);
-            self.db
-                .delete_cf(self.todo_index_cf(), name_key.as_bytes())?;
+            self.store
+                .delete_cf(CF_TODO_INDEX, name_key.as_bytes())?;
 
             // Delete parent index (if this was a sub-project)
             if let Some(ref parent_id) = project.parent_id {
@@ -1476,8 +1439,8 @@ impl TodoStore {
                     "project_parent:{}:{}:{}",
                     user_id, parent_id.0, project_id.0
                 );
-                self.db
-                    .delete_cf(self.todo_index_cf(), parent_key.as_bytes())?;
+                self.store
+                    .delete_cf(CF_TODO_INDEX, parent_key.as_bytes())?;
             }
 
             Ok(true)
@@ -1498,16 +1461,12 @@ impl TodoStore {
 
     /// Flush all RocksDB column families and save vector indices to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
-        use rocksdb::FlushOptions;
-        let mut flush_opts = FlushOptions::default();
-        flush_opts.set_wait(true);
-
-        for cf_name in &[CF_TODOS, CF_PROJECTS, CF_TODO_INDEX] {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                self.db
-                    .flush_cf_opt(cf, &flush_opts)
-                    .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
-            }
+        // One flush per family, errors propagated — the old loop did the same with
+        // flush_cf_opt(set_wait(true)); the trait's flush is synchronous.
+        for cf_name in [CF_TODOS, CF_PROJECTS, CF_TODO_INDEX] {
+            self.store
+                .flush_cf(cf_name)
+                .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
         }
 
         // Save vector indices
@@ -1678,8 +1637,9 @@ mod tests {
         )
         .unwrap();
 
-        // Run migration
-        let migrated = migrate_due_key_padding(&db, index_cf).unwrap();
+        // Run migration through the trait, as new() does
+        let store = crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db));
+        let migrated = migrate_due_key_padding(&store).unwrap();
         assert_eq!(migrated, 2);
 
         // Verify old keys are gone
@@ -1705,7 +1665,7 @@ mod tests {
         );
 
         // Re-running migration should be a no-op
-        let migrated_again = migrate_due_key_padding(&db, index_cf).unwrap();
+        let migrated_again = migrate_due_key_padding(&store).unwrap();
         assert_eq!(migrated_again, 0);
     }
 
