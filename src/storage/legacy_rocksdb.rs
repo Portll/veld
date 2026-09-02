@@ -398,7 +398,7 @@ impl GraphStore for RocksDbGraphStore {
 
     fn flush(&self) -> Result<()> {
         self.inner
-            .get_db()
+            .rocksdb_for_backup()
             .flush()
             .context("Failed to flush legacy RocksDB graph store")?;
         Ok(())

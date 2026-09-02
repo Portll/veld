@@ -3002,7 +3002,23 @@ impl MultiUserMemoryManager {
                     }
                 };
                 let memory_guard = memory_sys.read();
-                let db = memory_guard.get_db();
+                // Same refuse-don't-degrade shape as the graph below: a system
+                // that is not rocksdb-backed has no engine DB for the rocksdb
+                // BackupEngine, and pretending otherwise writes an archive
+                // missing its primary store while reporting success.
+                let db = match memory_guard.rocksdb_for_comprehensive_backup() {
+                    Some(db) => db,
+                    None => {
+                        if let Some(staged) = &staged {
+                            let _ = std::fs::remove_dir_all(&staged.staging_dir);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "refusing comprehensive backup for '{user_id}': the memory system \
+                             is not rocksdb-backed, and the comprehensive backup is a rocksdb \
+                             BackupEngine facility. The redb route is export/import."
+                        ));
+                    }
+                };
 
                 let secondary_refs = self.collect_legacy_secondary_store_refs();
                 let store_refs: Vec<crate::backup::SecondaryStoreRef<'_>> = secondary_refs
@@ -3032,7 +3048,7 @@ impl MultiUserMemoryManager {
                     )
                 })?;
                 let graph_guard = graph_lock.read();
-                let graph_db_ref = Some(graph_guard.get_db());
+                let graph_db_ref = Some(graph_guard.rocksdb_for_backup());
 
                 self.backup_engine.create_comprehensive_backup_with_staged_intent_log(
                     &db,
