@@ -166,6 +166,37 @@ pub fn read_all<R: Read>(mut src: R) -> Result<Vec<PortableRecord>> {
     Ok(out)
 }
 
+/// The trailer's record count and digest, without reading the frames.
+///
+/// For listing many dumps: `read_all` loads the whole file to answer a question the
+/// last 48 bytes already hold. It still REFUSES a file with no trailer, so a
+/// truncated backup is caught at list time and not only at restore time — which is
+/// the point at which finding out is expensive.
+pub fn read_trailer(path: &std::path::Path) -> Result<(u64, [u8; 32])> {
+    use std::io::{Seek, SeekFrom};
+    const TRAILER_LEN: i64 = 8 + 8 + 32;
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let len = f.metadata()?.len();
+    if len < 12 + TRAILER_LEN as u64 {
+        bail!("{} is {len} bytes — too short to hold a header and a trailer", path.display());
+    }
+    f.seek(SeekFrom::End(-TRAILER_LEN))?;
+    let mut buf = [0u8; TRAILER_LEN as usize];
+    f.read_exact(&mut buf)?;
+    if &buf[..8] != TRAILER {
+        bail!("{} does not end with a trailer — truncated or corrupt", path.display());
+    }
+    let count = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let digest: [u8; 32] = buf[16..].try_into().unwrap();
+    Ok((count, digest))
+}
+
+/// A digest as the lowercase hex this codebase stores in `BackupMetadata.checksum`.
+pub fn hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +279,47 @@ mod tests {
         let err = read_all(&b"this is a tarball, honestly, and it is long enough"[..])
             .expect_err("magic must be checked");
         assert!(err.to_string().contains("magic"));
+    }
+}
+
+#[cfg(test)]
+mod trailer_tests {
+    use super::*;
+
+    #[test]
+    fn the_trailer_reader_agrees_with_a_full_read() {
+        // Two ways to the same number, and they must not diverge — the cheap one is
+        // what `list_backups` trusts, and a listing that disagrees with a restore is
+        // worse than a slow listing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.veldport");
+        let mut buf = Vec::new();
+        let mut w = PortableWriter::new(&mut buf).unwrap();
+        for i in 0..7u8 {
+            w.write_record(&PortableRecord { cf: "kv".into(), key: vec![i], value: vec![i, i] }).unwrap();
+        }
+        let (count, digest) = w.finish().unwrap();
+        std::fs::write(&path, &buf).unwrap();
+
+        let (t_count, t_digest) = read_trailer(&path).unwrap();
+        assert_eq!(t_count, count);
+        assert_eq!(t_digest, digest);
+        assert_eq!(read_all(&buf[..]).unwrap().len() as u64, t_count);
+    }
+
+    #[test]
+    fn a_truncated_dump_is_refused_at_LIST_time_not_only_at_restore() {
+        // The whole reason the cheap reader still validates: finding out a backup is
+        // unusable when you come to restore it is finding out too late.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.veldport");
+        let mut buf = Vec::new();
+        let mut w = PortableWriter::new(&mut buf).unwrap();
+        w.write_record(&PortableRecord { cf: "kv".into(), key: b"a".to_vec(), value: b"1".to_vec() }).unwrap();
+        w.finish().unwrap();
+        std::fs::write(&path, &buf[..buf.len() - 9]).unwrap();
+
+        let err = read_trailer(&path).expect_err("a truncated dump must not list as usable");
+        assert!(err.to_string().contains("trailer") || err.to_string().contains("too short"));
     }
 }

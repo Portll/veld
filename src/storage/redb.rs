@@ -378,6 +378,12 @@ impl RedbPrimaryMemoryStore {
         Ok(Self { database })
     }
 
+    /// The live database handle, for stores that must share it rather than open the
+    /// path again — see RedbBackupStore. redb permits one opener per file.
+    pub fn database(&self) -> Arc<redb::Database> {
+        Arc::clone(&self.database)
+    }
+
     /// Decode every stored memory. Backs structured `search`: the memories table
     /// is the single source of truth, scanned and filtered by [`search_matches`].
     fn scan_all_memories(&self) -> Result<Vec<Memory>> {
@@ -1386,12 +1392,84 @@ mod redb_domain_tests {
 
 pub struct RedbBackupStore {
     path: PathBuf,
+    /// The SAME handle the primary store uses, when there is one.
+    ///
+    /// redb allows one opener per database file. A backup store that opens by path
+    /// therefore cannot run while the store it backs up is open — which is every
+    /// moment that matters. Caught by its own tests with "Database already open.
+    /// Cannot acquire lock.", after this file's own BatchWriter note already said a
+    /// second opener dies on the lock. The rocksdb side reached the same conclusion
+    /// and refuses at the factory: "requires a bound primary DB reference".
+    database: Arc<redb::Database>,
 }
 
 impl RedbBackupStore {
+    fn backup_dir(&self, user_id: &str) -> PathBuf {
+        self.path.join("backups").join(user_id)
+    }
+
+    /// The next id, from a persisted high-water mark — NOT from what is on disk.
+    ///
+    /// Deriving it from the directory looked right and is wrong: delete a backup and
+    /// the next one takes its number, so a restore that names id 2 resolves to
+    /// different bytes than it did yesterday, silently. Its own test caught this.
+    ///
+    /// The counter is the source, and the directory is a FLOOR under it rather than
+    /// the answer — if the marker is lost the ids still cannot go backwards past
+    /// what exists. Two sources, and the higher wins, because the failure being
+    /// prevented is only ever an id going DOWN.
+    fn next_backup_id(&self, dir: &Path) -> Result<u32> {
+        let marker = dir.join(".next_backup_id");
+        let recorded: u32 = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        let mut on_disk = 0u32;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(n) = stem.trim_end_matches(".meta").parse::<u32>() {
+                        on_disk = on_disk.max(n);
+                    }
+                }
+            }
+        }
+
+        let next = recorded.max(on_disk) + 1;
+        std::fs::write(&marker, next.to_string())
+            .with_context(|| format!("recording the next backup id in {}", marker.display()))?;
+        Ok(next)
+    }
+
+    /// Every table in the store, sorted. These are redb's column families.
+    fn table_names(&self) -> Result<Vec<String>> {
+        let read = self.database.begin_read()?;
+        let mut names: Vec<String> = read.list_tables()?.map(|t| t.name().to_string()).collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn count_memories(&self) -> Result<usize> {
+        let txn = self.database.begin_read()?;
+        match txn.open_table(MEMORIES_TABLE) {
+            Ok(t) => Ok(t.len()? as usize),
+            Err(_) => Ok(0),
+        }
+    }
+
+    /// Share a live handle — the constructor a running server must use.
+    pub fn from_database(database: Arc<redb::Database>, path: &Path) -> Self {
+        Self { path: path.to_path_buf(), database }
+    }
+
+    /// Open standalone. Only valid when nothing else holds the database: an offline
+    /// tool, or a restore into a fresh target. Fails on the lock otherwise, loudly.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
+        let database = create_redb_database(&path.join("storage.redb"))?;
         Ok(Self {
+            database,
             path: path.to_path_buf(),
         })
     }
@@ -1402,29 +1480,153 @@ impl BackupStore for RedbBackupStore {
         StorageBackend::Redb
     }
 
-    fn create_backup(&self, _user_id: &str) -> Result<BackupMetadata> {
-        Err(not_implemented("backup create", &self.path))
+    fn create_backup(&self, user_id: &str) -> Result<BackupMetadata> {
+        // A redb backup IS a portable dump. rocksdb uses its own BackupEngine, which
+        // has no redb analogue — so rather than a second mechanism this reuses
+        // export_portable, which means the same verification (trailer, count, digest)
+        // guards a backup and a cutover.
+        let dir = self.backup_dir(user_id);
+        std::fs::create_dir_all(&dir)?;
+        let backup_id = self.next_backup_id(&dir)?;
+        let dump = dir.join(format!("{backup_id}.veldport"));
+
+        RedbMigrationStore::from_database(Arc::clone(&self.database), &self.path)
+            .export_portable(user_id, &dump)?;
+
+        // Read the trailer back rather than trusting the writer's return: the file on
+        // disk is what a restore will use, and this is the one moment it is cheap to
+        // confirm the two agree.
+        let (records, digest) = crate::storage::portable::read_trailer(&dump)?;
+        let memory_count = self.count_memories()?;
+        let tables = self.table_names()?;
+        let meta = BackupMetadata {
+            backup_id,
+            created_at: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            backup_type: crate::backup::BackupType::Full,
+            size_bytes: std::fs::metadata(&dump)?.len(),
+            checksum: crate::storage::portable::hex(&digest),
+            memory_count,
+
+            // The rocksdb-shaped fields, filled honestly rather than with zeros that
+            // would read as measurements.
+            //
+            // `sequence_number` is documented "RocksDB sequence number (for PITR)".
+            // redb has no analogue and the field is not Option, so 0 is the only
+            // available value — it means ABSENT here, not "sequence zero", and must
+            // not be read as a point-in-time anchor for a redb backup.
+            sequence_number: 0,
+            // Not empty. A redb dump contains every table in one file, so the
+            // secondary stores ARE captured — reporting none would be the exact shape
+            // of 4d1ec01, "a backup that omitted a store said success", with the sign
+            // flipped: a backup that included them claiming it did not.
+            secondary_stores: tables.clone(),
+            // ...and their bytes are inside `size_bytes` above, not in separate
+            // archives, so there is no second figure to report.
+            secondary_size_bytes: 0,
+            // redb has no intent log and no journal, so there is no consistency cut to
+            // name. `journal_cut_lsn` is Option precisely for this and takes None;
+            // an empty Vec here is a true statement, not a missing measurement.
+            intent_log_files: Vec::new(),
+            journal_cut_lsn: None,
+            // redb tables are this backend's column families, one for one.
+            column_families: tables,
+        };
+        std::fs::write(
+            dir.join(format!("{backup_id}.meta.json")),
+            serde_json::to_vec_pretty(&meta)?,
+        )?;
+        tracing::info!(user_id, backup_id, records, memory_count, "redb backup written");
+        Ok(meta)
     }
 
-    fn list_backups(&self, _user_id: &str) -> Result<Vec<BackupMetadata>> {
-        Err(not_implemented("backup list", &self.path))
+    fn list_backups(&self, user_id: &str) -> Result<Vec<BackupMetadata>> {
+        let dir = self.backup_dir(user_id);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // ENOENT is the only absence that means "no backups yet".
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).context(format!("reading {}", dir.display())),
+        };
+
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let meta: BackupMetadata = match std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+            {
+                Some(m) => m,
+                None => {
+                    tracing::error!(path = %path.display(), "unreadable backup metadata — not listed");
+                    continue;
+                }
+            };
+            // THE SIDECAR IS CROSS-CHECKED, NEVER TRUSTED. It is a separate file from
+            // the dump it describes, so it can drift — or survive a dump that was
+            // truncated after it was written. A listing is a promise that these can be
+            // restored, so a backup whose trailer disagrees with its own metadata is
+            // reported as broken rather than offered as usable.
+            let dump = dir.join(format!("{}.veldport", meta.backup_id));
+            match crate::storage::portable::read_trailer(&dump) {
+                Ok((_, digest)) if crate::storage::portable::hex(&digest) == meta.checksum => {
+                    out.push(meta)
+                }
+                Ok(_) => tracing::error!(backup_id = meta.backup_id,
+                    "backup checksum does not match its metadata — NOT listed as restorable"),
+                Err(e) => tracing::error!(backup_id = meta.backup_id, error = %e,
+                    "backup dump is unreadable — NOT listed as restorable"),
+            }
+        }
+        out.sort_by_key(|m| m.backup_id);
+        Ok(out)
     }
 
-    fn restore_backup(&self, _user_id: &str, _backup_id: u32, _target_path: &Path) -> Result<()> {
-        Err(not_implemented("backup restore", &self.path))
+    fn restore_backup(&self, user_id: &str, backup_id: u32, target_path: &Path) -> Result<()> {
+        let dump = self.backup_dir(user_id).join(format!("{backup_id}.veldport"));
+        if !dump.exists() {
+            bail!("no backup {backup_id} for '{user_id}' at {}", dump.display());
+        }
+        // Into a TARGET, never over the source. import_portable refuses a target that
+        // already holds rows, so a restore cannot merge into a live store — the
+        // failure mode the whole export/import/verify/switch route exists to avoid.
+        let target = RedbMigrationStore::open(target_path)?;
+        target.import_portable(user_id, &dump)?;
+        target.verify_portable(&dump)?;
+        tracing::info!(user_id, backup_id, target = %target_path.display(),
+            "redb restore imported and verified");
+        Ok(())
     }
 }
 
 pub struct RedbMigrationStore {
     path: PathBuf,
+    database: Arc<redb::Database>,
 }
 
 impl RedbMigrationStore {
+    /// Share a live handle. Required whenever the store being exported is open —
+    /// redb permits ONE opener per database file, so opening the path again fails
+    /// with "Database already open. Cannot acquire lock." rather than degrading.
+    ///
+    /// This is not a redb quirk to route around; it is the property that makes a
+    /// single-file embedded database safe. What it means for this layer is that
+    /// `StorageFactory::open_*(path)` cannot be the constructor for a SECOND store
+    /// over an already-open database — the rocksdb side reached the same place and
+    /// made `open_backup_store` refuse outright.
+    pub fn from_database(database: Arc<redb::Database>, path: &Path) -> Self {
+        Self { path: path.to_path_buf(), database }
+    }
+
+    /// Open standalone. Valid only when nothing else holds the database: an offline
+    /// tool, or a fresh import target.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
+        let database = create_redb_database(&path.join("storage.redb"))?;
+        Ok(Self { path: path.to_path_buf(), database })
     }
 }
 
@@ -1450,7 +1652,7 @@ impl RedbMigrationStore {
         let file = std::fs::File::open(source)
             .with_context(|| format!("opening {}", source.display()))?;
         let records = read_all(file)?;
-        let database = create_redb_database(&self.path.join("storage.redb"))?;
+        let database = Arc::clone(&self.database);
         let read = database.begin_read()?;
 
         // Direction 1: everything the dump holds is in the target, byte-for-byte.
@@ -1503,8 +1705,71 @@ impl MigrationStore for RedbMigrationStore {
         StorageBackend::Redb
     }
 
-    fn export_portable(&self, _user_id: &str, _target: &Path) -> Result<()> {
-        Err(not_implemented("portable export", &self.path))
+    fn export_portable(&self, user_id: &str, target: &Path) -> Result<()> {
+        use crate::storage::portable::{PortableRecord, PortableWriter};
+
+        let database = Arc::clone(&self.database);
+
+        // TABLES ARE DISCOVERED, NOT LISTED — the opposite of the rocksdb side, and
+        // deliberately. rocksdb names its three families explicitly and refuses a
+        // store missing one, because a column family added later and not listed would
+        // be silently omitted from every export while the dump still verified.
+        // redb can enumerate, so an unexpected table is INCLUDED rather than dropped.
+        // The protection rocksdb gets from its fixed list is kept by asserting the
+        // known tables are present: a missing one is still an error, an extra one is
+        // still exported. Strictly the safer half of each.
+        let read = database.begin_read()?;
+        let mut names: Vec<String> = read
+            .list_tables()?
+            .map(|t| t.name().to_string())
+            .collect();
+        names.sort(); // fixed order, so two exports of one store are byte-identical
+        for required in [DEFAULT_TABLE_NAME, "memories", "vector_mappings"] {
+            if !names.iter().any(|n| n == required) {
+                bail!(
+                    "export_portable: this database has no table '{required}' — refusing to write \
+                     a dump that would be missing a keyspace"
+                );
+            }
+        }
+
+        let tmp = target.with_extension("partial");
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut writer = PortableWriter::new(std::io::BufWriter::new(file))?;
+
+        let written = (|| -> Result<(u64, [u8; 32])> {
+            for name in &names {
+                let def: redb::TableDefinition<'_, &[u8], &[u8]> =
+                    redb::TableDefinition::new(name.as_str());
+                let table = read.open_table(def)?;
+                for row in table.iter()? {
+                    let (k, v) = row?;
+                    writer.write_record(&PortableRecord {
+                        cf: name.clone(),
+                        key: k.value().to_vec(),
+                        value: v.value().to_vec(),
+                    })?;
+                }
+            }
+            writer.finish()
+        })();
+
+        let (count, _digest) = match written {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        std::fs::rename(&tmp, target)
+            .with_context(|| format!("renaming {} into place", tmp.display()))?;
+        tracing::info!(user_id, records = count, tables = names.len(),
+            target = %target.display(), "portable export written (redb)");
+        Ok(())
     }
 
     fn import_portable(&self, user_id: &str, source: &Path) -> Result<()> {
@@ -1517,7 +1782,7 @@ impl MigrationStore for RedbMigrationStore {
         // here rather than half-way through writing.
         let records = read_all(file)?;
 
-        let database = create_redb_database(&self.path.join("storage.redb"))?;
+        let database = Arc::clone(&self.database);
 
         // REFUSE A TARGET THAT IS NOT EMPTY. An import that merges into live data
         // is unrecoverable by config revert, which is the property the whole
@@ -2124,5 +2389,130 @@ mod redb_hierarchy_tests {
         assert_eq!(me.id, target.id);
         assert_eq!(anc.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![root.id]);
         assert_eq!(kids.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![kid.id]);
+    }
+}
+
+#[cfg(test)]
+mod redb_backup_tests {
+    use super::*;
+    use crate::memory::types::{Experience, ExperienceType, MemoryTier};
+
+    fn seeded_store(dir: &Path, n: usize) -> RedbPrimaryMemoryStore {
+        let s = RedbPrimaryMemoryStore::open(dir).expect("open");
+        let now = chrono::Utc::now();
+        for _ in 0..n {
+            let m = Memory::from_legacy(
+                MemoryId(uuid::Uuid::new_v4()),
+                Experience { experience_type: ExperienceType::Observation, content: "x".into(), ..Default::default() },
+                0.5, 0, now, now, false, MemoryTier::LongTerm, Vec::new(), 1.0,
+                None, None, None, None, 0.0, None, None, 1, Vec::new(), Vec::new(),
+            );
+            s.put_memory(&m).unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn create_list_restore_round_trips_and_the_target_holds_the_memories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let _s = seeded_store(&store_dir, 4);
+
+        let backups = RedbBackupStore::from_database(_s.database(), &store_dir);
+        let meta = backups.create_backup("alice").expect("create");
+        assert_eq!(meta.memory_count, 4);
+        assert_eq!(meta.backup_id, 1);
+        assert!(!meta.checksum.is_empty());
+
+        let listed = backups.list_backups("alice").expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].checksum, meta.checksum);
+
+        let target = tmp.path().join("restored");
+        backups.restore_backup("alice", 1, &target).expect("restore");
+        let restored = RedbPrimaryMemoryStore::open(&target).unwrap();
+        assert_eq!(restored.get_all().unwrap().len(), 4, "the restore did not carry the memories");
+    }
+
+    #[test]
+    fn a_backup_whose_dump_was_truncated_after_the_sidecar_is_not_listed() {
+        // The reason the sidecar is cross-checked rather than trusted: it is a
+        // separate file, so it survives damage to the dump it describes. Listing it
+        // would promise a restore that cannot happen.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let _s = seeded_store(&store_dir, 2);
+        let backups = RedbBackupStore::from_database(_s.database(), &store_dir);
+        backups.create_backup("alice").unwrap();
+
+        let dump = store_dir.join("backups").join("alice").join("1.veldport");
+        let bytes = std::fs::read(&dump).unwrap();
+        std::fs::write(&dump, &bytes[..bytes.len() - 12]).unwrap();
+
+        assert!(backups.list_backups("alice").unwrap().is_empty(),
+            "a truncated dump was offered as restorable");
+    }
+
+    #[test]
+    fn a_sidecar_that_disagrees_with_its_dump_is_not_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let _s = seeded_store(&store_dir, 2);
+        let backups = RedbBackupStore::from_database(_s.database(), &store_dir);
+        let mut meta = backups.create_backup("alice").unwrap();
+
+        meta.checksum = "0".repeat(64);
+        std::fs::write(
+            store_dir.join("backups").join("alice").join("1.meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        ).unwrap();
+
+        assert!(backups.list_backups("alice").unwrap().is_empty(),
+            "a backup whose metadata disagrees with its bytes was listed as usable");
+    }
+
+    #[test]
+    fn no_backups_yet_is_an_empty_list_and_not_an_error() {
+        // ENOENT is the only absence that legitimately means "none".
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let _s = seeded_store(&store_dir, 1);
+        assert!(RedbBackupStore::from_database(_s.database(), &store_dir).list_backups("nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ids_advance_and_are_never_reused() {
+        // A restore names an id. Reusing one makes an old reference resolve to
+        // different bytes, silently.
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let _s = seeded_store(&store_dir, 1);
+        let backups = RedbBackupStore::from_database(_s.database(), &store_dir);
+        assert_eq!(backups.create_backup("alice").unwrap().backup_id, 1);
+        assert_eq!(backups.create_backup("alice").unwrap().backup_id, 2);
+        std::fs::remove_file(store_dir.join("backups").join("alice").join("2.veldport")).unwrap();
+        std::fs::remove_file(store_dir.join("backups").join("alice").join("2.meta.json")).unwrap();
+        assert_eq!(backups.create_backup("alice").unwrap().backup_id, 3,
+            "id 2 was reused after its files were removed");
+    }
+
+    #[test]
+    fn a_restore_refuses_a_target_that_already_holds_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("store");
+        let _s = seeded_store(&store_dir, 2);
+        let backups = RedbBackupStore::from_database(_s.database(), &store_dir);
+        backups.create_backup("alice").unwrap();
+
+        let target = tmp.path().join("occupied");
+        // Scoped so the target is CLOSED before the restore. redb permits one opener,
+        // and a real restore target is not held open by anything — leaving it open
+        // would have this assert on a lock error rather than on the refusal.
+        {
+            let _existing = seeded_store(&target, 1);
+        }
+        let err = backups.restore_backup("alice", 1, &target)
+            .expect_err("restoring over a populated store must refuse");
+        assert!(err.to_string().contains("already holds rows"), "got: {err}");
     }
 }
