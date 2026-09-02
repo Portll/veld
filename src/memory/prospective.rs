@@ -90,9 +90,10 @@ pub struct ProspectiveStore {
     /// delete() batch across BOTH families in one commit; the DB-scoped batch API
     /// exists for exactly those two call sites.
     store: Arc<dyn crate::storage::ColumnStore>,
-    /// Kept ONLY for migrate_from_separate_dbs (a one-time rocksdb-to-rocksdb
-    /// import from superseded directories) and the backup accessor below.
-    db: Arc<DB>,
+    /// Present ONLY when rocksdb-backed: migrate_from_separate_dbs (a one-time
+    /// rocksdb-to-rocksdb import) and the rocksdb backup accessor need it; a
+    /// store built over another backend has no engine DB to hold.
+    db: Option<Arc<DB>>,
 }
 
 impl ProspectiveStore {
@@ -128,7 +129,23 @@ impl ProspectiveStore {
         migrate_due_key_padding(store.as_ref())?;
 
         tracing::info!("Prospective memory store initialized");
-        Ok(Self { store, db })
+        Ok(Self {
+            store,
+            db: Some(db),
+        })
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    /// Skips migrate_from_separate_dbs (a rocksdb-to-rocksdb import with no
+    /// meaning on another backend) but still runs the logical due-key
+    /// migration, which belongs to whichever backend holds the rows.
+    pub fn with_store(store: Arc<dyn crate::storage::ColumnStore>) -> Result<Self> {
+        for cf in [CF_PROSPECTIVE, CF_PROSPECTIVE_INDEX] {
+            store.ensure_cf(cf)?;
+        }
+        migrate_due_key_padding(store.as_ref())?;
+        tracing::info!("Prospective memory store initialized");
+        Ok(Self { store, db: None })
     }
 
     /// One-time migration: copy data from legacy separate RocksDB instances
@@ -195,9 +212,16 @@ impl ProspectiveStore {
         Ok(())
     }
 
-    /// Get references to all RocksDB databases for backup
+    /// Get references to all RocksDB databases for backup.
+    ///
+    /// Empty when not rocksdb-backed: there is no engine DB to hand a rocksdb
+    /// backup engine, and pretending otherwise is how a backup omits a store
+    /// while reporting success.
     pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![("prospective_shared", &self.db)]
+        match &self.db {
+            Some(db) => vec![("prospective_shared", db)],
+            None => Vec::new(),
+        }
     }
 
     /// Store a new prospective task
@@ -804,6 +828,44 @@ mod tests {
         let db = open_test_db(temp_dir.path());
         let store = ProspectiveStore::new(db, temp_dir.path()).unwrap();
         (temp_dir, store)
+    }
+
+    #[test]
+    fn test_with_store_redb_round_trip() {
+        // The point of with_store: the same store logic over the other backend,
+        // including the due-index scan that leans on the ascending-order contract.
+        let temp_dir = TempDir::new().unwrap();
+        let redb_db = crate::storage::redb::create_redb_database_for_test(
+            &temp_dir.path().join("prospective.redb"),
+        )
+        .unwrap();
+        let store = ProspectiveStore::with_store(Arc::new(
+            crate::storage::redb::RedbColumnStore::new(redb_db),
+        ))
+        .unwrap();
+
+        let task = ProspectiveTask::new(
+            "u".to_string(),
+            "remember".to_string(),
+            ProspectiveTrigger::AfterDuration {
+                seconds: 1,
+                from: Utc::now() - chrono::Duration::hours(1),
+            },
+        );
+        store.store(&task).unwrap();
+        assert_eq!(store.get("u", &task.id).unwrap().unwrap().content, "remember");
+
+        // Past-due pending task must surface through the ordered due scan.
+        let due = store.get_all_due_tasks().unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, "u");
+
+        assert!(store.mark_dismissed("u", &task.id).unwrap());
+        assert!(store.delete("u", &task.id).unwrap());
+        assert!(store.get("u", &task.id).unwrap().is_none());
+        assert!(store.list_for_user("u", None).unwrap().is_empty());
+        // No engine DB behind this store — the backup accessor must say so.
+        assert!(store.databases().is_empty());
     }
 
     #[test]

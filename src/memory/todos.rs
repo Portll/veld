@@ -81,9 +81,10 @@ pub struct TodoStore {
     /// Three families — CF_TODOS, CF_PROJECTS, CF_TODO_INDEX — so this takes the
     /// multi-family handle rather than a KeyValueStore bound to one.
     store: Arc<dyn crate::storage::ColumnStore>,
-    /// Kept ONLY for migrate_from_separate_dbs (a one-time rocksdb-to-rocksdb
-    /// import from superseded directories) and the backup accessor below.
-    db: Arc<DB>,
+    /// Present ONLY when rocksdb-backed: migrate_from_separate_dbs (a one-time
+    /// rocksdb-to-rocksdb import) and the rocksdb backup accessor need it; a
+    /// store built over another backend has no engine DB to hold.
+    db: Option<Arc<DB>>,
     /// Vector index for semantic search (per-user indices)
     vector_indices: RwLock<HashMap<String, VamanaIndex>>,
     /// Storage path for persisting vector indices
@@ -125,7 +126,33 @@ impl TodoStore {
 
         Ok(Self {
             store,
-            db,
+            db: Some(db),
+            vector_indices: RwLock::new(HashMap::new()),
+            storage_path: todos_path,
+            seq_mutex: parking_lot::Mutex::new(()),
+        })
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    /// Skips migrate_from_separate_dbs (a rocksdb-to-rocksdb import with no
+    /// meaning on another backend) but still runs the logical due-key
+    /// migration; `storage_path` is still needed for the vector indices.
+    pub fn with_store(
+        store: Arc<dyn crate::storage::ColumnStore>,
+        storage_path: &Path,
+    ) -> Result<Self> {
+        let todos_path = storage_path.join("todos");
+        std::fs::create_dir_all(&todos_path)?;
+
+        for cf in [CF_TODOS, CF_PROJECTS, CF_TODO_INDEX] {
+            store.ensure_cf(cf)?;
+        }
+        migrate_due_key_padding(store.as_ref())?;
+
+        tracing::info!("Todo store initialized");
+        Ok(Self {
+            store,
+            db: None,
             vector_indices: RwLock::new(HashMap::new()),
             storage_path: todos_path,
             seq_mutex: parking_lot::Mutex::new(()),
@@ -1476,9 +1503,16 @@ impl TodoStore {
         Ok(())
     }
 
-    /// Get reference to the shared RocksDB database for backup
+    /// Get reference to the shared RocksDB database for backup.
+    ///
+    /// Empty when not rocksdb-backed: there is no engine DB to hand a rocksdb
+    /// backup engine, and pretending otherwise is how a backup omits a store
+    /// while reporting success.
     pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![("todos_shared", &self.db)]
+        match &self.db {
+            Some(db) => vec![("todos_shared", db)],
+            None => Vec::new(),
+        }
     }
 
     /// Get overall todo stats for a user
@@ -1566,6 +1600,44 @@ mod tests {
         let db = open_test_shared_db(temp_dir.path());
         let store = TodoStore::new(db, temp_dir.path()).unwrap();
         (store, temp_dir)
+    }
+
+    #[test]
+    fn test_with_store_redb_round_trip() {
+        // The point of with_store: the same store logic over the other backend,
+        // crossing all three families (todos, todo_index via seq_num, projects).
+        let temp_dir = TempDir::new().unwrap();
+        let redb_db = crate::storage::redb::create_redb_database_for_test(
+            &temp_dir.path().join("todos.redb"),
+        )
+        .unwrap();
+        let store = TodoStore::with_store(
+            Arc::new(crate::storage::redb::RedbColumnStore::new(redb_db)),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        let todo = Todo::new("u".to_string(), "task".to_string());
+        let stored = store.store_todo(&todo).unwrap();
+        assert!(stored.seq_num > 0, "seq_num allocation crosses the index CF");
+        assert!(store.get_todo("u", &stored.id).unwrap().is_some());
+        assert_eq!(store.list_todos_for_user("u", None).unwrap().len(), 1);
+
+        let project = store.find_or_create_project("u", "alpha").unwrap();
+        assert_eq!(
+            store
+                .find_project_by_name("u", "alpha")
+                .unwrap()
+                .unwrap()
+                .id,
+            project.id
+        );
+        assert_eq!(store.list_projects("u").unwrap().len(), 1);
+
+        assert!(store.delete_todo("u", &stored.id).unwrap());
+        assert!(store.list_todos_for_user("u", None).unwrap().is_empty());
+        // No engine DB behind this store — the backup accessor must say so.
+        assert!(store.databases().is_empty());
     }
 
     #[test]
