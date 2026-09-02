@@ -455,6 +455,21 @@ impl OnnxCrossEncoder {
             );
             return;
         }
+        // The thread below is detached: `.spawn(…).ok()` drops the JoinHandle and
+        // nothing joins it. A test binary exits seconds after start, so teardown can
+        // race an in-flight ONNX CreateSession; a server runs for hours and the
+        // pre-warm is long done.
+        //
+        // Measured 2026-09-02: `cargo test --lib memory::` segfaulted on ~half of
+        // parallel runs, always AFTER `test result: ok`; the crash report named this
+        // thread, EXC_BAD_ACCESS at 0x17 in InferenceSession::Initialize. Three
+        // single-threaded runs were clean.
+        //
+        // Skipped rather than joined — a pre-warm you wait for is not a pre-warm.
+        // A caller needing the model loaded calls `ensure_loaded()` directly.
+        if cfg!(test) {
+            return;
+        }
         std::thread::Builder::new()
             .name(format!("cross-encoder-prewarm-{}", self_arc.config.id))
             .spawn(move || match self_arc.ensure_loaded() {
@@ -894,6 +909,10 @@ pub fn prewarm(model: Arc<dyn CrossEncoderModel>) {
         return;
     }
     let id = model.id().to_string();
+    // Same detached-thread hazard as the method above — see its comment.
+    if cfg!(test) {
+        return;
+    }
     std::thread::Builder::new()
         .name(format!("cross-encoder-prewarm-{id}"))
         .spawn(move || match model.score_pairs("warmup", &["warmup"]) {
