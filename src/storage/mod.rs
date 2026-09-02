@@ -260,6 +260,16 @@ pub trait ColumnStore: Send + Sync {
 
     fn flush_cf(&self, cf: &str) -> Result<()>;
 
+    /// Declare a family before use. rocksdb families exist only if the DB was
+    /// opened with their descriptors, so this VERIFIES — a store fails at
+    /// construction instead of at first use; redb tables are created lazily,
+    /// so this MATERIALIZES the table so a later read or batched write never
+    /// hits TableDoesNotExist (put_cf creates on demand, write_batch refuses —
+    /// found when a store's first touch of its index family was a batch).
+    /// `RedbKeyValueStore::open` already does this for its one table; this is
+    /// the multi-family parity.
+    fn ensure_cf(&self, cf: &str) -> Result<()>;
+
     /// Atomic across families — see [`WriteBatch`].
     fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
 }
@@ -642,7 +652,7 @@ mod column_store_conformance {
     use crate::storage::legacy_rocksdb::RocksDbColumnStore;
     use crate::storage::redb::RedbColumnStore;
 
-    const FAMILIES: [&str; 3] = ["default", "alpha", "beta"];
+    const FAMILIES: [&str; 4] = ["default", "alpha", "beta", "gamma"];
 
     /// Every observable answer the script produces, as comparable values.
     fn script(s: &dyn ColumnStore) -> Vec<(String, String)> {
@@ -686,6 +696,17 @@ mod column_store_conformance {
         note("after batch alpha/batched", format!("{:?}", s.get_cf("alpha", b"batched").unwrap()));
         note("after batch beta/batched", format!("{:?}", s.get_cf("beta", b"batched").unwrap()));
         note("after batch alpha/k2 deleted", format!("{:?}", s.get_cf("alpha", b"k2").unwrap()));
+
+        // A family whose FIRST touch is a batched write — the case a put-first
+        // script structurally cannot compare: redb's put_cf creates tables on
+        // demand while write_batch refuses missing ones, so every family the
+        // script had already put to masked the divergence. ensure_cf is the
+        // contract that makes the two backends answer identically here.
+        s.ensure_cf("gamma").unwrap();
+        let mut g = WriteBatch::new();
+        g.put_cf("gamma", b"gk".to_vec(), b"gv".to_vec());
+        s.write_batch(&g).unwrap();
+        note("fresh family, first touch batched", format!("{:?}", s.get_cf("gamma", b"gk").unwrap()));
 
         s.delete_cf("alpha", b"k1").unwrap();
         note("after delete alpha/k1", format!("{:?}", s.get_cf("alpha", b"k1").unwrap()));
