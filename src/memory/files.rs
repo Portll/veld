@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use glob::Pattern;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -28,6 +28,12 @@ const CF_FILE_INDEX: &str = "file_index";
 
 /// Storage and query engine for file memories
 pub struct FileMemoryStore {
+    /// Two families — CF_FILES and CF_FILE_INDEX — so this takes the multi-family
+    /// handle rather than a KeyValueStore bound to one.
+    store: Arc<dyn crate::storage::ColumnStore>,
+    /// Kept ONLY for the one-time migration below, which opens a second read-only
+    /// rocksdb and copies rows across. That is a rocksdb-to-rocksdb import, not a
+    /// store operation, and it has no meaning on another backend.
     db: Arc<DB>,
     /// Default configuration
     config: CodebaseConfig,
@@ -35,16 +41,9 @@ pub struct FileMemoryStore {
 
 impl FileMemoryStore {
     /// CF accessor for the files column family
-    fn files_cf(&self) -> &ColumnFamily {
-        self.db.cf_handle(CF_FILES).expect("files CF must exist")
-    }
+
 
     /// CF accessor for the file_index column family
-    fn file_index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_FILE_INDEX)
-            .expect("file_index CF must exist")
-    }
 
     /// Return CF descriptors needed by this store. The caller must include
     /// these when opening the shared RocksDB instance.
@@ -67,6 +66,9 @@ impl FileMemoryStore {
 
         tracing::info!("File memory store initialized");
         Ok(Self {
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(
+                Arc::clone(&db),
+            )),
             db,
             config: CodebaseConfig::default(),
         })
@@ -91,6 +93,9 @@ impl FileMemoryStore {
             let old_opts = Options::default();
             match DB::open_for_read_only(&old_opts, &old_dir, false) {
                 Ok(old_db) => {
+                    // Concrete rocksdb batch on purpose: this is a one-time
+                    // rocksdb-to-rocksdb import from a superseded directory, not a
+                    // store operation, and it has no meaning on another backend.
                     let mut batch = WriteBatch::default();
                     let mut count = 0usize;
                     for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
@@ -130,15 +135,12 @@ impl FileMemoryStore {
 
     /// Flush all column families to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
-        use rocksdb::FlushOptions;
-        let mut flush_opts = FlushOptions::default();
-        flush_opts.set_wait(true);
-        for cf_name in &[CF_FILES, CF_FILE_INDEX] {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                self.db
-                    .flush_cf_opt(cf, &flush_opts)
-                    .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
-            }
+        // One flush per family, errors propagated — the old loop did the same with
+        // flush_cf_opt(set_wait(true)); the trait's flush is synchronous.
+        for cf_name in [CF_FILES, CF_FILE_INDEX] {
+            self.store
+                .flush_cf(cf_name)
+                .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
         }
         Ok(())
     }
@@ -157,8 +159,8 @@ impl FileMemoryStore {
         let key = format!("{}:{}", file_memory.user_id, file_memory.id.0);
         let value = serde_json::to_vec(file_memory).context("Failed to serialize file memory")?;
 
-        self.db
-            .put_cf(self.files_cf(), key.as_bytes(), &value)
+        self.store
+            .put_cf(CF_FILES, key.as_bytes(), &value)
             .context("Failed to store file memory")?;
 
         self.update_indices(file_memory)?;
@@ -177,7 +179,7 @@ impl FileMemoryStore {
     pub fn get(&self, user_id: &str, file_id: &FileMemoryId) -> Result<Option<FileMemory>> {
         let key = format!("{}:{}", user_id, file_id.0);
 
-        match self.db.get_cf(self.files_cf(), key.as_bytes())? {
+        match self.store.get_cf(CF_FILES, key.as_bytes())? {
             Some(value) => {
                 let file_memory: FileMemory =
                     serde_json::from_slice(&value).context("Failed to deserialize file memory")?;
@@ -202,7 +204,7 @@ impl FileMemoryStore {
             Self::hash_path(path)
         );
 
-        match self.db.get_cf(self.file_index_cf(), path_key.as_bytes())? {
+        match self.store.get_cf(CF_FILE_INDEX, path_key.as_bytes())? {
             Some(file_id_bytes) => {
                 let file_id_str =
                     String::from_utf8(file_id_bytes.to_vec()).context("Invalid file ID")?;
@@ -230,7 +232,7 @@ impl FileMemoryStore {
     pub fn delete(&self, user_id: &str, file_id: &FileMemoryId) -> Result<bool> {
         if let Some(file_memory) = self.get(user_id, file_id)? {
             let key = format!("{}:{}", user_id, file_id.0);
-            self.db.delete_cf(self.files_cf(), key.as_bytes())?;
+            self.store.delete_cf(CF_FILES, key.as_bytes())?;
             self.remove_indices(&file_memory)?;
 
             tracing::debug!(
@@ -272,17 +274,10 @@ impl FileMemoryStore {
         let prefix = format!("user:{}:", user_id);
         let mut files = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
-        for item in iter {
-            let (key, file_id_bytes) = item?;
+        // scan_cf enforces the prefix bound; the hand-written break is gone.
+        for (key, file_id_bytes) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            // Stop if we've left our prefix
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+            let _ = &key_str;
 
             let file_id_str = String::from_utf8(file_id_bytes.to_vec())?;
             let file_id =
@@ -315,16 +310,10 @@ impl FileMemoryStore {
         let prefix = format!("project:{}:{}:", user_id, project_id.0);
         let mut files = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
-        for item in iter {
-            let (key, file_id_bytes) = item?;
+        // scan_cf enforces the prefix bound; the hand-written break is gone.
+        for (key, file_id_bytes) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+            let _ = &key_str;
 
             let file_id_str = String::from_utf8(file_id_bytes.to_vec())?;
             let file_id =
@@ -359,16 +348,10 @@ impl FileMemoryStore {
         let prefix = format!("type:{}:{}:{}:", user_id, project_id.0, type_str);
         let mut files = Vec::new();
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
-        for item in iter {
-            let (key, file_id_bytes) = item?;
+        // scan_cf enforces the prefix bound; the hand-written break is gone.
+        for (key, file_id_bytes) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+            let _ = &key_str;
 
             let file_id_str = String::from_utf8(file_id_bytes.to_vec())?;
             let file_id =
@@ -393,16 +376,10 @@ impl FileMemoryStore {
         let prefix = format!("project:{}:{}:", user_id, project_id.0);
         let mut count = 0;
 
-        let iter = self
-            .db
-            .prefix_iterator_cf(self.file_index_cf(), prefix.as_bytes());
-        for item in iter {
-            let (key, _) = item?;
+        // scan_cf enforces the prefix bound; the hand-written break is gone.
+        for (key, _) in self.store.scan_cf(CF_FILE_INDEX, Some(prefix.as_bytes()), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+            let _ = &key_str;
 
             count += 1;
         }
@@ -1095,17 +1072,17 @@ impl FileMemoryStore {
     // =========================================================================
 
     fn update_indices(&self, file: &FileMemory) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let id_str = file.id.0.to_string();
-        let idx_cf = self.file_index_cf();
+        
 
         // Index by user
         let user_key = format!("user:{}:{}", file.user_id, id_str);
-        batch.put_cf(idx_cf, user_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(CF_FILE_INDEX, user_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
 
         // Index by project
         let project_key = format!("project:{}:{}:{}", file.user_id, file.project_id.0, id_str);
-        batch.put_cf(idx_cf, project_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(CF_FILE_INDEX, project_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
 
         // Index by path (for fast lookup)
         let path_key = format!(
@@ -1114,7 +1091,7 @@ impl FileMemoryStore {
             file.project_id.0,
             Self::hash_path(&file.path)
         );
-        batch.put_cf(idx_cf, path_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(CF_FILE_INDEX, path_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
 
         // Index by file type
         let type_str = format!("{:?}", file.file_type);
@@ -1122,25 +1099,25 @@ impl FileMemoryStore {
             "type:{}:{}:{}:{}",
             file.user_id, file.project_id.0, type_str, id_str
         );
-        batch.put_cf(idx_cf, type_key.as_bytes(), id_str.as_bytes());
+        batch.put_cf(CF_FILE_INDEX, type_key.as_bytes().to_vec(), id_str.as_bytes().to_vec());
 
-        self.db
-            .write(batch)
+        self.store
+            .write_batch(&batch)
             .context("Failed to update file memory indices")?;
 
         Ok(())
     }
 
     fn remove_indices(&self, file: &FileMemory) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let id_str = file.id.0.to_string();
-        let idx_cf = self.file_index_cf();
+        
 
         let user_key = format!("user:{}:{}", file.user_id, id_str);
-        batch.delete_cf(idx_cf, user_key.as_bytes());
+        batch.delete_cf(CF_FILE_INDEX, user_key.as_bytes().to_vec());
 
         let project_key = format!("project:{}:{}:{}", file.user_id, file.project_id.0, id_str);
-        batch.delete_cf(idx_cf, project_key.as_bytes());
+        batch.delete_cf(CF_FILE_INDEX, project_key.as_bytes().to_vec());
 
         let path_key = format!(
             "path:{}:{}:{}",
@@ -1148,16 +1125,16 @@ impl FileMemoryStore {
             file.project_id.0,
             Self::hash_path(&file.path)
         );
-        batch.delete_cf(idx_cf, path_key.as_bytes());
+        batch.delete_cf(CF_FILE_INDEX, path_key.as_bytes().to_vec());
 
         let type_str = format!("{:?}", file.file_type);
         let type_key = format!(
             "type:{}:{}:{}:{}",
             file.user_id, file.project_id.0, type_str, id_str
         );
-        batch.delete_cf(idx_cf, type_key.as_bytes());
+        batch.delete_cf(CF_FILE_INDEX, type_key.as_bytes().to_vec());
 
-        self.db.write(batch)?;
+        self.store.write_batch(&batch)?;
         Ok(())
     }
 
