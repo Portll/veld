@@ -273,6 +273,28 @@ redb's 5 tests (`src/storage/redb.rs:541-887`) all run against **fresh temp data
 rocksdb-written data, none tests concurrency or crash recovery, none approaches this scale. Anything
 that wires redb into production is trusting unit round-trips on empty stores.
 
+## The test suite segfaults on exit, intermittently, and it PREDATES this work
+
+`cargo test --lib memory::` runs all 700 tests green and then the process dies with
+`signal: 11, SIGSEGV` — after `test result: ok`, so it is a teardown crash, not a
+failing test.
+
+**Flaky, and not caused by the storage work.** Measured 2026-09-02: two runs at HEAD
+gave exit 0 and exit 101; two runs in a detached worktree at `85dbc52` — the commit
+before the first change in this programme — gave exit 101 and exit 0. Same behaviour
+on both sides, so it is pre-existing.
+
+Each module alone is clean (`memory::storage`, `memory::mod`, `memory::merge`,
+`memory::files`, `memory::todos`, `memory::prospective` all exit 0), so it needs the
+whole set — consistent with many rocksdb instances being dropped at process exit.
+
+**Why it is written down rather than shrugged at.** A flaky segfault after a green
+run is the ideal shape for a wrong attribution: the next person to touch storage will
+see `CARGO_EXIT=101` on their change and assume they broke something, and a filtered
+run of their own module will pass, which looks like they fixed it. Both readings are
+wrong. Check the summary line before the exit code — `test result: ok` with a
+non-zero exit is this, not a failure — and re-run before believing it.
+
 ## Build note
 
 Plain `cargo build --release` FAILS on macOS — libclang is not found, because librocksdb-sys runs
