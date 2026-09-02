@@ -6,7 +6,7 @@
 //! type-dependent inertia to prevent noise from destabilizing useful memories.
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -1456,7 +1456,23 @@ pub struct FeedbackStore {
     previous_context: HashMap<String, PreviousContext>,
 
     /// Persistent storage for momentum data
-    db: Option<Arc<DB>>,
+    /// A handle bound to CF_FEEDBACK, not a database.
+
+    ///
+
+    /// Optional because this store works in memory with no persistence at all. That
+
+    /// made the old shape a DOUBLE option — `(Some(db), Some(cf))` at every call site —
+
+    /// where the second arm was a CF lookup that could fail independently of whether
+
+    /// persistence was configured. One handle collapses it: bound or absent, and a
+
+    /// missing column family becomes an error at construction rather than a silent
+
+    /// no-op at each write.
+
+    store: Option<Arc<dyn crate::storage::KeyValueStore>>,
 
     /// Track dirty entries that need persistence
     dirty: HashSet<MemoryId>,
@@ -1468,7 +1484,7 @@ impl std::fmt::Debug for FeedbackStore {
             .field("momentum_count", &self.momentum.len())
             .field("pending_count", &self.pending.len())
             .field("previous_context_count", &self.previous_context.len())
-            .field("has_db", &self.db.is_some())
+            .field("has_store", &self.store.is_some())
             .field("dirty_count", &self.dirty.len())
             .finish()
     }
@@ -1482,29 +1498,36 @@ impl FeedbackStore {
     }
 
     /// Get a reference to the feedback column family handle.
-    /// Returns `None` when running in-memory only or when the CF is missing.
-    fn feedback_cf(&self) -> Option<&ColumnFamily> {
-        self.db.as_ref().and_then(|db| db.cf_handle(CF_FEEDBACK))
-    }
-
     /// Create persistent store backed by a shared RocksDB instance.
     ///
     /// The caller is responsible for opening the DB with the `CF_FEEDBACK` column
     /// family already declared. On first use this constructor migrates data from
     /// the legacy standalone `feedback/` DB directory into the shared CF.
+    /// Bind a handle directly — the backend-agnostic constructor.
+    pub fn with_store(
+        store: Arc<dyn crate::storage::KeyValueStore>,
+        base_path: &Path,
+    ) -> anyhow::Result<Self> {
+        // base_path is used by the rocksdb constructor for its one-time migration and
+        // is not state this store keeps; a handle-bound caller has nothing to migrate.
+        let _ = base_path;
+        let mut s = Self::new();
+        s.store = Some(store);
+        Ok(s)
+    }
+
     pub fn with_shared_db(db: Arc<DB>, base_path: &Path) -> anyhow::Result<Self> {
         Self::migrate_from_separate_db(base_path, &db)?;
 
-        let cf = db.cf_handle(CF_FEEDBACK).expect("feedback CF must exist");
+        let store: Arc<dyn crate::storage::KeyValueStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_FEEDBACK),
+        );
 
         // Load all momentum entries from the feedback CF
         let mut momentum = HashMap::new();
-        let iter = db.prefix_iterator_cf(cf, b"momentum:");
-        for (key, value) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with("momentum:") {
-                    break;
-                }
+        let iter = store.scan_prefix(b"momentum:", None)?;
+        for (key, value) in iter {
+            if let Ok(_key_str) = std::str::from_utf8(&key) {
                 if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
                     momentum.insert(m.memory_id.clone(), m);
                 }
@@ -1512,29 +1535,23 @@ impl FeedbackStore {
         }
 
         let mut pending = HashMap::new();
-        let iter = db.prefix_iterator_cf(cf, b"pending:");
-        for (key, value) in iter.flatten() {
+        let iter = store.scan_prefix(b"pending:", None)?;
+        for (key, value) in iter {
             if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with("pending:") {
-                    break;
-                }
                 if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
                     if !p.is_expired() {
                         pending.insert(p.user_id.clone(), p);
                     } else {
-                        let _ = db.delete_cf(cf, key_str.as_bytes());
+                        let _ = store.delete_bytes(key_str.as_bytes());
                     }
                 }
             }
         }
 
         let mut previous_context = HashMap::new();
-        let iter = db.prefix_iterator_cf(cf, b"prev_ctx:");
-        for (key, value) in iter.flatten() {
+        let iter = store.scan_prefix(b"prev_ctx:", None)?;
+        for (key, value) in iter {
             if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with("prev_ctx:") {
-                    break;
-                }
                 if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
                     let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
                     previous_context.insert(user_id.to_string(), ctx);
@@ -1554,7 +1571,7 @@ impl FeedbackStore {
             quality_tracker: RetrievalQualityTracker::default(),
             pending,
             previous_context,
-            db: Some(db),
+            store: Some(store),
             dirty: HashSet::new(),
         })
     }
@@ -1622,17 +1639,15 @@ impl FeedbackStore {
         ];
         let db = DB::open_cf_descriptors(&opts, path.as_ref(), cfs)?;
         let db = Arc::new(db);
-
-        let cf = db.cf_handle(CF_FEEDBACK).expect("feedback CF must exist");
+        let store: Arc<dyn crate::storage::KeyValueStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(db, CF_FEEDBACK),
+        );
 
         // Load all momentum entries from the feedback CF
         let mut momentum = HashMap::new();
-        let iter = db.prefix_iterator_cf(cf, b"momentum:");
-        for (key, value) in iter.flatten() {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with("momentum:") {
-                    break;
-                }
+        let iter = store.scan_prefix(b"momentum:", None)?;
+        for (key, value) in iter {
+            if let Ok(_key_str) = std::str::from_utf8(&key) {
                 if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
                     momentum.insert(m.memory_id.clone(), m);
                 }
@@ -1641,18 +1656,15 @@ impl FeedbackStore {
 
         // Also load pending feedback entries (filter expired ones)
         let mut pending = HashMap::new();
-        let iter = db.prefix_iterator_cf(cf, b"pending:");
-        for (key, value) in iter.flatten() {
+        let iter = store.scan_prefix(b"pending:", None)?;
+        for (key, value) in iter {
             if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with("pending:") {
-                    break;
-                }
                 if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
                     if !p.is_expired() {
                         pending.insert(p.user_id.clone(), p);
                     } else {
                         // Clean up expired pending feedback from disk
-                        let _ = db.delete_cf(cf, key_str.as_bytes());
+                        let _ = store.delete_bytes(key_str.as_bytes());
                     }
                 }
             }
@@ -1660,12 +1672,9 @@ impl FeedbackStore {
 
         // Load previous context entries
         let mut previous_context = HashMap::new();
-        let iter = db.prefix_iterator_cf(cf, b"prev_ctx:");
-        for (key, value) in iter.flatten() {
+        let iter = store.scan_prefix(b"prev_ctx:", None)?;
+        for (key, value) in iter {
             if let Ok(key_str) = std::str::from_utf8(&key) {
-                if !key_str.starts_with("prev_ctx:") {
-                    break;
-                }
                 if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
                     let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
                     previous_context.insert(user_id.to_string(), ctx);
@@ -1685,7 +1694,7 @@ impl FeedbackStore {
             quality_tracker: RetrievalQualityTracker::default(),
             pending,
             previous_context,
-            db: Some(db),
+            store: Some(store),
             dirty: HashSet::new(),
         })
     }
@@ -1698,9 +1707,9 @@ impl FeedbackStore {
     ) -> &mut FeedbackMomentum {
         // Check if we need to load from disk
         if !self.momentum.contains_key(&memory_id) {
-            if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+            if let Some(store) = &self.store {
                 let key = format!("momentum:{}", memory_id.0);
-                if let Ok(Some(data)) = db.get_cf(cf, key.as_bytes()) {
+                if let Ok(Some(data)) = store.get_bytes(key.as_bytes()) {
                     if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&data) {
                         self.momentum.insert(memory_id.clone(), m);
                     }
@@ -1721,9 +1730,9 @@ impl FeedbackStore {
             return Some(m.clone());
         }
         // Fall back to disk lookup
-        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+        if let Some(store) = &self.store {
             let key = format!("momentum:{}", memory_id.0);
-            if let Ok(Some(data)) = db.get_cf(cf, key.as_bytes()) {
+            if let Ok(Some(data)) = store.get_bytes(key.as_bytes()) {
                 if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&data) {
                     return Some(m);
                 }
@@ -1743,10 +1752,10 @@ impl FeedbackStore {
         self.pending.insert(user_id.clone(), pending.clone());
 
         // Persist to disk
-        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+        if let Some(store) = &self.store {
             let key = format!("pending:{}", user_id);
             if let Ok(value) = serde_json::to_vec(&pending) {
-                if let Err(e) = db.put_cf(cf, key.as_bytes(), &value) {
+                if let Err(e) = store.put_bytes(key.as_bytes(), &value) {
                     tracing::warn!("Failed to persist pending feedback: {}", e);
                 }
             }
@@ -1758,9 +1767,9 @@ impl FeedbackStore {
         let result = self.pending.remove(user_id);
 
         // Remove from disk
-        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+        if let Some(store) = &self.store {
             let key = format!("pending:{}", user_id);
-            let _ = db.delete_cf(cf, key.as_bytes());
+            let _ = store.delete_bytes(key.as_bytes());
         }
 
         result
@@ -1796,10 +1805,10 @@ impl FeedbackStore {
             .insert(user_id.to_string(), prev_ctx.clone());
 
         // Persist to disk
-        if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+        if let Some(store) = &self.store {
             let key = format!("prev_ctx:{}", user_id);
             if let Ok(value) = serde_json::to_vec(&prev_ctx) {
-                if let Err(e) = db.put_cf(cf, key.as_bytes(), &value) {
+                if let Err(e) = store.put_bytes(key.as_bytes(), &value) {
                     tracing::warn!("Failed to persist previous context: {}", e);
                 }
             }
@@ -1837,10 +1846,7 @@ impl FeedbackStore {
 
     /// Flush dirty entries to disk and ensure WAL is persisted
     pub fn flush(&mut self) -> anyhow::Result<usize> {
-        let Some(ref db) = self.db else {
-            return Ok(0);
-        };
-        let Some(cf) = db.cf_handle(CF_FEEDBACK) else {
+        let Some(store) = self.store.clone() else {
             return Ok(0);
         };
 
@@ -1853,7 +1859,7 @@ impl FeedbackStore {
             if let Some(momentum) = self.momentum.get(memory_id) {
                 let key = format!("momentum:{}", memory_id.0);
                 let value = serde_json::to_vec(momentum)?;
-                db.put_cf(cf, key.as_bytes(), &value)?;
+                store.put_bytes(key.as_bytes(), &value)?;
                 flushed += 1;
             }
         }
@@ -1862,15 +1868,16 @@ impl FeedbackStore {
         for (user_id, pending) in &self.pending {
             let key = format!("pending:{}", user_id);
             let value = serde_json::to_vec(pending)?;
-            db.put_cf(cf, key.as_bytes(), &value)?;
+            store.put_bytes(key.as_bytes(), &value)?;
         }
 
-        // Flush the feedback CF to ensure data persistence (critical for graceful shutdown)
-        use rocksdb::FlushOptions;
-        let mut flush_opts = FlushOptions::default();
-        flush_opts.set_wait(true);
-        db.flush_cf_opt(cf, &flush_opts)
-            .map_err(|e| anyhow::anyhow!("Failed to flush feedback CF: {e}"))?;
+        // Persist before returning — the comment this replaces called it critical for
+        // graceful shutdown, and the error was being DISCARDED. A flush that fails on
+        // the way down is exactly the one a caller needs to hear about, so it now
+        // propagates. The old call was CF-scoped with set_wait(true); the trait's
+        // flush is whole-database and synchronous, so the wait is kept and the scope
+        // widens to a superset.
+        store.flush()?;
 
         if flushed > 0 {
             tracing::debug!("Flushed {} feedback momentum entries to disk", flushed);
@@ -1879,9 +1886,14 @@ impl FeedbackStore {
         Ok(flushed)
     }
 
-    /// Get reference to the RocksDB database for backup (if available)
-    pub fn database(&self) -> Option<&Arc<DB>> {
-        self.db.as_ref()
+    /// Whether this store persists at all.
+    ///
+    /// Replaces `database() -> Option<&Arc<DB>>`, which handed the raw engine handle
+    /// out for "backup" — the same leak `MemorySystem::get_db()` is, one store down.
+    /// A caller needing to back this up goes through BackupStore, which is the thing
+    /// that knows how.
+    pub fn is_persistent(&self) -> bool {
+        self.store.is_some()
     }
 
     /// Get statistics
