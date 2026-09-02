@@ -916,6 +916,183 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         // redb commits are durable per transaction — nothing buffered to flush.
         Ok(())
     }
+
+    // ── The eight the long_term_memory flip surfaced. All eight answer for
+    //    real: get_by_content_hash and set_fact_watermark have no error channel
+    //    in their signatures, so an unbuilt() stub could not even fail loudly —
+    //    it would BE the absence-as-success this file refuses everywhere else.
+
+    fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
+        // rocksdb answers from a content-hash index; redb has no such index yet,
+        // so this scans and compares. Correct-if-slow, and the same answer:
+        // "the memory whose content is exactly this". If remember-path dedupe
+        // latency matters on redb, the index is the fix — not a None that
+        // silently disables dedupe.
+        let memories = self.scan_all_memories().ok()?;
+        memories
+            .into_iter()
+            .find(|m| m.experience.content == content)
+            .map(|m| m.id)
+    }
+
+    fn update_access(&self, id: &MemoryId) -> Result<()> {
+        // Mirror of MemoryStorage::update_access: a missing memory is not an
+        // error, and the metadata mutation goes through the same interior-
+        // mutability path before the row is re-persisted.
+        if let Some(memory) = self.get_memory(id)? {
+            memory.update_access();
+            self.update_memory(&memory)?;
+        }
+        Ok(())
+    }
+
+    fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<Vec<MemoryId>> {
+        // rocksdb flags all rows in one WriteBatch; redb updates per row, so a
+        // crash mid-pass leaves a prefix flagged. The operation is idempotent
+        // and re-runnable — already-forgotten rows are skipped — so the weaker
+        // atomicity changes recovery, not outcome.
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut flagged_ids = Vec::new();
+        for mut memory in self.scan_all_memories()? {
+            if memory.is_forgotten() {
+                continue;
+            }
+            if memory.importance() < threshold {
+                memory
+                    .experience
+                    .metadata
+                    .insert("forgotten".to_string(), "true".to_string());
+                memory
+                    .experience
+                    .metadata
+                    .insert("forgotten_at".to_string(), now.clone());
+                self.update_memory(&memory)?;
+                flagged_ids.push(memory.id.clone());
+            }
+        }
+        Ok(flagged_ids)
+    }
+
+    fn save_interference_event_count(&self, count: usize) -> Result<()> {
+        // Same key and encoding as rocksdb's default keyspace, so an
+        // export/import carries the row across backends unchanged.
+        table_put(
+            &self.database,
+            DEFAULT_TABLE,
+            b"interference_meta:total",
+            &(count as u64).to_le_bytes(),
+        )
+    }
+
+    fn get_fact_watermark(&self, user_id: &str) -> Option<i64> {
+        let key = format!("_watermark:fact_extraction:{user_id}");
+        match table_get(&self.database, DEFAULT_TABLE, key.as_bytes()) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                Some(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            _ => None,
+        }
+    }
+
+    fn set_fact_watermark(&self, user_id: &str, timestamp_millis: i64) {
+        // Signature is MemoryStorage's exactly: returns () and logs, because
+        // every call site treats the watermark as best-effort.
+        let key = format!("_watermark:fact_extraction:{user_id}");
+        if let Err(e) = table_put(
+            &self.database,
+            DEFAULT_TABLE,
+            key.as_bytes(),
+            &timestamp_millis.to_le_bytes(),
+        ) {
+            tracing::warn!("Failed to persist fact extraction watermark: {e}");
+        }
+    }
+
+    fn key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
+        Arc::new(RedbTableKeyValueStore::new(
+            Arc::clone(&self.database),
+            "kv",
+        ))
+    }
+
+    fn default_key_value_store(&self) -> Arc<dyn crate::storage::KeyValueStore> {
+        Arc::new(RedbTableKeyValueStore::new(
+            Arc::clone(&self.database),
+            DEFAULT_TABLE_NAME,
+        ))
+    }
+}
+
+/// [`KeyValueStore`] view over one named table of an ALREADY-OPEN database.
+///
+/// By handle, never by path: redb permits one opener per file, so a store the
+/// primary hands out must share the primary's database. Distinct from
+/// [`RedbKeyValueStore`], which owns a whole `<namespace>.redb` file.
+pub struct RedbTableKeyValueStore {
+    database: Arc<redb::Database>,
+    table: &'static str,
+}
+
+impl RedbTableKeyValueStore {
+    pub fn new(database: Arc<redb::Database>, table: &'static str) -> Self {
+        Self { database, table }
+    }
+
+    fn def(&self) -> redb::TableDefinition<'static, &'static [u8], &'static [u8]> {
+        redb::TableDefinition::new(self.table)
+    }
+}
+
+impl KeyValueStore for RedbTableKeyValueStore {
+    fn backend(&self) -> StorageBackend {
+        StorageBackend::Redb
+    }
+
+    fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let txn = self.database.begin_read()?;
+        let table = match txn.open_table(self.def()) {
+            Ok(t) => t,
+            // A table nothing has written yet reads as empty, matching a fresh
+            // rocksdb family — not as an error.
+            Err(_) => return Ok(None),
+        };
+        Ok(table.get(key)?.map(|v| v.value().to_vec()))
+    }
+
+    fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        table_put(&self.database, self.def(), key, value)
+    }
+
+    fn delete_bytes(&self, key: &[u8]) -> Result<()> {
+        table_remove(&self.database, self.def(), key)?;
+        Ok(())
+    }
+
+    fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let txn = self.database.begin_read()?;
+        let table = match txn.open_table(self.def()) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::new();
+        for entry in table.range(prefix..)? {
+            let (k, v) = entry?;
+            let key_bytes = k.value();
+            if !key_bytes.starts_with(prefix) {
+                break;
+            }
+            out.push((key_bytes.to_vec(), v.value().to_vec()));
+            if limit.is_some_and(|max| out.len() >= max) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn flush(&self) -> Result<()> {
+        // Each write is committed durably in its own transaction.
+        Ok(())
+    }
 }
 
 pub struct RedbGraphStore {

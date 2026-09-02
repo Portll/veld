@@ -219,7 +219,7 @@ pub struct MemorySystem {
     /// Three-tier memory hierarchy
     working_memory: Arc<RwLock<WorkingMemory>>,
     session_memory: Arc<RwLock<SessionMemory>>,
-    long_term_memory: Arc<MemoryStorage>,
+    long_term_memory: Arc<dyn crate::storage::PrimaryMemoryStore>,
 
     /// Engine handle for the COMPREHENSIVE backup path, captured at
     /// construction where the concrete store type is known. Engine-typed BY
@@ -995,7 +995,11 @@ impl MemorySystem {
             session_memory: Arc::new(RwLock::new(SessionMemory::new(
                 config.session_memory_size_mb,
             ))),
-            long_term_memory: storage.clone(),
+            long_term_memory: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::from_arc(
+                    storage.clone(),
+                ),
+            ),
             rocksdb_backup_db: Some(storage.db()),
             compressor: CompressionPipeline::new(),
             retriever,
