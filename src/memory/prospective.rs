@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -45,12 +45,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Prior versions wrote bare timestamps (e.g. `due:1739404800:uuid`), which break
 /// lexicographic ordering (`"9" > "10"`). Zero-padding to 20 digits ensures
 /// lex order = chronological order, enabling early-termination scans.
-fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
-    let mut batch = WriteBatch::default();
+fn migrate_due_key_padding(store: &dyn crate::storage::ColumnStore) -> Result<usize> {
+    // A logical key rewrite, not a rocksdb-to-rocksdb import — so it runs on the
+    // trait and applies to whichever backend holds the rows.
+    let mut batch = crate::storage::WriteBatch::new();
     let mut count = 0;
 
-    for item in db.prefix_iterator_cf(index_cf, b"due:") {
-        let (key, value) = item.context("Failed to read due index during migration")?;
+    for (key, value) in store.scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)? {
         let key_str = std::str::from_utf8(&key).context("Non-UTF8 key in prospective due index")?;
 
         // Key format: due:{timestamp}:{task_id}
@@ -66,14 +67,15 @@ fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
 
         if let Ok(ts) = parts[1].parse::<i64>() {
             let new_key = format!("due:{:020}:{}", ts, parts[2]);
-            batch.delete_cf(index_cf, &*key);
-            batch.put_cf(index_cf, new_key.as_bytes(), &*value);
+            batch.delete_cf(CF_PROSPECTIVE_INDEX, key);
+            batch.put_cf(CF_PROSPECTIVE_INDEX, new_key.as_bytes(), value);
             count += 1;
         }
     }
 
     if count > 0 {
-        db.write(batch)
+        store
+            .write_batch(&batch)
             .context("Failed to write migrated prospective due keys")?;
         tracing::info!(count, "Migrated prospective due keys to zero-padded format");
     }
@@ -83,7 +85,13 @@ fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
 
 /// Storage and query engine for prospective memory (reminders)
 pub struct ProspectiveStore {
-    /// Shared RocksDB instance with "prospective" and "prospective_index" column families
+    /// Two families — CF_PROSPECTIVE and CF_PROSPECTIVE_INDEX — so this takes the
+    /// multi-family handle rather than a KeyValueStore bound to one. update() and
+    /// delete() batch across BOTH families in one commit; the DB-scoped batch API
+    /// exists for exactly those two call sites.
+    store: Arc<dyn crate::storage::ColumnStore>,
+    /// Kept ONLY for migrate_from_separate_dbs (a one-time rocksdb-to-rocksdb
+    /// import from superseded directories) and the backup accessor below.
     db: Arc<DB>,
 }
 
@@ -102,20 +110,6 @@ impl ProspectiveStore {
         ]
     }
 
-    /// CF accessor for the main task storage column family
-    fn tasks_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_PROSPECTIVE)
-            .expect("prospective CF must exist")
-    }
-
-    /// CF accessor for the secondary index column family
-    fn index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_PROSPECTIVE_INDEX)
-            .expect("prospective_index CF must exist")
-    }
-
     /// Create a new prospective store backed by the given shared DB.
     ///
     /// The DB must have been opened with the column families returned by
@@ -128,13 +122,13 @@ impl ProspectiveStore {
 
         Self::migrate_from_separate_dbs(&prospective_path, &db)?;
 
-        let index_cf = db
-            .cf_handle(CF_PROSPECTIVE_INDEX)
-            .expect("prospective_index CF must exist");
-        migrate_due_key_padding(&db, index_cf)?;
+        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
+        );
+        migrate_due_key_padding(store.as_ref())?;
 
         tracing::info!("Prospective memory store initialized");
-        Ok(Self { db })
+        Ok(Self { store, db })
     }
 
     /// One-time migration: copy data from legacy separate RocksDB instances
@@ -191,15 +185,12 @@ impl ProspectiveStore {
 
     /// Flush all column families to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
-        use rocksdb::FlushOptions;
-        let mut flush_opts = FlushOptions::default();
-        flush_opts.set_wait(true);
-        for cf_name in &[CF_PROSPECTIVE, CF_PROSPECTIVE_INDEX] {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                self.db
-                    .flush_cf_opt(cf, &flush_opts)
-                    .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
-            }
+        // One flush per family, errors propagated — the old loop did the same with
+        // flush_cf_opt(set_wait(true)); the trait's flush is synchronous.
+        for cf_name in [CF_PROSPECTIVE, CF_PROSPECTIVE_INDEX] {
+            self.store
+                .flush_cf(cf_name)
+                .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
         }
         Ok(())
     }
@@ -216,8 +207,8 @@ impl ProspectiveStore {
         let value =
             serde_json::to_vec(task).context("Failed to serialize prospective task to JSON")?;
 
-        self.db
-            .put_cf(self.tasks_cf(), key.as_bytes(), &value)
+        self.store
+            .put_cf(CF_PROSPECTIVE, key.as_bytes(), &value)
             .context("Failed to store prospective task")?;
 
         // Update indices
@@ -235,21 +226,25 @@ impl ProspectiveStore {
 
     /// Update secondary indices for efficient queries
     fn update_indices(&self, task: &ProspectiveTask) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
 
         // Index by user (for listing user's reminders)
         let user_key = format!("user:{}:{}", task.user_id, task.id);
-        batch.put_cf(self.index_cf(), user_key.as_bytes(), b"1");
+        batch.put_cf(CF_PROSPECTIVE_INDEX, user_key.as_bytes(), &b"1"[..]);
 
         // Index by status
         let status_key = format!("status:{:?}:{}:{}", task.status, task.user_id, task.id);
-        batch.put_cf(self.index_cf(), status_key.as_bytes(), b"1");
+        batch.put_cf(CF_PROSPECTIVE_INDEX, status_key.as_bytes(), &b"1"[..]);
 
         // Index by due time (for time-based trigger queries)
         // Zero-padded to 20 digits for correct lexicographic ordering
         if let Some(due_at) = task.trigger.due_at() {
             let due_key = format!("due:{:020}:{}", due_at.timestamp(), task.id);
-            batch.put_cf(self.index_cf(), due_key.as_bytes(), task.user_id.as_bytes());
+            batch.put_cf(
+                CF_PROSPECTIVE_INDEX,
+                due_key.as_bytes(),
+                task.user_id.as_bytes(),
+            );
         }
 
         // Index context triggers by keywords
@@ -261,12 +256,12 @@ impl ProspectiveStore {
                     task.user_id,
                     task.id
                 );
-                batch.put_cf(self.index_cf(), kw_key.as_bytes(), b"1");
+                batch.put_cf(CF_PROSPECTIVE_INDEX, kw_key.as_bytes(), &b"1"[..]);
             }
         }
 
-        self.db
-            .write(batch)
+        self.store
+            .write_batch(&batch)
             .context("Failed to update prospective indices")?;
 
         Ok(())
@@ -280,7 +275,7 @@ impl ProspectiveStore {
     ) -> Result<Option<ProspectiveTask>> {
         let key = format!("{}:{}", user_id, task_id);
 
-        match self.db.get_cf(self.tasks_cf(), key.as_bytes())? {
+        match self.store.get_cf(CF_PROSPECTIVE, key.as_bytes())? {
             Some(value) => {
                 let task: ProspectiveTask = serde_json::from_slice(&value)
                     .context("Failed to deserialize prospective task from JSON")?;
@@ -295,19 +290,22 @@ impl ProspectiveStore {
     /// Atomic: reads old task, builds a single WriteBatch containing old-index
     /// deletes + new task write + new index writes, then commits once.
     pub fn update(&self, task: &ProspectiveTask) -> Result<()> {
-        let mut batch = WriteBatch::default();
+        // ONE batch across CF_PROSPECTIVE and CF_PROSPECTIVE_INDEX — the DB-scoped
+        // batch API exists for this site; two batches would open a window where the
+        // task and its indices disagree, invisible from the call site.
+        let mut batch = crate::storage::WriteBatch::new();
 
         // 1. Remove old indices (need to read old task to know what to delete)
         if let Some(old_task) = self.get(&task.user_id, &task.id)? {
             let user_key = format!("user:{}:{}", task.user_id, task.id);
-            batch.delete_cf(self.index_cf(), user_key.as_bytes());
+            batch.delete_cf(CF_PROSPECTIVE_INDEX, user_key.as_bytes());
 
             let status_key = format!("status:{:?}:{}:{}", old_task.status, task.user_id, task.id);
-            batch.delete_cf(self.index_cf(), status_key.as_bytes());
+            batch.delete_cf(CF_PROSPECTIVE_INDEX, status_key.as_bytes());
 
             if let Some(due_at) = old_task.trigger.due_at() {
                 let due_key = format!("due:{:020}:{}", due_at.timestamp(), task.id);
-                batch.delete_cf(self.index_cf(), due_key.as_bytes());
+                batch.delete_cf(CF_PROSPECTIVE_INDEX, due_key.as_bytes());
             }
 
             if let ProspectiveTrigger::OnContext { ref keywords, .. } = old_task.trigger {
@@ -318,7 +316,7 @@ impl ProspectiveStore {
                         task.user_id,
                         task.id
                     );
-                    batch.delete_cf(self.index_cf(), kw_key.as_bytes());
+                    batch.delete_cf(CF_PROSPECTIVE_INDEX, kw_key.as_bytes());
                 }
             }
         }
@@ -327,21 +325,25 @@ impl ProspectiveStore {
         let key = format!("{}:{}", task.user_id, task.id);
         let value =
             serde_json::to_vec(task).context("Failed to serialize prospective task to JSON")?;
-        batch.put_cf(self.tasks_cf(), key.as_bytes(), &value);
+        batch.put_cf(CF_PROSPECTIVE, key.as_bytes(), value.as_slice());
 
         // 3. Write new indices
         let user_key = format!("user:{}:{}", task.user_id, task.id);
-        batch.put_cf(self.index_cf(), user_key.as_bytes(), b"1");
+        batch.put_cf(CF_PROSPECTIVE_INDEX, user_key.as_bytes(), &b"1"[..]);
 
         let status_key = format!("status:{:?}:{}:{}", task.status, task.user_id, task.id);
-        batch.put_cf(self.index_cf(), status_key.as_bytes(), b"1");
+        batch.put_cf(CF_PROSPECTIVE_INDEX, status_key.as_bytes(), &b"1"[..]);
 
         // Only index due time for Pending tasks — triggered/dismissed tasks
         // don't need to appear in due scans (fixes M13: stale due index bloat)
         if task.status == ProspectiveTaskStatus::Pending {
             if let Some(due_at) = task.trigger.due_at() {
                 let due_key = format!("due:{:020}:{}", due_at.timestamp(), task.id);
-                batch.put_cf(self.index_cf(), due_key.as_bytes(), task.user_id.as_bytes());
+                batch.put_cf(
+                    CF_PROSPECTIVE_INDEX,
+                    due_key.as_bytes(),
+                    task.user_id.as_bytes(),
+                );
             }
         }
 
@@ -353,13 +355,13 @@ impl ProspectiveStore {
                     task.user_id,
                     task.id
                 );
-                batch.put_cf(self.index_cf(), kw_key.as_bytes(), b"1");
+                batch.put_cf(CF_PROSPECTIVE_INDEX, kw_key.as_bytes(), &b"1"[..]);
             }
         }
 
         // 4. Single atomic commit
-        self.db
-            .write(batch)
+        self.store
+            .write_batch(&batch)
             .context("Failed to atomically update prospective task")?;
 
         tracing::debug!(
@@ -379,33 +381,34 @@ impl ProspectiveStore {
             None => return Ok(false),
         };
 
-        let mut batch = WriteBatch::default();
+        // ONE batch across both families — see update() for why this must not split.
+        let mut batch = crate::storage::WriteBatch::new();
 
         // Delete task data
         let key = format!("{}:{}", user_id, task_id);
-        batch.delete_cf(self.tasks_cf(), key.as_bytes());
+        batch.delete_cf(CF_PROSPECTIVE, key.as_bytes());
 
         // Delete all indices
         let user_key = format!("user:{}:{}", user_id, task_id);
-        batch.delete_cf(self.index_cf(), user_key.as_bytes());
+        batch.delete_cf(CF_PROSPECTIVE_INDEX, user_key.as_bytes());
 
         let status_key = format!("status:{:?}:{}:{}", task.status, user_id, task_id);
-        batch.delete_cf(self.index_cf(), status_key.as_bytes());
+        batch.delete_cf(CF_PROSPECTIVE_INDEX, status_key.as_bytes());
 
         if let Some(due_at) = task.trigger.due_at() {
             let due_key = format!("due:{:020}:{}", due_at.timestamp(), task_id);
-            batch.delete_cf(self.index_cf(), due_key.as_bytes());
+            batch.delete_cf(CF_PROSPECTIVE_INDEX, due_key.as_bytes());
         }
 
         if let ProspectiveTrigger::OnContext { ref keywords, .. } = task.trigger {
             for keyword in keywords {
                 let kw_key = format!("context:{}:{}:{}", keyword.to_lowercase(), user_id, task_id);
-                batch.delete_cf(self.index_cf(), kw_key.as_bytes());
+                batch.delete_cf(CF_PROSPECTIVE_INDEX, kw_key.as_bytes());
             }
         }
 
-        self.db
-            .write(batch)
+        self.store
+            .write_batch(&batch)
             .context("Failed to atomically delete prospective task")?;
 
         tracing::debug!(task_id = %task_id, user_id = %user_id, "Deleted prospective task");
@@ -422,11 +425,11 @@ impl ProspectiveStore {
         let prefix = format!("user:{}:", user_id);
         let mut tasks = Vec::new();
 
-        for item in self
-            .db
-            .prefix_iterator_cf(self.index_cf(), prefix.as_bytes())
+        // scan_cf enforces the prefix bound.
+        for (key, _) in self
+            .store
+            .scan_cf(CF_PROSPECTIVE_INDEX, Some(prefix.as_bytes()), None)?
         {
-            let (key, _) = item.context("Failed to read index entry")?;
             let key_str = String::from_utf8_lossy(&key);
 
             // Extract task_id from key: user:{user_id}:{task_id}
@@ -467,8 +470,10 @@ impl ProspectiveStore {
 
         // Scan due index for tasks with due_time <= now
         // Key format: due:{timestamp}:{task_id}
-        for item in self.db.prefix_iterator_cf(self.index_cf(), b"due:") {
-            let (key, value) = item.context("Failed to read due index")?;
+        // NOTE: the break below is an ORDERING early-exit, not a prefix guard — it
+        // relies on scan_cf returning keys in lexicographic order (zero-padded
+        // timestamps make lex order chronological). It stays.
+        for (key, value) in self.store.scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)? {
             let key_str = String::from_utf8_lossy(&key);
 
             // Parse key: due:{timestamp}:{task_id}
@@ -528,8 +533,8 @@ impl ProspectiveStore {
         let now_ts = Utc::now().timestamp();
         let mut due_tasks = Vec::new();
 
-        for item in self.db.prefix_iterator_cf(self.index_cf(), b"due:") {
-            let (key, value) = item.context("Failed to read due index")?;
+        // Same ordering early-exit as get_due_tasks — the break is load-bearing.
+        for (key, value) in self.store.scan_cf(CF_PROSPECTIVE_INDEX, Some(b"due:"), None)? {
             let key_str = String::from_utf8_lossy(&key);
 
             let parts: Vec<&str> = key_str.splitn(3, ':').collect();
@@ -959,8 +964,9 @@ mod tests {
         )
         .unwrap();
 
-        // Run migration
-        let migrated = migrate_due_key_padding(&db, index_cf).unwrap();
+        // Run migration through the trait, as new() does
+        let store = crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db));
+        let migrated = migrate_due_key_padding(&store).unwrap();
         assert_eq!(migrated, 2);
 
         // Verify old keys are gone
@@ -986,7 +992,7 @@ mod tests {
         );
 
         // Re-running migration should be a no-op
-        let migrated_again = migrate_due_key_padding(&db, index_cf).unwrap();
+        let migrated_again = migrate_due_key_padding(&store).unwrap();
         assert_eq!(migrated_again, 0);
     }
 

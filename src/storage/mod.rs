@@ -240,6 +240,11 @@ pub trait ColumnStore: Send + Sync {
 
     /// One scan for both uses a caller has. `prefix: None` walks the family.
     ///
+    /// Results are in ASCENDING key order — part of the contract, not an
+    /// implementation accident: prospective's due-index scans early-exit at the
+    /// first future timestamp, which is only correct when zero-padded keys come
+    /// back lexicographically. The conformance script asserts it.
+    ///
     /// `limit` is explicit and NOT defaulted, so an unbounded scan of a family that
     /// may hold hundreds of thousands of rows is a visible choice at the call site
     /// rather than the shape of the API. The prefix bound is the implementation's:
@@ -662,6 +667,13 @@ mod column_store_conformance {
         // The prefix bound: `qqq` sorts after `pre:` and must NOT be returned.
         let pre = s.scan_cf("alpha", Some(b"pre:"), None).unwrap();
         note("scan prefix", format!("{:?}", pre.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()));
+        // Ascending order is contract, not accident — the due-index early exit
+        // depends on it. A hard assert, not a note: two backends agreeing on a
+        // wrong order would pass the equality comparison.
+        assert!(
+            pre.windows(2).all(|w| w[0].0 < w[1].0),
+            "scan_cf must return keys in ascending order"
+        );
         note("scan prefix limit 1", format!("{}", s.scan_cf("alpha", Some(b"pre:"), Some(1)).unwrap().len()));
         note("scan whole family", format!("{}", s.scan_cf("alpha", None, None).unwrap().len()));
 
