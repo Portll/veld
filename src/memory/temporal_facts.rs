@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
-use rocksdb::{IteratorMode, DB};
+use rocksdb::DB;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -397,12 +397,24 @@ pub(super) fn decode_for_gc(data: &[u8]) -> anyhow::Result<TemporalFact> {
 
 /// Storage for temporal facts
 pub struct TemporalFactStore {
-    db: Arc<DB>,
+    /// Default-keyspace rows under `temporal_facts:`/`temporal_by_*:` prefixes,
+    /// so this binds the DEFAULT keyspace handle — the same keyspace the raw
+    /// `db.put` calls used, never the `kv` family.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl TemporalFactStore {
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self {
+            store: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
+            ),
+        }
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     /// Store a temporal fact
@@ -410,7 +422,7 @@ impl TemporalFactStore {
         // Primary storage
         let key = format!("temporal_facts:{}:{}", user_id, fact.id);
         let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
 
         // Entity index
         let entity_key = format!(
@@ -419,12 +431,12 @@ impl TemporalFactStore {
             fact.entity.to_lowercase(),
             fact.id
         );
-        self.db.put(entity_key.as_bytes(), fact.id.as_bytes())?;
+        self.store.put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
 
         // Event index (by each stem)
         for stem in &fact.event_stems {
             let event_key = format!("temporal_by_event:{}:{}:{}", user_id, stem, fact.id);
-            self.db.put(event_key.as_bytes(), fact.id.as_bytes())?;
+            self.store.put_bytes(event_key.as_bytes(), fact.id.as_bytes())?;
         }
 
         Ok(())
@@ -444,7 +456,7 @@ impl TemporalFactStore {
     /// Get a fact by ID
     pub fn get(&self, user_id: &str, fact_id: &str) -> Result<Option<TemporalFact>> {
         let key = format!("temporal_facts:{}:{}", user_id, fact_id);
-        match self.db.get(key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(data) => {
                 let (fact, _): (TemporalFact, _) =
                     bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
@@ -565,7 +577,7 @@ impl TemporalFactStore {
 
         let key = format!("temporal_facts:{}:{}", user_id, updated.id);
         let value = bincode::serde::encode_to_vec(&updated, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
         Ok(())
     }
 
@@ -673,18 +685,8 @@ impl TemporalFactStore {
         let mut facts = Vec::new();
         let mut seen_ids = HashSet::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
 
             let fact_id = String::from_utf8_lossy(&value);
             if seen_ids.insert(fact_id.to_string()) {
@@ -717,18 +719,8 @@ impl TemporalFactStore {
         let prefix = format!("temporal_facts:{}:", user_id);
         let mut facts = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
 
             if let Ok((fact, _)) = bincode::serde::decode_from_slice::<TemporalFact, _>(
                 &value,
@@ -759,18 +751,8 @@ impl TemporalFactStore {
         let prefix = format!("temporal_facts:{}:", user_id);
         let mut facts = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
 
             if let Ok((fact, _)) = bincode::serde::decode_from_slice::<TemporalFact, _>(
                 &value,

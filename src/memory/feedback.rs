@@ -2828,6 +2828,20 @@ mod tests {
         fn flush(&self) -> anyhow::Result<()> {
             Ok(())
         }
+        fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
+            let mut map = self.map.lock();
+            for (k, v) in pairs {
+                map.insert(k.clone(), v.clone());
+            }
+            Ok(())
+        }
+        fn delete_many(&self, keys: &[Vec<u8>]) -> anyhow::Result<()> {
+            let mut map = self.map.lock();
+            for k in keys {
+                map.remove(k);
+            }
+            Ok(())
+        }
     }
 
     fn mem_store() -> RetrievalTraceStore {

@@ -694,6 +694,24 @@ impl KeyValueStore for RocksDbDefaultKeyValueStore {
         self.db.flush()?;
         Ok(())
     }
+    fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let mut wb = WriteBatch::default();
+        for (k, v) in pairs {
+            wb.put(k, v);
+        }
+        self.db.write(wb)?;
+        Ok(())
+    }
+
+    fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
+        let mut wb = WriteBatch::default();
+        for k in keys {
+            wb.delete(k);
+        }
+        self.db.write(wb)?;
+        Ok(())
+    }
+
 }
 
 impl KeyValueStore for RocksDbColumnFamilyStore {
@@ -740,6 +758,26 @@ impl KeyValueStore for RocksDbColumnFamilyStore {
         self.db.flush_cf(self.cf()?)?;
         Ok(())
     }
+    fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let cf = self.cf()?;
+        let mut wb = WriteBatch::default();
+        for (k, v) in pairs {
+            wb.put_cf(cf, k, v);
+        }
+        self.db.write(wb)?;
+        Ok(())
+    }
+
+    fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
+        let cf = self.cf()?;
+        let mut wb = WriteBatch::default();
+        for k in keys {
+            wb.delete_cf(cf, k);
+        }
+        self.db.write(wb)?;
+        Ok(())
+    }
+
 }
 
 /// Audit adapter for the shared RocksDB-backed audit log column family.
