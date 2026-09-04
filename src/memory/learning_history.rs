@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use rocksdb::{IteratorMode, DB};
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,13 +121,24 @@ pub struct LearningStats {
 
 /// Persistent storage for learning history
 pub struct LearningHistoryStore {
-    db: Arc<DB>,
+    /// Default-keyspace rows under `learning:`/`learning_by_*:` prefixes, so
+    /// this binds the DEFAULT keyspace handle — never the `kv` family.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl LearningHistoryStore {
     /// Create a new learning history store
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self {
+            store: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
+            ),
+        }
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     /// Record a significant learning event
@@ -153,9 +164,10 @@ impl LearningHistoryStore {
         let key = format!("learning:{}:{:020}", user_id, timestamp_nanos);
         let value = rmp_serde::to_vec(&stored)?;
 
-        // Batch all writes atomically — avoids orphaned index entries on crash
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put(key.as_bytes(), &value);
+        // Batch all writes atomically — avoids orphaned index entries on crash.
+        // put_many is the single-keyspace atomic write; see KeyValueStore.
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        pairs.push((key.as_bytes().to_vec(), value.clone()));
 
         // Index by memory ID
         if let Some(ref mem_id) = memory_id {
@@ -163,7 +175,7 @@ impl LearningHistoryStore {
                 "learning_by_memory:{}:{}:{:020}",
                 user_id, mem_id, timestamp_nanos
             );
-            batch.put(mem_key.as_bytes(), key.as_bytes());
+            pairs.push((mem_key.as_bytes().to_vec(), key.as_bytes().to_vec()));
         }
 
         // Index related memory too (for edges/interference)
@@ -172,7 +184,7 @@ impl LearningHistoryStore {
                 "learning_by_memory:{}:{}:{:020}",
                 user_id, related_id, timestamp_nanos
             );
-            batch.put(related_key.as_bytes(), key.as_bytes());
+            pairs.push((related_key.as_bytes().to_vec(), key.as_bytes().to_vec()));
         }
 
         // Index by fact ID
@@ -181,7 +193,7 @@ impl LearningHistoryStore {
                 "learning_by_fact:{}:{}:{:020}",
                 user_id, f_id, timestamp_nanos
             );
-            batch.put(fact_key.as_bytes(), key.as_bytes());
+            pairs.push((fact_key.as_bytes().to_vec(), key.as_bytes().to_vec()));
         }
 
         // Index by event type
@@ -191,9 +203,9 @@ impl LearningHistoryStore {
             event_type.as_str(),
             timestamp_nanos
         );
-        batch.put(type_key.as_bytes(), key.as_bytes());
+        pairs.push((type_key.as_bytes().to_vec(), key.as_bytes().to_vec()));
 
-        self.db.write(batch)?;
+        self.store.put_many(&pairs)?;
 
         Ok(())
     }
@@ -382,20 +394,13 @@ impl LearningHistoryStore {
         let start_key = format!("learning:{}:{:020}", user_id, since_nanos);
 
         let mut events = Vec::new();
-        let iter = self.db.iterator(IteratorMode::From(
-            start_key.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            // Stop if we've moved past this user's events
-            if !key_str.starts_with(&prefix) {
-                break;
+        // scan_prefix bounds the user; the zero-padded timestamp makes the
+        // lexicographic floor equal to the temporal one, so skipping below
+        // start_key reproduces the old mid-prefix seek exactly.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
+            if key.as_slice() < start_key.as_bytes() {
+                continue;
             }
-
             if let Ok(event) = rmp_serde::from_slice::<StoredLearningEvent>(&value) {
                 events.push(event);
             }
@@ -426,20 +431,14 @@ impl LearningHistoryStore {
         let end_key = format!("learning:{}:{:020}", user_id, until_nanos);
 
         let mut events = Vec::new();
-        let iter = self.db.iterator(IteratorMode::From(
-            start_key.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
+        // Same floor trick as events_since; the ceiling break survives because
+        // scan_prefix returns ascending keys (trait contract).
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
+            if key.as_slice() < start_key.as_bytes() {
+                continue;
             }
             // Stop once we pass the upper bound key
-            if key_str.as_ref() > end_key.as_str() {
+            if key.as_slice() > end_key.as_bytes() {
                 break;
             }
 
@@ -461,18 +460,12 @@ impl LearningHistoryStore {
         let prefix = format!("learning_by_memory:{}:{}:", user_id, memory_id);
         let mut events = Vec::new();
 
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
-        for item in iter.take(limit) {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
-
+        // scan_prefix enforces the bound; limit matches the old take(limit),
+        // which capped SCANNED index rows, not fetched events.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), Some(limit))? {
             // Value is the primary key - fetch the actual event
             let primary_key = String::from_utf8_lossy(&value);
-            if let Some(event_data) = self.db.get(primary_key.as_bytes())? {
+            if let Some(event_data) = self.store.get_bytes(primary_key.as_bytes())? {
                 if let Ok(event) = rmp_serde::from_slice::<StoredLearningEvent>(&event_data) {
                     events.push(event);
                 }
@@ -492,17 +485,10 @@ impl LearningHistoryStore {
         let prefix = format!("learning_by_fact:{}:{}:", user_id, fact_id);
         let mut events = Vec::new();
 
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
-        for item in iter.take(limit) {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
-
+        // scan_prefix enforces the bound; limit matches the old take(limit).
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), Some(limit))? {
             let primary_key = String::from_utf8_lossy(&value);
-            if let Some(event_data) = self.db.get(primary_key.as_bytes())? {
+            if let Some(event_data) = self.store.get_bytes(primary_key.as_bytes())? {
                 if let Ok(event) = rmp_serde::from_slice::<StoredLearningEvent>(&event_data) {
                     events.push(event);
                 }
@@ -720,57 +706,52 @@ impl LearningHistoryStore {
         });
 
         let prefix = format!("learning:{}:", user_id);
-        let mut batch = rocksdb::WriteBatch::default();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
         let mut deleted = 0;
 
-        let iter = self.db.prefix_iterator(prefix.as_bytes());
-        for item in iter {
-            let (key, value) = item?;
+        // scan_prefix enforces the bound; the delete set commits atomically below.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             // Extract timestamp from key
             if let Some(ts_str) = key_str.strip_prefix(&prefix) {
                 if let Ok(ts) = ts_str.parse::<i64>() {
                     if ts < cutoff_nanos {
                         // Delete primary key
-                        batch.delete(&key);
+                        to_delete.push(key.clone());
 
                         // Also delete secondary index entries for this event
                         if let Ok(stored) = rmp_serde::from_slice::<StoredLearningEvent>(&value) {
                             let ts_fmt = format!("{:020}", ts);
                             if let Some(ref mem_id) = stored.memory_id {
-                                batch.delete(
+                                to_delete.push(
                                     format!("learning_by_memory:{}:{}:{}", user_id, mem_id, ts_fmt)
-                                        .as_bytes(),
+                                        .into_bytes(),
                                 );
                             }
                             if let Some(ref related_id) = stored.related_memory_id {
-                                batch.delete(
+                                to_delete.push(
                                     format!(
                                         "learning_by_memory:{}:{}:{}",
                                         user_id, related_id, ts_fmt
                                     )
-                                    .as_bytes(),
+                                    .into_bytes(),
                                 );
                             }
                             if let Some(ref f_id) = stored.fact_id {
-                                batch.delete(
+                                to_delete.push(
                                     format!("learning_by_fact:{}:{}:{}", user_id, f_id, ts_fmt)
-                                        .as_bytes(),
+                                        .into_bytes(),
                                 );
                             }
-                            batch.delete(
+                            to_delete.push(
                                 format!(
                                     "learning_by_type:{}:{}:{}",
                                     user_id,
                                     stored.event_type.as_str(),
                                     ts_fmt
                                 )
-                                .as_bytes(),
+                                .into_bytes(),
                             );
                         }
 
@@ -781,7 +762,7 @@ impl LearningHistoryStore {
         }
 
         if deleted > 0 {
-            self.db.write(batch)?;
+            self.store.delete_many(&to_delete)?;
         }
 
         Ok(deleted)

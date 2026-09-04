@@ -1127,6 +1127,30 @@ impl KeyValueStore for RedbTableKeyValueStore {
         // Each write is committed durably in its own transaction.
         Ok(())
     }
+    fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(self.def())?;
+            for (k, v) in pairs {
+                table.insert(k.as_slice(), v.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(self.def())?;
+            for k in keys {
+                table.remove(k.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
 }
 
 pub struct RedbGraphStore {
@@ -1315,6 +1339,30 @@ impl KeyValueStore for RedbKeyValueStore {
         // Each write is committed durably in its own transaction — nothing to flush.
         Ok(())
     }
+    fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(KV_TABLE)?;
+            for (k, v) in pairs {
+                table.insert(k.as_slice(), v.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
+        let txn = self.database.begin_write()?;
+        {
+            let mut table = txn.open_table(KV_TABLE)?;
+            for k in keys {
+                table.remove(k.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
