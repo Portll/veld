@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rocksdb::{IteratorMode, DB};
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -290,7 +290,9 @@ pub struct LineageStats {
 
 /// The Lineage Graph - stores and infers causal relationships
 pub struct LineageGraph {
-    db: Arc<DB>,
+    /// Default-keyspace rows under `lineage:` prefixes, so this binds the
+    /// DEFAULT keyspace handle — never the `kv` family.
+    store: Arc<dyn crate::storage::KeyValueStore>,
     config: InferenceConfig,
 }
 
@@ -298,14 +300,29 @@ impl LineageGraph {
     /// Create a new lineage graph backed by RocksDB
     pub fn new(db: Arc<DB>) -> Self {
         Self {
-            db,
+            store: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
+            ),
+            config: InferenceConfig::default(),
+        }
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self {
+            store,
             config: InferenceConfig::default(),
         }
     }
 
     /// Create with custom inference config
     pub fn with_config(db: Arc<DB>, config: InferenceConfig) -> Self {
-        Self { db, config }
+        Self {
+            store: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
+            ),
+            config,
+        }
     }
 
     // =========================================================================
@@ -317,15 +334,15 @@ impl LineageGraph {
         // Primary storage
         let key = format!("lineage:edges:{}:{}", user_id, edge.id);
         let value = bincode::serde::encode_to_vec(edge, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
 
         // Index by source (from)
         let from_key = format!("lineage:by_from:{}:{}:{}", user_id, edge.from.0, edge.id);
-        self.db.put(from_key.as_bytes(), edge.id.as_bytes())?;
+        self.store.put_bytes(from_key.as_bytes(), edge.id.as_bytes())?;
 
         // Index by target (to)
         let to_key = format!("lineage:by_to:{}:{}:{}", user_id, edge.to.0, edge.id);
-        self.db.put(to_key.as_bytes(), edge.id.as_bytes())?;
+        self.store.put_bytes(to_key.as_bytes(), edge.id.as_bytes())?;
 
         Ok(())
     }
@@ -333,7 +350,7 @@ impl LineageGraph {
     /// Get an edge by ID
     pub fn get_edge(&self, user_id: &str, edge_id: &str) -> Result<Option<LineageEdge>> {
         let key = format!("lineage:edges:{}:{}", user_id, edge_id);
-        match self.db.get(key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(data) => {
                 let (edge, _): (LineageEdge, _) =
                     bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
@@ -348,14 +365,14 @@ impl LineageGraph {
         if let Some(edge) = self.get_edge(user_id, edge_id)? {
             // Delete indices
             let from_key = format!("lineage:by_from:{}:{}:{}", user_id, edge.from.0, edge_id);
-            self.db.delete(from_key.as_bytes())?;
+            self.store.delete_bytes(from_key.as_bytes())?;
 
             let to_key = format!("lineage:by_to:{}:{}:{}", user_id, edge.to.0, edge_id);
-            self.db.delete(to_key.as_bytes())?;
+            self.store.delete_bytes(to_key.as_bytes())?;
 
             // Delete primary
             let key = format!("lineage:edges:{}:{}", user_id, edge_id);
-            self.db.delete(key.as_bytes())?;
+            self.store.delete_bytes(key.as_bytes())?;
 
             Ok(true)
         } else {
@@ -379,18 +396,8 @@ impl LineageGraph {
     fn get_edges_by_prefix(&self, user_id: &str, prefix: &str) -> Result<Vec<LineageEdge>> {
         let mut edges = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
 
             let edge_id = String::from_utf8_lossy(&value);
             if let Some(edge) = self.get_edge(user_id, &edge_id)? {
@@ -406,18 +413,8 @@ impl LineageGraph {
         let prefix = format!("lineage:edges:{}:", user_id);
         let mut edges = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
 
             if let Ok(edge) = bincode::serde::decode_from_slice::<LineageEdge, _>(
                 &value,
@@ -445,14 +442,14 @@ impl LineageGraph {
     pub fn store_branch(&self, user_id: &str, branch: &LineageBranch) -> Result<()> {
         let key = format!("lineage:branches:{}:{}", user_id, branch.id);
         let value = bincode::serde::encode_to_vec(branch, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
         Ok(())
     }
 
     /// Get a branch by ID
     pub fn get_branch(&self, user_id: &str, branch_id: &str) -> Result<Option<LineageBranch>> {
         let key = format!("lineage:branches:{}:{}", user_id, branch_id);
-        match self.db.get(key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(data) => {
                 let (branch, _): (LineageBranch, _) =
                     bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
@@ -467,18 +464,8 @@ impl LineageGraph {
         let prefix = format!("lineage:branches:{}:", user_id);
         let mut branches = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
 
             if let Ok(branch) = bincode::serde::decode_from_slice::<LineageBranch, _>(
                 &value,

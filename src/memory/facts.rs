@@ -10,7 +10,7 @@
 //! - `facts_embedding:{user_id}:{fact_id}` - Pre-computed embedding vector (384-dim)
 
 use anyhow::Result;
-use rocksdb::{IteratorMode, DB};
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -189,18 +189,24 @@ fn fact_is_valid_at(fact: &SemanticFact, at: chrono::DateTime<chrono::Utc>) -> b
 
 /// Storage for semantic facts with indexing
 pub struct SemanticFactStore {
-    db: Arc<DB>,
+    /// Default-keyspace rows under `facts:`/`facts_by_*:`/`facts_embedding:`
+    /// prefixes, so this binds the DEFAULT keyspace handle — never `kv`.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl SemanticFactStore {
     /// Create a new fact store backed by RocksDB
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self {
+            store: Arc::new(
+                crate::storage::legacy_rocksdb::RocksDbDefaultKeyValueStore::new(db),
+            ),
+        }
     }
 
-    /// Get references to all RocksDB databases for backup
-    pub fn databases(&self) -> Vec<(&str, &Arc<DB>)> {
-        vec![("semantic_facts", &self.db)]
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     /// Store a semantic fact
@@ -208,7 +214,7 @@ impl SemanticFactStore {
         // Primary storage
         let key = format!("facts:{}:{}", user_id, fact.id);
         let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
 
         // Entity index - index by each related entity
         for entity in &fact.related_entities {
@@ -218,13 +224,13 @@ impl SemanticFactStore {
                 entity.to_lowercase(),
                 fact.id
             );
-            self.db.put(entity_key.as_bytes(), fact.id.as_bytes())?;
+            self.store.put_bytes(entity_key.as_bytes(), fact.id.as_bytes())?;
         }
 
         // Type index
         let type_name = format!("{:?}", fact.fact_type);
         let type_key = format!("facts_by_type:{}:{}:{}", user_id, type_name, fact.id);
-        self.db.put(type_key.as_bytes(), fact.id.as_bytes())?;
+        self.store.put_bytes(type_key.as_bytes(), fact.id.as_bytes())?;
 
         Ok(())
     }
@@ -243,7 +249,7 @@ impl SemanticFactStore {
     /// Get a fact by ID
     pub fn get(&self, user_id: &str, fact_id: &str) -> Result<Option<SemanticFact>> {
         let key = format!("facts:{}:{}", user_id, fact_id);
-        match self.db.get(key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(data) => {
                 let (fact, _is_legacy) = decode_semantic_fact_with_fallback(&data)?;
                 Ok(Some(fact))
@@ -257,7 +263,7 @@ impl SemanticFactStore {
         // Simply overwrite - indices stay valid since ID doesn't change
         let key = format!("facts:{}:{}", user_id, fact.id);
         let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
         Ok(())
     }
 
@@ -273,17 +279,17 @@ impl SemanticFactStore {
                     entity.to_lowercase(),
                     fact_id
                 );
-                self.db.delete(entity_key.as_bytes())?;
+                self.store.delete_bytes(entity_key.as_bytes())?;
             }
 
             // Delete type index
             let type_name = format!("{:?}", fact.fact_type);
             let type_key = format!("facts_by_type:{}:{}:{}", user_id, type_name, fact_id);
-            self.db.delete(type_key.as_bytes())?;
+            self.store.delete_bytes(type_key.as_bytes())?;
 
             // Delete primary record
             let key = format!("facts:{}:{}", user_id, fact_id);
-            self.db.delete(key.as_bytes())?;
+            self.store.delete_bytes(key.as_bytes())?;
 
             // Delete embedding if present
             let _ = self.delete_embedding(user_id, fact_id);
@@ -313,18 +319,9 @@ impl SemanticFactStore {
         let mut facts = Vec::new();
         let now = chrono::Utc::now();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
 
             // Skip index keys (they contain extra colons)
             if key_str.matches(':').count() > 2 {
@@ -372,19 +369,8 @@ impl SemanticFactStore {
         let mut seen_ids = std::collections::HashSet::new();
         let now = chrono::Utc::now();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
-
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let fact_id = String::from_utf8_lossy(&value);
             if seen_ids.insert(fact_id.to_string()) {
                 if let Some(fact) = self.get(user_id, &fact_id)? {
@@ -426,19 +412,8 @@ impl SemanticFactStore {
         let mut facts = Vec::new();
         let now = chrono::Utc::now();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
-            let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
-
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (_key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let fact_id = String::from_utf8_lossy(&value);
             if let Some(fact) = self.get(user_id, &fact_id)? {
                 if !include_inactive && !fact_is_active(&fact, now) {
@@ -499,18 +474,9 @@ impl SemanticFactStore {
         let prefix = format!("facts:{}:", user_id);
         let mut facts = Vec::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = item?;
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
             if key_str.matches(':').count() > 2 {
                 continue;
             }
@@ -569,20 +535,11 @@ impl SemanticFactStore {
         let prefix = format!("facts:{user_id}:");
         let mut max_millis: Option<i64> = None;
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, value) = match item {
-                Ok(kv) => kv,
-                Err(_) => break,
-            };
+        // scan_prefix enforces the bound AND propagates read errors — the old
+        // loop broke silently on a mid-scan error, returning a truncated set
+        // that looked complete.
+        for (key, value) in self.store.scan_prefix(prefix.as_bytes(), None).ok()? {
             let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with(&prefix) {
-                break;
-            }
             // Skip index keys (entity/type sub-keys have extra colons)
             if key_str.matches(':').count() > 2 {
                 continue;
@@ -824,13 +781,13 @@ impl SemanticFactStore {
             new_fact_owned.supersedes = combined;
         }
 
-        let mut batch = rocksdb::WriteBatch::default();
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         // Re-encode each invalidated fact with valid_until + superseded_by set.
         for old in to_invalidate.drain(..) {
             let key = format!("facts:{}:{}", user_id, old.id);
             let value = bincode::serde::encode_to_vec(&old, bincode::config::standard())?;
-            batch.put(key.as_bytes(), &value);
+            pairs.push((key.into_bytes(), value));
 
             tracing::info!(
                 user_id = user_id,
@@ -844,7 +801,7 @@ impl SemanticFactStore {
         let new_key = format!("facts:{}:{}", user_id, new_fact_owned.id);
         let new_value =
             bincode::serde::encode_to_vec(&new_fact_owned, bincode::config::standard())?;
-        batch.put(new_key.as_bytes(), &new_value);
+        pairs.push((new_key.into_bytes(), new_value));
 
         // Entity indices for the new fact.
         for entity in &new_fact_owned.related_entities {
@@ -854,24 +811,24 @@ impl SemanticFactStore {
                 entity.to_lowercase(),
                 new_fact_owned.id
             );
-            batch.put(entity_key.as_bytes(), new_fact_owned.id.as_bytes());
+            pairs.push((entity_key.into_bytes(), new_fact_owned.id.as_bytes().to_vec()));
         }
 
         // Type index for the new fact.
         let type_name = format!("{:?}", new_fact_owned.fact_type);
         let type_key =
             format!("facts_by_type:{}:{}:{}", user_id, type_name, new_fact_owned.id);
-        batch.put(type_key.as_bytes(), new_fact_owned.id.as_bytes());
+        pairs.push((type_key.into_bytes(), new_fact_owned.id.as_bytes().to_vec()));
 
         // Optional embedding for the new fact.
         if let Some(emb) = new_embedding {
             let emb_key = format!("facts_embedding:{}:{}", user_id, new_fact_owned.id);
             let emb_value =
                 bincode::serde::encode_to_vec(emb, bincode::config::standard())?;
-            batch.put(emb_key.as_bytes(), &emb_value);
+            pairs.push((emb_key.into_bytes(), emb_value));
         }
 
-        self.db.write(batch)?;
+        self.store.put_many(&pairs)?;
         Ok(invalidated_ids)
     }
 
@@ -886,14 +843,14 @@ impl SemanticFactStore {
     pub fn store_embedding(&self, user_id: &str, fact_id: &str, embedding: &[f32]) -> Result<()> {
         let key = format!("facts_embedding:{user_id}:{fact_id}");
         let value = bincode::serde::encode_to_vec(embedding, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
+        self.store.put_bytes(key.as_bytes(), &value)?;
         Ok(())
     }
 
     /// Get pre-computed embedding vector for a fact
     pub fn get_embedding(&self, user_id: &str, fact_id: &str) -> Result<Option<Vec<f32>>> {
         let key = format!("facts_embedding:{user_id}:{fact_id}");
-        match self.db.get(key.as_bytes())? {
+        match self.store.get_bytes(key.as_bytes())? {
             Some(data) => {
                 let (embedding, _): (Vec<f32>, _) =
                     bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
@@ -906,7 +863,7 @@ impl SemanticFactStore {
     /// Delete embedding for a fact (called during fact deletion)
     pub fn delete_embedding(&self, user_id: &str, fact_id: &str) -> Result<()> {
         let key = format!("facts_embedding:{user_id}:{fact_id}");
-        self.db.delete(key.as_bytes())?;
+        self.store.delete_bytes(key.as_bytes())?;
         Ok(())
     }
 
@@ -915,18 +872,9 @@ impl SemanticFactStore {
         let prefix = "facts:";
         let mut users = std::collections::HashSet::new();
 
-        let iter = self.db.iterator(IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
-        for item in iter {
-            let (key, _) = item?;
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (key, _) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let key_str = String::from_utf8_lossy(&key);
-
-            if !key_str.starts_with(prefix) {
-                break;
-            }
 
             // Key format: facts:{user_id}:{fact_id}
             // Skip index keys (facts_by_entity, facts_by_type)
@@ -1107,7 +1055,7 @@ mod tests {
         // then read via the store — must transparently upgrade.
         let (store, _dir) = create_test_store();
         let key = format!("facts:{}:{}", "user-1", "legacy-fact");
-        store.db.put(key.as_bytes(), &v1_bytes).unwrap();
+        store.store.put_bytes(key.as_bytes(), &v1_bytes).unwrap();
 
         let got = store
             .get("user-1", "legacy-fact")

@@ -331,6 +331,14 @@ pub trait KeyValueStore: Send + Sync {
     fn delete_bytes(&self, key: &[u8]) -> Result<()>;
     fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     fn flush(&self) -> Result<()>;
+    /// Atomic multi-put WITHIN THIS STORE'S KEYSPACE. Required, not defaulted:
+    /// a default that looped put_bytes would silently trade away the atomicity
+    /// callers batch FOR, so every implementor states its own. Deliberately not
+    /// the DB-scoped [`WriteBatch`]: a cf on a single-keyspace handle is the
+    /// exact ambiguity the `cf: None` bug came from.
+    fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()>;
+    /// Atomic multi-delete within this store's keyspace.
+    fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()>;
 }
 
 /// Domain interface for the primary memory store.

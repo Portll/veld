@@ -2056,6 +2056,20 @@ mod tests {
         fn get_bytes(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
             Ok(self.map.lock().get(key).cloned())
         }
+        fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
+            let mut map = self.map.lock();
+            for (k, v) in pairs {
+                map.insert(k.clone(), v.clone());
+            }
+            Ok(())
+        }
+        fn delete_many(&self, keys: &[Vec<u8>]) -> anyhow::Result<()> {
+            let mut map = self.map.lock();
+            for k in keys {
+                map.remove(k);
+            }
+            Ok(())
+        }
         fn put_bytes(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
             self.map.lock().insert(key.to_vec(), value.to_vec());
             Ok(())
