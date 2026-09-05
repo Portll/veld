@@ -1114,8 +1114,32 @@ impl MultiUserMemoryManager {
                     bm25_index,
                 )
             }
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => {
+                let primary_store: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(
+                    crate::storage::redb::RedbPrimaryMemoryStore::open(&config.storage_path)
+                        .with_context(|| {
+                            format!(
+                                "Failed to open redb primary memory store at {:?}",
+                                config.storage_path
+                            )
+                        })?,
+                );
+
+                let bm25_index = self.get_user_bm25_index(user_id)?;
+
+                // None: there is no rocksdb engine behind this store, and the
+                // comprehensive-backup path refuses by name on it.
+                UserMemory::with_primary_store_and_bm25_index(
+                    config,
+                    primary_store,
+                    None,
+                    bm25_index,
+                )
+            }
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for MemorySystem construction yet",
+                "storage backend '{}' requires this build to enable the storage-redb feature",
                 self.server_config.effective_storage_backend
             )),
         }

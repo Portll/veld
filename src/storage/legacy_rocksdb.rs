@@ -345,6 +345,15 @@ impl PrimaryMemoryStore for RocksDbPrimaryMemoryStore {
         self.inner.get_all_vector_mappings()
     }
 
+    fn load_all_interference_records(
+        &self,
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<crate::memory::replay::InterferenceRecord>>,
+        usize,
+    )> {
+        self.inner.load_all_interference_records()
+    }
+
     fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()> {
         self.inner.update_vector_mapping(memory_id, vector_ids)
     }
