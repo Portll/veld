@@ -948,6 +948,59 @@ impl PrimaryMemoryStore for RedbPrimaryMemoryStore {
         Ok(mappings)
     }
 
+    fn load_all_interference_records(
+        &self,
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<crate::memory::replay::InterferenceRecord>>,
+        usize,
+    )> {
+        // Same default-keyspace rows as rocksdb: `interference:{memory_id}` JSON
+        // arrays plus the `interference_meta:total` counter (which sorts after
+        // the `interference:` prefix and is excluded by it, ':' < '_').
+        let txn = self.database.begin_read()?;
+        let table = txn.open_table(DEFAULT_TABLE)?;
+        let mut history: std::collections::HashMap<
+            String,
+            Vec<crate::memory::replay::InterferenceRecord>,
+        > = std::collections::HashMap::new();
+        let mut total_events: usize = 0;
+        let prefix: &[u8] = b"interference:";
+        for row in table.range(prefix..)? {
+            let (k, v) = row?;
+            let key = k.value();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let key_str = String::from_utf8_lossy(key);
+            if let Some(memory_id) = key_str.strip_prefix("interference:") {
+                match serde_json::from_slice::<Vec<crate::memory::replay::InterferenceRecord>>(
+                    v.value(),
+                ) {
+                    Ok(records) => {
+                        total_events += records.len();
+                        history.insert(memory_id.to_string(), records);
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %key_str, error = %e,
+                            "Failed to deserialize interference records, skipping");
+                    }
+                }
+            }
+        }
+        let persisted_total = table
+            .get(&b"interference_meta:total"[..])?
+            .map(|v| v.value().to_vec())
+            .and_then(|v| {
+                if v.len() == 8 {
+                    Some(u64::from_le_bytes(v[..8].try_into().unwrap()) as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(total_events);
+        Ok((history, persisted_total.max(total_events)))
+    }
+
     fn update_vector_mapping(&self, memory_id: &MemoryId, vector_ids: Vec<u32>) -> Result<()> {
         // Mirror of MemoryStorage::update_modality_vectors for Text: load the
         // existing entry so other modalities survive, then write it back.

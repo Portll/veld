@@ -604,6 +604,24 @@ impl MemorySystem {
         storage: Arc<MemoryStorage>,
         bm25_index: Arc<hybrid_search::BM25Index>,
     ) -> Result<Self> {
+        // Thin rocksdb wrapper: capture the engine handle where the concrete
+        // type is known, then build over the trait like any other backend.
+        let backup_db = Some(storage.db());
+        let primary: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::from_arc(storage),
+        );
+        Self::with_primary_store_and_bm25_index(config, primary, backup_db, bm25_index)
+    }
+
+    /// Backend-agnostic construction: everything below reaches storage through
+    /// the trait. `rocksdb_backup_db` is the ONE engine-typed capture (see the
+    /// field's doc); None on a backend whose backup route is export/import.
+    pub fn with_primary_store_and_bm25_index(
+        config: MemoryConfig,
+        primary_store: Arc<dyn crate::storage::PrimaryMemoryStore>,
+        rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
+        bm25_index: Arc<hybrid_search::BM25Index>,
+    ) -> Result<Self> {
         #[cfg(feature = "multi-tenant")]
         let storage_path = config.storage_path.clone();
 
@@ -768,13 +786,8 @@ impl MemorySystem {
 
         // Pass shared embedder and event buffer to retrieval engine (no duplicate model load)
         // Event buffer allows retriever to record Hebbian edge events for introspection
-        // ONE trait object shared by the retriever and long_term_memory below —
-        // the same store, seen through the same adapter.
-        let primary: Arc<dyn crate::storage::PrimaryMemoryStore> = Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbPrimaryMemoryStore::from_arc(storage.clone()),
-        );
         let retriever = RetrievalEngine::with_event_buffer(
-            primary.clone(),
+            primary_store.clone(),
             &config.storage_path,
             embedder.clone(),
             Some(consolidation_events.clone()),
@@ -783,7 +796,7 @@ impl MemorySystem {
 
         // STARTUP RECOVERY: Check for orphaned memories and auto-repair
         // This fixes memories that were stored but not indexed (crash, embedding failure, etc.)
-        let storage_count = storage.get_stats().map(|s| s.total_count).unwrap_or(0);
+        let storage_count = primary_store.get_stats().map(|s| s.total_count).unwrap_or(0);
         let indexed_count = retriever.len();
         let orphaned_count = storage_count.saturating_sub(indexed_count);
 
@@ -796,7 +809,7 @@ impl MemorySystem {
             );
 
             // Get all memories from storage
-            if let Ok(all_memories) = storage.get_all() {
+            if let Ok(all_memories) = primary_store.get_all() {
                 let indexed_ids = retriever.get_indexed_memory_ids();
                 let mut repaired = 0;
                 let mut failed = 0;
@@ -870,7 +883,7 @@ impl MemorySystem {
 
         // Load stats from storage to recover state after restart
         let initial_stats = {
-            let storage_stats = storage.get_stats().unwrap_or_default();
+            let storage_stats = primary_store.get_stats().unwrap_or_default();
             let vector_count = retriever.len();
             MemoryStats {
                 total_memories: storage_stats.total_count,
@@ -890,11 +903,15 @@ impl MemorySystem {
 
         // SHO-f0e7: Create semantic fact store using the same DB as long-term memory
         // Facts use "facts:" prefix to avoid key collisions with episodic memories
-        let fact_store = Arc::new(facts::SemanticFactStore::new(storage.db()));
+        let fact_store = Arc::new(facts::SemanticFactStore::with_store(
+            primary_store.default_key_value_store(),
+        ));
 
         // SHO-118: Create lineage graph for causal memory tracking
         // Lineage uses "lineage:" prefix for edges and branches
-        let lineage_graph = Arc::new(lineage::LineageGraph::new(storage.db()));
+        let lineage_graph = Arc::new(lineage::LineageGraph::with_store(
+            primary_store.default_key_value_store(),
+        ));
 
         // Initialize hybrid search engine (BM25 + Vector + RRF + Reranking)
         //
@@ -923,7 +940,7 @@ impl MemorySystem {
         // store the same handle on MemorySystem.
         let cognitive_dials_arc =
             Arc::new(parking_lot::RwLock::new(dials::CognitiveDials::from_env()));
-        if let Ok(Some(bytes)) = storage
+        if let Ok(Some(bytes)) = primary_store
             .key_value_store()
             .get_bytes(dials::COGNITIVE_DIALS_KEY)
         {
@@ -970,16 +987,20 @@ impl MemorySystem {
 
         // Initialize learning history store for persistent significant events
         // Uses the same DB as long-term memory with "learning:" prefix
-        let learning_history = Arc::new(learning_history::LearningHistoryStore::new(storage.db()));
+        let learning_history = Arc::new(learning_history::LearningHistoryStore::with_store(
+            primary_store.default_key_value_store(),
+        ));
 
         // Initialize temporal fact store for multi-hop temporal reasoning
         // Uses the same DB with "temporal_facts:", "temporal_by_entity:", "temporal_by_event:" prefixes
-        let temporal_fact_store = Arc::new(temporal_facts::TemporalFactStore::new(storage.db()));
+        let temporal_fact_store = Arc::new(temporal_facts::TemporalFactStore::with_store(
+            primary_store.default_key_value_store(),
+        ));
 
         // SHO-106: Load persisted interference history from RocksDB
         let interference_detector = {
             let mut detector = replay::InterferenceDetector::new();
-            match storage.load_all_interference_records() {
+            match primary_store.load_all_interference_records() {
                 Ok((history, total_events)) => {
                     if !history.is_empty() {
                         detector.load_history(history, total_events);
@@ -1001,8 +1022,8 @@ impl MemorySystem {
             session_memory: Arc::new(RwLock::new(SessionMemory::new(
                 config.session_memory_size_mb,
             ))),
-            long_term_memory: primary,
-            rocksdb_backup_db: Some(storage.db()),
+            long_term_memory: primary_store.clone(),
+            rocksdb_backup_db,
             compressor: CompressionPipeline::new(),
             retriever,
             embedder,
@@ -1055,14 +1076,14 @@ impl MemorySystem {
             )),
             // R2 (LTR): per-user retrieval-trace store over this user's own KV CF.
             retrieval_trace_store: feedback::RetrievalTraceStore::with_kv(
-                storage.key_value_store(),
+                primary_store.key_value_store(),
             ),
             // R3a (F3): per-user persistent learned-weight store over this user's
             // own KV CF. Mirrors retrieval_trace_store. Pure persistence — the
             // weights are loaded on init (below) but NOT injected into scoring.
             learned_weights_store: {
                 let store =
-                    hybrid_search::LearnedWeightsStore::with_kv(storage.key_value_store());
+                    hybrid_search::LearnedWeightsStore::with_kv(primary_store.key_value_store());
                 // Load on init to exercise the read path and surface any B12
                 // fallback warning early. Intentionally discarded: R3a must not
                 // feed learned weights into the scoring path (that is R3b).

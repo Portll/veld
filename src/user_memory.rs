@@ -67,6 +67,24 @@ impl UserMemory {
         })
     }
 
+    /// Backend-agnostic construction — see
+    /// [`MemorySystem::with_primary_store_and_bm25_index`].
+    pub fn with_primary_store_and_bm25_index(
+        config: MemoryConfig,
+        primary_store: Arc<dyn crate::storage::PrimaryMemoryStore>,
+        rocksdb_backup_db: Option<Arc<rocksdb::DB>>,
+        bm25_index: Arc<BM25Index>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: MemorySystem::with_primary_store_and_bm25_index(
+                config,
+                primary_store,
+                rocksdb_backup_db,
+                bm25_index,
+            )?,
+        })
+    }
+
     /// Return the wrapped implementation.
     pub fn into_inner(self) -> MemorySystem {
         self.inner
