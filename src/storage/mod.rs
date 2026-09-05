@@ -399,6 +399,15 @@ pub trait PrimaryMemoryStore: Send + Sync {
         memory_id: &str,
         records: &[crate::memory::replay::InterferenceRecord],
     ) -> Result<()>;
+    /// The whole interference history plus the persisted event total — the
+    /// startup load MemorySystem does once. The total may exceed the sum of
+    /// records (eviction), so it is carried, not recomputed.
+    fn load_all_interference_records(
+        &self,
+    ) -> Result<(
+        std::collections::HashMap<String, Vec<crate::memory::replay::InterferenceRecord>>,
+        usize,
+    )>;
     fn delete_interference_records(&self, memory_id: &str) -> Result<()>;
     fn clear_all_interference_records(&self) -> Result<usize>;
     fn cleanup_corrupted(&self) -> Result<usize>;
@@ -655,7 +664,7 @@ mod backend_coverage_matrix {
         )
     }
 
-    /// Calls all 43 trait methods and returns (name, outcome), sorted.
+    /// Calls all 44 trait methods and returns (name, outcome), sorted.
     fn matrix(s: &dyn PrimaryMemoryStore) -> Vec<(&'static str, Outcome)> {
         let m = a_memory();
         let id = m.id.clone();
@@ -684,6 +693,7 @@ mod backend_coverage_matrix {
             ("get_uncompressed_older_than",   probe(|| s.get_uncompressed_older_than(cutoff))),
             ("mark_forgotten_by_age",         probe(|| s.mark_forgotten_by_age(cutoff))),
             ("save_interference_records",     probe(|| s.save_interference_records("m", &[]))),
+            ("load_all_interference_records", probe(|| s.load_all_interference_records())),
             ("delete_interference_records",   probe(|| s.delete_interference_records("m"))),
             ("clear_all_interference_records",probe(|| s.clear_all_interference_records())),
             ("cleanup_corrupted",             probe(|| s.cleanup_corrupted())),
@@ -730,7 +740,7 @@ mod backend_coverage_matrix {
 
         let r = matrix(&rocks);
         let b = matrix(&redb);
-        assert_eq!(r.len(), 43, "the matrix must cover every trait method");
+        assert_eq!(r.len(), 44, "the matrix must cover every trait method");
         assert_eq!(r.len(), b.len());
 
         let rocks_ok = r.iter().filter(|(_, o)| *o == Outcome::Works).count();
@@ -739,13 +749,13 @@ mod backend_coverage_matrix {
             .filter(|((_, ro), (_, bo))| *ro == Outcome::Works && *bo != Outcome::Works)
             .map(|((n, _), _)| *n).collect();
 
-        eprintln!("COVERAGE  rocksdb {rocks_ok}/43   redb {redb_ok}/43   gap {}", gap.len());
+        eprintln!("COVERAGE  rocksdb {rocks_ok}/44   redb {redb_ok}/44   gap {}", gap.len());
         for name in &gap { eprintln!("  redb missing: {name}"); }
 
         // The direction that matters: redb must never be ahead in a way that hides a
         // rocksdb regression, and the gap list must be exactly what is claimed.
         assert!(rocks_ok >= redb_ok, "redb reports more working methods than rocksdb — check the probe, not the backends");
-        assert_eq!(gap.len(), 43 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
+        assert_eq!(gap.len(), 44 - redb_ok, "a redb method failed that rocksdb also fails — the gap list is not the whole story");
     }
 }
 
