@@ -452,6 +452,7 @@ impl GraphStore for RocksDbGraphStore {
     fn flush(&self) -> Result<()> {
         self.inner
             .rocksdb_for_backup()
+            .ok_or_else(|| anyhow!("legacy rocksdb graph adapter wraps a non-rocksdb graph"))?
             .flush()
             .context("Failed to flush legacy RocksDB graph store")?;
         Ok(())
