@@ -241,7 +241,7 @@ async function connectStream(): Promise<void> {
         },
       });
       streamSocket?.send(handshake);
-      console.error("[Stream] Sent handshake for user:", USER_ID);
+      console.error("[Stream] Sent handshake");
     };
 
     streamSocket.onmessage = (event) => {
@@ -5343,7 +5343,14 @@ async function main() {
   await server.connect(transport);
   console.error("Veld MCP server v0.7.7 running");
   console.error(`Connecting to: ${API_URL}`);
-  console.error(`User ID: ${USER_ID}`);
+  // digest, not the value: VELD_USER_ID often holds an email
+  console.error(
+    `User ID: ${
+      USER_ID === "claude-code"
+        ? "claude-code"
+        : `custom (sha256:${crypto.createHash("sha256").update(USER_ID).digest("hex").slice(0, 8)})`
+    }`,
+  );
   console.error(`Streaming: ${STREAM_ENABLED ? "enabled" : "disabled"}`);
   console.error(
     `Proactive surfacing: ${PROACTIVE_SURFACING ? "enabled" : "disabled (VELD_PROACTIVE=false)"}`,

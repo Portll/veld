@@ -113,10 +113,14 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
-    headers.insert(
-        "Content-Security-Policy",
-        HeaderValue::from_static("default-src 'none'"),
-    );
+    // fallback only: overwriting strips the per-page policy a browser-facing
+    // route needs to run its own scripts
+    if !headers.contains_key("Content-Security-Policy") {
+        headers.insert(
+            "Content-Security-Policy",
+            HeaderValue::from_static("default-src 'none'"),
+        );
+    }
     headers.insert("Cache-Control", HeaderValue::from_static("no-store"));
 
     // HSTS in production only (requires HTTPS to be meaningful)

@@ -487,16 +487,55 @@ mod tests {
     /// that touch auth env vars must hold this lock for the duration of the test.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Every `VELD_*` variable the auth path reads.
+    const AUTH_ENV_VARS: &[&str] = &[
+        // singular form; its absence here broke the seam
+        "VELD_API_KEY",
+        "VELD_API_KEYS",
+        "VELD_DEV_API_KEY",
+        "VELD_ENV",
+        "VELD_HIDE_DEV_KEY",
+        "VELD_MULTI_TENANT",
+        KEY_USER_BINDINGS_PATH_ENV,
+        "VELD_COLLECTIVE_STORE_DIR",
+    ];
+
     /// Clear all auth-related env vars to isolate tests.
     /// Caller MUST hold `ENV_LOCK` — this is not enforced at compile time.
     fn clear_auth_env() {
-        env::remove_var("VELD_API_KEYS");
-        env::remove_var("VELD_DEV_API_KEY");
-        env::remove_var("VELD_ENV");
-        env::remove_var("VELD_HIDE_DEV_KEY");
-        env::remove_var("VELD_MULTI_TENANT");
-        env::remove_var(KEY_USER_BINDINGS_PATH_ENV);
-        env::remove_var("VELD_COLLECTIVE_STORE_DIR");
+        for name in AUTH_ENV_VARS {
+            env::remove_var(name);
+        }
+    }
+
+    /// Derives the var list from this module's source, so a name added later
+    /// cannot silently fall outside the seam.
+    #[test]
+    fn every_auth_env_var_is_isolated() {
+        let source = include_str!("auth.rs");
+        let mut referenced: std::collections::BTreeSet<String> = Default::default();
+        let bytes = source.as_bytes();
+        for (i, _) in source.match_indices("VELD_") {
+            let mut end = i + "VELD_".len();
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase() || bytes[end] == b'_' || bytes[end].is_ascii_digit())
+            {
+                end += 1;
+            }
+            // skip the bare prefix this scanner matches on
+            if end > i + "VELD_".len() {
+                referenced.insert(source[i..end].to_string());
+            }
+        }
+
+        let cleared: std::collections::BTreeSet<String> =
+            AUTH_ENV_VARS.iter().map(|s| s.to_string()).collect();
+
+        let missing: Vec<&String> = referenced.difference(&cleared).collect();
+        assert!(
+            missing.is_empty(),
+            "clear_auth_env() does not clear: {missing:?} — add them to AUTH_ENV_VARS"
+        );
     }
 
     // ── constant_time_compare ──
