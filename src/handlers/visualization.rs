@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 
@@ -248,9 +248,29 @@ pub struct GraphDataStats {
 }
 
 /// GET /graph/view - Serve interactive graph visualization HTML
-pub async fn graph_view(Query(params): Query<GraphViewParams>) -> Html<String> {
+pub async fn graph_view(Query(params): Query<GraphViewParams>) -> impl IntoResponse {
     let user_id = params.user_id.unwrap_or_else(|| "default".to_string());
-    Html(generate_graph_html(&user_id))
+    let nonce = fresh_csp_nonce();
+    (
+        [(
+            "Content-Security-Policy",
+            format!(
+                "default-src 'none'; script-src 'nonce-{nonce}' \
+                 https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; \
+                 style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; \
+                 base-uri 'none'; form-action 'none'"
+            ),
+        )],
+        Html(generate_graph_html(&user_id, &nonce)),
+    )
+}
+
+/// Per-response nonce; 128 bits from the OS RNG.
+fn fresh_csp_nonce() -> String {
+    use base64::Engine;
+    let mut bytes = [0u8; 16];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut bytes[..]);
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
 /// GET /api/graph/data/{user_id} - Get graph data as JSON for d3.js
@@ -392,9 +412,10 @@ pub async fn get_graph_data(
 }
 
 /// Generate the HTML page for graph visualization (includes 2D/3D toggle)
-fn generate_graph_html(user_id: &str) -> String {
+fn generate_graph_html(user_id: &str, nonce: &str) -> String {
     let html = include_str!("graph_view.html");
     let user_id_json =
         serde_json::to_string(user_id).unwrap_or_else(|_| "\"default\"".to_string());
     html.replace("{{USER_ID_JSON}}", &user_id_json)
+        .replace("{{CSP_NONCE}}", nonce)
 }
