@@ -5,14 +5,25 @@
 //! report/baseline-comparison format.
 //!
 //! Imported from shodh-memory upstream, which runs it as a held-out LoCoMo
-//! gate. Four modules are live here; the eight ablation harnesses below need
-//! `LayerMode` — an ablation switch through the retrieval pipeline that veld
-//! does not have — and `runner` additionally needs `gold_funnel` and
-//! `fusion_features`. Their sources are kept in this directory unmodified so
-//! the follow-up is a wiring job rather than a re-import:
+//! gate. Four modules are live. The remaining eight are on disk unmodified and
+//! need, measured against this tree:
 //!
-//!   bridge_harness  decay_sim  forgetting_harness  lineage_harness
-//!   multihop  ontology_harness  runner  temporal_harness
+//! - `runner` — five instrumentation call sites backed by two capture modules
+//!   veld lacks: `memory::gold_funnel` (begin/take) and
+//!   `memory::fusion_features` (begin/take + a jsonl dump). Diagnostic capture,
+//!   not ranking, so porting them does not move retrieval behaviour.
+//! - `bridge_harness`, `forgetting_harness`, `lineage_harness`, `multihop`,
+//!   `ontology_harness`, `temporal_harness` — only `runner`'s helpers
+//!   (`build_manager`, `ingest_corpus`, `run_smoke_suite_with_ranks`,
+//!   `RunInputs`, `EVAL_USER`, `HARNESS_CLOCK_ANCHOR`), so they unblock with it.
+//! - `bridge_harness` also needs five `UserMemory` -> `MemorySystem`
+//!   unwrappings, veld's wrapper being absent upstream.
+//! - `decay_sim` — `RelationshipEdge::synthetic_for_sim`, an upstream test
+//!   constructor.
+//!
+//! They stay undeclared rather than half-adapted because `runner` cannot be
+//! executed here without embedder models and a real corpus ingest, and an
+//! installed harness nobody has run is the failure this import exists to end.
 
 pub mod fixtures;
 pub mod metrics;
