@@ -1514,9 +1514,14 @@ pub enum EpisodeSource {
 /// Uses a single RocksDB instance with 9 column families for all graph data.
 /// This reduces file descriptor usage from 9 separate DBs to 1 (sharing WAL, MANIFEST, LOCK).
 pub struct GraphMemory {
-    /// Unified RocksDB database with column families for entities, relationships,
-    /// episodes, and all index tables
-    db: Arc<DB>,
+    /// Multi-family access to the graph's nine column families, backend-erased.
+    /// Every read/write/scan/batch goes through this.
+    store: Arc<dyn crate::storage::ColumnStore>,
+
+    /// Present ONLY when rocksdb-backed: the backup/checkpoint accessor hands
+    /// the engine DB to the rocksdb BackupEngine. A store built over another
+    /// backend has no engine DB to hold.
+    db: Option<Arc<DB>>,
 
     /// In-memory entity name index for fast lookups (loaded from name_index CF)
     entity_name_index: Arc<parking_lot::RwLock<HashMap<String, Uuid>>>,
@@ -1582,55 +1587,8 @@ impl GraphMemory {
     /// and named for it: GraphMemory is a rocksdb-backed type, and this handle
     /// feeds the rocksdb BackupEngine's comprehensive archive. Nothing else
     /// should reach through it.
-    pub fn rocksdb_for_backup(&self) -> &DB {
-        &self.db
-    }
-
-    // Column family accessors — cheap HashMap lookups on DB internals
-    fn entities_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_ENTITIES)
-            .expect("entities CF must exist")
-    }
-    fn relationships_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_RELATIONSHIPS)
-            .expect("relationships CF must exist")
-    }
-    fn episodes_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_EPISODES)
-            .expect("episodes CF must exist")
-    }
-    fn entity_edges_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_ENTITY_EDGES)
-            .expect("entity_edges CF must exist")
-    }
-    fn entity_pair_index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_ENTITY_PAIR_INDEX)
-            .expect("entity_pair_index CF must exist")
-    }
-    fn entity_episodes_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_ENTITY_EPISODES)
-            .expect("entity_episodes CF must exist")
-    }
-    fn name_index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_NAME_INDEX)
-            .expect("name_index CF must exist")
-    }
-    fn lowercase_index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_LOWERCASE_INDEX)
-            .expect("lowercase_index CF must exist")
-    }
-    fn stemmed_index_cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_STEMMED_INDEX)
-            .expect("stemmed_index CF must exist")
+    pub fn rocksdb_for_backup(&self) -> Option<&DB> {
+        self.db.as_deref()
     }
 
     /// Create a new graph memory system.
@@ -1738,8 +1696,12 @@ impl GraphMemory {
             Self::load_entity_embedding_cache(&db, entities_cf, &entity_name_index);
         let embedding_cache_size = entity_embedding_cache.len();
 
+        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
+        );
         let graph = Self {
-            db,
+            store,
+            db: Some(db),
             entity_name_index: Arc::new(parking_lot::RwLock::new(entity_name_index)),
             entity_lowercase_index: Arc::new(parking_lot::RwLock::new(entity_lowercase_index)),
             entity_stemmed_index: Arc::new(parking_lot::RwLock::new(entity_stemmed_index)),
@@ -2211,19 +2173,19 @@ impl GraphMemory {
         }
 
         // Persist name->UUID mappings
-        self.db.put_cf(
-            self.name_index_cf(),
+        self.store.put_cf(
+            CF_NAME_INDEX,
             entity.name.as_bytes(),
             entity.uuid.as_bytes(),
         )?;
-        self.db.put_cf(
-            self.lowercase_index_cf(),
+        self.store.put_cf(
+            CF_LOWERCASE_INDEX,
             lowercase_name.as_bytes(),
             entity.uuid.as_bytes(),
         )?;
         if !entity.is_proper_noun {
-            self.db.put_cf(
-                self.stemmed_index_cf(),
+            self.store.put_cf(
+                CF_STEMMED_INDEX,
                 stemmed_name.as_bytes(),
                 entity.uuid.as_bytes(),
             )?;
@@ -2232,7 +2194,7 @@ impl GraphMemory {
         // Store entity in database
         let key = entity.uuid.as_bytes();
         let value = bincode::serde::encode_to_vec(&entity, bincode::config::standard())?;
-        self.db.put_cf(self.entities_cf(), key, value)?;
+        self.store.put_cf(CF_ENTITIES, key, &value)?;
 
         // Increment counter only for truly new entities
         if is_new_entity {
@@ -2245,7 +2207,7 @@ impl GraphMemory {
     /// Get entity by UUID
     pub fn get_entity(&self, uuid: &Uuid) -> Result<Option<EntityNode>> {
         let key = uuid.as_bytes();
-        match self.db.get_cf(self.entities_cf(), key)? {
+        match self.store.get_cf(CF_ENTITIES, key)? {
             Some(value) => {
                 let (entity, _): (EntityNode, _) =
                     bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
@@ -2274,7 +2236,7 @@ impl GraphMemory {
         };
 
         // 1. Remove from entities CF
-        self.db.delete_cf(self.entities_cf(), uuid.as_bytes())?;
+        self.store.delete_cf(CF_ENTITIES, uuid.as_bytes())?;
 
         // 2-3-4. Remove from name indices (in-memory + persisted)
         let lowercase_name = entity.name.to_lowercase();
@@ -2285,22 +2247,22 @@ impl GraphMemory {
             let mut index = self.entity_name_index.write();
             index.remove(&entity.name);
         }
-        self.db
-            .delete_cf(self.name_index_cf(), entity.name.as_bytes())?;
+        self.store
+            .delete_cf(CF_NAME_INDEX, entity.name.as_bytes())?;
 
         {
             let mut index = self.entity_lowercase_index.write();
             index.remove(&lowercase_name);
         }
-        self.db
-            .delete_cf(self.lowercase_index_cf(), lowercase_name.as_bytes())?;
+        self.store
+            .delete_cf(CF_LOWERCASE_INDEX, lowercase_name.as_bytes())?;
 
         {
             let mut index = self.entity_stemmed_index.write();
             index.remove(&stemmed_name);
         }
-        self.db
-            .delete_cf(self.stemmed_index_cf(), stemmed_name.as_bytes())?;
+        self.store
+            .delete_cf(CF_STEMMED_INDEX, stemmed_name.as_bytes())?;
 
         // 5. Remove from embedding cache
         {
@@ -2312,8 +2274,10 @@ impl GraphMemory {
         let prefix = format!("{}:", uuid);
         let mut pairs_to_delete = Vec::new();
         let iter = self
-            .db
-            .prefix_iterator_cf(self.entity_pair_index_cf(), prefix.as_bytes());
+            .store
+            .scan_cf(CF_ENTITY_PAIR_INDEX, Some(prefix.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for item in iter {
             match item {
                 Ok((key, _)) => {
@@ -2330,8 +2294,10 @@ impl GraphMemory {
         // Also scan for reverse direction (other_uuid:this_uuid)
         let suffix = format!(":{}", uuid);
         let iter = self
-            .db
-            .iterator_cf(self.entity_pair_index_cf(), rocksdb::IteratorMode::Start);
+            .store
+            .scan_cf(CF_ENTITY_PAIR_INDEX, None, None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for item in iter {
             match item {
                 Ok((key, _)) => {
@@ -2344,7 +2310,7 @@ impl GraphMemory {
             }
         }
         for key in &pairs_to_delete {
-            self.db.delete_cf(self.entity_pair_index_cf(), key)?;
+            self.store.delete_cf(CF_ENTITY_PAIR_INDEX, key)?;
         }
 
         // 7. Remove entity_episodes entries (prefix scan)
@@ -2362,10 +2328,11 @@ impl GraphMemory {
         // written in both orientations.
         let episode_prefix = format!("{}:", uuid);
         let mut episode_keys_to_delete = Vec::new();
-        let iter = self.db.prefix_iterator_cf(
-            self.entity_episodes_cf(),
-            episode_prefix.as_bytes(),
-        );
+        let iter = self
+            .store
+            .scan_cf(CF_ENTITY_EPISODES, Some(episode_prefix.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for item in iter {
             match item {
                 Ok((key, _)) => {
@@ -2381,7 +2348,7 @@ impl GraphMemory {
         }
         let leaked = episode_keys_to_delete.len();
         for key in &episode_keys_to_delete {
-            self.db.delete_cf(self.entity_episodes_cf(), key)?;
+            self.store.delete_cf(CF_ENTITY_EPISODES, key)?;
         }
         if leaked > 0 {
             tracing::debug!(
@@ -2570,8 +2537,8 @@ impl GraphMemory {
     /// Index an entity pair → edge UUID for O(1) dedup lookups
     fn index_entity_pair(&self, entity_a: &Uuid, entity_b: &Uuid, edge_uuid: &Uuid) -> Result<()> {
         let key = Self::pair_key(entity_a, entity_b);
-        self.db.put_cf(
-            self.entity_pair_index_cf(),
+        self.store.put_cf(
+            CF_ENTITY_PAIR_INDEX,
             key.as_bytes(),
             edge_uuid.as_bytes(),
         )?;
@@ -2581,8 +2548,8 @@ impl GraphMemory {
     /// Remove entity pair from the pair index
     fn remove_entity_pair_index(&self, entity_a: &Uuid, entity_b: &Uuid) -> Result<()> {
         let key = Self::pair_key(entity_a, entity_b);
-        self.db
-            .delete_cf(self.entity_pair_index_cf(), key.as_bytes())?;
+        self.store
+            .delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())?;
         Ok(())
     }
 
@@ -2598,8 +2565,8 @@ impl GraphMemory {
         // Fast path: O(1) pair index lookup
         let key = Self::pair_key(entity_a, entity_b);
         if let Some(edge_uuid_bytes) = self
-            .db
-            .get_cf(self.entity_pair_index_cf(), key.as_bytes())?
+            .store
+            .get_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())?
         {
             if edge_uuid_bytes.len() == 16 {
                 let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
@@ -2608,8 +2575,8 @@ impl GraphMemory {
                 }
                 // Edge was deleted but pair index is stale — clean up and fall through
                 if let Err(e) = self
-                    .db
-                    .delete_cf(self.entity_pair_index_cf(), key.as_bytes())
+                    .store
+                    .delete_cf(CF_ENTITY_PAIR_INDEX, key.as_bytes())
                 {
                     tracing::warn!("Failed to clean stale pair index entry: {e}");
                 }
@@ -2702,7 +2669,7 @@ impl GraphMemory {
             // Persist the strengthened edge
             let key = existing.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&existing, bincode::config::standard())?;
-            self.db.put_cf(self.relationships_cf(), key, value)?;
+            self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
 
             return Ok(existing.uuid);
         }
@@ -2714,7 +2681,7 @@ impl GraphMemory {
         // Store relationship
         let key = edge.uuid.as_bytes();
         let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
-        self.db.put_cf(self.relationships_cf(), key, value)?;
+        self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
 
         // Increment relationship counter
         self.relationship_count.fetch_add(1, Ordering::Relaxed);
@@ -2734,8 +2701,8 @@ impl GraphMemory {
                 e
             );
             if let Err(del_err) = self
-                .db
-                .delete_cf(self.relationships_cf(), edge.uuid.as_bytes())
+                .store
+                .delete_cf(CF_RELATIONSHIPS, edge.uuid.as_bytes())
             {
                 tracing::warn!(
                     "Rollback delete failed for relationship {}: {del_err}",
@@ -2758,8 +2725,8 @@ impl GraphMemory {
     /// Index an edge for an entity
     fn index_entity_edge(&self, entity_uuid: &Uuid, edge_uuid: &Uuid) -> Result<()> {
         let key = format!("{entity_uuid}:{edge_uuid}");
-        self.db
-            .put_cf(self.entity_edges_cf(), key.as_bytes(), b"1")?;
+        self.store
+            .put_cf(CF_ENTITY_EDGES, key.as_bytes(), b"1")?;
         Ok(())
     }
 
@@ -2778,8 +2745,10 @@ impl GraphMemory {
         // Fast path: count edges without loading them
         let prefix = format!("{entity_uuid}:");
         let iter = self
-            .db
-            .prefix_iterator_cf(self.entity_edges_cf(), prefix.as_bytes());
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
 
         let mut edge_count = 0usize;
         for (key, _) in iter.flatten() {
@@ -2876,8 +2845,10 @@ impl GraphMemory {
         // We must read all to sort by strength — storage order is arbitrary
         let mut edge_uuids: Vec<Uuid> = Vec::with_capacity(256);
         let iter = self
-            .db
-            .prefix_iterator_cf(self.entity_edges_cf(), prefix.as_bytes());
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
 
         for (key, _) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -2901,9 +2872,10 @@ impl GraphMemory {
         let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
 
-        let results = self
-            .db
-            .batched_multi_get_cf(self.relationships_cf(), &key_refs, false);
+        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
+            .iter()
+            .map(|k| self.store.get_cf(CF_RELATIONSHIPS, k))
+            .collect();
 
         let mut edges = Vec::with_capacity(edge_uuids.len());
         for value in results.into_iter().flatten().flatten() {
@@ -3000,8 +2972,10 @@ impl GraphMemory {
     pub fn entity_edge_count(&self, entity_uuid: &Uuid) -> Result<usize> {
         let prefix = format!("{entity_uuid}:");
         let iter = self
-            .db
-            .prefix_iterator_cf(self.entity_edges_cf(), prefix.as_bytes());
+            .store
+            .scan_cf(CF_ENTITY_EDGES, Some(prefix.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
 
         let mut count = 0;
         for (key, _) in iter.flatten() {
@@ -3089,7 +3063,7 @@ impl GraphMemory {
     /// Get relationship by UUID (raw, without decay applied)
     pub fn get_relationship(&self, uuid: &Uuid) -> Result<Option<RelationshipEdge>> {
         let key = uuid.as_bytes();
-        match self.db.get_cf(self.relationships_cf(), key)? {
+        match self.store.get_cf(CF_RELATIONSHIPS, key)? {
             Some(value) => {
                 let (edge, _): (RelationshipEdge, _) =
                     bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
@@ -3109,7 +3083,7 @@ impl GraphMemory {
         uuid: &Uuid,
     ) -> Result<Option<RelationshipEdge>> {
         let key = uuid.as_bytes();
-        match self.db.get_cf(self.relationships_cf(), key)? {
+        match self.store.get_cf(CF_RELATIONSHIPS, key)? {
             Some(value) => {
                 let (mut edge, _): (RelationshipEdge, _) =
                     bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
@@ -3135,7 +3109,7 @@ impl GraphMemory {
         };
 
         // Delete from main storage
-        self.db.delete_cf(self.relationships_cf(), key)?;
+        self.store.delete_cf(CF_RELATIONSHIPS, key)?;
         self.relationship_count.fetch_sub(1, Ordering::Relaxed);
         // Decrement total activations by the edge's count (NPMI denominator)
         let edge_acts = edge.activation_count as u64;
@@ -3152,13 +3126,13 @@ impl GraphMemory {
         // (add_relationship indexes both from_entity and to_entity)
         let from_key = format!("{}:{}", edge.from_entity, uuid);
         if let Err(e) = self
-            .db
-            .delete_cf(self.entity_edges_cf(), from_key.as_bytes())
+            .store
+            .delete_cf(CF_ENTITY_EDGES, from_key.as_bytes())
         {
             tracing::warn!(edge = %uuid, key = %from_key, error = %e, "Failed to delete from entity_edges index");
         }
         let to_key = format!("{}:{}", edge.to_entity, uuid);
-        if let Err(e) = self.db.delete_cf(self.entity_edges_cf(), to_key.as_bytes()) {
+        if let Err(e) = self.store.delete_cf(CF_ENTITY_EDGES, to_key.as_bytes()) {
             tracing::warn!(edge = %uuid, key = %to_key, error = %e, "Failed to delete from entity_edges index");
         }
 
@@ -3185,14 +3159,14 @@ impl GraphMemory {
         };
 
         // Delete episode from main storage
-        self.db
-            .delete_cf(self.episodes_cf(), episode_uuid.as_bytes())?;
+        self.store
+            .delete_cf(CF_EPISODES, episode_uuid.as_bytes())?;
         self.episode_count.fetch_sub(1, Ordering::Relaxed);
 
         // Remove from entity_episodes inverted index
         for entity_uuid in &episode.entity_refs {
             let key = format!("{entity_uuid}:{episode_uuid}");
-            if let Err(e) = self.db.delete_cf(self.entity_episodes_cf(), key.as_bytes()) {
+            if let Err(e) = self.store.delete_cf(CF_ENTITY_EPISODES, key.as_bytes()) {
                 tracing::warn!(episode = %episode_uuid, key = %key, error = %e, "Failed to delete from entity_episodes index");
             }
         }
@@ -3200,8 +3174,10 @@ impl GraphMemory {
         // Delete edges sourced from this episode
         // Scan all relationships for matching source_episode_id
         let iter = self
-            .db
-            .iterator_cf(self.relationships_cf(), rocksdb::IteratorMode::Start);
+            .store
+            .scan_cf(CF_RELATIONSHIPS, None, None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         let mut edges_to_delete = Vec::new();
         for (_, value) in iter.flatten() {
             if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
@@ -3242,13 +3218,11 @@ impl GraphMemory {
 
         // Clear each column family by iterating and batch-deleting
         for cf_name in GRAPH_CF_NAMES {
-            let cf = self.db.cf_handle(cf_name).unwrap();
-            let mut batch = rocksdb::WriteBatch::default();
-            let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-            for (key, _) in iter.flatten() {
-                batch.delete_cf(cf, &key);
+            let mut batch = crate::storage::WriteBatch::new();
+            for (key, _) in self.store.scan_cf(cf_name, None, None)? {
+                batch.delete_cf(*cf_name, key);
             }
-            self.db.write(batch)?;
+            self.store.write_batch(&batch)?;
         }
 
         // Clear in-memory indices
@@ -3286,7 +3260,7 @@ impl GraphMemory {
         );
 
         let value = bincode::serde::encode_to_vec(&episode, bincode::config::standard())?;
-        self.db.put_cf(self.episodes_cf(), key, value)?;
+        self.store.put_cf(CF_EPISODES, key, &value)?;
 
         // Increment episode counter
         let prev = self.episode_count.fetch_add(1, Ordering::Relaxed);
@@ -3303,15 +3277,15 @@ impl GraphMemory {
     /// Index an episode for an entity (inverted index)
     fn index_entity_episode(&self, entity_uuid: &Uuid, episode_uuid: &Uuid) -> Result<()> {
         let key = format!("{entity_uuid}:{episode_uuid}");
-        self.db
-            .put_cf(self.entity_episodes_cf(), key.as_bytes(), b"1")?;
+        self.store
+            .put_cf(CF_ENTITY_EPISODES, key.as_bytes(), b"1")?;
         Ok(())
     }
 
     /// Get episode by UUID
     pub fn get_episode(&self, uuid: &Uuid) -> Result<Option<EpisodicNode>> {
         let key = uuid.as_bytes();
-        match self.db.get_cf(self.episodes_cf(), key)? {
+        match self.store.get_cf(CF_EPISODES, key)? {
             Some(value) => {
                 let (episode, _): (EpisodicNode, _) =
                     bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
@@ -3333,8 +3307,10 @@ impl GraphMemory {
         // Phase 1: Collect episode UUIDs from index (fast prefix scan, no data transfer)
         let mut episode_uuids: Vec<Uuid> = Vec::new();
         let iter = self
-            .db
-            .prefix_iterator_cf(self.entity_episodes_cf(), prefix.as_bytes());
+            .store
+            .scan_cf(CF_ENTITY_EPISODES, Some(prefix.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (key, _) in iter.flatten() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if !key_str.starts_with(&prefix) {
@@ -3356,9 +3332,10 @@ impl GraphMemory {
         let keys: Vec<[u8; 16]> = episode_uuids.iter().map(|u| *u.as_bytes()).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
 
-        let results = self
-            .db
-            .batched_multi_get_cf(self.episodes_cf(), &key_refs, false);
+        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
+            .iter()
+            .map(|k| self.store.get_cf(CF_EPISODES, k))
+            .collect();
 
         let mut episodes = Vec::with_capacity(episode_uuids.len());
         for value in results.into_iter().flatten().flatten() {
@@ -4081,8 +4058,10 @@ impl GraphMemory {
 
         // Iterate through all entities as potential starting points
         let iter = self
-            .db
-            .iterator_cf(self.entities_cf(), rocksdb::IteratorMode::Start);
+            .store
+            .scan_cf(CF_ENTITIES, None, None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for result in iter {
             if all_matches.len() >= limit {
                 break;
@@ -4126,7 +4105,7 @@ impl GraphMemory {
 
             let key = edge.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
-            self.db.put_cf(self.relationships_cf(), key, value)?;
+            self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
         }
 
         Ok(())
@@ -4151,7 +4130,7 @@ impl GraphMemory {
 
             let key = edge.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
-            self.db.put_cf(self.relationships_cf(), key, value)?;
+            self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
         }
 
         Ok(())
@@ -4179,11 +4158,12 @@ impl GraphMemory {
         // Batch read all edges in a single RocksDB call (same pattern as get_entity_relationships_limited)
         let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let results = self
-            .db
-            .batched_multi_get_cf(self.relationships_cf(), &key_refs, false);
+        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
+            .iter()
+            .map(|k| self.store.get_cf(CF_RELATIONSHIPS, k))
+            .collect();
 
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let mut strengthened = 0;
 
         for (i, result) in results.into_iter().enumerate() {
@@ -4195,7 +4175,7 @@ impl GraphMemory {
                     let _ = edge.strengthen();
                     match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
                         Ok(encoded) => {
-                            batch.put_cf(self.relationships_cf(), keys[i], encoded);
+                            batch.put_cf(CF_RELATIONSHIPS, keys[i], encoded);
                             strengthened += 1;
                         }
                         Err(e) => {
@@ -4208,7 +4188,7 @@ impl GraphMemory {
 
         // Atomic write of all updates
         if strengthened > 0 {
-            self.db.write(batch)?;
+            self.store.write_batch(&batch)?;
             self.total_activations
                 .fetch_add(strengthened as u64, Ordering::Relaxed);
         }
@@ -4265,7 +4245,7 @@ impl GraphMemory {
             .ok_or_else(|| {
                 anyhow::anyhow!("synapse_update_lock timeout in record_memory_coactivation")
             })?;
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let mut edges_updated = 0;
         let mut new_edges = 0;
         let mut promotions: Vec<EdgePromotion> = Vec::new();
@@ -4292,7 +4272,7 @@ impl GraphMemory {
                 if let Ok(value) =
                     bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
-                    batch.put_cf(self.relationships_cf(), key, value);
+                    batch.put_cf(CF_RELATIONSHIPS, key, value);
                     edges_updated += 1;
                 }
             } else {
@@ -4327,18 +4307,18 @@ impl GraphMemory {
                 if let Ok(value) =
                     bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
-                    batch.put_cf(self.relationships_cf(), key, value);
+                    batch.put_cf(CF_RELATIONSHIPS, key, value);
 
                     // Index both directions for lookup
                     let idx_key_fwd = format!("mem_edge:{}:{}", trigger_id, coact_id);
                     let idx_key_rev = format!("mem_edge:{}:{}", coact_id, trigger_id);
                     batch.put_cf(
-                        self.relationships_cf(),
+                        CF_RELATIONSHIPS,
                         idx_key_fwd.as_bytes(),
                         edge.uuid.as_bytes(),
                     );
                     batch.put_cf(
-                        self.relationships_cf(),
+                        CF_RELATIONSHIPS,
                         idx_key_rev.as_bytes(),
                         edge.uuid.as_bytes(),
                     );
@@ -4372,7 +4352,7 @@ impl GraphMemory {
                     if let Ok(value) =
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                     {
-                        batch.put_cf(self.relationships_cf(), key, value);
+                        batch.put_cf(CF_RELATIONSHIPS, key, value);
                         edges_updated += 1;
                     }
                 } else {
@@ -4404,17 +4384,17 @@ impl GraphMemory {
                     if let Ok(value) =
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                     {
-                        batch.put_cf(self.relationships_cf(), key, value);
+                        batch.put_cf(CF_RELATIONSHIPS, key, value);
 
                         let idx_key_fwd = format!("mem_edge:{mem_a}:{mem_b}");
                         let idx_key_rev = format!("mem_edge:{mem_b}:{mem_a}");
                         batch.put_cf(
-                            self.relationships_cf(),
+                            CF_RELATIONSHIPS,
                             idx_key_fwd.as_bytes(),
                             edge.uuid.as_bytes(),
                         );
                         batch.put_cf(
-                            self.relationships_cf(),
+                            CF_RELATIONSHIPS,
                             idx_key_rev.as_bytes(),
                             edge.uuid.as_bytes(),
                         );
@@ -4427,7 +4407,7 @@ impl GraphMemory {
         }
 
         if edges_updated > 0 {
-            self.db.write(batch)?;
+            self.store.write_batch(&batch)?;
             self.total_activations
                 .fetch_add(edges_updated as u64, Ordering::Relaxed);
             // Update relationship counter for newly created edges
@@ -4554,8 +4534,8 @@ impl GraphMemory {
         // Check forward index
         let idx_key = format!("mem_edge:{entity_a}:{entity_b}");
         if let Some(edge_uuid_bytes) = self
-            .db
-            .get_cf(self.relationships_cf(), idx_key.as_bytes())?
+            .store
+            .get_cf(CF_RELATIONSHIPS, idx_key.as_bytes())?
         {
             if edge_uuid_bytes.len() == 16 {
                 let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
@@ -4566,8 +4546,8 @@ impl GraphMemory {
         // Check reverse index
         let idx_key_rev = format!("mem_edge:{entity_b}:{entity_a}");
         if let Some(edge_uuid_bytes) = self
-            .db
-            .get_cf(self.relationships_cf(), idx_key_rev.as_bytes())?
+            .store
+            .get_cf(CF_RELATIONSHIPS, idx_key_rev.as_bytes())?
         {
             if edge_uuid_bytes.len() == 16 {
                 let edge_uuid = Uuid::from_slice(&edge_uuid_bytes)?;
@@ -4601,7 +4581,7 @@ impl GraphMemory {
             .ok_or_else(|| {
                 anyhow::anyhow!("synapse_update_lock timeout in strengthen_edges_from_boosts")
             })?;
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let mut strengthened = 0;
         let mut promotion_boosts = Vec::new();
 
@@ -4631,7 +4611,7 @@ impl GraphMemory {
                 let key = edge.uuid.as_bytes();
                 if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
-                    batch.put_cf(self.relationships_cf(), key, value);
+                    batch.put_cf(CF_RELATIONSHIPS, key, value);
                     strengthened += 1;
 
                     // If a tier promotion occurred, emit boost signals for both memories
@@ -4692,18 +4672,18 @@ impl GraphMemory {
                 let key = edge.uuid.as_bytes();
                 if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                 {
-                    batch.put_cf(self.relationships_cf(), key, value);
+                    batch.put_cf(CF_RELATIONSHIPS, key, value);
 
                     // Index both directions
                     let idx_key_fwd = format!("mem_edge:{from_uuid}:{to_uuid}");
                     let idx_key_rev = format!("mem_edge:{to_uuid}:{from_uuid}");
                     batch.put_cf(
-                        self.relationships_cf(),
+                        CF_RELATIONSHIPS,
                         idx_key_fwd.as_bytes(),
                         edge.uuid.as_bytes(),
                     );
                     batch.put_cf(
-                        self.relationships_cf(),
+                        CF_RELATIONSHIPS,
                         idx_key_rev.as_bytes(),
                         edge.uuid.as_bytes(),
                     );
@@ -4714,7 +4694,7 @@ impl GraphMemory {
         }
 
         if strengthened > 0 {
-            self.db.write(batch)?;
+            self.store.write_batch(&batch)?;
             self.total_activations
                 .fetch_add(strengthened as u64, Ordering::Relaxed);
 
@@ -4778,8 +4758,10 @@ impl GraphMemory {
         let prefix_fwd = format!("mem_edge:{memory_id}:");
 
         let iter = self
-            .db
-            .prefix_iterator_cf(self.relationships_cf(), prefix_fwd.as_bytes());
+            .store
+            .scan_cf(CF_RELATIONSHIPS, Some(prefix_fwd.as_bytes()), None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for item in iter {
             let (key, value) = item?;
 
@@ -4845,7 +4827,7 @@ impl GraphMemory {
             .ok_or_else(|| {
                 anyhow::anyhow!("synapse_update_lock timeout in strengthen_episode_entity_edges")
             })?;
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let mut strengthened = 0;
 
         // Iterate over unique entity pairs
@@ -4866,7 +4848,7 @@ impl GraphMemory {
                     if let Ok(value) =
                         bincode::serde::encode_to_vec(&edge, bincode::config::standard())
                     {
-                        batch.put_cf(self.relationships_cf(), key, value);
+                        batch.put_cf(CF_RELATIONSHIPS, key, value);
                         strengthened += 1;
                     }
                 }
@@ -4875,7 +4857,7 @@ impl GraphMemory {
         }
 
         if strengthened > 0 {
-            self.db.write(batch)?;
+            self.store.write_batch(&batch)?;
             self.total_activations
                 .fetch_add(strengthened as u64, Ordering::Relaxed);
             tracing::debug!(
@@ -4975,7 +4957,7 @@ impl GraphMemory {
 
             let key = edge.uuid.as_bytes();
             let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
-            self.db.put_cf(self.relationships_cf(), key, value)?;
+            self.store.put_cf(CF_RELATIONSHIPS, key, &value)?;
 
             return Ok(should_prune);
         }
@@ -4999,7 +4981,7 @@ impl GraphMemory {
                 anyhow::anyhow!("synapse_update_lock timeout in batch_decay_synapses")
             })?;
 
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let mut to_prune = Vec::new();
 
         for edge_uuid in edge_uuids {
@@ -5009,7 +4991,7 @@ impl GraphMemory {
                 let key = edge.uuid.as_bytes();
                 match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
                     Ok(value) => {
-                        batch.put_cf(self.relationships_cf(), key, value);
+                        batch.put_cf(CF_RELATIONSHIPS, key, value);
                         if should_prune {
                             to_prune.push(*edge_uuid);
                         }
@@ -5022,7 +5004,7 @@ impl GraphMemory {
         }
 
         // Atomic write of all updates
-        self.db.write(batch)?;
+        self.store.write_batch(&batch)?;
 
         Ok(to_prune)
     }
@@ -5049,7 +5031,7 @@ impl GraphMemory {
         // their EntityNode.mention_count to avoid per-edge RocksDB lookups.
         let mention_counts = self.build_mention_count_cache(edges);
 
-        let mut batch = WriteBatch::default();
+        let mut batch = crate::storage::WriteBatch::new();
         let mut to_prune = Vec::new();
 
         for edge in edges.iter_mut() {
@@ -5093,7 +5075,7 @@ impl GraphMemory {
                 let key = edge.uuid.as_bytes();
                 match bincode::serde::encode_to_vec(&*edge, bincode::config::standard()) {
                     Ok(value) => {
-                        batch.put_cf(self.relationships_cf(), key, value);
+                        batch.put_cf(CF_RELATIONSHIPS, key, value);
                         if should_prune {
                             to_prune.push(edge.uuid);
                         }
@@ -5105,7 +5087,7 @@ impl GraphMemory {
             }
         }
 
-        self.db.write(batch)?;
+        self.store.write_batch(&batch)?;
         Ok(to_prune)
     }
 
@@ -5314,9 +5296,10 @@ impl GraphMemory {
 
         let keys: Vec<[u8; 16]> = entity_uuids.iter().map(|u| *u.as_bytes()).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let results = self
-            .db
-            .batched_multi_get_cf(self.entities_cf(), &key_refs, false);
+        let results: Vec<anyhow::Result<Option<Vec<u8>>>> = key_refs
+            .iter()
+            .map(|k| self.store.get_cf(CF_ENTITIES, k))
+            .collect();
 
         let mut mention_counts = HashMap::with_capacity(entity_uuids.len());
         let uuid_vec: Vec<Uuid> = entity_uuids.into_iter().collect();
@@ -5337,12 +5320,9 @@ impl GraphMemory {
     pub fn get_all_entities(&self) -> Result<Vec<EntityNode>> {
         let mut entities = Vec::new();
 
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.fill_cache(false);
-        let iter =
-            self.db
-                .iterator_cf_opt(self.entities_cf(), read_opts, rocksdb::IteratorMode::Start);
-        for (_, value) in iter.flatten() {
+        // scan_cf materializes the rows; the fill_cache(false) block-cache
+        // courtesy was a rocksdb-specific transient-read hint.
+        for (_, value) in self.store.scan_cf(CF_ENTITIES, None, None)? {
             if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(
                 &value,
                 bincode::config::standard(),
@@ -5366,13 +5346,11 @@ impl GraphMemory {
         // fill_cache(false) prevents this full scan from evicting hot data from
         // the block cache. Decompressed blocks are used transiently and freed
         // after the iterator advances, reducing peak C++ heap usage.
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.fill_cache(false);
-        let iter = self.db.iterator_cf_opt(
-            self.relationships_cf(),
-            read_opts,
-            rocksdb::IteratorMode::Start,
-        );
+        // scan_cf materializes the rows; the fill_cache(false) block-cache
+        // courtesy was a rocksdb-specific transient-read hint.
+        let iter = self.store.scan_cf(CF_RELATIONSHIPS, None, None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (_, value) in iter.flatten() {
             if let Ok(edge) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
                 &value,
@@ -5402,13 +5380,11 @@ impl GraphMemory {
         &self,
     ) -> Result<Vec<(String, String, f32, String)>> {
         let mut safe_edges = Vec::new();
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.fill_cache(false);
-        let iter = self.db.iterator_cf_opt(
-            self.relationships_cf(),
-            read_opts,
-            rocksdb::IteratorMode::Start,
-        );
+        // scan_cf materializes the rows; the fill_cache(false) block-cache
+        // courtesy was a rocksdb-specific transient-read hint.
+        let iter = self.store.scan_cf(CF_RELATIONSHIPS, None, None)?
+            .into_iter()
+            .map(Ok::<(Vec<u8>, Vec<u8>), anyhow::Error>);
         for (_, value) in iter.flatten() {
             let edge = match bincode::serde::decode_from_slice::<RelationshipEdge, _>(
                 &value,

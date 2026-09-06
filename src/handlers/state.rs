@@ -3170,7 +3170,17 @@ impl MultiUserMemoryManager {
                     )
                 })?;
                 let graph_guard = graph_lock.read();
-                let graph_db_ref = Some(graph_guard.rocksdb_for_backup());
+                // Same refusal shape as above: a graph without a rocksdb engine
+                // cannot feed the rocksdb BackupEngine, and omitting it would be
+                // the silently-incomplete archive this block refuses.
+                let graph_db_ref = Some(graph_guard.rocksdb_for_backup().ok_or_else(|| {
+                    if let Some(staged) = &staged {
+                        let _ = std::fs::remove_dir_all(&staged.staging_dir);
+                    }
+                    anyhow::anyhow!(
+                        "refusing comprehensive backup for '{user_id}': the graph store is                          not rocksdb-backed"
+                    )
+                })?);
 
                 self.require_backup_engine("comprehensive backup creation")?.create_comprehensive_backup_with_staged_intent_log(
                     &db,
