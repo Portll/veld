@@ -2,9 +2,14 @@
   "mcpServers": {
     "veld": {
       "command": "bun",
-      "args": ["run", "mcp-server/index.ts"],
+      "args": [
+        "run",
+        "mcp-server/index.ts"
+      ],
       "env": {
-        "VELD_API_KEY": "sk-veld-dev-local-testing-key"
+        "VELD_API_URL": "${VELD_API_URL:-http://127.0.0.1:3030}",
+        "VELD_API_KEY": "${VELD_API_KEY:-sk-veld-dev-local-testing-key}",
+        "VELD_USER_ID": "${VELD_USER_ID:-portll}"
       }
     }
   }
