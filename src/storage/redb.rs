@@ -263,6 +263,13 @@ pub fn open_shared_database(base_path: &Path) -> Result<Arc<redb::Database>> {
     create_redb_database(&base_path.join("shared.redb"))
 }
 
+/// Open (or create) a per-user GRAPH database — the redb counterpart of the
+/// graph's own rocksdb directory. Separate file from the shared stores, matching
+/// the rocksdb layout where the graph is its own database.
+pub fn open_graph_database(graph_path: &Path) -> Result<Arc<redb::Database>> {
+    create_redb_database(&graph_path.join("graph.redb"))
+}
+
 fn create_redb_database(path: &Path) -> Result<Arc<redb::Database>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
