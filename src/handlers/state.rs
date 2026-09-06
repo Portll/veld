@@ -1160,8 +1160,20 @@ impl MultiUserMemoryManager {
 
                 Ok(graph_store.into_inner())
             }
+            #[cfg(feature = "storage-redb")]
+            StorageBackend::Redb => {
+                std::fs::create_dir_all(&graph_path)?;
+                let database = crate::storage::redb::open_graph_database(&graph_path)?;
+                GraphMemory::with_store(Arc::new(
+                    crate::storage::redb::RedbColumnStore::new(database),
+                ))
+                .with_context(|| {
+                    format!("Failed to open redb graph store for user '{user_id}' at {graph_path:?}")
+                })
+            }
+            #[cfg(not(feature = "storage-redb"))]
             StorageBackend::Redb => Err(anyhow::anyhow!(
-                "storage backend '{}' is not wired for GraphMemory construction yet",
+                "storage backend '{}' requires this build to enable the storage-redb feature",
                 self.server_config.effective_storage_backend
             )),
         }
@@ -3998,5 +4010,47 @@ mod shared_store_bootstrap_tests {
             .get("boot-user", "nope")
             .unwrap()
             .is_none());
+    }
+
+    /// The graph half of the boot: arm 1060 over redb, exercised.
+    #[cfg(feature = "storage-redb")]
+    #[test]
+    fn redb_graph_memory_boots_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::create_dir_all(&graph_path).unwrap();
+        let database = crate::storage::redb::open_graph_database(&graph_path).unwrap();
+        let graph = crate::graph_memory::GraphMemory::with_store(std::sync::Arc::new(
+            crate::storage::redb::RedbColumnStore::new(database),
+        ))
+        .expect("redb graph boots");
+
+        // No engine DB behind it — the backup accessor must say so rather than
+        // hand a caller something that cannot exist.
+        assert!(graph.rocksdb_for_backup().is_none());
+
+        // A round trip across two families: the entity row and its name index.
+        let entity = crate::graph_memory::EntityNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: "Ada Lovelace".to_string(),
+            labels: vec![crate::graph_memory::EntityLabel::Person],
+            created_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: true,
+            pii_classification: crate::graph_memory::PiiClassification::PersonalIdentity,
+        };
+        let uuid = graph.add_entity(entity).expect("add_entity over redb");
+        let fetched = graph.get_entity(&uuid).expect("get_entity").expect("present");
+        assert_eq!(fetched.name, "Ada Lovelace");
+
+        // The in-memory name index was populated from the same write path that
+        // a restart would reload, so the two agree by construction.
+        let stats = graph.get_stats().expect("stats");
+        assert_eq!(stats.entity_count, 1);
     }
 }

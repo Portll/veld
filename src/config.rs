@@ -61,10 +61,20 @@ pub const fn default_requested_storage_backend() -> StorageBackend {
     StorageBackend::RocksDb
 }
 
+// A request for redb is now honoured: every construction path is wired
+// (bundle, backup engine, MemorySystem, GraphMemory). The five backup
+// OPERATIONS still refuse by name — that is deliberate, not unfinished:
+// the comprehensive backup is a rocksdb BackupEngine facility whose redb
+// route is export/import.
 pub const fn effective_storage_backend_for_current_build(
     requested: StorageBackend,
 ) -> StorageBackend {
     match requested {
+        #[cfg(feature = "storage-redb")]
+        StorageBackend::Redb => StorageBackend::Redb,
+        // Without the feature there is no redb code to run, so serving the
+        // request would be a lie the binary cannot honour.
+        #[cfg(not(feature = "storage-redb"))]
         StorageBackend::Redb => StorageBackend::RocksDb,
         StorageBackend::RocksDb => StorageBackend::RocksDb,
     }

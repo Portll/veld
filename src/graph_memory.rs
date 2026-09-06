@@ -1665,43 +1665,63 @@ impl GraphMemory {
             );
         }
 
+        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
+            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
+        );
+        Self::from_store(store, Some(db))
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    ///
+    /// Skips migrate_from_separate_dbs: that is a rocksdb-to-rocksdb import from
+    /// superseded directories and has no meaning on another backend. The families
+    /// are materialized here, since redb creates tables lazily.
+    pub fn with_store(store: Arc<dyn crate::storage::ColumnStore>) -> Result<Self> {
+        for cf in GRAPH_CF_NAMES {
+            store.ensure_cf(cf)?;
+        }
+        Self::from_store(store, None)
+    }
+
+    /// The shared startup path: load the three indices, count, and warm the
+    /// embedding cache. Everything below reads through the trait, so both
+    /// constructors do the same work over whichever engine they were given.
+    fn from_store(
+        store: Arc<dyn crate::storage::ColumnStore>,
+        db: Option<Arc<DB>>,
+    ) -> Result<Self> {
         // Load entity name index from name_index CF (O(n) but faster than deserializing entities)
         // If empty, migrate from entities CF (one-time migration for existing data)
-        let entity_name_index = Self::load_or_migrate_name_index(&db)?;
+        let entity_name_index = Self::load_or_migrate_name_index(store.as_ref())?;
 
         // Load/migrate lowercase index for O(1) case-insensitive lookup
         let entity_lowercase_index =
-            Self::load_or_migrate_lowercase_index(&db, &entity_name_index)?;
+            Self::load_or_migrate_lowercase_index(store.as_ref(), &entity_name_index)?;
 
         // Load/migrate stemmed index for O(1) linguistic lookup
-        let entity_stemmed_index = Self::load_or_migrate_stemmed_index(&db, &entity_name_index)?;
+        let entity_stemmed_index =
+            Self::load_or_migrate_stemmed_index(store.as_ref(), &entity_name_index)?;
 
         let entity_count = entity_name_index.len();
 
         // Count relationships and episodes during startup (one-time cost)
         // This is O(n) at startup, but get_stats() will be O(1) at runtime
-        let relationships_cf = db.cf_handle(CF_RELATIONSHIPS).unwrap();
-        let episodes_cf = db.cf_handle(CF_EPISODES).unwrap();
-        let relationship_count = Self::count_cf_entries(&db, relationships_cf);
-        let episode_count = Self::count_cf_entries(&db, episodes_cf);
+        let relationship_count = Self::count_cf_entries(store.as_ref(), CF_RELATIONSHIPS);
+        let episode_count = Self::count_cf_entries(store.as_ref(), CF_EPISODES);
 
         // Sum total activation_count across all edges (one-time O(n) at startup).
         // Used as N_s denominator in NPMI computation for Hebbian edge pruning.
-        let total_activations = Self::sum_activation_counts(&db, relationships_cf);
+        let total_activations = Self::sum_activation_counts(store.as_ref(), CF_RELATIONSHIPS);
 
         // Load entity embedding cache for concept merging
         // Only entities with pre-computed name_embeddings are cached
-        let entities_cf = db.cf_handle(CF_ENTITIES).unwrap();
         let entity_embedding_cache =
-            Self::load_entity_embedding_cache(&db, entities_cf, &entity_name_index);
+            Self::load_entity_embedding_cache(store.as_ref(), &entity_name_index);
         let embedding_cache_size = entity_embedding_cache.len();
 
-        let store: Arc<dyn crate::storage::ColumnStore> = Arc::new(
-            crate::storage::legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(&db)),
-        );
         let graph = Self {
             store,
-            db: Some(db),
+            db,
             entity_name_index: Arc::new(parking_lot::RwLock::new(entity_name_index)),
             entity_lowercase_index: Arc::new(parking_lot::RwLock::new(entity_lowercase_index)),
             entity_stemmed_index: Arc::new(parking_lot::RwLock::new(entity_stemmed_index)),
@@ -1835,14 +1855,13 @@ impl GraphMemory {
     }
 
     /// Load entity name->UUID index from name_index CF, or migrate from entities CF if empty
-    fn load_or_migrate_name_index(db: &DB) -> Result<HashMap<String, Uuid>> {
-        let name_index_cf = db.cf_handle(CF_NAME_INDEX).unwrap();
-        let entities_cf = db.cf_handle(CF_ENTITIES).unwrap();
+    fn load_or_migrate_name_index(
+        store: &dyn crate::storage::ColumnStore,
+    ) -> Result<HashMap<String, Uuid>> {
         let mut index = HashMap::new();
 
         // Try to load from name_index CF first
-        let iter = db.iterator_cf(name_index_cf, rocksdb::IteratorMode::Start);
-        for (key, value) in iter.flatten() {
+        for (key, value) in store.scan_cf(CF_NAME_INDEX, None, None)? {
             if let (Ok(name), Ok(uuid_bytes)) = (
                 std::str::from_utf8(&key),
                 <[u8; 16]>::try_from(value.as_ref()),
@@ -1853,9 +1872,8 @@ impl GraphMemory {
 
         // If name_index CF is empty but entities exist, migrate (one-time operation)
         if index.is_empty() {
-            let entity_iter = db.iterator_cf(entities_cf, rocksdb::IteratorMode::Start);
             let mut migrated_count = 0;
-            for (_, value) in entity_iter.flatten() {
+            for (_, value) in store.scan_cf(CF_ENTITIES, None, None)? {
                 if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(
                     &value,
                     bincode::config::standard(),
@@ -1863,8 +1881,8 @@ impl GraphMemory {
                 .map(|(v, _)| v)
                 {
                     // Store in name_index CF: name -> UUID bytes
-                    db.put_cf(
-                        name_index_cf,
+                    store.put_cf(
+                        CF_NAME_INDEX,
                         entity.name.as_bytes(),
                         entity.uuid.as_bytes(),
                     )?;
@@ -1884,15 +1902,13 @@ impl GraphMemory {
     ///
     /// This enables O(1) case-insensitive entity lookup instead of O(n) linear search.
     fn load_or_migrate_lowercase_index(
-        db: &DB,
+        store: &dyn crate::storage::ColumnStore,
         name_index: &HashMap<String, Uuid>,
     ) -> Result<HashMap<String, Uuid>> {
-        let lowercase_cf = db.cf_handle(CF_LOWERCASE_INDEX).unwrap();
         let mut index = HashMap::new();
 
         // Try to load from lowercase_index CF
-        let iter = db.iterator_cf(lowercase_cf, rocksdb::IteratorMode::Start);
-        for (key, value) in iter.flatten() {
+        for (key, value) in store.scan_cf(CF_LOWERCASE_INDEX, None, None)? {
             if let (Ok(name), Ok(uuid_bytes)) = (
                 std::str::from_utf8(&key),
                 <[u8; 16]>::try_from(value.as_ref()),
@@ -1905,7 +1921,7 @@ impl GraphMemory {
         if index.is_empty() && !name_index.is_empty() {
             for (name, uuid) in name_index {
                 let lowercase_name = name.to_lowercase();
-                db.put_cf(lowercase_cf, lowercase_name.as_bytes(), uuid.as_bytes())?;
+                store.put_cf(CF_LOWERCASE_INDEX, lowercase_name.as_bytes(), uuid.as_bytes())?;
                 index.insert(lowercase_name, *uuid);
             }
             tracing::info!(
@@ -1922,15 +1938,13 @@ impl GraphMemory {
     /// This enables O(1) linguistic entity lookup: "running" matches "run"
     /// Uses Porter2 stemmer for English language stemming.
     fn load_or_migrate_stemmed_index(
-        db: &DB,
+        store: &dyn crate::storage::ColumnStore,
         name_index: &HashMap<String, Uuid>,
     ) -> Result<HashMap<String, Uuid>> {
-        let stemmed_cf = db.cf_handle(CF_STEMMED_INDEX).unwrap();
         let mut index = HashMap::new();
 
         // Try to load from stemmed_index CF
-        let iter = db.iterator_cf(stemmed_cf, rocksdb::IteratorMode::Start);
-        for (key, value) in iter.flatten() {
+        for (key, value) in store.scan_cf(CF_STEMMED_INDEX, None, None)? {
             if let (Ok(name), Ok(uuid_bytes)) = (
                 std::str::from_utf8(&key),
                 <[u8; 16]>::try_from(value.as_ref()),
@@ -1944,7 +1958,7 @@ impl GraphMemory {
             let stemmer = Stemmer::create(Algorithm::English);
             for (name, uuid) in name_index {
                 let stemmed_name = Self::stem_entity_name(&stemmer, name);
-                db.put_cf(stemmed_cf, stemmed_name.as_bytes(), uuid.as_bytes())?;
+                store.put_cf(CF_STEMMED_INDEX, stemmed_name.as_bytes(), uuid.as_bytes())?;
                 index.insert(stemmed_name, *uuid);
             }
             tracing::info!("Migrated {} entities to stemmed index CF", name_index.len());
@@ -1965,8 +1979,8 @@ impl GraphMemory {
     }
 
     /// Count entries in a column family (one-time startup cost)
-    fn count_cf_entries(db: &DB, cf: &ColumnFamily) -> usize {
-        db.iterator_cf(cf, rocksdb::IteratorMode::Start).count()
+    fn count_cf_entries(store: &dyn crate::storage::ColumnStore, cf: &str) -> usize {
+        store.scan_cf(cf, None, None).map(|r| r.len()).unwrap_or(0)
     }
 
     /// Sum activation_count across all relationships (one-time startup cost).
@@ -1974,12 +1988,13 @@ impl GraphMemory {
     /// Used to initialize `total_activations` for NPMI computation.
     /// Follows the same pattern as `count_cf_entries` — O(n) scan at startup,
     /// then the atomic counter is maintained incrementally.
-    fn sum_activation_counts(db: &DB, cf: &ColumnFamily) -> u64 {
+    fn sum_activation_counts(store: &dyn crate::storage::ColumnStore, cf: &str) -> u64 {
         let mut total: u64 = 0;
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.fill_cache(false);
-        let iter = db.iterator_cf_opt(cf, read_opts, rocksdb::IteratorMode::Start);
-        for (_, value) in iter.flatten() {
+        let rows = match store.scan_cf(cf, None, None) {
+            Ok(rows) => rows,
+            Err(_) => return 0,
+        };
+        for (_, value) in rows {
             if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
                 &value,
                 bincode::config::standard(),
@@ -1997,14 +2012,13 @@ impl GraphMemory {
     /// merging during `add_entity()`. Entities without embeddings (pre-upgrade
     /// data) are skipped and will gain embeddings on their next mention.
     fn load_entity_embedding_cache(
-        db: &DB,
-        entities_cf: &ColumnFamily,
+        store: &dyn crate::storage::ColumnStore,
         name_index: &HashMap<String, Uuid>,
     ) -> Vec<(Uuid, Vec<f32>)> {
         let mut cache = Vec::with_capacity(ENTITY_EMBEDDING_CACHE_MAX.min(name_index.len()));
         for uuid in name_index.values() {
             let key = uuid.as_bytes();
-            if let Ok(Some(value)) = db.get_cf(entities_cf, key) {
+            if let Ok(Some(value)) = store.get_cf(CF_ENTITIES, key) {
                 if let Ok((entity, _)) = bincode::serde::decode_from_slice::<EntityNode, _>(
                     &value,
                     bincode::config::standard(),
