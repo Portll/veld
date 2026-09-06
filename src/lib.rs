@@ -45,6 +45,7 @@ pub mod pir;
 pub mod query_parsing;
 pub mod query_planner;
 pub mod rate_limit_governance;
+pub mod recall_harness;
 pub mod relevance;
 pub mod server_runtime;
 pub mod server;
