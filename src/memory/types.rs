@@ -3028,6 +3028,59 @@ pub fn geohash_search_prefixes(lat: f64, lon: f64, radius_meters: f64) -> Vec<St
 }
 
 /// Query for retrieving memories
+/// Retrieval ablation ladder: how much of the pipeline a query is allowed to
+/// use. Each variant is the one before it plus one stage, so a recall delta
+/// between adjacent modes is attributable to the stage that was added.
+///
+/// Ported from shodh-memory upstream, which drives its LoCoMo layer
+/// attribution from these; the labels in `report_key` match so both projects'
+/// reports are comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LayerMode {
+    /// Vector ANN only. Raw cosine; no graph, no BM25, no rerank, no fusion.
+    VamanaOnly,
+    /// + graph spreading activation.
+    PlusSpreading,
+    /// + BM25 lexical fusion.
+    PlusBm25,
+    /// + reranking (cross-encoder / ontological boost).
+    PlusRerank,
+    /// + fact-source prefetch and boost.
+    PlusFacts,
+    /// Production: everything, including scoring and Hebbian coactivation.
+    #[default]
+    Full,
+}
+
+impl LayerMode {
+    /// Stable identifier emitted into harness reports.
+    pub fn report_key(self) -> &'static str {
+        match self {
+            Self::VamanaOnly => "vamana_only",
+            Self::PlusSpreading => "+spreading",
+            Self::PlusBm25 => "+bm25",
+            Self::PlusRerank => "+rerank",
+            Self::PlusFacts => "+facts",
+            Self::Full => "full",
+        }
+    }
+
+    /// Variants in ascending pipeline coverage.
+    pub const ALL: [LayerMode; 6] = [
+        LayerMode::VamanaOnly,
+        LayerMode::PlusSpreading,
+        LayerMode::PlusBm25,
+        LayerMode::PlusRerank,
+        LayerMode::PlusFacts,
+        LayerMode::Full,
+    ];
+
+    /// Does this mode run the given stage?
+    pub fn allows(self, stage: LayerMode) -> bool {
+        self >= stage
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Query {
     // === User Context ===
@@ -3037,6 +3090,14 @@ pub struct Query {
     // === Semantic Search ===
     pub query_text: Option<String>,
     pub query_embedding: Option<Vec<f32>>,
+
+    // === Ablation ===
+    /// How much of the retrieval pipeline this query may use. None = Full.
+    /// Set by the recall harness to attribute a change to one stage.
+    pub layers: Option<LayerMode>,
+    /// Pre-extracted entity names, so a harness can hold NER constant while
+    /// varying the stages under test.
+    pub ner_entities: Option<Vec<String>>,
 
     // === Temporal Filters ===
     pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -3182,6 +3243,8 @@ impl Default for Query {
             user_id: None,
             query_text: None,
             query_embedding: None,
+            layers: None,
+            ner_entities: None,
             time_range: None,
             as_of: None,
             experience_types: None,
@@ -3219,8 +3282,17 @@ impl Query {
     /// Defaulting to strongest-wins preserves current live behavior while still
     /// allowing explicit per-query overrides during 0.8 cleanup.
     pub fn effective_competition_mode(&self) -> CompetitionMode {
+        // Competition is a Full-only stage; an ablated query must not run it.
+        if !self.layer_mode().allows(LayerMode::Full) {
+            return CompetitionMode::Coexist;
+        }
         self.competition_mode
             .unwrap_or(CompetitionMode::ResolveStrongest)
+    }
+
+    /// The ablation rung this query runs at. None means the full pipeline.
+    pub fn layer_mode(&self) -> LayerMode {
+        self.layers.unwrap_or(LayerMode::Full)
     }
 
     /// Check if a memory matches all query filters
@@ -3407,6 +3479,18 @@ pub struct QueryBuilder {
 }
 
 impl QueryBuilder {
+    /// Restrict the query to one rung of the ablation ladder.
+    pub fn layers(mut self, mode: LayerMode) -> Self {
+        self.query.layers = Some(mode);
+        self
+    }
+
+    /// Supply entity names instead of letting retrieval extract them.
+    pub fn ner_entities(mut self, entities: Vec<String>) -> Self {
+        self.query.ner_entities = Some(entities);
+        self
+    }
+
     /// Set user ID for per-user temporal fact lookup and personalized retrieval
     pub fn user_id(mut self, id: impl Into<String>) -> Self {
         self.query.user_id = Some(id.into());
@@ -5485,6 +5569,99 @@ pub struct GraphDecayResult {
 
 #[cfg(test)]
 mod tests {
+    // ── LayerMode ablation ──
+
+    /// The ladder must be strictly ordered, or `allows` silently admits a stage
+    /// the caller ablated away.
+    #[test]
+    fn layer_ladder_is_ordered_and_each_rung_admits_only_itself_and_below() {
+        use super::LayerMode::*;
+        assert_eq!(LayerMode::ALL.len(), 6);
+        for (i, mode) in LayerMode::ALL.iter().enumerate() {
+            for (j, stage) in LayerMode::ALL.iter().enumerate() {
+                assert_eq!(
+                    mode.allows(*stage),
+                    j <= i,
+                    "{:?} vs {:?}: a rung must admit exactly the stages at or below it",
+                    mode,
+                    stage
+                );
+            }
+        }
+        assert!(!VamanaOnly.allows(PlusSpreading));
+        assert!(Full.allows(PlusFacts));
+        assert_eq!(LayerMode::default(), Full);
+    }
+
+    /// Report keys are a wire contract shared with shodh-memory's harness.
+    #[test]
+    fn layer_report_keys_are_stable_and_unique() {
+        let keys: Vec<&str> = LayerMode::ALL.iter().map(|m| m.report_key()).collect();
+        assert_eq!(
+            keys,
+            vec!["vamana_only", "+spreading", "+bm25", "+rerank", "+facts", "full"]
+        );
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len());
+    }
+
+    /// The switch must CHANGE something. An ablated query that still ran every
+    /// stage would pass any test asserting only that it returns results, so this
+    /// asserts the observable consequence: competition is a Full-only stage, and
+    /// below Full it must not eliminate candidates.
+    #[test]
+    fn ablated_queries_do_not_run_full_only_stages() {
+        let full = Query {
+            layers: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            full.effective_competition_mode(),
+            CompetitionMode::ResolveStrongest,
+            "an unablated query keeps production behaviour"
+        );
+
+        for mode in [
+            LayerMode::VamanaOnly,
+            LayerMode::PlusSpreading,
+            LayerMode::PlusBm25,
+            LayerMode::PlusRerank,
+            LayerMode::PlusFacts,
+        ] {
+            let ablated = Query {
+                layers: Some(mode),
+                ..Default::default()
+            };
+            assert_eq!(
+                ablated.effective_competition_mode(),
+                CompetitionMode::Coexist,
+                "{mode:?} must not eliminate candidates — competition is Full-only"
+            );
+        }
+
+        // An explicit Full request behaves as production, not as an ablation.
+        let explicit_full = Query {
+            layers: Some(LayerMode::Full),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit_full.effective_competition_mode(),
+            CompetitionMode::ResolveStrongest
+        );
+    }
+
+    /// A caller's explicit competition_mode still loses to the ablation, or the
+    /// harness would measure a stage it asked to remove.
+    #[test]
+    fn ablation_overrides_an_explicit_competition_mode() {
+        let q = Query {
+            layers: Some(LayerMode::VamanaOnly),
+            competition_mode: Some(CompetitionMode::ResolveNewest),
+            ..Default::default()
+        };
+        assert_eq!(q.effective_competition_mode(), CompetitionMode::Coexist);
+    }
+
     use super::*;
 
     #[test]

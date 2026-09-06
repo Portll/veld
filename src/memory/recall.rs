@@ -330,7 +330,10 @@ impl super::MemorySystem {
                     g.entities_average_density(&seed_uuids).ok().flatten()
                 };
                 let use_rerank = !density
-                    .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD);
+                    .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD)
+                    && query
+                        .layer_mode()
+                        .allows(crate::memory::types::LayerMode::PlusRerank);
                 (density, use_rerank)
             } else {
                 (None, false)
@@ -638,7 +641,12 @@ impl super::MemorySystem {
             let mut boosts: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
 
-            if let Some(user_id) = &query.user_id {
+            // Layer 0.7 is a PlusFacts stage; below that rung it contributes nothing.
+            let facts_allowed = query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::PlusFacts);
+
+            if let Some(user_id) = &query.user_id.clone().filter(|_| facts_allowed) {
                 let entity_names: Vec<String> = query_analysis
                     .focal_entities
                     .iter()
@@ -758,7 +766,9 @@ impl super::MemorySystem {
         let use_graph = matches!(
             query.retrieval_mode,
             RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
-        );
+        ) && query
+            .layer_mode()
+            .allows(crate::memory::types::LayerMode::PlusSpreading);
         #[allow(clippy::type_complexity)]
         let (
             graph_results,
@@ -1014,6 +1024,10 @@ impl super::MemorySystem {
             user_id: query.user_id.clone(),
             query_text: None, // Don't re-generate embedding
             query_embedding: Some(query_embedding.clone()),
+            // inherited: a sub-query that widened the ladder would leak stages
+            // the caller ablated away
+            layers: query.layers,
+            ner_entities: query.ner_entities.clone(),
             time_range: query.time_range,
             as_of: query.as_of,
             experience_types: query.experience_types.clone(),
@@ -1110,6 +1124,8 @@ impl super::MemorySystem {
                     user_id: query.user_id.clone(),
                     query_text: None,
                     query_embedding: Some(sub_embedding),
+                    layers: query.layers,
+                    ner_entities: query.ner_entities.clone(),
                     time_range: query.time_range,
                     as_of: query.as_of,
                     experience_types: query.experience_types.clone(),
@@ -2995,7 +3011,12 @@ impl super::MemorySystem {
             let d = self.cognitive_dials.read();
             (d.use_reranking, d.rerank_count)
         };
-        if memories.len() > 1 && layer53_use_reranking.unwrap_or(true) {
+        if memories.len() > 1
+            && layer53_use_reranking.unwrap_or(true)
+            && query
+                .layer_mode()
+                .allows(crate::memory::types::LayerMode::PlusRerank)
+        {
             if let Some(reranker) = self.hybrid_search.reranker() {
                 // Decomposed queries: widen CE budget from 20→30 to exploit the
                 // broader candidate pool from multi-query vector search.
