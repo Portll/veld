@@ -48,7 +48,8 @@ pub struct GraduationRecord {
 }
 
 pub struct GraduationStore {
-    db: Arc<DB>,
+    /// One family, so a CF-bound handle.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl GraduationStore {
@@ -62,13 +63,17 @@ impl GraduationStore {
     }
 
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self {
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
+                db,
+                CF_SLEEP_TIME_GRADUATIONS,
+            )),
+        }
     }
 
-    fn cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_SLEEP_TIME_GRADUATIONS)
-            .expect("sleep_time_graduations CF must exist in shared DB")
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     fn key_for(memory_id: &MemoryId) -> [u8; 16] {
@@ -77,8 +82,8 @@ impl GraduationStore {
 
     /// O(1) lookup: is this memory id present in the graduation registry?
     pub fn is_graduated(&self, memory_id: &MemoryId) -> bool {
-        self.db
-            .get_cf(self.cf(), Self::key_for(memory_id))
+        self.store
+            .get_bytes(&Self::key_for(memory_id))
             .ok()
             .flatten()
             .is_some()
@@ -99,8 +104,8 @@ impl GraduationStore {
         };
         let bytes = bincode::serde::encode_to_vec(&record, bincode::config::standard())
             .context("encode GraduationRecord")?;
-        self.db
-            .put_cf(self.cf(), Self::key_for(memory_id), bytes)
+        self.store
+            .put_bytes(&Self::key_for(memory_id), &bytes)
             .context("write sleep_time_graduations")?;
         Ok(())
     }
@@ -108,8 +113,8 @@ impl GraduationStore {
     /// Inspect the record for a graduated memory; `None` if not graduated.
     pub fn get(&self, memory_id: &MemoryId) -> Result<Option<GraduationRecord>> {
         let raw = self
-            .db
-            .get_cf(self.cf(), Self::key_for(memory_id))
+            .store
+            .get_bytes(&Self::key_for(memory_id))
             .context("read sleep_time_graduations")?;
         match raw {
             None => Ok(None),
@@ -127,8 +132,8 @@ impl GraduationStore {
     pub fn forget(&self, memory_id: &MemoryId) -> Result<bool> {
         let existed = self.is_graduated(memory_id);
         if existed {
-            self.db
-                .delete_cf(self.cf(), Self::key_for(memory_id))
+            self.store
+                .delete_bytes(&Self::key_for(memory_id))
                 .context("delete sleep_time_graduations")?;
         }
         Ok(existed)

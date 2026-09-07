@@ -80,7 +80,8 @@ pub struct SupersessionRecord {
 }
 
 pub struct SupersessionStore {
-    db: Arc<DB>,
+    /// One family, so a CF-bound handle.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl SupersessionStore {
@@ -94,13 +95,17 @@ impl SupersessionStore {
     }
 
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self {
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
+                db,
+                CF_SLEEP_TIME_SUPERSESSIONS,
+            )),
+        }
     }
 
-    fn cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_SLEEP_TIME_SUPERSESSIONS)
-            .expect("sleep_time_supersessions CF must exist in shared DB")
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     /// Key layout: `[direction_byte | 16 uuid bytes]`. 17 bytes total.
@@ -140,19 +145,18 @@ impl SupersessionStore {
             .context("encode forward SupersessionRecord")?;
         let r_bytes = bincode::serde::encode_to_vec(&reverse, bincode::config::standard())
             .context("encode reverse SupersessionRecord")?;
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put_cf(
-            self.cf(),
-            Self::key_for(Direction::Forward, superseder),
-            f_bytes,
-        );
-        batch.put_cf(
-            self.cf(),
-            Self::key_for(Direction::Reverse, superseded),
-            r_bytes,
-        );
-        self.db
-            .write(batch)
+        // one family, so put_many is the atomic write — see KeyValueStore
+        self.store
+            .put_many(&[
+                (
+                    Self::key_for(Direction::Forward, superseder).to_vec(),
+                    f_bytes,
+                ),
+                (
+                    Self::key_for(Direction::Reverse, superseded).to_vec(),
+                    r_bytes,
+                ),
+            ])
             .context("write SupersessionStore batch")?;
         Ok(())
     }
@@ -175,8 +179,8 @@ impl SupersessionStore {
         memory_id: &MemoryId,
     ) -> Result<Option<SupersessionRecord>> {
         let raw = self
-            .db
-            .get_cf(self.cf(), Self::key_for(direction, memory_id))
+            .store
+            .get_bytes(&Self::key_for(direction, memory_id))
             .context("read sleep_time_supersessions")?;
         let Some(bytes) = raw else { return Ok(None) };
         let (rec, _): (SupersessionRecord, _) =
@@ -195,16 +199,15 @@ impl SupersessionStore {
         let f = Self::key_for(Direction::Forward, superseder);
         let r = Self::key_for(Direction::Reverse, superseded);
         let existed = self
-            .db
-            .get_cf(self.cf(), f)
+            .store
+            .get_bytes(&f)
             .ok()
             .flatten()
             .is_some()
-            || self.db.get_cf(self.cf(), r).ok().flatten().is_some();
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.delete_cf(self.cf(), f);
-        batch.delete_cf(self.cf(), r);
-        self.db.write(batch).context("forget supersession batch")?;
+            || self.store.get_bytes(&r).ok().flatten().is_some();
+        self.store
+            .delete_many(&[f.to_vec(), r.to_vec()])
+            .context("forget supersession batch")?;
         Ok(existed)
     }
 
@@ -238,19 +241,17 @@ impl SupersessionStore {
             .context("encode reinforced forward record")?;
         let r_bytes = bincode::serde::encode_to_vec(&rev, bincode::config::standard())
             .context("encode reinforced reverse record")?;
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put_cf(
-            self.cf(),
-            Self::key_for(Direction::Forward, superseder),
-            f_bytes,
-        );
-        batch.put_cf(
-            self.cf(),
-            Self::key_for(Direction::Reverse, &superseded),
-            r_bytes,
-        );
-        self.db
-            .write(batch)
+        self.store
+            .put_many(&[
+                (
+                    Self::key_for(Direction::Forward, superseder).to_vec(),
+                    f_bytes,
+                ),
+                (
+                    Self::key_for(Direction::Reverse, &superseded).to_vec(),
+                    r_bytes,
+                ),
+            ])
             .context("write reinforce batch")?;
         Ok(Some(rec))
     }
@@ -263,8 +264,8 @@ impl SupersessionStore {
         memory_id: &MemoryId,
     ) -> Result<Option<SupersessionRecord>> {
         let raw = self
-            .db
-            .get_cf(self.cf(), Self::key_for(direction, memory_id))
+            .store
+            .get_bytes(&Self::key_for(direction, memory_id))
             .context("read raw sleep_time_supersessions")?;
         let Some(bytes) = raw else { return Ok(None) };
         let (rec, _): (SupersessionRecord, _) =
@@ -290,9 +291,7 @@ impl SupersessionStore {
         let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut deletes: Vec<Vec<u8>> = Vec::new();
 
-        let iter = self.db.iterator_cf(self.cf(), rocksdb::IteratorMode::Start);
-        for entry in iter {
-            let (k, v) = entry.context("iterate sleep_time_supersessions")?;
+        for (k, v) in self.store.scan_prefix(b"", None)? {
             let Ok((mut rec, _)): std::result::Result<
                 (SupersessionRecord, _),
                 bincode::error::DecodeError,
@@ -301,26 +300,26 @@ impl SupersessionStore {
             };
             rec.confidence = (rec.confidence - decay).max(0.0);
             if rec.confidence <= 0.0 {
-                deletes.push(k.into_vec());
+                deletes.push(k.clone());
                 removed += 1;
             } else {
                 let encoded = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
                     .context("encode decayed record")?;
-                updates.push((k.into_vec(), encoded));
+                updates.push((k.clone(), encoded));
                 decayed += 1;
             }
         }
 
         // Pass 2: apply.
-        if !updates.is_empty() || !deletes.is_empty() {
-            let mut batch = rocksdb::WriteBatch::default();
-            for (k, v) in &updates {
-                batch.put_cf(self.cf(), k, v);
-            }
-            for k in &deletes {
-                batch.delete_cf(self.cf(), k);
-            }
-            self.db.write(batch).context("write decay batch")?;
+        if !updates.is_empty() {
+            self.store
+                .put_many(&updates)
+                .context("write decay updates")?;
+        }
+        if !deletes.is_empty() {
+            self.store
+                .delete_many(&deletes)
+                .context("write decay deletes")?;
         }
 
         Ok((decayed, removed))
