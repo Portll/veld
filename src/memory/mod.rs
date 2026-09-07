@@ -13,6 +13,8 @@ pub mod compression;
 pub mod merge;
 pub mod context;
 pub mod context_blocks;
+pub mod fusion_features;
+pub mod gold_funnel;
 pub mod facets;
 pub mod facts;
 pub mod feedback;

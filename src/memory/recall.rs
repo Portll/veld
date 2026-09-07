@@ -1011,6 +1011,8 @@ impl super::MemorySystem {
             }
         };
 
+        crate::memory::gold_funnel::record("graph", graph_results.iter().map(|(id, _, _)| id));
+
         let t_graph = recall_start.elapsed();
         tracing::info!(
             graph_ms = format!("{:.2}", (t_graph - t_embedding).as_secs_f64() * 1000.0),
@@ -1202,6 +1204,8 @@ impl super::MemorySystem {
                 vr
             }
         };
+
+        crate::memory::gold_funnel::record("vector", vector_results.iter().map(|(id, _)| id));
 
         let t_vector = recall_start.elapsed();
         tracing::info!(
@@ -2393,6 +2397,8 @@ impl super::MemorySystem {
             tracing::debug!("Layer 4: {} fused results (rerank budget={})", res.len(), rerank_budget);
             (res, heb, attr)
         };
+
+        crate::memory::gold_funnel::record("fusion", memory_ids.iter().map(|(id, _)| id));
 
         let t_fusion = recall_start.elapsed();
         tracing::info!(
@@ -4052,6 +4058,8 @@ impl super::MemorySystem {
                 }
             }
         }
+
+        crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
 
         let t_total = recall_start.elapsed();
         tracing::info!(
