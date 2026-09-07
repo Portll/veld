@@ -92,12 +92,31 @@ Four of twelve modules are live (`metrics`, `fixtures`, `report`). Enabling the
 rest against `LayerMode` (landed `046cd25`) took the compile errors 45 → 16, and
 the remainder is specific:
 
-- **`runner`** — five instrumentation sites needing two capture modules veld
-  lacks: `memory::gold_funnel` (`begin`/`take`) and `memory::fusion_features`
-  (`begin`/`take` + a jsonl dump). These are *diagnostic capture, not ranking*,
-  so porting them does not move retrieval behaviour. Port them for real; a
-  no-op capture that returns empty diagnostics is a harness reporting on
-  nothing.
+- **`runner`** — **this estimate was wrong and is corrected here.** The
+  capture modules (`memory::gold_funnel`, `memory::fusion_features`) landed
+  2026-09-07 along with four wired `gold_funnel::record` stages in
+  `memory/recall.rs`. Declaring all twelve modules then dropped the errors 45 →
+  32 and the *compiler* named eight further APIs the earlier grep never looked
+  for, because it searched only the two names already hypothesised:
+
+  | API | status in veld |
+  |---|---|
+  | `GraphMemory::relation_type_distribution` | port — accessor over data veld has |
+  | `RelationshipEdge::synthetic_for_sim` | port — test constructor |
+  | `MemorySystem::simulate_edge_aging` | port — ~15 lines |
+  | `MemorySystem::force_vector_quality_rebuild` | port — ~3 lines |
+  | `MultiUserMemoryManager::annotate_query_ner` | port — ~7 lines |
+  | `graph_retrieval::edge_dir_flip_count` | **inapplicable** |
+  | `graph_memory::directed_reverse_collapse_count` | **inapplicable** |
+  | `metrics::HUB_SATURATION_EDGE_SKIP_TOTAL` | **inapplicable** |
+
+  The last three instrument code paths **veld does not have** — veld has no
+  `edge_neighbor` and no `dir_fix` branch at all. Adding the accessors would
+  make them return a permanent zero, and a report printing `EDGE_DIR_FLIPS=0`
+  reads as "the fix ran and flipped nothing" rather than "there is no such fix
+  in this build". Decide how the shared report format expresses *inapplicable*
+  before enabling `runner`, or veld's output and upstream's will use the same
+  field to mean different things.
 - **Six ablation harnesses** (`bridge`, `forgetting`, `lineage`, `multihop`,
   `ontology`, `temporal`) — need only `runner`'s helpers (`build_manager`,
   `ingest_corpus`, `run_smoke_suite_with_ranks`, `RunInputs`, `EVAL_USER`,
@@ -110,6 +129,11 @@ the remainder is specific:
 **Verification owed, and it is the point:** `runner` must be *executed* against
 `tests/recall/corpora/` and produce a report, not merely compile. ~2,900 lines
 landed unrun is the same defect as a CI gate that cannot build.
+
+**Method note, since this section has now been mis-measured twice.** Both wrong
+estimates came from grepping for blockers already hypothesised, which returns
+what you searched for and is silent about the rest. Declare the modules and let
+the compiler enumerate; it is the only witness here that is exhaustive.
 
 ### 3. Make the recall gate real
 
