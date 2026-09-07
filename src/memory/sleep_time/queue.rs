@@ -33,7 +33,8 @@ pub const CF_SLEEP_TIME_QUEUE: &str = "sleep_time_queue";
 pub const DEFAULT_CLAIM_LEASE_SECS: i64 = 600; // 10 minutes
 
 pub struct Queue {
-    db: Arc<DB>,
+    /// One family, so a CF-bound handle rather than the multi-family one.
+    store: Arc<dyn crate::storage::KeyValueStore>,
 }
 
 impl Queue {
@@ -44,13 +45,17 @@ impl Queue {
     }
 
     pub fn new(db: Arc<DB>) -> Self {
-        Self { db }
+        Self {
+            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
+                db,
+                CF_SLEEP_TIME_QUEUE,
+            )),
+        }
     }
 
-    fn cf(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(CF_SLEEP_TIME_QUEUE)
-            .expect("sleep_time_queue CF must exist in shared DB")
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
+        Self { store }
     }
 
     /// Build the RocksDB key for an item. The middle component is the
@@ -79,8 +84,8 @@ impl Queue {
         let key = Self::key(&item);
         let bytes = bincode::serde::encode_to_vec(&item, bincode::config::standard())
             .context("encode QueueItem")?;
-        self.db
-            .put_cf(self.cf(), key.as_bytes(), bytes)
+        self.store
+            .put_bytes(key.as_bytes(), &bytes)
             .context("write sleep_time_queue")?;
         tracing::debug!(
             user_id = %item.user_id,
@@ -124,13 +129,9 @@ impl Queue {
     pub fn scan_user(&self, user_id: &str) -> Result<Vec<QueueItem>> {
         let prefix = format!("{user_id}:");
         let mut out = Vec::new();
-        let iter = self.db.prefix_iterator_cf(self.cf(), prefix.as_bytes());
-        for entry in iter {
-            let (k, v) = entry.context("iterate sleep_time_queue")?;
+        // scan_prefix enforces the bound; the hand-written break is gone.
+        for (k, v) in self.store.scan_prefix(prefix.as_bytes(), None)? {
             let k_str = String::from_utf8_lossy(&k);
-            if !k_str.starts_with(&prefix) {
-                break;
-            }
             match decode_item(&v) {
                 Ok(Some(item)) => out.push(item),
                 Ok(None) => {
@@ -159,9 +160,8 @@ impl Queue {
     /// applying per-user fairness on top.
     pub fn next_unclaimed(&self) -> Result<Option<QueueItem>> {
         let now = Utc::now();
-        let iter = self.db.iterator_cf(self.cf(), IteratorMode::Start);
-        for entry in iter {
-            let (_, v) = entry.context("iterate sleep_time_queue")?;
+        // empty prefix = the whole family, ascending
+        for (_k, v) in self.store.scan_prefix(b"", None)? {
             match decode_item(&v) {
                 Ok(Some(item)) if item.claim_expired(now) => return Ok(Some(item)),
                 Ok(Some(_)) => continue, // currently-claimed, skip
@@ -194,7 +194,7 @@ impl Queue {
         lease_secs: i64,
     ) -> Result<Option<QueueItem>> {
         let key = Self::key(item);
-        let raw = self.db.get_cf(self.cf(), key.as_bytes())?;
+        let raw = self.store.get_bytes(key.as_bytes())?;
         let Some(bytes) = raw else { return Ok(None) };
         let current = match decode_item(&bytes) {
             Ok(Some(c)) => c,
@@ -211,8 +211,8 @@ impl Queue {
 
         let new_bytes = bincode::serde::encode_to_vec(&claimed, bincode::config::standard())
             .context("encode claimed QueueItem")?;
-        self.db
-            .put_cf(self.cf(), key.as_bytes(), new_bytes)
+        self.store
+            .put_bytes(key.as_bytes(), &new_bytes)
             .context("write claimed sleep_time_queue")?;
         Ok(Some(claimed))
     }
@@ -220,8 +220,8 @@ impl Queue {
     /// Release `item` after successful processing — deletes it.
     pub fn complete(&self, item: &QueueItem) -> Result<()> {
         let key = Self::key(item);
-        self.db
-            .delete_cf(self.cf(), key.as_bytes())
+        self.store
+            .delete_bytes(key.as_bytes())
             .context("delete completed sleep_time_queue")?;
         Ok(())
     }
@@ -231,7 +231,7 @@ impl Queue {
     /// attempt count separately and call [`Self::complete`] to give up.
     pub fn release(&self, item: &QueueItem) -> Result<()> {
         let key = Self::key(item);
-        let raw = self.db.get_cf(self.cf(), key.as_bytes())?;
+        let raw = self.store.get_bytes(key.as_bytes())?;
         let Some(bytes) = raw else { return Ok(()) };
         let Ok(Some(mut current)) = decode_item(&bytes) else {
             return Ok(());
@@ -240,8 +240,8 @@ impl Queue {
         current.claim_expires_at = None;
         let new_bytes = bincode::serde::encode_to_vec(&current, bincode::config::standard())
             .context("encode released QueueItem")?;
-        self.db
-            .put_cf(self.cf(), key.as_bytes(), new_bytes)
+        self.store
+            .put_bytes(key.as_bytes(), &new_bytes)
             .context("write released sleep_time_queue")?;
         Ok(())
     }
@@ -253,9 +253,7 @@ impl Queue {
         let cutoff = Utc::now() - ttl;
         let mut purged = 0usize;
         let mut to_delete: Vec<Vec<u8>> = Vec::new();
-        let iter = self.db.iterator_cf(self.cf(), IteratorMode::Start);
-        for entry in iter {
-            let (k, v) = entry.context("iterate sleep_time_queue cold-start")?;
+        for (k, v) in self.store.scan_prefix(b"", None)? {
             let decoded = decode_item(&v);
             let drop = match decoded {
                 Ok(Some(item)) => item.enqueued_at < cutoff,
@@ -263,12 +261,12 @@ impl Queue {
                 Err(_) => true,   // unreadable — drop on cold start
             };
             if drop {
-                to_delete.push(k.into_vec());
+                to_delete.push(k);
             }
         }
         for k in to_delete {
-            self.db
-                .delete_cf(self.cf(), &k)
+            self.store
+                .delete_bytes(&k)
                 .context("cold-start delete")?;
             purged += 1;
         }
@@ -287,9 +285,7 @@ impl Queue {
     /// fairness scheduling.
     pub fn distinct_users(&self) -> Result<Vec<String>> {
         let mut users = std::collections::BTreeSet::new();
-        let iter = self.db.iterator_cf(self.cf(), IteratorMode::Start);
-        for entry in iter {
-            let (k, _) = entry.context("iterate sleep_time_queue users")?;
+        for (k, _) in self.store.scan_prefix(b"", None)? {
             if let Some(u) = Self::parse_user_from_key(&k) {
                 users.insert(u.to_string());
             }

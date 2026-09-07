@@ -67,7 +67,8 @@ impl Default for PolicyLimits {
 // =============================================================================
 
 pub struct BudgetTracker {
-    db: Arc<DB>,
+    /// Two families, so the multi-family handle.
+    store: Arc<dyn crate::storage::ColumnStore>,
     limits: PolicyLimits,
     /// Per-user mutexes so the read-check-write sequence for charges is
     /// linearised. Created lazily.
@@ -87,18 +88,23 @@ impl BudgetTracker {
     }
 
     pub fn new(db: Arc<DB>, limits: PolicyLimits) -> Self {
+        Self::with_store(
+            Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(db)),
+            limits,
+        )
+    }
+
+    /// Bind a handle directly — the constructor a backend-agnostic caller uses.
+    pub fn with_store(
+        store: Arc<dyn crate::storage::ColumnStore>,
+        limits: PolicyLimits,
+    ) -> Self {
         Self {
-            db,
+            store,
             limits,
             user_locks: Mutex::new(HashMap::new()),
             global_lock: Mutex::new(()),
         }
-    }
-
-    fn cf(&self, name: &str) -> &ColumnFamily {
-        self.db
-            .cf_handle(name)
-            .expect("sleep-time budget CF must exist in shared DB")
     }
 
     fn user_lock(&self, user_id: &str) -> Arc<Mutex<()>> {
@@ -111,8 +117,8 @@ impl BudgetTracker {
     /// Read current per-user state, rolling the windows if they have expired.
     pub fn user_state(&self, user_id: &str) -> Result<BudgetState> {
         let raw = self
-            .db
-            .get_cf(self.cf(CF_SLEEP_TIME_BUDGET), user_id.as_bytes())
+            .store
+            .get_cf(CF_SLEEP_TIME_BUDGET, user_id.as_bytes())
             .context("read sleep_time_budget")?;
         let mut state: BudgetState = match raw {
             Some(bytes) => bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
@@ -127,8 +133,8 @@ impl BudgetTracker {
     fn write_user_state(&self, user_id: &str, state: &BudgetState) -> Result<()> {
         let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard())
             .context("encode BudgetState")?;
-        self.db
-            .put_cf(self.cf(CF_SLEEP_TIME_BUDGET), user_id.as_bytes(), bytes)
+        self.store
+            .put_cf(CF_SLEEP_TIME_BUDGET, user_id.as_bytes(), &bytes)
             .context("write sleep_time_budget")?;
         Ok(())
     }
@@ -136,8 +142,8 @@ impl BudgetTracker {
     /// Read global state; rolls the daily window if expired.
     pub fn global_state(&self) -> Result<GlobalBudgetState> {
         let raw = self
-            .db
-            .get_cf(self.cf(CF_SLEEP_TIME_GLOBAL_BUDGET), GLOBAL_KEY)
+            .store
+            .get_cf(CF_SLEEP_TIME_GLOBAL_BUDGET, GLOBAL_KEY)
             .context("read sleep_time_global_budget")?;
         let mut state: GlobalBudgetState = match raw {
             Some(bytes) => bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
@@ -152,8 +158,8 @@ impl BudgetTracker {
     fn write_global_state(&self, state: &GlobalBudgetState) -> Result<()> {
         let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard())
             .context("encode GlobalBudgetState")?;
-        self.db
-            .put_cf(self.cf(CF_SLEEP_TIME_GLOBAL_BUDGET), GLOBAL_KEY, bytes)
+        self.store
+            .put_cf(CF_SLEEP_TIME_GLOBAL_BUDGET, GLOBAL_KEY, &bytes)
             .context("write sleep_time_global_budget")?;
         Ok(())
     }
