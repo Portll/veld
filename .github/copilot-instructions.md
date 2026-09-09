@@ -81,11 +81,11 @@ Multi-agent parallel execution with todo-driven task graphs. Activated for "orch
 
 ---
 
-## Sleight — Cognitive Evaluation Framework
+## Spine — Cognitive Evaluation Framework
 
-You also have access to **Sleight**, a cognitive evaluation framework that uses Veld for persistent memory. Sleight surfaces blind spots, scores plans, and detects structural gaps through topological data analysis.
+You also have access to **Spine**, a cognitive evaluation framework that uses Veld for persistent memory. Spine surfaces blind spots, scores plans, and detects structural gaps through topological data analysis.
 
-### Sleight Tools — Registered Switches
+### Spine Tools — Registered Switches
 
 #### Plan Evaluation
 | Tool | When | Switch |
@@ -121,7 +121,7 @@ You also have access to **Sleight**, a cognitive evaluation framework that uses 
 | `rebreaker` | Adversarial regression verification — re-attacks after remediation to verify fixes | ON |
 | `code_tda` | Topological data analysis on Rust/TypeScript/Python — dependency graphs + persistent homology | ON |
 
-### When to Use Sleight
+### When to Use Spine
 
 - **Before implementing a plan**: Call `bifocal_plan` or `bifocal_feat` to score it and surface gaps
 - **After significant changes**: Call `overwatch` for a full evaluation pass
@@ -132,14 +132,14 @@ You also have access to **Sleight**, a cognitive evaluation framework that uses 
 - **To detect hidden concepts**: Call `get_planet_x` when the knowledge graph has unexplained voids
 - **To find trade-off conflicts**: Call `get_three_body` when improving one area degrades another
 
-### Combined Veld + Sleight Workflow
+### Combined Veld + Spine Workflow
 
 1. **Start**: `proactive_context` (Veld) — load relevant memories
-2. **Plan**: `bifocal_feat` (Sleight) — generate and score the plan
+2. **Plan**: `bifocal_feat` (Spine) — generate and score the plan
 3. **Work**: Use Veld `remember` for decisions and `recall` for context
-4. **Evaluate**: `overwatch` (Sleight) — full dimensional analysis
-5. **Iterate**: `overloop` (Sleight) — feedback-driven improvements
-6. **Verify**: `rebreaker` (Sleight) — confirm prior issues are resolved
+4. **Evaluate**: `overwatch` (Spine) — full dimensional analysis
+5. **Iterate**: `overloop` (Spine) — feedback-driven improvements
+6. **Verify**: `rebreaker` (Spine) — confirm prior issues are resolved
 7. **Store**: `remember` (Veld) — persist learnings for future sessions
 
 --- Workflow

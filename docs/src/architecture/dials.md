@@ -2,10 +2,10 @@
 
 `CognitiveDials` is the unified, runtime-tunable surface for veld's cognitive
 system. One place to toggle or tune the parameters a human (via the monitor's
-"Dials" tab) or Sleight (via the automated-tuning path) can drive at runtime —
+"Dials" tab) or Spine (via the automated-tuning path) can drive at runtime —
 rather than a second tuning system beside
 [`FeedbackStore`](../reference/http-api.md)'s learned weights and the
-Sleight-pushed [`ExternalDimensionScores`](knowledge-graph.md#external-dimension-scores).
+Spine-pushed [`ExternalDimensionScores`](knowledge-graph.md#external-dimension-scores).
 
 Source: [src/memory/dials.rs](https://github.com/Portll/veld/blob/main/src/memory/dials.rs).
 
@@ -58,7 +58,7 @@ PUT /api/dials             → replace with the body's CognitiveDials JSON
 
 Full-replace REST semantics — the client GETs, edits, and PUTs the whole
 struct. There is no PATCH; partial updates would race against
-Sleight-driven updates on the same key.
+Spine-driven updates on the same key.
 
 Source: [src/handlers/dials.rs](https://github.com/Portll/veld/blob/main/src/handlers/dials.rs).
 
@@ -85,7 +85,7 @@ the *runtime* surface for things that benefit from being tweaked while the
 server is live:
 
 - Quick A/B sweeps without a restart.
-- Sleight-driven automated tuning that wants to push a new RRF k or
+- Spine-driven automated tuning that wants to push a new RRF k or
   cross-encoder budget every few minutes based on quality signals.
 - Per-user overrides — every user's dials are independent.
 

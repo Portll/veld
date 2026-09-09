@@ -56,7 +56,7 @@ ask the user about, or where new ingest should be prioritised.
 
 ## External dimension scores
 
-Sleight (an external evaluator) can push topological-health scores via
+Spine (an external evaluator) can push topological-health scores via
 `POST /api/sleight/dimensions`:
 
 - `density` — entity density in the region

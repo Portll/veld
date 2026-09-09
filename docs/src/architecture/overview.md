@@ -55,7 +55,7 @@ The composite score is built from 20 signals per memory. Categories:
 | **Graph** | Graph edge strength / Hebbian (8), episode coherence (16) |
 | **Confidence** | Calibrated confidence (9), confidence observations (10) |
 | **Rerank** | Cross-encoder (12) |
-| **External** | Sleight dimension aggregate (20) |
+| **External** | Spine dimension aggregate (20) |
 
 For per-signal definitions, computation, and blend weights, see
 [Retrieval pipeline → The 20 scoring signals](retrieval.md#the-20-scoring-signals).

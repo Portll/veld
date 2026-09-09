@@ -1,8 +1,8 @@
-# Coherence Galaxy Map: Claude Decision Trees x Veld/Sleight Memory Architecture
+# Coherence Galaxy Map: Claude Decision Trees x Veld/Spine Memory Architecture
 
 ## How to Read This Map
 
-This is a **family tree / galaxy cluster** showing how Claude's decision-making improves when Veld/Sleight surfaces information, and what's only visible when you know to look. Each cluster is a decision domain. Lines show information flow. Dotted lines show **flows that should exist but don't yet**.
+This is a **family tree / galaxy cluster** showing how Claude's decision-making improves when Veld/Spine surfaces information, and what's only visible when you know to look. Each cluster is a decision domain. Lines show information flow. Dotted lines show **flows that should exist but don't yet**.
 
 ```
                               ╔═══════════════════════════════════════╗
