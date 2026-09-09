@@ -127,7 +127,7 @@ system or graph, and returns JSON.
 | `lineage.rs` | `/api/lineage/trace`, `/api/lineage/link` |
 | `sessions.rs` | `/api/sessions`, `/api/sessions/end` |
 | `mif.rs` | `/api/export/mif`, `/api/import/mif` — memory interchange format |
-| `external_dimensions.rs` | `/api/sleight/dimensions` — overlook vector push from sleight |
+| `external_dimensions.rs` | `/api/sleight/dimensions` — overlook vector push from spine |
 
 ### MCP Server (mcp-server/)
 
@@ -168,8 +168,8 @@ The system records memories and retrieves them, but doesn't close the loop:
 - `reinforce` endpoint exists but isn't wired into the scoring layers
 - No prompt quality feedback → memory importance adjustment
 
-### 4. Sleight ↔ Veld Evaluation Feedback
+### 4. Spine ↔ Veld Evaluation Feedback
 
-Sleight evaluates code quality, but evaluation results don't flow back to
+Spine evaluates code quality, but evaluation results don't flow back to
 influence which memories are surfaced. The `/api/sleight/dimensions` endpoint
 exists but the pushed dimensions don't affect recall scoring.

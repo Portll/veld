@@ -98,7 +98,7 @@ The retrieval pipeline is **multi-layer hybrid search**, not a single algorithm.
 - **Cross-encoder reranking** ([src/embeddings/cross_encoder.rs](src/embeddings/cross_encoder.rs)) at ~18% blend, top-20 budget.
 - **Dual-embedder competition**: MiniLM 384d + Nomic 768d via LM Studio / Ollama / vLLM HTTP API (auto-detect). `CompetitiveEmbedder` uses `Arc<dyn Embedder>`.
 - **20-signal scoring** ([src/memory/types.rs](src/memory/types.rs) `ScoringSignals`): base score, recency, arousal, source credibility, temporal match, session boost, access count, graph strength, calibrated confidence (Bayesian α/β), confidence observations, feedback momentum (EMA), cross-encoder, importance, entity match, tag match, episode coherence, source-type multiplier, emotional valence intensity, sequence proximity, activation level, temporal fact density, entity density.
-- **External-dimension modulation** from Sleight's evaluation engine via `ExternalDimensionScores` (density, coherence, closure, confidence, isotropy) — modulates retrieval rank when fresh.
+- **External-dimension modulation** from Spine's evaluation engine via `ExternalDimensionScores` (density, coherence, closure, confidence, isotropy) — modulates retrieval rank when fresh.
 - **Signal attribution** per memory ([src/memory/types.rs](src/memory/types.rs) `SignalAttribution`): which signals contributed to a memory's rank. Drives adaptive weight learning.
 
 ### Storage
