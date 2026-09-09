@@ -50,12 +50,12 @@ feedback via `POST /api/reinforce`:
 A few well-placed reinforce calls per session shape the next session's
 retrieval significantly.
 
-## External Sleight dimensions
+## External Spine dimensions
 
 If you run [Sleight](https://github.com/Portll/sleight) alongside veld,
 push topological-health scores via `POST /api/sleight/dimensions`. The
 five scores (density, coherence, closure, confidence, isotropy) modulate
-retrieval rank when fresh. Sleight effectively becomes the 20th retrieval
+retrieval rank when fresh. Spine effectively becomes the 20th retrieval
 signal.
 
 ## Anchor for invariants

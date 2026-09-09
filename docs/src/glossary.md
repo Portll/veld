@@ -44,7 +44,7 @@ A facet linking a memory to a specific learning episode or engram cluster. Suppo
 Scoring signal 9 (8% weight). Memories that were encoded in the same session or share EngramBinding facets get a coherence boost when retrieved together.
 
 **External dimension scores**
-Five scores pushed from Sleight's evaluation engine via `POST /api/sleight/dimensions`: density, coherence, closure, confidence, isotropy. These modulate retrieval rank as signal 20 when fresh. Allows Sleight to exert fine-grained influence on which memories surface.
+Five scores pushed from Spine's evaluation engine via `POST /api/sleight/dimensions`: density, coherence, closure, confidence, isotropy. These modulate retrieval rank as signal 20 when fresh. Allows Spine to exert fine-grained influence on which memories surface.
 
 **Facet**
 A structured annotation attached to a memory. Facets include `Who`, `What`, `When`, `Where`, `Why`, `RecordKind`, `ContentKind`, `CausalLink`, `EngramBinding`, `Prediction`, `AgentRef`, `Place`. Used for graph-based retrieval and the wiki-render page taxonomy.
@@ -110,7 +110,7 @@ A compact binary serialization format. Used for `IntentPayload` encoding in the 
 A facet describing the *form* of a memory's content: `Code`, `Prose`, `StructuredData`, etc. Distinct from `RecordKind` (which describes the *role* of the memory).
 
 **External dimension scores**
-See full entry above; pushed by Sleight via `POST /api/sleight/dimensions`. Carry `is_stale()` for freshness checking.
+See full entry above; pushed by Spine via `POST /api/sleight/dimensions`. Carry `is_stale()` for freshness checking.
 
 **Fortress**
 A distribution-build feature flag. Strips tracing, replaces error messages with codes, installs a custom panic handler, and adds anti-debug + integrity checks. For shipping veld to untrusted environments.
@@ -142,8 +142,8 @@ A facet describing the *role* of a memory: `Episodic`, `Semantic`, `Procedural`,
 **ScoringSignals**
 The 20-field struct in `src/memory/types.rs` that holds the inputs to the composite ranking score. Populated during retrieval by extracting signals from each candidate memory.
 
-**Sleight**
-An external evaluation engine that pushes topological-health scores into veld via `POST /api/sleight/dimensions`. Sleight computes the scores using gap analysis + Voronoi decomposition on veld's graph API; veld consumes them as the 20th retrieval signal.
+**Spine**
+An external evaluation engine that pushes topological-health scores into veld via `POST /api/sleight/dimensions`. Spine computes the scores using gap analysis + Voronoi decomposition on veld's graph API; veld consumes them as the 20th retrieval signal.
 
 **SPANN**
 A vector ANN algorithm — Space Partition Approximate Nearest Neighbour. Two-level partitioned index for very large vector collections. Available in `src/vector_db/spann.rs` alongside HNSW.

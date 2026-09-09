@@ -145,10 +145,10 @@ RRF fusion or scoring layer.
 **Function:** Boosts memories stored in close temporal sequence to others surfacing for the same query. If memory A was stored at 14:23 and memory B at 14:24, and both are relevant, the pair surfaces together.
 **Benefit:** Catches conversational / causal chains that aren't bound to the same session window. Two memories about consecutive events lift each other even when individual scores are mid-range.
 
-### External Sleight dimension aggregate
+### External Spine dimension aggregate
 
-**Function:** Five topological-health scores pushed by Sleight via `POST /api/sleight/dimensions`: **density** (entity density), **coherence** (semantic coherence of neighbours), **closure** (fraction of triangles closed), **confidence** (average edge confidence), **isotropy** (directional balance). Geometric mean modulates rank when scores are fresh (< 1 hour old).
-**Benefit:** Memories from well-mapped, high-confidence regions of the knowledge graph outrank memories from sparse, incoherent regions. Lets an external evaluator (Sleight) exert fine-grained influence on retrieval without veld having to compute topology itself.
+**Function:** Five topological-health scores pushed by Spine via `POST /api/sleight/dimensions`: **density** (entity density), **coherence** (semantic coherence of neighbours), **closure** (fraction of triangles closed), **confidence** (average edge confidence), **isotropy** (directional balance). Geometric mean modulates rank when scores are fresh (< 1 hour old).
+**Benefit:** Memories from well-mapped, high-confidence regions of the knowledge graph outrank memories from sparse, incoherent regions. Lets an external evaluator (Spine) exert fine-grained influence on retrieval without veld having to compute topology itself.
 
 ---
 
