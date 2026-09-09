@@ -42,10 +42,26 @@ pub struct MemoryWithHierarchy {
 // LIST MEMORIES TYPES
 // =============================================================================
 
+/// Hard ceiling on `limit` for the memory-listing endpoints (`/api/list/{user_id}`,
+/// `/api/memories`). Any `limit` is clamped to this to bound per-request memory and scan cost;
+/// large exports page through with `offset`. Ported from shodh-memory 00c42ec (#407): the
+/// previous cap of 1000 with no offset made every record past the first 1000 unreachable
+/// through this API, and the response gave no sign of it.
+const MAX_LIST_LIMIT: usize = 10_000;
+
+/// Ceiling on the content preview in `ListMemoryItem::content`. `content_truncated` and
+/// `content_length` say when the cut happened, so a caller cannot mistake the preview for the
+/// record (shodh-memory 9233dcd).
+const LIST_CONTENT_PREVIEW_CHARS: usize = 500;
+
 /// Query parameters for listing memories
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
+    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
     pub limit: Option<usize>,
+    /// Items to skip before collecting `limit` results. Defaults to 0. Combine with `total`
+    /// in the response to page past `MAX_LIST_LIMIT`.
+    pub offset: Option<usize>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     /// Text search query - filters by content or tags (case-insensitive)
@@ -56,6 +72,8 @@ pub struct ListQuery {
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
     pub memories: Vec<ListMemoryItem>,
+    /// Total matching the filters, independent of `limit`/`offset`: compare
+    /// `memories.len() + offset` against it to know whether pages remain.
     pub total: usize,
 }
 
@@ -63,7 +81,10 @@ pub struct ListResponse {
 #[derive(Debug, Deserialize)]
 pub struct ListMemoriesRequest {
     pub user_id: String,
+    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
     pub limit: Option<usize>,
+    /// Items to skip before collecting `limit` results. Defaults to 0.
+    pub offset: Option<usize>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
@@ -72,12 +93,34 @@ pub struct ListMemoriesRequest {
 #[derive(Debug, Serialize)]
 pub struct ListMemoryItem {
     pub id: String,
+    /// Content preview, cut at [`LIST_CONTENT_PREVIEW_CHARS`]. Check `content_truncated`
+    /// before treating it as the record; GET /api/memory/{id} returns the whole text.
     pub content: String,
+    /// True when `content` is shorter than the stored content.
+    pub content_truncated: bool,
+    /// Character length of the full stored content.
+    pub content_length: usize,
     pub memory_type: String,
     pub importance: f32,
     pub tags: Vec<String>,
     pub created_at: String,
     pub tier: String,
+}
+
+/// One list row from a memory, with the preview cut declared rather than silent.
+fn list_item(m: &crate::memory::Memory) -> ListMemoryItem {
+    let content_length = m.experience.content.chars().count();
+    ListMemoryItem {
+        id: m.id.0.to_string(),
+        content: m.experience.content.chars().take(LIST_CONTENT_PREVIEW_CHARS).collect(),
+        content_truncated: content_length > LIST_CONTENT_PREVIEW_CHARS,
+        content_length,
+        memory_type: format!("{:?}", m.experience.experience_type),
+        importance: m.importance(),
+        tags: m.experience.entities.clone(),
+        created_at: m.created_at.to_rfc3339(),
+        tier: format!("{:?}", m.tier),
+    }
 }
 
 // =============================================================================
@@ -300,20 +343,14 @@ pub async fn list_memories(
     }
 
     let total = filtered.len();
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let limit = query.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
 
     let memories: Vec<ListMemoryItem> = filtered
         .into_iter()
+        .skip(offset)
         .take(limit)
-        .map(|m| ListMemoryItem {
-            id: m.id.0.to_string(),
-            content: m.experience.content.chars().take(500).collect(),
-            memory_type: format!("{:?}", m.experience.experience_type),
-            importance: m.importance(),
-            tags: m.experience.entities.clone(),
-            created_at: m.created_at.to_rfc3339(),
-            tier: format!("{:?}", m.tier),
-        })
+        .map(|m| list_item(&m))
         .collect();
 
     Ok(Json(ListResponse { memories, total }))
@@ -334,6 +371,7 @@ pub async fn list_memories_post(
 pub struct ListMemoriesQuery {
     pub user_id: String,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
@@ -349,6 +387,7 @@ pub async fn list_memories_get(
     let req = ListMemoriesRequest {
         user_id: params.user_id,
         limit: params.limit,
+        offset: params.offset,
         memory_type: params.memory_type,
         query: params.query,
     };
@@ -407,20 +446,14 @@ async fn list_memories_inner(
     }
 
     let total = filtered.len();
-    let limit = req.limit.unwrap_or(100).min(1000);
+    let limit = req.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
+    let offset = req.offset.unwrap_or(0);
 
     let memories: Vec<ListMemoryItem> = filtered
         .into_iter()
+        .skip(offset)
         .take(limit)
-        .map(|m| ListMemoryItem {
-            id: m.id.0.to_string(),
-            content: m.experience.content.chars().take(500).collect(),
-            memory_type: format!("{:?}", m.experience.experience_type),
-            importance: m.importance(),
-            tags: m.experience.entities.clone(),
-            created_at: m.created_at.to_rfc3339(),
-            tier: format!("{:?}", m.tier),
-        })
+        .map(|m| list_item(&m))
         .collect();
 
     Ok(Json(ListResponse { memories, total }))
@@ -1490,5 +1523,92 @@ fn parse_experience_type(type_str: &str) -> Result<ExperienceType, AppError> {
             field: "memory_type".to_string(),
             reason: format!("Invalid memory type: {type_str}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handlers::test_helpers::{self, TestHarness};
+    use crate::memory::Experience;
+    use axum::http::StatusCode;
+
+    fn remember_n(harness: &TestHarness, user_id: &str, contents: &[String]) {
+        let memory = harness.manager.get_user_memory(user_id).unwrap();
+        let guard = memory.read();
+        for c in contents {
+            guard
+                .remember(Experience { content: c.clone(), ..Default::default() }, None)
+                .unwrap();
+        }
+    }
+
+    /// Ported from shodh-memory 9233dcd: the list path used to cut content at 500 chars with
+    /// no signal it was incomplete, so a preview read as the record.
+    #[tokio::test]
+    async fn list_memories_marks_truncated_content() {
+        let harness = TestHarness::new();
+        let user_id = "truncation-user";
+        let long_content = "a".repeat(600);
+        let short_content = "b".repeat(42);
+        remember_n(&harness, user_id, &[long_content.clone(), short_content.clone()]);
+
+        let req = test_helpers::get(&format!("/api/list/{user_id}?limit=10"));
+        let (status, body) = test_helpers::send(harness.router(), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let memories = body["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 2);
+
+        let long_item = memories
+            .iter()
+            .find(|m| m["content_truncated"] == true)
+            .expect("expected one truncated item");
+        assert_eq!(long_item["content_length"], 600u64);
+        assert_eq!(long_item["content"].as_str().unwrap().chars().count(), 500);
+
+        let short_item = memories
+            .iter()
+            .find(|m| m["content_truncated"] == false)
+            .expect("expected one non-truncated item");
+        assert_eq!(short_item["content_length"], 42u64);
+        assert_eq!(short_item["content"], short_content);
+    }
+
+    /// Ported from shodh-memory 00c42ec (#407): without `offset`, everything past `limit` was
+    /// unreachable through this API and `total` was the only sign it existed.
+    #[tokio::test]
+    async fn list_memories_pages_with_offset_and_total() {
+        let harness = TestHarness::new();
+        let user_id = "paging-user";
+        let contents: Vec<String> = (0..5).map(|i| format!("record number {i}")).collect();
+        remember_n(&harness, user_id, &contents);
+
+        let page = |offset: usize| test_helpers::get(&format!("/api/list/{user_id}?limit=2&offset={offset}"));
+
+        let (status, p0) = test_helpers::send(harness.router(), page(0)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p0["total"], 5u64);
+        assert_eq!(p0["memories"].as_array().unwrap().len(), 2);
+
+        let (_, p1) = test_helpers::send(harness.router(), page(2)).await;
+        let (_, p2) = test_helpers::send(harness.router(), page(4)).await;
+        assert_eq!(p1["memories"].as_array().unwrap().len(), 2);
+        assert_eq!(p2["memories"].as_array().unwrap().len(), 1);
+
+        // Three pages cover the five records exactly once.
+        let mut seen: Vec<String> = [&p0, &p1, &p2]
+            .iter()
+            .flat_map(|p| p["memories"].as_array().unwrap().iter())
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "pages must partition the result set");
+
+        // Past the end is an empty page, not an error.
+        let (status, p3) = test_helpers::send(harness.router(), page(6)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p3["memories"].as_array().unwrap().len(), 0);
+        assert_eq!(p3["total"], 5u64);
     }
 }
