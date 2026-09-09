@@ -4775,6 +4775,21 @@ impl MemorySystem {
     ///
     /// Returns `Ok(true)` if rebuild was performed, `Ok(false)` if not needed.
     /// Thread-safe: concurrent calls are no-ops while rebuild is in progress.
+    /// Rebuild the vector index unconditionally. The harness calls this after
+    /// ingest so a quality measurement reads a freshly built index rather than
+    /// one mid-degradation, which would attribute an indexing artefact to
+    /// retrieval.
+    /// BM25 commit batches lost during ingest. Non-zero means the searchable
+    /// index is missing documents and any recall figure is measured over an
+    /// incomplete index.
+    pub fn bm25_commit_failure_count(&self) -> u64 {
+        self.hybrid_search.bm25_commit_failure_count()
+    }
+
+    pub fn force_vector_quality_rebuild(&self) -> Result<()> {
+        self.retriever.rebuild_index()
+    }
+
     pub fn auto_rebuild_index_if_needed(&self) -> Result<bool> {
         self.retriever.auto_rebuild_index_if_needed()
     }

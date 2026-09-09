@@ -1023,6 +1023,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// disk and wraps it in `Arc` itself. Either way, every read goes through
 /// the same handle that the journaled writer's projection commits to.
 pub struct HybridSearchEngine {
+    /// Count of BM25 commit batches lost after their error was handled and
+    /// ingest continued. Seven callers in memory/mod.rs treat a failed
+    /// commit_and_reload as recoverable and log it — correct for availability,
+    /// but it leaves the searchable index missing documents with nothing
+    /// downstream able to tell. A measurement run reads this and refuses
+    /// rather than reporting recall over an index it cannot vouch for.
+    bm25_commit_failures: std::sync::atomic::AtomicU64,
     bm25_index: Arc<BM25Index>,
     config: HybridSearchConfig,
     reranker: Option<CrossEncoderReranker>,
@@ -1082,6 +1089,7 @@ impl HybridSearchEngine {
         let learned_weights = RwLock::new(LearnedWeights::from_defaults(&config));
 
         Self {
+            bm25_commit_failures: std::sync::atomic::AtomicU64::new(0),
             bm25_index,
             config,
             reranker,
@@ -1150,8 +1158,26 @@ impl HybridSearchEngine {
 
     /// Commit and reload in one call for immediate searchability
     pub fn commit_and_reload(&self) -> Result<()> {
-        self.bm25_index.commit()?;
-        self.bm25_index.reload()
+        // Counted HERE, not at the seven call sites: a caller added later
+        // cannot forget to record its own loss.
+        if let Err(e) = self.bm25_index.commit() {
+            self.bm25_commit_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
+        if let Err(e) = self.bm25_index.reload() {
+            self.bm25_commit_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Commit batches lost since process start. Non-zero means the BM25 index
+    /// is missing documents.
+    pub fn bm25_commit_failure_count(&self) -> u64 {
+        self.bm25_commit_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get BM25 index reference for direct searches
