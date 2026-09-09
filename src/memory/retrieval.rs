@@ -53,6 +53,9 @@ const SECONDARY_VAMANA_INDEX_FILE: &str = "secondary_vamana.idx";
 /// **Note:** Memory graph (Hebbian learning) has been consolidated into GraphMemory
 /// which is managed at the API layer (MultiUserMemoryManager.graph_memories)
 pub struct RetrievalEngine {
+    /// Vector index inserts lost after their error was handled and ingest
+    /// continued — the memory is stored and semantically unreachable.
+    vector_index_failures: std::sync::atomic::AtomicU64,
     storage: Arc<dyn crate::storage::PrimaryMemoryStore>,
     embedder: Arc<CompetitiveEmbedder>,
     /// Lock order: 1 - Acquire first
@@ -277,6 +280,7 @@ impl RetrievalEngine {
             };
 
         let engine = Self {
+            vector_index_failures: std::sync::atomic::AtomicU64::new(0),
             storage,
             embedder,
             vector_index: Arc::new(RwLock::new(vector_index)),
@@ -1110,7 +1114,28 @@ impl RetrievalEngine {
     ///
     /// For long content, this chunks the text and creates multiple embeddings
     /// to ensure ALL content is searchable, not just the first 256 tokens.
+    /// Vector index inserts lost since process start. Non-zero means memories
+    /// are stored and semantically unreachable — the orphan condition the
+    /// startup recovery repairs, counted while it is accumulating rather than
+    /// only after a restart notices.
+    pub fn vector_index_failure_count(&self) -> u64 {
+        self.vector_index_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
+        match self.index_memory_inner(memory) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Counted at the boundary, not at the seven call sites.
+                self.vector_index_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    fn index_memory_inner(&self, memory: &Memory) -> Result<()> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
