@@ -274,6 +274,28 @@ pub fn retention_curve_debug(potentiated: bool) -> String {
 /// - LtpStatus::Full → 0.1 (10x slower decay, maximum)
 #[inline]
 pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, ltp_decay_factor: f32) -> (f32, bool) {
+    tier_decay_factor_adaptive(hours_elapsed, tier, ltp_decay_factor, None)
+}
+
+/// Tier decay with an optional per-edge rate learned from observed access intervals.
+///
+/// `typical_interval_hours` is the edge's own measured gap between activations.
+/// When present and credible, the decay rate is re-derived so the edge reaches
+/// its tier prune threshold after `ADAPTIVE_DECAY_SURVIVAL_MULTIPLE` such gaps,
+/// rather than after the tier's global calibration. When absent, this is
+/// byte-for-byte the previous behaviour.
+///
+/// The rate is clamped to `[base × MIN_FACTOR, base × MAX_FACTOR]` so neither a
+/// long-cadence edge becomes immortal nor a burst-activated one prunes itself
+/// before its next use. The age cap is extended in step with the rate — leaving
+/// it fixed would let `exceeded_max_age` prune an edge the rate was explicitly
+/// tuned to keep, which is the same defect one layer down.
+pub fn tier_decay_factor_adaptive(
+    hours_elapsed: f64,
+    tier: u8,
+    ltp_decay_factor: f32,
+    typical_interval_hours: Option<f64>,
+) -> (f32, bool) {
     use crate::constants::*;
 
     if hours_elapsed <= 0.0 {
@@ -304,6 +326,30 @@ pub fn tier_decay_factor(hours_elapsed: f64, tier: u8, ltp_decay_factor: f32) ->
             // Max age: effectively unlimited (10 years)
             (decay_per_hour, 87600.0, L3_PRUNE_THRESHOLD)
         }
+    };
+
+    // Adaptive rate: re-derive λ from the edge's own observed access interval.
+    // Solve w₀ × e^(-λT) = prune_threshold for T = SURVIVAL_MULTIPLE × interval.
+    let initial_weight = match tier {
+        0 => L1_INITIAL_WEIGHT,
+        1 => L2_PROMOTION_WEIGHT,
+        _ => L3_PROMOTION_WEIGHT,
+    } as f64;
+
+    let (decay_rate, max_age_hours) = match typical_interval_hours {
+        Some(interval) if interval.is_finite() && interval > 0.0 => {
+            let survive_hours = interval * ADAPTIVE_DECAY_SURVIVAL_MULTIPLE;
+            let ratio = initial_weight / prune_threshold as f64;
+            // ratio > 1 for every tier (0.4/0.1, 0.5/0.2, 0.7/0.3), so ln is positive.
+            let adaptive = (ratio.ln() / survive_hours)
+                .clamp(
+                    decay_rate * ADAPTIVE_DECAY_MIN_FACTOR,
+                    decay_rate * ADAPTIVE_DECAY_MAX_FACTOR,
+                );
+            // Extend the age cap in step, or it prunes what the rate preserves.
+            (adaptive, max_age_hours.max(survive_hours))
+        }
+        _ => (decay_rate, max_age_hours),
     };
 
     // PIPE-4: Apply graduated LTP protection
@@ -435,14 +481,104 @@ mod tests {
 
     #[test]
     fn test_tier_decay_factor_l1_prune_threshold() {
-        let (factor_at_max_age, should_prune_at_max_age) = tier_decay_factor(48.0, 0, 1.0);
+        // Boundary is L1_MAX_AGE_HOURS (240h / 10 days), recalibrated from the
+        // measured p90 revisit interval. Was 48h.
+        let (factor_at_max_age, should_prune_at_max_age) = tier_decay_factor(240.0, 0, 1.0);
         // At max age boundary, L1 should still not prune because pruning requires "greater than" max age.
         assert!(factor_at_max_age > 0.1);
         assert!(!should_prune_at_max_age);
 
-        let (factor_past_max_age, should_prune_past_max_age) = tier_decay_factor(96.0, 0, 1.0);
+        let (factor_past_max_age, should_prune_past_max_age) = tier_decay_factor(480.0, 0, 1.0);
         assert!(factor_past_max_age < 0.1);
         assert!(should_prune_past_max_age);
+    }
+
+    /// The calibration this tuning exists to guarantee: an L1 edge must still be
+    /// alive when the subject is next returned to. Pinned at the measured p90
+    /// revisit interval (9.9 days) so a future rate change that reintroduces the
+    /// old aggressive pruning fails here rather than silently in production.
+    #[test]
+    fn test_l1_survives_measured_p90_revisit_interval() {
+        let p90_revisit_hours = 9.9 * 24.0;
+        let (factor, should_prune) = tier_decay_factor(p90_revisit_hours, 0, 1.0);
+        assert!(
+            !should_prune,
+            "L1 edge pruned before the p90 revisit interval ({p90_revisit_hours}h)"
+        );
+        assert!(
+            factor > crate::constants::L1_PRUNE_THRESHOLD,
+            "L1 factor {factor} fell below prune threshold before p90 revisit"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_rate_none_matches_tier_default() {
+        // The no-evidence path must be byte-identical to the previous behaviour.
+        for hours in [1.0, 24.0, 240.0, 1000.0] {
+            let base = tier_decay_factor(hours, 0, 1.0);
+            let adaptive = tier_decay_factor_adaptive(hours, 0, 1.0, None);
+            assert_eq!(base, adaptive, "divergence at {hours}h");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_rate_slower_for_long_interval() {
+        // An edge revisited every 30 days should decay slower than the L1 default.
+        let interval = 30.0 * 24.0;
+        let (default_factor, _) = tier_decay_factor_adaptive(interval, 0, 1.0, None);
+        let (adaptive_factor, adaptive_prune) =
+            tier_decay_factor_adaptive(interval, 0, 1.0, Some(interval));
+        assert!(
+            adaptive_factor > default_factor,
+            "adaptive {adaptive_factor} should exceed default {default_factor}"
+        );
+        assert!(
+            !adaptive_prune,
+            "an edge used every 30 days must not be pruned at 30 days"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_rate_faster_for_short_interval() {
+        // An edge revisited every 30 minutes should decay faster than the default.
+        let (default_factor, _) = tier_decay_factor_adaptive(24.0, 0, 1.0, None);
+        let (adaptive_factor, _) = tier_decay_factor_adaptive(24.0, 0, 1.0, Some(0.5));
+        assert!(
+            adaptive_factor < default_factor,
+            "adaptive {adaptive_factor} should undercut default {default_factor}"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_rate_is_clamped_both_directions() {
+        use crate::constants::*;
+        let base = L1_DECAY_PER_HOUR as f64;
+
+        // Absurdly long interval must not make the edge immortal.
+        let (slow_factor, _) =
+            tier_decay_factor_adaptive(1000.0, 0, 1.0, Some(100.0 * 365.0 * 24.0));
+        let floor_factor = (-base * ADAPTIVE_DECAY_MIN_FACTOR * 1000.0).exp() as f32;
+        assert!(
+            slow_factor <= floor_factor + 1e-6,
+            "rate fell below the clamp floor"
+        );
+
+        // Absurdly short interval must not prune before the next hour.
+        let (fast_factor, _) = tier_decay_factor_adaptive(1.0, 0, 1.0, Some(1e-6));
+        let ceil_factor = (-base * ADAPTIVE_DECAY_MAX_FACTOR * 1.0).exp() as f32;
+        assert!(
+            fast_factor >= ceil_factor - 1e-6,
+            "rate exceeded the clamp ceiling"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_rate_ignores_nonsense_intervals() {
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            let base = tier_decay_factor(24.0, 0, 1.0);
+            let adaptive = tier_decay_factor_adaptive(24.0, 0, 1.0, Some(bad));
+            assert_eq!(base, adaptive, "nonsense interval {bad} changed the rate");
+        }
     }
 
     #[test]

@@ -766,38 +766,61 @@ impl RelationshipEdge {
 
     /// Record an activation timestamp (PIPE-4)
     ///
-    /// Only records for L2+ edges. Maintains capacity limits.
+    /// Records for every tier. L1 was previously excluded as "too transient",
+    /// but the adaptive decay rate is derived FROM this history, so excluding
+    /// L1 guaranteed L1 could never learn its own cadence — the tier that most
+    /// needs the evidence was the one forbidden to collect it. L1 keeps a short
+    /// buffer; an interval needs two timestamps, not a lifecycle.
     fn record_activation_timestamp(&mut self, timestamp: DateTime<Utc>) {
         use crate::constants::*;
 
-        // L1 edges don't track history (too transient)
-        if matches!(self.tier, EdgeTier::L1Working) {
-            return;
-        }
+        let capacity = match self.tier {
+            EdgeTier::L1Working => ACTIVATION_HISTORY_L1_CAPACITY,
+            EdgeTier::L2Episodic => ACTIVATION_HISTORY_L2_CAPACITY,
+            EdgeTier::L3Semantic => ACTIVATION_HISTORY_L3_CAPACITY,
+        };
 
         // Initialize if needed
         if self.activation_timestamps.is_none() {
-            let capacity = match self.tier {
-                EdgeTier::L1Working => return,
-                EdgeTier::L2Episodic => ACTIVATION_HISTORY_L2_CAPACITY,
-                EdgeTier::L3Semantic => ACTIVATION_HISTORY_L3_CAPACITY,
-            };
             self.activation_timestamps = Some(VecDeque::with_capacity(capacity));
         }
 
         if let Some(ref mut timestamps) = self.activation_timestamps {
-            let capacity = match self.tier {
-                EdgeTier::L1Working => return,
-                EdgeTier::L2Episodic => ACTIVATION_HISTORY_L2_CAPACITY,
-                EdgeTier::L3Semantic => ACTIVATION_HISTORY_L3_CAPACITY,
-            };
-
             // Maintain capacity limit (ring buffer behavior)
             while timestamps.len() >= capacity {
                 timestamps.pop_front();
             }
             timestamps.push_back(timestamp);
         }
+    }
+
+    /// The edge's own typical interval between activations, in hours.
+    ///
+    /// Returns `None` until there are `ADAPTIVE_DECAY_MIN_SAMPLES` timestamps
+    /// (i.e. at least two intervals) — below that, one coincidence would set the
+    /// rate. Uses the MEDIAN rather than the mean: activation histories are
+    /// bursty, and a single long idle gap would drag a mean far enough to make
+    /// the edge effectively permanent.
+    pub fn typical_activation_interval_hours(&self) -> Option<f64> {
+        use crate::constants::ADAPTIVE_DECAY_MIN_SAMPLES;
+
+        let timestamps = self.activation_timestamps.as_ref()?;
+        if timestamps.len() < ADAPTIVE_DECAY_MIN_SAMPLES {
+            return None;
+        }
+
+        let mut gaps: Vec<f64> = timestamps
+            .iter()
+            .zip(timestamps.iter().skip(1))
+            .map(|(a, b)| (*b - *a).num_seconds() as f64 / 3600.0)
+            .filter(|g| *g > 0.0)
+            .collect();
+
+        if gaps.is_empty() {
+            return None;
+        }
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(gaps[gaps.len() / 2])
     }
 
     /// Detect LTP status based on unified readiness model (PIPE-4 + PIPE-5)
@@ -944,7 +967,10 @@ impl RelationshipEdge {
     ///
     /// Returns true if synapse should be pruned (below tier's threshold)
     pub(crate) fn decay(&mut self) -> bool {
-        use crate::decay::tier_decay_factor;
+        use crate::decay::tier_decay_factor_adaptive;
+
+        // Computed before any mutation below (immutable borrow of self).
+        let typical_interval = self.typical_activation_interval_hours();
 
         let now = Utc::now();
         let elapsed = now.signed_duration_since(self.last_activated);
@@ -965,7 +991,7 @@ impl RelationshipEdge {
         };
         let ltp_factor = self.ltp_status.decay_factor();
         let (decay_factor, exceeded_max_age) =
-            tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
+            tier_decay_factor_adaptive(hours_elapsed, tier_num, ltp_factor, typical_interval);
         self.strength *= decay_factor;
 
         // Update last_activated to prevent double-decay on repeated calls
@@ -1064,7 +1090,7 @@ impl RelationshipEdge {
     /// would be after decay, without modifying the edge.
     /// Uses tier-aware decay (L1/L2/L3 have different decay rates).
     pub fn effective_strength(&self) -> f32 {
-        use crate::decay::tier_decay_factor;
+        use crate::decay::tier_decay_factor_adaptive;
 
         let now = Utc::now();
         let elapsed = now.signed_duration_since(self.last_activated);
@@ -1080,7 +1106,14 @@ impl RelationshipEdge {
             EdgeTier::L3Semantic => 2,
         };
         let ltp_factor = self.ltp_status.decay_factor();
-        let (decay_factor, _) = tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
+        // Same rate as decay() — a read path on a different rate than the write
+        // path reports a strength the store will never actually hold.
+        let (decay_factor, _) = tier_decay_factor_adaptive(
+            hours_elapsed,
+            tier_num,
+            ltp_factor,
+            self.typical_activation_interval_hours(),
+        );
         (self.strength * decay_factor).max(LTP_MIN_STRENGTH)
     }
 
@@ -7294,6 +7327,93 @@ mod tests {
     }
 
     #[test]
+    fn test_l1_records_activation_history_while_still_l1() {
+        // Regression: L1 used to record nothing, which meant the adaptive decay
+        // rate could never be derived for the tier whose default was most wrong.
+        let mut edge = create_test_edge(0.1, 0);
+        assert!(matches!(edge.tier, EdgeTier::L1Working));
+
+        let _ = edge.strengthen();
+
+        assert!(
+            matches!(edge.tier, EdgeTier::L1Working),
+            "test needs the edge to still be L1 to prove L1 itself recorded"
+        );
+        assert!(
+            edge.activation_timestamps.is_some(),
+            "L1 edge must record activation history"
+        );
+    }
+
+    #[test]
+    fn test_l1_activation_history_respects_capacity() {
+        use crate::constants::ACTIVATION_HISTORY_L1_CAPACITY;
+        let mut edge = create_test_edge(0.1, 0);
+        edge.activation_timestamps = Some(std::collections::VecDeque::new());
+
+        let now = Utc::now();
+        for i in 0..(ACTIVATION_HISTORY_L1_CAPACITY as i64 + 5) {
+            edge.record_activation_timestamp(now + chrono::Duration::minutes(i));
+        }
+
+        assert_eq!(
+            edge.activation_timestamps.as_ref().unwrap().len(),
+            ACTIVATION_HISTORY_L1_CAPACITY,
+            "L1 history must be bounded by its capacity"
+        );
+    }
+
+    #[test]
+    fn test_typical_interval_needs_min_samples() {
+        let mut edge = create_test_edge(0.3, 0);
+        let now = Utc::now();
+
+        // Two timestamps = one interval = not yet evidence of a rhythm.
+        edge.activation_timestamps = Some(
+            vec![now, now + chrono::Duration::hours(24)]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(edge.typical_activation_interval_hours(), None);
+
+        // Three timestamps = two intervals.
+        edge.activation_timestamps = Some(
+            vec![
+                now,
+                now + chrono::Duration::hours(24),
+                now + chrono::Duration::hours(48),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let interval = edge.typical_activation_interval_hours().unwrap();
+        assert!((interval - 24.0).abs() < 0.01, "expected 24h, got {interval}");
+    }
+
+    #[test]
+    fn test_typical_interval_uses_median_not_mean() {
+        // One long idle gap must not drag the rate toward permanence.
+        let mut edge = create_test_edge(0.3, 0);
+        let now = Utc::now();
+        edge.activation_timestamps = Some(
+            vec![
+                now,
+                now + chrono::Duration::hours(1),
+                now + chrono::Duration::hours(2),
+                now + chrono::Duration::hours(2000),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let interval = edge.typical_activation_interval_hours().unwrap();
+        assert!(
+            interval < 100.0,
+            "median should reject the 1998h outlier, got {interval}"
+        );
+    }
+
+    #[test]
     fn test_pipe4_l1_promotes_and_tracks() {
         // L1 edges that promote to L2 should start tracking timestamps
         let mut edge = create_test_edge(0.3, 0);
@@ -7625,22 +7745,32 @@ mod tests {
 
     #[test]
     fn test_decay_tier_aware() {
-        // Test tier-aware decay: L2 episodic with exponential decay (λ=0.031/day) over 7 days
-        // Expected: e^(-0.031 * 7) ≈ 0.805, so strength decays to ~80%
-        let mut edge = create_test_edge_with_tier(1.0, 7, EdgeTier::L2Episodic);
+        // Tier-aware decay over 7 days at L2. The expected value is DERIVED from
+        // L2_DECAY_PER_DAY rather than hardcoded, because a hardcoded band pins
+        // the tuning rather than the mechanism and fails on every recalibration.
+        // What this actually guards is that the L2 rate is applied in the right
+        // units and to the right tier — a per-day rate read as per-hour is the
+        // live bug class here, and it lands 24x off, far outside the tolerance.
+        use crate::constants::L2_DECAY_PER_DAY;
 
+        let mut edge = create_test_edge_with_tier(1.0, 7, EdgeTier::L2Episodic);
         edge.decay();
 
-        // After 7 days with L2 exponential decay, expect moderate reduction (~80% retained)
-        // but well above floor since within max age
+        let expected = (-(L2_DECAY_PER_DAY as f64) * 7.0).exp() as f32;
         assert!(
-            edge.strength < 0.85,
-            "After 7 days with L2 decay, strength should be below 0.85, got {}",
+            (edge.strength - expected).abs() < 0.01,
+            "7-day L2 decay should track L2_DECAY_PER_DAY: expected ~{expected}, got {}",
+            edge.strength
+        );
+        // Direction and survival, both tuning-independent.
+        assert!(
+            edge.strength < 1.0,
+            "decay must reduce strength, got {}",
             edge.strength
         );
         assert!(
-            edge.strength > 0.75,
-            "After 7 days with L2 decay, strength should be above 0.75, got {}",
+            edge.strength > EdgeTier::L2Episodic.prune_threshold(),
+            "a 7-day-old L2 edge must not be at prune level, got {}",
             edge.strength
         );
         assert!(
