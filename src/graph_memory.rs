@@ -1021,6 +1021,43 @@ impl RelationshipEdge {
         }
     }
 
+    /// Synthetic, non-persisted edge for the decay-simulation harness.
+    /// Timestamps anchored at `origin` so a harness can drive decay forward
+    /// from a known point. Never written to storage.
+    ///
+    /// Adapted from upstream: veld's RelationshipEdge has no
+    /// endpoint_selectivity, forman_curvature, provenance or promoted_at.
+    pub(crate) fn synthetic_for_sim(
+        strength: f32,
+        tier: EdgeTier,
+        ltp_status: LtpStatus,
+        origin: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength,
+            created_at: origin,
+            valid_at: origin,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: origin,
+            activation_count: 0,
+            ltp_status,
+            activation_timestamps: None,
+            tier,
+            entity_confidence: None,
+            // veld-only fields, absent upstream: a synthetic edge is
+            // undirected-equivalent, so both directions carry `strength`.
+            created_by: EdgeSource::Coactivation,
+            forward_strength: strength,
+            backward_strength: strength,
+        }
+    }
+
     /// Get the effective strength considering recency
     ///
     /// This is a read-only version that calculates what the strength
@@ -5351,6 +5388,25 @@ impl GraphMemory {
         entities.sort_by(|a, b| b.mention_count.cmp(&a.mention_count));
 
         Ok(entities)
+    }
+
+    /// Count of edges per relation type, descending then alphabetical.
+    /// Read by the recall harness's ontology report.
+    pub fn relation_type_distribution(&self) -> Result<Vec<(String, usize)>> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (_, value) in self.store.scan_cf(CF_RELATIONSHIPS, None, None)? {
+            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
+                &value,
+                bincode::config::standard(),
+            ) {
+                *counts
+                    .entry(edge.relation_type.as_str().to_string())
+                    .or_default() += 1;
+            }
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
     }
 
     /// Get all relationships in the graph
