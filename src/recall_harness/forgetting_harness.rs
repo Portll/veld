@@ -212,7 +212,7 @@ pub fn analyze_selective_forgetting(
         let query = Query {
             query_text: Some(q.to_string()),
             max_results: wide,
-            layers: LayerMode::Full,
+            layers: Some(LayerMode::Full),
             ..Default::default()
         };
         match system.read().recall(&query) {
