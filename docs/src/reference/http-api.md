@@ -6,7 +6,7 @@
 
 # HTTP API
 
-Veld exposes **220** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
+Veld exposes **227** HTTP routes. Every route (except `/health/*` probes) requires API-key authentication via the `X-API-Key` header.
 
 > Warning: 2 route(s) used a non-literal path string and were skipped by the generator. Inspect [src/handlers/router.rs](https://github.com/Portll/veld/blob/main/src/handlers/router.rs) directly for those.
 
@@ -124,6 +124,12 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `POST` | `/api/datasets/{name}/query` | `datasets::query_dataset` |
 | `POST` | `/api/datasets/{name}/rows` | `datasets::insert_rows` |
 
+## /dials
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/dials/schema` | `dials::get_dials_schema` |
+
 ## /entity
 
 | Method | Path | Handler |
@@ -163,6 +169,12 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `POST` | `/api/facts/temporal` | `facts::list_temporal_facts` |
 | `POST` | `/api/facts/temporal/search` | `facts::search_temporal_facts` |
 
+## /file_answer
+
+| Method | Path | Handler |
+|---|---|---|
+| `POST` | `/api/file_answer` | `remember::file_answer` |
+
 ## /files
 
 | Method | Path | Handler |
@@ -198,6 +210,7 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 | `GET` | `/api/graph/data/{user_id}` | `visualization::get_graph_data` |
 | `POST` | `/api/graph/entities/all` | `graph::get_all_entities` |
 | `POST` | `/api/graph/entity/add` | `mif::add_entity` |
+| `DELETE` | `/api/graph/entity/delete` | `graph::delete_entity` |
 | `POST` | `/api/graph/entity/find` | `graph::find_entity` |
 | `POST` | `/api/graph/episode/get` | `graph::get_episode` |
 | `POST` | `/api/graph/relationship/add` | `mif::add_relationship` |
@@ -276,6 +289,8 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/api/memory/compress` | `compression::compress_memory` |
 | `POST` | `/api/memory/decompress` | `compression::decompress_memory` |
+| `POST` | `/api/memory/merge` | `memory_ops::merge_memories` |
+| `POST` | `/api/memory/split` | `memory_ops::split_memory` |
 | `POST` | `/api/memory/tier` | `crud::move_memory_tier` |
 | `DELETE` | `/api/memory/{memory_id}` | `crud::delete_memory` |
 | `PUT` | `/api/memory/{memory_id}` | `crud::update_memory` |
@@ -415,6 +430,12 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/api/sleight/dimensions` | `external_dimensions::push_dimensions` |
 
+## /spine
+
+| Method | Path | Handler |
+|---|---|---|
+| `POST` | `/api/spine/dimensions` | `external_dimensions::push_dimensions` |
+
 ## /stats
 
 | Method | Path | Handler |
@@ -515,6 +536,12 @@ Base URL: `http://127.0.0.1:3030` (default; configurable via `VELD_BIND_ADDR`).
 |---|---|---|
 | `POST` | `/webhook/github` | `integrations::github_webhook` |
 | `POST` | `/webhook/linear` | `integrations::linear_webhook` |
+
+## /wiki
+
+| Method | Path | Handler |
+|---|---|---|
+| `POST` | `/api/wiki/render` | `crud::wiki_render` |
 
 ## /wintermute
 

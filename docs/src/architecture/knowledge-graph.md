@@ -57,7 +57,7 @@ ask the user about, or where new ingest should be prioritised.
 ## External dimension scores
 
 Spine (an external evaluator) can push topological-health scores via
-`POST /api/sleight/dimensions`:
+`POST /api/spine/dimensions` (`/api/sleight/dimensions` is a retained alias):
 
 - `density` — entity density in the region
 - `coherence` — semantic coherence of neighbours

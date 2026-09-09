@@ -628,8 +628,14 @@ pub fn build_protected_routes(state: AppState, metrics_public: bool) -> Router {
         .route("/api/ab/summary", get(ab_testing::get_ab_summary))
         // =================================================================
         // EXTERNAL DIMENSION PUSH (GRAPH TOPOLOGICAL HEALTH)
-        // Sleight integration — accepts topology scores from evaluator
+        // Spine integration — accepts topology scores from evaluator
         // =================================================================
+        .route(
+            "/api/spine/dimensions",
+            post(external_dimensions::push_dimensions),
+        )
+        // deprecated alias: /api/sleight/dimensions is retained until callers
+        // drain onto /api/spine/dimensions, then remove it
         .route(
             "/api/sleight/dimensions",
             post(external_dimensions::push_dimensions),
