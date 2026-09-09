@@ -2590,7 +2590,12 @@ impl MemoryStorage {
             }
         }
 
-        Ok(all_ids.into_iter().collect())
+        // A HashSet has no order, and recall_by_tags truncates what this returns — so with more
+        // matches than the limit, WHICH records came back changed between identical calls.
+        // Sorted by id the truncation is at least repeatable; callers wanting recency sort again.
+        let mut ids: Vec<MemoryId> = all_ids.into_iter().collect();
+        ids.sort();
+        Ok(ids)
     }
 
     /// Search memories by episode ID
