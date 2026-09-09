@@ -4779,6 +4779,20 @@ impl MemorySystem {
     /// ingest so a quality measurement reads a freshly built index rather than
     /// one mid-degradation, which would attribute an indexing artefact to
     /// retrieval.
+    /// Index inserts lost during ingest, vector and lexical.
+    ///
+    /// Non-zero means memories are STORED BUT UNREACHABLE by that route: the
+    /// primary store has them and no query can find them. Distinct from a lost
+    /// commit, where the document reached the writer and the batch did not
+    /// reach disk. Both are handled-and-continued for availability, which is
+    /// right for a server and fatal for a measurement.
+    pub fn index_failure_counts(&self) -> (u64, u64) {
+        (
+            self.retriever.vector_index_failure_count(),
+            self.hybrid_search.bm25_index_failure_count(),
+        )
+    }
+
     /// BM25 commit batches lost during ingest. Non-zero means the searchable
     /// index is missing documents and any recall figure is measured over an
     /// incomplete index.
