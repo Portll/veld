@@ -77,6 +77,29 @@ use crate::constants::{
 use crate::memory::storage::MemoryStorage;
 pub use crate::memory::types::*;
 
+/// `VELD_RECALL_READONLY=1` — recall performs NO usage writes: no access-count persistence,
+/// no co-retrieval edge reinforcement, no interference accumulation, no retrieval-counter
+/// bump. Set by the eval harness (`recall_harness::runner` pins it at startup): eval repeats
+/// measure variance, not learning curves, and a first-repeat usage write shifts later repeats'
+/// rankings. Production default (unset): writes on, unchanged.
+///
+/// Ported from shodh-memory 4ec3b6e / 622a439. The harness imported at 369e21c pins the
+/// upstream spelling `SHODH_RECALL_READONLY`, and until this function existed nothing here read
+/// EITHER name, so every "read-only" eval query was mutating the store it measured. Both names
+/// are honoured; `VELD_` wins when both are set.
+///
+/// This is the single source of truth for the gate: every recall-path mutation site checks
+/// this function rather than re-deriving the env read. Known residual: `traverse_bidirectional`
+/// in `graph_memory.rs` strengthens the edges it walks and is reached from the multi-hop leg
+/// of `recall`; gating it needs a parameter on that function and that file is under another
+/// session's edit at the time of writing.
+pub(crate) fn recall_readonly() -> bool {
+    let flag = |name: &str| std::env::var(name).ok().map(|v| v == "1");
+    flag("VELD_RECALL_READONLY")
+        .or_else(|| flag("SHODH_RECALL_READONLY"))
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Shared Zenoh session for the ZenohEmbedder cache
 // ---------------------------------------------------------------------------
@@ -7989,5 +8012,56 @@ mod temporal_gate_regression_tests {
             "gate MUST return empty vec when query has no temporal refs \
              (contract: callers fall through to unfiltered results)"
         );
+    }
+}
+
+#[cfg(test)]
+mod recall_readonly_tests {
+    use super::recall_readonly;
+    use std::sync::Mutex;
+
+    // Process-wide env; serialise the tests that touch it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env(pairs: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in pairs {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        f();
+        for (k, _) in pairs {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn unset_means_writes_on() {
+        with_env(&[("VELD_RECALL_READONLY", None), ("SHODH_RECALL_READONLY", None)], || {
+            assert!(!recall_readonly());
+        });
+    }
+
+    /// The imported harness pins the upstream spelling; it must not be silently ignored.
+    #[test]
+    fn either_spelling_arms_the_gate() {
+        with_env(&[("VELD_RECALL_READONLY", Some("1")), ("SHODH_RECALL_READONLY", None)], || {
+            assert!(recall_readonly());
+        });
+        with_env(&[("VELD_RECALL_READONLY", None), ("SHODH_RECALL_READONLY", Some("1"))], || {
+            assert!(recall_readonly());
+        });
+    }
+
+    #[test]
+    fn only_one_is_on_and_veld_wins_when_both_are_set() {
+        with_env(&[("VELD_RECALL_READONLY", Some("0")), ("SHODH_RECALL_READONLY", Some("1"))], || {
+            assert!(!recall_readonly(), "VELD_ explicitly off outranks the upstream spelling");
+        });
+        with_env(&[("VELD_RECALL_READONLY", Some("true")), ("SHODH_RECALL_READONLY", None)], || {
+            assert!(!recall_readonly(), "only the literal 1 arms it, as upstream");
+        });
     }
 }
