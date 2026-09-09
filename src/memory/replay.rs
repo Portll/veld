@@ -405,10 +405,15 @@ impl InterferenceDetector {
     ///
     /// When multiple similar memories are retrieved, they compete
     /// for activation. Stronger memories suppress weaker ones.
+    /// `record_state` — whether the interference produced here is ACCUMULATED into the
+    /// detector's history. Suppression is computed in every mode (it is per-query ranking);
+    /// accumulation is a usage write that feeds later queries' boosts, so read-only recall
+    /// (eval repeats) passes `false`. Ported from shodh-memory 4ec3b6e.
     pub fn apply_retrieval_competition(
         &mut self,
         candidates: &[(String, f32, f32)], // (memory_id, relevance_score, similarity_to_query)
         query_preview: &str,
+        record_state: bool,
     ) -> CompetitionResult {
         if candidates.len() <= 1 {
             return CompetitionResult {
@@ -458,23 +463,27 @@ impl InterferenceDetector {
                         if new_score > 0.1 {
                             winners.push((id.clone(), new_score));
                             // Mild interference record for close survivors ("battle-tested")
-                            self.record_interference(
-                                id,
-                                winner_id,
-                                score_ratio,
-                                InterferenceType::RetrievalCompetition,
-                                suppression * 0.3,
-                            );
+                            if record_state {
+                                self.record_interference(
+                                    id,
+                                    winner_id,
+                                    score_ratio,
+                                    InterferenceType::RetrievalCompetition,
+                                    suppression * 0.3,
+                                );
+                            }
                         } else {
                             suppressed.push(id.clone());
                             // Strong interference record for fully suppressed memories
-                            self.record_interference(
-                                id,
-                                winner_id,
-                                score_ratio,
-                                InterferenceType::RetrievalCompetition,
-                                suppression,
-                            );
+                            if record_state {
+                                self.record_interference(
+                                    id,
+                                    winner_id,
+                                    score_ratio,
+                                    InterferenceType::RetrievalCompetition,
+                                    suppression,
+                                );
+                            }
                         }
                     } else {
                         winners.push((id.clone(), *score));
@@ -539,6 +548,11 @@ impl InterferenceDetector {
     }
 
     /// Get interference history for a memory
+    /// Number of interference records held across all memories — what a usage write adds to.
+    pub fn interference_history_len(&self) -> usize {
+        self.interference_history.values().map(Vec::len).sum()
+    }
+
     pub fn get_history(&self, memory_id: &str) -> Option<&Vec<InterferenceRecord>> {
         self.interference_history.get(memory_id)
     }
@@ -874,12 +888,35 @@ mod tests {
             ("mem-3".to_string(), 0.5, 0.70),  // Lower, should survive
         ];
 
-        let result = detector.apply_retrieval_competition(&candidates, "test query");
+        let result = detector.apply_retrieval_competition(&candidates, "test query", true);
 
         // Winner should be first
         assert_eq!(result.winners[0].0, "mem-1");
         // Close competitor may be suppressed depending on competition factor
         assert!(!result.winners.is_empty());
+    }
+
+    /// Read-only recall still competes (same winners, same suppression) but leaves no
+    /// interference record behind, so a repeat measures the same detector.
+    #[test]
+    fn test_retrieval_competition_readonly_computes_but_does_not_record() {
+        let candidates = vec![
+            ("mem-1".to_string(), 0.9, 0.85),
+            ("mem-2".to_string(), 0.88, 0.82),
+            ("mem-3".to_string(), 0.5, 0.70),
+        ];
+
+        let mut recording = InterferenceDetector::new();
+        let recorded = recording.apply_retrieval_competition(&candidates, "q", true);
+        let recorded_history = recording.interference_history_len();
+
+        let mut readonly = InterferenceDetector::new();
+        let silent = readonly.apply_retrieval_competition(&candidates, "q", false);
+
+        assert_eq!(recorded.winners, silent.winners, "ranking must not depend on the flag");
+        assert_eq!(recorded.suppressed, silent.suppressed);
+        assert!(recorded_history > 0, "the recording run must have written something for the test to mean anything");
+        assert_eq!(readonly.interference_history_len(), 0, "read-only recall taught the detector");
     }
 
     // =========================================================================

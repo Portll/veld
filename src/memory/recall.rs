@@ -115,15 +115,21 @@ impl super::MemorySystem {
             .read()
             .log_retrieved("", memories.len(), &sources);
 
+        // Usage writes below (access counts, coactivation, retrieval counter) are skipped under
+        // read-only recall — see `recall_readonly()` for why an eval must not teach the store.
+        let readonly = super::recall_readonly();
+
         // Update access counts with instrumentation for consolidation events
-        for memory in &memories {
-            self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+        if !readonly {
+            for memory in &memories {
+                self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+            }
         }
 
         // Hebbian learning: co-activation strengthens associations between memories
         // When memories are retrieved together, they form/strengthen edges in the memory graph.
         // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
-        if memories.len() >= 2 {
+        if !readonly && memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let retrieval_id = uuid::Uuid::new_v4();
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
@@ -153,8 +159,10 @@ impl super::MemorySystem {
         }
 
         // Increment and persist retrieval counter
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        if !readonly {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
         }
 
         Ok(memories)
@@ -206,8 +214,10 @@ impl super::MemorySystem {
         let criteria = storage::SearchCriteria::ByTags(tags.to_vec());
         let mut memories = self.advanced_search(criteria)?;
         memories.truncate(limit);
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        if !super::recall_readonly() {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
         }
         Ok(memories)
     }
@@ -224,8 +234,10 @@ impl super::MemorySystem {
         let criteria = storage::SearchCriteria::ByDate { start, end };
         let mut memories = self.advanced_search(criteria)?;
         memories.truncate(limit);
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        if !super::recall_readonly() {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
         }
         Ok(memories)
     }
@@ -3626,10 +3638,13 @@ impl super::MemorySystem {
                 })
                 .collect();
 
+            // Suppression COMPUTES in every mode (per-query ranking); interference
+            // ACCUMULATION is a usage write, so read-only recall must not teach the detector.
+            let record_state = !super::recall_readonly();
             let competition_result = self
                 .interference_detector
                 .write()
-                .apply_retrieval_competition(&candidates, query_text);
+                .apply_retrieval_competition(&candidates, query_text, record_state);
 
             // Record competition event if any memories were suppressed
             if let Some(ref event) = competition_result.event {
@@ -3878,10 +3893,16 @@ impl super::MemorySystem {
             }
         }
 
+        // Usage writes from here on (access counts, coactivation, retrieval counter) are
+        // skipped under read-only recall — see `recall_readonly()`.
+        let readonly = super::recall_readonly();
+
         // Update access counts with instrumentation for consolidation events
         // (only for memories that survived competition)
-        for memory in &memories {
-            self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+        if !readonly {
+            for memory in &memories {
+                self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+            }
         }
 
         // =====================================================================
@@ -3968,7 +3989,7 @@ impl super::MemorySystem {
         // participate in coactivation (biological: "neurons that fire together
         // wire together" but suppressed neurons don't fire).
         // S-R4: routed through apply_reinforcement so duplicate retrieval_ids are no-ops.
-        if memories.len() >= 2 {
+        if !readonly && memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let retrieval_id = uuid::Uuid::new_v4();
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
@@ -3999,8 +4020,10 @@ impl super::MemorySystem {
         }
 
         // Increment and persist retrieval counter
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        if !readonly {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
         }
 
         self.logger
@@ -4780,8 +4803,10 @@ impl super::MemorySystem {
     /// ```
     pub fn recall_tracked(&self, query: &Query) -> Result<TrackedRetrieval> {
         let result = self.retriever.search_tracked(query, query.max_results)?;
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        if !super::recall_readonly() {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
         }
         Ok(result)
     }
