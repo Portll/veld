@@ -670,8 +670,13 @@ pub struct GraphStructure {
     /// ORDER, on a criterion uncorrelated with information — while the PMI-squared
     /// gate beside it culls on exactly that criterion. A large number here means
     /// the graph's shape is an artefact of ingest sequence.
-    #[serde(default)]
-    pub hub_saturation_skipped_edges: u64,
+    ///
+    /// `None` means the build has no hub cap to saturate — veld has no
+    /// `HUB_DEGREE_MAX` — as distinct from `Some(0)`, "a cap that skipped
+    /// nothing". Do not collapse these with `unwrap_or(0)`: that is the
+    /// misreading the Option exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_saturation_skipped_edges: Option<u64>,
 
     /// Stored edges by relation type, descending.
     ///

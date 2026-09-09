@@ -695,7 +695,7 @@ fn run_one_pass(
             let mut query = Query {
                 query_text: Some(case.query.clone()),
                 max_results: SMOKE_K,
-                layers: *mode,
+                layers: Some(*mode),
                 ..Default::default()
             };
             // SHODH_QUERY_NER A/B lever: neural-NER graph seeding (no-op when unset).
@@ -781,7 +781,7 @@ fn run_one_pass(
                 let mut deep_query = Query {
                     query_text: Some(case.query.clone()),
                     max_results: diag_k,
-                    layers: *mode,
+                    layers: Some(*mode),
                     ..Default::default()
                 };
                 manager.annotate_query_ner(&mut deep_query);
@@ -1074,7 +1074,8 @@ pub fn ingest_corpus(
                     confidence: e.confidence,
                     start_char: Some(e.start),
                     end_char: Some(e.end),
-                    fine_label: e.fine_label,
+                    // veld's NerEntity carries no fine label; the coarse
+                    // entity_type above is the whole classification here.
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -1118,11 +1119,13 @@ pub fn ingest_corpus(
         // Pass 2: build the entity graph from this memory (the step the bare
         // MemorySystem path skipped entirely).
         manager
+            // veld's signature takes three: it derives name embeddings inside
+            // rather than accepting them, so the harness cannot hold them
+            // constant across arms the way upstream does.
             .process_experience_into_graph(
                 EVAL_USER,
                 &experience,
                 &memory_id,
-                name_embeddings.as_ref(),
             )
             .with_context(|| format!("graph-processing corpus item {}", item.id))?;
 
@@ -1352,13 +1355,13 @@ pub fn run_longmemeval(
         let mut query = Query {
             query_text: Some(case.question.clone()),
             max_results: k,
-            layers: primary_mode,
+            layers: Some(primary_mode),
             ..Default::default()
         };
         manager.annotate_query_ner(&mut query);
 
         for &mode in &modes {
-            query.layers = mode;
+            query.layers = Some(mode);
             let memories = system.read().recall(&query).unwrap_or_default();
             let topk: HashSet<Uuid> = memories.iter().take(k).map(|m| m.id.0).collect();
 
@@ -1451,18 +1454,16 @@ pub fn run_longmemeval(
     // Proof-of-execution for the edge-direction fix: with the flag off this is
     // always 0; with it on, a non-zero count proves the patched traversal ran
     // and changed targets, independent of whether recall@10 moved.
-    eprintln!(
-        "EDGE_DIR_FLIPS={}",
-        crate::memory::graph_retrieval::edge_dir_flip_count()
-    );
+    // n/a, not 0: veld has no edge_neighbor and no dir_fix branch, so there is
+    // no traversal to flip. A 0 here would read as "the fix ran and changed
+    // nothing", which is a different claim.
+    eprintln!("EDGE_DIR_FLIPS=n/a (no dir_fix traversal in this build)");
 
     // #8 measurement: how many CAUSAL attestations collapsed into an existing
     // edge in the REVERSE direction during ingest. Gates whether a
     // direction-sensitive pair key (+ index migration) is worth building.
-    eprintln!(
-        "DIRECTED_REVERSE_COLLAPSE={}",
-        crate::graph_memory::directed_reverse_collapse_count()
-    );
+    // n/a for the same reason: nothing tracks reverse-direction collapse here.
+    eprintln!("DIRECTED_REVERSE_COLLAPSE=n/a (not tracked in this build)");
 
     let layers: BTreeMap<String, (f64, usize)> = mode_agg
         .into_iter()
@@ -1615,7 +1616,7 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
             let query = Query {
                 query_text: Some(case.query.clone()),
                 max_results: SMOKE_K,
-                layers: LayerMode::Full,
+                layers: Some(LayerMode::Full),
                 ..Default::default()
             };
             let memories = system.read().recall(&query).unwrap_or_default();
@@ -2036,7 +2037,7 @@ pub fn analyze_funnel(inputs: &RunInputs) -> Result<FunnelReport> {
         let query = Query {
             query_text: Some(case.query.clone()),
             max_results: diag_k,
-            layers: crate::memory::types::LayerMode::Full,
+            layers: Some(crate::memory::types::LayerMode::Full),
             ..Default::default()
         };
 
@@ -2297,7 +2298,8 @@ pub fn analyze_graph_reachability(inputs: &RunInputs) -> Result<ReachabilityRepo
             } else {
                 degree_sum as f64 / total_entities as f64
             },
-            hub_saturation_skipped_edges: crate::metrics::HUB_SATURATION_EDGE_SKIP_TOTAL.get(),
+            // None: no hub cap in this build. Some(n) the day one lands.
+            hub_saturation_skipped_edges: None,
             hub_count: degrees
                 .iter()
                 .filter(|d| **d > HUB_REPORT_THRESHOLD)
@@ -2506,7 +2508,7 @@ fn run_learning_arm(
         let query = Query {
             query_text: Some(q.to_string()),
             max_results: TRACK_K,
-            layers: LayerMode::Full,
+            layers: Some(LayerMode::Full),
             ..Default::default()
         };
         match system.read().recall(&query) {
@@ -2781,7 +2783,7 @@ mod tests {
         let query = crate::memory::types::Query {
             query_text: Some("What was the earliest origin behind the Caldor incident?".into()),
             max_results: 10,
-            layers: LayerMode::Full,
+            layers: Some(LayerMode::Full),
             ..Default::default()
         };
         let results = system.read().recall(&query).expect("recall");
@@ -2970,7 +2972,7 @@ mod tests {
             .recall(&crate::memory::types::Query {
                 query_text: Some("Where does Caroline live now?".into()),
                 max_results: 10,
-                layers: LayerMode::Full,
+                layers: Some(LayerMode::Full),
                 ..Default::default()
             })
             .expect("recall");
@@ -3224,7 +3226,7 @@ mod tests {
                 let q = crate::memory::types::Query {
                     query_text: Some(case.query.clone()),
                     max_results: 10,
-                    layers: *mode,
+                    layers: Some(*mode),
                     ..Default::default()
                 };
                 let _ = system.read().recall(&q);
@@ -3244,7 +3246,7 @@ mod tests {
         let query = crate::memory::types::Query {
             query_text: Some("What was the earliest origin behind the Selvic incident?".into()),
             max_results: 10,
-            layers: LayerMode::Full,
+            layers: Some(LayerMode::Full),
             ..Default::default()
         };
         let results = system.read().recall(&query).expect("recall");
@@ -3549,7 +3551,7 @@ mod tests {
             let query = Query {
                 query_text: Some(q.to_string()),
                 max_results: 3,
-                layers: LayerMode::Full,
+                layers: Some(LayerMode::Full),
                 ..Default::default()
             };
             system

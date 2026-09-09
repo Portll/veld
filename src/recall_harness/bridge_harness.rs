@@ -468,7 +468,7 @@ fn pin_env() {
 /// any NER backend — the benchmark isolates bridge TRAVERSAL, not entity
 /// recognition, which is measured elsewhere.
 fn measure_present_curve(
-    system: &parking_lot::RwLock<crate::memory::MemorySystem>,
+    system: &parking_lot::RwLock<crate::user_memory::UserMemory>,
     cases: &[BridgeCase],
     id_map: &std::collections::HashMap<String, Uuid>,
     cutoffs: &[usize],
@@ -488,7 +488,7 @@ fn measure_present_curve(
             query_text: Some(case.query.clone()),
             ner_entities: Some(case.anchor_names.clone()),
             max_results: query_k,
-            layers: LayerMode::Full,
+            layers: Some(LayerMode::Full),
             ..Default::default()
         };
         let memories = system.read().recall(&query).unwrap_or_default();
@@ -509,7 +509,7 @@ fn measure_present_curve(
 /// Mean bridge-crossing recall@`k` — a case scores 1.0 iff its gold cluster-B
 /// memory is in the top-`k`, else 0.0. Thin wrapper over [`measure_present_curve`].
 fn measure_bridge_recall(
-    system: &parking_lot::RwLock<crate::memory::MemorySystem>,
+    system: &parking_lot::RwLock<crate::user_memory::UserMemory>,
     cases: &[BridgeCase],
     id_map: &std::collections::HashMap<String, Uuid>,
     k: usize,
@@ -520,7 +520,7 @@ fn measure_bridge_recall(
 /// Delete the memories named by `corpus_ids` from the live system (all tiers +
 /// graph episode + BM25 + vector index), skipping ids absent from `id_map`.
 fn delete_nodes(
-    system: &parking_lot::RwLock<crate::memory::MemorySystem>,
+    system: &parking_lot::RwLock<crate::user_memory::UserMemory>,
     id_map: &std::collections::HashMap<String, Uuid>,
     corpus_ids: &[String],
 ) -> Result<()> {
