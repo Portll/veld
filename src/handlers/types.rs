@@ -161,6 +161,11 @@ pub struct RecallRequest {
     /// (point-in-time query) instead of the default "currently valid" filter.
     #[serde(default)]
     pub as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter by tags (any match). Ported from shodh-memory `5aa1d5d`: the field was absent
+    /// here, so serde dropped it and a tagged recall returned untagged records while looking
+    /// filtered. MemoryQuery already enforced the filter; only the wiring was missing.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 pub fn default_recall_limit() -> usize {
@@ -1051,6 +1056,26 @@ mod tests {
             req.competition_mode,
             Some(crate::memory::CompetitionMode::ResolveStrongest)
         );
+    }
+
+    /// The field used to be absent, so serde dropped it and a tagged recall returned untagged
+    /// records while looking filtered. Ported from shodh-memory 5aa1d5d.
+    #[test]
+    fn test_recall_request_carries_tags_and_defaults_to_none() {
+        let json = json!({
+            "user_id": "test-user",
+            "query": "search query",
+            "tags": ["scope:commitwork-sweep", "memory-layer-project:commitwork"]
+        });
+        let req: RecallRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            req.tags.as_deref(),
+            Some(&["scope:commitwork-sweep".to_string(), "memory-layer-project:commitwork".to_string()][..])
+        );
+
+        let bare: RecallRequest =
+            serde_json::from_value(json!({ "user_id": "u", "query": "q" })).unwrap();
+        assert!(bare.tags.is_none());
     }
 
     #[test]

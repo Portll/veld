@@ -444,6 +444,7 @@ pub async fn recall(
     let memory_for_recall = memory.clone();
     let user_id_for_recall = req.user_id.clone();
     let query_for_recall = req.query.clone();
+    let tags_for_recall = req.tags.clone();
 
     let (memories, triggered_reminders, _prospective_signals, query_embedding_opt) =
         tokio::task::spawn_blocking(move || {
@@ -522,6 +523,7 @@ pub async fn recall(
                 competition_mode: req.competition_mode,
                 rrf_k: rrf_k_for_recall,
                 as_of: req.as_of,
+                tags: tags_for_recall,
                 ..Default::default()
             };
 
@@ -716,7 +718,8 @@ pub async fn recall(
             unique_facts.entry(fact.id.clone()).or_insert(fact);
         }
         let mut sorted_facts: Vec<RecallFact> = unique_facts.into_values().collect();
-        sorted_facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        // Total order: a truncating sort on a float alone is repeat-unstable (shodh-memory 6272430).
+        sorted_facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
         sorted_facts.truncate(5);
         sorted_facts
     };
@@ -1706,8 +1709,8 @@ pub async fn proactive_context(
                 })
                 .collect();
 
-            // Sort by boosted score (highest first)
-            enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+            // Sort by boosted score (highest first), id as the tie-break so the order is repeatable
+            enriched.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
 
             // Drop results below minimum absolute score — don't pad with irrelevant filler
             // Also drop results that are < 30% of the top score (too weak relative to best)
@@ -2201,7 +2204,8 @@ pub async fn proactive_context(
                     _ => b
                         .similarity_score
                         .unwrap_or(0.0)
-                        .total_cmp(&a.similarity_score.unwrap_or(0.0)),
+                        .total_cmp(&a.similarity_score.unwrap_or(0.0))
+                        .then_with(|| a.id.cmp(&b.id)),
                 }
             });
             todos_with_scores
@@ -2252,7 +2256,7 @@ pub async fn proactive_context(
                 }
                 // Deduplicate by text similarity: if two facts share >80% words, keep higher confidence
                 let mut sorted: Vec<ProactiveFact> = found.into_values().collect();
-                sorted.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+                sorted.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
                 let mut deduped: Vec<ProactiveFact> = Vec::new();
                 for fact in sorted {
                     let fact_words: std::collections::HashSet<&str> =
