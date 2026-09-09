@@ -5,25 +5,29 @@
 //! report/baseline-comparison format.
 //!
 //! Imported from shodh-memory upstream, which runs it as a held-out LoCoMo
-//! gate. Four modules are live. The remaining eight are on disk unmodified and
-//! need, measured against this tree:
+//! gate. Three modules are live. The remaining eight are on disk unmodified.
 //!
-//! - `runner` — five instrumentation call sites backed by two capture modules
-//!   veld lacks: `memory::gold_funnel` (begin/take) and
-//!   `memory::fusion_features` (begin/take + a jsonl dump). Diagnostic capture,
-//!   not ranking, so porting them does not move retrieval behaviour.
-//! - `bridge_harness`, `forgetting_harness`, `lineage_harness`, `multihop`,
-//!   `ontology_harness`, `temporal_harness` — only `runner`'s helpers
-//!   (`build_manager`, `ingest_corpus`, `run_smoke_suite_with_ranks`,
-//!   `RunInputs`, `EVAL_USER`, `HARNESS_CLOCK_ANCHOR`), so they unblock with it.
+//! The capture layer they need is now HERE: `memory::gold_funnel` and
+//! `memory::fusion_features` landed in `803033d`, with four
+//! `gold_funnel::record` stages wired into `memory/recall.rs` (graph, vector,
+//! fusion, final). What still blocks the eight, measured against this tree:
+//!
+//! - Five APIs upstream has and veld does not. Three are ported as of this
+//!   commit (`relation_type_distribution`, `synthetic_for_sim`,
+//!   `annotate_query_ner`); two go deeper than their line counts suggested —
+//!   `simulate_edge_aging` needs `GraphMemory::apply_decay_at` and
+//!   `force_vector_quality_rebuild` needs `RetrievalEngine::force_quality_rebuild`,
+//!   neither of which exists here.
+//! - Three counters that instrument a directed-edge fix veld does not have:
+//!   no `edge_neighbor`, no `dir_fix` branch. Adding the accessors would make
+//!   them return a permanent zero, and `EDGE_DIR_FLIPS=0` reads as "the fix
+//!   ran and flipped nothing" rather than "there is no such fix here".
+//!   See `docs/HANDOFF-2026-09-07.md` §A1 — a decision, not a task.
 //! - `bridge_harness` also needs five `UserMemory` -> `MemorySystem`
 //!   unwrappings, veld's wrapper being absent upstream.
-//! - `decay_sim` — `RelationshipEdge::synthetic_for_sim`, an upstream test
-//!   constructor.
 //!
-//! They stay undeclared rather than half-adapted because `runner` cannot be
-//! executed here without embedder models and a real corpus ingest, and an
-//! installed harness nobody has run is the failure this import exists to end.
+//! They stay undeclared rather than half-adapted, because an installed harness
+//! nobody has run is the failure this import exists to end.
 
 pub mod fixtures;
 pub mod metrics;
