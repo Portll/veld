@@ -138,18 +138,27 @@ impl CompressionPipeline {
         Ok(compressed_memory)
     }
 
-    /// Semantic compression - extract essence
+    /// Semantic compression - attach an additive summary WITHOUT discarding content.
+    ///
+    /// Ported from shodh-memory `0cefb8c` (#391). The full `experience.content` is preserved
+    /// byte-for-byte; the extractive summary and keywords are stored as ADDITIONAL metadata
+    /// (`summary`, `keywords`) as a retrieval-layer view, never as a replacement for the body.
+    /// Semantic compression is therefore lossless; byte savings come only from the LZ4 layer.
+    ///
+    /// The `summary` metadata key doubles as the on-disk marker that separates new-format
+    /// (content-preserving) records from legacy records whose bodies were destroyed.
     fn compress_semantic(&self, memory: &Memory) -> Result<Memory> {
         let mut compressed_memory = memory.clone();
 
-        // Extract keywords
+        // Keywords and an extractive summary, both as retrieval-layer views.
         let keywords = self.keyword_extractor.extract(&memory.experience.content);
-
-        // Create summary (simplified - in production would use LLM)
         let summary = self.create_summary(&memory.experience.content, 50);
 
-        // Store only summary and keywords
-        compressed_memory.experience.content = summary;
+        // Full content stays intact — the summary is additive, not a replacement.
+        compressed_memory
+            .experience
+            .metadata
+            .insert("summary".to_string(), summary);
         compressed_memory
             .experience
             .metadata
@@ -163,19 +172,22 @@ impl CompressionPipeline {
         Ok(compressed_memory)
     }
 
-    /// Hybrid compression - combine strategies
+    /// Hybrid compression - additive semantic summary + lossless LZ4 of the FULL body.
+    ///
+    /// The semantic step attaches summary/keywords with the body intact, then LZ4 compresses
+    /// the full experience, so the original is fully recoverable through `decompress`.
     fn compress_hybrid(&self, memory: &Memory) -> Result<Memory> {
-        // First apply semantic compression
+        // First attach the additive semantic view (content preserved).
         let semantic = self.compress_semantic(memory)?;
 
-        // Then apply LZ4 on the result
+        // Then LZ4-compress the full experience.
         let mut hybrid = self.compress_lz4(&semantic)?;
 
-        // Re-tag. compress_lz4 writes "lz4" unconditionally, which left every hybrid record —
-        // whose original was ALREADY destroyed by the semantic pass — advertising the lossless
-        // strategy. The consequences were not cosmetic: is_lossless() returned true, decompress()
-        // took the "lz4" branch and returned the 50-word summary AS the restored original, and the
-        // honest "hybrid" error below could never fire. The label has to survive the last writer.
+        // Re-tag. compress_lz4 writes "lz4" unconditionally; before the semantic pass became
+        // additive that left every hybrid record — whose original was ALREADY destroyed —
+        // advertising the lossless strategy, so is_lossless() said true and decompress() handed
+        // back the 50-word summary AS the original. The label has to survive the last writer,
+        // and it is also what lets is_legacy_lossy() recognise those records today.
         hybrid
             .experience
             .metadata
@@ -184,18 +196,30 @@ impl CompressionPipeline {
         Ok(hybrid)
     }
 
-    /// Decompress a memory
+    /// Decompress a memory, restoring its full original content.
     ///
-    /// # Returns
-    /// - `Ok(Memory)` - Decompressed memory with original content restored
-    /// - `Err` - If decompression fails or compression is lossy (semantic)
+    /// Everything the current pipeline produces is lossless:
+    /// - `"lz4"` / `"hybrid"` restore the full experience from the LZ4 blob.
+    /// - `"semantic"` records already hold the full body in `experience.content` (the summary
+    ///   is additive metadata), so the restore is in place.
     ///
     /// # Errors
-    /// - Returns error for semantic compression (lossy - original data not recoverable)
-    /// - Returns error if compressed data is missing or corrupted
+    /// - The LZ4 blob is missing or corrupt, or the strategy is unknown.
+    /// - The record is a legacy one whose body was destroyed at storage time (see
+    ///   [`Self::is_legacy_lossy`]); that fails honestly instead of returning a summary as the
+    ///   original.
     pub fn decompress(&self, memory: &Memory) -> Result<Memory> {
         if !memory.compressed {
             return Ok(memory.clone());
+        }
+
+        if Self::is_legacy_lossy(memory) {
+            return Err(anyhow!(
+                "Memory '{}' was written by the pre-fix lossy compressor: its full content was \
+                 replaced by a summary at storage time and is not recoverable. Only the \
+                 surviving summary and keywords remain in place.",
+                memory.id.0
+            ));
         }
 
         let strategy = memory
@@ -206,44 +230,50 @@ impl CompressionPipeline {
             .unwrap_or("unknown");
 
         match strategy {
-            "lz4" => self.decompress_lz4(memory),
+            // Both LZ4 and hybrid store the full experience in the LZ4 blob.
+            "lz4" | "hybrid" => self.decompress_lz4(memory),
             "semantic" => {
-                // Semantic compression is LOSSY - original content is NOT recoverable
-                // This is intentional: we extracted keywords and summary, discarded original
-                // Callers must handle this error appropriately
-                Err(anyhow!(
-                    "Cannot decompress semantically compressed memory '{}': \
-                     semantic compression is lossy. Original content was replaced with \
-                     summary and keywords. Use memory.experience.content for the summary \
-                     and metadata['keywords'] for extracted keywords.",
-                    memory.id.0
-                ))
-            }
-            "hybrid" => {
-                // Hybrid = semantic + lz4. The lz4 layer can be decompressed,
-                // but the underlying content is still the semantic summary
-                let lz4_decompressed = self.decompress_lz4(memory)?;
-                // Mark that this is still semantically compressed (lossy)
-                Err(anyhow!(
-                    "Cannot fully decompress hybrid-compressed memory '{}': \
-                     underlying semantic compression is lossy. LZ4 layer decompressed, \
-                     but original content is not recoverable.",
-                    lz4_decompressed.id.0
-                ))
+                // New-format semantic records preserve the full body — restore in place.
+                let mut restored = memory.clone();
+                restored.compressed = false;
+                restored.experience.metadata.remove("compression_strategy");
+                Ok(restored)
             }
             unknown => Err(anyhow!(
-                "Unknown compression strategy '{}' for memory '{}'. \
-                 Cannot decompress.",
+                "Unknown compression strategy '{}' for memory '{}'. Cannot decompress.",
                 unknown,
                 memory.id.0
             )),
         }
     }
 
-    /// Check if a memory's compression is lossless (can be fully decompressed)
+    /// Detect legacy records whose content was destructively replaced.
+    ///
+    /// The pre-fix semantic pass overwrote `experience.content` with a summary ending in `...`,
+    /// wrote `keywords`, and never wrote a `summary` key. The new-format pass always writes
+    /// `summary` alongside `keywords` and keeps the body. So a compressed record that carries
+    /// `keywords` but no `summary`, with a `...`-terminated body, is an unrecoverable legacy
+    /// record — whatever strategy label it carries. In veld those records are labelled `lz4`
+    /// (the fallthrough-hybrid bug fixed in `edfb43f` re-tagged its LAST writer) as well as
+    /// `hybrid` and `semantic`, so the label alone cannot identify them; the key set can.
+    fn is_legacy_lossy(memory: &Memory) -> bool {
+        let meta = &memory.experience.metadata;
+        memory.compressed
+            && meta.contains_key("keywords")
+            && !meta.contains_key("summary")
+            && memory.experience.content.trim_end().ends_with("...")
+    }
+
+    /// Check if a memory's compression is lossless (can be fully restored).
+    ///
+    /// Everything the current pipeline produces is lossless; the only lossy case that can
+    /// still exist on disk is a legacy record (see [`Self::is_legacy_lossy`]).
     pub fn is_lossless(&self, memory: &Memory) -> bool {
         if !memory.compressed {
             return true;
+        }
+        if Self::is_legacy_lossy(memory) {
+            return false;
         }
         let strategy = memory
             .experience
@@ -251,7 +281,7 @@ impl CompressionPipeline {
             .get("compression_strategy")
             .map(|s| s.as_str())
             .unwrap_or("unknown");
-        strategy == "lz4"
+        matches!(strategy, "lz4" | "hybrid" | "semantic")
     }
 
     /// Get the compression strategy used for a memory
@@ -1607,27 +1637,35 @@ mod tests {
         assert!(result.compressed);
     }
 
+    /// Build a deterministic multi-word body of the requested length.
+    fn make_body(words: usize) -> String {
+        (0..words)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Ported from shodh-memory `0cefb8c`: the semantic pass is additive. The body survives
+    /// byte-for-byte and the summary rides alongside as metadata.
     #[test]
-    fn test_semantic_compression_lossy() {
+    fn semantic_compression_preserves_full_content() {
         let pipeline = CompressionPipeline::new();
-        let mut memory = create_test_memory(
-            "This is a long test memory with many words for semantic compression testing purposes",
-            0.1,
-        );
-        memory.created_at = chrono::Utc::now() - chrono::Duration::days(100);
+        let body = make_body(300);
+        let memory = create_test_memory(&body, 0.1);
 
         let compressed = pipeline.compress_semantic(&memory).unwrap();
         assert!(compressed.compressed);
+        assert_eq!(compressed.experience.content, body);
+        assert!(compressed.experience.metadata.contains_key("summary"));
         assert!(compressed.experience.metadata.contains_key("keywords"));
 
-        let result = pipeline.decompress(&compressed);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("lossy"));
+        let restored = pipeline.decompress(&compressed).unwrap();
+        assert!(!restored.compressed);
+        assert_eq!(restored.experience.content, body);
     }
 
-    /// A hybrid record is LOSSY — compress_semantic destroys the original before lz4 ever runs.
-    /// It used to be tagged "lz4" because compress_lz4 writes that tag last, so it advertised the
-    /// lossless strategy while its content was already gone.
+    /// The hybrid label still has to survive the last writer (compress_lz4 writes "lz4"), and a
+    /// hybrid record is now lossless because the semantic pass no longer destroys the body.
     #[test]
     fn test_hybrid_is_labelled_hybrid_not_lz4() {
         let pipeline = CompressionPipeline::new();
@@ -1638,27 +1676,72 @@ mod tests {
 
         let hybrid = pipeline.compress_hybrid(&memory).unwrap();
         assert_eq!(pipeline.get_strategy(&hybrid), Some("hybrid"));
-        assert!(
-            !pipeline.is_lossless(&hybrid),
-            "a hybrid record is lossy; reporting it lossless is how a destroyed document passes for an intact one"
-        );
+        assert!(pipeline.is_lossless(&hybrid));
     }
 
-    /// The "hybrid" arm of decompress() was unreachable while the tag said "lz4": decompress took
-    /// the lz4 branch, succeeded, and handed back the 50-word summary as the restored original.
+    /// Decompressing a hybrid record returns every byte of the original, not the summary.
     #[test]
-    fn test_hybrid_decompress_refuses_instead_of_returning_the_summary() {
+    fn hybrid_compression_round_trips_full_content() {
         let pipeline = CompressionPipeline::new();
-        let original = "The quick brown fox jumps over the lazy dog and then keeps running \
-                        for a great many more words so the summary cannot possibly cover it";
-        let memory = create_test_memory(original, 0.3);
+        let body = make_body(300);
+        let memory = create_test_memory(&body, 0.6);
 
         let hybrid = pipeline.compress_hybrid(&memory).unwrap();
-        let result = pipeline.decompress(&hybrid);
+        let restored = pipeline.decompress(&hybrid).unwrap();
+        assert!(!restored.compressed);
+        assert_eq!(restored.experience.content, body);
+    }
 
-        assert!(result.is_err(), "a lossy record must not decompress to a confident wrong answer");
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not recoverable"), "got: {msg}");
+    /// The exact entrypoint tier promotion invokes is compress(); drive it end to end for the
+    /// two strategies that used to truncate (persistence waived so the lossy branches are reachable).
+    #[test]
+    fn promotion_to_longterm_never_truncates() {
+        let pipeline = CompressionPipeline::new();
+        let body = make_body(300);
+
+        let mut low = create_test_memory(&body, 0.1);
+        low.persistent = false;
+        low.created_at = chrono::Utc::now() - chrono::Duration::days(100);
+        let c_low = pipeline.compress(&low).unwrap();
+        assert_eq!(pipeline.get_strategy(&c_low), Some("semantic"));
+        assert_eq!(c_low.experience.content, body);
+        assert_eq!(pipeline.decompress(&c_low).unwrap().experience.content, body);
+    }
+
+    /// A record the pre-fix compressor wrote: body replaced by a `...` summary, `keywords` present,
+    /// no `summary` key. In veld those carry the "lz4" label (the last-writer bug), so the
+    /// detector must key on the metadata shape, not the label — and must refuse to decompress
+    /// them into a confident wrong answer.
+    #[test]
+    fn legacy_lossy_record_is_detected_under_any_label_and_refuses_to_decompress() {
+        let pipeline = CompressionPipeline::new();
+        for label in ["lz4", "hybrid", "semantic"] {
+            let mut legacy = create_test_memory("first fifty words of a document that is gone...", 0.3);
+            legacy.compressed = true;
+            let meta = &mut legacy.experience.metadata;
+            meta.insert("keywords".to_string(), "document,gone".to_string());
+            meta.insert("compression_strategy".to_string(), label.to_string());
+            if label != "semantic" {
+                // A blob is present on the old lz4/hybrid records; it holds the summary experience.
+                let blob = pipeline.compress_lz4(&create_test_memory("first fifty words of a document that is gone...", 0.3)).unwrap();
+                let data = blob.experience.metadata.get("compressed_data").unwrap().clone();
+                legacy.experience.metadata.insert("compressed_data".to_string(), data);
+            }
+
+            assert!(!pipeline.is_lossless(&legacy), "label {label}: a destroyed body is not lossless");
+            let err = pipeline.decompress(&legacy).unwrap_err().to_string();
+            assert!(err.contains("not recoverable"), "label {label}: got {err}");
+        }
+    }
+
+    /// The detector must not fire on an intact record whose content merely ends with "...".
+    #[test]
+    fn intact_lz4_record_ending_in_ellipsis_is_not_legacy() {
+        let pipeline = CompressionPipeline::new();
+        let memory = create_test_memory("To be continued...", 0.9);
+        let compressed = pipeline.compress_lz4(&memory).unwrap();
+        assert!(pipeline.is_lossless(&compressed));
+        assert_eq!(pipeline.decompress(&compressed).unwrap().experience.content, "To be continued...");
     }
 
     /// The fallthrough default decided the fate of every ordinary memory. Hybrid meant lossy.
@@ -1754,8 +1837,9 @@ mod tests {
         let compressed_lz4 = pipeline.compress_lz4(&memory).unwrap();
         assert!(pipeline.is_lossless(&compressed_lz4));
 
+        // Semantic compression keeps the body; the summary is additive.
         let compressed_semantic = pipeline.compress_semantic(&memory).unwrap();
-        assert!(!pipeline.is_lossless(&compressed_semantic));
+        assert!(pipeline.is_lossless(&compressed_semantic));
     }
 
     #[test]
