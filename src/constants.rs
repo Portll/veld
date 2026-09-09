@@ -1440,6 +1440,54 @@ pub const ACTIVATION_HISTORY_L2_CAPACITY: usize = 30;
 /// - Memory: 200 × 8 bytes = 1600 bytes per L3 edge
 pub const ACTIVATION_HISTORY_L3_CAPACITY: usize = 200;
 
+/// Activation history capacity for L1 (Working) tier edges
+///
+/// L1 edges previously stored no history at all, on the reasoning that they are
+/// too transient to need it. That reasoning was circular: history is what an
+/// adaptive decay rate is measured FROM, so withholding it guaranteed L1 could
+/// only ever run at the hardcoded global rate, whatever the subject's real
+/// rhythm. A short buffer is enough — the adaptive rate needs an interval, not
+/// a full lifecycle.
+///
+/// Memory: 8 × 8 bytes = 64 bytes per L1 edge.
+pub const ACTIVATION_HISTORY_L1_CAPACITY: usize = 8;
+
+// =============================================================================
+// ADAPTIVE DECAY (per-edge rate learned from observed access intervals)
+// =============================================================================
+// A single global decay rate assumes every association is revisited on the same
+// cadence. Measured revisit intervals on a real corpus span three orders of
+// magnitude — sub-hour for an area under active work, ~70 days for reference
+// material — so one rate is necessarily wrong for most edges. These constants
+// let an edge derive its own rate from how often it is ACTUALLY re-activated,
+// falling back to the tier default until it has enough evidence.
+
+/// Minimum activation timestamps before an edge may use an adaptive rate
+///
+/// Three timestamps yield two intervals — enough to distinguish a rhythm from a
+/// single coincidence. Below this the tier default applies.
+pub const ADAPTIVE_DECAY_MIN_SAMPLES: usize = 3;
+
+/// How many observed intervals an edge should survive unrefreshed
+///
+/// The rate is set so the edge reaches its prune threshold at
+/// `2 × typical interval`. One multiple would prune an edge exactly as its next
+/// use arrives; two leaves a margin for an interval that runs long without
+/// making the edge effectively permanent.
+pub const ADAPTIVE_DECAY_SURVIVAL_MULTIPLE: f64 = 2.0;
+
+/// Lower bound on the adaptive rate, as a fraction of the tier default
+///
+/// Caps how immortal a rarely-but-regularly used edge can become. An edge
+/// revisited every 70 days still decays at no less than 1/8 the tier rate.
+pub const ADAPTIVE_DECAY_MIN_FACTOR: f64 = 0.125;
+
+/// Upper bound on the adaptive rate, as a multiple of the tier default
+///
+/// Caps how fast a rapidly-churned edge decays, so a burst of activity in one
+/// minute cannot set a rate that prunes the edge before the next hour.
+pub const ADAPTIVE_DECAY_MAX_FACTOR: f64 = 4.0;
+
 // =============================================================================
 // UNIFIED LTP READINESS MODEL (PIPE-5)
 // Based on neuroscience: multiple paths to LTP (E-LTP intensity, L-LTP repetition)
@@ -2334,14 +2382,21 @@ pub const L1_INITIAL_WEIGHT: f32 = 0.4;
 
 /// Decay rate per hour for unused L1 edges
 ///
-/// Calibrated so edges reach L1_PRUNE_THRESHOLD (0.1) at 48 hours:
-/// 0.4 × e^(-0.029 × 48) ≈ 0.1
-pub const L1_DECAY_PER_HOUR: f32 = 0.029;
+/// Calibrated so edges reach L1_PRUNE_THRESHOLD (0.1) at 240 hours (10 days):
+/// 0.4 × e^(-0.00578 × 240) ≈ 0.1
+///
+/// The former 48-hour calibration was measured against a real corpus and found
+/// to prune roughly a third of associations before their next use: over 4,448
+/// revisit intervals, only 65.9% of returns to a subject happened within 48h,
+/// against 90% within 10 days. An edge that dies before its second activation
+/// can never promote, so the short window suppressed the very co-activation
+/// evidence promotion depends on.
+pub const L1_DECAY_PER_HOUR: f32 = 0.00578;
 
 /// Maximum age in hours before L1 edge must promote or die
 ///
-/// 48-hour window gives edges time to accumulate co-activations before pruning.
-pub const L1_MAX_AGE_HOURS: u32 = 48;
+/// 240 hours ≈ the p90 revisit interval. See L1_DECAY_PER_HOUR.
+pub const L1_MAX_AGE_HOURS: u32 = 240;
 
 /// Minimum weight threshold for L1 edges
 ///
@@ -2368,14 +2423,18 @@ pub const L2_PROMOTION_WEIGHT: f32 = 0.5;
 
 /// Decay rate per day for unused L2 edges
 ///
-/// Calibrated so edges reach L2_PRUNE_THRESHOLD (0.2) at 30 days:
-/// 0.5 × e^(-0.031 × 30) ≈ 0.2
-pub const L2_DECAY_PER_DAY: f32 = 0.031;
+/// Calibrated so edges reach L2_PRUNE_THRESHOLD (0.2) at 90 days:
+/// 0.5 × e^(-0.0102 × 90) ≈ 0.2
+///
+/// 90 days sits beyond the longest revisit interval observed in the reference
+/// corpus (45.6 days), so an episodic association outlives the gap rather than
+/// the gap outliving it.
+pub const L2_DECAY_PER_DAY: f32 = 0.0102;
 
 /// Maximum age in days before L2 edge must promote or die
 ///
-/// 30-day window gives episodic associations a full month to consolidate to L3.
-pub const L2_MAX_AGE_DAYS: u32 = 30;
+/// 90-day window — see L2_DECAY_PER_DAY.
+pub const L2_MAX_AGE_DAYS: u32 = 90;
 
 /// Minimum weight threshold for L2 edges
 ///
