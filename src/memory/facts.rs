@@ -339,8 +339,8 @@ impl SemanticFactStore {
             }
         }
 
-        // Sort by confidence (highest first)
-        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        // Sort by confidence (highest first); id breaks ties so the order is repeatable
+        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
 
         Ok(facts)
     }
@@ -494,7 +494,7 @@ impl SemanticFactStore {
             }
         }
 
-        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        facts.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.id.cmp(&b.id)));
         Ok(facts)
     }
 
