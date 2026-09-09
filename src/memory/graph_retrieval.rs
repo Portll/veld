@@ -1140,8 +1140,13 @@ pub fn spreading_activation_retrieve_with_stats(
             .observe(stats.linguistic_variance_pct as f64);
     }
 
-    // Step 6: Sort by final score (descending)
-    scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+    // Step 6: Sort by final score (descending), memory id as the tie-break: the truncate below
+    // makes any tie a coin toss over WHICH memories are returned (shodh-memory 6272430).
+    scored_memories.sort_by(|a, b| {
+        b.final_score
+            .total_cmp(&a.final_score)
+            .then_with(|| a.memory.id.cmp(&b.memory.id))
+    });
 
     // Step 7: Apply limit
     scored_memories.truncate(query.max_results);
