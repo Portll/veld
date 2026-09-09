@@ -1707,6 +1707,13 @@ impl MultiUserMemoryManager {
     }
 
     /// Get keyword extractor for statistical term extraction
+    /// Fill `query.ner_entities` from the neural NER, so a harness can hold
+    /// entity extraction constant while varying the retrieval stages under
+    /// test. Delegates to [`annotate_query_ner_with`].
+    pub fn annotate_query_ner(&self, query: &mut crate::memory::types::Query) {
+        annotate_query_ner_with(&self.neural_ner, query)
+    }
+
     pub fn get_keyword_extractor(&self) -> Arc<KeywordExtractor> {
         self.keyword_extractor.clone()
     }
@@ -4052,5 +4059,36 @@ mod shared_store_bootstrap_tests {
         // a restart would reload, so the two agree by construction.
         let stats = graph.get_stats().expect("stats");
         assert_eq!(stats.entity_count, 1);
+    }
+}
+
+/// Annotate a query with NER-extracted entity names.
+///
+/// Off with `VELD_QUERY_NER=0`. Entities below 0.5 confidence or shorter than
+/// two characters are dropped, and at most eight are kept — the same filter
+/// upstream applies, so a harness run is comparable across both projects.
+pub fn annotate_query_ner_with(ner: &NeuralNer, query: &mut crate::memory::types::Query) {
+    let enabled = std::env::var("VELD_QUERY_NER")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    let Some(text) = query.query_text.as_deref() else {
+        return;
+    };
+    match ner.extract(text) {
+        Ok(entities) => {
+            let names: Vec<String> = entities
+                .into_iter()
+                .filter(|e| e.confidence >= 0.5 && e.text.trim().len() >= 2)
+                .map(|e| e.text)
+                .take(8)
+                .collect();
+            if !names.is_empty() {
+                query.ner_entities = Some(names);
+            }
+        }
+        Err(e) => tracing::debug!("query NER annotation failed: {e}"),
     }
 }
