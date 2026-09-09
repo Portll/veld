@@ -558,7 +558,14 @@ fn relation_type_to_string(r: &crate::graph_memory::RelationType) -> String {
         RelationType::AlternativeTo => "alternative_to",
         RelationType::AssignedTo => "assigned_to",
         RelationType::Approves => "approves",
-        RelationType::Custom(s) => return s.to_lowercase(),
+        // Verbatim, NOT lowercased. Import maps any unrecognised name straight
+        // back to Custom(name), so lowercasing here silently renamed the
+        // relation across a round trip: Custom("Subsumes") returned as
+        // Custom("subsumes"), and edge matching compares RelationType exactly.
+        // A backup/restore therefore changed a relation's identity with no
+        // error, and every query filtering on the original spelling stopped
+        // matching. Case is part of the name because the name is user-supplied.
+        RelationType::Custom(s) => return s.clone(),
     }
     .to_string()
 }
@@ -584,4 +591,44 @@ fn todo_priority_to_string(p: &TodoPriority) -> String {
         TodoPriority::None => "none",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relation_type_to_string;
+    use crate::graph_memory::RelationType;
+    use crate::mif::import::parse_relation_type;
+
+    /// Regression: export lowercased Custom relation names while import maps any
+    /// unrecognised name back to Custom verbatim, so a backup/restore renamed the
+    /// relation — Custom("Subsumes") returned as Custom("subsumes"). Edge matching
+    /// compares RelationType exactly, so every query on the original spelling
+    /// silently stopped matching, with no error at any point.
+    #[test]
+    fn custom_relation_survives_round_trip_with_case_intact() {
+        for name in ["Subsumes", "EntailedBy", "SpecialisationOf", "STPA_Triple"] {
+            let original = RelationType::Custom(name.to_string());
+            let wire = relation_type_to_string(&original);
+            assert_eq!(wire, name, "export must not rewrite a user-supplied name");
+
+            let restored = parse_relation_type(&wire);
+            assert_eq!(
+                restored,
+                original,
+                "round trip changed the relation's identity for {name}"
+            );
+        }
+    }
+
+    /// Built-in relations keep their existing canonical lowercase wire form —
+    /// the fix above must not widen into a format change.
+    #[test]
+    fn builtin_relations_keep_canonical_wire_form() {
+        assert_eq!(relation_type_to_string(&RelationType::PartOf), "part_of");
+        assert_eq!(
+            relation_type_to_string(&RelationType::SupersededBy),
+            "superseded_by"
+        );
+        assert_eq!(parse_relation_type("part_of"), RelationType::PartOf);
+    }
 }
