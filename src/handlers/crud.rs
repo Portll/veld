@@ -36,6 +36,25 @@ pub struct MemoryWithHierarchy {
     pub children_ids: Vec<String>,
     /// Number of children
     pub children_count: usize,
+    /// True when `experience.content` is the complete stored text. False when the record is
+    /// compressed and `?decompress=1` was not asked for, or when the record is a legacy one whose
+    /// body was replaced at storage time and cannot be restored; `content_note` says which.
+    /// Measured 2026-09-02: `?full=true` and `?decompress=true` were silently ignored and a
+    /// 410-byte preview came back as if it were a 19,396-byte document.
+    pub full_content: bool,
+    /// Whether the full content is recoverable at all (false only for legacy lossy records).
+    pub lossless: bool,
+    /// Why `full_content` is false, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_note: Option<String>,
+}
+
+/// `?decompress=1|true` (alias `?full=`) asks GET /api/memory/{id} for the restored content.
+fn wants_full_content(params: &HashMap<String, String>) -> bool {
+    ["decompress", "full"]
+        .iter()
+        .filter_map(|k| params.get(*k))
+        .any(|v| matches!(v.as_str(), "1" | "true"))
 }
 
 // =============================================================================
@@ -264,6 +283,34 @@ pub async fn get_memory(
     let memory_obj = (*shared_memory).clone();
     let resolved_id = shared_memory.id.clone();
 
+    // The response says what its content IS. A compressed record is returned as stored unless
+    // the caller asks for the restored body; a legacy lossy record is never passed off as full.
+    let lossless = memory_guard.memory_is_lossless(&memory_obj);
+    let (memory_obj, full_content, content_note) = if !memory_obj.compressed {
+        (memory_obj, true, None)
+    } else if !lossless {
+        (
+            memory_obj,
+            false,
+            Some(
+                "written by the pre-fix lossy compressor: the body was replaced by a summary at \
+                 storage time and cannot be restored"
+                    .to_string(),
+            ),
+        )
+    } else if wants_full_content(&params) {
+        match memory_guard.decompress_memory(&memory_obj) {
+            Ok(restored) => (restored, true, None),
+            Err(e) => (memory_obj, false, Some(format!("decompression failed: {e}"))),
+        }
+    } else {
+        (
+            memory_obj,
+            false,
+            Some("compressed; pass ?decompress=1 for the restored content".to_string()),
+        )
+    };
+
     // Fetch children for hierarchy context
     let children = memory_guard
         .get_memory_children(&resolved_id)
@@ -276,6 +323,9 @@ pub async fn get_memory(
         memory: memory_obj,
         children_ids,
         children_count,
+        full_content,
+        lossless,
+        content_note,
     }))
 }
 
@@ -1610,5 +1660,35 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(p3["memories"].as_array().unwrap().len(), 0);
         assert_eq!(p3["total"], 5u64);
+    }
+
+    /// GET /api/memory/{id} says what its content is. An uncompressed record is full and
+    /// lossless whether or not ?decompress is passed, and carries no note; the flag is parsed
+    /// under both spellings.
+    #[tokio::test]
+    async fn get_memory_reports_full_content_and_honours_the_decompress_flag() {
+        let harness = TestHarness::new();
+        let user_id = "get-full-user";
+        let content = "z".repeat(1200);
+        let id = {
+            let memory = harness.manager.get_user_memory(user_id).unwrap();
+            let guard = memory.read();
+            guard
+                .remember(Experience { content: content.clone(), ..Default::default() }, None)
+                .unwrap()
+        };
+
+        for suffix in ["", "&decompress=1", "&full=true"] {
+            let req = test_helpers::get(&format!("/api/memory/{}?user_id={user_id}{suffix}", id.0));
+            let (status, body) = test_helpers::send(harness.router(), req).await;
+            assert_eq!(status, StatusCode::OK, "{suffix}");
+            assert_eq!(body["full_content"], true, "{suffix}");
+            assert_eq!(body["lossless"], true, "{suffix}");
+            assert!(body.get("content_note").is_none(), "{suffix}: {:?}", body["content_note"]);
+            assert_eq!(body["experience"]["content"], content, "{suffix}: the whole body, not a preview");
+        }
+
+        assert!(super::wants_full_content(&[("decompress".to_string(), "true".to_string())].into_iter().collect()));
+        assert!(!super::wants_full_content(&[("decompress".to_string(), "0".to_string())].into_iter().collect()));
     }
 }

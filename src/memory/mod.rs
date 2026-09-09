@@ -4601,6 +4601,11 @@ impl MemorySystem {
         self.compressor.decompress(memory)
     }
 
+    /// Whether the memory's full content is recoverable (see `CompressionPipeline::is_lossless`).
+    pub fn memory_is_lossless(&self, memory: &Memory) -> bool {
+        self.compressor.is_lossless(memory)
+    }
+
     /// Get storage statistics
     pub fn get_storage_stats(&self) -> Result<storage::StorageStats> {
         self.long_term_memory.get_stats()
