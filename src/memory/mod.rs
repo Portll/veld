@@ -300,8 +300,9 @@ pub struct MemorySystem {
     /// and suppress frequently-ignored memories (up to 20% penalty for negative momentum)
     feedback_store: Option<Arc<parking_lot::RwLock<FeedbackStore>>>,
 
-    /// External dimension scores (Sleight): topological health of the knowledge graph.
-    /// Pushed by Sleight via `/api/sleight/dimensions`, read during Layer 5 scoring.
+    /// External dimension scores (Spine): topological health of the knowledge graph.
+    /// Pushed by Spine via `/api/spine/dimensions` (`/api/sleight/dimensions` is a
+    /// retained alias), read during Layer 5 scoring.
     /// When available, memories from high-quality graph regions rank higher.
     external_scores: Arc<parking_lot::RwLock<Option<types::ExternalDimensionScores>>>,
 

@@ -127,7 +127,7 @@ system or graph, and returns JSON.
 | `lineage.rs` | `/api/lineage/trace`, `/api/lineage/link` |
 | `sessions.rs` | `/api/sessions`, `/api/sessions/end` |
 | `mif.rs` | `/api/export/mif`, `/api/import/mif` — memory interchange format |
-| `external_dimensions.rs` | `/api/sleight/dimensions` — overlook vector push from spine |
+| `external_dimensions.rs` | `/api/spine/dimensions` — overlook vector push from spine (`/api/sleight/dimensions` is a retained alias) |
 
 ### MCP Server (mcp-server/)
 
@@ -171,5 +171,5 @@ The system records memories and retrieves them, but doesn't close the loop:
 ### 4. Spine ↔ Veld Evaluation Feedback
 
 Spine evaluates code quality, but evaluation results don't flow back to
-influence which memories are surfaced. The `/api/sleight/dimensions` endpoint
+influence which memories are surfaced. The `/api/spine/dimensions` endpoint
 exists but the pushed dimensions don't affect recall scoring.

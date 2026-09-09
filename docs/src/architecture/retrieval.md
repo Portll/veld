@@ -147,7 +147,7 @@ RRF fusion or scoring layer.
 
 ### External Spine dimension aggregate
 
-**Function:** Five topological-health scores pushed by Spine via `POST /api/sleight/dimensions`: **density** (entity density), **coherence** (semantic coherence of neighbours), **closure** (fraction of triangles closed), **confidence** (average edge confidence), **isotropy** (directional balance). Geometric mean modulates rank when scores are fresh (< 1 hour old).
+**Function:** Five topological-health scores pushed by Spine via `POST /api/spine/dimensions` (`/api/sleight/dimensions` is a retained alias): **density** (entity density), **coherence** (semantic coherence of neighbours), **closure** (fraction of triangles closed), **confidence** (average edge confidence), **isotropy** (directional balance). Geometric mean modulates rank when scores are fresh (< 1 hour old).
 **Benefit:** Memories from well-mapped, high-confidence regions of the knowledge graph outrank memories from sparse, incoherent regions. Lets an external evaluator (Spine) exert fine-grained influence on retrieval without veld having to compute topology itself.
 
 ---
