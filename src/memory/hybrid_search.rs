@@ -1023,6 +1023,13 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// disk and wraps it in `Arc` itself. Either way, every read goes through
 /// the same handle that the journaled writer's projection commits to.
 pub struct HybridSearchEngine {
+    /// Count of BM25 index inserts lost after their error was handled and
+    /// ingest continued. A memory whose insert failed is STORED BUT
+    /// UNFINDABLE: it exists in the primary store and no lexical query can
+    /// reach it. Distinct from a lost commit, where the document reached the
+    /// writer and the batch did not reach disk.
+    bm25_index_failures: std::sync::atomic::AtomicU64,
+
     /// Count of BM25 commit batches lost after their error was handled and
     /// ingest continued. Seven callers in memory/mod.rs treat a failed
     /// commit_and_reload as recoverable and log it — correct for availability,
@@ -1089,6 +1096,7 @@ impl HybridSearchEngine {
         let learned_weights = RwLock::new(LearnedWeights::from_defaults(&config));
 
         Self {
+            bm25_index_failures: std::sync::atomic::AtomicU64::new(0),
             bm25_commit_failures: std::sync::atomic::AtomicU64::new(0),
             bm25_index,
             config,
@@ -1138,7 +1146,21 @@ impl HybridSearchEngine {
         tags: &[String],
         entities: &[String],
     ) -> Result<()> {
-        self.bm25_index.upsert(memory_id, content, tags, entities)
+        // Counted HERE, not at the five call sites that log and continue: a
+        // caller added later cannot forget to record its own loss.
+        if let Err(e) = self.bm25_index.upsert(memory_id, content, tags, entities) {
+            self.bm25_index_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// BM25 index inserts lost since process start. Non-zero means memories
+    /// are stored and lexically unreachable.
+    pub fn bm25_index_failure_count(&self) -> u64 {
+        self.bm25_index_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Remove a memory from the BM25 index
@@ -2255,6 +2277,40 @@ mod tests {
 
     // Helper: build a minimal HybridSearchEngine for R3b tests that exercise
     // only the weight machinery (no actual BM25/vector search is performed).
+    // ── silent-loss counters ──
+    #[test]
+    fn bm25_index_failure_is_counted_not_swallowed() {
+        let (engine, tmp) = super::tests::make_test_engine();
+        assert_eq!(engine.bm25_index_failure_count(), 0, "clean at start");
+
+        let id = crate::memory::MemoryId(uuid::Uuid::new_v4());
+        engine
+            .index_memory(&id, "findable content", &[], &[])
+            .expect("healthy insert succeeds");
+        assert_eq!(
+            engine.bm25_index_failure_count(),
+            0,
+            "a successful insert must not count as a loss"
+        );
+
+        // Remove the index directory under the writer, then insert again. The
+        // callers in memory/mod.rs log this and continue, which is why the
+        // count is the only thing that can report it afterwards.
+        std::fs::remove_dir_all(tmp.path()).ok();
+        let id2 = crate::memory::MemoryId(uuid::Uuid::new_v4());
+        let result = engine.index_memory(&id2, "lost content", &[], &[]);
+
+        // The insert must not fail UNCOUNTED. Either tantivy held its handles
+        // and the write survived, or it failed and the counter moved.
+        assert_eq!(
+            result.is_err(),
+            engine.bm25_index_failure_count() == 1,
+            "error and count disagree: err={} count={}",
+            result.is_err(),
+            engine.bm25_index_failure_count()
+        );
+    }
+
     fn make_test_engine() -> (HybridSearchEngine, tempfile::TempDir) {
         use crate::embeddings::competitive::CompetitiveEmbedder;
 
@@ -2447,3 +2503,4 @@ mod tests {
         );
     }
 }
+
