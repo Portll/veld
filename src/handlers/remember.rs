@@ -72,6 +72,14 @@ pub struct RememberRequest {
     /// Merged into entity tags with "intent:" prefix for importance boost
     #[serde(default)]
     pub intent_tags: Vec<String>,
+    /// WHO IS WRITING THIS, as the caller describes itself — session, model,
+    /// transcript, workspace. Optional, and recorded verbatim under
+    /// `session.declared`; nothing here is verified and nothing here grants
+    /// anything. See [`crate::memory::facets::DeclaredWriter`] for why it has
+    /// to come from the caller: the server's own session detection describes
+    /// the server.
+    #[serde(default)]
+    pub writer: Option<crate::memory::facets::DeclaredWriter>,
 }
 
 /// Remember response
@@ -132,6 +140,12 @@ pub struct BatchMemoryItem {
     /// Parent memory ID for hierarchical organization
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Per-item writer identity — see [`RememberRequest::writer`]. Declared per
+    /// ITEM rather than per batch: a batch is a transport convenience, and
+    /// nothing guarantees every item in one came from the same session or the
+    /// same model.
+    #[serde(default)]
+    pub writer: Option<crate::memory::facets::DeclaredWriter>,
 }
 
 /// Error detail for batch item
@@ -297,6 +311,7 @@ pub fn build_rich_context(
     episode_id: Option<String>,
     sequence_number: Option<u32>,
     preceding_memory_id: Option<String>,
+    declared_writer: Option<crate::memory::facets::DeclaredWriter>,
 ) -> Option<RichContext> {
     let has_explicit_context = emotional_valence.is_some()
         || emotional_arousal.is_some()
@@ -310,6 +325,21 @@ pub fn build_rich_context(
     // Always start from the session-populated baseline so the AgentSession
     // facet is recorded even when the caller supplied no other signal.
     let mut ctx = crate::memory::session_detect::rich_context_with_session();
+
+    // WRITER IDENTITY IS SET BEFORE THE EARLY RETURN, and that placement is the
+    // whole point. `has_explicit_context` asks whether the caller sent any
+    // emotional/source/episode hints; a caller that sends ONLY who it is sends
+    // none of those, so recording the writer after that check would drop the
+    // identity of precisely the callers who bothered to declare one and nothing
+    // else. Provenance is not a kind of context hint, it is a property of the
+    // write, so it is attached to every write.
+    if let Some(declared) = declared_writer {
+        ctx.session.declared = declared;
+    }
+    // The server's own half. `received_at` is the one writer fact that needs no
+    // trust at all — this process observed it. It is deliberately not the
+    // record's `created_at`, which a caller may override.
+    ctx.session.verified.received_at = Some(chrono::Utc::now());
 
     if !has_explicit_context {
         return Some(ctx);
@@ -668,6 +698,7 @@ pub async fn remember(
         req.episode_id.clone(),
         req.sequence_number,
         req.preceding_memory_id.clone(),
+        req.writer.clone(),
     );
 
     let experience = Experience {
@@ -1353,6 +1384,7 @@ pub async fn batch_remember(
             item.episode_id.clone(),
             item.sequence_number,
             item.preceding_memory_id.clone(),
+            item.writer.clone(),
         );
 
         let experience = Experience {
