@@ -112,14 +112,39 @@ fn load_embedder_by_id(id: &str) -> Result<std::sync::Arc<dyn Embedder>> {
         return Ok(Arc::new(e));
     }
     if id.starts_with("http://") || id.starts_with("https://") {
-        let mut cfg = http_embedder::HttpEmbedderConfig::from_env();
-        cfg.base_url = id.to_string();
+        // `<url>` or `<url>#<model>` — the form HttpEmbedder::id() emits.
+        let cfg = http_embedder::HttpEmbedderConfig::from_id(id);
         let e = http_embedder::HttpEmbedder::new(cfg);
         return Ok(Arc::new(e));
     }
     anyhow::bail!(
         "unknown embedder id: {id} (supported prefixes: nomic*, minilm*, http://, https://)"
     );
+}
+
+/// The primary embedder this process chose, for `/health` and anyone else who needs to know
+/// what the vectors in the store were made by. Recorded once at the first `MemorySystem`
+/// construction; every user's system reads the same environment, so first-wins is exact.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PrimaryEmbedderInfo {
+    /// Canonical id, the value the corpus marker `.veld_embedder` holds.
+    pub id: String,
+    pub model: String,
+    pub dimension: usize,
+    /// `nomic-onnx` | `minilm-onnx` | `http` — where the vectors come from.
+    pub kind: &'static str,
+    /// Why this one: the env that asked for it, or the fallback step that reached it.
+    pub reason: String,
+}
+
+static PRIMARY_EMBEDDER: std::sync::OnceLock<PrimaryEmbedderInfo> = std::sync::OnceLock::new();
+
+pub fn record_primary_embedder(info: PrimaryEmbedderInfo) {
+    let _ = PRIMARY_EMBEDDER.set(info);
+}
+
+pub fn primary_embedder_info() -> Option<PrimaryEmbedderInfo> {
+    PRIMARY_EMBEDDER.get().cloned()
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
