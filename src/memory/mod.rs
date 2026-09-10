@@ -93,6 +93,14 @@ pub use crate::memory::types::*;
 /// in `graph_memory.rs` strengthens the edges it walks and is reached from the multi-hop leg
 /// of `recall`; gating it needs a parameter on that function and that file is under another
 /// session's edit at the time of writing.
+/// The embedder id the corpus marker names, when it is an HTTP endpoint (`http(s)://…#model`).
+/// `None` for a local model id, an `unverified:` provenance, or no marker.
+fn marker_names_http(storage_path: &std::path::Path) -> Option<String> {
+    let id = std::fs::read_to_string(storage_path.join(".veld_embedder")).ok()?;
+    let id = id.trim();
+    (id.starts_with("http://") || id.starts_with("https://")).then(|| id.to_string())
+}
+
 pub(crate) fn recall_readonly() -> bool {
     let flag = |name: &str| std::env::var(name).ok().map(|v| v == "1");
     flag("VELD_RECALL_READONLY")
@@ -653,52 +661,136 @@ impl MemorySystem {
 
         // CRITICAL: Initialize embedder ONCE and share between MemorySystem and RetrievalEngine.
         //
-        // PRIMARY embedder: Nomic-embed-text-v1.5 (768d, Matryoshka-truncatable
-        // via VELD_NOMIC_DIM) is the preferred primary. It falls back to MiniLM
-        // (384d) only when the Nomic ONNX model cannot run as a real (non-simplified)
-        // model — a simplified hash-mode Nomic is worse than a real MiniLM.
+        // PRIMARY embedder, in order:
+        //   1. `VELD_EMBEDDER` when set: `nomic` | `minilm` | `http` | an `http(s)://` URL
+        //      (optionally `#model`). An explicit ask that cannot be honoured is an error, not
+        //      a fallback — the operator said which vectors they want in the store.
+        //   2. Nomic-embed-text-v1.5 ONNX (768d), when its model files are present.
+        //   3. The OpenAI-compatible HTTP endpoint (LM Studio :1234, `llama-server
+        //      --embedding` :8080, …) when it answers a probe for the configured model —
+        //      the same nomic model served by a process that already holds it, instead of
+        //      a second copy in-process. Its identity carries the model, so the corpus
+        //      marker re-embeds on a swap.
+        //   4. MiniLM ONNX (384d), which refuses to start on hash embeddings unless
+        //      VELD_ALLOW_SIMPLIFIED_EMBEDDINGS is set. Before step 3 existed this was where a
+        //      box with no model files ended up: on the binary built 2026-08-29 that meant
+        //      silently non-semantic vectors; on the current code, a refusal to boot.
         let primary: Arc<dyn crate::embeddings::Embedder> = {
-            let want_nomic = crate::embeddings::are_nomic_models_downloaded()
-                || crate::embeddings::auto_download_models_enabled();
+            use crate::embeddings::{http_embedder, minilm, nomic, PrimaryEmbedderInfo};
 
-            let nomic_primary: Option<Arc<dyn crate::embeddings::Embedder>> = if want_nomic {
-                match crate::embeddings::nomic::NomicEmbedder::new(
-                    crate::embeddings::nomic::NomicConfig::from_env(),
-                ) {
-                    Ok(n) if !n.is_simplified() => {
-                        tracing::info!(
-                            "Primary embedder: Nomic-embed-text-v1.5 ONNX ({}d)",
-                            n.dimension()
-                        );
-                        Some(Arc::new(n) as Arc<dyn crate::embeddings::Embedder>)
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            "Nomic available only in simplified mode — using MiniLM as primary"
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!("Nomic init failed ({e}) — using MiniLM as primary");
-                        None
-                    }
-                }
-            } else {
-                tracing::info!(
-                    "Nomic model not present — using MiniLM as primary (384d). \
-                     Set VELD_AUTO_DOWNLOAD_MODELS=true to enable Nomic."
-                );
-                None
+            let record = |e: &dyn crate::embeddings::Embedder, kind: &'static str, reason: String| {
+                crate::embeddings::record_primary_embedder(PrimaryEmbedderInfo {
+                    id: e.id().to_string(),
+                    model: e.model_id().to_string(),
+                    dimension: e.dimension(),
+                    kind,
+                    reason,
+                });
             };
 
-            match nomic_primary {
-                Some(p) => p,
+            let nomic_onnx = |reason: &str| -> Result<Arc<dyn crate::embeddings::Embedder>> {
+                let n = nomic::NomicEmbedder::new(nomic::NomicConfig::from_env())?;
+                if n.is_simplified() {
+                    anyhow::bail!("Nomic ONNX available only in simplified (hash) mode");
+                }
+                tracing::info!("Primary embedder: Nomic-embed-text-v1.5 ONNX ({}d) — {reason}", n.dimension());
+                record(&n, "nomic-onnx", reason.to_string());
+                Ok(Arc::new(n))
+            };
+            let minilm_onnx = |reason: &str| -> Result<Arc<dyn crate::embeddings::Embedder>> {
+                let m = minilm::MiniLMEmbedder::new(minilm::EmbeddingConfig::default())
+                    .context("Failed to initialize MiniLM embedder (ONNX model)")?;
+                tracing::info!("Primary embedder: MiniLM ONNX ({}d) — {reason}", m.dimension());
+                record(&m, "minilm-onnx", reason.to_string());
+                Ok(Arc::new(m))
+            };
+            let http = |cfg: http_embedder::HttpEmbedderConfig, reason: &str| -> Result<Arc<dyn crate::embeddings::Embedder>> {
+                let e = http_embedder::HttpEmbedder::new(cfg);
+                let dim = e.probe().with_context(|| {
+                    format!("HTTP embedder {} ({}) failed its probe", e.base_url(), e.model_id())
+                })?;
+                tracing::info!(
+                    "Primary embedder: HTTP {} at {} ({dim}d) — {reason}",
+                    e.model_id(),
+                    e.base_url()
+                );
+                record(&e, "http", reason.to_string());
+                Ok(Arc::new(e))
+            };
+
+            let explicit = std::env::var("VELD_EMBEDDER")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+
+            match explicit.as_deref() {
+                Some("nomic") => nomic_onnx("VELD_EMBEDDER=nomic")?,
+                Some("minilm") => minilm_onnx("VELD_EMBEDDER=minilm")?,
+                Some("http") => http(http_embedder::HttpEmbedderConfig::from_env(), "VELD_EMBEDDER=http")?,
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                    http(http_embedder::HttpEmbedderConfig::from_id(url), "VELD_EMBEDDER=<url>")?
+                }
+                Some(other) => anyhow::bail!(
+                    "VELD_EMBEDDER={other:?} not understood: use nomic, minilm, http, or an http(s):// URL"
+                ),
+                // STICKY. The corpus marker (`.veld_embedder`, written by the retrieval
+                // engine after a clean pass) names what embedded the store. If that was an
+                // HTTP endpoint, this boot must use it or refuse — never fall through to a
+                // local model because the endpoint happens to be down, because a swap
+                // re-embeds every memory and a second swap back does it again. An automatic
+                // choice that depends on another process's liveness is not a choice.
+                None if marker_names_http(&config.storage_path).is_some() => {
+                    let m = marker_names_http(&config.storage_path).unwrap_or_default();
+                    http(http_embedder::HttpEmbedderConfig::from_id(&m), "the corpus marker names this endpoint")
+                        .with_context(|| format!(
+                            "the corpus at {} was embedded by {m} and that endpoint failed its probe. \
+                             Start it (LM Studio, or llama-server --embedding), or set VELD_EMBEDDER to \
+                             swap deliberately — a swap re-embeds every memory",
+                            config.storage_path.display()
+                        ))?
+                }
                 None => {
-                    let embedding_config = crate::embeddings::minilm::EmbeddingConfig::default();
-                    Arc::new(
-                        crate::embeddings::minilm::MiniLMEmbedder::new(embedding_config)
-                            .context("Failed to initialize MiniLM embedder (ONNX model)")?,
-                    ) as Arc<dyn crate::embeddings::Embedder>
+                    let want_nomic = crate::embeddings::are_nomic_models_downloaded()
+                        || crate::embeddings::auto_download_models_enabled();
+                    let from_nomic = if want_nomic {
+                        match nomic_onnx("local model files present") {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                tracing::warn!("Nomic ONNX unavailable ({e}) — trying the HTTP endpoint");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // The automatic probe reaches out to a local port. Unit tests must not
+                    // inherit whatever server happens to be running on the developer's box —
+                    // that would make the suite's vectors depend on LM Studio's state — so
+                    // under cfg(test) the automatic step is skipped; an explicit
+                    // VELD_EMBEDDER=http still works there for a deliberate live test.
+                    let auto_http = if cfg!(test) {
+                        Err(anyhow::anyhow!("automatic HTTP probe is disabled under cfg(test)"))
+                    } else {
+                        http(
+                            http_embedder::HttpEmbedderConfig::from_env(),
+                            "no local Nomic model; the HTTP endpoint answered the probe",
+                        )
+                    };
+                    match from_nomic {
+                        Some(p) => p,
+                        None => match auto_http {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "No HTTP embedder either ({e:#}) — falling back to MiniLM ONNX. \
+                                     Set VELD_AUTO_DOWNLOAD_MODELS=true for local Nomic, or run an \
+                                     OpenAI-compatible embedding server (LM Studio, llama-server \
+                                     --embedding) at VELD_EMBEDDING_API_URL."
+                                );
+                                minilm_onnx("no local Nomic model and no HTTP endpoint")?
+                            }
+                        },
+                    }
                 }
             }
         };
@@ -710,7 +802,8 @@ impl MemorySystem {
             // HTTP-backed embedder via any declared host (see crate::llm_hosts)
             let http_config = crate::embeddings::http_embedder::HttpEmbedderConfig::from_env();
             let http_embedder = crate::embeddings::http_embedder::HttpEmbedder::new(http_config);
-            if http_embedder.is_available() {
+            // The same endpoint and model as the primary is not a second opinion.
+            if http_embedder.id() != primary.id() && http_embedder.is_available() {
                 tracing::info!(
                     "Secondary embedder: HTTP API at {}",
                     std::env::var("VELD_EMBEDDING_API_URL")
@@ -8067,6 +8160,90 @@ mod recall_readonly_tests {
         });
         with_env(&[("VELD_RECALL_READONLY", Some("true")), ("SHODH_RECALL_READONLY", None)], || {
             assert!(!recall_readonly(), "only the literal 1 arms it, as upstream");
+        });
+    }
+}
+
+#[cfg(test)]
+mod embedder_selection_tests {
+    // Explicit `VELD_EMBEDDER` and the corpus-marker stickiness. The automatic HTTP probe is
+    // off under cfg(test) (see the selection block), so these drive the explicit path.
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_embedder_env(value: Option<&str>, f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => std::env::set_var("VELD_EMBEDDER", v),
+            None => std::env::remove_var("VELD_EMBEDDER"),
+        }
+        f();
+        std::env::remove_var("VELD_EMBEDDER");
+    }
+
+    #[test]
+    fn marker_helper_only_returns_http_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::marker_names_http(dir.path()), None, "no marker");
+        std::fs::write(dir.path().join(".veld_embedder"), "minilm\n").unwrap();
+        assert_eq!(super::marker_names_http(dir.path()), None, "local id");
+        std::fs::write(dir.path().join(".veld_embedder"), "unverified:http://x#m").unwrap();
+        assert_eq!(super::marker_names_http(dir.path()), None, "unverified provenance");
+        std::fs::write(dir.path().join(".veld_embedder"), "http://127.0.0.1:1234#text-embedding-nomic-embed-text-v1.5\n").unwrap();
+        assert_eq!(
+            super::marker_names_http(dir.path()).as_deref(),
+            Some("http://127.0.0.1:1234#text-embedding-nomic-embed-text-v1.5")
+        );
+    }
+
+    /// An explicit ask that cannot be honoured is an error, not a fallback.
+    #[test]
+    fn explicit_http_to_a_dead_port_refuses_instead_of_falling_back() {
+        with_embedder_env(Some("http://127.0.0.1:9#nothing"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let config = super::MemoryConfig { storage_path: dir.path().to_path_buf(), ..Default::default() };
+            let err = super::MemorySystem::new(config, None).err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert!(err.contains("127.0.0.1:9"), "must name the endpoint: {err}");
+        });
+    }
+
+    #[test]
+    fn an_unknown_embedder_name_is_refused() {
+        with_embedder_env(Some("bogus"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let config = super::MemoryConfig { storage_path: dir.path().to_path_buf(), ..Default::default() };
+            let err = super::MemorySystem::new(config, None).err().map(|e| format!("{e:#}")).unwrap_or_default();
+            assert!(err.contains("not understood"), "{err}");
+        });
+    }
+
+    /// LIVE: `VELD_LIVE_EMBEDDER=1 cargo test -- --ignored live_http_primary` against a running
+    /// OpenAI-compatible embedding server (LM Studio :1234 with nomic loaded). Proves the whole
+    /// path: explicit selection, probe, task prefixes, 768-d vectors, remember → recall, and the
+    /// marker the corpus is left with.
+    #[test]
+    #[ignore]
+    fn live_http_primary_round_trip() {
+        if std::env::var("VELD_LIVE_EMBEDDER").as_deref() != Ok("1") {
+            eprintln!("skipped: VELD_LIVE_EMBEDDER!=1");
+            return;
+        }
+        with_embedder_env(Some("http"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let config = super::MemoryConfig { storage_path: dir.path().to_path_buf(), ..Default::default() };
+            let system = super::MemorySystem::new(config, None).expect("HTTP primary must construct against the live server");
+            let info = crate::embeddings::primary_embedder_info().expect("primary recorded");
+            assert_eq!(info.kind, "http");
+            assert_eq!(info.dimension, 768, "{info:?}");
+            assert!(info.id.contains('#'), "identity must carry the model: {}", info.id);
+
+            let id = system
+                .remember(super::Experience { content: "the tide left a strandline of kelp along the whole beach".into(), ..Default::default() }, None)
+                .unwrap();
+            let q = super::Query { query_text: Some("seaweed washed up by the sea".into()), max_results: 3, ..Default::default() };
+            let hits = system.recall(&q).unwrap();
+            assert!(hits.iter().any(|m| m.id == id), "semantic recall must find the record among {}", hits.len());
         });
     }
 }
