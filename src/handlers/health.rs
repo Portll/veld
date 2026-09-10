@@ -33,6 +33,11 @@ pub struct HealthResponse {
     pub users_in_cache: usize,
     pub user_evictions: usize,
     pub max_cache_size: usize,
+    /// The primary embedder this process chose (id, model, dimension, kind, reason). `null`
+    /// until the first user's memory system has been constructed. Measured 2026-09-10: the
+    /// running server was on hash-bigram vectors and nothing on this endpoint said so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedder: Option<crate::embeddings::PrimaryEmbedderInfo>,
 }
 
 /// Main health check endpoint
@@ -52,6 +57,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         users_in_cache,
         user_evictions,
         max_cache_size: config.max_users_in_memory,
+        embedder: crate::embeddings::primary_embedder_info(),
     })
 }
 
