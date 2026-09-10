@@ -160,6 +160,15 @@ fn build_session() -> AgentSession {
         vscode_window_id,
         started_at: Some(Utc::now()),
         parent_repo,
+        // Left at their defaults DELIBERATELY. Everything this function can see
+        // belongs to the veld process — its cwd, its git branch, its parent
+        // process — and none of that is the writer. The declared half is filled
+        // in by the request handler from what the caller sent; the verified half
+        // from what the server established about that request. Detecting them
+        // here is not merely unimplemented, it is not possible: a server cannot
+        // see who made an HTTP call by looking at itself.
+        declared: Default::default(),
+        verified: Default::default(),
     }
 }
 

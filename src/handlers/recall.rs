@@ -594,6 +594,12 @@ pub async fn recall(
                             | crate::memory::types::SourceType::System
                     )
                 }),
+                // Both halves of the writer facet, nested exactly as stored.
+                // Cloned rather than summarised into a string: a reader deciding
+                // how much weight to give a memory needs to see WHICH fields were
+                // verified, and any flattening here would erase that distinction
+                // at the one place a consumer actually looks.
+                writer: m.experience.context.as_ref().map(|c| c.session.clone()),
                 injection_suspected: {
                     // C3.1 (W-006): flag only non-trusted-source content that
                     // matches injection-style directives. `None` (the common
@@ -1997,6 +2003,14 @@ pub async fn proactive_context(
                         ingest_episode_id.clone(),
                         ingest_seq,
                         None, // preceding_memory_id
+                        // No declared writer on the AUTO-INGEST path, and None is
+                        // the honest value rather than a gap to fill later: this
+                        // content was segmented out of a conversation by veld
+                        // itself, so there is no caller declaring anything. The
+                        // server half (`received_at`) is still stamped, so these
+                        // records are distinguishable from ones where a writer
+                        // was asked for and did not answer.
+                        None,
                     );
                     let experience = Experience {
                         content: segment.content,
@@ -2595,6 +2609,12 @@ pub async fn recall_tracked(
                             | crate::memory::types::SourceType::System
                     )
                 }),
+                // Both halves of the writer facet, nested exactly as stored.
+                // Cloned rather than summarised into a string: a reader deciding
+                // how much weight to give a memory needs to see WHICH fields were
+                // verified, and any flattening here would erase that distinction
+                // at the one place a consumer actually looks.
+                writer: m.experience.context.as_ref().map(|c| c.session.clone()),
                 injection_suspected: {
                     // C3.1 (W-006): flag only non-trusted-source content that
                     // matches injection-style directives. `None` (the common
