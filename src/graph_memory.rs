@@ -2854,31 +2854,62 @@ impl GraphMemory {
             return Ok(()); // Race condition guard
         }
 
-        // Sort by pruning priority: LTP-protected edges last (survive pruning),
-        // then by effective strength descending (strongest survive)
-        let mut scored: Vec<(Uuid, f32, bool)> = all_edges
+        // Sort by pruning priority: LTP-protected edges last (survive pruning), then by
+        // effective strength ascending (weakest are the prune candidates).
+        //
+        // CROSS-INGEST DETERMINISM (ported from shodh-memory 6272430). get_entity_relationships
+        // returns edges in prefix-scan order, i.e. edge-UUID order, and edge UUIDs are
+        // Uuid::new_v4() — random per ingest. A stable sort on (protection, strength) leaves
+        // equal-priority edges in that random order, and take(prune_count) below does not merely
+        // reorder them: it DELETES them. Fresh graphs carry large exact-strength plateaus (every
+        // co-occurrence edge starts at its tier's initial weight) and hubs carry far more edges
+        // than MAX_ENTITY_DEGREE, so two ingests of the same corpus kept different edge sets —
+        // not a different order over one graph, a different graph.
+        //
+        // Ordered by a key that is a pure function of graph CONTENT: (peer entity name, relation
+        // type, edge uuid). Peer names are repeat-stable via entity resolution, and
+        // add_relationship dedups by (from, to, type), so the uuid only ever separates
+        // content-identical edges, where the choice cannot matter.
+        let peer_of = |e: &RelationshipEdge| -> Uuid {
+            if e.from_entity == *entity_uuid {
+                e.to_entity
+            } else {
+                e.from_entity
+            }
+        };
+        let mut peer_names: HashMap<Uuid, String> = HashMap::new();
+        for e in &all_edges {
+            let peer = peer_of(e);
+            peer_names.entry(peer).or_insert_with(|| {
+                self.get_entity(&peer)
+                    .ok()
+                    .flatten()
+                    .map(|ent| ent.name)
+                    .unwrap_or_default()
+            });
+        }
+
+        // effective_strength() reads Utc::now(), so it is snapshotted once per edge here rather
+        // than called from inside the comparator.
+        let mut scored: Vec<(&RelationshipEdge, f32, bool)> = all_edges
             .iter()
-            .map(|e| {
-                let is_protected = e.is_potentiated();
-                (e.uuid, e.effective_strength(), is_protected)
-            })
+            .map(|e| (e, e.effective_strength(), e.is_potentiated()))
             .collect();
 
         // Sort: unprotected+weak first (pruning candidates), protected+strong last (survivors)
         scored.sort_by(|a, b| {
-            // Protected edges sort after unprotected
-            match a.2.cmp(&b.2) {
-                CmpOrdering::Equal => {
-                    // Within same protection class, weaker edges first (prune candidates)
-                    a.1.total_cmp(&b.1)
-                }
-                other => other,
-            }
+            a.2.cmp(&b.2)
+                .then_with(|| a.1.total_cmp(&b.1))
+                .then_with(|| peer_names[&peer_of(a.0)].cmp(&peer_names[&peer_of(b.0)]))
+                .then_with(|| {
+                    format!("{:?}", a.0.relation_type).cmp(&format!("{:?}", b.0.relation_type))
+                })
+                .then_with(|| a.0.uuid.cmp(&b.0.uuid))
         });
 
         // Prune excess: first N edges in sorted order are weakest/unprotected
         let prune_count = scored.len() - MAX_ENTITY_DEGREE;
-        let to_prune: Vec<Uuid> = scored.iter().take(prune_count).map(|s| s.0).collect();
+        let to_prune: Vec<Uuid> = scored.iter().take(prune_count).map(|s| s.0.uuid).collect();
 
         for edge_uuid in &to_prune {
             if let Err(e) = self.delete_relationship(edge_uuid) {
@@ -3566,8 +3597,10 @@ impl GraphMemory {
 
         // Apply Hebbian strengthening to all traversed edges atomically (SHO-65)
         // "Neurons that fire together, wire together"
-        // Uses batch update for efficiency instead of individual writes
-        if !edges_to_strengthen.is_empty() {
+        // Uses batch update for efficiency instead of individual writes.
+        // A usage write: skipped under read-only recall (memory::recall_readonly), so an eval
+        // repeat does not strengthen the edges it walked (shodh-memory 4ec3b6e).
+        if !edges_to_strengthen.is_empty() && !crate::memory::recall_readonly() {
             match self.batch_strengthen_synapses(&edges_to_strengthen) {
                 Ok(count) => {
                     if count > 0 {
@@ -3752,8 +3785,8 @@ impl GraphMemory {
         // Sort entities by path score (decay_factor) descending
         all_entities.sort_by(|a, b| b.decay_factor.total_cmp(&a.decay_factor));
 
-        // Hebbian strengthening
-        if !edges_to_strengthen.is_empty() {
+        // Hebbian strengthening — a usage write, skipped under read-only recall.
+        if !edges_to_strengthen.is_empty() && !crate::memory::recall_readonly() {
             if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
                 tracing::debug!("Failed to strengthen synapses: {}", e);
             }
@@ -3964,8 +3997,10 @@ impl GraphMemory {
             );
         }
 
-        // Hebbian strengthening for traversed edges
-        if !edges_to_strengthen.is_empty() {
+        // Hebbian strengthening for traversed edges — a usage write, skipped under read-only
+        // recall. This is the site recall's multi-hop leg reaches (memory/recall.rs), the one
+        // the gate's doc comment named as the residual when the gate landed.
+        if !edges_to_strengthen.is_empty() && !crate::memory::recall_readonly() {
             if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
                 tracing::debug!("Failed to strengthen synapses: {}", e);
             }
@@ -4876,7 +4911,7 @@ impl GraphMemory {
         }
 
         // Sort by strength descending and limit
-        associations.sort_by(|a, b| b.1.total_cmp(&a.1));
+        associations.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         associations.truncate(max_results);
 
         Ok(associations)
