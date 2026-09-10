@@ -399,9 +399,19 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
         );
     }
 
+    // The embedder that ACTUALLY produced this run's vectors, read from the process-wide
+    // record the memory system writes when it chooses its primary. This used to be the
+    // constant EMBEDDER_ID, so a run under VELD_EMBEDDER=http (a binary, not cfg(test))
+    // would have labelled nomic vectors "minilm-l6-v2" and compare_to_baseline's embedder
+    // guard would have had nothing true to read. The constant remains the fallback for a
+    // report built before any memory system existed.
+    let embedder = crate::embeddings::primary_embedder_info()
+        .map(|info| info.model)
+        .unwrap_or_else(|| EMBEDDER_ID.to_string());
+
     let report = Report {
         suite: inputs.suite.clone(),
-        embedder: EMBEDDER_ID.to_string(),
+        embedder,
         git_sha: inputs.git_sha.clone(),
         timestamp: chrono::Utc::now(),
         layers,
