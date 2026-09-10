@@ -506,6 +506,19 @@ pub fn compare_to_baseline(
     current: &Report,
     tolerance_pct: f64,
 ) -> Vec<Failure> {
+    // A value nothing reads is not a check. Both reports carry `embedder`; a diff across
+    // two embedders is a diff of two systems, and calling its result a regression or an
+    // improvement describes neither. Refuse before any metric is compared.
+    if baseline.embedder != current.embedder {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "embedder differs: baseline {:?}, current {:?} — metrics from two embedders are \
+                 not comparable; record a new baseline under the current embedder instead",
+                baseline.embedder, current.embedder
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -945,6 +958,19 @@ mod tests {
         let baseline = report_with_full(0.60, 0.70, 0.50, 0.40);
         let current = report_with_full(0.80, 0.90, 0.70, 0.60);
         assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    /// Two embedders, identical numbers: not a pass, not a regression, a refusal — and no
+    /// metric failure rides along with it.
+    #[test]
+    fn different_embedder_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1); // would fail every gate
+        current.embedder = "text-embedding-nomic-embed-text-v1.5".to_string();
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(failures[0].detail.contains("embedder differs"), "{}", failures[0].detail);
     }
 
     #[test]
