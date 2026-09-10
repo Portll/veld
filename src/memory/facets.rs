@@ -806,6 +806,101 @@ pub struct AgentSession {
     /// its parent so a branch-aware tool can group siblings.
     #[serde(default)]
     pub parent_repo: Option<PathBuf>,
+
+    /// What the CALLER said about itself — see [`DeclaredWriter`].
+    #[serde(default)]
+    pub declared: DeclaredWriter,
+
+    /// What the SERVER established — see [`VerifiedWriter`].
+    #[serde(default)]
+    pub verified: VerifiedWriter,
+}
+
+/// Writer identity AS CLAIMED BY THE CALLER. Every field is an assertion by
+/// whoever made the request: recorded because it is useful, trusted for nothing.
+///
+/// WHY THIS MUST COME FROM THE CLIENT, when the fields above look like they
+/// already answer it. They do not, and the reason belongs next to the fields:
+/// [`crate::memory::session_detect::build_session`] reads `current_dir()`, the
+/// git branch and the parent process OF THE VELD SERVER, then caches the result
+/// process-wide ("session identity does not change mid-process"). So every
+/// memory written over HTTP records veld's own worktree and branch — populated,
+/// plausible, non-null, and identical on every record for the life of the
+/// process. The existing comment says the facet records "the session identity
+/// of the process that recorded it", which is literally true and reads as the
+/// opposite of what it means: that process is the server.
+///
+/// A server receiving an HTTP request cannot detect who sent it. The choice is
+/// therefore not between verified and declared identity — it is between
+/// declared identity and none, and none is what a reader has had until now.
+///
+/// `agent_id` above is a chat BRAND constrained to `KNOWN_AGENT_BRANDS`. It
+/// answers what KIND of agent wrote a record and can never answer WHICH one:
+/// twenty-two Claude Code sessions produce twenty-two records reading
+/// `"Claude"`. `session_name` and `session_id` are the instance grain that
+/// attribution actually needs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeclaredWriter {
+    /// The caller's own session identifier.
+    ///
+    /// NOT AN IDENTITY ON ITS OWN. A resumed session forks its id, so one id
+    /// can name two live processes at once; the id plus the process identity is
+    /// what disambiguates. Recorded here as one leg of that, never as the answer.
+    #[serde(default)]
+    pub session_id: Option<String>,
+
+    /// The id this session carried BEFORE a restart, where the caller knows it.
+    /// Without it, the records either side of a restart are two unrelated
+    /// writers; with it they are one thread a reader can follow backwards.
+    #[serde(default)]
+    pub previous_session_id: Option<String>,
+
+    /// Human-facing name the fleet addresses this session by, e.g.
+    /// `"commitwork-bb"`. Contended by construction — names get reassigned, and
+    /// two live sessions have been observed answering to one name — so it is a
+    /// label for reading, never a key.
+    #[serde(default)]
+    pub session_name: Option<String>,
+
+    /// Transcript the write happened in. A CORRELATION KEY, not an address: one
+    /// transcript can be held by two live processes at once, so it groups
+    /// records without identifying a writer.
+    #[serde(default)]
+    pub transcript_id: Option<String>,
+
+    /// Model that ran the command producing this record, e.g.
+    /// `"claude-opus-5[1m]"`. The field most likely to be wanted later and
+    /// impossible to recover afterwards: when a memory turns out to be wrong,
+    /// this decides whether it is one bad record or a class of them, and
+    /// nothing else in the record can answer that.
+    #[serde(default)]
+    pub model_id: Option<String>,
+
+    /// Workspace or repository root the CALLER was working in — as distinct
+    /// from `worktree_path` above, which is the server's.
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+}
+
+/// Writer facts THE SERVER ESTABLISHED ITSELF. Kept structurally separate from
+/// [`DeclaredWriter`] rather than distinguished by naming convention, so that
+/// reading a claim as though it were evidence takes a deliberate act.
+///
+/// `None` here means "nothing was established", which is NOT the same as "the
+/// caller declared nothing". Collapsing those two is the failure this split
+/// exists to prevent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VerifiedWriter {
+    /// Principal resolved from the presented credential, where the deployment
+    /// binds keys to users. `None` when binding is not enabled: a valid key was
+    /// still presented, but it names nobody.
+    #[serde(default)]
+    pub principal: Option<String>,
+
+    /// Server clock at acceptance. Deliberately distinct from the record's
+    /// `created_at`, which a caller is allowed to override.
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
 }
 
 // =============================================================================
@@ -1131,6 +1226,8 @@ mod tests {
             vscode_window_id: Some("window-42".into()),
             started_at: Some(started_at),
             parent_repo: Some(PathBuf::from("/c/Repositories/Portll/veld")),
+            declared: Default::default(),
+            verified: Default::default(),
         };
         let bytes =
             bincode::serde::encode_to_vec(&session, bincode::config::standard()).unwrap();
@@ -1153,13 +1250,88 @@ mod tests {
             vscode_window_id: Some("vscode-1".into()),
             started_at: Some(started_at),
             parent_repo: Some(PathBuf::from("/repo")),
+            declared: DeclaredWriter {
+                session_id: Some("cfd2b753-1643-4ad0-874a-af251f2ce3e3".into()),
+                previous_session_id: Some("prior-id-before-restart".into()),
+                session_name: Some("commitwork-11".into()),
+                transcript_id: Some("cfd2b753-1643-4ad0-874a-af251f2ce3e3".into()),
+                model_id: Some("claude-opus-5".into()),
+                workspace: Some(PathBuf::from("/repo")),
+            },
+            verified: VerifiedWriter {
+                principal: Some("portll".into()),
+                received_at: Some(started_at),
+            },
         };
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"branch\":\"main\""));
         assert!(json.contains("\"agent_id\":\"Copilot\""));
         assert!(json.contains("\"vscode_window_id\":\"vscode-1\""));
+        // The two halves must be VISIBLY separate on the wire. A consumer that
+        // has to consult documentation to learn which fields were verified will
+        // eventually read a claim as evidence, so the nesting carries that and
+        // the flat shape is what this pins against.
+        assert!(json.contains("\"declared\":{"), "declared half must be nested, not flattened");
+        assert!(json.contains("\"verified\":{"), "verified half must be nested, not flattened");
+        assert!(json.contains("\"model_id\":\"claude-opus-5\""));
+        assert!(json.contains("\"session_name\":\"commitwork-11\""));
         let back: AgentSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, session);
+    }
+
+    /// A RECORD WRITTEN BEFORE THE WRITER FIELDS EXISTED MUST STILL DECODE.
+    ///
+    /// This is the claim the whole change rests on, and it is the one that
+    /// would otherwise be checked by reasoning rather than by running anything.
+    /// The versioning contract at the top of this file permits an additive
+    /// change without a `FACET_SCHEMA_VERSION` bump *because* `#[serde(default)]`
+    /// fills missing fields — so the test that must exist is the one that feeds
+    /// the OLD shape to the NEW reader. Reading the contract is not evidence
+    /// that the code obeys it.
+    ///
+    /// The literal below is deliberately a hand-written old payload rather than
+    /// something re-serialised from the current struct: a fixture generated by
+    /// today's code cannot be missing today's fields, so it would prove nothing
+    /// and would keep passing forever.
+    #[test]
+    fn a_pre_writer_agent_session_decodes_with_empty_declared_and_verified() {
+        let old = r#"{
+            "worktree_path": "/repo/wt",
+            "branch": "main",
+            "agent_id": "Claude",
+            "vscode_window_id": "vscode-1",
+            "started_at": null,
+            "parent_repo": "/repo"
+        }"#;
+        let back: AgentSession = serde_json::from_str(old).expect("old records must still decode");
+        assert_eq!(back.branch.as_deref(), Some("main"));
+        assert_eq!(back.declared, DeclaredWriter::default());
+        assert_eq!(back.verified, VerifiedWriter::default());
+        // Absent is absent, and must not be dressed up as an answer. An empty
+        // string or a placeholder here would let a reader believe a writer was
+        // recorded as "unknown" when in fact nothing was ever asked.
+        assert!(back.declared.model_id.is_none());
+        assert!(back.declared.session_name.is_none());
+        assert!(back.verified.principal.is_none());
+    }
+
+    /// The declared half must survive a round trip WITHOUT leaking into the
+    /// verified half. Cheap to write, and it is the mistake that would make the
+    /// split cosmetic: a serde rename or a `flatten` added later would merge
+    /// them, and every other test here would still pass.
+    #[test]
+    fn a_declared_claim_never_lands_in_the_verified_half() {
+        let mut s = AgentSession::default();
+        s.declared.session_name = Some("commitwork-11".into());
+        s.declared.model_id = Some("claude-opus-5".into());
+        let json = serde_json::to_string(&s).unwrap();
+        let back: AgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.declared.session_name.as_deref(), Some("commitwork-11"));
+        assert_eq!(
+            back.verified,
+            VerifiedWriter::default(),
+            "a caller-declared value reached the verified half"
+        );
     }
 
     // ========================================================================

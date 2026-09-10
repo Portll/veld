@@ -324,6 +324,19 @@ pub struct RecallMemory {
     /// C3: whether the source tier is trusted (derived from source_type).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_trusted: Option<bool>,
+    /// WHO WROTE THIS, so a reader can weigh a memory instead of inheriting it.
+    ///
+    /// The write path has recorded a session facet since it was added, and
+    /// nothing ever projected it here — so every consumer read content with no
+    /// way to ask where it came from, and a memory written by anything was
+    /// indistinguishable from a memory written by the operator. Recording
+    /// provenance that no reader can reach is not provenance.
+    ///
+    /// Carries both halves, nested and separate: `declared` is what the caller
+    /// said about itself and is evidence of nothing, `verified` is what this
+    /// server established. Absent for engrams with no rich context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writer: Option<crate::memory::facets::AgentSession>,
     /// C3.1 (W-006): `Some(true)` when this memory came from a non-trusted
     /// source AND its content matches prompt-injection-style directives.
     /// Best-effort defense-in-depth — a consumer should fence such content
