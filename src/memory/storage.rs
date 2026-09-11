@@ -4298,6 +4298,15 @@ mod tests {
         content: String,
     }
 
+    // LEGACY_FALLBACK_BRANCH_TOTAL is a process-wide metric. Two tests that decode legacy
+    // records in parallel see each other's increments, so a `before + 1` assertion reads 2 —
+    // the other half of why test_deserialize_with_fallback_bincode1_minimal_fixture "failed in
+    // company". Every test that touches the decoder's counters takes this lock.
+    static FALLBACK_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        FALLBACK_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn sample_memory(id: MemoryId, content: &str) -> Memory {
         let now = Utc::now();
         let experience = Experience {
@@ -4331,6 +4340,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_with_fallback_records_current_bincode2_branch() {
+        let _serial = counter_guard();
         let id = MemoryId(uuid::Uuid::new_v4());
         let memory = sample_memory(id.clone(), "current format memory");
         let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
@@ -4350,6 +4360,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_with_fallback_bincode1_minimal_fixture() {
+        let _serial = counter_guard();
         let id = MemoryId(uuid::Uuid::new_v4());
         let fixture = LegacyMinimalFixture {
             id: id.clone(),
@@ -4375,6 +4386,7 @@ mod tests {
     /// random id this failed on a small fraction of runs and read as order-dependent.
     #[test]
     fn test_bincode1_minimal_fixture_is_not_misread_by_a_varint_candidate() {
+        let _serial = counter_guard();
         let bytes16 = [0x2fu8, 0x4b, 0xff, 0x82, 0x3e, 0x81, 0x4a, 0x0a, 0xb3, 0x00, 0x33, 0x37, 0xeb, 0x6f, 0xf4, 0x3c];
         let id = MemoryId(uuid::Uuid::from_bytes(bytes16));
         let fixture = LegacyMinimalFixture { id: id.clone(), content: "legacy bincode1 minimal".to_string() };
@@ -4388,6 +4400,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_with_fallback_msgpack_minimal_fixture() {
+        let _serial = counter_guard();
         let id = MemoryId(uuid::Uuid::new_v4());
         let fixture = LegacyMinimalFixture {
             id: id.clone(),
