@@ -21,3 +21,5 @@ pointing back at it with `supersedes:` in the frontmatter and add
 | [0002](0002-llm-wiki-dual-pathway.md) | LLM wiki as rendered projection over veld | accepted | 2026-05-28 |
 | [0003](0003-epistemic-hygiene-location.md) | Epistemic hygiene lives in CLAUDE.md as a named section | accepted | 2026-05-28 |
 | [0004](0004-docs-sidecar-stack.md) | Docs sidecar built on mdBook + Rust generators | accepted | 2026-05-28 |
+| [0005](0005-facts-purge-and-narratives.md) | Facts purge, narratives, and the `purged_at` field | accepted | 2026-05-29 |
+| [0006](0006-backend-parity-and-on-demand-migration.md) | Backend parity and on-demand migration | proposed | 2026-09-11 |
