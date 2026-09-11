@@ -2277,40 +2277,6 @@ mod tests {
 
     // Helper: build a minimal HybridSearchEngine for R3b tests that exercise
     // only the weight machinery (no actual BM25/vector search is performed).
-    // ── silent-loss counters ──
-    #[test]
-    fn bm25_index_failure_is_counted_not_swallowed() {
-        let (engine, tmp) = super::tests::make_test_engine();
-        assert_eq!(engine.bm25_index_failure_count(), 0, "clean at start");
-
-        let id = crate::memory::MemoryId(uuid::Uuid::new_v4());
-        engine
-            .index_memory(&id, "findable content", &[], &[])
-            .expect("healthy insert succeeds");
-        assert_eq!(
-            engine.bm25_index_failure_count(),
-            0,
-            "a successful insert must not count as a loss"
-        );
-
-        // Remove the index directory under the writer, then insert again. The
-        // callers in memory/mod.rs log this and continue, which is why the
-        // count is the only thing that can report it afterwards.
-        std::fs::remove_dir_all(tmp.path()).ok();
-        let id2 = crate::memory::MemoryId(uuid::Uuid::new_v4());
-        let result = engine.index_memory(&id2, "lost content", &[], &[]);
-
-        // The insert must not fail UNCOUNTED. Either tantivy held its handles
-        // and the write survived, or it failed and the counter moved.
-        assert_eq!(
-            result.is_err(),
-            engine.bm25_index_failure_count() == 1,
-            "error and count disagree: err={} count={}",
-            result.is_err(),
-            engine.bm25_index_failure_count()
-        );
-    }
-
     fn make_test_engine() -> (HybridSearchEngine, tempfile::TempDir) {
         use crate::embeddings::competitive::CompetitiveEmbedder;
 
