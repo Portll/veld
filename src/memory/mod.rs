@@ -4901,6 +4901,24 @@ impl MemorySystem {
     /// ingest so a quality measurement reads a freshly built index rather than
     /// one mid-degradation, which would attribute an indexing artefact to
     /// retrieval.
+    /// Reconcile what is STORED against what is INDEXED.
+    ///
+    /// The failure counters beside this are the belt: they catch a loss whose
+    /// error surfaced. This is the braces, and it is strictly stronger — it
+    /// compares populations rather than trusting that every loss announced
+    /// itself. It catches a silent drop, a path that never called index at
+    /// all, an insert that returned Ok having done nothing, and a commit that
+    /// vanished, none of which produce an Err for a counter to see.
+    ///
+    /// Returns (stored, vector_indexed, lexically_indexed). A caller that
+    /// needs its corpus whole — any measurement — compares them and refuses.
+    pub fn index_coverage(&self) -> Result<(usize, usize, usize)> {
+        let stored = self.long_term_memory.get_all_ids()?.len();
+        let vector_indexed = self.retriever.len();
+        let lexically_indexed = self.hybrid_search.bm25_doc_count();
+        Ok((stored, vector_indexed, lexically_indexed))
+    }
+
     /// Index inserts lost during ingest, vector and lexical.
     ///
     /// Non-zero means memories are STORED BUT UNREACHABLE by that route: the
