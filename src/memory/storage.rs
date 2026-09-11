@@ -873,6 +873,14 @@ fn deserialize_legacy_fallback(
     let is_first_failure = !DEBUG_ENTRY_LOGGED.load(std::sync::atomic::Ordering::Relaxed);
 
     // Collect all errors for debugging
+    // Every bincode 2.x candidate below must consume the WHOLE record. decode_from_slice
+    // returns (value, bytes_read) and does not object to trailing bytes, so a varint decoder
+    // could "succeed" on a bincode 1.x fixint record: the 8-byte length prefix 10 00 00 00 00
+    // 00 00 00 reads as varint 16 followed by seven zero bytes, the uuid lands displaced by
+    // seven and zero-padded, and whether the rest parsed as a String depended on uuid byte 9 —
+    // which is why test_deserialize_with_fallback_bincode1_minimal_fixture failed on some
+    // random ids and not others and read as order-dependent. A legacy record has no trailing
+    // bytes; a partial read is a misread, not a match.
     let mut errors: Vec<(&str, String)> = Vec::new();
     errors.push(("bincode2 Memory", first_error.to_string()));
 
@@ -884,22 +892,30 @@ fn deserialize_legacy_fallback(
         data,
         bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
-        Ok((legacy, _)) => {
+        Ok((legacy, n)) if n == data.len() => {
             tracing::debug!("Migrated memory from bincode 2.x pre-W3.4 format");
             record_branch("bincode2_legacy_flat_v3");
             return Ok((legacy.into_memory(), true));
         }
+        Ok((_, n)) => errors.push((
+            "bincode2 LegacyMemoryFlatV3",
+            format!("decoded {n} of {} bytes — a legacy record has no trailing bytes, so this was a misread", data.len()),
+        )),
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV3", e.to_string())),
     }
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
     match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>()) {
-        Ok((minimal, _)) => {
+        Ok((minimal, n)) if n == data.len() => {
             tracing::debug!("Migrated memory from bincode 2.x minimal format");
             record_branch("bincode2_minimal");
             return Ok((minimal.into_memory(), true));
         }
+        Ok((_, n)) => errors.push((
+            "bincode2 MinimalMemory",
+            format!("decoded {n} of {} bytes — a legacy record has no trailing bytes, so this was a misread", data.len()),
+        )),
         Err(e) => errors.push(("bincode2 MinimalMemory", e.to_string())),
     }
 
@@ -909,11 +925,15 @@ fn deserialize_legacy_fallback(
         data,
         bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
-        Ok((typed, _)) => {
+        Ok((typed, n)) if n == data.len() => {
             tracing::debug!("Migrated memory from bincode 2.x with type prefix");
             record_branch("bincode2_type_prefix");
             return Ok((typed.into_memory(), true));
         }
+        Ok((_, n)) => errors.push((
+            "bincode2 MemoryWithTypePrefix",
+            format!("decoded {n} of {} bytes — a legacy record has no trailing bytes, so this was a misread", data.len()),
+        )),
         Err(e) => errors.push(("bincode2 MemoryWithTypePrefix", e.to_string())),
     }
 
@@ -922,11 +942,15 @@ fn deserialize_legacy_fallback(
         data,
         bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
-        Ok((legacy, _)) => {
+        Ok((legacy, n)) if n == data.len() => {
             tracing::debug!("Migrated memory from bincode 2.x pre-multimodal format");
             record_branch("bincode2_legacy_flat_v2");
             return Ok((legacy.into_memory(), true));
         }
+        Ok((_, n)) => errors.push((
+            "bincode2 LegacyMemoryFlatV2",
+            format!("decoded {n} of {} bytes — a legacy record has no trailing bytes, so this was a misread", data.len()),
+        )),
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV2", e.to_string())),
     }
 
@@ -4343,6 +4367,23 @@ mod tests {
         assert_eq!(decoded.id, id);
         assert!(is_legacy);
         assert_eq!(after, before + 1);
+    }
+
+    /// The misread, made deterministic: uuid byte 9 = 0x00 is the value that let the bincode2
+    /// MinimalMemory candidate read the bincode1 fixint prefix as a 16-byte id and an empty
+    /// content, and decode_from_slice's tolerance of trailing bytes let it return Ok. With a
+    /// random id this failed on a small fraction of runs and read as order-dependent.
+    #[test]
+    fn test_bincode1_minimal_fixture_is_not_misread_by_a_varint_candidate() {
+        let bytes16 = [0x2fu8, 0x4b, 0xff, 0x82, 0x3e, 0x81, 0x4a, 0x0a, 0xb3, 0x00, 0x33, 0x37, 0xeb, 0x6f, 0xf4, 0x3c];
+        let id = MemoryId(uuid::Uuid::from_bytes(bytes16));
+        let fixture = LegacyMinimalFixture { id: id.clone(), content: "legacy bincode1 minimal".to_string() };
+        let bytes = bincode1::serialize(&fixture).unwrap();
+
+        let (decoded, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
+        assert_eq!(decoded.id, id, "the id came back displaced: a varint candidate misread the fixint prefix");
+        assert_eq!(decoded.experience.content, "legacy bincode1 minimal");
+        assert!(is_legacy);
     }
 
     #[test]
