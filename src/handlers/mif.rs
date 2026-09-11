@@ -52,9 +52,13 @@ pub async fn export_mif(
     let memory_sys = state
         .get_user_memory(&user_id)
         .map_err(AppError::Internal)?;
+    // Every read below feeds the exported document. Swallowing a store-read error here (the old
+    // unwrap_or_default) let an export "succeed" while silently omitting memories, todos,
+    // projects or reminders — the worst shape of loss, because the caller holds a backup with
+    // no sign it is partial. A failed read fails the export (shodh-memory 9233dcd).
     let memories = {
         let guard = memory_sys.read();
-        guard.get_all_memories().unwrap_or_default()
+        guard.get_all_memories().map_err(AppError::Internal)?
     };
 
     let graph = if req.include_graph {
@@ -66,14 +70,17 @@ pub async fn export_mif(
     let todos = state
         .todo_store
         .list_todos_for_user(&user_id, None)
-        .unwrap_or_default();
+        .map_err(AppError::Internal)?;
 
-    let projects = state.todo_store.list_projects(&user_id).unwrap_or_default();
+    let projects = state
+        .todo_store
+        .list_projects(&user_id)
+        .map_err(AppError::Internal)?;
 
     let reminders = state
         .prospective_store
         .list_for_user(&user_id, None)
-        .unwrap_or_default();
+        .map_err(AppError::Internal)?;
 
     let since = req
         .since
@@ -542,4 +549,34 @@ pub async fn get_uncompressed_old(
         .collect();
 
     Ok(Json(RetrieveResponse { memories, count }))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handlers::test_helpers::{self, TestHarness};
+    use crate::memory::{Experience, Project};
+    use axum::http::StatusCode;
+
+    /// Happy path: the export carries the real seeded memory and project, not an empty document.
+    #[tokio::test]
+    async fn export_mif_returns_real_data() {
+        let harness = TestHarness::new();
+        let user_id = "mif-export-user";
+        {
+            let memory = harness.manager.get_user_memory(user_id).unwrap();
+            let guard = memory.read();
+            guard
+                .remember(Experience { content: "MIF export happy-path memory".to_string(), ..Default::default() }, None)
+                .unwrap();
+        }
+        let project = Project::new(user_id.to_string(), "Export Test Project".to_string());
+        harness.manager.todo_store.store_project(&project).unwrap();
+
+        let req = test_helpers::post_json("/api/export/mif", &serde_json::json!({ "user_id": user_id }));
+        let (status, body) = test_helpers::send(harness.router(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["memories"].as_array().unwrap().len(), 1, "export must include the seeded memory");
+        assert_eq!(body["projects"].as_array().unwrap().len(), 1, "export must include the seeded project");
+        assert_eq!(body["projects"][0]["name"], "Export Test Project");
+    }
 }
