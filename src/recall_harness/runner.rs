@@ -403,11 +403,12 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
     // record the memory system writes when it chooses its primary. This used to be the
     // constant EMBEDDER_ID, so a run under VELD_EMBEDDER=http (a binary, not cfg(test))
     // would have labelled nomic vectors "minilm-l6-v2" and compare_to_baseline's embedder
-    // guard would have had nothing true to read. The constant remains the fallback for a
-    // report built before any memory system existed.
+    // guard would have had nothing true to read. When no record exists the report says
+    // EMBEDDER_UNKNOWN — not the constant, which would be the same defect with a narrower
+    // entrance: a plausible label the guard accepts. Unknown is a value the guard refuses.
     let embedder = crate::embeddings::primary_embedder_info()
         .map(|info| info.model)
-        .unwrap_or_else(|| EMBEDDER_ID.to_string());
+        .unwrap_or_else(|| crate::recall_harness::report::EMBEDDER_UNKNOWN.to_string());
 
     let report = Report {
         suite: inputs.suite.clone(),
