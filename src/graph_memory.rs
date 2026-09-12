@@ -7309,6 +7309,105 @@ mod tests {
         );
     }
 
+    // ── Recovered from tests/graph_memory_tests.rs ────────────────────────────
+    //
+    // strengthen() and decay() are pub(crate); tests/ is a separate crate, so
+    // that file could never compile and these cases never ran — from the commit
+    // that introduced both, 2026-04-08. Moved here rather than widening the API,
+    // because the pub(crate) boundary is the thing that forces external callers
+    // through apply_reinforcement instead of writing edge.strength directly.
+    //
+    // Only the cases with no in-crate equivalent were brought across; the rest
+    // were duplicates and were deleted with the file's test half.
+
+    #[test]
+    fn test_strengthen_increases_strength() {
+        let mut edge = create_test_edge(0.5, 0);
+        let initial_strength = edge.strength;
+
+        let _ = edge.strengthen();
+
+        assert!(
+            edge.strength > initial_strength,
+            "Strength should increase after strengthening: {} -> {}",
+            initial_strength,
+            edge.strength
+        );
+        assert_eq!(edge.activation_count, 1, "Activation count should be 1");
+    }
+
+    #[test]
+    fn test_strengthen_asymptotic_approach_to_one() {
+        // The ceiling holds from an already-high base: five more activations
+        // must still move it up and must never cross 1.0.
+        let mut edge = create_test_edge(0.9, 0);
+
+        for _ in 0..5 {
+            let _ = edge.strengthen();
+        }
+
+        assert!(
+            edge.strength <= 1.0,
+            "Strength should not exceed 1.0, got {}",
+            edge.strength
+        );
+        assert!(
+            edge.strength > 0.9,
+            "Strength should increase even from a high base, got {}",
+            edge.strength
+        );
+    }
+
+    #[test]
+    fn test_strengthen_diminishing_returns() {
+        // The same single activation must buy less the stronger the edge
+        // already is — the property that keeps repetition from saturating
+        // every edge to the ceiling.
+        let mut low_edge = create_test_edge(0.2, 0);
+        let low_initial = low_edge.strength;
+        let _ = low_edge.strengthen();
+        let low_increase = low_edge.strength - low_initial;
+
+        let mut high_edge = create_test_edge(0.8, 0);
+        let high_initial = high_edge.strength;
+        let _ = high_edge.strengthen();
+        let high_increase = high_edge.strength - high_initial;
+
+        assert!(
+            low_increase > high_increase,
+            "Low-strength edge should gain more: {low_increase} > {high_increase}"
+        );
+    }
+
+    #[test]
+    fn test_burst_ltp_negative_boundary_at_l1() {
+        // Adds two things the neighbouring tests do not cover:
+        // test_ltp_threshold_potentiation checks 0 and 10, and
+        // test_pipe4_burst_to_full_upgrade checks 5 at L2. Neither asserts the
+        // step BELOW the burst threshold, which is where an off-by-one lands,
+        // and neither walks the L1 tier into Burst.
+        let mut edge = create_test_edge(0.5, 0);
+        assert!(
+            !edge.is_potentiated(),
+            "Edge should not be potentiated initially"
+        );
+
+        for _ in 0..4 {
+            let _ = edge.strengthen();
+        }
+        assert!(
+            !edge.is_potentiated(),
+            "Edge must not be potentiated at 4 activations (burst threshold is 5)"
+        );
+
+        let _ = edge.strengthen();
+        assert!(
+            edge.is_potentiated(),
+            "Edge should be potentiated at 5 activations (Burst LTP), got {:?}",
+            edge.ltp_status
+        );
+    }
+
     #[test]
     fn test_pipe4_burst_ltp_detection() {
         // Create an L2 edge with low strength to avoid early tier promotion
