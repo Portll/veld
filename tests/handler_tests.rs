@@ -21,7 +21,9 @@ use tower::ServiceExt;
 
 use veld::{
     config::ServerConfig,
-    handlers::{build_protected_routes, build_public_routes, MultiUserMemoryManager},
+    handlers::{
+        build_probe_routes, build_protected_routes, build_public_routes, MultiUserMemoryManager,
+    },
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -65,11 +67,12 @@ impl Harness {
 
     fn app(&self) -> Router {
         // Mirror main.rs: auth middleware only wraps protected routes.
+        let probes = build_probe_routes(self.mgr.clone());
         let public = build_public_routes(self.mgr.clone(), false);
         let protected = build_protected_routes(self.mgr.clone(), false).layer(axum::middleware::from_fn(
             veld::auth::auth_middleware,
         ));
-        Router::new().merge(public).merge(protected)
+        Router::new().merge(probes).merge(public).merge(protected)
     }
 }
 
@@ -242,8 +245,46 @@ async fn health_ready() {
 #[tokio::test]
 async fn health_index() {
     let h = Harness::new();
-    let (status, _) = json_of(h.app(), authed_get("/health/index?user_id=test-user")).await;
+    let (status, body) = json_of(h.app(), authed_get("/health/index?user_id=test-user")).await;
     assert_eq!(status, StatusCode::OK);
+    // The aggregate must carry the reconciliation counts, and must count an
+    // unreadable coverage separately rather than folding it into "no shortfall".
+    for field in [
+        "users_checked",
+        "users_with_index_shortfall_count",
+        "users_coverage_unreadable_count",
+    ] {
+        assert!(
+            body.get(field).and_then(|v| v.as_u64()).is_some(),
+            "aggregate index health is missing {field}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn health_index_user_reports_coverage() {
+    let h = Harness::new();
+    let (status, body) = json_of(h.app(), authed_get("/api/health/index?user_id=test-user")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let cov = body
+        .get("index_coverage")
+        .unwrap_or_else(|| panic!("per-user index health is missing index_coverage: {body}"));
+    let n = |k: &str| {
+        cov.get(k)
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| panic!("index_coverage.{k} missing or not a number: {cov}"))
+    };
+    let (stored, vector_indexed, lexically_indexed) =
+        (n("stored"), n("vector_indexed"), n("lexically_indexed"));
+
+    // The flag must be derived from these three numbers, not from something
+    // else that happens to be false here.
+    assert_eq!(
+        cov.get("shortfall").and_then(|v| v.as_bool()),
+        Some(vector_indexed < stored || lexically_indexed < stored),
+        "shortfall flag disagrees with the counts it summarises: {cov}"
+    );
 }
 
 #[tokio::test]
