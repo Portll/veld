@@ -238,6 +238,8 @@ pub async fn health_index(
     let mut total_incremental: usize = 0;
     let mut users_checked: usize = 0;
     let mut users_needing_rebuild: usize = 0;
+    let mut users_with_shortfall: usize = 0;
+    let mut users_coverage_unreadable: usize = 0;
     for user_id in state.list_cached_users() {
         if let Ok(memory) = state.get_user_memory(&user_id) {
             let guard = memory.read();
@@ -246,6 +248,16 @@ pub async fn health_index(
             total_incremental += h.incremental_inserts;
             if h.needs_rebuild {
                 users_needing_rebuild += 1;
+            }
+            // Stored-vs-indexed, counted the same aggregate way as the rebuild
+            // flag above. An unreadable coverage is its own count, never folded
+            // into "no shortfall".
+            match guard.index_coverage() {
+                Ok((stored, vec_idx, lex_idx)) if vec_idx < stored || lex_idx < stored => {
+                    users_with_shortfall += 1
+                }
+                Ok(_) => {}
+                Err(_) => users_coverage_unreadable += 1,
             }
             users_checked += 1;
         }
@@ -259,6 +271,8 @@ pub async fn health_index(
             "total_vectors": total_vectors,
             "total_incremental_inserts": total_incremental,
             "users_needing_rebuild_count": users_needing_rebuild,
+            "users_with_index_shortfall_count": users_with_shortfall,
+            "users_coverage_unreadable_count": users_coverage_unreadable,
             "rebuild_threshold": crate::vector_db::vamana::REBUILD_THRESHOLD,
             "timestamp": chrono::Utc::now().to_rfc3339()
         })),
@@ -283,11 +297,21 @@ pub async fn health_index_user(
         .map_err(AppError::Internal)?;
     let guard = memory.read();
     let health = guard.index_health();
+    // Populations, not error counts: a memory stored and never indexed is
+    // unretrievable and raises nothing for a counter to see.
+    let coverage = guard.index_coverage().map_err(AppError::Internal)?;
+    let (stored, vector_indexed, lexically_indexed) = coverage;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
             "user_id": user_id,
+            "index_coverage": {
+                "stored": stored,
+                "vector_indexed": vector_indexed,
+                "lexically_indexed": lexically_indexed,
+                "shortfall": vector_indexed < stored || lexically_indexed < stored,
+            },
             "total_vectors": health.total_vectors,
             "incremental_inserts": health.incremental_inserts,
             "needs_rebuild": health.needs_rebuild,
