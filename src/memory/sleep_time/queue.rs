@@ -1,6 +1,6 @@
 //! Persistent debounced work queue for sleep-time triggers.
 //!
-//! Queue items live in the `sleep_time_queue` RocksDB column family so
+//! Queue items live in the `sleep_time_queue` column family so
 //! triggers survive process restart. Workers claim items with a time-bounded
 //! lease (R3) — if a worker dies mid-process the claim expires and the item
 //! is re-claimable.
@@ -14,12 +14,11 @@
 //!     introduced the bump owns the migration.
 //!
 //! Key layout: `{user_id}:{iso8601_enqueued_at}:{item_id}` — sorts items
-//! chronologically per-user via RocksDB's lexicographic ordering, which makes
+//! chronologically per-user via the store's lexicographic ordering, which makes
 //! `claim_next_for_user` a cheap prefix scan that returns the oldest first.
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, DB};
 use std::sync::Arc;
 
 use super::types::{QueueItem, SleepMode, SleepTimeTrigger, QUEUE_ITEM_SCHEMA_VERSION};
@@ -38,27 +37,12 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
-        let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        vec![ColumnFamilyDescriptor::new(CF_SLEEP_TIME_QUEUE, opts)]
-    }
-
-    pub fn new(db: Arc<DB>) -> Self {
-        Self {
-            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
-                db,
-                CF_SLEEP_TIME_QUEUE,
-            )),
-        }
-    }
-
     /// Bind a handle directly — the constructor a backend-agnostic caller uses.
     pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
         Self { store }
     }
 
-    /// Build the RocksDB key for an item. The middle component is the
+    /// Build the storage key for an item. The middle component is the
     /// enqueued_at timestamp in lexicographically-sortable form so `next_*`
     /// scans return oldest-first.
     fn key(item: &QueueItem) -> String {
@@ -323,111 +307,128 @@ fn decode_item(bytes: &[u8]) -> Result<Option<QueueItem>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StorageBackend;
+    use crate::storage::test_support::{assert_both_backends, column_stores};
+    use crate::storage::FamilyKeyValueStore;
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    fn open_test_db() -> (Arc<DB>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        let cfs = Queue::cf_descriptors();
-        let db = DB::open_cf_descriptors(&db_opts, tmp.path(), cfs).unwrap();
-        (Arc::new(db), tmp)
+    fn queues() -> Vec<(StorageBackend, Queue, TempDir)> {
+        let out: Vec<_> = column_stores(&[CF_SLEEP_TIME_QUEUE])
+            .into_iter()
+            .map(|(backend, column, tmp)| {
+                let kv = FamilyKeyValueStore::new(column, CF_SLEEP_TIME_QUEUE).unwrap();
+                (backend, Queue::with_store(Arc::new(kv)), tmp)
+            })
+            .collect();
+        assert_both_backends(&out);
+        out
     }
 
     #[test]
     fn enqueue_then_scan_returns_item() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
-        let item = QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem);
-        q.enqueue(item.clone()).unwrap();
-        let scanned = q.scan_user("alice").unwrap();
-        assert_eq!(scanned.len(), 1);
-        assert_eq!(scanned[0].id, item.id);
+        for (backend, q, _tmp) in queues() {
+            let item = QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem);
+            q.enqueue(item.clone()).unwrap();
+            let scanned = q.scan_user("alice").unwrap();
+            assert_eq!(scanned.len(), 1, "{backend:?}");
+            assert_eq!(scanned[0].id, item.id, "{backend:?}");
+        }
     }
 
     #[test]
     fn enqueue_debounced_drops_duplicates() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
-        let first = q
-            .enqueue_debounced("u", SleepMode::Nrem, SleepTimeTrigger::Idle, Duration::seconds(60))
-            .unwrap();
-        assert!(first.is_some());
-        let second = q
-            .enqueue_debounced("u", SleepMode::Nrem, SleepTimeTrigger::Idle, Duration::seconds(60))
-            .unwrap();
-        assert!(second.is_none(), "duplicate within window should be dropped");
-        // Different mode bypasses the debounce.
-        let third = q
-            .enqueue_debounced("u", SleepMode::Rem, SleepTimeTrigger::Idle, Duration::seconds(60))
-            .unwrap();
-        assert!(third.is_some());
+        for (backend, q, _tmp) in queues() {
+            let first = q
+                .enqueue_debounced("u", SleepMode::Nrem, SleepTimeTrigger::Idle, Duration::seconds(60))
+                .unwrap();
+            assert!(first.is_some(), "{backend:?}");
+            let second = q
+                .enqueue_debounced("u", SleepMode::Nrem, SleepTimeTrigger::Idle, Duration::seconds(60))
+                .unwrap();
+            assert!(second.is_none(), "{backend:?}: duplicate within window should be dropped");
+            // Different mode bypasses the debounce.
+            let third = q
+                .enqueue_debounced("u", SleepMode::Rem, SleepTimeTrigger::Idle, Duration::seconds(60))
+                .unwrap();
+            assert!(third.is_some(), "{backend:?}");
+        }
     }
 
     #[test]
     fn claim_then_release_makes_re_claimable() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
-        let item = QueueItem::new("u", SleepTimeTrigger::Manual, SleepMode::Nrem);
-        let stored = q.enqueue(item).unwrap();
+        for (backend, q, _tmp) in queues() {
+            let item = QueueItem::new("u", SleepTimeTrigger::Manual, SleepMode::Nrem);
+            let stored = q.enqueue(item).unwrap();
 
-        let claimed = q.claim(&stored, "worker-1", 300).unwrap().unwrap();
-        assert_eq!(claimed.claimed_by.as_deref(), Some("worker-1"));
-        // Re-claim attempt should fail while leased.
-        let racey = q.claim(&claimed, "worker-2", 300).unwrap();
-        assert!(racey.is_none());
+            let claimed = q.claim(&stored, "worker-1", 300).unwrap().unwrap();
+            assert_eq!(claimed.claimed_by.as_deref(), Some("worker-1"), "{backend:?}");
+            // Re-claim attempt should fail while leased.
+            let racey = q.claim(&claimed, "worker-2", 300).unwrap();
+            assert!(racey.is_none(), "{backend:?}: a leased item was claimed twice");
 
-        q.release(&claimed).unwrap();
-        let re_claimed = q.claim(&claimed, "worker-2", 300).unwrap().unwrap();
-        assert_eq!(re_claimed.claimed_by.as_deref(), Some("worker-2"));
+            q.release(&claimed).unwrap();
+            let re_claimed = q.claim(&claimed, "worker-2", 300).unwrap().unwrap();
+            assert_eq!(re_claimed.claimed_by.as_deref(), Some("worker-2"), "{backend:?}");
+        }
     }
 
     #[test]
     fn complete_removes_item() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
-        let stored = q
-            .enqueue(QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Nrem))
-            .unwrap();
-        let claimed = q.claim(&stored, "w", 60).unwrap().unwrap();
-        q.complete(&claimed).unwrap();
-        assert_eq!(q.scan_user("u").unwrap().len(), 0);
+        for (backend, q, _tmp) in queues() {
+            let stored = q
+                .enqueue(QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Nrem))
+                .unwrap();
+            let claimed = q.claim(&stored, "w", 60).unwrap().unwrap();
+            q.complete(&claimed).unwrap();
+            assert_eq!(q.scan_user("u").unwrap().len(), 0, "{backend:?}");
+        }
     }
 
     #[test]
     fn cold_start_purge_drops_old_items() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
+        for (backend, q, _tmp) in queues() {
+            let mut ancient = QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Nrem);
+            ancient.enqueued_at = Utc::now() - Duration::days(7);
+            q.enqueue(ancient).unwrap();
 
-        let mut ancient = QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Nrem);
-        ancient.enqueued_at = Utc::now() - Duration::days(7);
-        q.enqueue(ancient).unwrap();
+            let fresh = QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Rem);
+            q.enqueue(fresh).unwrap();
 
-        let fresh = QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Rem);
-        q.enqueue(fresh).unwrap();
-
-        let purged = q.cold_start_purge(Duration::hours(2)).unwrap();
-        assert_eq!(purged, 1);
-        let left = q.scan_user("u").unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].mode, SleepMode::Rem);
+            let purged = q.cold_start_purge(Duration::hours(2)).unwrap();
+            assert_eq!(purged, 1, "{backend:?}");
+            let left = q.scan_user("u").unwrap();
+            assert_eq!(left.len(), 1, "{backend:?}");
+            assert_eq!(left[0].mode, SleepMode::Rem, "{backend:?}");
+        }
     }
 
     #[test]
     fn distinct_users_returns_unique_set() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
-        q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem))
-            .unwrap();
-        q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Rem))
-            .unwrap();
-        q.enqueue(QueueItem::new("bob", SleepTimeTrigger::Manual, SleepMode::Nrem))
-            .unwrap();
-        let mut users = q.distinct_users().unwrap();
-        users.sort();
-        assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+        for (backend, q, _tmp) in queues() {
+            q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem))
+                .unwrap();
+            q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Rem))
+                .unwrap();
+            q.enqueue(QueueItem::new("bob", SleepTimeTrigger::Manual, SleepMode::Nrem))
+                .unwrap();
+            let mut users = q.distinct_users().unwrap();
+            users.sort();
+            assert_eq!(users, vec!["alice".to_string(), "bob".to_string()], "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn scan_user_does_not_leak_a_neighbouring_prefix() {
+        // `al:` must not match `alice:` rows; the bound is the store's, not a hand break.
+        for (backend, q, _tmp) in queues() {
+            q.enqueue(QueueItem::new("alice", SleepTimeTrigger::Idle, SleepMode::Nrem))
+                .unwrap();
+            q.enqueue(QueueItem::new("al", SleepTimeTrigger::Idle, SleepMode::Nrem))
+                .unwrap();
+            assert_eq!(q.scan_user("al").unwrap().len(), 1, "{backend:?}");
+            assert_eq!(q.pending_count("alice").unwrap(), 1, "{backend:?}");
+        }
     }
 
     #[test]
@@ -449,16 +450,16 @@ mod tests {
 
     #[test]
     fn next_unclaimed_returns_oldest_first() {
-        let (db, _tmp) = open_test_db();
-        let q = Queue::new(db);
-        // Insert in non-monotonic order; scan should still return oldest first.
-        let mut newer = QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Nrem);
-        newer.enqueued_at = Utc::now();
-        let mut older = QueueItem::new("u", SleepTimeTrigger::Manual, SleepMode::Rem);
-        older.enqueued_at = Utc::now() - Duration::minutes(10);
-        q.enqueue(newer).unwrap();
-        q.enqueue(older.clone()).unwrap();
-        let next = q.next_unclaimed().unwrap().unwrap();
-        assert_eq!(next.id, older.id);
+        for (backend, q, _tmp) in queues() {
+            // Insert in non-monotonic order; scan should still return oldest first.
+            let mut newer = QueueItem::new("u", SleepTimeTrigger::Idle, SleepMode::Nrem);
+            newer.enqueued_at = Utc::now();
+            let mut older = QueueItem::new("u", SleepTimeTrigger::Manual, SleepMode::Rem);
+            older.enqueued_at = Utc::now() - Duration::minutes(10);
+            q.enqueue(newer).unwrap();
+            q.enqueue(older.clone()).unwrap();
+            let next = q.next_unclaimed().unwrap().unwrap();
+            assert_eq!(next.id, older.id, "{backend:?}");
+        }
     }
 }

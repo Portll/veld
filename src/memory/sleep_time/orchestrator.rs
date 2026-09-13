@@ -1,16 +1,16 @@
 //! Public surface for sleep-time / observational memory.
 //!
 //! [`SleepTimeOrchestrator`] owns:
-//!   - the persistent [`Queue`] (RocksDB CF)
-//!   - the [`BudgetTracker`] (per-user + global, RocksDB CF)
+//!   - the persistent [`Queue`] (one storage family)
+//!   - the [`BudgetTracker`] (per-user + global families)
 //!   - the in-memory [`DebounceTracker`]
 //!   - the [`Rewriter`] (production: Anthropic; tests: Mock)
 //!   - the [`tokio_util::sync::CancellationToken`] used to drain workers on
 //!     shutdown (R3 + R36)
 //!   - the spawned [`tokio::task`] worker handles
 //!
-//! The orchestrator is bootstrapped once from `AppState::bootstrap` with the
-//! shared RocksDB instance and the `Arc<MemorySystem>` it operates against.
+//! The orchestrator is bootstrapped once from `AppState::bootstrap` with a
+//! column store over the shared database and the `Arc<MemorySystem>` it operates against.
 //! It deliberately exposes a *small* API: enqueue triggers, query status,
 //! toggle locks, shutdown.
 
@@ -21,11 +21,12 @@ use std::sync::{Arc, Weak};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::graduation::GraduationStore;
+use super::graduation::{GraduationStore, CF_SLEEP_TIME_GRADUATIONS};
 use super::policies::{BudgetTracker, DebounceTracker, PolicyLimits};
-use super::queue::Queue;
+use super::queue::{Queue, CF_SLEEP_TIME_QUEUE};
 use super::rewriter::Rewriter;
-use super::supersession::SupersessionStore;
+use super::supersession::{SupersessionStore, CF_SLEEP_TIME_SUPERSESSIONS};
+use crate::storage::FamilyKeyValueStore;
 use super::types::{BudgetState, SleepMode, SleepTimeResult, SleepTimeTrigger};
 use crate::config::SleepTimeConfig;
 use crate::user_memory::SharedUserMemory;
@@ -109,7 +110,7 @@ impl SleepTimeOrchestrator {
     /// started, will observe `enabled=false` and skip processing.
     pub fn new(
         config: SleepTimeConfig,
-        db: Arc<rocksdb::DB>,
+        column: Arc<dyn crate::storage::ColumnStore>,
         manager: Weak<MultiUserMemoryManager>,
         block_store: Arc<ContextBlockStore>,
         rewriter: Rewriter,
@@ -123,14 +124,20 @@ impl SleepTimeOrchestrator {
             debounce_secs: config.debounce_secs,
         };
 
+        let family = |cf: &str| -> Result<Arc<dyn crate::storage::KeyValueStore>> {
+            Ok(Arc::new(FamilyKeyValueStore::new(Arc::clone(&column), cf)?))
+        };
+
         let (tx, rx) = watch::channel(false);
         Ok(Self {
-            queue: Arc::new(Queue::new(db.clone())),
-            budget: Arc::new(BudgetTracker::new(db.clone(), limits)),
+            queue: Arc::new(Queue::with_store(family(CF_SLEEP_TIME_QUEUE)?)),
+            budget: Arc::new(BudgetTracker::with_store(Arc::clone(&column), limits)?),
             debounce: Arc::new(DebounceTracker::new(config.debounce_secs)),
             rewriter: Arc::new(rewriter),
-            graduation: Arc::new(GraduationStore::new(db.clone())),
-            supersession: Arc::new(SupersessionStore::new(db)),
+            graduation: Arc::new(GraduationStore::with_store(family(CF_SLEEP_TIME_GRADUATIONS)?)),
+            supersession: Arc::new(SupersessionStore::with_store(family(
+                CF_SLEEP_TIME_SUPERSESSIONS,
+            )?)),
             manager,
             block_store,
             cancel_tx: Arc::new(tx),
@@ -284,7 +291,7 @@ impl SleepTimeOrchestrator {
             anyhow::bail!("sleep-time orchestrator is shutting down");
         }
 
-        // In-memory dedup first — cheap and avoids a RocksDB read on storm.
+        // In-memory dedup first — cheap and avoids a store read on storm.
         if self.debounce.should_debounce(user_id, mode) {
             tracing::debug!(
                 user_id = user_id,
@@ -367,7 +374,71 @@ impl SleepTimeOrchestrator {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::SleepTimeProfile;
+    use super::*;
+    use crate::config::{SleepTimeProfile, StorageBackend};
+    use crate::memory::context_blocks::CF_CONTEXT_BLOCKS;
+    use crate::memory::sleep_time::policies::{CF_SLEEP_TIME_BUDGET, CF_SLEEP_TIME_GLOBAL_BUDGET};
+    use crate::memory::types::MemoryId;
+    use crate::storage::test_support::{assert_both_backends, column_stores};
+
+    const FAMILIES: [&str; 6] = [
+        CF_SLEEP_TIME_QUEUE,
+        CF_SLEEP_TIME_BUDGET,
+        CF_SLEEP_TIME_GLOBAL_BUDGET,
+        CF_SLEEP_TIME_GRADUATIONS,
+        CF_SLEEP_TIME_SUPERSESSIONS,
+        CF_CONTEXT_BLOCKS,
+    ];
+
+    fn orchestrator(column: Arc<dyn crate::storage::ColumnStore>) -> Result<SleepTimeOrchestrator> {
+        let blocks = ContextBlockStore::with_store(Arc::new(FamilyKeyValueStore::new(
+            Arc::clone(&column),
+            CF_CONTEXT_BLOCKS,
+        )?));
+        SleepTimeOrchestrator::new(
+            SleepTimeProfile::Balanced.to_config(),
+            column,
+            Weak::new(),
+            Arc::new(blocks),
+            Rewriter::Mock(super::super::rewriter::MockRewriter::new("mock")),
+        )
+    }
+
+    #[test]
+    fn constructs_over_one_column_store_on_both_backends() {
+        let stores = column_stores(&FAMILIES);
+        assert_both_backends(&stores);
+        for (backend, column, _tmp) in stores {
+            let orch = orchestrator(Arc::clone(&column)).unwrap();
+
+            assert!(orch.enqueue("u", SleepMode::Nrem, SleepTimeTrigger::Idle).unwrap(), "{backend:?}");
+            let status = orch.status().unwrap();
+            assert_eq!((status.queue_pending_total, status.distinct_users_in_queue), (1, 1), "{backend:?}");
+            assert_eq!(orch.user_status("u").unwrap().budget.calls_today, 0, "{backend:?}");
+
+            let (new, old) = (MemoryId(uuid::Uuid::new_v4()), MemoryId(uuid::Uuid::new_v4()));
+            orch.graduation_store().record_graduation(&new, 3).unwrap();
+            orch.supersession_store().record(&new, &old, 0.9).unwrap();
+
+            // Each store landed in its own family of THIS database, read back raw.
+            let queue_rows = column.scan_cf(CF_SLEEP_TIME_QUEUE, None, None).unwrap();
+            assert_eq!(queue_rows.len(), 1, "{backend:?}: queue row not in its family");
+            assert!(column.get_cf(CF_SLEEP_TIME_GRADUATIONS, new.0.as_bytes()).unwrap().is_some(), "{backend:?}");
+            assert_eq!(column.scan_cf(CF_SLEEP_TIME_SUPERSESSIONS, None, None).unwrap().len(), 2, "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn a_rocksdb_database_without_the_families_refuses_at_construction() {
+        for (backend, column, _tmp) in column_stores(&[CF_CONTEXT_BLOCKS]) {
+            let built = orchestrator(column);
+            match backend {
+                StorageBackend::RocksDb => assert!(built.is_err(), "missing families must fail construction, not first use"),
+                // redb tables are created on declaration, so the same call succeeds.
+                StorageBackend::Redb => assert!(built.is_ok(), "{:?}", built.err()),
+            }
+        }
+    }
 
     #[test]
     fn profile_disabled_disables_config() {

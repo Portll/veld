@@ -12,7 +12,7 @@
 //! interior-mutable. Working- and session-tier memories are held as
 //! `Arc<Memory>` and mutating their `experience.metadata` would require
 //! replacing the entire memory in the tier map — a much wider blast radius
-//! than necessary. A small per-memory registry in its own RocksDB column
+//! than necessary. A small per-memory registry in its own column
 //! family ("sleep_time_graduations") gives O(1) lookup and zero coupling
 //! to the memory-mutation API.
 //!
@@ -24,7 +24,6 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -53,24 +52,6 @@ pub struct GraduationStore {
 }
 
 impl GraduationStore {
-    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
-        let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        vec![ColumnFamilyDescriptor::new(
-            CF_SLEEP_TIME_GRADUATIONS,
-            opts,
-        )]
-    }
-
-    pub fn new(db: Arc<DB>) -> Self {
-        Self {
-            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
-                db,
-                CF_SLEEP_TIME_GRADUATIONS,
-            )),
-        }
-    }
-
     /// Bind a handle directly — the constructor a backend-agnostic caller uses.
     pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
         Self { store }
@@ -166,7 +147,7 @@ pub struct GraduationPassResult {
 /// Intended to be called from the heavy maintenance cycle; the existing
 /// `MemorySystem` access-count tracker is the authoritative input. The
 /// call is cheap: a single linear scan over `get_all_memories()` plus one
-/// RocksDB read per observation and one RocksDB write per *new* graduation.
+/// store read per observation and one store write per *new* graduation.
 pub fn graduate_eligible_observations(
     mem_sys: &MemorySystem,
     store: &GraduationStore,
@@ -242,18 +223,23 @@ pub fn effective_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StorageBackend;
     use crate::memory::types::Experience;
+    use crate::storage::test_support::{assert_both_backends, column_stores};
+    use crate::storage::FamilyKeyValueStore;
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    fn open_test_db() -> (Arc<DB>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        let cfs = GraduationStore::cf_descriptors();
-        let db = DB::open_cf_descriptors(&db_opts, tmp.path(), cfs).unwrap();
-        (Arc::new(db), tmp)
+    fn stores() -> Vec<(StorageBackend, GraduationStore, TempDir)> {
+        let out: Vec<_> = column_stores(&[CF_SLEEP_TIME_GRADUATIONS])
+            .into_iter()
+            .map(|(backend, column, tmp)| {
+                let kv = FamilyKeyValueStore::new(column, CF_SLEEP_TIME_GRADUATIONS).unwrap();
+                (backend, GraduationStore::with_store(Arc::new(kv)), tmp)
+            })
+            .collect();
+        assert_both_backends(&out);
+        out
     }
 
     fn fresh_id() -> MemoryId {
@@ -271,76 +257,82 @@ mod tests {
 
     #[test]
     fn not_graduated_when_registry_empty() {
-        let (db, _tmp) = open_test_db();
-        let store = GraduationStore::new(db);
-        assert!(!store.is_graduated(&fresh_id()));
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            assert!(!store.is_graduated(&fresh_id()));
+        }
     }
 
     #[test]
     fn record_and_lookup_round_trip() {
-        let (db, _tmp) = open_test_db();
-        let store = GraduationStore::new(db);
-        let id = fresh_id();
-        store.record_graduation(&id, 5).unwrap();
-        assert!(store.is_graduated(&id));
-        let rec = store.get(&id).unwrap().unwrap();
-        assert_eq!(rec.access_count_at_graduation, 5);
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let id = fresh_id();
+            store.record_graduation(&id, 5).unwrap();
+            assert!(store.is_graduated(&id));
+            let rec = store.get(&id).unwrap().unwrap();
+            assert_eq!(rec.access_count_at_graduation, 5);
+        }
     }
 
     #[test]
     fn record_is_idempotent_and_updates_access_count() {
-        let (db, _tmp) = open_test_db();
-        let store = GraduationStore::new(db);
-        let id = fresh_id();
-        store.record_graduation(&id, 3).unwrap();
-        store.record_graduation(&id, 9).unwrap(); // re-graduation overwrites
-        let rec = store.get(&id).unwrap().unwrap();
-        assert_eq!(rec.access_count_at_graduation, 9);
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let id = fresh_id();
+            store.record_graduation(&id, 3).unwrap();
+            store.record_graduation(&id, 9).unwrap(); // re-graduation overwrites
+            let rec = store.get(&id).unwrap().unwrap();
+            assert_eq!(rec.access_count_at_graduation, 9);
+        }
     }
 
     #[test]
     fn forget_removes_from_registry() {
-        let (db, _tmp) = open_test_db();
-        let store = GraduationStore::new(db);
-        let id = fresh_id();
-        store.record_graduation(&id, 3).unwrap();
-        assert!(store.forget(&id).unwrap());
-        assert!(!store.is_graduated(&id));
-        assert!(!store.forget(&id).unwrap()); // second forget is a no-op
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let id = fresh_id();
+            store.record_graduation(&id, 3).unwrap();
+            assert!(store.forget(&id).unwrap());
+            assert!(!store.is_graduated(&id));
+            assert!(!store.forget(&id).unwrap()); // second forget is a no-op
+        }
     }
 
     #[test]
     fn effective_origin_overrides_observation_when_graduated() {
-        let (db, _tmp) = open_test_db();
-        let store = GraduationStore::new(db);
-        let id = fresh_id();
-        let exp = observation_experience();
-        // Pre-graduation: stays Observation.
-        assert_eq!(
-            effective_origin(&id, &exp, &store),
-            MemoryOrigin::BackgroundSleepTimeObservation
-        );
-        store.record_graduation(&id, 3).unwrap();
-        // Post-graduation: upgrades to Graduated.
-        assert_eq!(
-            effective_origin(&id, &exp, &store),
-            MemoryOrigin::BackgroundSleepTimeGraduated
-        );
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let id = fresh_id();
+            let exp = observation_experience();
+            // Pre-graduation: stays Observation.
+            assert_eq!(
+                effective_origin(&id, &exp, &store),
+                MemoryOrigin::BackgroundSleepTimeObservation
+            );
+            store.record_graduation(&id, 3).unwrap();
+            // Post-graduation: upgrades to Graduated.
+            assert_eq!(
+                effective_origin(&id, &exp, &store),
+                MemoryOrigin::BackgroundSleepTimeGraduated
+            );
+        }
     }
 
     #[test]
     fn effective_origin_leaves_foreground_alone() {
-        let (db, _tmp) = open_test_db();
-        let store = GraduationStore::new(db);
-        let id = fresh_id();
-        let exp = Experience::default(); // no origin metadata → ForegroundUser
-        // Even if we record a graduation against a non-observation memory
-        // (shouldn't happen in practice), the effective origin only
-        // overrides Observation. Foreground stays Foreground.
-        store.record_graduation(&id, 5).unwrap();
-        assert_eq!(
-            effective_origin(&id, &exp, &store),
-            MemoryOrigin::ForegroundUser
-        );
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let id = fresh_id();
+            let exp = Experience::default(); // no origin metadata → ForegroundUser
+            // Even if we record a graduation against a non-observation memory
+            // (shouldn't happen in practice), the effective origin only
+            // overrides Observation. Foreground stays Foreground.
+            store.record_graduation(&id, 5).unwrap();
+            assert_eq!(
+                effective_origin(&id, &exp, &store),
+                MemoryOrigin::ForegroundUser
+            );
+        }
     }
 }
