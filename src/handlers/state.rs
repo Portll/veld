@@ -322,9 +322,48 @@ pub struct MultiUserMemoryManager {
         parking_lot::RwLock<Option<Arc<crate::memory::sleep_time::SleepTimeOrchestrator>>>,
 }
 
+/// User directories under the data root. An unreadable entry is an error, not a
+/// skipped user: the boot guard must see every tenant or refuse.
+pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    const SYSTEM_DIRS: &[&str] = &[
+        "audit_logs",
+        "audit_logs.pre_cf_migration",
+        "backups",
+        "feedback",
+        "feedback.pre_cf_migration",
+        "semantic_facts",
+        "files",
+        "files.pre_cf_migration",
+        "prospective",
+        "prospective.pre_cf_migration",
+        "todos",
+        "todos.pre_cf_migration",
+        "shared",
+    ];
+    let mut users = Vec::new();
+    for entry in std::fs::read_dir(base_path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if !SYSTEM_DIRS.contains(&name) {
+                users.push(name.to_string());
+            }
+        }
+    }
+    users.sort();
+    Ok(users)
+}
+
 impl MultiUserMemoryManager {
     pub fn new(base_path: std::path::PathBuf, server_config: ServerConfig) -> Result<Self> {
         std::fs::create_dir_all(&base_path)?;
+        crate::storage::boot_guard::refuse_stranded_data(
+            &base_path,
+            server_config.effective_storage_backend,
+            &list_user_dirs(&base_path)?,
+        )?;
 
         let (event_broadcaster, _) = tokio::sync::broadcast::channel(1024);
 
@@ -1530,36 +1569,7 @@ impl MultiUserMemoryManager {
 
     /// List all users
     pub fn list_users(&self) -> Vec<String> {
-        let mut users = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.base_path) {
-            for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type() {
-                    if file_type.is_dir() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            // Filter out system directories
-                            if name != "audit_logs"
-                                && name != "audit_logs.pre_cf_migration"
-                                && name != "backups"
-                                && name != "feedback"
-                                && name != "feedback.pre_cf_migration"
-                                && name != "semantic_facts"
-                                && name != "files"
-                                && name != "files.pre_cf_migration"
-                                && name != "prospective"
-                                && name != "prospective.pre_cf_migration"
-                                && name != "todos"
-                                && name != "todos.pre_cf_migration"
-                                && name != "shared"
-                            {
-                                users.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        users.sort();
-        users
+        list_user_dirs(&self.base_path).unwrap_or_default()
     }
 
     /// List users currently loaded in the Moka cache (no filesystem scan)

@@ -498,6 +498,25 @@ fn search_matches(memory: &Memory, criteria: &SearchCriteria) -> bool {
     }
 }
 
+/// Memories in a user's redb primary store, opened without creating anything.
+/// `None` when no store file exists.
+pub fn user_memory_count(user_dir: &Path) -> Result<Option<u64>> {
+    let path = user_dir.join("storage.redb");
+    match std::fs::metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("probe redb store {}", path.display())),
+    }
+    let database = redb::Database::open(&path)
+        .with_context(|| format!("probe redb store {}", path.display()))?;
+    let txn = database.begin_read()?;
+    match txn.open_table(MEMORIES_TABLE) {
+        Ok(table) => Ok(Some(table.len()?)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(Some(0)),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub struct RedbPrimaryMemoryStore {
     database: Arc<redb::Database>,
 }
