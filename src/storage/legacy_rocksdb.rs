@@ -190,6 +190,28 @@ pub struct RocksDbPrimaryMemoryStore {
     inner: Arc<MemoryStorage>,
 }
 
+/// Whether a user's rocksdb primary store holds at least one memory. Opened
+/// read-only, because a normal open creates the store it is asked about.
+/// `None` when no store exists.
+pub fn user_has_memories(user_dir: &Path) -> Result<Option<bool>> {
+    let path = user_dir.join("storage");
+    match std::fs::metadata(path.join("CURRENT")) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("probe rocksdb store {}", path.display())),
+    }
+    let db = DB::open_for_read_only(&rocksdb::Options::default(), &path, false)
+        .with_context(|| format!("probe rocksdb store {}", path.display()))?;
+    for item in db.iterator(IteratorMode::Start) {
+        let (key, _) = item?;
+        // Memories are the 16-byte uuid keys; the default family holds other keys too.
+        if key.len() == 16 {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
 impl RocksDbPrimaryMemoryStore {
     pub fn open(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
         Ok(Self {
