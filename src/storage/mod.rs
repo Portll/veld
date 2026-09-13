@@ -4,6 +4,7 @@
 //! backends should integrate at this seam rather than through direct database
 //! types in recall, graph traversal, or server orchestration.
 
+pub mod boot_guard;
 pub mod legacy_rocksdb;
 pub mod portable;
 #[cfg(feature = "storage-redb")]
