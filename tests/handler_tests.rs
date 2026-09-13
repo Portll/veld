@@ -225,6 +225,9 @@ async fn health_endpoint() {
         body.get("status").is_some(),
         "health response needs 'status' field"
     );
+    let census = &body["tenants_with_data"];
+    assert_eq!(census["rocksdb"].as_u64(), Some(0), "fresh install has no tenant data: {body}");
+    assert!(census["measured_at"].is_string(), "census must say when it was measured: {body}");
 }
 
 #[tokio::test]

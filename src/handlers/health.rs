@@ -38,6 +38,9 @@ pub struct HealthResponse {
     /// running server was on hash-bigram vectors and nothing on this endpoint said so.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedder: Option<crate::embeddings::PrimaryEmbedderInfo>,
+    /// Tenants holding data on each backend at boot. `users_count` over an empty
+    /// store is the 2026-09-10 outage; this is what tells the two apart.
+    pub tenants_with_data: crate::storage::boot_guard::BackendCensus,
 }
 
 /// Main health check endpoint
@@ -58,6 +61,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         user_evictions,
         max_cache_size: config.max_users_in_memory,
         embedder: crate::embeddings::primary_embedder_info(),
+        tenants_with_data: state.backend_census.clone(),
     })
 }
 

@@ -46,41 +46,62 @@ const fn other_backend(backend: StorageBackend) -> StorageBackend {
     }
 }
 
+/// Tenants holding at least one memory, per backend, measured at boot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackendCensus {
+    pub rocksdb: usize,
+    /// `None` when this build cannot read redb, which is unknown rather than zero.
+    pub redb: Option<usize>,
+    pub measured_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// A probe that fails refuses the boot too: an unreadable store is unknown, and
 /// unknown is exactly what the outage served as healthy.
 pub fn refuse_stranded_data(
     base_path: &Path,
     selected: StorageBackend,
     users: &[String],
-) -> Result<()> {
+) -> Result<BackendCensus> {
     let other = other_backend(selected);
-    if other == StorageBackend::Redb && !cfg!(feature = "storage-redb") {
+    let can_read_other = other != StorageBackend::Redb || cfg!(feature = "storage-redb");
+    if !can_read_other {
         tracing::warn!("boot guard: this build cannot read redb, so data stranded there is unchecked");
-        return Ok(());
     }
 
+    let mut with_data = [0usize; 2];
+    let slot = |b: StorageBackend| match b {
+        StorageBackend::RocksDb => 0,
+        StorageBackend::Redb => 1,
+    };
     let mut stranded = Vec::new();
     for user in users {
         let dir = base_path.join(user);
-        if user_store_content(&dir, selected)? == StoreContent::NonEmpty {
-            continue;
-        }
-        if user_store_content(&dir, other)? == StoreContent::NonEmpty {
+        let selected_has = user_store_content(&dir, selected)? == StoreContent::NonEmpty;
+        let other_has =
+            can_read_other && user_store_content(&dir, other)? == StoreContent::NonEmpty;
+        with_data[slot(selected)] += usize::from(selected_has);
+        with_data[slot(other)] += usize::from(other_has);
+        if !selected_has && other_has {
             stranded.push(user.as_str());
         }
     }
-    if stranded.is_empty() {
-        return Ok(());
+
+    if !stranded.is_empty() {
+        bail!(
+            "refusing to serve: the {selected} store is empty for {n} user(s) whose memories are \
+             in {other}: {users}. Serving would report healthy over an empty store. Set \
+             VELD_STORAGE_BACKEND={other} to serve the existing data. Migrating it to {selected} \
+             is `veld migrate`, not yet wired (ADR 0006 WP2).",
+            n = stranded.len(),
+            users = stranded.join(", "),
+        );
     }
 
-    bail!(
-        "refusing to serve: the {selected} store is empty for {n} user(s) whose memories are in \
-         {other}: {users}. Serving would report healthy over an empty store. Set \
-         VELD_STORAGE_BACKEND={other} to serve the existing data. Migrating it to {selected} is \
-         `veld migrate`, not yet wired (ADR 0006 WP2).",
-        n = stranded.len(),
-        users = stranded.join(", "),
-    )
+    Ok(BackendCensus {
+        rocksdb: with_data[0],
+        redb: cfg!(feature = "storage-redb").then_some(with_data[1]),
+        measured_at: chrono::Utc::now(),
+    })
 }
 
 #[cfg(all(test, feature = "storage-redb"))]
@@ -186,6 +207,25 @@ mod tests {
         for backend in [StorageBackend::Redb, StorageBackend::RocksDb] {
             refuse_stranded_data(base.path(), backend, &users(&["fresh", "both"])).unwrap();
         }
+    }
+
+    #[test]
+    fn the_census_counts_each_backend_independently() {
+        let base = tempfile::tempdir().unwrap();
+        let both = base.path().join("both");
+        rocksdb_with_memory(&both);
+        redb_with_memory(&both);
+        rocksdb_with_memory(&base.path().join("rocks_only"));
+        redb_empty(&base.path().join("rocks_only"));
+        std::fs::create_dir_all(base.path().join("fresh")).unwrap();
+
+        let census = refuse_stranded_data(
+            base.path(),
+            StorageBackend::RocksDb,
+            &users(&["both", "fresh", "rocks_only"]),
+        )
+        .unwrap();
+        assert_eq!((census.rocksdb, census.redb), (2, Some(1)));
     }
 
     #[test]
