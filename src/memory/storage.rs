@@ -873,14 +873,15 @@ fn deserialize_legacy_fallback(
     let is_first_failure = !DEBUG_ENTRY_LOGGED.load(std::sync::atomic::Ordering::Relaxed);
 
     // Collect all errors for debugging
-    // Every bincode 2.x candidate below must consume the WHOLE record. decode_from_slice
-    // returns (value, bytes_read) and does not object to trailing bytes, so a varint decoder
-    // could "succeed" on a bincode 1.x fixint record: the 8-byte length prefix 10 00 00 00 00
-    // 00 00 00 reads as varint 16 followed by seven zero bytes, the uuid lands displaced by
-    // seven and zero-padded, and whether the rest parsed as a String depended on uuid byte 9 —
-    // which is why test_deserialize_with_fallback_bincode1_minimal_fixture failed on some
-    // random ids and not others and read as order-dependent. A legacy record has no trailing
-    // bytes; a partial read is a misread, not a match.
+    // The two TINY bincode 2.x candidates (MinimalMemory, MemoryWithTypePrefix) must consume
+    // the whole record. decode_from_slice does not object to trailing bytes, so a varint
+    // decoder of a 16-byte id plus a string could "succeed" on a bincode 1.x fixint record:
+    // the 8-byte length prefix 10 00 00 00 00 00 00 00 reads as varint 16 followed by seven
+    // zero bytes, the uuid lands displaced by seven and zero-padded, and whether the rest
+    // parsed as a String depended on uuid byte 9 — the random failure of
+    // test_deserialize_with_fallback_bincode1_minimal_fixture. The FULL-memory candidates
+    // (LegacyMemoryFlatV3/V2) keep tolerating trailing bytes: for them a partial read is a
+    // later schema with appended fields, not a misread — see the note on each arm.
     let mut errors: Vec<(&str, String)> = Vec::new();
     errors.push(("bincode2 Memory", first_error.to_string()));
 
@@ -892,15 +893,15 @@ fn deserialize_legacy_fallback(
         data,
         bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
-        Ok((legacy, n)) if n == data.len() => {
+        // Trailing bytes are ALLOWED here: this is a full-memory struct, and a record that
+        // decodes as it with bytes left over is a later schema that appended fields — measured
+        // 2026-09-13 on the live store, 24 of 9932 records were exactly that and became
+        // "corrupted" the moment a full-consumption guard was applied to this arm too.
+        Ok((legacy, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x pre-W3.4 format");
             record_branch("bincode2_legacy_flat_v3");
             return Ok((legacy.into_memory(), true));
         }
-        Ok((_, n)) => errors.push((
-            "bincode2 LegacyMemoryFlatV3",
-            format!("decoded {n} of {} bytes — a legacy record has no trailing bytes, so this was a misread", data.len()),
-        )),
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV3", e.to_string())),
     }
 
@@ -942,15 +943,15 @@ fn deserialize_legacy_fallback(
         data,
         bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>(),
     ) {
-        Ok((legacy, n)) if n == data.len() => {
+        // Trailing bytes are ALLOWED here: this is a full-memory struct, and a record that
+        // decodes as it with bytes left over is a later schema that appended fields — measured
+        // 2026-09-13 on the live store, 24 of 9932 records were exactly that and became
+        // "corrupted" the moment a full-consumption guard was applied to this arm too.
+        Ok((legacy, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x pre-multimodal format");
             record_branch("bincode2_legacy_flat_v2");
             return Ok((legacy.into_memory(), true));
         }
-        Ok((_, n)) => errors.push((
-            "bincode2 LegacyMemoryFlatV2",
-            format!("decoded {n} of {} bytes — a legacy record has no trailing bytes, so this was a misread", data.len()),
-        )),
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV2", e.to_string())),
     }
 
@@ -4395,6 +4396,91 @@ mod tests {
         let (decoded, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
         assert_eq!(decoded.id, id, "the id came back displaced: a varint candidate misread the fixint prefix");
         assert_eq!(decoded.experience.content, "legacy bincode1 minimal");
+        assert!(is_legacy);
+    }
+
+    /// The full-memory legacy arm must keep accepting a record with bytes left over: that shape
+    /// is a later schema that appended fields, and 24 of 9932 live records were exactly that.
+    /// Applying the tiny-candidate full-consumption guard to this arm turned them into
+    /// "corrupted memory entry" on the 2026-09-13 deploy.
+    #[test]
+    fn test_v3_record_with_trailing_bytes_still_decodes() {
+        let _serial = counter_guard();
+        #[derive(Serialize)]
+        struct V3PlusAppendedFields {
+            id: MemoryId,
+            experience: Experience,
+            importance: f32,
+            access_count: u32,
+            created_at: DateTime<Utc>,
+            last_accessed: DateTime<Utc>,
+            compressed: bool,
+            tier: MemoryTier,
+            entity_refs: Vec<EntityRef>,
+            activation: f32,
+            last_retrieval_id: Option<uuid::Uuid>,
+            agent_id: Option<String>,
+            run_id: Option<String>,
+            actor_id: Option<String>,
+            temporal_relevance: f32,
+            score: Option<f32>,
+            external_id: Option<String>,
+            version: u32,
+            history: Vec<MemoryRevision>,
+            related_todo_ids: Vec<TodoId>,
+            parent_id: Option<MemoryId>,
+            anchored: bool,
+            calibrated_confidence: Option<f32>,
+            confidence_alpha: Option<f32>,
+            confidence_beta: Option<f32>,
+            valid_until: Option<DateTime<Utc>>,
+            access_history: Option<Vec<DateTime<Utc>>>,
+            elaboration_score: Option<f32>,
+            fragment_demotion: Option<f32>,
+            appended_later: u64,
+            appended_later_too: String,
+        }
+        let id = MemoryId(uuid::Uuid::new_v4());
+        let now = Utc::now();
+        let fixture = V3PlusAppendedFields {
+            id: id.clone(),
+            experience: Experience { content: "a record from a schema between V3 and today".to_string(), ..Default::default() },
+            importance: 0.5,
+            access_count: 0,
+            created_at: now,
+            last_accessed: now,
+            compressed: false,
+            tier: MemoryTier::LongTerm,
+            entity_refs: Vec::new(),
+            activation: 0.0,
+            last_retrieval_id: None,
+            agent_id: None,
+            run_id: None,
+            actor_id: None,
+            temporal_relevance: 1.0,
+            score: None,
+            external_id: None,
+            version: 1,
+            history: Vec::new(),
+            related_todo_ids: Vec::new(),
+            parent_id: None,
+            anchored: false,
+            calibrated_confidence: None,
+            confidence_alpha: None,
+            confidence_beta: None,
+            valid_until: None,
+            access_history: None,
+            elaboration_score: None,
+            fragment_demotion: None,
+            appended_later: 7,
+            appended_later_too: "trailing".to_string(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&fixture, bincode::config::standard()).unwrap();
+
+        let (decoded, is_legacy) = deserialize_with_fallback(&bytes)
+            .expect("a V3 record with appended fields must still decode through the V3 arm");
+        assert_eq!(decoded.id, id);
+        assert_eq!(decoded.experience.content, "a record from a schema between V3 and today");
         assert!(is_legacy);
     }
 
