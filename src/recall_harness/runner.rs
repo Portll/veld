@@ -3752,6 +3752,47 @@ mod tests {
     // runner_repeats_2_produces_same_quality_as_repeats_1` before shipping
     // changes that touch the harness or scoring path.
     #[test]
+    /// Record a baseline from THIS tree with THIS process's embedder:
+    ///
+    ///   VELD_EMBEDDER=http VELD_WRITE_BASELINE=tests/recall/baseline.json \
+    ///     cargo test --release --lib -- --ignored record_smoke_baseline --nocapture
+    ///
+    /// The report names the embedder that produced it (compare_to_baseline refuses a diff across
+    /// embedders), and git_sha is read from the tree, so the file says what it measures.
+    #[test]
+    #[ignore = "writes a baseline file; run explicitly with VELD_WRITE_BASELINE set"]
+    fn record_smoke_baseline() {
+        let out = std::env::var("VELD_WRITE_BASELINE").expect("VELD_WRITE_BASELINE unset — refusing to guess where a baseline goes");
+        let git_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .expect("git rev-parse HEAD must succeed: a baseline without a sha measures nothing");
+        let storage = unique_storage_dir("baseline");
+        let inputs = RunInputs {
+            storage_path: storage.clone(),
+            corpus_path: None,
+            cases_path: None,
+            suite: "smoke".to_string(),
+            git_sha,
+            repeats: 1,
+            layer_modes: vec![LayerMode::Full],
+            age_days: 0.0,
+        };
+        let report = run_smoke_suite(&inputs).expect("smoke suite must run");
+        let _ = std::fs::remove_dir_all(&storage);
+        assert_ne!(report.embedder, crate::recall_harness::report::EMBEDDER_UNKNOWN, "a baseline of unknown provenance is not a baseline");
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        std::fs::write(&out, json).expect("write baseline");
+        let full = report.layers.get("full").expect("full layer");
+        eprintln!(
+            "baseline written to {out}: embedder={} sha={} cases={} ndcg@10={:.4} recall@10={:.4} mrr={:.4} p@1={:.4}",
+            report.embedder, report.git_sha, report.case_count, full.ndcg_at_10, full.recall_at_10, full.mrr, full.p_at_1
+        );
+    }
+
     #[ignore = "expensive: runs the smoke suite twice (~12min). enable with --ignored before shipping harness changes."]
     fn runner_repeats_2_produces_same_quality_as_repeats_1() {
         let storage1 = unique_storage_dir("repeats1");
