@@ -147,6 +147,9 @@ pub struct MultiUserMemoryManager {
     /// `require_rocksdb(..)` and refuse on the other engine by name.
     pub shared_db: crate::storage::SharedEngineDb,
 
+    /// Tenants with data on each backend, measured by the boot guard.
+    pub backend_census: crate::storage::boot_guard::BackendCensus,
+
     /// Audit log storage routed through the backend abstraction layer.
     audit_store: Arc<dyn AuditStore>,
 
@@ -359,7 +362,7 @@ pub(crate) fn list_user_dirs(base_path: &std::path::Path) -> std::io::Result<Vec
 impl MultiUserMemoryManager {
     pub fn new(base_path: std::path::PathBuf, server_config: ServerConfig) -> Result<Self> {
         std::fs::create_dir_all(&base_path)?;
-        crate::storage::boot_guard::refuse_stranded_data(
+        let backend_census = crate::storage::boot_guard::refuse_stranded_data(
             &base_path,
             server_config.effective_storage_backend,
             &list_user_dirs(&base_path)?,
@@ -626,6 +629,7 @@ impl MultiUserMemoryManager {
             user_memories,
             audit_logs: Arc::new(DashMap::new()),
             shared_db: shared_stores.shared_db,
+            backend_census,
             audit_store: shared_stores.audit_store,
             base_path,
             default_config: MemoryConfig {
