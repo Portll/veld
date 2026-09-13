@@ -15,13 +15,12 @@
 //!   3. **Forget-cascade ready** (V3) — `forget_supersession` peels the
 //!      claim cleanly without touching either memory.
 //!
-//! Like [`super::graduation::GraduationStore`], we use a dedicated RocksDB
-//! column family. Two keys per relationship (forward + reverse) so either
+//! Like [`super::graduation::GraduationStore`], we use a dedicated column
+//! family. Two keys per relationship (forward + reverse) so either
 //! end can be queried in O(1).
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -43,7 +42,7 @@ pub const DEFAULT_SUPERSESSION_DECAY: f32 = 0.0225;
 /// `effective_supersession` helper returns `None`.
 pub const SUPERSESSION_EXPIRY_FLOOR: f32 = 0.10;
 
-/// Direction marker baked into the RocksDB key so the same struct shape
+/// Direction marker baked into the key so the same struct shape
 /// stores both ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -85,24 +84,6 @@ pub struct SupersessionStore {
 }
 
 impl SupersessionStore {
-    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
-        let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        vec![ColumnFamilyDescriptor::new(
-            CF_SLEEP_TIME_SUPERSESSIONS,
-            opts,
-        )]
-    }
-
-    pub fn new(db: Arc<DB>) -> Self {
-        Self {
-            store: Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnFamilyStore::new(
-                db,
-                CF_SLEEP_TIME_SUPERSESSIONS,
-            )),
-        }
-    }
-
     /// Bind a handle directly — the constructor a backend-agnostic caller uses.
     pub fn with_store(store: Arc<dyn crate::storage::KeyValueStore>) -> Self {
         Self { store }
@@ -118,7 +99,7 @@ impl SupersessionStore {
 
     /// Record a supersession claim: `superseder` replaces `superseded`.
     ///
-    /// Writes both directions atomically via `WriteBatch` so retrieval can
+    /// Writes both directions atomically via `put_many` so retrieval can
     /// walk the edge from either side. If a claim already exists in either
     /// direction it is overwritten — caller should check
     /// [`Self::supersession_for`] first if they want to detect re-claims.
@@ -286,8 +267,7 @@ impl SupersessionStore {
         let mut decayed = 0usize;
         let mut removed = 0usize;
 
-        // Pass 1: collect mutations. We can't mutate while iterating because
-        // RocksDB's iterator handle borrows the CF.
+        // Pass 1: collect mutations; pass 2 applies them.
         let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut deletes: Vec<Vec<u8>> = Vec::new();
 
@@ -329,17 +309,22 @@ impl SupersessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StorageBackend;
+    use crate::storage::test_support::{assert_both_backends, column_stores};
+    use crate::storage::FamilyKeyValueStore;
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    fn open_test_db() -> (Arc<DB>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        let cfs = SupersessionStore::cf_descriptors();
-        let db = DB::open_cf_descriptors(&db_opts, tmp.path(), cfs).unwrap();
-        (Arc::new(db), tmp)
+    fn stores() -> Vec<(StorageBackend, SupersessionStore, TempDir)> {
+        let out: Vec<_> = column_stores(&[CF_SLEEP_TIME_SUPERSESSIONS])
+            .into_iter()
+            .map(|(backend, column, tmp)| {
+                let kv = FamilyKeyValueStore::new(column, CF_SLEEP_TIME_SUPERSESSIONS).unwrap();
+                (backend, SupersessionStore::with_store(Arc::new(kv)), tmp)
+            })
+            .collect();
+        assert_both_backends(&out);
+        out
     }
 
     fn id() -> MemoryId {
@@ -348,107 +333,114 @@ mod tests {
 
     #[test]
     fn record_writes_both_directions() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        let new = id();
-        let old = id();
-        store
-            .record(&new, &old, DEFAULT_SUPERSESSION_CONFIDENCE)
-            .unwrap();
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let new = id();
+            let old = id();
+            store
+                .record(&new, &old, DEFAULT_SUPERSESSION_CONFIDENCE)
+                .unwrap();
 
-        // Forward: newer claims to supersede older.
-        let f = store.supersession_for(&new).unwrap().unwrap();
-        assert_eq!(f.other, old);
+            // Forward: newer claims to supersede older.
+            let f = store.supersession_for(&new).unwrap().unwrap();
+            assert_eq!(f.other, old);
 
-        // Reverse: older is superseded by newer.
-        let r = store.superseded_by(&old).unwrap().unwrap();
-        assert_eq!(r.other, new);
+            // Reverse: older is superseded by newer.
+            let r = store.superseded_by(&old).unwrap().unwrap();
+            assert_eq!(r.other, new);
+        }
     }
 
     #[test]
     fn read_returns_none_when_below_floor() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        let new = id();
-        let old = id();
-        store
-            .record(&new, &old, SUPERSESSION_EXPIRY_FLOOR / 2.0)
-            .unwrap();
-        assert!(store.supersession_for(&new).unwrap().is_none());
-        assert!(store.superseded_by(&old).unwrap().is_none());
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let new = id();
+            let old = id();
+            store
+                .record(&new, &old, SUPERSESSION_EXPIRY_FLOOR / 2.0)
+                .unwrap();
+            assert!(store.supersession_for(&new).unwrap().is_none());
+            assert!(store.superseded_by(&old).unwrap().is_none());
+        }
     }
 
     #[test]
     fn forget_removes_both_directions() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        let new = id();
-        let old = id();
-        store.record(&new, &old, 0.8).unwrap();
-        assert!(store.forget(&new, &old).unwrap());
-        assert!(store.supersession_for(&new).unwrap().is_none());
-        assert!(store.superseded_by(&old).unwrap().is_none());
-        // Second forget returns false.
-        assert!(!store.forget(&new, &old).unwrap());
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let new = id();
+            let old = id();
+            store.record(&new, &old, 0.8).unwrap();
+            assert!(store.forget(&new, &old).unwrap());
+            assert!(store.supersession_for(&new).unwrap().is_none());
+            assert!(store.superseded_by(&old).unwrap().is_none());
+            // Second forget returns false.
+            assert!(!store.forget(&new, &old).unwrap());
+        }
     }
 
     #[test]
     fn reinforce_boosts_confidence_clamped_to_one() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        let new = id();
-        let old = id();
-        store.record(&new, &old, 0.5).unwrap();
-        let rec = store.reinforce(&new, 0.8).unwrap().unwrap();
-        assert!((rec.confidence - 1.0).abs() < f32::EPSILON);
-        assert!(rec.last_reinforced_at.is_some());
-        // Reverse also reinforced.
-        let rev = store.superseded_by(&old).unwrap().unwrap();
-        assert!((rev.confidence - 1.0).abs() < f32::EPSILON);
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let new = id();
+            let old = id();
+            store.record(&new, &old, 0.5).unwrap();
+            let rec = store.reinforce(&new, 0.8).unwrap().unwrap();
+            assert!((rec.confidence - 1.0).abs() < f32::EPSILON);
+            assert!(rec.last_reinforced_at.is_some());
+            // Reverse also reinforced.
+            let rev = store.superseded_by(&old).unwrap().unwrap();
+            assert!((rev.confidence - 1.0).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
     fn reinforce_on_missing_returns_none() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        assert!(store.reinforce(&id(), 0.1).unwrap().is_none());
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            assert!(store.reinforce(&id(), 0.1).unwrap().is_none());
+        }
     }
 
     #[test]
     fn decay_reduces_confidence_and_removes_zero() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        let a_new = id();
-        let a_old = id();
-        let b_new = id();
-        let b_old = id();
-        store.record(&a_new, &a_old, 0.6).unwrap();
-        store.record(&b_new, &b_old, 0.04).unwrap(); // below floor on next decay
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let a_new = id();
+            let a_old = id();
+            let b_new = id();
+            let b_old = id();
+            store.record(&a_new, &a_old, 0.6).unwrap();
+            store.record(&b_new, &b_old, 0.04).unwrap(); // below floor on next decay
 
-        let (decayed, removed) = store.decay_all(0.05).unwrap();
-        // a decays from 0.60 → 0.55 (still above 0), b drops to 0.0 and is removed.
-        // Each edge is stored twice (forward + reverse), so a = 2 decayed, b = 2 removed.
-        assert_eq!(decayed, 2);
-        assert_eq!(removed, 2);
+            let (decayed, removed) = store.decay_all(0.05).unwrap();
+            // a decays from 0.60 → 0.55 (still above 0), b drops to 0.0 and is removed.
+            // Each edge is stored twice (forward + reverse), so a = 2 decayed, b = 2 removed.
+            assert_eq!(decayed, 2);
+            assert_eq!(removed, 2);
 
-        // a still present at the reduced confidence.
-        let a = store.supersession_for(&a_new).unwrap().unwrap();
-        assert!((a.confidence - 0.55).abs() < 1e-5);
+            // a still present at the reduced confidence.
+            let a = store.supersession_for(&a_new).unwrap().unwrap();
+            assert!((a.confidence - 0.55).abs() < 1e-5);
 
-        // b gone.
-        assert!(store.supersession_for(&b_new).unwrap().is_none());
-        assert!(store.superseded_by(&b_old).unwrap().is_none());
+            // b gone.
+            assert!(store.supersession_for(&b_new).unwrap().is_none());
+            assert!(store.superseded_by(&b_old).unwrap().is_none());
+        }
     }
 
     #[test]
     fn record_overwrites_existing() {
-        let (db, _tmp) = open_test_db();
-        let store = SupersessionStore::new(db);
-        let new = id();
-        let old = id();
-        store.record(&new, &old, 0.4).unwrap();
-        store.record(&new, &old, 0.9).unwrap();
-        let rec = store.supersession_for(&new).unwrap().unwrap();
-        assert!((rec.confidence - 0.9).abs() < f32::EPSILON);
+        for (backend, store, _tmp) in stores() {
+            eprintln!("backend: {backend:?}");
+            let new = id();
+            let old = id();
+            store.record(&new, &old, 0.4).unwrap();
+            store.record(&new, &old, 0.9).unwrap();
+            let rec = store.supersession_for(&new).unwrap().unwrap();
+            assert!((rec.confidence - 0.9).abs() < f32::EPSILON);
+        }
     }
 }

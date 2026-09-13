@@ -143,7 +143,7 @@ pub struct MultiUserMemoryManager {
 
     /// Shared engine database for all global stores (todos, reminders, files,
     /// feedback, audit), carried by ENGINE. Engine-typed consumers (user-auth,
-    /// GDPR purge, sleep-time, comprehensive backup) go through
+    /// GDPR purge, comprehensive backup) go through
     /// `require_rocksdb(..)` and refuse on the other engine by name.
     pub shared_db: crate::storage::SharedEngineDb,
 
@@ -873,10 +873,15 @@ impl MultiUserMemoryManager {
         cfs.extend(crate::memory::ContextBlockStore::cf_descriptors());
         // Sleep-time / observational memory CFs (V1 + V2). Always created
         // so the orchestrator can be enabled later without an offline migration.
-        cfs.extend(crate::memory::sleep_time::policies::BudgetTracker::cf_descriptors());
-        cfs.extend(crate::memory::sleep_time::queue::Queue::cf_descriptors());
-        cfs.extend(crate::memory::sleep_time::graduation::GraduationStore::cf_descriptors());
-        cfs.extend(crate::memory::sleep_time::supersession::SupersessionStore::cf_descriptors());
+        for cf in [
+            crate::memory::sleep_time::CF_SLEEP_TIME_BUDGET,
+            crate::memory::sleep_time::CF_SLEEP_TIME_GLOBAL_BUDGET,
+            crate::memory::sleep_time::CF_SLEEP_TIME_QUEUE,
+            crate::memory::sleep_time::CF_SLEEP_TIME_GRADUATIONS,
+            crate::memory::sleep_time::CF_SLEEP_TIME_SUPERSESSIONS,
+        ] {
+            cfs.push(ColumnFamilyDescriptor::new(cf, Self::shared_store_cf_options()));
+        }
         cfs.push(ColumnFamilyDescriptor::new(
             crate::memory::feedback::CF_FEEDBACK,
             Self::shared_store_cf_options(),

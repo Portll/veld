@@ -3,7 +3,7 @@
 //! Three concerns live here:
 //!
 //! 1. **Per-user budget** — hourly token + daily call caps (R12 / R20). State
-//!    is persisted in the `sleep_time_budget` RocksDB CF so caps survive
+//!    is persisted in the `sleep_time_budget` family so caps survive
 //!    restart. A pre-flight `try_charge_*` call atomically (under a per-user
 //!    Mutex) checks and reserves capacity; the caller settles with
 //!    `record_actual_*` once the LLM response is in (R39 WAL-style ledger).
@@ -20,7 +20,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, DB};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -78,33 +77,19 @@ pub struct BudgetTracker {
 }
 
 impl BudgetTracker {
-    pub fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
-        let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        vec![
-            ColumnFamilyDescriptor::new(CF_SLEEP_TIME_BUDGET, opts.clone()),
-            ColumnFamilyDescriptor::new(CF_SLEEP_TIME_GLOBAL_BUDGET, opts),
-        ]
-    }
-
-    pub fn new(db: Arc<DB>, limits: PolicyLimits) -> Self {
-        Self::with_store(
-            Arc::new(crate::storage::legacy_rocksdb::RocksDbColumnStore::new(db)),
-            limits,
-        )
-    }
-
     /// Bind a handle directly — the constructor a backend-agnostic caller uses.
     pub fn with_store(
         store: Arc<dyn crate::storage::ColumnStore>,
         limits: PolicyLimits,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        store.ensure_cf(CF_SLEEP_TIME_BUDGET)?;
+        store.ensure_cf(CF_SLEEP_TIME_GLOBAL_BUDGET)?;
+        Ok(Self {
             store,
             limits,
             user_locks: Mutex::new(HashMap::new()),
             global_lock: Mutex::new(()),
-        }
+        })
     }
 
     fn user_lock(&self, user_id: &str) -> Arc<Mutex<()>> {
@@ -351,16 +336,19 @@ impl DebounceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StorageBackend;
+    use crate::storage::test_support::{assert_both_backends, column_stores};
     use tempfile::TempDir;
 
-    fn open_test_db() -> (Arc<DB>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        let cfs = BudgetTracker::cf_descriptors();
-        let db = DB::open_cf_descriptors(&db_opts, tmp.path(), cfs).unwrap();
-        (Arc::new(db), tmp)
+    fn trackers(limits: PolicyLimits) -> Vec<(StorageBackend, BudgetTracker, TempDir)> {
+        let out: Vec<_> = column_stores(&[CF_SLEEP_TIME_BUDGET, CF_SLEEP_TIME_GLOBAL_BUDGET])
+            .into_iter()
+            .map(|(backend, column, tmp)| {
+                (backend, BudgetTracker::with_store(column, limits).unwrap(), tmp)
+            })
+            .collect();
+        assert_both_backends(&out);
+        out
     }
 
     fn small_limits() -> PolicyLimits {
@@ -376,57 +364,62 @@ mod tests {
 
     #[test]
     fn try_charge_call_blocks_after_call_cap() {
-        let (db, _tmp) = open_test_db();
-        let t = BudgetTracker::new(db, small_limits());
-        for _ in 0..3 {
-            t.try_charge_call("u", 100).unwrap();
+        for (backend, t, _tmp) in trackers(small_limits()) {
+            eprintln!("backend: {backend:?}");
+            for _ in 0..3 {
+                t.try_charge_call("u", 100).unwrap();
+            }
+            let err = t.try_charge_call("u", 100).unwrap_err();
+            assert!(matches!(err, SleepTimeError::BudgetExhausted { .. }));
         }
-        let err = t.try_charge_call("u", 100).unwrap_err();
-        assert!(matches!(err, SleepTimeError::BudgetExhausted { .. }));
     }
 
     #[test]
     fn try_charge_call_blocks_when_projection_exceeds_hourly() {
-        let (db, _tmp) = open_test_db();
-        let t = BudgetTracker::new(db, small_limits());
-        // First call: projected 600 tokens, then settled at 600.
-        t.try_charge_call("u", 600).unwrap();
-        t.record_actual_spend("u", 600).unwrap();
-        // Second call: projected 500 → would exceed 1000/hour after 600.
-        let err = t.try_charge_call("u", 500).unwrap_err();
-        assert!(matches!(err, SleepTimeError::BudgetExhausted { .. }));
+        for (backend, t, _tmp) in trackers(small_limits()) {
+            eprintln!("backend: {backend:?}");
+            // First call: projected 600 tokens, then settled at 600.
+            t.try_charge_call("u", 600).unwrap();
+            t.record_actual_spend("u", 600).unwrap();
+            // Second call: projected 500 → would exceed 1000/hour after 600.
+            let err = t.try_charge_call("u", 500).unwrap_err();
+            assert!(matches!(err, SleepTimeError::BudgetExhausted { .. }));
+        }
     }
 
     #[test]
     fn record_actual_spend_accumulates() {
-        let (db, _tmp) = open_test_db();
-        let t = BudgetTracker::new(db, small_limits());
-        t.try_charge_call("u", 100).unwrap();
-        t.record_actual_spend("u", 80).unwrap();
-        let s = t.user_state("u").unwrap();
-        assert_eq!(s.tokens_this_hour, 80);
-        assert_eq!(s.calls_today, 1);
+        for (backend, t, _tmp) in trackers(small_limits()) {
+            eprintln!("backend: {backend:?}");
+            t.try_charge_call("u", 100).unwrap();
+            t.record_actual_spend("u", 80).unwrap();
+            let s = t.user_state("u").unwrap();
+            assert_eq!(s.tokens_this_hour, 80);
+            assert_eq!(s.calls_today, 1);
+        }
     }
 
     #[test]
     fn lock_state_set_and_check() {
-        let (db, _tmp) = open_test_db();
-        let t = BudgetTracker::new(db, small_limits());
-        assert!(!t.is_block_locked("u", "persona").unwrap());
-        t.set_block_lock("u", "persona", true).unwrap();
-        assert!(t.is_block_locked("u", "persona").unwrap());
-        t.set_block_lock("u", "persona", false).unwrap();
-        assert!(!t.is_block_locked("u", "persona").unwrap());
+        for (backend, t, _tmp) in trackers(small_limits()) {
+            eprintln!("backend: {backend:?}");
+            assert!(!t.is_block_locked("u", "persona").unwrap());
+            t.set_block_lock("u", "persona", true).unwrap();
+            assert!(t.is_block_locked("u", "persona").unwrap());
+            t.set_block_lock("u", "persona", false).unwrap();
+            assert!(!t.is_block_locked("u", "persona").unwrap());
+        }
     }
 
     #[test]
     fn lock_idempotent() {
-        let (db, _tmp) = open_test_db();
-        let t = BudgetTracker::new(db, small_limits());
-        t.set_block_lock("u", "x", true).unwrap();
-        t.set_block_lock("u", "x", true).unwrap(); // no-op
-        let s = t.user_state("u").unwrap();
-        assert_eq!(s.locked_blocks.len(), 1);
+        for (backend, t, _tmp) in trackers(small_limits()) {
+            eprintln!("backend: {backend:?}");
+            t.set_block_lock("u", "x", true).unwrap();
+            t.set_block_lock("u", "x", true).unwrap(); // no-op
+            let s = t.user_state("u").unwrap();
+            assert_eq!(s.locked_blocks.len(), 1);
+        }
     }
 
     #[test]
@@ -436,5 +429,20 @@ mod tests {
         assert!(d.should_debounce("u", SleepMode::Nrem));
         // different mode is independent
         assert!(!d.should_debounce("u", SleepMode::Rem));
+    }
+
+    #[test]
+    fn user_and_global_ledgers_are_separate_families() {
+        // The two budgets share a key shape; a family collapse would read one as the other.
+        for (backend, t, _tmp) in trackers(small_limits()) {
+            t.try_charge_call("global", 100).unwrap();
+            t.record_actual_spend("global", 70).unwrap();
+            t.try_charge_call("other", 100).unwrap();
+            t.record_actual_spend("other", 5).unwrap();
+            let user = t.user_state("global").unwrap();
+            let global = t.global_state().unwrap();
+            assert_eq!((user.calls_today, user.tokens_this_hour), (1, 70), "{backend:?}");
+            assert_eq!((global.calls_today, global.tokens_today), (2, 75), "{backend:?}");
+        }
     }
 }

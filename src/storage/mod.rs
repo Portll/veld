@@ -10,6 +10,8 @@ pub mod portable;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
 pub mod relational;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -66,7 +68,7 @@ impl StorageCapabilities {
 
 /// The one shared engine database behind the global stores, carried by ENGINE
 /// rather than erased. The consumers that remain engine-typed — user-auth, the
-/// GDPR purge's raw column scans, sleep-time, the comprehensive backup — must
+/// GDPR purge's raw column scans, the comprehensive backup — must
 /// SAY which engine they need and refuse on the other, instead of discovering
 /// the mismatch at their first raw call.
 #[derive(Clone)]
@@ -109,6 +111,17 @@ impl SharedEngineDb {
         match self {
             SharedEngineDb::Redb(db) => Some(db),
             SharedEngineDb::RocksDb(_) => None,
+        }
+    }
+
+    /// A multi-family handle over THIS open database, never a second opener.
+    pub fn column_store(&self) -> Arc<dyn ColumnStore> {
+        match self {
+            SharedEngineDb::RocksDb(db) => {
+                Arc::new(legacy_rocksdb::RocksDbColumnStore::new(Arc::clone(db)))
+            }
+            #[cfg(feature = "storage-redb")]
+            SharedEngineDb::Redb(db) => Arc::new(redb::RedbColumnStore::new(Arc::clone(db))),
         }
     }
 }
@@ -322,6 +335,68 @@ pub trait ColumnStore: Send + Sync {
 
     /// Atomic across families — see [`WriteBatch`].
     fn write_batch(&self, batch: &WriteBatch) -> Result<()>;
+}
+
+/// [`KeyValueStore`] over one family of a [`ColumnStore`], for single-family
+/// stores that share a database with multi-family ones.
+///
+/// Backend-agnostic by construction: every operation is a `ColumnStore` call, so
+/// one adapter serves both engines and a store built on it needs no per-backend
+/// constructor. The family is declared at construction (`ensure_cf`), so a
+/// rocksdb database opened without it fails here rather than at first use.
+pub struct FamilyKeyValueStore {
+    store: Arc<dyn ColumnStore>,
+    cf: CfName,
+}
+
+impl FamilyKeyValueStore {
+    pub fn new(store: Arc<dyn ColumnStore>, cf: impl Into<CfName>) -> Result<Self> {
+        let cf = cf.into();
+        store.ensure_cf(&cf)?;
+        Ok(Self { store, cf })
+    }
+}
+
+impl KeyValueStore for FamilyKeyValueStore {
+    fn backend(&self) -> StorageBackend {
+        self.store.backend()
+    }
+
+    fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.store.get_cf(&self.cf, key)
+    }
+
+    fn put_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.store.put_cf(&self.cf, key, value)
+    }
+
+    fn delete_bytes(&self, key: &[u8]) -> Result<()> {
+        self.store.delete_cf(&self.cf, key)
+    }
+
+    fn scan_prefix(&self, prefix: &[u8], limit: Option<usize>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.store.scan_cf(&self.cf, Some(prefix), limit)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.store.flush_cf(&self.cf)
+    }
+
+    fn put_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for (k, v) in pairs {
+            batch.put_cf(self.cf.clone(), k.clone(), v.clone());
+        }
+        self.store.write_batch(&batch)
+    }
+
+    fn delete_many(&self, keys: &[Vec<u8>]) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for k in keys {
+            batch.delete_cf(self.cf.clone(), k.clone());
+        }
+        self.store.write_batch(&batch)
+    }
 }
 
 /// Generic key-value operations for shared secondary stores.

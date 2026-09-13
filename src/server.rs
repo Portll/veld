@@ -705,18 +705,9 @@ fn start_sleep_time_orchestrator(manager: AppState) {
         }
     };
 
-    // Sleep-time is rocksdb-typed today; on another engine it does not start,
-    // and says so — same shape as every other startup failure in this block.
-    let sleep_shared_db = match manager.shared_db.rocksdb() {
-        Some(db) => Arc::clone(db),
-        None => {
-            error!("sleep-time orchestrator requires the rocksdb engine; NOT started");
-            return;
-        }
-    };
     let orch = match SleepTimeOrchestrator::new(
         cfg,
-        sleep_shared_db,
+        manager.shared_db.column_store(),
         Arc::downgrade(&manager),
         Arc::clone(&manager.context_block_store),
         rewriter,
