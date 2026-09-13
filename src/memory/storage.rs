@@ -3260,10 +3260,24 @@ impl MemoryStorage {
                         }
                         Err(e) => {
                             deserialize_errors += 1;
+                            // The id is what makes an undecodable record actionable; a length
+                            // alone identified nothing when 24 surfaced on the 2026-09-13 deploy.
+                            // No byte prefix: content can begin inside the first 24 bytes of a
+                            // record and 25 tenants share this log. A digest identifies the bytes
+                            // without printing them.
+                            let id = uuid::Uuid::from_slice(&key)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|_| hex::encode(&key));
+                            let digest = {
+                                use sha2::{Digest, Sha256};
+                                hex::encode(&Sha256::digest(&value)[..8])
+                            };
                             tracing::warn!(
-                                "Corrupted memory entry (key len: {}, value len: {}): {}",
+                                "Corrupted memory entry id={} (key len: {}, value len: {}, sha256[..8]={}): {}",
+                                id,
                                 key.len(),
                                 value.len(),
+                                digest,
                                 e
                             );
                         }
