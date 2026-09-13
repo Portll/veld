@@ -421,7 +421,10 @@ impl RetrievalEngine {
         for id in &ids {
             let mut memory = match self.storage.get(id) {
                 Ok(m) => m,
-                Err(_) => {
+                Err(e) => {
+                    // Named, because a count of failures cannot be acted on and an id can:
+                    // 24 of these blocked the marker on the 2026-09-13 deploy.
+                    warn!("Embedding migration cannot load {}: {}", id.0, e);
                     failed += 1;
                     continue;
                 }
