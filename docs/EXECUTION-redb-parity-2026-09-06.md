@@ -5,6 +5,15 @@ measured today against this tree, not carried forward from the earlier handoffs.
 Where a number moved in the *wrong* direction it says so, because a migration
 that reports only its wins is how the last stretch of one gets mis-scoped.
 
+> **Status 2026-09-14.** Ordering is now set by
+> [ADR 0006](src/decisions/0006-backend-parity-and-on-demand-migration.md): WP1
+> refuse the false clean, WP2 wire migration, WP3 adoption plus the
+> `tests/rocksdb_ratchet.rs` ratchet, WP4 upstream discipline. §1 below is
+> stale: `7698553` already gave the four sleep_time stores `with_store`; what
+> remains there is their legacy `new(Arc<DB>)` constructors,
+> `orchestrator.rs`'s raw handle and `merge.rs`. The "0 raw calls" figures for
+> `policies` and `graduation` were a single-line grep missing split calls.
+
 Companion: `docs/HANDOFF-storage-remaining-2026-09-02.md` holds the design
 rationale for the trait split and the batch API. This document holds only the
 work that is left.
