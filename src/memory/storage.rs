@@ -146,71 +146,6 @@ impl MemoryWith3ByteHeader {
     }
 }
 
-/// Try to parse as raw bytes: UUID (16) + skip header bytes + raw UTF-8 string
-/// This is a last-resort fallback for entries that don't match any standard format
-fn try_raw_memory_parse(data: &[u8]) -> Option<Memory> {
-    if data.len() < 20 {
-        return None;
-    }
-
-    // Extract UUID from first 16 bytes
-    let uuid_bytes: [u8; 16] = data[0..16].try_into().ok()?;
-    let id = MemoryId(uuid::Uuid::from_bytes(uuid_bytes));
-
-    // Try different header sizes (2, 3, 4 bytes) and find valid UTF-8
-    for header_skip in [2, 3, 4, 5, 6] {
-        let content_start = 16 + header_skip;
-        if content_start >= data.len() {
-            continue;
-        }
-        if let Ok(content) = std::str::from_utf8(&data[content_start..]) {
-            if !content.is_empty()
-                && content
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_graphic())
-                    .unwrap_or(false)
-            {
-                let now = Utc::now();
-                let experience = Experience {
-                    experience_type: ExperienceType::Observation,
-                    content: content.to_string(),
-                    ..Default::default()
-                };
-                // Log only at debug level to avoid spam
-                tracing::debug!(
-                    "Recovered memory with raw parsing (header_skip={}, content_len={})",
-                    header_skip,
-                    content.len()
-                );
-                return Some(Memory::from_legacy(
-                    id,
-                    experience,
-                    0.5,
-                    0,
-                    now,
-                    now,
-                    false,
-                    MemoryTier::LongTerm,
-                    Vec::new(),
-                    1.0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    0.0,
-                    None,
-                    None,
-                    1,
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-        }
-    }
-    None
-}
-
 impl MemoryWithTypePrefix {
     fn into_memory(self) -> Memory {
         let now = Utc::now();
@@ -646,12 +581,6 @@ impl LegacyMemoryV2 {
 /// Returns (Memory, needs_migration) where needs_migration=true means the data
 /// was in a legacy format and should be re-written for future performance.
 fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
-    deserialize_memory_with(data, true)
-}
-
-/// `allow_raw_parse: false` refuses the last-resort arm, which builds a memory from any
-/// UTF-8 run it finds and so "decodes" arbitrary bytes.
-fn deserialize_memory_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory, bool)> {
     // Reject obviously corrupt entries before any deserialization attempt.
     // A single memory should never exceed 64MB — corrupt varint length fields
     // in bincode1 can request 7.9 exabytes and OOM-kill the process.
@@ -683,12 +612,10 @@ fn deserialize_memory_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory
         }
         let payload = &data[4..payload_end];
         // Try current format first, then fallback to legacy formats
-        deserialize_with_fallback_with(payload, allow_raw_parse)
-            .map_err(|e| anyhow!("v{version} decode failed: {e}"))
+        deserialize_with_fallback(payload).map_err(|e| anyhow!("v{version} decode failed: {e}"))
     } else {
         // Legacy format: raw bincode (no SHO header)
-        deserialize_with_fallback_with(data, allow_raw_parse)
-            .map_err(|e| anyhow!("legacy decode failed: {e}"))
+        deserialize_with_fallback(data).map_err(|e| anyhow!("legacy decode failed: {e}"))
     }
 }
 
@@ -699,9 +626,7 @@ fn deserialize_memory_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory
 /// through the legacy chain and re-encoded once. `Memory` holds `HashMap`s, so
 /// re-encoding is not byte-stable and must not be applied to already-current records.
 /// Encrypted records are refused: the redb backend has no at-rest encryption, and a
-/// dump is plaintext. So is a record only the raw-UTF-8 heuristic accepts: that arm
-/// fabricates a memory from arbitrary bytes, and carrying the fabrication would replace
-/// the original bytes on the target.
+/// dump is plaintext.
 pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     if crate::keystore::is_encrypted_record(data) {
         return Err(anyhow!(
@@ -714,7 +639,7 @@ pub(crate) fn portable_memory_value(data: &[u8]) -> Result<std::borrow::Cow<'_, 
             return Ok(std::borrow::Cow::Borrowed(data));
         }
     }
-    let (memory, _) = deserialize_memory_with(data, false)?;
+    let (memory, _) = deserialize_memory(data)?;
     let encoded = bincode::serde::encode_to_vec(&memory, bincode::config::standard())
         .context("re-encoding a decoded memory")?;
     Ok(std::borrow::Cow::Owned(encoded))
@@ -981,10 +906,6 @@ pub fn decode_memory_snapshot(bytes: &[u8]) -> Result<Memory> {
 /// Returns (Memory, is_legacy) where is_legacy=true means the data was in an old format
 /// and should be re-written to current format for future performance.
 fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
-    deserialize_with_fallback_with(data, true)
-}
-
-fn deserialize_with_fallback_with(data: &[u8], allow_raw_parse: bool) -> Result<(Memory, bool)> {
     fn record_branch(branch: &str) {
         crate::metrics::LEGACY_FALLBACK_BRANCH_TOTAL
             .with_label_values(&[branch])
@@ -1001,7 +922,7 @@ fn deserialize_with_fallback_with(data: &[u8], allow_raw_parse: bool) -> Result<
         Err(e) => {
             // Current format failed — enter fallback chain.
             // From here on we collect errors for diagnostics.
-            deserialize_legacy_fallback(data, e, record_branch, allow_raw_parse)
+            deserialize_legacy_fallback(data, e, record_branch)
         }
     }
 }
@@ -1014,7 +935,6 @@ fn deserialize_legacy_fallback(
     data: &[u8],
     first_error: bincode::error::DecodeError,
     record_branch: fn(&str),
-    allow_raw_parse: bool,
 ) -> Result<(Memory, bool)> {
     // Guard: reject data larger than 64MB before attempting any deserialization.
     // This catches corrupt entries before bincode1 (which lacks with_limit) tries
@@ -1259,14 +1179,6 @@ fn deserialize_legacy_fallback(
         }
         Err(e) => errors.push(("bincode2 MemoryWith3ByteHeader", e.to_string())),
     }
-
-    // LAST RESORT: Try raw byte parsing with different header skip sizes
-    // This handles non-standard formats by finding where valid UTF-8 content starts
-    if let Some(memory) = try_raw_memory_parse(data).filter(|_| allow_raw_parse) {
-        record_branch("raw_parse");
-        return Ok((memory, true));
-    }
-    errors.push(("raw parse", "no valid UTF-8 content found".to_string()));
 
     // Log debug info on first failure only (at debug level to reduce noise)
     if is_first_failure {
@@ -2337,7 +2249,7 @@ impl MemoryStorage {
 
                 // Lazy migration: re-write legacy formats in current format
                 if needs_migration {
-                    if let Err(e) = self.migrate_memory_format(&memory) {
+                    if let Err(e) = self.migrate_memory_format(key, &memory) {
                         // Migration failure is non-fatal - log and continue
                         tracing::debug!("Lazy migration skipped for memory {}: {}", memory.id.0, e);
                     }
@@ -2349,9 +2261,16 @@ impl MemoryStorage {
         }
     }
 
-    /// Re-write a memory in current format (lazy migration helper)
-    fn migrate_memory_format(&self, memory: &Memory) -> Result<()> {
-        let key = memory.id.0.as_bytes();
+    /// Re-write a memory in current format (lazy migration helper). Writes only under the key
+    /// the bytes were read from: a decoder that took the id from the value itself would
+    /// otherwise create a row under an id nothing else references.
+    fn migrate_memory_format(&self, key: &[u8], memory: &Memory) -> Result<()> {
+        if memory.id.0.as_bytes() != key {
+            return Err(anyhow!(
+                "decoded id {} does not match the stored key; not rewriting",
+                memory.id.0
+            ));
+        }
         let value = self
             .serialize_memory(memory)
             .context("Failed to serialize for migration")?;
@@ -4556,7 +4475,15 @@ pub(crate) mod wire_fixtures {
             tags: vec!["synthetic".into()],
             ..Default::default()
         };
-        let mut memory = Memory::new(MemoryId(uuid::Uuid::new_v4()), experience, 0.7, None, None, None, None);
+        let mut memory = Memory::new(
+            MemoryId(uuid::Uuid::new_v4()),
+            experience,
+            0.7,
+            None,
+            None,
+            None,
+            None,
+        );
         memory.when.episode_ordinal = Some(3);
         memory
     }
@@ -4569,8 +4496,15 @@ pub(crate) mod wire_fixtures {
     pub(crate) fn strip_writer_structs(current: &[u8]) -> Vec<u8> {
         let cfg = bincode::config::standard().with_limit::<BINCODE_ALLOC_LIMIT>();
         let (_, gap_at) =
-            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(current, cfg).unwrap();
-        assert_eq!(&current[gap_at..gap_at + 8], &PRE_WRITER_SESSION_GAP, "fixture must carry default writers");
+            bincode::serde::decode_from_slice::<LegacyMemoryThroughPreWriterSession, _>(
+                current, cfg,
+            )
+            .unwrap();
+        assert_eq!(
+            &current[gap_at..gap_at + 8],
+            &PRE_WRITER_SESSION_GAP,
+            "fixture must carry default writers"
+        );
         [&current[..gap_at], &current[gap_at + 8..]].concat()
     }
 }
@@ -4789,6 +4723,50 @@ mod tests {
     }
 
     use super::wire_fixtures::{encode, memory_with_session, strip_writer_structs};
+
+    /// A value that is not a memory but whose tail is UTF-8 used to "decode" through a raw-parse
+    /// arm that took the id from the value's first 16 bytes, and `get` then rewrote that
+    /// fabrication under the fabricated id. The arm is gone; this pins both halves.
+    #[test]
+    fn a_non_memory_value_with_a_utf8_tail_is_undecodable_and_never_rewritten() {
+        let (storage, _dir) = test_storage();
+        let key = MemoryId(uuid::Uuid::new_v4());
+        let fabricated = uuid::Uuid::new_v4();
+        let mut value = fabricated.as_bytes().to_vec();
+        value.extend_from_slice(&[0x00, 0x01]);
+        value.extend_from_slice(b"this was never a memory");
+        storage.db.put(key.0.as_bytes(), &value).unwrap();
+
+        assert!(
+            storage.get(&key).is_err(),
+            "a fabricated memory must not be served"
+        );
+        assert!(
+            storage.db.get(fabricated.as_bytes()).unwrap().is_none(),
+            "no phantom row"
+        );
+        assert_eq!(
+            storage.db.get(key.0.as_bytes()).unwrap().unwrap(),
+            value,
+            "original bytes intact"
+        );
+    }
+
+    #[test]
+    fn lazy_migration_refuses_a_key_the_decoded_id_does_not_match() {
+        let (storage, _dir) = test_storage();
+        let memory = memory_with_session("legacy-shaped");
+        let other = uuid::Uuid::new_v4();
+        assert!(storage
+            .migrate_memory_format(other.as_bytes(), &memory)
+            .is_err());
+        assert!(storage.db.get(memory.id.0.as_bytes()).unwrap().is_none());
+        assert!(storage.db.get(other.as_bytes()).unwrap().is_none());
+        storage
+            .migrate_memory_format(memory.id.0.as_bytes(), &memory)
+            .unwrap();
+        assert!(storage.db.get(memory.id.0.as_bytes()).unwrap().is_some());
+    }
 
     #[test]
     fn a_record_with_a_pre_writer_session_recovers_through_the_splice() {

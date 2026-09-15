@@ -769,9 +769,10 @@ fn migrate_with_quarantine_migrates_the_rest_and_reports_what_it_set_aside() {
 }
 
 #[test]
-fn the_planted_record_is_one_the_raw_utf8_heuristic_would_have_fabricated_a_memory_from() {
-    // Guards the plant: the runtime reader accepts these bytes via its last-resort arm,
-    // so a test that planted bytes nothing at all accepts would not cover that arm.
+fn the_planted_record_is_undecodable_to_the_runtime_reader_and_the_portable_dump_alike() {
+    // Guards the plant: these bytes once "decoded" through a raw-UTF-8 arm that fabricated a
+    // memory from them (removed 2026-09-16); both readers must now refuse them, so the
+    // quarantine tests above exercise a record no arm accepts.
     assert!(crate::memory::storage::portable_memory_value(UNDECODABLE_VALUE).is_err());
-    assert!(crate::memory::storage::deserialize_memory_for_test(UNDECODABLE_VALUE).is_ok());
+    assert!(crate::memory::storage::deserialize_memory_for_test(UNDECODABLE_VALUE).is_err());
 }
