@@ -3640,7 +3640,7 @@ mod tests {
                     "Which person was registered for the Paris trade summit?".to_string(),
                 ),
                 max_results: 10,
-                layers,
+                layers: Some(layers),
                 ..Default::default()
             };
             system
@@ -3736,22 +3736,6 @@ mod tests {
         ));
     }
 
-    // -------------------- RH-12 (#272) -------------------------------------
-    //
-    // Run the full smoke suite with N=2 and verify (a) the report records
-    // repeats=2, (b) per-repeat storage subdirs exist, (c) quality metrics
-    // are bit-identical between the N=1 baseline run and the N=2 run.
-    //
-    // This test is the load-bearing assertion that RH-12 changed only the
-    // measurement, not the metric — if N=1 and N=2 disagree on quality,
-    // either the determinism guarantee broke OR `aggregate_layer` is no
-    // longer a pure function of its inputs.
-    //
-    // Marked `#[ignore]` because it pays the ingest cost twice (~12 min on
-    // a cold runner). Run via `cargo test --release -- --ignored
-    // runner_repeats_2_produces_same_quality_as_repeats_1` before shipping
-    // changes that touch the harness or scoring path.
-    #[test]
     /// Record a baseline from THIS tree with THIS process's embedder:
     ///
     ///   VELD_EMBEDDER=http VELD_WRITE_BASELINE=tests/recall/baseline.json \
@@ -3793,6 +3777,22 @@ mod tests {
         );
     }
 
+    // -------------------- RH-12 (#272) -------------------------------------
+    //
+    // Run the full smoke suite with N=2 and verify (a) the report records
+    // repeats=2, (b) per-repeat storage subdirs exist, (c) quality metrics
+    // are bit-identical between the N=1 baseline run and the N=2 run.
+    //
+    // This test is the load-bearing assertion that RH-12 changed only the
+    // measurement, not the metric — if N=1 and N=2 disagree on quality,
+    // either the determinism guarantee broke OR `aggregate_layer` is no
+    // longer a pure function of its inputs.
+    //
+    // Marked `#[ignore]` because it pays the ingest cost twice (~12 min on
+    // a cold runner). Run via `cargo test --release -- --ignored
+    // runner_repeats_2_produces_same_quality_as_repeats_1` before shipping
+    // changes that touch the harness or scoring path.
+    #[test]
     #[ignore = "expensive: runs the smoke suite twice (~12min). enable with --ignored before shipping harness changes."]
     fn runner_repeats_2_produces_same_quality_as_repeats_1() {
         let storage1 = unique_storage_dir("repeats1");
