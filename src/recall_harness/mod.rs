@@ -5,30 +5,27 @@
 //! report/baseline-comparison format.
 //!
 //! Imported from shodh-memory upstream, which runs it as a held-out LoCoMo
-//! gate. Three modules are live. The remaining eight are on disk unmodified.
+//! gate. All eleven modules are declared and compiled.
 //!
-//! The capture layer they need is now HERE: `memory::gold_funnel` and
-//! `memory::fusion_features` landed in `803033d`, with four
-//! `gold_funnel::record` stages wired into `memory/recall.rs` (graph, vector,
-//! fusion, final). What still blocks the eight, measured against this tree:
+//! Where veld has no counterpart to an upstream mechanism the harness says so
+//! rather than reporting zero: `EDGE_DIR_FLIPS` and `DIRECTED_REVERSE_COLLAPSE`
+//! print `n/a`, because veld has no directed-edge traversal fix to instrument.
 //!
-//! - Five APIs upstream has and veld does not. Three are ported as of this
-//!   commit (`relation_type_distribution`, `synthetic_for_sim`,
-//!   `annotate_query_ner`); two go deeper than their line counts suggested —
-//!   `simulate_edge_aging` needs `GraphMemory::apply_decay_at` and
-//!   `force_vector_quality_rebuild` needs `RetrievalEngine::force_quality_rebuild`,
-//!   neither of which exists here.
-//! - Three counters that instrument a directed-edge fix veld does not have:
-//!   no `edge_neighbor`, no `dir_fix` branch. Adding the accessors would make
-//!   them return a permanent zero, and `EDGE_DIR_FLIPS=0` reads as "the fix
-//!   ran and flipped nothing" rather than "there is no such fix here".
-//!   See `docs/HANDOFF-2026-09-07.md` §A1 — a decision, not a task.
-//! - `bridge_harness` also needs five `UserMemory` -> `MemorySystem`
-//!   unwrappings, veld's wrapper being absent upstream.
-//!
-//! They stay undeclared rather than half-adapted, because an installed harness
-//! nobody has run is the failure this import exists to end.
+//! The ablation arms in `runner::analyze_ablation` do not yet say so. They set
+//! upstream `SHODH_*` pipeline flags that nothing in veld reads (the graph
+//! expand/traverse/edge-dir/boost/fusion flags, `SHODH_DISABLE_BOOSTS`,
+//! `SHODH_DISABLE_FACT_LAYERS`), so every such arm measures the baseline under
+//! another name. Likewise `SHODH_EVAL_NOW` pins no clock here. Read an arm that
+//! matches baseline as "not wired in veld", never as "no effect".
 
 pub mod fixtures;
 pub mod metrics;
 pub mod report;
+pub mod bridge_harness;
+pub mod decay_sim;
+pub mod forgetting_harness;
+pub mod lineage_harness;
+pub mod multihop;
+pub mod ontology_harness;
+pub mod runner;
+pub mod temporal_harness;

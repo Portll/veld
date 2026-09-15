@@ -7,16 +7,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_UNDECLARED: &[&str] = &[
-    "recall_harness/bridge_harness.rs",
-    "recall_harness/decay_sim.rs",
-    "recall_harness/forgetting_harness.rs",
-    "recall_harness/lineage_harness.rs",
-    "recall_harness/multihop.rs",
-    "recall_harness/ontology_harness.rs",
-    "recall_harness/runner.rs",
-    "recall_harness/temporal_harness.rs",
-];
+const KNOWN_UNDECLARED: &[&str] = &[];
 
 fn declared_modules(source: &str) -> Vec<String> {
     source
