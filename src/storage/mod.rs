@@ -610,8 +610,8 @@ pub trait StorageFactory: Send + Sync {
 }
 
 pub use legacy_rocksdb::{
-    RocksDbBackupStore, RocksDbBatchWriter, RocksDbGraphStore, RocksDbPrimaryMemoryStore,
-    RocksDbStorageFactory,
+    visit_records_read_only, RocksDbBackupStore, RocksDbBatchWriter, RocksDbGraphStore,
+    RocksDbPrimaryMemoryStore, RocksDbStorageFactory,
 };
 #[cfg(feature = "storage-redb")]
 pub use redb::{RedbBatchWriter, RedbStorageFactory};
